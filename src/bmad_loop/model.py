@@ -202,16 +202,16 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
-    # How many times a human re-arm (`runs.rearm_escalation`) has re-opened this
-    # task. Re-arm resets `attempt` to 0 and the next dispatch bumps it back to 1,
-    # so without a discriminator the re-minted session task_id is byte-equal to a
-    # record the ABANDONED attempt already appended to the append-only `sessions`
-    # list — and `Engine._resumable_session`, which matches on that id, replays the
-    # abandoned attempt's verdict for the fresh one (#705). Feeds
+    # Session-id namespace rollovers performed when an escalated task is reopened
+    # while its attempt budget resets to 0. This happens in `runs.rearm_escalation`
+    # and in the sweep engine's ESCALATED restart arms. The next dispatch bumps the
+    # attempt back to 1, so without a discriminator the re-minted session task_id is
+    # byte-equal to a record the ABANDONED attempt already appended to the
+    # append-only `sessions` list. Feeds
     # `engine._session_task_id`, which emits the suffix only above zero, so every
     # id already on disk stays byte-identical across the upgrade. `task.sessions`
-    # is deliberately NOT cleared at re-arm: the run-dir audit trail it indexes is
-    # read by a second resolve cycle.
+    # is deliberately NOT cleared when a task is reopened: the run-dir audit trail
+    # it indexes is read by a later resolve cycle.
     generation: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the

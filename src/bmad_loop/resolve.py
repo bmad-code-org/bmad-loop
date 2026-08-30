@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters.base import SessionSpec
+from .engine import _session_task_id
 from .model import RunState
 from .platform_util import safe_segment
 from .runs import (
@@ -252,14 +253,41 @@ def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, A
     return ctx
 
 
-def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model: str = "") -> bool:
+def run_session(
+    adapter,
+    project: Path,
+    run_dir: Path,
+    story_key: str,
+    *,
+    generation: int,
+    model: str = "",
+) -> bool:
     """Launch the interactive resolve agent attached to the caller's terminal.
 
     Blocks until the agent session exits. Returns whether the agent produced a
     resolution marker. The context file must already be written (build_context).
+
+    Nothing consumes this session's ``task_id``: no task dir is created,
+    ``interactive_argv`` ignores it, ``interactive_env`` does not export it, and no
+    ``SessionRecord`` is appended. It is minted through ``engine._session_task_id``
+    anyway because this was the FOURTH hand-mint site outside that chokepoint and
+    there are now none. The property being restored is whole-composition
+    sanitization: sanitizing ``story_key`` alone and concatenating the suffix AFTER
+    can push a key already at ``MAX_SEGMENT`` back past it, and ``safe_segment``'s
+    digest differs between the two orders. Since nothing reads the id, no collision
+    follows from one — ``seq`` is a hardcoded 1 and several ``cmd_resolve`` paths
+    return before the re-arm, so a later resolve of the same story may legitimately
+    re-mint a byte-identical id.
+
+    ``generation`` is required with no default for the reason that docstring gives —
+    an implicit 0 is right in every run that never re-armed and wrong only on the one
+    that did, so a default here would reproduce the defect at this seam. ``cmd_resolve``
+    CALLS this before ``runs.rearm_escalation``, so the value it passes is the one still
+    on disk, i.e. pre-bump. Not because the read is ordered against the bump: the re-arm
+    reloads state and mutates its own copy, leaving the caller's ``task`` untouched.
     """
     spec = SessionSpec(
-        task_id=f"{safe_segment(story_key)}-resolve-1",
+        task_id=_session_task_id(story_key, "resolve", 1, generation),
         role="dev",
         prompt=f"/bmad-loop-resolve {story_key}",
         cwd=project,

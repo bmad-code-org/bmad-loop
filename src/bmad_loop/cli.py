@@ -3105,7 +3105,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
-                adapters["dev"], project, run_dir, story_key, model=model
+                adapters["dev"],
+                project,
+                run_dir,
+                story_key,
+                # This CALL precedes the re-arm below, so the generation it passes is
+                # the one still on disk — the pre-bump value. Not an ordering of the
+                # read: `rearm_escalation` reloads state and bumps its own copy, so
+                # this `task` object reads the same either way.
+                generation=task.generation,
+                model=model,
             )
         except NotImplementedError:
             print(

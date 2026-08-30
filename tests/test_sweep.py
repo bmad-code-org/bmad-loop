@@ -2392,6 +2392,9 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
     assert dec["env_fault"] is True
 
+    abandoned = [s.task_id for s in adapter.sessions]
+    assert abandoned == ["sweep-triage-triage-1"]  # generation 0 emits no suffix
+
     # resume once the outage clears: the ESCALATED-resume resets attempt to 0
     # (fresh budget) and re-drives triage to completion
     good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
@@ -2399,6 +2402,47 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     assert not resumed.run().paused
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(radapter.sessions) == 1
+    # ...and it does so in a NEW generation. The attempt reset above is exactly what
+    # would otherwise re-mint `attempt == 1` — an id byte-equal to the abandoned
+    # attempt's, pointing the fresh record at the abandoned cycle's
+    # tasks/<id>/escalation.json, which `resolve._gather_escalations` reads per record.
+    # (result.json is not the hazard here: both start_sessions unlink it on launch.)
+    assert resumed.state.tasks["sweep-triage"].generation == 1
+    assert [s.task_id for s in radapter.sessions] == ["sweep-triage-triage-1-g1"]
+    assert radapter.sessions[0].task_id not in abandoned
+
+
+def test_repeated_triage_escalation_restarts_keep_advancing_generation(project):
+    """Every ESCALATED restart opens a new namespace, not only the first one.
+
+    Starting from generation zero alone would let ``generation += 1`` regress to
+    ``generation = 1`` while every first-restart assertion stayed green. A second
+    escalation proves the next reset advances to generation two and cannot re-mint
+    either earlier session id.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    outage = SessionResult(
+        status="timeout",
+        env_fault=True,
+        env_fault_evidence="API Error: Unable to connect (ECONNREFUSED)",
+    )
+    engine, first = make_sweep(project, [outage])
+    assert engine.run().paused
+    first_id = first.sessions[0].task_id
+
+    resumed_once, second = resume_sweep(project, engine, [outage])
+    assert resumed_once.run().paused
+    assert resumed_once.state.tasks["sweep-triage"].generation == 1
+    second_id = second.sessions[0].task_id
+    assert second_id == "sweep-triage-triage-1-g1"
+
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    resumed_twice, third = resume_sweep(project, resumed_once, [triage_effect(good)])
+    assert not resumed_twice.run().paused
+    assert resumed_twice.state.tasks["sweep-triage"].generation == 2
+    third_id = third.sessions[0].task_id
+    assert third_id == "sweep-triage-triage-1-g2"
+    assert len({first_id, second_id, third_id}) == 3
 
 
 def test_triage_plain_timeout_still_retries_to_cap(project):
@@ -2495,6 +2539,59 @@ def test_triage_escalation_resume_retries_triage(project):
     assert not summary.paused
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(adapter.sessions) == 1
+
+
+def test_non_escalated_triage_restart_keeps_its_generation(project):
+    """Control for the ESCALATED-arm bump: a task restarted from a NON-escalated
+    phase (the host died mid-triage) keeps its attempt counter, so `attempt += 1`
+    already yields a fresh number and the namespace must not move. Bumping outside
+    that arm would break the property `_session_task_id`'s suffix rule exists to
+    hold — every id an existing run already wrote to disk stays byte-identical."""
+    write_ledger(project, {"DW-1": "open"})
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    engine, adapter = make_sweep(project, [triage_effect(good)])
+    # a session that never reported: TRIAGE_RUNNING with one attempt already spent
+    task = StoryTask(story_key="sweep-triage", epic=0)
+    task.phase = Phase.TRIAGE_RUNNING
+    task.attempt = 1
+    engine.state.tasks["sweep-triage"] = task
+
+    assert not engine.run().paused
+
+    assert engine.state.tasks["sweep-triage"].generation == 0  # NOT bumped
+    assert engine.state.tasks["sweep-triage"].attempt == 2  # the counter continued
+    # attempt 2 is already a fresh id; no -g suffix rewrites the namespace
+    assert [s.task_id for s in adapter.sessions] == ["sweep-triage-triage-2"]
+
+
+def test_non_escalated_migrate_restart_keeps_its_generation(project):
+    """The migrate twin of the row above. Both restart arms scope the bump to
+    `Phase.ESCALATED` independently, so pinning only the triage one leaves
+    `_ensure_migration`'s scoping free: dedenting its `_rearm_generation(task)` call
+    a level passes the whole triage-side suite."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "moot"}])
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    # a migration session that never reported: TRIAGE_RUNNING, one attempt spent
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    task.phase = Phase.TRIAGE_RUNNING
+    task.attempt = 1
+    engine.state.tasks["sweep-migrate"] = task
+
+    assert not engine.run().paused
+
+    assert engine.state.tasks["sweep-migrate"].generation == 0  # NOT bumped
+    assert engine.state.tasks["sweep-migrate"].attempt == 2  # the counter continued
+    # attempt 2 is already a fresh id; no -g suffix rewrites the namespace
+    assert adapter.sessions[0].task_id == "sweep-migrate-triage-2"
 
 
 def test_interactive_decisions_build_and_close(project):
@@ -4152,8 +4249,10 @@ def test_migration_escalation_resume_retries(project):
     write_legacy_ledger(project, LEGACY_LEDGER)
     manifest = legacy_manifest()
     bad = migrate_effect(project, LEGACY_LEDGER, [])  # no conversion at all
-    engine, _ = make_sweep(project, [bad, bad])
+    engine, first = make_sweep(project, [bad, bad])
     assert engine.run().paused
+    abandoned = [s.task_id for s in first.sessions]
+    assert abandoned == ["sweep-migrate-triage-1", "sweep-migrate-triage-2"]
 
     mapping = [
         {"key": manifest[0]["key"], "dw_id": "DW-1"},
@@ -4170,6 +4269,12 @@ def test_migration_escalation_resume_retries(project):
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(adapter.sessions) == 2
+    # the ESCALATED-resume opened a new generation of the migrate task, so its
+    # restarted attempt 1 does not re-mint the abandoned attempt 1's id
+    assert resumed.state.tasks["sweep-migrate"].generation == 1
+    migrate_id = adapter.sessions[0].task_id
+    assert migrate_id == "sweep-migrate-triage-1-g1"
+    assert migrate_id not in abandoned
 
 
 def test_no_legacy_skips_migration(project):

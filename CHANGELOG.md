@@ -207,6 +207,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Prevent escalated sweep restarts from reusing abandoned session ids, and clear stale
+  `escalation.json` artifacts when either adapter reuses a task directory.
+- Route interactive resolve task ids through the shared whole-composition sanitizer while
+  preserving generation-zero ids for clean story keys.
 - A verify command whose child cannot be started pauses the run instead of crashing it. Any
   spawn-time `OSError` — most often a working directory that is missing, is a regular file, or
   cannot be searched, but a missing shell or EMFILE too — raised out of `subprocess.run` past

@@ -3147,6 +3147,44 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
 
 
+def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkeypatch):
+    """`cmd_resolve` hands the resolve session the generation it read off the task — a
+    real value, not a constant. The row seeds a NON-zero generation deliberately:
+    `escalated_run` builds tasks at the default 0, so an `assert seen == [0]` cannot
+    tell "read from the task" from "hardcoded 0" — that earlier form passed with
+    `generation=task.generation` ablated to a literal `generation=0`.
+
+    The call precedes `rearm_escalation`, so the value passed is the pre-bump one still
+    on disk. That follows from call ORDER, not from where the read sits: the re-arm
+    reloads state and bumps its own copy, leaving this `task` object untouched either
+    way. Nothing consumes the resulting id, so no collision claim rides on it."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state, save_state
+
+    _escalated_run(tmp_path, "r1")
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
+    state = load_state(run_dir)
+    state.tasks["s1"].generation = 2  # a story already re-armed twice
+    save_state(run_dir, state)
+    seen: list[int] = []
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        seen.append(generation)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    # --no-resume: re-arm only, so the bump this row contrasts against still runs
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == [2]  # the task's own generation, not a constant
+    assert load_state(run_dir).tasks["s1"].generation == 3  # the re-arm bumped past it
+
+
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
     from bmad_loop import resolve
 
@@ -3384,7 +3422,7 @@ def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
     ran: list = []
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the resolve agent records a restore_patch in its output marker
         ran.append(story_key)
         marker = resolve.resolution_path(rd, story_key)
@@ -3569,7 +3607,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     patch.write_text("diff", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the resolve agent records a restore_patch in its output marker
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -3625,7 +3663,7 @@ def test_resolve_rereads_isolation_after_the_agent_session(
     _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
     _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the human and the agent conclude the story needs isolation, and the operator
         # edits policy.toml from another terminal while the session is still open
         if flipped_mid_session:
@@ -3668,7 +3706,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
@@ -3699,7 +3737,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")

@@ -369,12 +369,13 @@ def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> st
     differs between the two orders. ``_resumable_session``'s resume match must
     be byte-identical to what ``_run_session`` stored, so both MUST call this.
 
-    ``generation`` is ``StoryTask.generation``, bumped once per human re-arm
-    (``runs.rearm_escalation``). Re-arm resets ``attempt`` to 0 and the next
-    dispatch bumps it back to 1, so without this the re-minted id was BYTE-EQUAL
-    to a record the abandoned attempt already appended to ``task.sessions`` — and
-    ``_resumable_session``, which scans that append-only list, replayed the
-    abandoned attempt's verdict for the fresh one (#705).
+    ``generation`` is ``StoryTask.generation``, bumped whenever an escalated task
+    is reopened while resetting ``attempt`` to 0 (``runs.rearm_escalation`` and the
+    sweep engine's ESCALATED restart arms). The next dispatch bumps the attempt
+    back to 1, so without this the re-minted id is BYTE-EQUAL to a record the
+    abandoned attempt already appended to ``task.sessions``. For dev/review tasks,
+    ``_resumable_session`` would then replay that abandoned verdict (#705); sweep
+    task records would alias the same task-directory artifacts.
 
     REQUIRED, with no default, for the reason ``verify_dev_exclude_relpaths``' ``root``
     is: an implicit ``generation=0`` is correct in every run that never re-armed — which
