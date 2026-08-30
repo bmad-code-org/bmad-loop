@@ -2982,6 +2982,81 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     assert warned[0]["commits"] == [git(tmp_path, "rev-parse", "HEAD")]
 
 
+def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_path):
+    """A bad old baseline is warn-only, and the persisted reset proves re-arm
+    reached its save rather than returning early.
+
+    Ablation: catch a type outside ``verify.GitError`` and the real rev-list
+    failure escapes before any of these completion assertions can run.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, _spec, _patch = _stale_restore_tree(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks["1-1-a"]
+    initial_generation = task.generation
+    task.baseline_commit = "0" * 39 + "1"  # sha-shaped, but names no object
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING
+    assert task.attempt == 0
+    assert task.generation == initial_generation + 1
+    assert task.restore_patch is None
+    assert task.baseline_commit == git(tmp_path, "rev-parse", "HEAD")
+    assert not _kinds(run_dir, "stale-restore-commits")
+    excluded = _kinds(run_dir, "stale-restore-excluded")
+    assert len(excluded) == 1
+    assert excluded[0]["files"] == ["newfile.txt"]
+
+
+def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
+    """A non-repository code tree reaches the same typed, silent degrade.
+
+    Ablation: catch a type outside ``verify.GitError`` and the pinned probe fault
+    escapes, so the persisted generation and latch reset never appear.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, restore_patch_stale="old.patch")
+    state = load_state(run_dir)
+    task = state.tasks["1-1-a"]
+    initial_generation = task.generation
+    task.baseline_commit = "0" * 39 + "1"
+    save_state(run_dir, state)
+    with pytest.raises(verify.GitError):
+        verify.commits_above(tmp_path, task.baseline_commit)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING
+    assert task.attempt == 0
+    assert task.generation == initial_generation + 1
+    assert task.restore_patch is None
+    assert task.baseline_commit == "0" * 39 + "1"
+    assert not _kinds(run_dir, "stale-restore-commits")
+    assert len(_kinds(run_dir, "stale-restore-unparseable")) == 1
+
+
+def test_rearm_does_not_swallow_a_non_git_fault_from_the_commits_probe(monkeypatch, tmp_path):
+    """Only Git faults are warn-only; programming faults must escape.
+
+    Ablation: widen the catch back to ``Exception`` and this fails with
+    ``DID NOT RAISE``, directly grading the narrowing rather than its old behavior.
+    """
+    run_dir, _spec, _patch = _stale_restore_tree(tmp_path)
+
+    def boom(repo, baseline):
+        raise MemoryError("not a git answer")
+
+    monkeypatch.setattr(runs.verify, "commits_above", boom)
+    with pytest.raises(MemoryError, match="not a git answer"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+
 def test_archive_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')

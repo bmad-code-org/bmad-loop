@@ -694,6 +694,122 @@ def test_sentinel_upstream_record_drops_the_stories_root_it_names():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+_PATCH_PATH_ROUTING_ROWS = (
+    (
+        "stale-restore-excluded",
+        "patch",
+        f"{HOME_PATH}/artifacts/{SPEC_NAME}.patch",
+    ),
+    (
+        "stale-restore-unparseable",
+        "patch",
+        f"{HOME_PATH}/artifacts/{SPEC_NAME}.patch",
+    ),
+    ("attempt-restored", "patch", "attempt.patch"),
+    ("attempt-restore-failed", "patch", f"{HOME_PATH}/artifacts/attempt.patch"),
+    (
+        "unit-closed",
+        "patch",
+        f"{HOME_PATH}/.bmad-loop/runs/r1/failed/{STORY_KEY}/changes.patch",
+    ),
+    (
+        "deferred-artifacts-stashed",
+        "stashed_to",
+        f"{HOME_PATH}/.bmad-loop/runs/r1/deferred/{STORY_KEY}/{SPEC_NAME}",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "value"),
+    _PATCH_PATH_ROUTING_ROWS,
+    ids=[row[0] for row in _PATCH_PATH_ROUTING_ROWS],
+)
+def test_patch_and_stash_path_fields_are_dropped_at_the_routing_seam(kind, field, value):
+    """Every current producer is routed by field name, including a retained
+    unit's full forensic path and a bare operator latch.
+
+    Ablation: remove either field from ``_JOURNAL_DROP_FIELDS`` and its rows fail
+    the structural absence/presence assertions even when path-shaped canaries stay green.
+    """
+    control_story = "1.2-ControlStory"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": kind, "story_key": control_story, field: value},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert field not in scrubbed
+    assert scrubbed[f"{field}_present"] is True
+    story_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "story" and orig == control_story
+    )
+    assert scrubbed["story_key"] == story_alias
+    assert scrubbed["story_key"] != control_story
+    entries = pseudo.entries()
+    assert not [orig for ns, orig, _alias in entries if ns == "spec"]
+    legend_values = {orig for _ns, orig, _alias in entries}
+    assert value not in legend_values
+    assert Path(value).name not in legend_values
+    rendered = json.dumps(scrubbed)
+    for canary in (value, HOME_PATH, SPEC_NAME, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    legend = json.dumps(pseudo.legend())
+    for canary in (value, HOME_PATH, SPEC_NAME, PROPRIETARY, *CANARIES):
+        assert canary not in legend, f"LEAK via legend: {canary!r}"
+
+
+def test_patch_and_stash_paths_are_absent_from_public_diagnostic_renders(project):
+    """Journal records flow through collect and both public renderers.
+
+    Ablation: remove either DROP route and the decoded JSON entry retains the
+    source field, so this fails even though the absolute-path leak sweep stays green.
+    """
+    run_dir = _seed_run(project.project)
+    patch_path = f"{HOME_PATH}/artifacts/patch-{SPEC_NAME}.patch"
+    stash_path = f"{HOME_PATH}/.bmad-loop/runs/r1/deferred/{STORY_KEY}/stash-{SPEC_NAME}"
+    journal = Journal(run_dir)
+    journal.append(
+        "stale-restore-excluded",
+        story_key=STORY_KEY,
+        patch=patch_path,
+        files=["newfile.txt"],
+    )
+    journal.append(
+        "deferred-artifacts-stashed",
+        story_key=STORY_KEY,
+        stashed_to=stash_path,
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    json_text = diagnostics.render_json(diag, pseudo=pseudo)
+    document = json.loads(json_text)
+    entries = document["runs"][0]["journal"]["entries"]
+    excluded = next(entry for entry in entries if entry["kind"] == "stale-restore-excluded")
+    stashed = next(entry for entry in entries if entry["kind"] == "deferred-artifacts-stashed")
+
+    assert "patch" not in excluded
+    assert excluded["patch_present"] is True
+    assert "stashed_to" not in stashed
+    assert stashed["stashed_to_present"] is True
+    story_alias = next(a for ns, orig, a in pseudo.entries() if ns == "story" and orig == STORY_KEY)
+    assert excluded["story_key"] == story_alias
+    assert stashed["story_key"] == story_alias
+    assert story_alias in markdown
+    rendered = markdown + json_text
+    for canary in (patch_path, stash_path, HOME_PATH, SPEC_NAME, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    spec_legend_values = {orig for ns, orig, _alias in pseudo.entries() if ns == "spec"}
+    assert spec_legend_values == {SPEC_NAME}
+    legend_values = set(pseudo.legend().values())
+    for dropped in (patch_path, Path(patch_path).name, stash_path, Path(stash_path).name):
+        assert dropped not in legend_values
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -1132,7 +1248,7 @@ def test_legacy_in_tree_events_still_counted_and_summed_with_the_primary(
 
     group = _events_group(run_dir, project.project)
     assert group is not None
-    # ONE group, summed — the payload shape is the v1 schema and does not split.
+    # ONE group, summed — the schema-versioned payload shape does not split.
     assert group.count == 5
 
 

@@ -69,7 +69,9 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 # would falsely tell a consumer pinned to v1 that the fields it reads are gone,
 # while a consumer actually broken by the repackaging finds out immediately —
 # the fence is gone and json.loads fails. Bump only on a payload break.
-SCHEMA_VERSION = 1
+# v2 replaces journal-entry `patch` / `stashed_to` values with the presence keys
+# `patch_present` / `stashed_to_present`.
+SCHEMA_VERSION = 2
 DEFAULT_JOURNAL_CAP = 200
 
 # Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
@@ -263,6 +265,15 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # `/`, `\` and `:`), so — exactly as for `repo` — only an assertion on the
         # field's ABSENCE can grade this, and the canary sweep cannot.
         "stories_root",
+        # A relative or absolute operator-selected or retained forensic patch path.
+        # `story_key` already correlates these records, so aliasing adds no value;
+        # drop it because the fallback redacts separator-bearing paths but lets a
+        # bare feature- or spec-named patch through verbatim.
+        "patch",
+        # The absolute deferred-stash target embeds the run directory, story key,
+        # and spec filename. Drop rather than create a second spec correlation;
+        # the fallback redacts it only by virtue of its current separators.
+        "stashed_to",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).
@@ -494,9 +505,9 @@ def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> li
     maintainer is reading the dump to understand.
 
     Both are summed into ONE ``FileGroup`` named ``events``: the payload shape is
-    the schema, and splitting the category (or adding a field) would be a break
-    for a v1 consumer. Which root the events came from is not what the count is
-    for — "did the hooks fire at all" is.
+    the schema, and splitting the category (or adding a field) would be a payload
+    break requiring another schema bump. Which root the events came from is not
+    what the count is for — "did the hooks fire at all" is.
     """
     if category != _EVENTS_CATEGORY:
         return [run_dir / category]

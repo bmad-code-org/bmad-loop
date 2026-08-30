@@ -5056,7 +5056,7 @@ def test_diagnose_json_emits_pure_document(project, capsys):
 
     _seed_run(project.project)
     doc = machine_json(["diagnose", "--project", str(project.project), "--json"], capsys)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert doc["runs"], "the document carries the run it resolved"
     for canary in CANARIES:
         assert canary not in json.dumps(doc), f"LEAK via CLI: {canary!r}"
@@ -5076,7 +5076,7 @@ def test_diagnose_json_out_writes_document_and_keeps_stdout_empty(project, tmp_p
     assert "written to" in err  # the confirmation moved to stderr
     written = out_file.read_text()
     doc = json.loads(written)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert "```" not in written  # no fences in a file written in JSON mode
     for canary in CANARIES:
         assert canary not in written, f"LEAK via CLI: {canary!r}"
