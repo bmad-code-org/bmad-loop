@@ -3,6 +3,7 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import shutil
@@ -536,6 +537,180 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
     )
 
 
+# --------------------------------------- divergent roots (`repo_root` override)
+#
+# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
+# supported shape where `paths.project` and `paths.repo_root` name different
+# directories (`bmadconfig.worktree_isolation_conflict` refuses the other, and
+# `ProjectPaths.rebased` sets both roots, so worktree isolation never diverges).
+# The `project` fixture above sets no override, so `repo_root == project` there and
+# nothing built on it can tell the two apart. These helpers centralize the shared
+# marker probes, config writer, and nested builder so new coverage does not have to
+# re-derive those load-bearing pieces.
+
+# Two markers, one per root. A row that plants both and probes each pins the cwd
+# from BOTH directions — the marker only `repo_root` holds must pass AND the one
+# only `project` holds must fail. The positive probe identifies `repo_root`; the
+# negative probe rules out the tempting `project` regression explicitly.
+MARKER_IN_REPO_ROOT = "only-in-repo-root.txt"
+MARKER_IN_PROJECT = "only-in-project.txt"
+
+# RELATIVE probes on purpose: an absolute path answers the same from any cwd, so
+# only a relative one is cwd-sensitive — and `_file_exists_cmd` keeps it honest on
+# both host shells rather than a POSIX-only `test` cmd rejects.
+REPO_ROOT_MARKER_CMD = _file_exists_cmd(MARKER_IN_REPO_ROOT)
+PROJECT_MARKER_CMD = _file_exists_cmd(MARKER_IN_PROJECT)
+
+
+def plant_root_markers(*, repo_root: Path, project: Path) -> None:
+    """Plant one marker in each root, for a two-direction cwd probe.
+
+    Deliberately plain untracked files: an engine row's baseline snapshot
+    (`Engine._dev_phase` stamps `baseline_untracked` from `workspace.root`)
+    absorbs anything planted before the run, so these cannot themselves satisfy
+    proof-of-work and the row still needs real session work to pass its gate.
+
+    KEYWORD-ONLY, and the two roots must differ. Both parameters are `Path`, so
+    positionally a swapped call type-checks, runs, and grades the OPPOSITE
+    direction to the one its row claims; and handed the collapsed `project`
+    fixture (`repo_root == project`, the default) both markers land in one tree,
+    where every probe passes from either cwd and the two-direction claim grades
+    nothing at all. Neither mistake can raise on its own, so the precondition is
+    asserted here rather than left to each caller to remember. Existing opposite-
+    root markers are refused too: otherwise a stale file could make a wrong cwd
+    satisfy both probes.
+    """
+    assert repo_root.resolve() != project.resolve(), (
+        "plant_root_markers needs two DIFFERENT roots: with the collapsed `project` "
+        "fixture both markers land in one tree and the two-direction probe grades "
+        "nothing. Build the divergent fixture first (nested_repo_root_paths, or a "
+        "write_repo_root_override code root)."
+    )
+    assert not (project / MARKER_IN_REPO_ROOT).exists(), (
+        f"stale {MARKER_IN_REPO_ROOT} in project would make the repo-root probe "
+        "pass from the wrong cwd"
+    )
+    assert not (repo_root / MARKER_IN_PROJECT).exists(), (
+        f"stale {MARKER_IN_PROJECT} in repo_root would make the project-root probe "
+        "pass from the wrong cwd"
+    )
+    (repo_root / MARKER_IN_REPO_ROOT).write_text("x\n", encoding="utf-8")
+    (project / MARKER_IN_PROJECT).write_text("x\n", encoding="utf-8")
+
+
+# The config file every divergent-roots row overrides, and the artifact-path body
+# `install_bmad_config` and `write_repo_root_override` both write. One text, so a
+# change to the artifact keys cannot reach the plain config and skip the override
+# one (or the reverse) — the two would then differ in a way no row asserts.
+BMAD_CONFIG_REL = Path("_bmad") / "bmm" / "config.yaml"
+_ARTIFACT_PATH_KEYS = (
+    "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+    "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
+)
+
+
+def write_repo_root_override(paths: ProjectPaths, code_root: Path) -> None:
+    """Rewrite `_bmad/bmm/config.yaml` with a `repo_root:` pointing at `code_root`.
+
+    The one supported divergent-roots config: `isolation = "none"` plus a
+    `repo_root:` key (`bmadconfig.worktree_isolation_conflict` refuses the other
+    combination, and `ProjectPaths.rebased` sets both roots, so worktree isolation
+    never diverges). Overwrites rather than appends, so it is exact whether or not
+    `install_bmad_config` ran first.
+
+    `code_root` need not be a git checkout, and several rows deliberately pass a
+    plain directory or a missing one.
+    """
+    assert code_root.is_absolute(), (
+        "write_repo_root_override requires an absolute code_root: bmadconfig "
+        "resolves relative configured paths against the process cwd, not the project"
+    )
+    config = paths.project / BMAD_CONFIG_REL
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        _ARTIFACT_PATH_KEYS
+        + f"repo_root: {json.dumps(code_root.as_posix(), ensure_ascii=False)}\n",
+        encoding="utf-8",
+    )
+
+
+NESTED_SUBDIR = "app"
+
+
+def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
+    """The MONOREPO shape of the override: `repo_root` an ANCESTOR of `project`.
+
+    The BMAD project lives at ``<repo>/app`` inside a checkout whose root is the
+    git root — `repo_root` stays `paths.project` (the sandbox repo) while
+    `project` and all three artifact dirs move under ``app/``.
+
+    Why a second shape at all. `tests/test_verify.py::_repo_root_override` builds
+    the SIBLING shape, where the artifact tree is disjoint from the code tree — so
+    a code-root spelling collapses to ``()`` while a project-root spelling is a
+    non-empty tail that matches nothing in the code tree. Both spellings therefore
+    agree on the gate outcome and a wrong-but-plausible pathspec passes unnoticed.
+    Nested, the wrong pathspec is not empty: resolved
+    against the code root, ``_bmad-output/implementation-artifacts/spec-1-1-a.md``
+    names the OUTER project's real artifact dir. That is the "not merely wrong, it
+    is SILENTLY wrong" failure the production docstrings describe, and it is
+    separable by VALUE.
+
+    Seeds and COMMITS ``app/src.txt`` so `dev_effect` works unchanged — it
+    reads `paths.project / "src.txt"` and `rev_parse_head(paths.project)`, and git
+    resolves `.git` upward from the subdir. Committed rather than left untracked
+    for the reason `plant_root_markers` gives: a session's edit to a TRACKED file
+    is proof of work the attempt's baseline snapshot cannot absorb.
+
+    Also writes ``app/.gitignore`` with the `bmad-loop init` run-state entry.
+    Init writes that file next to the project it initializes, and the sandbox
+    template's own root-anchored ``.bmad-loop/runs/`` does not match a nested one —
+    so without it a nested engine run's journal would show up as untracked work.
+
+    The subdirectory is FIXED at `NESTED_SUBDIR` rather than a parameter because
+    every consumer's assertions spell the ``app/`` prefix literally. A parameter
+    would make a non-default argument redden those rows on a prefix mismatch instead
+    of on the contract they grade.
+
+    Refuses input it cannot honor. It commits unconditionally, so a second call on
+    the same `paths` (or one whose subdir a caller pre-created) dies inside `git`
+    with a raw ``CalledProcessError`` from ``git commit`` — "nothing to commit" —
+    naming neither the helper nor the precondition. Both guards below fail with
+    the precondition instead.
+    """
+    assert paths.project == paths.repo_root, (
+        "nested_repo_root_paths builds the divergence; it cannot be applied to paths "
+        "that already have one. Pass the plain `project` fixture."
+    )
+    staged = git(paths.project, "diff", "--cached", "--name-only")
+    assert not staged, (
+        "nested_repo_root_paths commits its seed files and requires an empty index; "
+        f"already staged: {staged}"
+    )
+    project = paths.project / NESTED_SUBDIR
+    assert not project.exists(), (
+        f"{NESTED_SUBDIR}/ already exists under {paths.project}: this helper seeds and "
+        "COMMITS it, so a second call (or a caller that pre-created it) would reach "
+        "`git commit` with nothing staged."
+    )
+    output_folder = project / "_bmad-output"
+    impl = output_folder / "implementation-artifacts"
+    plan = output_folder / "planning-artifacts"
+    impl.mkdir(parents=True, exist_ok=True)
+    plan.mkdir(parents=True, exist_ok=True)
+    (project / "src.txt").write_text("original\n", encoding="utf-8")
+    (project / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
+    git(paths.project, "add", f"{NESTED_SUBDIR}/src.txt", f"{NESTED_SUBDIR}/.gitignore")
+    git(paths.project, "commit", "-q", "-m", f"seed the {NESTED_SUBDIR}/ project")
+    return dataclasses.replace(
+        paths,
+        project=project,
+        implementation_artifacts=impl,
+        planning_artifacts=plan,
+        output_folder=output_folder,
+        repo_root=paths.project,
+    )
+
+
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
 
@@ -564,12 +739,9 @@ def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
 
 def install_bmad_config(paths: ProjectPaths) -> None:
     """Write the _bmad/bmm/config.yaml that bmadconfig.load_paths resolves."""
-    cfg = paths.project / "_bmad" / "bmm"
-    cfg.mkdir(parents=True)
-    (cfg / "config.yaml").write_text(
-        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
-        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
-    )
+    cfg = paths.project / BMAD_CONFIG_REL
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(_ARTIFACT_PATH_KEYS)
 
 
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:

@@ -14,12 +14,15 @@ from conftest import (
     _OK,
     MISSING_TOOL_CMD,
     OMIT,
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
-    _file_exists_cmd,
     _Omit,
     fault_read_text,
     git,
     make_git_noisy,
+    nested_repo_root_paths,
+    plant_root_markers,
     refuse_to_resolve,
     spec_path,
     write_spec,
@@ -3302,8 +3305,8 @@ def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     `cli._reverify` both already used `repo_root`.
 
     Pinned from BOTH directions on purpose: a marker only the repo root holds
-    must pass AND a marker only the project holds must fail. Either assertion
-    alone is satisfied by a cwd that is neither of them.
+    must pass AND a marker only the project holds must fail. The positive probe
+    identifies `repo_root`; the negative probe rules out `project` explicitly.
 
     It does NOT pin the other half of the split. The artifact reads resolve
     through `paths.sprint_status` / `paths.deferred_work` (derived from
@@ -3317,6 +3320,13 @@ def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     plain dir is the honest fixture. Turning it into a real repo would let a
     regression that started shelling out to git there pass unnoticed.
 
+    The two markers and their RELATIVE probes come from `conftest`
+    (`plant_root_markers`, `REPO_ROOT_MARKER_CMD`, `PROJECT_MARKER_CMD`) rather
+    than being built here: the four other unpinned `[verify] commands` callers
+    (both `Engine._verify_commands_with_results` stages, both `cli._reverify`
+    call sites) are graded by the same two-direction probe, and a re-derived
+    fixture would let one of those rows quietly ask a different question.
+
     INVERSE ablation: restore the pre-#695 root — `verify_commands_outcome(policy,
     paths.project)` in `_verify_review_commands` — and all three modes fail on the
     FIRST assertion, the repo-root marker going missing, before the refusal leg is
@@ -3324,19 +3334,13 @@ def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     cannot reproduce the bug; only putting the old root back does."""
     repo_root = tmp_path / "code-root"
     repo_root.mkdir()
-    (repo_root / "only-in-repo-root.txt").write_text("x\n", encoding="utf-8")
-    (project.project / "only-in-project.txt").write_text("x\n", encoding="utf-8")
+    plant_root_markers(repo_root=repo_root, project=project.project)
     paths = dataclasses.replace(project, repo_root=repo_root)
     task, gate = _review_gate_at_done(project, mode)
 
-    # relative paths, so the probe is cwd-sensitive on both OSes
-    in_repo_root = Policy(
-        verify=VerifyPolicy(commands=(_file_exists_cmd("only-in-repo-root.txt"),))
-    )
-    assert gate(task, paths, in_repo_root).ok
+    assert gate(task, paths, Policy(verify=VerifyPolicy(commands=(REPO_ROOT_MARKER_CMD,)))).ok
 
-    in_project = Policy(verify=VerifyPolicy(commands=(_file_exists_cmd("only-in-project.txt"),)))
-    out = gate(task, paths, in_project)
+    out = gate(task, paths, Policy(verify=VerifyPolicy(commands=(PROJECT_MARKER_CMD,))))
     assert not out.ok and "verify command failed" in out.reason
 
 
@@ -6002,12 +6006,22 @@ def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path
     the gate's git root, and it is pinned at the SEAM rather than by outcome — on
     purpose.
 
-    Under the supported override the story record and manifest sit outside the code
-    tree whichever root is used, so both spellings end in "nothing was excluded" and
-    no outcome assertion can separate them. What the wrong root actually costs is
-    invisible in a passing gate: a `project`-relative pathspec is resolved by git
-    against the CODE tree, silently excluding whatever happens to live at that
-    relative path there. So the contract is the root itself.
+    Under the SIBLING fixture this row uses (`_repo_root_override`: an artifact
+    tree disjoint from the code tree) the story record and manifest sit outside the
+    code tree whichever root is used, so both spellings end in "nothing was
+    excluded" and no outcome assertion over THIS fixture can separate them. What
+    the wrong root actually costs is invisible in a passing gate: a
+    `project`-relative pathspec is resolved by git against the CODE tree, silently
+    excluding whatever happens to live at that relative path there. So the
+    contract here is the root itself.
+
+    The claim is scoped to the fixture, not to the function. Under the NESTED
+    (monorepo) shape the artifacts are inside the code tree and the two spellings
+    differ by value and by outcome — see
+    `test_stories_relpaths_separates_the_two_roots_in_a_monorepo` for the value
+    and, for THIS gate's outcome,
+    `test_verify_dev_stories_refuses_a_bare_spec_flip_under_the_monorepo_shape`
+    (whose sprint-mode twin drops the `_stories` infix).
 
     Ablation: pass `paths.project` at the call site and the recorded root reddens.
     """
@@ -6050,6 +6064,226 @@ def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
     )
     # outside the code tree: nothing to exclude there, and no exception
     assert verify._stories_relpaths(paths.repo_root, spec_folder) == ()
+
+
+# ------------------------------------- the MONOREPO shape of the same override
+#
+# `_repo_root_override` above builds the SIBLING shape: `artifacts-root` beside
+# `sandbox`, so every artifact sits outside the code tree. The code-root spelling
+# collapses to `()` while the project-root spelling is a non-empty tail that still
+# matches nothing in the code tree. Values can differ, but both spellings have the
+# same gate outcome, so the seam rows assert on the recorded root instead.
+#
+# `conftest.nested_repo_root_paths` is the shape that CAN separate them: the BMAD
+# project at `<repo>/app`, `repo_root` its ancestor. There the wrong pathspec is
+# not empty, it is *plausible* — `_bmad-output/implementation-artifacts/...`
+# resolved against the code root names the OUTER project's real artifact dir.
+# That is the "not merely wrong, it is SILENTLY wrong" failure the production
+# docstrings describe, and the sibling fixture could never exhibit it. An
+# ADDITIONAL variant, not a replacement: the sibling rows grade the disjoint
+# layout, which is a supported configuration in its own right.
+
+
+def test_verify_dev_exclude_relpaths_separates_the_two_roots_in_a_monorepo(project):
+    """Both spellings are non-empty and unequal, and the code-tree one is prefixed.
+
+    The silently-wrong value assertion the sibling shape cannot make. There the
+    wrong non-empty tail matches nothing in the code tree; here it names a real
+    outer artifact. The two spellings differ by exactly the `app/` prefix, so the
+    equality pins WHICH root the relpaths were measured against rather than merely
+    that something was measured.
+
+    The last assertion is the point of the whole shape: the `project`-rooted
+    spelling, handed to git in the CODE tree, resolves onto a real file that is
+    NOT the one it meant to exclude. A silently-wrong exclusion, not an absent
+    one.
+
+    Ablation: pin `base = paths.project` inside `verify_dev_exclude_relpaths` and
+    the prefix assertions redden — both spellings come back identical.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise every assertion below rests on: genuinely divergent, and
+    # genuinely NESTED (the sibling shape satisfies the first and not the second)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    # the OUTER project's board — the file a `project`-rooted pathspec silently
+    # names when git resolves it in the code tree
+    write_sprint(project, {"1-1-a": "review"})
+
+    from_code_root = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.repo_root)
+    from_project = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.project)
+
+    assert from_code_root and from_project and from_code_root != from_project
+    assert from_code_root == tuple(f"app/{rel}" for rel in from_project)
+    assert from_code_root == (
+        "app/_bmad-output/implementation-artifacts/sprint-status.yaml",
+        "app/_bmad-output/implementation-artifacts/spec-1-1-a.md",
+    )
+    # silently wrong, not empty: the wrong spelling names the outer board
+    assert (paths.repo_root / from_project[0]).is_file()
+    assert (paths.repo_root / from_project[0]) != paths.sprint_status
+
+
+def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
+    """Same rule, same shape, for the stories-mode exclude.
+
+    Its sibling row above asserts `() `for the code-tree spelling because under the
+    disjoint layout there is genuinely nothing to exclude. Nested, both spellings
+    produce two pathspecs and only the prefix tells them apart.
+
+    Ablation: drop the `relative_to(root)` rebase in `_stories_relpaths` (return
+    the project-relative tail whatever the root) and the prefix assertion reddens.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    spec_folder = paths.implementation_artifacts / "spec-x"
+    spec_folder.mkdir(parents=True)
+
+    from_code_root = verify._stories_relpaths(paths.repo_root, spec_folder)
+    from_project = verify._stories_relpaths(paths.project, spec_folder)
+
+    assert from_code_root and from_project and from_code_root != from_project
+    assert from_code_root == tuple(f"app/{rel}" for rel in from_project)
+    assert from_code_root == (
+        "app/_bmad-output/implementation-artifacts/spec-x/stories",
+        "app/_bmad-output/implementation-artifacts/spec-x/stories.yaml",
+    )
+
+
+def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):
+    """The OUTCOME assertion the sibling shape cannot make (DW-9).
+
+    An attempt whose only residue is its own spec's status flip and the board has
+    produced nothing, and the proof-of-work gate must say so. That refusal is only
+    reachable when the exclusions actually MATCH: git has to recognise
+    `app/_bmad-output/.../sprint-status.yaml` and the spec as excluded before its
+    tracked-diff probe can come back empty.
+
+    Under the sibling shape this is unaskable — the artifacts sit outside the code
+    tree, so a `project`-rooted exclude names nothing there, but so does a correct
+    one, and `_changes_since` answers False either way. The two seam rows above
+    say exactly that about their own fixture; this row is the counterexample their
+    prose now points at.
+
+    Ablation: force `root=paths.project` at the `verify_dev_exclude_relpaths` call
+    site inside `_verify_shared_gates.proof_of_work_probe` and this reddens with
+    `ok=True` — the exclusions stop matching the two tracked bookkeeping changes,
+    which then count as the work the attempt never did.
+
+    Deliberately asserts the SPECIFIC reason: `not out.ok` alone passes for every
+    other gate this function runs (workflow tag, status, baseline match, sprint
+    pair), none of which is what this row is about.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the refusal rests on: genuinely divergent, and genuinely NESTED.
+    # `!=` alone is satisfied by the sibling shape, under which the exclusions
+    # match nothing and this row would grade a different question entirely.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    # Seed the bookkeeping as tracked content first. The attempt below then
+    # exercises git's exclude pathspec branch, not only the separate untracked
+    # filtering branch in `_changes_since`.
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    git(
+        paths.repo_root,
+        "add",
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked BMAD bookkeeping")
+
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "review"})
+    write_spec(sp, "in-review", task.baseline_commit)
+    # ...and no source edit at all: the spec flip and the board ARE the residue
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # the same attempt with one real source edit passes, so the refusal above is
+    # about the missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev(task, paths, dev_result(sp)).ok
+
+
+def test_verify_dev_stories_refuses_bookkeeping_only_changes_under_the_monorepo_shape(project):
+    """The stories-mode twin of the outcome row above (DW-9).
+
+    `_stories_relpaths` had a VALUE row and a SEAM row but no outcome row, so its
+    production caller — the stories-mode proof-of-work gate — was still graded
+    solely by `test_verify_dev_stories_roots_its_exclude_on_the_code_tree`, whose
+    own amended docstring now says that fixture cannot separate the two roots. A
+    value row proves the helper computes the right string; only this proves the
+    gate ACTS on it.
+
+    Same construction as `test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`,
+    driving `verify_dev_stories` instead: the attempt's residue is only bookkeeping
+    git must recognise as excluded before the tracked-diff probe can come back empty.
+    Nested, the exclude is `app/_bmad-output/planning-artifacts/epic-a/...`; rooted
+    on `project` it loses the `app/` prefix, matches nothing in the code tree, and
+    the bookkeeping then counts as the work the attempt never did.
+
+    The residue is deliberately NOT the driven story's own spec. That file is
+    already excluded by `verify_dev_exclude_relpaths` (the gate's own
+    `spec_path` exclusion), so a row whose only residue was the spec refuses
+    identically whichever root `_stories_relpaths` was given — it grades a
+    different exclude and passes the relevant ablation. The residue is therefore
+    the two paths ONLY `_stories_relpaths` covers, one per element of its returned
+    tuple: the `stories.yaml` manifest, and a sibling record under `stories/`.
+
+    Ablation: pass `paths.project` to `_stories_relpaths` at its call site in
+    `verify_dev_stories` and this reddens with `ok=True`.
+
+    Asserts the SPECIFIC reason for the reason the dev twin gives: `not out.ok`
+    alone is reachable from every other gate this function runs (spec resolution,
+    id prefix, workflow tag, status, baseline match).
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    spec_folder = paths.planning_artifacts / "epic-a"
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    sp = write_story(spec_folder, "1", "x", "ready-for-dev", initial_baseline)
+    manifest = spec_folder / "stories.yaml"
+    manifest.write_text("stories: [1]\n", encoding="utf-8")
+    sibling = write_story(spec_folder, "2", "y", "draft", initial_baseline)
+    git(
+        paths.repo_root,
+        "add",
+        spec_folder.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked stories bookkeeping")
+
+    task = StoryTask(story_key="1", epic=1)
+    # stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    # The manifest and sibling record are tracked modifications, so git itself
+    # must honor both pathspecs returned by `_stories_relpaths`.
+    manifest.write_text("stories: [1, 2]\n", encoding="utf-8")
+    write_spec(sibling, "done", task.baseline_commit)
+
+    out = verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # the same attempt with one real source edit passes, so the refusal above is
+    # about the missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    ).ok
 
 
 def test_artifact_relpaths_returns_in_repo_folders(project):
@@ -7268,17 +7502,25 @@ def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkey
     """The gate's OWN exclude composition, pinned at the seam.
 
     `_stories_relpaths` has carried a seam pin since this wave landed; the sprint
-    gate's call did not, and no outcome row can supply one. Under the supported
-    override the artifact tree is disjoint from the code tree, so a `project`-rooted
-    exclude yields pathspecs git matches nothing against — and `has_changes_since`
-    fails OPEN (`rc != 0 -> return True`), so the passing row stays green and the
-    refusal row reddens for its own unrelated reason. Reverting `root=paths.repo_root`
-    to `root=paths.project` left the entire suite green before this row existed, which
-    is how the anchor this wave exists to establish could be silently undone.
+    gate's call did not, and no outcome row OVER THE SIBLING FIXTURE can supply one.
+    Under `_repo_root_override` the artifact tree is disjoint from the code tree, so
+    a `project`-rooted exclude yields pathspecs git matches nothing against — and
+    `has_changes_since` fails OPEN (`rc != 0 -> return True`), so the passing row
+    stays green and the refusal row reddens for its own unrelated reason. Reverting
+    `root=paths.repo_root` to `root=paths.project` left the entire suite green before
+    this row existed, which is how the anchor this wave exists to establish could be
+    silently undone.
 
-    The contract is therefore the ROOT itself, exactly as the stories-mode row states
-    it: a pathspec relative to the wrong root is not merely wrong, it is SILENTLY
-    wrong.
+    The contract here is therefore the ROOT itself, exactly as the stories-mode row
+    states it: a pathspec relative to the wrong root is not merely wrong, it is
+    SILENTLY wrong.
+
+    "No outcome row can supply one" was true of this fixture and is no longer true
+    of the function: `test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`
+    is that outcome row, built on the NESTED shape where the artifacts live inside
+    the code tree and the wrong pathspec is plausible rather than empty. Both rows
+    are kept — the seam pin grades the disjoint layout, which is a supported
+    configuration the outcome row does not cover.
 
     Ablation: pass `root=paths.project` at the call site and the recorded root reddens.
     """

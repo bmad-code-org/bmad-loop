@@ -16,6 +16,10 @@ import pytest
 from conftest import (
     _FAIL,
     _OK,
+    MARKER_IN_PROJECT,
+    MARKER_IN_REPO_ROOT,
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
     _disarm_check_script,
     _file_exists_cmd,
     _self_disarming_cmd,
@@ -26,6 +30,8 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    nested_repo_root_paths,
+    plant_root_markers,
     refuse_to_resolve,
     review_effect,
     set_sprint,
@@ -2527,6 +2533,220 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
 
     monkeypatch.setattr(Path, "resolve", resolve_fault)
     assert engine._harvest_gate_exclude(task) == ()
+
+
+# ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
+#
+# `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
+# — which `Workspace.default` sets to `paths.repo_root`, the CODE tree. Both of its
+# stages (`dev` and `fix`) were unpinned: every other engine row mocks
+# `verify.run_verify_commands` with a `lambda policy, cwd:` that DISCARDS the cwd,
+# so moving the root back to `paths.project` left the whole suite green. These two
+# rows therefore run the real commands, and use `conftest.nested_repo_root_paths`
+# so the two roots are genuinely different directories.
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_dev_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, marker_root):
+    """The `dev` stage, pinned from BOTH directions by a full engine run.
+
+    A marker only `repo_root` holds must let the story through AND a marker only
+    `project` holds must fail it. The positive leg identifies `repo_root`; the
+    negative leg rules out the tempting `project` regression explicitly.
+
+    Deliberately does NOT mock `verify.run_verify_commands`: that mock is what
+    made this caller blind in the first place, and a spy over it would pin only
+    the argument rather than the behavior an operator sees.
+
+    The markers are planted BEFORE the run, so `Engine._dev_phase`'s
+    `baseline_untracked` snapshot absorbs them and neither can be mistaken for
+    proof of work; the passing leg still owes a real diff, which `dev_effect`'s
+    edit to the tracked `app/src.txt` supplies.
+
+    `max_dev_attempts=1` keeps the failing leg to one scripted session: a fixable
+    verify failure otherwise routes a repair session the fixed-length script
+    cannot serve.
+
+    Ablation: hand `paths.project` to `run_verify_commands` /
+    `verify_command_results_outcome` in `_verify_commands_with_results` and BOTH
+    legs redden — the repo-root leg on `done`, the project leg on the deferral it
+    no longer gets. The gate here is a cwd choice rather than a check, so only
+    putting the other root back reproduces the bug; deleting code cannot.
+    """
+    paths = nested_repo_root_paths(project)
+    plant_root_markers(repo_root=paths.repo_root, project=paths.project)
+    write_sprint(paths, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=1),
+            scm=ScmPolicy(rollback_on_failure=True),
+            verify=VerifyPolicy(
+                commands=(
+                    # a dict, not `X if marker_root == "repo_root" else Y`: under
+                    # the conditional any value but that exact literal silently
+                    # selected the project probe, so a typo in the `parametrize`
+                    # list graded BOTH legs in the project direction and both
+                    # still passed — a false green inside a row built to prevent
+                    # false greens. An unknown key raises `KeyError`.
+                    {
+                        "repo_root": REPO_ROOT_MARKER_CMD,
+                        "project": PROJECT_MARKER_CMD,
+                    }[marker_root],
+                )
+            ),
+        ),
+    )
+    # the premise the whole row rests on: two genuinely different directories,
+    # and genuinely NESTED. `!=` alone is satisfied by a builder regression that
+    # flattened the nest (say, back onto the sibling shape), under which the
+    # `project` leg would fail for the unrelated reason that its cwd is not a
+    # checkout at all.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    classify_cwds: list[Path] = []
+    real_classify = verify.verify_command_results_outcome
+
+    def classify_in(results, cwd):
+        classify_cwds.append(cwd)
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
+
+    summary = engine.run()
+
+    # The first classification is this dev pass; a passing run reaches later review
+    # gates too, and every one must classify against the same root it executed in.
+    assert classify_cwds and classify_cwds[0] == paths.repo_root
+    assert all(cwd == paths.repo_root for cwd in classify_cwds)
+    dev_records = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
+    ]
+    if marker_root == "repo_root":
+        assert summary.done == 1 and summary.deferred == 0
+        assert [r["returncode"] for r in dev_records] == [0]
+    else:
+        assert summary.deferred == 1 and summary.done == 0
+        assert [r["returncode"] for r in dev_records] == [1]
+        # the SPECIFIC failure, not a bare "it did not finish": a deferral is
+        # reachable from every other gate this run gets near
+        reason = engine.state.tasks["1-1-a"].defer_reason
+        assert "verify command failed" in reason and MARKER_IN_PROJECT in reason
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_fix_stage_verify_commands_run_in_the_code_tree(project, monkeypatch, marker_root):
+    """The `fix` stage, driven directly — the second unpinned caller.
+
+    The intent pins this phase-specific caller directly from the REVIEW_VERIFY
+    phase it is entered at. That keeps the cwd choice isolated from the separate
+    production transition into repair, whose sequencing can also depend on
+    stateful operator-authored commands.
+
+    One marker NAME, two plant locations: the repair session writes
+    `only-in-repo-root.txt` into `repo_root` on one leg and into `project` on the
+    other, and the command probes it RELATIVELY. The only variable is which
+    directory holds the file, so rc separates the legs if and only if the commands
+    run in `workspace.root`. Planted BY the session rather than before it, because
+    a repair that repaired nothing is not the thing under test.
+
+    `max_dev_attempts=2` with the production-reachable `attempt=1` makes the
+    `while task.attempt < max_dev_attempts` loop run exactly once, so one scripted
+    session covers the whole phase and the failing leg falls out into its DEFER.
+
+    The refusal leg is graded specifically rather than by the bare action. What
+    `_fix_phase` can be asked for is bounded: the `fix-decision` record pins
+    `session_status="completed"`, `ok=False`, `env_fault=False`, and the marker
+    assertion below pins that the repair actually WROTE something. Together those
+    distinguish the verify refusal from the other path to the same DEFER action,
+    without freezing today's empty `Decision.reason` as a contract.
+
+    Ablation: hand `paths.project` to `run_verify_commands` in
+    `_verify_commands_with_results` and both legs redden (PROCEED becomes DEFER
+    and back).
+    """
+    from bmad_loop.escalation import Action
+
+    paths = nested_repo_root_paths(project)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "done", rev_parse_head(paths.repo_root))
+    # a dict for the reason the dev-stage row above gives: under an `if/else` on
+    # the literal, a typo'd parametrize value silently graded the project
+    # direction on both legs
+    target = {"repo_root": paths.repo_root, "project": paths.project}[marker_root]
+
+    def repair(_spec):
+        (target / MARKER_IN_REPO_ROOT).write_text("x\n", encoding="utf-8")
+        return SessionResult(status="completed")
+
+    engine, adapter = make_engine(
+        paths,
+        [repair],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            limits=LimitsPolicy(max_dev_attempts=2),
+            verify=VerifyPolicy(commands=(REPO_ROOT_MARKER_CMD,)),
+        ),
+    )
+    # the premise both legs rest on: genuinely different, and genuinely NESTED —
+    # `!=` alone is satisfied by a flattened builder under which the `project` leg
+    # would fail because its cwd is not a checkout, not because of the cwd choice
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        attempt=1,
+        spec_file=str(sp),
+    )
+    engine.state.tasks[task.story_key] = task
+
+    classify_cwds: list[Path] = []
+    real_classify = verify.verify_command_results_outcome
+
+    def classify_in(results, cwd):
+        classify_cwds.append(cwd)
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "verify_command_results_outcome", classify_in)
+
+    decision = engine._fix_phase(task, "verify commands failed after a clean review")
+
+    assert len(adapter.sessions) == 1  # exactly one repair, so rc is that repair's
+    assert classify_cwds == [paths.repo_root]
+    # the repair actually repaired: without this the refusal leg passes unchanged
+    # when `repair` writes nothing at all, which is a reason for rc 1 that has
+    # nothing to do with which root the command ran in
+    assert (target / MARKER_IN_REPO_ROOT).is_file()
+    fix_records = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "fix"
+    ]
+    fix_decisions = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
+    if marker_root == "repo_root":
+        assert decision.action == Action.PROCEED
+        assert [r["returncode"] for r in fix_records] == [0]
+        assert [d["ok"] for d in fix_decisions] == [True]
+    else:
+        # SPECIFIC, not a bare "it deferred": the records say the repair ran to
+        # completion and the commands returned 1 rather than failing to spawn —
+        # which would be an env fault and escalate instead.
+        assert decision.action == Action.DEFER
+        assert [r["returncode"] for r in fix_records] == [1]
+        assert [r["spawn_error"] for r in fix_records] == [None]
+        assert [(d["ok"], d["env_fault"], d["session_status"]) for d in fix_decisions] == [
+            (False, False, "completed")
+        ]
 
 
 def test_dev_retry_notifies_the_operator_with_the_reason(project):

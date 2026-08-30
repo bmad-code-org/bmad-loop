@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
     escalated_run,
     fault_read_text,
@@ -25,10 +27,12 @@ from conftest import (
     install_dev_shim,
     machine_json,
     mark_ledger_done,
+    plant_root_markers,
     refuse_to_resolve,
     spec_path,
     write_gated_ledger,
     write_ledger,
+    write_repo_root_override,
     write_script_launcher,
     write_spec,
     write_sprint,
@@ -8028,12 +8032,7 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
 
     install_bmad_config(project)
     missing = tmp_path / "no-such-code-root"
-    (project.project / "_bmad" / "bmm" / "config.yaml").write_text(
-        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
-        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
-        f"repo_root: '{missing.as_posix()}'\n",
-        encoding="utf-8",
-    )
+    write_repo_root_override(project, missing)
     sp = _park_story(project)
     before = sp.read_text()
     _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
@@ -8047,6 +8046,116 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     assert sp.read_text() == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+def _diverge_repo_root(paths, code_root: Path) -> None:
+    """Compose the two shared conftest halves of the divergent fixture: the
+    `repo_root:` config override, and one cwd marker per root.
+
+    Both load-bearing halves are conftest's, not this module's.
+    `write_repo_root_override` writes the same three keys the two unusable-cwd
+    rows above need, and
+    `plant_root_markers` is the same planter the review-gate row in
+    `test_verify.py` uses — so the four `[verify] commands` callers graded by a
+    two-direction probe cannot end up asking subtly different questions.
+
+    Why this fixture exists at all: `cli._reverify` is handed `paths.repo_root` at
+    both of its call sites, and every pre-existing row here runs a cwd-INSENSITIVE
+    command (`python -c "pass"`) under the collapsed `project` fixture, so nothing
+    observed which root the commands ran in.
+
+    `code_root` is deliberately NOT a git repo, because that is what an operator's
+    `repo_root:` pointing at a non-checkout looks like and `_reverify` runs no git
+    there. Note the limit of that choice: `_land_confirmation` SWALLOWS the
+    `GitError` its `path_ignored`/`commit_paths` calls raise in such a root, so a
+    regression that started shelling out to git here would pass these rows
+    unnoticed. (`test_verify.py::test_verify_review_gates_run_commands_in_repo_root`
+    makes the stronger claim, about a gate that does not swallow it.)
+    """
+    write_repo_root_override(paths, code_root)
+    plant_root_markers(repo_root=code_root, project=paths.project)
+
+
+def _marker_policy(paths, marker_root: str) -> None:
+    """A `[verify] commands` policy holding the RELATIVE probe for one root.
+
+    A dict rather than `X if marker_root == "repo_root" else Y`: under the
+    conditional any value but that exact literal silently selected the project
+    probe, so a typo in the `parametrize` list would have graded BOTH legs in the
+    project direction and left both green — a false-green mechanism inside the
+    rows built to prevent false greens. An unknown key raises `KeyError` here.
+    """
+    command = {"repo_root": REPO_ROOT_MARKER_CMD, "project": PROJECT_MARKER_CMD}[marker_root]
+    _write_policy(paths.project, f"[verify]\ncommands = [{json.dumps(command)}]\n")
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_confirm_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """`cmd_confirm`'s `_reverify` call site, pinned from BOTH directions.
+
+    The marker only `repo_root` holds must let the confirmation through AND the
+    marker only `project` holds must refuse it. The positive leg identifies
+    `repo_root`; the negative leg rules out the tempting `paths.project` regression
+    explicitly. No pre-existing row could see either: they all run cwd-insensitive
+    commands under the `project` fixture, where the two roots are the same object.
+
+    The refusal leg asserts the SPECIFIC failure (`NOT confirmed`) and that all
+    three records are byte-identical to before — a refused `--reverify` has to
+    leave the spec, the board and the park entry exactly where it found them, and
+    `rc == 1` alone is reachable from several other refusals in this command.
+
+    All three are compared as BYTES, which is what "untouched" means and what the
+    claim above says. A parsed read-back (`sprintstatus.story_status`, key
+    membership in `operatoractions.load`) answers a weaker question: a refusal
+    that rewrote the board's other rows, reordered its keys, or rewrote the record
+    in place would satisfy it. The semantic assertions are kept beside the byte
+    ones because they say WHAT the unchanged bytes are.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in `cmd_confirm`
+    and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    sp = _park_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = sp.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "--reverify failed" in captured.err and "NOT confirmed" in captured.err
+        assert sp.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
 
 
 def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, monkeypatch):
@@ -8478,12 +8587,7 @@ def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
 
     install_bmad_config(project)
     missing = tmp_path / "no-such-resume-code-root"
-    (project.project / "_bmad" / "bmm" / "config.yaml").write_text(
-        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
-        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
-        f"repo_root: '{missing.as_posix()}'\n",
-        encoding="utf-8",
-    )
+    write_repo_root_override(project, missing)
     spec = _interrupted_story(project)
     before = spec.read_text(encoding="utf-8")
     _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
@@ -8497,6 +8601,71 @@ def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
     assert spec.read_text(encoding="utf-8") == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """The resumable confirmation's own `_reverify` call site — the second of the
+    two, and a separate line of code from `cmd_confirm`'s.
+
+    Same two-direction probe, and the refusal leg asserts the wording that
+    distinguishes this caller: "NOT advanced" and NOT "NOT confirmed". The
+    confirmation itself already happened here, so telling a human it was not
+    confirmed sends them looking for a sign-off to redo. Asserting the absence
+    matters as much as the presence — one shared message would satisfy a bare
+    "it refused".
+
+    The already-written sign-off must survive either way, which is what makes
+    this leg's "nothing was lost" claim testable at all — and it is compared as
+    BYTES, together with the board and the park record, for the reason the
+    `cmd_confirm` twin gives: a parsed read-back cannot see a record rewritten in
+    place.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in
+    `_resume_confirmation` and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    spec = _interrupted_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = spec.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "NOT advanced" in captured.err and "NOT confirmed" not in captured.err
+        assert spec.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
 
 
 def test_list_marks_an_interrupted_confirmation_as_signed_off_not_refused(project, capsys):
