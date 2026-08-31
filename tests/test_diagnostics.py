@@ -660,6 +660,71 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
+    """`old_baseline` is a 40-hex sha on BOTH of `_stale_restore_residue`'s records,
+    and routing is by field NAME, so one entry has to cover both kinds (DW-81).
+
+    It was declared benign in `tests/test_portability_guard.py`'s inventory, which is
+    the misfiling that inventory's own warning describes — "a name carrying a story
+    key, a branch, a sha, a spec filename, a path, or free text belongs in a
+    `diagnostics` table instead" — and the second producer is what forced it.
+
+    The two kinds are graded together rather than one standing in for the other,
+    because the value's whole use is a comparison an operator makes across them: the
+    probe-failure record says "I could not tell you what sits above this sha" and the
+    commits record says "these do". Aliasing one spelling and not the other would
+    destroy that correlation. That is also why the producer was not respelled to the
+    already-routed `baseline` — same sha, two spellings, two aliases in one dump.
+
+    Ablation: drop `"old_baseline"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at
+    the `next(...)` alias lookup with `StopIteration`. The canary sweep is not the
+    grade: depending on its entropy, the fallback may redact a sha as a secret rather
+    than preserving the correlatable alias this table promises.
+
+    `commits` remains deliberately outside this test and outside DW-81's routing
+    change. It is a list on `stale-restore-commits` but an integer count on
+    `rollback-manual-required`; routing it requires a separate, kind-scoped policy.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    probe_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "rearm-commits-probe-failed",
+            "story_key": STORY_KEY,
+            "old_baseline": SHA,
+            "error": f"GitError: git rev-list {SHA}..HEAD failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    commits = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "stale-restore-commits",
+            "story_key": STORY_KEY,
+            "old_baseline": SHA,
+            "commits": ["c" * 40],
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    # aliased, not dropped — the key stays and only the VALUE is replaced
+    assert probe_failed["old_baseline"] == commits["old_baseline"] == alias != SHA
+    # one legend entry for the shared baseline, not one per record spelling
+    assert {orig for ns, orig, _a in pseudo.entries() if ns == "commit"} == {SHA}
+    # the free-text sibling on the probe record quotes both the sha and a host path
+    # back, and is reached by the drop set rather than aliased
+    assert "error" not in probe_failed and probe_failed["error_present"] is True
+
+    rendered = json.dumps([probe_failed, commits])
+    for canary in (SHA, PROPRIETARY, HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_sentinel_upstream_record_drops_the_stories_root_it_names():
     """`rearm-upstream-write-unreachable` carries an absolute host path naming the
     folder a sentinel's upstream correction has to land in.

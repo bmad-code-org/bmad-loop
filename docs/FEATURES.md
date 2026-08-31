@@ -75,7 +75,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 - CRITICAL resolution: `bmad-loop resolve <run-id>` opens an interactive resolve agent seeded with the escalation + frozen spec; you disambiguate, it re-arms the story (`escalated → pending`, spec reset to `ready-for-dev`) and resumes. `--no-interactive` skips to re-arm if you fixed the spec yourself. The re-arm advances the story's
   baseline in the **code tree** and is honest when it cannot: a failed advance is narrowed to typed git
   errors, journalled, echoed to stderr, and explicitly NOT followed by a re-stamp it did not earn, so
-  spec and task never silently agree on a stale sha (#640). A re-stamp that does overwrite a differing
+  spec and task never silently agree on a stale sha (#640). The re-arm's other warn-only git probe — the one that lists the commits an abandoned attempt left below the re-drive's new baseline — is honest the same way (DW-81): its Git failures journal `rearm-commits-probe-failed` and echo to the same surfaces, because that probe's silence is otherwise indistinguishable from a clean answer, and the absent warning is the operator's only sign that those commits are now a permanent starting point nothing will revisit. A re-stamp that does overwrite a differing
   claim records what it replaced, and warns on either leg: the record fires only when the spec claimed
   a baseline the run never recorded, which is the only remaining trace of a divergence the gate can no
   longer report. `spec_file` is persisted relative to a worktree for an isolated task, so every out-of-process reader

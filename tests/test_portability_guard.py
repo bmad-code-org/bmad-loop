@@ -351,7 +351,19 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "next",
         "normalized",
         "ok",
-        "old_baseline",
+        # `old_baseline` is NOT here any more: it moved to `_JOURNAL_ALIAS_FIELDS`
+        # (the `commit` namespace) once a second producer —
+        # `rearm-commits-probe-failed` — forced the decision this set's own warning
+        # describes, and on the same footing as the `question` note above: it was a
+        # live leak, just an intermittent one. Unrouted, a real 40-hex sha usually
+        # collapses to `<redacted:secret>` at `_scrub_str`'s secret check — but only
+        # usually. Real shas straddle that bar, and about one in twenty-five sampled
+        # from this repo's own history ships VERBATIM. Routing also restores the
+        # correlation the alias table exists to preserve: even on the shas the
+        # fallback does catch, `<redacted:secret>` left the two records naming one
+        # baseline unable to be seen as naming the same one. Left as a note rather
+        # than a silent deletion, because a name leaving this set is the guard working
+        # — a benign declaration that turned out to be wrong.
         "open",
         "open_now",
         "original",

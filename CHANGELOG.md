@@ -9,6 +9,13 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
+  The warn-only probe that lists the commits an abandoned attempt left below the re-drive's
+  new baseline used to swallow its `GitError` and write nothing — byte-identical to finding
+  no commits at all. It now records the baseline and the typed error, and both operator
+  surfaces render it through `runs.rearm_event_notice`. Advisory: it does not hold the
+  resume.
+
 - **Review-gate verify commands are journalled** (#656, partial). The three review gates
   (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
   `verify-command-result` per command, `verification_stage: "review"`, sharing the story's
