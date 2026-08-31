@@ -4517,6 +4517,34 @@ async def test_story_checkpoint_card_surfaces_real_review_cycles(project, monkey
         assert "verification passed" not in line
 
 
+def test_tui_rearm_refuses_an_alive_run_before_any_mutation(project, monkeypatch):
+    """The liveness helper's result must control the re-arm, not merely be observed."""
+    from bmad_loop import runs
+
+    notes: list[str] = []
+    rearms: list[str] = []
+    run_id = "20260611-100000-aaaa"
+    run_dir = project.project / RUNS_DIR / run_id
+    app = BmadLoopApp(project.project)
+
+    def fail_if_rearm_continues(_path):
+        raise AssertionError("continued past liveness gate")
+
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "alive")
+    monkeypatch.setattr(app, "notify", lambda message, **_kwargs: notes.append(message))
+    monkeypatch.setattr(policy_mod, "load", fail_if_rearm_continues)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda _run_dir, story_key, **_kwargs: rearms.append(story_key),
+    )
+
+    app._do_rearm(run_id, run_dir, "1")
+
+    assert rearms == []
+    assert notes == [f"run {run_id} may still be live — stop it first"]
+
+
 async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypatch):
     from bmad_loop import resolve, runs
 

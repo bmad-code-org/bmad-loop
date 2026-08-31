@@ -3666,6 +3666,42 @@ def _rearm_commit_landed(run_dir: Path, story_key: str, task: StoryTask) -> bool
     only if some other writer had minted the same bump, and `phase` alone moves for
     reasons a re-arm does not own.
 
+    Those two conjuncts are a sufficient identity ONLY because `rearm_escalation` runs as
+    the SOLE writer of this run's `state.json`, and that model is the probe's premise
+    rather than an assumption left implicit. Exactly TWO call sites reach this
+    transaction — `cli.cmd_resolve` and `tui.TuiApp._do_rearm` — and each consults
+    liveness before any side effect: :func:`engine_liveness` in the CLI, its pid-file
+    sibling :func:`liveness` in the TUI (`probe_liveness` is the shared body). A third
+    control command, `cli.cmd_resume`, never re-arms but DOES write this run's
+    `state.json` (through `_resume_paused_run`), which is why the sole-writer claim has
+    to account for it as well as for the two callers.
+    `tests/test_portability_guard.py::test_rearm_escalation_called_only_behind_a_liveness_gate`
+    holds that enumeration, which is otherwise prose a third call site could falsify
+    silently.
+
+    Those gates establish that no engine is PROVABLY ALIVE — not that one is proven
+    dead — and the premise rests on the difference, so it is stated rather than rounded
+    off. `"alive"` is refused outright at all three. `"unknown"` is not: `cmd_resolve`
+    proceeds on it under `--force`, `cmd_resume` warns and proceeds by design (it is the
+    recovery path that rewrites engine.pid), and the TUI counts it as blocking only for a
+    pid-backed run. So the model this probe leans on is the engine stopped AND the
+    operator driving one control command at a time. Under it only THIS caller can have
+    moved either field, which is exactly what the exact-phase predicate reports — the
+    predicate is correct for the reason it is narrow.
+
+    Two overlapping control commands are OUTSIDE that model rather than handled by it,
+    and deliberately so. `journal.save_state` stages through a FIXED `state.json.tmp`
+    sibling before its `atomic_replace` — the collision `_write_stop_request` documents
+    under #379, which names the stop-request file as the ONE control file with genuinely
+    *concurrent* writers — so two overlapping re-arms lose a `save_state` to
+    `FileNotFoundError` long before this probe's identity could matter. Answering them
+    here was weighed and declined: a lock taken by only `rearm_escalation` excludes
+    nobody (the honest fix is a run-level one shared with `_resume_paused_run` and the
+    engine's own `save_state`), and a durable per-re-arm token stamped on `StoryTask`
+    would buy this probe a precision the `save_state` writer beneath it cannot honour, at
+    the cost of a new persisted model field. Tracked as DW-93; the probe stays two
+    conjuncts over the reloaded task.
+
     Degrades to `False` — roll back, the pre-existing behavior — on ANY failure to read
     or parse the state file. This is observation feeding a repair decision, and the safe
     default is the one that leaves the spec as the re-arm found it: a re-arm that did

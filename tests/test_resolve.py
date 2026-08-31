@@ -1987,6 +1987,83 @@ def test_rearm_reports_a_failed_rollback_through_the_plain_arm(tmp_path, monkeyp
     assert "MemoryError" in aborted["error"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_rearm_rollback_replaces_a_link_planted_at_the_spec_rather_than_writing_through_it(
+    tmp_path, monkeypatch
+):
+    """The out-of-root undo replaces the NAME, so a link planted at it cannot aim the
+    captured bytes into whatever it points at — on the shape this row drives, where that
+    file's bytes DIFFER from the preimage.
+
+    That scope is the short-circuit's, not a hedge. `_restore_rearmed_spec` answers
+    `"unchanged"` and writes NOTHING when `spec_path.read_bytes()` already equals the
+    preimage, and that read follows the link — so a link aimed at a byte-equal file is
+    never replaced and there is nothing left for `follow_symlinks` to decide. Reaching
+    that shape needs a second actor mutating the spec's name mid-window, which this
+    story's triage log has repeatedly found unreachable while the run is paused and the
+    resolve session that wrote the spec has terminated. It is therefore left ungraded
+    rather than pinned by a row built on an actor that does not exist.
+
+    `_restore_rearmed_spec`'s plain arm passes `follow_symlinks=False`, matching the
+    three writers it undoes (`frontmatter.set_frontmatter_status` states the rule).
+    That argument was the one thing on this path with no caller-level coverage: the
+    sibling rows above drive the arm over a plain regular file, where following or not
+    following resolves to the same inode, so dropping the argument left them green while
+    the undo silently gained the default's `path.resolve()` — and with it a window in
+    which the last thing that touches the spec's name decides which file this re-arm's
+    preimage lands in.
+
+    The window is the widened transaction's own: the flip and the strip publish to the
+    real file, then the guard's whole residue/advance/`save_state` tail runs before the
+    undo looks at the name again. This row plants the link at the last moment inside that
+    tail — from the injected `save_state`, so the redirection is in place before the
+    rollback and after every write it exists to put back.
+
+    The `restored` record is the third claim rather than a redundant one: the undo has to
+    read the link (seeing the OTHER file's bytes, which do not match the preimage), take
+    its writer, and land — the same three steps a silent write-through also takes, which
+    is why the byte assertions and not the record are what tell the two apart.
+
+    Ablation: drop `follow_symlinks=False` from `_restore_rearmed_spec`'s plain
+    `atomic_write_bytes` call and this reddens on the FIRST assertion — the preimage
+    lands in the unrelated file — with `not spec.is_symlink()` reddening behind it. The
+    final byte comparison stays green through that ablation (it reads THROUGH the link),
+    so it cannot carry this row on its own.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    bystander = tmp_path / "artifacts" / "someone-elses-notes.md"
+    bystander.write_bytes(b"not this re-arm's file\n")
+    bystander_before = bystander.read_bytes()
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        # the flip and the strip have already LANDED on the real file; the name is
+        # redirected here, inside the window, before the undo looks at it again
+        spec.unlink()
+        spec.symlink_to(bystander)
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert bystander.read_bytes() == bystander_before  # the preimage did NOT go through
+    assert not spec.is_symlink()  # the name was replaced, whatever it pointed at
+    assert spec.read_bytes() == before
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
+
+
 def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     """A claim the re-stamp normalizes away is the only trace of a divergence the
     gate can no longer report, so it lands in the journal on the way out — read
