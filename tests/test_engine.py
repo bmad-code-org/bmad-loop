@@ -16805,3 +16805,79 @@ def test_notice_reason_bound_is_an_upper_bound_not_an_equality():
     short = _notice_reason("short first line\nthe evidence lives here")
     assert short == "short first line […]"  # marked well under the cap
     assert len(short) < NOTICE_REASON_MAX
+
+
+def test_llm_authored_preference_keys_cannot_hijack_journal_reserved_names(project):
+    """`_review_and_commit` splats a review session's own `result.json` escalation
+    entries into `journal.append`, so an LLM chooses the journal FIELD NAMES. Some
+    collide with the bound call, while others can replace metadata `append` owns.
+
+    Reproduced before the fix: an entry carrying `kind` raised
+    `TypeError: Journal.append() got multiple values for argument 'kind'`, and
+    `story_key` the same, so a single invented key ABORTED THE WHOLE REVIEW LEG.
+    `self` collides with the bound-method receiver. `ts` did not raise and was worse
+    for it — `append` builds
+    `{"ts": now, "kind": kind, **fields}`, so a supplied `ts: 0` silently replaced
+    the real clock and every relative offset a diagnostic dump computes off it.
+    `log_task` and `log_pos` also did not raise: `append` stamps them with
+    `setdefault`, so caller values silently won, forged the pane-log pointer, and let
+    an identifier-shaped `log_pos` survive the diagnostic scrubber verbatim.
+
+    Driven through a real run rather than by calling the filter directly: the
+    defect was the CALL SITE forwarding unfiltered keys, and a unit test over
+    `_JOURNAL_RESERVED_KEYS` would pass with the site left unpatched.
+
+    Ablation: drop the `_JOURNAL_RESERVED_KEYS` comprehension in
+    `_review_and_commit` and this reddens with the TypeError above."""
+
+    def hostile_review_effect(spec):
+        sp = spec_path(project, "1-1-a")
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "done", baseline)
+        set_sprint(project, "1-1-a", "done")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [
+                    {
+                        "type": "preference",
+                        "severity": "PREFERENCE",
+                        "detail": "prose",
+                        # journal-owned names, all LLM-authored here
+                        "self": "hijacked-receiver",
+                        "kind": "hijacked-kind",
+                        "story_key": "9-9-not-this-story",
+                        "ts": 0,
+                        "log_task": "9-9-forged-story",
+                        "log_pos": "AcmeVault",
+                    }
+                ],
+            },
+        )
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a"), hostile_review_effect])
+
+    summary = engine.run()  # the TypeError made this raise
+
+    assert summary.done == 1
+    entries = [
+        json.loads(ln)
+        for ln in (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    (pref,) = [e for e in entries if e["kind"] == "preference-escalation"]
+    # the journal's own names survived, none of them the LLM's
+    assert pref["kind"] == "preference-escalation"
+    assert pref["story_key"] == "1-1-a"
+    assert pref["ts"] > 1_000_000_000, "an LLM-supplied ts replaced the real clock"
+    assert pref["log_task"] != "9-9-forged-story"
+    assert isinstance(pref["log_pos"], int)
+    assert "AcmeVault" not in json.dumps(pref), "an LLM-supplied log_pos reached the journal"
+    # ...and the declared schema still rode through untouched
+    assert pref["type"] == "preference" and pref["detail"] == "prose"
