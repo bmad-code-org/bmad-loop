@@ -23,6 +23,7 @@ from typing import Any
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
+from .journal import TASK_CYCLE_ARTIFACTS
 from .model import RunState
 from .platform_util import safe_segment
 from .runs import (
@@ -93,9 +94,12 @@ def _gather_escalations(
     default 0 reproduces the pre-DW-11 walk byte-for-byte, which is what a
     pre-upgrade ``state.json`` deserializes to.
 
-    Reads each session's tasks/<task_id>/result.json (and escalation.json) — the
-    same files the engine inspected when it decided to pause. Ordering is
-    `reversed(task.sessions)` and, within a directory, result.json before
+    Reads each session's tasks/<task_id>/ artifacts — the same files the engine
+    inspected when it decided to pause. WHICH files is not spelled here: it is
+    ``journal.TASK_CYCLE_ARTIFACTS``, the one list this reader shares with the two
+    adapters that clear the same directory in ``start_session``, so a name added
+    there reaches all three sites at once. Ordering is `reversed(task.sessions)`
+    and, within a directory, that constant's own order — result.json before
     escalation.json; a duplicate keeps its FIRST occurrence's position, which is
     what preserves "newest first". Three guards, each for a defect this reader
     hit on the way to the operator:
@@ -156,7 +160,7 @@ def _gather_escalations(
         seen_ids.add(session.task_id)
         target = found if last - offset >= start else answered
         task_dir = run_dir / "tasks" / session.task_id
-        for fname in ("result.json", "escalation.json"):
+        for fname in TASK_CYCLE_ARTIFACTS:
             fpath = task_dir / fname
             if not fpath.is_file():
                 continue

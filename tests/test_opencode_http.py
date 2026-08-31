@@ -44,6 +44,7 @@ from bmad_loop.adapters.opencode_http import (
 )
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.process_host import ProcessHostError, get_process_host
@@ -1290,28 +1291,35 @@ def test_missing_binary_is_a_clean_error(tmp_path):
         adapter.start_session(spec)
 
 
-def test_start_session_drops_a_reused_task_dirs_escalation(tmp_path):
+def test_start_session_drops_every_reused_task_cycle_artifact(tmp_path):
     """Parity with GenericAdapter: both adapters own a tasks/<id>/ dir, so both must
-    drop a prior cycle's `escalation.json` — the file the sweep skill writes and
-    `resolve._gather_escalations` reads beside result.json — before a re-armed run
-    reusing the id lands there. No fake server needed: the unlink runs BEFORE
-    _spawn_server's PATH check raises, so a missing binary still exercises it."""
+    drop a prior cycle's artifacts before a re-armed run reusing the id lands there.
+    No fake server needed: the unlinks run BEFORE _spawn_server's PATH check raises,
+    so a missing binary still exercises them.
+
+    That parity is now STRUCTURAL rather than asserted twice in prose: both adapters
+    loop over `journal.TASK_CYCLE_ARTIFACTS`, this test iterates the same constant,
+    and `test_portability_guard.test_task_cycle_artifacts_named_only_through_the_constant`
+    refuses the bare literal that would let one adapter drift from the other. A third
+    artifact added to the constant is covered here with no edit."""
     adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
     spec = SessionSpec(task_id="t-1", role="triage", prompt="p", cwd=tmp_path)
     task_dir = adapter.tasks_dir / "t-1"
     task_dir.mkdir(parents=True, exist_ok=True)
-    stale = task_dir / "escalation.json"
-    stale.write_text(
-        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
-        encoding="utf-8",
-    )
+    assert TASK_CYCLE_ARTIFACTS, "the constant is the list under test; an empty one is vacuous"
+    stale = [task_dir / name for name in TASK_CYCLE_ARTIFACTS]
+    for path in stale:
+        path.write_text(
+            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+            encoding="utf-8",
+        )
 
     with pytest.raises(OpencodeServerError, match="not found on PATH"):
         adapter.start_session(spec)
-    assert not stale.exists()
+    assert [p for p in stale if p.exists()] == []
 
-    # ...and the ordinary case — no prior escalation — reaches the same spawn error,
-    # i.e. the unlink is missing_ok and did not become the failure itself
+    # ...and the ordinary case — nothing left behind — reaches the same spawn error,
+    # i.e. the unlinks are missing_ok and did not become the failure themselves
     with pytest.raises(OpencodeServerError, match="not found on PATH"):
         adapter.start_session(spec)
 

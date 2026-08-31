@@ -146,7 +146,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import gates
 from ..bmadconfig import ProjectPaths
-from ..journal import LOGS_DIR
+from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
@@ -624,10 +624,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
         # Task ids are supplied by the caller, so defensively reset cycle-scoped
         # outputs if one is reused. A silent session must not inherit a stale result.
-        (task_dir / "result.json").unlink(missing_ok=True)
-        # The sweep skill also writes escalation.json here, and
-        # `resolve._gather_escalations` reads it alongside result.json.
-        (task_dir / "escalation.json").unlink(missing_ok=True)
+        # Iterating `journal.TASK_CYCLE_ARTIFACTS` is what makes the parity with
+        # GenericAdapter.start_session structural instead of a claim in a test
+        # docstring: both adapters and `resolve._gather_escalations` share one list.
+        for artifact in TASK_CYCLE_ARTIFACTS:
+            (task_dir / artifact).unlink(missing_ok=True)
         # Same hazard, same reason, for the file the #194 tail scan reads (mirrors
         # GenericAdapter.start_session, which unlinks its pane tee here). This one
         # bites hardest on the path the classifier exists to serve: an env fault

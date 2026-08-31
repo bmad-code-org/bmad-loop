@@ -24,6 +24,44 @@ LOGS_DIR = "logs"
 # Verifier subprocess streams, deliberately NOT under LOGS_DIR — see
 # Journal.write_verify_stream for why sharing that directory is a TUI bug.
 VERIFY_DIR = "verify"
+# The cycle-scoped artifacts a session writes into ``tasks/<task_id>/``: the ONE
+# list the three sites that touch them share. Both adapters clear these in
+# ``start_session`` (a caller-supplied task_id may be reused, and a silent session
+# must not inherit a stale predecessor's outputs) and
+# ``resolve._gather_escalations`` reads them back. Spelled here rather than three
+# times, because a fourth artifact added to the reader alone would silently miss
+# both adapters — which is the shape the parity was in before.
+#
+# ``result.json`` is the dev/review contract's own result file. ``escalation.json``
+# is the SWEEP SKILL's: its automation contract
+# (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a sweep session to
+# write that file and then mirror the same entries into ``result.json``'s
+# ``escalations``. That sentence lived in both adapters' comments and nowhere else,
+# and it is the whole reason the reader opens two names rather than one.
+#
+# ORDER IS LOAD-BEARING — but NOT because of the mirroring, which is the obvious
+# reading and the wrong one: ``_gather_escalations`` keys its map on canonical
+# JSON, so a mirrored entry's STORED value is byte-identical whichever copy is read
+# first. What the order fixes is the POSITION of DISTINCT entries in the
+# newest-first list the operator is shown — result.json's entries precede
+# escalation.json's, and a repeat keeps its first occurrence's slot. Swap these two
+# and ``tests/test_resolve.py``'s
+# ``test_gather_escalations_preserves_result_before_escalation_file_order`` and
+# ``test_gather_escalations_keeps_a_duplicates_first_position`` redden (measured,
+# not reasoned about).
+#
+# Appending a name is bounded twice, so it is not free. ``_gather_escalations``
+# JSON-parses every name here and skips anything that is not an
+# ``{"escalations": [...]}`` document, so a name that does not carry that shape
+# buys the reader nothing. And both adapters run this unlink loop AFTER
+# ``start_session`` has already written ``prompt.txt`` into the same directory, so
+# a name an earlier step of that method writes would be deleted on the way out.
+#
+# Four other cycle-scoped files live in ``tasks/<task_id>/`` and are deliberately
+# NOT here, because each is owned and read by ONE adapter rather than shared:
+# ``heartbeat.json``, ``resultless-stops.jsonl`` and ``session-lifecycle.jsonl``
+# (``adapters/generic.py``) and ``messages.json`` (``adapters/opencode_http.py``).
+TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ("result.json", "escalation.json")
 
 
 class Journal:
