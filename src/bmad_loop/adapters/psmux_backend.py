@@ -555,6 +555,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # psmux's list-windows emits bare `@N` lines; qualify them identically
         # to new_window or window_alive's membership check (native_id in
         # list_window_ids) would read every window as dead.
+        #
+        # No `_SESSION_GONE_STDERR` override, and that is a measurement rather
+        # than an omission (#525). psmux 3.3.8 words a vanished session as
+        # `psmux: no server running on session '<name>'` — the base's fragment
+        # matches it — and its client-side variant carries `can't find session`
+        # too. The failures that must NOT read as gone are worded well clear of
+        # both: a live session whose key was rejected answers `psmux: Invalid
+        # session key`, and one whose server is unreachable answers `psmux:
+        # connection timed out`. Both were rc 1 with the windows demonstrably
+        # alive — this backend is where the bug was actually reachable, because
+        # a per-session TCP server has failure modes tmux's socket does not.
         return [
             self._qualified_window_id(session, window_id)
             for window_id in super().list_window_ids(session)
@@ -593,6 +604,16 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         rows = super().list_windows(session, probe_fields)
         id_columns = {i for i, field in enumerate(fields) if field == "window_id"}
         if not opt_columns and not id_columns:
+            return rows
+        if not rows:
+            # No rows to fill, so the option listing below has nothing to fill
+            # them WITH — a pure short-circuit, byte-identical output. It is
+            # load-bearing anyway (#525): the base answers [] both for a session
+            # it proved gone and for a spawn that never landed, silently in each
+            # case, and pressing on would spend a second probe and then warn that
+            # the option listing failed — about a session that is legitimately
+            # gone, or on a box with no multiplexer at all. The base's honest
+            # silences must not be re-broken by the wrapper that reads them.
             return rows
         # The #221 degrade: an empty or `:`-bearing session cannot be routed
         # with `-t`, and an unrouted read would answer from whichever server
@@ -901,7 +922,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         surprising {} is possible and is not proof that no keys are set."""
         try:
             proc = self._run(["show-options", "-q", "-t", session], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError):
+            # UnicodeError as in the base's listings (#525): this is the SECOND
+            # probe of a two-probe read, so a strict-codec leaf that decoded the
+            # window listing cleanly can still fault here — and the caller above
+            # is a best-effort metadata op that must degrade to "unset", never
+            # raise a decode error out of it.
             return None
         if proc.returncode != 0:
             return None
@@ -951,10 +977,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 # A session being swept just minted a window, so an empty live
                 # list is a failed probe, not an empty session — treating it as
                 # truth would sweep every key, live windows included. Warned for
-                # the same reason the listing failure above is, and this is the
-                # branch that actually fires: list_window_ids RAISES on a
-                # transport fault (caught below) and answers [] only on rc != 0,
-                # so silence here is a server failing every launch with no signal.
+                # the same reason the listing failure above is. Since #525 the
+                # only way to reach here is a listing that PROVED the session
+                # gone — every other failure raises and lands in the arm below —
+                # which under a just-minted window means the server died between
+                # the mint and the sweep. Its keys died with it, so the warning
+                # is the whole remaining duty.
                 print(
                     f"warning: orphan-key sweep on {session} could not list live "
                     "windows; orphaned keys unswept until the next launch",
@@ -978,10 +1006,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # (the project tag scopes the prune retry; the return key keeps both
         # return legs armed, see _parked_trailer). Scope resolves before the kill because a name
         # token cannot be resolved once the window is dead. An empty liveness
-        # listing is ambiguous — a failed probe, or a session that died with
-        # its last window — so it degrades toward retaining the keys; the
-        # launch-time orphan sweep reclaims them once the window is provably
-        # gone. Discovery is generic by the seam's marker — the backend must
+        # listing means the session is gone (#525 narrowed it to that; anything
+        # unproven raises into the arm below), and its keys went with the
+        # server — but this path cannot tell that from the pre-#525 reading, so
+        # it still degrades toward retaining them; the launch-time orphan sweep
+        # reclaims whatever survived once the window is provably gone. Discovery is generic by the seam's marker — the backend must
         # not know which option names callers use. Best-effort throughout:
         # cleanup failure warns (the sweep precedent) but never blocks or
         # fails the kill.

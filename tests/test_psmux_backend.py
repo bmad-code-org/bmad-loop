@@ -203,6 +203,81 @@ def test_list_windows_id_column_is_findable_in_list_window_ids(monkeypatch):
     assert all(row[0] in live for row in rows)
 
 
+def test_list_windows_does_not_probe_options_for_an_empty_listing(monkeypatch, capsys):
+    """An empty window listing ends the read here — no option probe, no warning.
+
+    The base answers `[]` for a missing binary — after one failed spawn, silently —
+    and for a session it PROVED gone (#525). Both are honest silences, and this
+    wrapper is what would re-break them: it fetches the id-keyed options
+    whenever an `@` column is asked for, so pressing on past an empty listing
+    spends a second probe and then warns that the option listing failed — on a
+    box with no multiplexer at all, or about a session that is legitimately
+    gone. Since there are no rows to fill, the fetch could only ever be waste.
+
+    Ablation: drop the `if not rows` short-circuit and both halves fail — the
+    gone case gains a show-options spawn plus a warning, the unspawnable case
+    gains a second doomed spawn and the same stray warning."""
+    spawned: list[list[str]] = []
+
+    def gone(argv, **_kwargs):
+        spawned.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="psmux: no server running on session 's'"
+        )
+
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "C:/bin/psmux.exe")
+    monkeypatch.setattr(tmux_base.subprocess, "run", gone)
+    mux = PsmuxMultiplexer()
+    assert mux.list_windows("s", ["window_id", "@bmad_project"]) == []
+    assert [a[1] for a in spawned] == ["list-windows"]  # never show-options
+    assert capsys.readouterr().err == ""
+
+    # ...and when the binary cannot be spawned at all, one doomed attempt, not
+    # two: the base returns [] from the failed spawn and this wrapper stops
+    # there rather than sending a second one after options that cannot exist.
+    # The transport says so, never PATH — `which` decides only whether the
+    # failure is worth a warning, so this half holds identically on a box that
+    # has psmux and one that does not.
+    spawned.clear()
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: spawned.append(argv) or _raise(FileNotFoundError(argv[0])),
+    )
+    assert mux.list_windows("s", ["window_id", "@bmad_project"]) == []
+    assert [a[1] for a in spawned] == ["list-windows"]
+    assert capsys.readouterr().err == ""
+
+
+def _raise(exc: BaseException):
+    raise exc
+
+
+def test_scoped_options_contains_a_decode_fault(monkeypatch, capsys):
+    """The SECOND probe of the two-probe read must degrade, not raise.
+
+    A strict-codec leaf can decode the window listing cleanly and still fault on
+    the option listing, so `_scoped_options` needs the same `UnicodeError` arm
+    the base's listings carry (#525). Without it a raw `UnicodeDecodeError`
+    escapes `list_windows` — a method the seam calls best-effort, whose callers
+    catch nothing.
+
+    Ablation: drop `UnicodeError` from the catch tuple and this fails on the
+    raw decode error escaping."""
+
+    def fake(argv, **_kwargs):
+        if argv[1] == "show-options":
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
+
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "C:/bin/psmux.exe")
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    rows = PsmuxMultiplexer().list_windows("s", ["window_id", "@bmad_project"])
+    assert rows == [("s:@1", "")]  # the option column degrades to "unset"
+    assert "show-options listing failed" in capsys.readouterr().err
+
+
 def test_qualification_degrades_to_bare_on_colon_session(monkeypatch, tmp_path):
     # A `:` in the session name would split the target at the wrong colon on
     # replay — both methods degrade to the bare id identically (the #221 rule).
@@ -1597,16 +1672,23 @@ def test_sweep_unlistable_options_warns(monkeypatch, capsys):
 def test_sweep_treats_empty_live_list_as_failed_probe(monkeypatch, tmp_path, capsys):
     # We just minted a window in this session, so an empty live listing is a
     # failed probe, not an empty session — believing it would sweep every key,
-    # live windows included. It is also said out loud: list_window_ids raises on
-    # a transport fault and answers [] only on rc != 0, so this branch is a
-    # server failing every launch, and silence would leak keys with no signal.
+    # live windows included. It is also said out loud: since #525 list_window_ids
+    # answers [] ONLY for a listing that proved the session gone, so reaching this
+    # branch right after a mint means the server died under us — and silence would
+    # leak keys with no signal.
+    #
+    # The stderr below is load-bearing, not decoration: it is psmux 3.3.8's real
+    # vanished-session wording. Any other wording now RAISES (the sweep's outer
+    # arm warns instead), which is a different branch than this test pins.
     listing = '@bmad_project__blw@2 "live"\n@bmad_project__blw@7 "gone"\n'
     calls = []
 
     def fake(argv, **kwargs):
         calls.append(argv)
         if argv[1] == "list-windows":
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no server")
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="psmux: no server running on session 'ctl'"
+            )
         out = {"new-window": "@2\n", "show-options": listing}.get(argv[1], "")
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 

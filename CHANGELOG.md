@@ -180,6 +180,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Tell a failed window listing apart from an empty session: liveness raises when the failure is unproven, metadata keeps its sentinel and warns (#525).
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's
