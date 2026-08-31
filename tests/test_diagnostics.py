@@ -599,12 +599,19 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    # The OTHER three kinds `runs.rearm_escalation` journals `spec_file` on. Routing is
+    # The OTHER four kinds the re-arm family journals `spec_file` on. Routing is
     # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
     # `rearm-baseline-restamped` and are correct today for free — which is exactly why
     # they belong in the sweep: the canary is what catches a field added to one of
-    # these kinds later, and a sweep that covers two of four grades the routing of a
+    # these kinds later, and a sweep that covers two of five grades the routing of a
     # record shape nobody re-checks.
+    #
+    # `rearm-aborted` is the fifth and the one written by a DIFFERENT function
+    # (`runs._rollback_rearm`, from the transaction guard's error path) rather than by
+    # `rearm_escalation` itself — the divergence that made the routing entry's own
+    # producer note undercount. It carries two fields the others do not: `error`, which
+    # the free-text drop set reaches, and `rollback`, a literal enum string that is
+    # declared benign rather than routed and must therefore still ship VERBATIM.
     siblings = [
         diagnostics._scrub_entry(
             {"ts": 3.0, "kind": kind, "story_key": STORY_KEY, "spec_file": SPEC_ABS, **extra},
@@ -616,11 +623,20 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
             ("rearm-spec-write-unreachable", {"target_branch": REARM_BRANCH}),
             ("rearm-spec-flip-skipped", {"status": "ready-for-dev"}),
             ("rearm-baseline-restamp-skipped", {"baseline": SHA}),
+            (
+                "rearm-aborted",
+                {"error": f"OSError: cannot write {HOME_PATH}/spec.md", "rollback": "restored"},
+            ),
         )
     ]
     # every one of them aliases to the SAME alias as the restamped record above: one
     # spec, one alias, however many kinds carry it
-    assert [s["spec_file"] for s in siblings] == [alias, alias, alias]
+    assert [s["spec_file"] for s in siblings] == [alias, alias, alias, alias]
+    # the abort record's own two fields: the free-text one is dropped (it quotes a host
+    # path back), the enum one is deliberately NOT aliased — both surfaces read the
+    # record for `rollback`, so pseudonymizing it would destroy the field's whole point
+    assert "error" not in siblings[3] and siblings[3]["error_present"] is True
+    assert siblings[3]["rollback"] == "restored"
     assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
 
     # `rearm-spec-write-unreachable` names the branch the re-drive cuts its replacement

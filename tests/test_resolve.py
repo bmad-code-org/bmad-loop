@@ -1680,10 +1680,15 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     to `ready-for-dev` and stripped of the `## Auto Run Result` section the next resolve
     session reads as its context — the one edit nothing else records.
 
-    Ablation: drop the `_restore_rearmed_spec(...)` call from the re-stamp's except arm
-    and this reddens on the byte comparison (the status flip and the strip both stand),
-    while the `RearmError` and the ESCALATED phase keep passing — which is exactly why
-    those two alone do not grade this.
+    The undo is no longer written into the re-stamp's own `except` arm: the whole window
+    from the first spec write to `save_state` is one transaction, and its guard rolls the
+    spec back for every fault that escapes — this one included. What the arm still owns is
+    the `RearmError` and its remedy.
+
+    Ablation: delete the `except BaseException` arm from `rearm_escalation` and this
+    reddens on the byte comparison (the status flip and the strip both stand), while the
+    `RearmError` and the ESCALATED phase keep passing — which is exactly why those two
+    alone do not grade this.
     """
     old_head = _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
@@ -1731,9 +1736,11 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     reddens the flip first and leaves nothing to restore. The injection stands in for the
     faults above, which are real and are exactly what the atomic writers exist for.
 
-    Ablation: drop the `_restore_rearmed_spec(...)` call from that arm and this reddens on
-    the byte comparison alone — the `RearmError` and the ESCALATED phase both still pass,
-    since the flip landing is precisely what neither observes. Both of those assertions
+    Ablation: delete the `except BaseException` arm from `rearm_escalation` — the
+    transaction guard that now performs this undo, in place of the per-arm call this test
+    used to grade — and it reddens on the byte comparison alone. The `RearmError` and the
+    ESCALATED phase both still pass, since the flip landing is precisely what neither
+    observes. Both of those assertions
     are load-bearing for that claim, so both stay in THIS test: an isolated sibling row
     was once inserted between them and silently adopted the phase check, leaving this
     docstring citing an assertion the test no longer made.
@@ -4091,6 +4098,78 @@ def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
     # nothing to do to THIS file; `rearm-spec-write-unreachable` carries the remedy on
     # exactly the legs that still have one, and holds the resume behind it
     assert step == ""
+
+
+def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
+    """One kind, THREE renderings, and the split is by what the surface may CLAIM about
+    the file — not by how the re-arm failed.
+
+    Nothing else grades this. The CLI's abort-echo test asserts "the re-arm ABORTED",
+    "nothing was persisted", "still escalated" and the spec path, and every one of those
+    is true of the `failed` message too — so replacing the discriminator with `if False:`
+    was SILENT across the whole suite while an operator holding a part-written spec was
+    told it had been "left exactly as the re-arm found it". A row that reads the table
+    directly is the only place the three can be compared.
+
+    The unrecognized-value leg is the load-bearing one. `unknown` is a real producer
+    answer (the sentinel-clear leg, and a spec the undo could not read), an absent field
+    is what a record from an older or future producer looks like, and neither may inherit
+    the reassuring branch by falling through to it. So the default is the branch that
+    claims nothing, and the assertions below say that in the strongest available form:
+    the "left exactly as the re-arm found it" sentence appears on `restored`/`unchanged`
+    and NOWHERE else.
+
+    next_step is graded beside the message for `rearm-spec-flip-skipped`'s reason above —
+    it is the half that costs an operator time — and for one this kind adds: the TUI
+    drops next_step entirely, so `failed`'s restore-from-git remedy has to survive in the
+    MESSAGE as well. That is asserted on the message, not just on the step.
+
+    Ablations, each run: replace the `rollback == "failed"` test with `if False:` and the
+    `failed` assertions redden; replace the `rollback in ("restored", "unchanged")` test
+    with `if True:` and the `unknown`/absent assertions redden; drop "restore it from git"
+    from the `failed` MESSAGE (keeping next_step) and the TUI-reachability assertion
+    reddens alone.
+    """
+    entry = {
+        "kind": "rearm-aborted",
+        "spec_file": "/p/specs/s1.md",
+        "error": "OSError: [Errno 28] No space left on device",
+    }
+    left_as_found = "left exactly as the re-arm found it"
+
+    _, failed_msg, failed_step = runs.rearm_event_notice({**entry, "rollback": "failed"})
+    _, restored_msg, restored_step = runs.rearm_event_notice({**entry, "rollback": "restored"})
+    _, unchanged_msg, _ = runs.rearm_event_notice({**entry, "rollback": "unchanged"})
+    _, unknown_msg, unknown_step = runs.rearm_event_notice({**entry, "rollback": "unknown"})
+    _, absent_msg, absent_step = runs.rearm_event_notice(entry)
+    _, future_msg, _ = runs.rearm_event_notice({**entry, "rollback": "something-new"})
+
+    # every rendering states the two facts that are true whatever happened
+    for msg in (failed_msg, restored_msg, unchanged_msg, unknown_msg, absent_msg, future_msg):
+        assert "the re-arm ABORTED" in msg
+        assert "nothing was persisted" in msg
+        assert "still escalated" in msg
+
+    # ...and ONLY the two outcomes that proved it say the file is intact
+    assert left_as_found in restored_msg and left_as_found in unchanged_msg
+    assert left_as_found not in failed_msg
+    assert left_as_found not in unknown_msg
+    assert left_as_found not in absent_msg
+    assert left_as_found not in future_msg  # an unrecognized value defaults to NOT reassuring
+
+    # `failed` is the only one that can leave a part-written spec, and its remedy has to
+    # reach a TUI operator, which never sees next_step
+    assert "may be left part-written" in failed_msg
+    assert "restore it from git" in failed_msg
+    assert failed_step == "Restore the spec from git, then re-run resolve"
+    # ...and it does NOT enumerate which writes landed: a fault inside
+    # `strip_auto_run_result` reaches the guard with the flip published and the section
+    # still present, so an enumeration would describe a state this record cannot know
+    assert "## Auto Run Result" not in failed_msg
+
+    # the three next_steps are distinct remedies, not one sentence reused
+    assert len({failed_step, restored_step, unknown_step}) == 3
+    assert absent_step == unknown_step  # an absent field IS the unknown outcome
 
 
 def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():

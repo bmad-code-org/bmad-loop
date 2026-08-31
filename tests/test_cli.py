@@ -2962,19 +2962,36 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
 
 
 def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeypatch, capsys):
-    """An abort is when the residue matters MOST, so the echo lives in a `finally`.
+    """An abort is when the residue matters MOST, so the echo lives in a `finally` — and
+    since the whole re-arm window became one transaction, the echo has to say the re-arm
+    ABORTED as well as what it left behind (DW-85).
 
-    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
-    `RearmError`, so on that path the records are already on disk when the abort
-    happens — and an echo placed after an early `return 1` threw away records the
-    re-arm had genuinely written. The one it threw away is the one that cannot be
-    recovered from anywhere else: `stale-restore-commits` names commits now sitting
-    below a baseline the operator is looking at in a half-run re-arm, and nothing
-    but this line will tell them. The failure and the residue are both true, and the
-    operator needs both to decide what to do with the tree.
+    `runs._stale_restore_residue` journals BEFORE anything that can raise past it, so on
+    an abort those records are already on disk when the fault happens — and an echo
+    placed after an early `return 1` threw away records the re-arm had genuinely written.
+    The one it threw away is the one that cannot be recovered from anywhere else:
+    `stale-restore-commits` names commits now sitting below a baseline the operator is
+    looking at, and nothing but this line will tell them.
+
+    But that line alone MISDESCRIBES the tree once the rollback exists. It says files
+    were "excluded from the re-drive baseline" and commits "sit below the re-drive's new
+    baseline" — a baseline `save_state` never persisted, because the transaction rolled
+    the whole window back. The residue records are true observations of what the re-arm
+    LOOKED at and false as a description of what it LEFT, so `rearm-aborted` is journalled
+    from the rollback and echoed beside them: the operator needs both, and needs to know
+    which one describes the disk.
+
+    The fake journals the two records in the order the real path writes them (the residue
+    pass, then the abort record from `_rollback_rearm`'s `finally`) and then raises, which
+    is what makes the echo's one walk over the new entries the thing under test.
 
     Ablation (residue echo): move `_echo_rearm_events` out of the `finally` back under
     the `try` and the commits assertion reddens while the `error:` line still prints.
+
+    Ablation (abort line): drop the `rearm-aborted` arm from `runs.rearm_event_notice`
+    and the "still escalated" assertion reddens while the commits line still prints —
+    which is exactly the DW-85 state, a true residue notice with nothing saying it
+    describes a baseline that was never saved.
 
     Ablation (success output): deleting the gate outright does NOT grade the last
     assertion. Drop `return 1` from `cmd_resolve`'s `except runs.RearmError` arm and the
@@ -2996,6 +3013,14 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
         Journal(rd).append(
             "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
         )
+        # ...and then the rollback's own record, from `_rollback_rearm`'s `finally`
+        Journal(rd).append(
+            "rearm-aborted",
+            story_key=key,
+            spec_file="/p/specs/s1.md",
+            error="OSError: [Errno 28] No space left on device",
+            rollback="restored",
+        )
         raise runs.RearmError("could not re-stamp the spec baseline")
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
@@ -3007,6 +3032,11 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
     out, err = capsys.readouterr()
     assert "error: could not re-stamp the spec baseline" in err  # the abort still reports
     assert "2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    # ...and the line that says the baseline those commits sit below was never persisted
+    assert "the re-arm ABORTED" in err
+    assert "nothing was persisted" in err
+    assert "still escalated" in err
+    assert "/p/specs/s1.md" in err
     assert "re-armed" not in out  # ...and the failure is not dressed up as a success
 
 
