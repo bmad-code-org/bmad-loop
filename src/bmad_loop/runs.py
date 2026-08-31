@@ -4750,6 +4750,34 @@ def rearm_event_notice(
             "abandoned attempt rather than your resolve, revert them now",
             "",
         )
+    if kind == "rearm-commits-probe-failed":
+        # The sibling row above is written only when the probe ANSWERED, so its
+        # absence used to mean either "no commits from the abandoned attempt" or
+        # "the probe could not tell" — and nothing downstream could separate them.
+        # The range is named in BOTH halves on purpose: `resolve` prints the
+        # next_step and the TUI drops it, so the message has to stand alone there.
+        baseline = str(entry.get("old_baseline", "?"))
+        # A first-party value is a full rev-parse hex result. Refuse to turn a
+        # malformed persisted value into a copy/paste command, and collapse control
+        # characters from git's detail before either operator surface renders it.
+        base = baseline[:12] if re.fullmatch(r"[0-9a-fA-F]{12,}", baseline) else "unknown"
+        detail = str(entry.get("error", "?"))
+        if baseline:
+            # `commits_above` repeats the complete baseline in its GitError. The
+            # display label and command deliberately use the short form, so leaving
+            # the full value in the detail defeated that truncation on both surfaces.
+            detail = detail.replace(baseline, base)
+        detail = re.sub(r"[\x00-\x1f\x7f\ud800-\udfff]+", " ", detail)
+        if len(detail) > 4096:
+            detail = detail[:4093] + "..."
+        return (
+            "warning",
+            f"could not list the commits above the abandoned attempt's baseline "
+            f"({base}..) — {detail}; this silence proves nothing, so fix the Git "
+            f"failure, then run `git log {base}..HEAD` yourself and revert anything "
+            "that did not come from your resolve",
+            f"Fix the Git failure, then check `git log {base}..HEAD` before resuming",
+        )
     if kind == "rearm-baseline-advance-failed":
         return (
             "warning",
@@ -4980,11 +5008,15 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     but futile: the re-drive re-plans from a tree that never saw the correction and
     mints the same sentinel again.
 
-    The other warnings stay advisory and do NOT hold. `stale-restore-commits`,
-    `stale-restore-unparseable` and `rearm-baseline-advance-failed` each report
-    something an operator may need to act on, but none of them PROVES the re-drive
-    cannot route, and holding on a maybe would turn the ordinary degrade path into a
-    two-command gesture for an outcome nothing decided.
+    The other warnings stay advisory and do NOT hold — `stale-restore-commits`,
+    `stale-restore-unparseable`, `rearm-commits-probe-failed` and
+    `rearm-baseline-advance-failed` among them: each reports something an operator may
+    need to act on, but none of them PROVES the re-drive cannot route, and holding on a
+    maybe would turn the ordinary degrade path into a two-command gesture for an
+    outcome nothing decided. `rearm-commits-probe-failed` is the newest and the least
+    tempting to promote: it says the commits probe could not answer, which is strictly
+    LESS than the answer — it proves nothing about whether the re-drive can route, only
+    that one advisory could not be computed.
 
     Not folded into `rearm_event_notice`'s tuple, because they are different questions
     asked of the same entry: that table answers "what do I tell the operator", this
@@ -5021,8 +5053,11 @@ def _stale_restore_residue(
     human is the classifier. `bmad-loop resolve` echoes these to stderr.
 
     Best-effort throughout: a deleted or unreadable patch, a non-repo project, a
-    bad old baseline — none may wedge a resolve. A patch parse failure journals
-    its degrade; a commits-probe Git failure deliberately degrades silently.
+    bad old baseline — none may wedge a resolve. Both degrades journal a record of
+    their own: a patch parse failure writes `stale-restore-unparseable`, and a
+    commits-probe Git failure writes `rearm-commits-probe-failed` (DW-81). Neither
+    is silent, because the sibling record's ABSENCE is what an operator reads as
+    "clean" — and a probe that could not answer is not the same claim.
     """
     if not old_latch:
         return set()
@@ -5053,17 +5088,34 @@ def _stale_restore_residue(
     if old_baseline:
         try:
             shas = verify.commits_above(repo, old_baseline)
-        except verify.GitError:
-            # Follow rearm_escalation's baseline-advance taxonomy boundary;
-            # this warn-only probe remains silent.
-            shas = []
-        if shas:
+        except verify.GitError as e:
+            # Follows rearm_escalation's baseline-advance taxonomy boundary, and the
+            # catch stays EXACTLY `verify.GitError`: every fault `_run_git` can
+            # translate (spawn, timeout, decode, non-zero rc) lands here, and a
+            # non-git fault still escapes to the re-arm's transaction guard.
+            #
+            # Warn-only, but no longer silent. This arm used to set `shas = []` and
+            # fall through to the `if shas:` gate below, which made a probe that
+            # FAILED byte-identical — on every downstream surface — to a probe that
+            # found no commits above the old baseline. The operator was told nothing
+            # either way, and the absent record is the only warning they get that the
+            # abandoned attempt's commits may still be sitting under the re-drive's
+            # new baseline. The `else:` is what retires the sentinel rather than
+            # leaving it inert: no `shas` exists on this leg to gate on.
             journal.append(
-                "stale-restore-commits",
+                "rearm-commits-probe-failed",
                 story_key=story_key,
                 old_baseline=old_baseline,
-                commits=shas,
+                error=f"{e.__class__.__name__}: {e}",
             )
+        else:
+            if shas:
+                journal.append(
+                    "stale-restore-commits",
+                    story_key=story_key,
+                    old_baseline=old_baseline,
+                    commits=shas,
+                )
     return residue
 
 

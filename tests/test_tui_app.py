@@ -5010,7 +5010,9 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     TUI's own copy of the chain happened to handle.
 
     That copy carried `rearm-baseline-*` only and silently dropped the whole
-    `stale-restore-*` family, including `stale-restore-commits` — the record
+    `stale-restore-*` family (and would have dropped `rearm-commits-probe-failed`,
+    the record that says the commits probe could not answer at all), including
+    `stale-restore-commits` — the record
     `cli._echo_rearm_events`' docstring calls the one a human must act on, and the
     one whose whole point is that nothing else will tell them. All of it is
     warn-only by contract, so a toast is the only place this path can ever show it,
@@ -5050,6 +5052,16 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             commits=["c1", "c2"],
         )
         journal.append("stale-restore-excluded", story_key=sk, patch="a.patch", files=["new.txt"])
+        # The commits record's TWIN: the probe that could not answer at all. It rides
+        # this walk because the pair is the whole point — the record above is written
+        # only when the probe answered, so without this one its absence reads as
+        # "clean" on the surface that resumes in the same gesture (DW-81).
+        journal.append(
+            "rearm-commits-probe-failed",
+            story_key=sk,
+            old_baseline="e" * 40,
+            error=f"GitError: git rev-list {'e' * 40}..HEAD failed in /code: fatal",
+        )
         journal.append(
             "rearm-baseline-restamp-skipped",
             story_key=sk,
@@ -5115,6 +5127,14 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     assert severity_of("2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)") == (
         "warning"
     )
+    # ...and its twin, the probe that could not answer — advisory, so a toast is the
+    # only place this surface can ever show it
+    assert severity_of("could not list the commits above the abandoned attempt's baseline") == (
+        "warning"
+    )
+    # the range is carried in the MESSAGE, because this surface drops `next_step`
+    assert any("git log eeeeeeeeeeee..HEAD" in n[0] for n in notes), notes
+    assert not any("e" * 40 in n[0] for n in notes), notes
     assert severity_of("is not a readable file from here") == "warning"
     assert severity_of("could not be re-opened to `ready-for-dev`") == "warning"
     # `note` maps onto Textual's own channel name, not through unchanged

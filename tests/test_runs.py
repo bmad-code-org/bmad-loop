@@ -2912,7 +2912,18 @@ def _kinds(run_dir, prefix="stale-restore-"):
 def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     """The abandoned attempt's applied new files must NOT be blessed as
     pre-existing, or finalize_commit's `add -A` sweeps them into the corrected
-    story's commit. The resolve session's own untracked file still is."""
+    story's commit. The resolve session's own untracked file still is.
+
+    Also the commits probe's ORDINARY answer: nothing was committed above the old
+    baseline here, so `verify.commits_above` returns `[]` and BOTH commit records
+    stay away. That silence is the one an operator is entitled to read as "clean",
+    which is exactly why the failed probe now writes `rearm-commits-probe-failed`
+    instead of reproducing it (DW-81).
+
+    Ablation: relax the producer's `if shas:` gate to `if shas is not None:` and the
+    `stale-restore-commits` assertion reddens; journal the probe failure outside its
+    `except` arm and the `rearm-commits-probe-failed` one does.
+    """
     run_dir, _spec, patch = _stale_restore_tree(tmp_path)
 
     runs.rearm_escalation(
@@ -2927,6 +2938,9 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
     assert excluded[0]["patch"] == str(patch)
+    # the probe ran and answered "none" — neither commit record may appear
+    assert not _kinds(run_dir, "stale-restore-commits")
+    assert not _kinds(run_dir, "rearm-commits-probe-failed")
 
 
 def test_rearm_re_latching_the_same_patch_still_excludes_its_residue(tmp_path):
@@ -3008,10 +3022,19 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
 
 def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_path):
     """A bad old baseline is warn-only, and the persisted reset proves re-arm
-    reached its save rather than returning early.
+    reached its save rather than returning early — and it now leaves a RECORD.
+
+    The probe failing used to be byte-identical to the probe finding nothing: both
+    wrote no journal entry, so `assert not _kinds(run_dir, "stale-restore-commits")`
+    below is true for two opposite reasons and cannot tell them apart. The
+    `rearm-commits-probe-failed` assertions are what separate them (DW-81) — without
+    them this test passes on a re-arm that silently swallowed the fault.
 
     Ablation: catch a type outside ``verify.GitError`` and the real rev-list
-    failure escapes before any of these completion assertions can run.
+    failure escapes before any of these completion assertions can run. Delete the
+    new ``journal.append("rearm-commits-probe-failed", ...)`` and the length
+    assertion below reddens while every pre-existing assertion here stays green —
+    which is the gap it was added to close.
     """
     from bmad_loop.model import Phase
 
@@ -3030,17 +3053,28 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     assert task.generation == initial_generation + 1
     assert task.restore_patch is None
     assert task.baseline_commit == git(tmp_path, "rev-parse", "HEAD")
-    assert not _kinds(run_dir, "stale-restore-commits")
+    assert not _kinds(run_dir, "stale-restore-commits")  # the probe never answered...
+    probe = _kinds(run_dir, "rearm-commits-probe-failed")  # ...and now says so
+    assert len(probe) == 1
+    assert probe[0]["old_baseline"] == "0" * 39 + "1"  # the baseline it could not read
+    assert probe[0]["story_key"] == "1-1-a"
+    # the typed error, spelled the way the sibling `rearm-baseline-advance-failed`
+    # spells it — `GitError: ...`, not a bare repr
+    assert probe[0]["error"].startswith("GitError: ")
+    assert "rev-list" in probe[0]["error"]
     excluded = _kinds(run_dir, "stale-restore-excluded")
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
 
 
 def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
-    """A non-repository code tree reaches the same typed, silent degrade.
+    """A non-repository code tree reaches the same typed, warn-only degrade — and
+    the same record, because the operator's exposure is identical either way.
 
     Ablation: catch a type outside ``verify.GitError`` and the pinned probe fault
-    escapes, so the persisted generation and latch reset never appear.
+    escapes, so the persisted generation and latch reset never appear. Delete the
+    new ``journal.append("rearm-commits-probe-failed", ...)`` and only the record
+    assertions redden.
     """
     from bmad_loop.model import Phase
 
@@ -3062,6 +3096,41 @@ def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
     assert task.restore_patch is None
     assert task.baseline_commit == "0" * 39 + "1"
     assert not _kinds(run_dir, "stale-restore-commits")
+    probe = _kinds(run_dir, "rearm-commits-probe-failed")
+    assert len(probe) == 1
+    assert probe[0]["old_baseline"] == "0" * 39 + "1"
+    assert probe[0]["error"].startswith("GitError: ")
+    assert len(_kinds(run_dir, "stale-restore-unparseable")) == 1
+
+
+def test_rearm_skips_the_commits_probe_entirely_without_a_recorded_baseline(tmp_path):
+    """No recorded baseline means no range to ask about, so the probe never runs —
+    and a probe that never ran must not journal that it FAILED.
+
+    The `if old_baseline:` guard is what separates "there was nothing to measure
+    against" from "the measurement broke", and `rearm-commits-probe-failed` claims
+    the second. Telling an operator to go diff a range that was never established
+    would be the mirror of the silence DW-81 closed: a warning with no referent,
+    trained straight into the scroll-past habit the `restore` split exists to prevent.
+
+    The sibling `stale-restore-unparseable` is asserted PRESENT on purpose: without
+    it this test is green for the uninteresting reason that
+    `_stale_restore_residue` returned early on a missing latch and journalled
+    nothing at all. It proves the function ran and only the commits block was
+    skipped.
+
+    Ablation: delete the `if old_baseline:` guard and `commits_above` is handed a
+    `None` baseline, git fails on the `None..HEAD` range, and the record this test
+    denies appears.
+    """
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, restore_patch_stale="old.patch")
+    assert load_state(run_dir).tasks["1-1-a"].baseline_commit is None  # pin the premise
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert not _kinds(run_dir, "rearm-commits-probe-failed")
+    assert not _kinds(run_dir, "stale-restore-commits")
+    # ...while the residue pass itself did run: the latched patch is missing
     assert len(_kinds(run_dir, "stale-restore-unparseable")) == 1
 
 
@@ -3107,6 +3176,11 @@ def test_rearm_does_not_swallow_a_non_git_fault_from_the_commits_probe(monkeypat
     assert aborted["rollback"] == "restored"  # a published write really was put back
     assert "MemoryError" in aborted["error"]
     assert aborted["spec_file"] == str(spec)
+    # ...and the degrade record is NOT one of the things it leaves behind: this fault
+    # is not a git answer, so the warn-only arm never runs and the abort is the whole
+    # story. Graded by the same narrowing as the raise above — widen the catch to
+    # `Exception` and the fault is swallowed into a record instead of propagating.
+    assert not _kinds(run_dir, "rearm-commits-probe-failed")
 
 
 def test_rearm_rolls_back_when_save_state_itself_fails(monkeypatch, tmp_path):

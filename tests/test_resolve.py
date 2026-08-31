@@ -4426,6 +4426,51 @@ def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
     assert absent_step == unknown_step  # an absent field IS the unknown outcome
 
 
+def test_rearm_event_notice_renders_the_commits_probe_failure():
+    """The row that stops a FAILED commits probe reading as a clean one (DW-81).
+
+    `stale-restore-commits` is written only when the probe answered, so its absence
+    used to carry two opposite meanings — "nothing from the abandoned attempt" and
+    "nobody could tell" — and neither operator surface could separate them. This row
+    is the separation, so it is graded on all three returned fields:
+
+    * the truncated baseline, because that is the ref the operator has to diff from
+      and the record is read out of process from the journal line alone;
+    * the typed error, because a bad baseline and a non-repo code tree are different
+      things to go fix;
+    * the range, in the MESSAGE as well as the next_step — the TUI drops `next_step`
+      and resumes in the same gesture, so a message that only said "something went
+      wrong" would leave that surface's operator with no action at all.
+
+    Ablation: return None for this kind and every assertion here reddens; drop the
+    `git log` range from the message while keeping it in the next_step and only the
+    message assertion does — which is the half the TUI would have lost.
+    """
+    baseline = "abc123def456" + "0" * 28
+    rec = {
+        "kind": "rearm-commits-probe-failed",
+        "story_key": "1-1-a",
+        "old_baseline": baseline,
+        "error": f"GitError: git rev-list {baseline}..HEAD failed in /code:\n"
+        + "fatal "
+        + "x" * 5000,
+    }
+    severity, message, next_step = runs.rearm_event_notice(rec)
+    assert severity == "warning"
+    assert "abc123def456.." in message  # truncated to 12, as the sibling row does
+    assert "0" * 28 not in message  # ...and NOT the whole sha
+    assert "GitError" in message and "rev-list" in message  # the typed cause
+    assert "\n" not in message and len(message) < 4500  # terminal-safe and bounded
+    assert "proves nothing" in message  # the silence is not evidence of "clean"
+    assert "fix the Git failure" in message  # do not blindly repeat the failed probe
+    assert "git log abc123def456..HEAD" in message  # actionable on the TUI alone
+    assert next_step == (
+        "Fix the Git failure, then check `git log abc123def456..HEAD` before resuming"
+    )
+    # the imperative lives ONLY in next_step: the TUI drops it and resumes here
+    assert "before resuming" not in message
+
+
 def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     """The hold is PROOF, not urgency — and it is asked of every kind the table knows.
 
@@ -4451,6 +4496,9 @@ def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
         "stale-restore-commits",
         "stale-restore-unparseable",
         "stale-restore-excluded",
+        # the probe that could NOT answer proves strictly less than the answer, so if
+        # `stale-restore-commits` does not hold, neither can this
+        "rearm-commits-probe-failed",
         "rearm-baseline-advance-failed",
         "rearm-baseline-restamp-skipped",
         "rearm-baseline-restamped",

@@ -3175,6 +3175,55 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
     assert commits.endswith("revert them now")
 
 
+def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys):
+    """The failed commits probe reaches stderr, imperative and all (DW-81).
+
+    Before it had a record, a probe that FAILED and a probe that found nothing were
+    byte-identical here: neither journalled, so neither printed, and the operator was
+    never told that the abandoned attempt's commits might be sitting under the
+    re-drive's new baseline unreverted. Graded on this surface specifically because
+    it is the one that appends `next_step` — the TUI drops it — and because the
+    record is warn-only by contract, so an echo is the only place it can ever appear.
+
+    Ablation: delete the `rearm-commits-probe-failed` row from
+    `runs.rearm_event_notice` and the line is not printed at all, so `next(...)`
+    raises `StopIteration`; drop `tail` from `_echo_rearm_events`' f-string and only
+    the `endswith` reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+    baseline = "b" * 40
+
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
+        Journal(rd).append(
+            "rearm-commits-probe-failed",
+            story_key=key,
+            old_baseline=baseline,
+            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: "
+            "not a git repository",
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    probe = next(ln for ln in lines if "could not list the commits above" in ln)
+    assert probe.startswith("warning: ")  # advisory severity, rendered as the prefix
+    assert "bbbbbbbbbbbb.." in probe and "b" * 40 not in probe  # truncated, not raw
+    assert "not a git repository" in probe  # the typed cause survives the echo
+    assert probe.endswith(
+        "; Fix the Git failure, then check `git log bbbbbbbbbbbb..HEAD` before resuming"
+    )
+
+
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state

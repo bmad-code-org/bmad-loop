@@ -133,6 +133,30 @@ _JOURNAL_ALIAS_FIELDS = {
     # single record: alias one and leave the other and a dump pseudonymizes half a
     # comparison, which is worse than either doing both or doing neither.
     "overwritten": "commit",
+    # A THIRD spelling of a baseline sha, journalled by `runs._stale_restore_residue`
+    # on BOTH of its commit records: `stale-restore-commits` (the probe answered, and
+    # these shas sit above it) and `rearm-commits-probe-failed` (the probe could not
+    # answer). Routing is by NAME, so this one entry gives that one value ONE alias
+    # across both kinds — which is also why the producer was not respelled to the
+    # already-routed `baseline`: that would give one sha two spellings and two
+    # aliases in a single dump.
+    #
+    # Routed for CORRELATION, not to stop a leak — this table's header states that
+    # purpose ("pseudonymized, not dropped, so events stay correlatable") and it is
+    # the whole reason this entry exists. Left unrouted a real sha does NOT ship
+    # verbatim: `_scrub_str` applies `looks_like_secret` AFTER `looks_like_identifier`,
+    # and a real 40-hex sha clears the length+entropy bar, so the fallback renders
+    # `<redacted:secret>` — USUALLY, and the exception is the point. Real shas
+    # straddle that check's bar: measured over this repo's own history (1790 commits,
+    # 2026-08-31), about one sha in twenty-five is NOT caught and ships verbatim. So
+    # routing closes a real, intermittent leak. On the ~96% the fallback does catch it
+    # buys the other thing this table exists for: `<redacted:secret>` is safe and
+    # useless — an operator can no longer tell that the probe-failure record and the
+    # commits record name the SAME baseline, which is the one comparison those two
+    # kinds exist to support. That the name ALSO had to leave the routing guard's
+    # benign inventory follows from that inventory's own rule: a name carrying a sha
+    # belongs in a `diagnostics` table.
+    "old_baseline": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
