@@ -206,8 +206,8 @@ def test_list_windows_id_column_is_findable_in_list_window_ids(monkeypatch):
 def test_list_windows_does_not_probe_options_for_an_empty_listing(monkeypatch, capsys):
     """An empty window listing ends the read here — no option probe, no warning.
 
-    The base answers `[]` for a missing binary (silently, without spawning) and
-    for a session it PROVED gone (#525). Both are honest silences, and this
+    The base answers `[]` for a missing binary — after one failed spawn, silently —
+    and for a session it PROVED gone (#525). Both are honest silences, and this
     wrapper is what would re-break them: it fetches the id-keyed options
     whenever an `@` column is asked for, so pressing on past an empty listing
     spends a second probe and then warns that the option listing failed — on a
