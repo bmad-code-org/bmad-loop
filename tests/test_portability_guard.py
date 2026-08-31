@@ -406,6 +406,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "run_id",
         "run_type",
         "security_config_changed",
+        "seen_again",
         "sentinel",
         "sentinel_kind",
         "session_status",

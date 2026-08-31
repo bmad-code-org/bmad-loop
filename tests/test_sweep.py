@@ -4489,11 +4489,11 @@ def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(projec
 # ------------------------------------------ review-budget commit-instead-of-rollback
 
 
-def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
+def test_sweep_bundle_budget_exhausted_commits_and_journals(project):
     """A bundle whose review keeps recommending a follow-up but is finalized
     (spec done, owned dw ids closed, verify green) is COMMITTED when the review
-    budget is exhausted — not rolled back. The lingering follow-up is re-filed as
-    a fresh open deferred-work entry."""
+    budget is exhausted — not rolled back. The spent budget is journaled; no
+    deferred-work entry is filed."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4519,15 +4519,16 @@ def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-budget-committed" in kinds and "story-deferred" not in kinds
 
 
 def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     """Re-review cap: when a bundle itself closes a `review-budget-followup` entry
-    and still won't converge, the work is committed but NOT re-filed again — a
-    second non-convergence should reach a human, not loop across sweeps."""
+    (legacy and hand-filed rows still exist) and still won't converge, the work is
+    committed and the journal flags the repeat — a second non-convergence should
+    reach a human, not loop across sweeps."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
@@ -4568,11 +4569,11 @@ def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     assert len(capped) == 1 and capped[0]["re_review_capped"] is True
 
 
-def test_sweep_bundle_followup_damped_commits_and_refiles(project):
+def test_sweep_bundle_followup_damped_commits_and_journals(project):
     """Default damping cap (1): a bundle whose review keeps recommending a follow-up
     converges after ONE honored round instead of burning the whole review budget.
-    The lingering follow-up is re-filed once, the work is committed, and — the
-    steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
+    The spent budget is journaled (no ledger entry), the work is committed, and —
+    the steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4593,7 +4594,7 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-followup-damped" in kinds
     assert "review-budget-committed" not in kinds and "story-deferred" not in kinds
@@ -4603,9 +4604,10 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
 
 def test_sweep_bundle_damped_re_review_capped_notifies_not_refiles(project):
     """Re-review cap survives damping: when a bundle itself closes a
-    `review-budget-followup` entry and still won't converge, the damped force-
-    converge commits but does NOT re-file again — and, unlike an ordinary quiet
-    damped converge, it raises an ATTENTION notice so a human sees the repeat."""
+    `review-budget-followup` entry (legacy and hand-filed rows still exist) and
+    still won't converge, the damped force-converge commits — and, unlike an
+    ordinary quiet damped converge, it raises an ATTENTION notice so a human sees
+    the repeat."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
