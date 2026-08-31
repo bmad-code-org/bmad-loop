@@ -344,6 +344,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "restore",
         "returncode",
         "role",
+        # The outcome of an aborted re-arm's spec rollback (`rearm-aborted`), one of
+        # three literal enum strings the producer chooses. Benign rather than routed:
+        # it names no customer artifact and IS the field both operator surfaces read
+        # the record for, so an alias would destroy it (the failure
+        # `_JOURNAL_KIND_ALIAS_FIELDS`' `target` row documents in the other direction).
+        "rollback",
         "run_id",
         "run_type",
         "security_config_changed",

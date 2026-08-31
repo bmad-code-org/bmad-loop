@@ -4998,7 +4998,10 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     already queued behind this toast.
 
     Ablation: make `runs.rearm_event_notice` return None for any one of these kinds
-    and this reddens on that kind's message alone.
+    and this reddens on that kind's message alone. Drop "restore it from git" from the
+    `rearm-aborted` `failed` MESSAGE while keeping it in that arm's `next_step` and only
+    the remedy assertion reddens — which is the point of grading it here rather than on
+    the CLI, where the dropped half is still printed.
     """
     from bmad_loop import resolve, runs
     from bmad_loop.journal import Journal
@@ -5029,6 +5032,22 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             story_key=sk,
             spec_file="wt/specs/s1.md",
             status="ready-for-dev",
+        )
+        # `rearm-aborted` is journalled by `runs._rollback_rearm` from the transaction
+        # guard's error path. It rides this walk for its ROUTING, which is what this test
+        # grades — the rendering path is real on this surface either way, since a genuine
+        # abort reaches `_do_rearm`'s `finally` (and so this echo) BEFORE its
+        # `except RearmError` arm returns. The `failed` outcome is the one chosen on
+        # purpose: it is the single re-arm kind whose imperative is NOT moot here, because
+        # this path does not go on to resume, and this surface drops `next_step` — so the
+        # restore-from-git remedy has to survive in the MESSAGE or a TUI operator never
+        # gets it at all.
+        journal.append(
+            "rearm-aborted",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            error="OSError: [Errno 28] No space left on device",
+            rollback="failed",
         )
         return "ready-for-dev"
 
@@ -5071,6 +5090,11 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     assert severity_of("could not be re-opened to `ready-for-dev`") == "warning"
     # `note` maps onto Textual's own channel name, not through unchanged
     assert severity_of("excluded the abandoned restore's new files") == "information"
+    # the abort record, and specifically the half that only the MESSAGE can carry on a
+    # surface with no `next_step`: without it a TUI operator is told the spec may be
+    # part-written and given no remedy for it
+    assert severity_of("may be left part-written") == "warning"
+    assert any("restore it from git" in n[0] for n in notes), notes
     # the CLI's trailing imperative is omitted here: the resume is already queued
     assert not any("before resuming" in n[0] for n in notes), notes
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires

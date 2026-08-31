@@ -146,18 +146,25 @@ _JOURNAL_ALIAS_FIELDS = {
     # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
-    # The same value also arrives under a second field NAME. `runs.rearm_escalation`
-    # is the only journal producer of `spec_file`, across FOUR kinds —
-    # `rearm-spec-write-unreachable`, `rearm-spec-flip-skipped`,
-    # `rearm-baseline-restamp-skipped` and `rearm-baseline-restamped`. Routing is by
-    # field NAME, not by kind, so the list is documentation rather than a gate — but an
-    # enumeration that undercounts is how the next reader concludes a kind is unrouted.
+    # The same value also arrives under a second field NAME, from the re-arm family in
+    # `runs` — FIVE kinds, and no longer from a single function. `rearm_escalation`
+    # writes four of them (`rearm-spec-write-unreachable`, `rearm-spec-flip-skipped`,
+    # `rearm-baseline-restamp-skipped`, `rearm-baseline-restamped`); the fifth,
+    # `rearm-aborted`, is written by `runs._rollback_rearm` from the transaction guard's
+    # error path — a DIFFERENT function, which is why "the only producer" is no longer
+    # the right shape for this note. Routing is by field NAME, not by kind, so the list
+    # is documentation rather than a gate — but an enumeration that undercounts is how
+    # the next reader concludes a kind is unrouted, so it is corrected rather than
+    # left to age. `rearm-aborted` also carries `error` (dropped as free text) and
+    # `rollback`, a literal enum string declared benign in the routing guard.
     # `engine._park_awaiting_operator` passes
     # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
     # one — but BOTH fields are mixed-shape, and neither is the reliable one:
     # Both fields now journal an absolute path wherever they carry one: `spec_file`
-    # through `str(task_spec_path(...))` on all four kinds, and `spec` through
+    # through `str(task_spec_path(...))` on all five kinds — `rearm-aborted` forwards
+    # the same already-anchored value, and writes `""` rather than a story key when the
+    # aborted re-arm never resolved a spec path — and `spec` through
     # `engine._operator_spec_path` (which anchors `checkpoint-pause` the same
     # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
     # value, same namespace. Do NOT read that convergence as "both fields are
