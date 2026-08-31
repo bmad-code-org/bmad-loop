@@ -950,6 +950,185 @@ def test_stranded_bundle_story_keys_are_aliased_element_wise():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_scalar_story_keys_fails_closed_instead_of_shipping_verbatim():
+    """`_JOURNAL_KEYLIST_FIELDS` routing was gated on `isinstance(v, list)`, so a
+    SCALAR value on one of those names fell straight through to `scrub_json` — which
+    is the identity on an identifier-shaped string. `story_keys="1-1-acme-auth"` came
+    back verbatim.
+
+    Every producer passes a list today, so this is latent rather than live. That is
+    the argument FOR closing it rather than against: the routing decision would
+    otherwise rest on a survey of producers staying true, and the neighbouring
+    `story_keys` row above is graded on lists only, so nothing would notice.
+
+    Asserted on the raw value's ABSENCE, not on the presence key alone — a
+    presence-key assertion passes for every reason a value could be missing,
+    including the field never having been read.
+
+    Ablation: restore the `and isinstance(v, list)` gate on the `elif` and the
+    absence assertions redden with the raw key coming back."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "sweep-inflight-stranded", "story_keys": STORY_KEY},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert "story_keys" not in scrubbed, "the unknown-shaped value survived under its own name"
+    assert scrubbed["story_keys_present"] is True
+    rendered = json.dumps(scrubbed)
+    assert STORY_KEY not in rendered
+    for canary in CANARIES:
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_off_schema_preference_escalation_keys_are_collapsed_to_presence():
+    """`engine._review_and_commit` splats `escalation.preference_escalations(rj)`
+    into `journal.append`, and those entries come out of a session's own
+    `result.json` — so an LLM chooses the journal FIELD NAMES. No by-name table can
+    route a name nobody can enumerate, and `scrub_json` is the identity on an
+    identifier-shaped scalar, so `customer="AcmeVault"` shipped byte-identical into
+    a dump whose module docstring ends "the dump will be posted publicly".
+
+    `_JOURNAL_KIND_SCHEMAS` declares the record to be `{type, severity, detail}` and
+    collapses everything else on that kind. Both halves are graded here: the
+    off-schema value must be GONE, and the declared fields must NOT be — a policy
+    that flattened the whole record would pass an absence-only assertion while
+    destroying the field the record is read for.
+
+    ACCEPTED RESIDUAL, asserted so it stays honest rather than drifting: the key
+    NAME still reaches the dump as `<name>_present`. That was decided on 2026-08-30
+    over a name-free `unrouted_field_count` collapse; this row PINS it, so a future
+    reader finds it recorded as a decision rather than re-discovering it as a bug.
+
+    Ablation: drop the `preference-escalation` row from `_JOURNAL_KIND_SCHEMAS` and
+    the `AcmeVault` absence assertions redden."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "preference-escalation",
+            "story_key": STORY_KEY,
+            "type": "preference",
+            "severity": "MEDIUM",
+            "detail": "CANARY_ESCALATION prose about " + PROPRIETARY,
+            "customer": "AcmeVault",
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    # the off-schema key: collapsed, and its VALUE gone from the entry entirely
+    assert "customer" not in scrubbed
+    assert scrubbed["customer_present"] is True
+    assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema preference value"
+    # the declared schema is NOT collapsed — these are why the record is read
+    assert scrubbed["type"] == "preference"
+    assert scrubbed["severity"] == "MEDIUM"
+    # `detail` is in the schema but `_JOURNAL_DROP_FIELDS` reaches it first, which is
+    # the intended precedence: a stricter table always wins over this one
+    assert "detail" not in scrubbed and scrubbed["detail_present"] is True
+    # the entry stays correlatable — the kind policy replaces the FALLBACK only, so
+    # every routing rule above it still runs
+    assert scrubbed["story_key"] != STORY_KEY and scrubbed["story_key"].startswith("s1-")
+
+    rendered = json.dumps(scrubbed)
+    for canary in (STORY_KEY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_self_minted_fields_survive_a_declared_schema_kind():
+    """`Journal.append` stamps `log_task`/`log_pos` onto EVERY entry with
+    `setdefault`, including one whose kind carries a declared schema. They are
+    engine-authored, not LLM-authored, so the fail-closed arm must not touch them.
+
+    It did: `log_pos` is outside `{type, severity, detail}`, so a real
+    `preference-escalation` rendered `log_pos_present: true` and the pane-log byte
+    offset was gone — on exactly the records an operator opens a dump to trace.
+    `log_task` was never affected, since aliasing reaches it first; `log_pos` was the
+    only casualty, which is why a test naming the pair would have stayed green.
+
+    The exemption reads `journal.SELF_MINTED_FIELDS` rather than restating the pair,
+    so it cannot drift from the `setdefault` calls that create the fields.
+
+    Ablation: drop the `k not in SELF_MINTED_FIELDS` clause from `_scrub_entry`'s
+    fail-closed arm and the integer assertion reddens with `log_pos_present`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "preference-escalation",
+            "log_task": STORY_KEY,
+            "log_pos": 4096,
+            "type": "preference",
+            "customer": "AcmeVault",
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    # the byte offset survives as an INTEGER — the whole point of the exemption
+    assert scrubbed["log_pos"] == 4096
+    assert "log_pos_present" not in scrubbed
+    # the pane-log task pointer is still aliased, not dropped and not raw
+    assert scrubbed["log_task"] != STORY_KEY and scrubbed["log_task"].startswith("s1-")
+    # ...while the LLM-authored key on the same record is still collapsed, so the
+    # exemption did not widen into a general escape from the fail-closed arm
+    assert "customer" not in scrubbed and scrubbed["customer_present"] is True
+
+    rendered = json.dumps(scrubbed)
+    for canary in (STORY_KEY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_decision_pending_question_is_dropped_not_scrubbed():
+    """`sweep.py` journals `question=decision.question` on `decision-pending`, and it
+    was declared benign. A MULTI-WORD question does collapse — but only by accident
+    of `_IDENTIFIER_RE` forbidding spaces, which is not a property to route on. A
+    ONE-TOKEN question is identifier-shaped and shipped verbatim.
+
+    So it joins `detail`/`reason`/`blocker`/`suggestion`/`note` in
+    `_JOURNAL_DROP_FIELDS`, under the same free-text rule. No user-facing surface
+    loses the text: `tui/data.py`'s `decision_pending` reads the RAW journal on the
+    operator's own machine, not this dump.
+
+    The one-token case is the load-bearing one — grade the multi-word case alone and
+    the row stays green with the routing deleted, because the fallback happens to
+    redact it.
+
+    Ablation: drop `question` from `_JOURNAL_DROP_FIELDS` and the one-token absence
+    assertion reddens (the multi-word one does not — which is the point)."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    one_token = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "decision-pending", "dw_id": "DW-7", "question": "AcmeVault"},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "question" not in one_token
+    assert one_token["question_present"] is True
+    assert "AcmeVault" not in json.dumps(one_token), "LEAK: one-token decision question"
+    # the dw id beside it is untouched — it is the record's correlation handle
+    assert one_token["dw_id"] == "DW-7"
+
+    # an unset question still reports as absent rather than as set
+    empty = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "decision-pending", "dw_id": "DW-7", "question": ""},
+        pseudo,
+        {},
+        1.0,
+    )
+    assert empty["question_present"] is False
+
+    rendered = json.dumps([one_token, empty])
+    for canary in CANARIES:
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

@@ -42,7 +42,12 @@ import pytest
 
 import bmad_loop
 from bmad_loop import diagnostics, envvars
-from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, Journal
+from bmad_loop.journal import (
+    JOURNAL_FILE,
+    SELF_MINTED_FIELDS,
+    TASK_CYCLE_ARTIFACTS,
+    Journal,
+)
 
 SRC = Path(bmad_loop.__file__).resolve().parent
 # Marker an allowlisted exception line must carry. Written as ``# portability: …``;
@@ -320,7 +325,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
-        "question",
+        # `question` is NOT here any more: it moved to `_JOURNAL_DROP_FIELDS`
+        # (schema v3) once a one-token `decision-pending` question was shown to
+        # ship verbatim. Left as a note rather than a silent deletion, because a
+        # name leaving this set is the guard working — a benign declaration that
+        # turned out to be wrong.
         "rc",
         "re_review_capped",
         "rearmed",
@@ -384,7 +393,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
 # the fields a call spells. ``test_journal_append_writes_only_accounted_fields``
 # closes that from the other side by RUNNING an append and reading the entry back;
 # this set is what stops the staleness check below from calling ``log_pos`` dead.
-JOURNAL_SELF_MINTED_FIELDS = frozenset({"log_task", "log_pos"})
+#
+# READ FROM ``journal``, not restated: ``diagnostics._scrub_entry`` exempts the same
+# pair from the fail-closed arm it applies to a declared-schema kind, and a literal
+# copy here would let this guard and that exemption drift apart silently — which is
+# the failure mode DW-82 exists to remove, applied to the guard itself.
+JOURNAL_SELF_MINTED_FIELDS = SELF_MINTED_FIELDS
 
 # ``(file, enclosing function) -> the field names that actually flow through it`` for
 # every ``journal.append(**name)`` whose keys are NOT statically resolvable. An
@@ -421,9 +435,30 @@ JOURNAL_SPLAT_ALLOW = {
     ),
     # `pref` comes from `preference_escalations(result_json)` — LLM-authored keys out
     # of a session's own result.json. Not statically knowable in principle, not just
-    # in this scan; the redaction fallback is what covers it, and no inventory can be
-    # written for it at all.
-    ("engine.py", "_review_and_commit"): frozenset(),
+    # in this scan, so the OFF-SCHEMA half of this hole can never be inventoried.
+    #
+    # The three names below are the half that can: they are the record's declared
+    # schema, and they are the names whose VALUES still reach the dump (everything
+    # else on this kind collapses to a presence marker). Asserted against
+    # `diagnostics._JOURNAL_KIND_SCHEMAS` by
+    # `test_journal_routing_tables_are_read_from_diagnostics`, so this inventory and
+    # that table cannot disagree.
+    #
+    # What covers it is `diagnostics._JOURNAL_KIND_SCHEMAS`, which declares
+    # `preference-escalation`'s record to be `{type, severity, detail}` and collapses
+    # every other key on that kind to `<name>_present`. This comment used to say the
+    # REDACTION FALLBACK covered it, which was verified false: `scrub_json` is the
+    # IDENTITY on an identifier-shaped scalar, so `customer="AcmeVault"` came back
+    # byte-identical while this allowlist entry read as accounted for. A comment that
+    # names the wrong mechanism is how the next reader concludes a hole is closed
+    # when it is not.
+    #
+    # The hole this entry declares is therefore narrower than it looks, and it is
+    # still a hole: the key NAMES remain LLM-authored and still reach the dump as
+    # `<name>_present` markers. That residual was weighed against a name-free
+    # `unrouted_field_count` collapse and DELIBERATELY ACCEPTED on 2026-08-30 — see
+    # `_JOURNAL_KIND_SCHEMAS`. It is decided, not outstanding.
+    ("engine.py", "_review_and_commit"): frozenset({"type", "severity", "detail"}),
     # `self._session_end_extras(result)` is a method call, and that method builds its
     # dict with `extras.update(...)` — unresolvable at the call site and at the
     # definition. The names below are read off `engine._session_end_extras`, and five
@@ -3675,6 +3710,49 @@ def test_journal_routing_tables_are_read_from_diagnostics():
             "`_scrub_entry` consults `_JOURNAL_KIND_ALIAS_FIELDS` per kind, so a "
             "by-name claim about it is false on every other kind"
         )
+    # `_JOURNAL_KIND_SCHEMAS` is the FOURTH table `_scrub_entry` consults, and it was
+    # coupled to this guard by prose alone: deleting its `preference-escalation` row
+    # left every assertion here green while the fail-closed arm stopped running and
+    # `customer="AcmeVault"` went back to shipping verbatim (measured). Read it here
+    # so that cannot recur.
+    schemas = diagnostics._JOURNAL_KIND_SCHEMAS
+    assert schemas, (
+        "`_JOURNAL_KIND_SCHEMAS` is empty — `_scrub_entry`'s fail-closed arm is now "
+        "unreachable and every off-schema key falls back to `scrub_json`"
+    )
+    # The kind whose keys are LLM-authored is the reason the table exists, and
+    # `JOURNAL_SPLAT_ALLOW`'s comment for `engine.py::_review_and_commit` names this
+    # table as the mechanism that covers that hole. Pinned rather than trusted: a
+    # comment naming a mechanism that is not there is the failure this file exists
+    # to refuse.
+    assert "preference-escalation" in schemas
+    assert (
+        schemas["preference-escalation"] == JOURNAL_SPLAT_ALLOW[("engine.py", "_review_and_commit")]
+    ), (
+        "the declared schema and the splat inventory that cites it disagree — one "
+        "of the two was edited alone"
+    )
+    for kind, names in schemas.items():
+        # An empty declared set would collapse a record ENTIRELY, presence-marking
+        # every field including the ones the record is read for. Never the intent:
+        # a kind with nothing worth showing should not be in this table at all.
+        assert names, f"{kind} declares an empty schema, which collapses its whole record"
+        # Every declared name is accounted for on the guard's side too, so a schema
+        # can neither name a field nothing produces nor quietly introduce one that
+        # bypassed the routed/benign decision. `type` and `severity` reach the
+        # journal only through the allowlisted splat, so the inventory there is
+        # where they are declared.
+        unaccounted = names - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
+        unaccounted -= frozenset().union(*JOURNAL_SPLAT_ALLOW.values())
+        assert unaccounted == set(), (
+            f"{kind}'s declared schema names fields the guard does not account for: "
+            f"{sorted(unaccounted)}"
+        )
+        # A declared name must not also be kind-aliased on the same kind: the alias
+        # arm runs FIRST, so such a name would never reach the schema arm and the
+        # declaration would be a dead letter that reads as live.
+        assert not names & JOURNAL_KIND_ROUTED_FIELDS.get(kind, frozenset())
+
     # and the sets are disjoint: a routed name must never also be declared
     # benign, which would make the routing row unfalsifiable from this side.
     assert not JOURNAL_ROUTED_FIELDS & JOURNAL_BENIGN_FIELDS

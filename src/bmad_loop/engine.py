@@ -40,7 +40,7 @@ from .escalation import (
     session_failure_reason,
 )
 from .install import dev_primitive_or_default
-from .journal import Journal, save_state
+from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -105,6 +105,16 @@ HARVEST_ORIGIN = "spec-deferred"
 # read one immediate retry, but never dispatch another session over an unread
 # source: that later pass is allowed to replace the frontmatter list.
 HARVEST_REPAIR_READ_ATTEMPTS = 2
+# Journal field names a bound `journal.append(...)` call owns, and which therefore
+# cannot be carried by a `**splat` of LLM-authored keys. `self`/`kind` are `append`'s
+# bound parameters and `story_key` is already bound at the one splat site that needs
+# this, so any of them arriving in the splat raises `TypeError: got multiple values
+# for argument`; `ts` does not raise and instead silently overwrites the entry's real
+# timestamp, since `append` builds `{"ts": now, "kind": kind, **fields}`.
+# `log_task`/`log_pos` also do not raise: `append` stamps them with `setdefault`, so a
+# supplied value silently wins and forges the pane-log pointer. Import the defining
+# set from the minting site so this filter cannot drift from that pair.
+_JOURNAL_RESERVED_KEYS = frozenset({"self", "kind", "story_key", "ts"}) | SELF_MINTED_FIELDS
 
 
 def _digest_of(text: str | None) -> str:
@@ -2811,6 +2821,25 @@ class Engine:
 
             rj = result.result_json or {}
             for pref in preference_escalations(rj):
+                # `pref` is LLM-authored — it comes straight out of the session's own
+                # result.json — so its keys become journal field NAMES, and three of
+                # them collide with names this call already owns. `self` is bound by
+                # the method call and `kind`/`story_key` are bound above, so a
+                # result.json carrying any of them
+                # raised `TypeError: got multiple values for argument` and aborted
+                # the whole review leg over a field an agent invented (reproduced).
+                # `ts` does not raise and is worse for it: `Journal.append` builds
+                # `{"ts": now, "kind": kind, **fields}`, so a supplied `ts` silently
+                # OVERWRITES the real timestamp — `ts: 0` lands in the journal and
+                # every relative offset in a diagnostic dump is computed off it.
+                # Dropped rather than renamed: the record's declared schema is
+                # `{type, severity, detail}` (see `diagnostics._JOURNAL_KIND_SCHEMAS`),
+                # so a key spelled `kind`/`story_key`/`ts` is off-schema either way and
+                # would collapse to a presence marker in a dump regardless.
+                # `log_task`/`log_pos` also need filtering: `append` sets those with
+                # `setdefault`, so a caller value would silently replace its real
+                # pane-log pointer. All are journal-owned, not preference fields.
+                pref = {k: v for k, v in pref.items() if k not in _JOURNAL_RESERVED_KEYS}
                 self.journal.append("preference-escalation", story_key=task.story_key, **pref)
             # A review pass is itself a bmad-build-auto run: it produces a spec
             # (status done/blocked + a refreshed followup_review_recommended),

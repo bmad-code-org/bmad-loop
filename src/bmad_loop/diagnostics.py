@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, sanitize
-from .journal import VERIFY_DIR, Journal, load_state
+from .journal import SELF_MINTED_FIELDS, VERIFY_DIR, Journal, load_state
 from .model import RunState, StoryTask
 from .platform_util import walk_files_unlinked
 
@@ -71,7 +71,22 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 # the fence is gone and json.loads fails. Bump only on a payload break.
 # v2 replaces journal-entry `patch` / `stashed_to` values with the presence keys
 # `patch_present` / `stashed_to_present`.
-SCHEMA_VERSION = 2
+# v3 does the same thing to two more journal-entry values, which is the same
+# payload break for the same reason: `question` (on `decision-pending`) becomes
+# `question_present`, and on `preference-escalation` EVERY key outside the
+# `{type, severity, detail}` schema becomes `<name>_present` — see
+# `_JOURNAL_KIND_SCHEMAS`. A consumer reading `entry["question"]` finds it gone,
+# so this is a break under `machine.py`'s additive-only rule, exactly as v2 was.
+# The third change shipping with it — `_JOURNAL_KEYLIST_FIELDS` failing closed on a
+# non-list value — is deliberately NOT part of this rationale, but the reason is the
+# JSONL ROUND-TRIP, not the call sites. Two producers do pass a tuple
+# (`sweep.py`'s `dw_ids=(decision.id,)` and `dw_ids=tuple(task.dw_ids)`), so a survey
+# of producers would be the wrong argument and is false as such. What makes it a
+# non-break is that `_scrub_entry` never sees a producer's object: entries are
+# serialized to `journal.jsonl` and read back, and JSON has no tuple type, so every
+# sequence arrives as a `list` and takes the same arm it always did. The new arm is
+# reachable only by a shape no round-tripped entry can hold.
+SCHEMA_VERSION = 3
 DEFAULT_JOURNAL_CAP = 200
 
 # Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
@@ -234,6 +249,21 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "message",
         "note",
         "blocker",
+        # The deferred-work decision text a sweep parks on (`sweep.py`'s
+        # `decision-pending`) — operator-facing prose about the customer's own
+        # work, so it belongs beside `detail`/`reason`/`blocker`/`suggestion`/`note`
+        # under this set's free-text rule. Routed rather than left to `scrub_json`
+        # for the reason stated above that fallback: it collapses a MULTI-WORD
+        # question only by accident of `_IDENTIFIER_RE` forbidding spaces, and a
+        # one-token question (`"AcmeVault"`) is identifier-shaped and shipped
+        # verbatim (reproduced against `_scrub_entry`, 2026-08-30). No user-facing
+        # surface loses the text: both operator-facing readers take it from the RAW
+        # journal on the operator's own machine, not from this dump —
+        # `tui.data.pending_decision` (which returns the `(dw_id, question)` pair)
+        # and `tui.launch.decision_pending` (which answers the boolean). Named
+        # exactly, in both directions: an earlier version of this comment attributed
+        # `decision_pending` to `tui/data.py`, where no such symbol exists.
+        "question",
         "commit_message",
         "was_paused",
         "command",
@@ -285,6 +315,66 @@ _JOURNAL_DROP_FIELDS = frozenset(
 # unrouted `story_keys` shipped its keys verbatim while the singular `story_key`
 # beside it in the neighbouring record was aliased.
 _JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
+
+# ``kind -> the field names that kind's record is DECLARED to carry``. On a kind
+# listed here the usual ``scrub_json`` fallback is replaced by a fail-closed one:
+# any key outside its declared set renders as ``<name>_present`` rather than as a
+# value. Every other routing rule above still runs first and still wins, so a
+# declared-schema kind's ``story_key`` is aliased and its ``detail`` is dropped
+# exactly as on any other kind — this table only decides what happens to the names
+# nothing else claimed.
+#
+# It exists because ONE kind's field names are not authored by this codebase at all.
+# ``engine._review_and_commit`` splats ``escalation.preference_escalations(rj)`` —
+# entries lifted straight out of a session's own ``result.json`` — into
+# ``journal.append``, so an LLM chooses the journal FIELD NAMES. The by-name tables
+# cannot route a name nobody can enumerate, and the ``scrub_json`` fallback is the
+# IDENTITY on an identifier-shaped scalar: an entry carrying
+# ``customer="AcmeVault"`` came back byte-identical (reproduced against
+# ``_scrub_entry``, 2026-08-30).
+#
+# The declared shape is ``{type, severity, detail}``. Its PROVENANCE, stated
+# precisely because an earlier version of this comment got it wrong: the sole
+# producer of this kind is ``engine._review_and_commit``, splatting a
+# bmad-build-auto REVIEW session's ``result.json`` entries. Sweep does not journal
+# ``preference-escalation`` at all. ``data/skills/bmad-loop-sweep/automation-mode.md``
+# declares the same three-key shape for a DIFFERENT session type, so it corroborates
+# the shape and is not the contract that produces this record. Anything outside those
+# three keys is off-schema and has no diagnostic claim on being shown verbatim.
+#
+# ⚠️ ACCEPTED RESIDUAL — decided 2026-08-30, not an oversight, and NOT to be
+# re-filed or "fixed" as a fresh finding. This table closes the NAME axis only, and
+# three things still reach the dump. Stated in full, because a disclosure that
+# understates its own scope is the same defect as a comment naming the wrong
+# mechanism.
+#
+#  1. The key NAME. ``AcmeVaultTenant=1`` renders as ``AcmeVaultTenant_present``.
+#     A name-free collapse (a single ``unrouted_field_count`` integer) closes this
+#     and was OFFERED AND DECLINED, in favour of the per-key marker's diagnostic
+#     value — a maintainer can see WHICH off-schema key a session invented, which is
+#     most of why the record is read.
+#  2. Arbitrary key SHAPES, which follows from 1 and is easy to miss: nothing
+#     constrains an LLM-authored key to be identifier-shaped, so a free-text key
+#     survives as a JSON key with the suffix glued on —
+#     ``"customer AcmeVault owes 5k"`` renders as
+#     ``"customer AcmeVault owes 5k_present"`` (reproduced).
+#  3. The VALUES of the three DECLARED names, which this table does not touch at
+#     all: they stay on the ``scrub_json`` fallback, so
+#     ``type="acmevault-tenant-isolation"`` and ``severity="AcmeVaultHigh"`` both come
+#     back byte-identical, as does a container in a declared name
+#     (``type={"customer": "AcmeVault"}``) — all reproduced.
+#
+# Do NOT "fix" 3 by routing ``type``/``severity``: the intent this table implements
+# requires the declared schema to be emitted as it is today, on the ground that
+# collapsing it destroys the field the record is read for. A further leak here is
+# DISCLOSED — which is what this comment is — never routed.
+#
+# ``detail`` is named here for completeness even though ``_JOURNAL_DROP_FIELDS``
+# reaches it first: the set states the record's schema, and a schema that omitted a
+# field because some other table happened to cover it would mislead the next reader.
+_JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
+    "preference-escalation": frozenset({"type", "severity", "detail"}),
+}
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
 # rather than scrubbed, since a single-token API key or repo name could be
@@ -723,8 +813,14 @@ def _scrub_entry(
     first_ts: float | None,
 ) -> dict:
     """One journal entry reduced to a shareable form: relative timestamp, kind
-    verbatim, identifier fields aliased, free-text fields collapsed to a
-    presence boolean, and every remaining/unknown field scrub_json'd."""
+    verbatim, identifier fields aliased, free-text fields collapsed to a presence
+    boolean, and every remaining/unknown field scrub_json'd.
+
+    Two kinds of field never reach that last fallback, because for them
+    ``scrub_json`` fails closed only by accident of a value's shape. A name in
+    ``_JOURNAL_KEYLIST_FIELDS`` carrying something other than a list collapses to a
+    presence key, and on a kind with a declared schema
+    (``_JOURNAL_KIND_SCHEMAS``) so does every key the schema does not name."""
     out: dict[str, Any] = {}
     ts = entry.get("ts")
     if isinstance(ts, (int, float)) and first_ts is not None:
@@ -735,23 +831,55 @@ def _scrub_entry(
     # `looks_like_identifier` is not one of the three below anyway, and keying on the
     # placeholder would silently unroute every entry in a dump that had one.
     by_kind = _JOURNAL_KIND_ALIAS_FIELDS.get(kind, {})
+    declared = _JOURNAL_KIND_SCHEMAS.get(kind)
     for k, v in entry.items():
         if k in ("ts", "kind"):
             continue
         kind_ns = by_kind.get(k)
         if k in _JOURNAL_DROP_FIELDS:
             out[f"{k}_present"] = v is not None and v != ""
-        elif k in _JOURNAL_KEYLIST_FIELDS and isinstance(v, list):
-            # Namespace by field, not by "everything that is not `keys`": both
-            # story-key list fields must land in the SAME namespace as the singular
-            # `story_key`, or one dump would carry two aliases for one story.
-            ns = "dw" if k == "dw_ids" else "story"
-            out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
+        elif k in _JOURNAL_KEYLIST_FIELDS:
+            if isinstance(v, list):
+                # Namespace by field, not by "everything that is not `keys`": both
+                # story-key list fields must land in the SAME namespace as the
+                # singular `story_key`, or one dump would carry two aliases for one
+                # story.
+                ns = "dw" if k == "dw_ids" else "story"
+                out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
+            else:
+                # A name in this set is DECLARED to carry a list of identifiers, so a
+                # non-list is an unknown shape — and falling through to `scrub_json`
+                # for it is exactly the accident this whole set exists to stop: a
+                # scalar `story_keys="1-1-acme-auth"` is identifier-shaped and ships
+                # verbatim (reproduced, 2026-08-30). Every producer passes a list
+                # today, so this is latent rather than live — which is the reason to
+                # fail closed on it rather than to rest on that survey staying true.
+                # A presence marker rather than an alias because the shape is
+                # genuinely unknown: a dict or an int has no sensible alias, and the
+                # one thing worth reporting is that the field was set.
+                out[f"{k}_present"] = v is not None and v != ""
         elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
             ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
+        elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
+            # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
+            # `scrub_json` fallback with a fail-closed one, because on such a kind an
+            # unclaimed name is not a field nobody has routed yet — it is a field
+            # nobody in this codebase NAMED. See that table for the accepted residual:
+            # the key name itself still ships.
+            #
+            # `SELF_MINTED_FIELDS` is exempt because the premise does not hold for it.
+            # `Journal.append` stamps `log_task`/`log_pos` onto EVERY entry, including
+            # this kind's, so they are engine-authored and arrive on a record whose
+            # other keys are not. Collapsing them buys no safety — `log_task` is
+            # aliased before it ever reaches here, and `log_pos` is a byte offset —
+            # while `log_pos_present: true` would silently destroy the pane-log
+            # pointer on precisely the records an operator opens a dump to trace.
+            # Imported from `journal` rather than restated, so this exemption cannot
+            # drift from the `setdefault` pair that creates the fields.
+            out[f"{k}_present"] = v is not None and v != ""
         else:
             out[k] = sanitize.scrub_json(v)
     return out
