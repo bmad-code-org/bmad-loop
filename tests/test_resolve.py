@@ -92,6 +92,20 @@ def _escalated_run(
     return run.run_dir, run.state, run.task
 
 
+def _context(state, run_dir, story_key, *, isolation):
+    """`build_context`'s Path alone, for the ~30 rows that assert on `context.json`.
+
+    `build_context` returns `(path, withheld)` since DW-11, and the withheld count is
+    an OPERATOR-facing number the CLI prints — no row here is about it. Routing every
+    Path-only caller through one unpack pins the arity for all of them at once: grow
+    the tuple a third member and this helper fails, rather than every row silently
+    binding a longer tuple to `path` (which is what a bare `path, _ = ...` at each
+    site would do). The rows that ARE about the count call `resolve.build_context`
+    directly, so the number is never produced by this helper."""
+    path, _withheld = resolve.build_context(state, run_dir, story_key, isolation=isolation)
+    return path
+
+
 # ------------------------------------------------------------ set_frontmatter_field
 #
 # `set_frontmatter_status`'s own tests live in tests/test_frontmatter.py, next to
@@ -531,7 +545,7 @@ def test_build_context_gathers_critical_escalations(tmp_path):
         ),
         encoding="utf-8",
     )
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == "6-4-cli-list-command"
     assert ctx["spec_file"] == spec.as_posix()
@@ -589,7 +603,7 @@ def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)  # what the resolve session actually runs from
 
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert Path(ctx["spec_file"]).is_absolute()
     # the worktree's copy, not the main checkout's twin — compared as posix, which is
@@ -611,17 +625,15 @@ def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=None, worktree_path=str(wt))
 
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_file"] is None  # task present, spec-less escalation
 
     assert "no-such-story" not in state.tasks
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "no-such-story", isolation="worktree").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "no-such-story", isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] is None  # no task at all
     # ... and the escalation gather degrades on the same absence rather than
@@ -631,7 +643,7 @@ def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
 
 def test_build_context_no_session_files(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, with_session=False)
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["escalations"] == []
     assert ctx["paused_reason"].startswith("CRITICAL")
@@ -646,25 +658,25 @@ def test_build_context_restore_supported_signal(tmp_path):
     run_dir, state, task = _escalated_run(tmp_path, spec_file="/abs/spec.md", with_session=False)
     key = "6-4-cli-list-command"
 
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is True
 
-    path = resolve.build_context(state, run_dir, key, isolation="worktree")
+    path = _context(state, run_dir, key, isolation="worktree")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = str(tmp_path / "wt")  # recorded worktree execution
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = ""
     task.spec_file = None  # spec-less escalation: a restored patch has no review to resume
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.spec_file = "/abs/spec.md"
     state.source = "stories"
     task.sentinel_kind = "missing-prd"  # pre-planning wedge: nothing attempted to restore
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
 
@@ -675,7 +687,7 @@ def test_build_context_sanitizes_dirty_story_key(tmp_path):
     dirty = "6-4:cli?list"
     seg = safe_segment(dirty)
     assert seg != dirty
-    path = resolve.build_context(state, run_dir, dirty, isolation="")
+    path = _context(state, run_dir, dirty, isolation="")
     assert path.parent.name == seg
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == dirty
@@ -689,7 +701,7 @@ def test_rearm_flips_phase_and_spec_status(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    key = runs.rearm_escalation(run_dir, isolated_redrive=False)
+    key = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert key == "6-4-cli-list-command"
     state = load_state(run_dir)
     task = state.tasks[key]
@@ -713,7 +725,7 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
         encoding="utf-8",
     )
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     text = spec.read_text(encoding="utf-8")
     assert "Auto Run Result" not in text and "names not unique" not in text
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
@@ -756,7 +768,7 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
         tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["story_key"] == "6-4-cli-list-command"
@@ -778,7 +790,7 @@ def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_pat
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -846,9 +858,9 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
     if shape == "no-frontmatter":
         with pytest.raises(runs.RearmError, match="no frontmatter `status:`"):
-            runs.rearm_escalation(run_dir, isolated_redrive=False)
+            runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     else:
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
     if shape == "already-at-target":
@@ -879,7 +891,7 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
 def test_rearm_journals_event(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     journal = (run_dir / "journal.jsonl").read_text(encoding="utf-8")
     assert "story-escalation-resolved" in journal
 
@@ -898,7 +910,7 @@ def test_rearm_advances_baseline_to_resolved_head(project):
     # a file the resolve session (or the user) left untracked must enter the
     # snapshot, so the redrive reset treats it as pre-existing, not run-created
     (root / "leftover.txt").write_text("keep me\n", encoding="utf-8")
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(root, "rev-parse", "HEAD")
     assert task.baseline_commit != old_head
@@ -917,7 +929,7 @@ def test_rearm_baseline_all_or_nothing_on_partial_git_failure(monkeypatch, proje
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
     assert task.baseline_untracked is None
@@ -927,7 +939,7 @@ def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
     # best-effort contract: a project dir that is not a git repo (or a broken
     # one) must not make re-arm fail — the old baseline simply stands
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
 
@@ -947,7 +959,7 @@ def test_rearm_journals_a_failed_baseline_advance(tmp_path):
     """
     run_dir, _, _ = _escalated_run(tmp_path)  # tmp_path is not a git repo
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"]
     assert entry["story_key"] == "6-4-cli-list-command"
@@ -975,7 +987,7 @@ def test_rearm_does_not_swallow_a_non_git_fault_from_the_advance(monkeypatch, tm
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
     with pytest.raises(MemoryError):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 @pytest.mark.parametrize("restore", [None, "artifacts/attempt.patch"])
@@ -999,7 +1011,9 @@ def test_rearm_does_not_restamp_a_baseline_the_advance_did_not_move(monkeypatch,
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir, restore_patch=restore, isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir, restore_patch=restore, isolated_redrive=False, resolution_recorded=True
+    )
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == old_head  # NOT re-stamped with the stale sha
@@ -1024,7 +1038,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     before = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert before.generation == 0 and len(before.sessions) == 1
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.generation == 1
@@ -1032,7 +1046,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     assert len(task.sessions) == 1  # the audit trail survives the re-arm
 
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].generation == 2
 
 
@@ -1057,7 +1071,7 @@ def test_rearm_advances_the_baseline_in_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     (code / "leftover.txt").write_text("keep me\n")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(code, "rev-parse", "HEAD") != head
@@ -1115,7 +1129,9 @@ def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     new_head = git(code, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)  # from scratch: the latch is dropped
+    runs.rearm_escalation(
+        run_dir, isolated_redrive=False, resolution_recorded=True
+    )  # from scratch: the latch is dropped
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == new_head
@@ -1156,7 +1172,7 @@ def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
 
     assert load_state(run_dir).repo_root == ""
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
 
 
@@ -1203,7 +1219,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)  # what `bmad-loop resolve` actually runs from
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     fm = verify.read_frontmatter(wt / rel)
     assert fm["status"] == "ready-for-dev"  # the flip landed in the WORKTREE
@@ -1240,7 +1256,7 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=False
+        run_dir, isolated_redrive=False, resolution_recorded=True
     )  # must not raise: the flip's no-op is not a refusal
 
     kinds = _kinds(run_dir)
@@ -1280,7 +1296,7 @@ def test_rearm_records_an_unreachable_spec_even_when_the_advance_failed(tmp_path
         _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
@@ -1308,7 +1324,7 @@ def test_rearm_restamps_normally_when_the_spec_resolves(tmp_path):
     spec.write_text("---\nstatus: 'escalated'\nbaseline_revision: 'old'\n---\n\nbody\n")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"] == []
@@ -1337,7 +1353,7 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    returned = runs.rearm_escalation(run_dir, isolated_redrive=False)
+    returned = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert returned == key
 
     # sentinel deleted from disk, a copy preserved under the run dir
@@ -1377,7 +1393,7 @@ def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
     # detected as a sentinel) → status-flip, not delete.
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # not deleted
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1397,7 +1413,7 @@ def test_rearm_sentinel_named_spec_never_detected_is_not_deleted(tmp_path):
     # stories mode, but sentinel_kind unset — the run never classified it as a sentinel
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1414,7 +1430,7 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nreal work\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))  # sprint-status source
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"  # flipped like any spec
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1441,7 +1457,10 @@ def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
 
     with pytest.raises(runs.RearmError, match="sentinel"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=False,
+            resolution_recorded=True,
         )
 
     assert sentinel.is_file()  # nothing deleted, copy NOT preserved — no clear happened
@@ -1463,7 +1482,10 @@ def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
 
     with pytest.raises(runs.RearmError, match="no recorded spec file"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=False,
+            resolution_recorded=True,
         )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
@@ -1472,7 +1494,7 @@ def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
     assert not (run_dir / "journal.jsonl").exists()  # nothing journaled
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=False
+        run_dir, isolated_redrive=False, resolution_recorded=True
     )  # a from-scratch re-arm remains available
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
@@ -1490,14 +1512,20 @@ def test_rearm_rejects_restore_patch_for_a_worktree_executed_task(tmp_path):
 
     with pytest.raises(runs.RearmError, match="worktree-isolation"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=True
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=True,
+            resolution_recorded=True,
         )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.phase == Phase.ESCALATED  # nothing mutated; still armed for a re-resolve
     assert task.restore_patch is None
     # a from-scratch re-arm of the same task is unaffected — the guard is latch-only
-    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == "6-4-cli-list-command"
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+        == "6-4-cli-list-command"
+    )
 
 
 def test_validate_restore_latch_passes_a_clean_in_place_escalation(tmp_path):
@@ -1524,7 +1552,12 @@ def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir,
+        restore_patch="artifacts/attempt.patch",
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
     task = load_state(run_dir).tasks[key]
     assert task.phase == Phase.PENDING
     assert task.restore_patch == "artifacts/attempt.patch"
@@ -1564,7 +1597,12 @@ def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
     new_head = git(tmp_path, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir,
+        restore_patch="artifacts/attempt.patch",
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head  # step-04 diffs from the ADVANCED baseline
@@ -1614,7 +1652,7 @@ def test_rearm_restamps_spec_baseline_on_the_from_scratch_leg_too(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)  # no restore
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)  # no restore
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head
@@ -1665,7 +1703,7 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
 
     with pytest.raises(runs.RearmError, match="baseline_revision"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # flip AND strip both undone
     # nothing was persisted either, so the escalation is still armed for a corrected spec
@@ -1716,7 +1754,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
 
     with pytest.raises(runs.RearmError, match="No space left on device"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # the published flip is rolled back
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
@@ -1762,7 +1800,7 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
 
     with pytest.raises(runs.RearmError, match="No space left on device"):
-        runs.rearm_escalation(run_dir, isolated_redrive=True)
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # the undo reached a spec outside the mount
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
@@ -1781,7 +1819,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, _spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head
@@ -1790,7 +1828,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
 
     # a second re-arm has nothing left to overwrite: no duplicate record
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert len([e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]) == 1
 
 
@@ -1816,7 +1854,7 @@ def test_rearm_does_not_report_a_divergence_the_run_never_had(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head, recorded=old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     # the re-stamp itself ran: this row is about what was REPORTED, not what was skipped
     assert verify.read_frontmatter(spec)["baseline_revision"] == new_head
@@ -1852,7 +1890,7 @@ def test_rearm_reports_a_claim_the_advanced_head_would_have_masked(tmp_path):
         encoding="utf-8",
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == new_head  # the claim, carried verbatim
@@ -1869,7 +1907,7 @@ def test_rearm_prefers_the_fresh_revision_when_the_spec_carries_both_keys(tmp_pa
         tmp_path, old_head, extra=f"baseline_commit: {'a' * 40}\n"
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head  # NOT the stale baseline_commit
@@ -1905,7 +1943,7 @@ def test_build_context_tolerates_non_utf8_present_spec(tmp_path):
     (stories_dir / f"{key}-slug.md").write_bytes(_BAD_UTF8)  # a real spec, undecodable
     run_dir, state, _ = _escalated_run(tmp_path, source="stories")
 
-    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
+    path = _context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["spec_folder"] == ""  # best-effort context still produced
     assert "sentinel" not in ctx["stories"]  # the undecodable spec yields no sentinel
@@ -1920,7 +1958,7 @@ def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
     (stories_dir / f"{key}-unresolved.md").write_bytes(_BAD_UTF8)  # undecodable sentinel
     run_dir, state, _ = _escalated_run(tmp_path, source="stories", sentinel_kind="unresolved")
 
-    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
+    path = _context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["sentinel"]["kind"] == "unresolved"
     assert ctx["stories"]["sentinel"]["blocking_condition"] == ""  # unreadable → empty
@@ -1941,7 +1979,7 @@ def test_rearm_non_utf8_present_spec_fails_clean_and_stays_armed(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
     with pytest.raises(runs.RearmError) as exc:
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert "UTF-8" in str(exc.value) and "resolve" in str(exc.value)
     assert spec.read_bytes() == _BAD_UTF8  # spec untouched
     task = load_state(run_dir).tasks[key]
@@ -1961,7 +1999,9 @@ def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    assert runs.rearm_escalation(run_dir, isolated_redrive=False) == key  # must not raise
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True) == key
+    )  # must not raise
     assert not sentinel.exists()  # cleared by deletion
     assert (run_dir / "sentinels" / f"{key}-unresolved.md").is_file()  # copy preserved
     assert load_state(run_dir).tasks[key].spec_file is None  # cleared → PENDING re-dispatch
@@ -1994,7 +2034,7 @@ def test_rearm_rejects_non_escalation_stage(tmp_path):
         ),
     )
     with pytest.raises(runs.RearmError, match="not paused at an escalation"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 def test_rearm_rejects_unescalated_story(tmp_path):
@@ -2002,7 +2042,7 @@ def test_rearm_rejects_unescalated_story(tmp_path):
     task.phase = Phase.DONE  # terminal but not escalated
     save_state(run_dir, state)
     with pytest.raises(runs.RearmError, match="not escalated"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 # ------------------------------------------------- _gather_escalations
@@ -2032,7 +2072,7 @@ def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
         encoding="utf-8",
     )
 
-    found = resolve._gather_escalations(run_dir, state, key)
+    found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["abandoned cycle"]  # once, not twice
 
     # DW-71: the id bump only protects records minted AFTER it. State persisted
@@ -2040,7 +2080,7 @@ def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
     # directory's single mutable escalation.json — the reader itself has to return
     # the escalation once rather than attribute it to the fresh session too.
     task.sessions[1] = SessionRecord(task_id=abandoned, role="dev", status="completed")
-    collided = resolve._gather_escalations(run_dir, state, key)
+    collided, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in collided] == ["abandoned cycle"]
 
 
@@ -2082,7 +2122,7 @@ def test_gather_escalations_opens_a_repeated_task_id_once(tmp_path, monkeypatch)
     # back the suite's `BMAD_LOOP_STATE_DIR` isolation too, mid-test.
     with monkeypatch.context() as mp:
         mp.setattr(Path, "read_text", counting_read_text)
-        found = resolve._gather_escalations(run_dir, state, key)
+        found, _ = resolve._gather_escalations(run_dir, state, key)
 
     assert reads.count(str(result_file)) == 1  # each artifact once, not once per record
     assert reads.count(str(esc_file)) == 1
@@ -2124,7 +2164,7 @@ def test_gather_escalations_dedupes_one_entry_across_two_sessions(tmp_path):
     for d in (older_dir, newer_dir):
         (d / "escalation.json").write_text(json.dumps({"escalations": [entry]}), encoding="utf-8")
 
-    found = resolve._gather_escalations(run_dir, state, key)
+    found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["unresolved across attempts"]
 
 
@@ -2140,7 +2180,7 @@ def test_gather_escalations_orders_distinct_sessions_newest_first(tmp_path):
             encoding="utf-8",
         )
 
-    found = resolve._gather_escalations(run_dir, state, key)
+    found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["newer", "older"]
 
 
@@ -2173,9 +2213,7 @@ def test_gather_escalations_returns_a_mirrored_entry_once(tmp_path):
         (task_dir / fname).write_text(json.dumps({"escalations": [value]}), encoding="utf-8")
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert ctx["escalations"] == [entry]
 
@@ -2192,7 +2230,7 @@ def test_gather_escalations_keeps_distinct_entries_from_both_files(tmp_path):
     (task_dir / "result.json").write_text(json.dumps({"escalations": [a]}), encoding="utf-8")
     (task_dir / "escalation.json").write_text(json.dumps({"escalations": [a, b]}), encoding="utf-8")
 
-    found = resolve._gather_escalations(run_dir, state, "6-4-cli-list-command")
+    found, _ = resolve._gather_escalations(run_dir, state, "6-4-cli-list-command")
     assert [e["detail"] for e in found] == ["A", "B"]
 
 
@@ -2218,7 +2256,10 @@ def test_gather_escalations_keeps_full_objects_that_share_a_detail(tmp_path):
         json.dumps({"escalations": [first, second]}), encoding="utf-8"
     )
 
-    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
 
 
 def test_gather_escalations_preserves_result_before_escalation_file_order(tmp_path):
@@ -2232,7 +2273,10 @@ def test_gather_escalations_preserves_result_before_escalation_file_order(tmp_pa
         json.dumps({"escalations": [second]}), encoding="utf-8"
     )
 
-    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
 
 
 def test_gather_escalations_keeps_a_duplicates_first_position(tmp_path):
@@ -2246,7 +2290,10 @@ def test_gather_escalations_keeps_a_duplicates_first_position(tmp_path):
         json.dumps({"escalations": [second, first]}), encoding="utf-8"
     )
 
-    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
 
 
 def test_gather_escalations_dedupes_repeats_inside_one_list(tmp_path):
@@ -2258,7 +2305,7 @@ def test_gather_escalations_dedupes_repeats_inside_one_list(tmp_path):
         json.dumps({"escalations": [entry, entry]}), encoding="utf-8"
     )
 
-    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [entry]
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == ([entry], 0)
 
 
 def test_gather_escalations_keeps_mixed_case_critical_and_drops_non_dicts(tmp_path):
@@ -2271,7 +2318,7 @@ def test_gather_escalations_keeps_mixed_case_critical_and_drops_non_dicts(tmp_pa
         json.dumps({"escalations": [None, "junk", preference, critical]}), encoding="utf-8"
     )
 
-    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [critical]
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == ([critical], 0)
 
 
 def test_gather_escalations_skips_a_non_utf8_artifact(tmp_path):
@@ -2288,9 +2335,7 @@ def test_gather_escalations_skips_a_non_utf8_artifact(tmp_path):
     )
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert [e["detail"] for e in ctx["escalations"]] == ["still readable"]
 
@@ -2319,7 +2364,7 @@ def test_gather_escalations_skips_a_plain_json_value_error(tmp_path, monkeypatch
 
     with monkeypatch.context() as mp:
         mp.setattr(resolve.json, "loads", loads_with_digit_limit)
-        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
@@ -2346,9 +2391,7 @@ def test_gather_escalations_skips_a_json_recursion_error(tmp_path):
     )
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
 
@@ -2372,7 +2415,7 @@ def test_gather_escalations_skips_a_canonicalization_recursion_error(tmp_path, m
 
     with monkeypatch.context() as mp:
         mp.setattr(resolve.json, "dumps", dumps_with_recursion_error)
-        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["escalations"] == [sibling]
@@ -2405,7 +2448,7 @@ def test_gather_escalations_skips_a_non_list_escalations_field(tmp_path, monkeyp
 
     with monkeypatch.context() as mp:
         mp.setattr(resolve, "critical_escalations", recording_critical_escalations)
-        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert filtered == [
@@ -2435,13 +2478,338 @@ def test_gather_escalations_preference_only_yields_nothing(tmp_path):
     for fname in ("result.json", "escalation.json"):
         (task_dir / fname).write_text(json.dumps({"escalations": [pref]}), encoding="utf-8")
 
-    assert resolve._gather_escalations(run_dir, state, key) == []
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
 
     crit = {"type": "spec-gap", "severity": "CRITICAL", "detail": "kept"}
     for fname in ("result.json", "escalation.json"):
         (task_dir / fname).write_text(json.dumps({"escalations": [pref, crit]}), encoding="utf-8")
-    found = resolve._gather_escalations(run_dir, state, key)
+    found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["kept"]  # this directory IS read
+
+
+# -------------------------------------- DW-11: the escalation watermark
+
+
+def _watermarked_trail(tmp_path, per_session):
+    """A task whose append-only `sessions` list carries ONE record per element of
+    `per_session`, each with its own `tasks/<id>/escalation.json` holding that
+    record's CRITICAL details. Returns `(run_dir, state, task, key)` with the state
+    already saved, so a row can re-arm it without re-saving by hand.
+
+    The ids are minted through `engine._session_task_id`, varying the SEQ inside
+    generation 0 — the trail one pre-re-arm cycle leaves behind. Distinctness is
+    asserted rather than assumed: a shared id collapses into the reader's `seen_ids`
+    guard, leaving one directory and one side to route to, and every row below would
+    then pass with the filter ablated. Varying the seq (not the generation) also
+    keeps the whole namespace clear of the ids a LATER re-arm mints, so a re-drive
+    record cannot silently overwrite a trail artifact.
+    """
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    task.sessions.clear()
+    for seq, details in enumerate(per_session, start=1):
+        task_id = _session_task_id(key, "review", seq, 0)
+        assert task_id not in {r.task_id for r in task.sessions}
+        task.sessions.append(SessionRecord(task_id=task_id, role="dev", status="completed"))
+        d = run_dir / "tasks" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "escalation.json").write_text(
+            json.dumps(
+                {
+                    "escalations": [
+                        {"type": "spec-gap", "severity": "CRITICAL", "detail": detail}
+                        for detail in details
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    save_state(run_dir, state)
+    return run_dir, state, task, key
+
+
+def _redrive_escalates(run_dir, key, detail, *, escalated=False):
+    """Append the record + artifact a re-driven session that escalated again leaves
+    behind — through `record_session`, the SOLE mutation of `task.sessions` in
+    `src/`, which is what makes a length watermark meaningful. The id carries the
+    re-arm's own generation, exactly as `engine._session_task_id` would mint it."""
+    state = load_state(run_dir)
+    task = state.tasks[key]
+    assert task.generation > 0  # a re-arm ran, so this id is in a fresh namespace
+    task_id = _session_task_id(key, "review", 1, task.generation)
+    assert task_id not in {r.task_id for r in task.sessions}
+    task.record_session(SessionRecord(task_id=task_id, role="dev", status="completed"))
+    d = run_dir / "tasks" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "escalation.json").write_text(
+        json.dumps(
+            {"escalations": [{"type": "spec-gap", "severity": "CRITICAL", "detail": detail}]}
+        ),
+        encoding="utf-8",
+    )
+    if escalated:
+        task.phase = Phase.ESCALATED
+    save_state(run_dir, state)
+
+
+def test_gather_escalations_shows_the_whole_trail_at_watermark_zero(tmp_path):
+    """The default is the PRE-DW-11 walk, byte-for-byte. 0 is what a task that was
+    never resolved carries and what a pre-upgrade `state.json` deserializes to, so
+    this row is also the legacy-state contract at the reader."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    assert task.escalations_resolved_upto == 0
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["newer", "older"]
+    assert withheld == 0
+
+
+def test_gather_escalations_hides_sessions_below_the_watermark(tmp_path):
+    """The defect DW-11 names. `task.sessions` is append-only and a re-arm
+    deliberately does not clear it, so a second resolve cycle re-presented every
+    escalation the story ever raised — interleaved with the new ones and with
+    nothing marking which was which, against a skill contract that is singular
+    ("present THE escalation").
+
+    Ablation: ignore `start` in `_gather_escalations` (route everything to `found`)
+    and this row fails by showing the answered entry again."""
+    run_dir, state, _task, key = _watermarked_trail(
+        tmp_path, [["answered last cycle"], ["raised since"]]
+    )
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["raised since"]
+    assert withheld == 1
+
+
+def test_gather_escalations_counts_the_entries_it_withheld(tmp_path):
+    """The number the operator is shown is the count of DISTINCT withheld entries,
+    not of sessions or of directories — and it comes from the same single walk that
+    produced the shown list, never a second call subtracting lengths."""
+    run_dir, state, _task, key = _watermarked_trail(tmp_path, [["a", "b", "c"], ["new"]])
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["new"]
+    assert withheld == 3
+
+
+def test_gather_escalations_does_not_count_an_entry_it_still_shows(tmp_path):
+    """ "Not shown" is the claim the number makes, so it must never count something
+    the operator can see. An escalation the re-drive re-raised appears on BOTH sides
+    of the watermark: it is shown once (the newest-first content map) and contributes
+    0 to the count, while its answered-only sibling contributes 1.
+
+    The sibling is the in-row positive control: an `assert withheld == 0` alone would
+    pass just as well if the answered directory were never read at all.
+
+    Ablation: drop the `key not in found` clause from the count and this reddens at
+    2 != 1."""
+    run_dir, state, _task, key = _watermarked_trail(
+        tmp_path,
+        [["re-raised by the re-drive", "answered and gone"], ["re-raised by the re-drive"]],
+    )
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["re-raised by the re-drive"]  # once, not twice
+    assert withheld == 1  # "answered and gone" only
+
+
+def test_gather_escalations_attributes_a_task_id_spanning_the_watermark_to_the_shown_side(
+    tmp_path,
+):
+    """One `task_id` on an answered record AND an unanswered one — the shape the
+    pre-`generation` id namespace produced, which persisted state still carries. The
+    `seen_ids` guard opens that directory ONCE, at its newest occurrence, which is
+    the unanswered side: the entry is SHOWN. Over-showing is the conservative
+    direction; the alternative buries an escalation on an ambiguity.
+
+    Ablation: walk the trail FORWARD — `for index, session in enumerate(task.sessions)`
+    with `target = found if index >= start else answered`, a rewrite that still reads
+    correct and leaves every other row in this block green except the ordering sibling
+    — and this reddens at `([], 1)`. The shared directory is then opened at its
+    ANSWERED occurrence, so the escalation is buried AND counted as already answered:
+    the second member is what catches that, which is why the assertion is a tuple and
+    not the shown list alone. MEASURED, and the recipe is specific for a reason:
+    deleting the `seen_ids` guard does NOT redden this row (the directory is read
+    twice, but the key lands in `found` first and the count's `key not in found`
+    clause absorbs the duplicate), so `seen_ids` is graded by its own siblings above,
+    not here."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["spans the watermark"]])
+    shared = task.sessions[0].task_id
+    task.sessions.append(SessionRecord(task_id=shared, role="dev", status="completed"))
+    save_state(run_dir, state)
+
+    assert resolve._gather_escalations(run_dir, state, key, start=1) == (
+        [{"type": "spec-gap", "severity": "CRITICAL", "detail": "spans the watermark"}],
+        0,
+    )
+
+
+def test_gather_escalations_with_no_sessions_is_empty_and_reports_nothing(tmp_path):
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [])
+    assert task.sessions == []
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+
+def test_gather_escalations_past_the_end_of_the_trail_never_raises(tmp_path):
+    """A watermark beyond the list — hand-edited state, or a trail that shrank —
+    must yield an empty shown list, not an IndexError. `start` only SELECTS a map;
+    nothing is indexed with it, which is what makes that true structurally.
+
+    The `2` is load-bearing: `== ([], 2)` proves both directories were READ and
+    filtered. An `== []` alone would pass equally if the walk had found nothing."""
+    run_dir, state, _task, key = _watermarked_trail(tmp_path, [["first"], ["second"]])
+
+    assert resolve._gather_escalations(run_dir, state, key, start=9) == ([], 2)
+
+
+def test_rearm_stamps_the_watermark_when_a_resolution_was_recorded(tmp_path):
+    """The stamp records how much of the audit trail the accepted resolution covered
+    — a LENGTH of `task.sessions`, taken before the re-drive appends anything.
+
+    Ablation: drop the stamp from `rearm_escalation` and this reddens at 0 != 1,
+    taking the second-cycle rows below with it."""
+    run_dir, _, _ = _escalated_run(tmp_path)
+    before = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert before.escalations_resolved_upto == 0 and len(before.sessions) == 1
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.escalations_resolved_upto == 1
+    assert len(task.sessions) == 1  # the trail the watermark indexes still stands
+    assert task.generation == 1  # positive control: the bump ran on this gesture too
+
+
+def test_rearm_leaves_the_watermark_where_it_was_when_nothing_was_recorded(tmp_path):
+    """`cmd_resolve` prints "no resolution recorded" and FALLS THROUGH to re-arm, and
+    both non-interactive re-arm gestures run no session at all. None of them accepted
+    anything, so none may advance the watermark: escalations no human answered would
+    otherwise become invisible to every later cycle and be reported as already
+    answered — the inverse of the defect.
+
+    The generation assertion is the positive control and the discriminator: the bump
+    is UNCONDITIONAL (it answers session-id reuse, #705, which an abandoned attempt
+    needs just as much), so this row cannot pass by the re-arm having done nothing.
+
+    Ablation: remove the `if resolution_recorded:` gate and this reddens at 1 != 0."""
+    run_dir, _, _ = _escalated_run(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=False)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.escalations_resolved_upto == 0
+    assert task.generation == 1
+
+
+def test_a_second_resolve_cycle_shows_only_what_the_redrive_raised(tmp_path):
+    """The whole chain with no seam hand-set: escalate, re-arm on a recorded
+    resolution, let the re-drive append its own session record and artifact, then
+    build the context a second time. `build_context` reads the watermark off the task
+    it loaded — nothing in this row passes `start`."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["the first cycle answered this"]])
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    _redrive_escalates(run_dir, key, "raised by the re-drive")
+
+    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised by the re-drive"]
+    assert withheld == 1
+
+
+def test_a_third_cycle_stamps_again_over_the_second(tmp_path):
+    """TWO accepted cycles in sequence. Every other multi-cycle row stops after one
+    accepted cycle (`..._shows_only_what_the_redrive_raised`) or pairs an accepted one
+    with a declining one (`..._over_a_surviving_marker_...`), so nothing pinned that the
+    watermark keeps ADVANCING. A stamp that fires once and then sticks passes both of
+    those rows and re-presents cycle 2's answered escalation to every later cycle —
+    DW-11 itself, surviving one cycle further along.
+
+    Ablation: make the stamp `max(task.escalations_resolved_upto, 1)` and this row
+    reddens on the third cycle's shown list and its count, while both existing
+    multi-cycle rows stay green."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered in cycle 1"]])
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(run_dir).tasks[key].escalations_resolved_upto == 1
+    _redrive_escalates(run_dir, key, "answered in cycle 2", escalated=True)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    task = load_state(run_dir).tasks[key]
+    assert task.escalations_resolved_upto == 2  # ADVANCED again, over cycle 2's record
+    assert task.generation == 2  # positive control: both gestures re-armed
+
+    _redrive_escalates(run_dir, key, "raised after cycle 2")
+
+    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 2"]
+    assert withheld == 2  # each answered cycle counted once
+
+
+def test_a_rearm_over_a_surviving_marker_does_not_move_the_watermark(tmp_path):
+    """`resolution.json` SURVIVES the re-arm that consumed it: the only unlink in
+    `src/` is in `resolve.run_session`, which two of the three re-arm callers never
+    reach, and nothing deletes it at or after a re-arm. So a marker-presence gate
+    reads the PREVIOUS cycle's marker as this gesture's own, and a second re-arm
+    running no session would stamp over an escalation nobody has seen — hiding it
+    forever and reporting it as already answered.
+
+    The marker is deliberately left on disk here and never removed, which is the
+    state a real second gesture opens on.
+
+    Ablation: replace the `resolution_recorded` parameter with a
+    `resolution_path(run_dir, key).is_file()` read inside `rearm_escalation` and this
+    row reddens twice — the watermark advances to 2, and the context comes back
+    empty with the new escalation counted as withheld."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered in cycle 1"]])
+
+    marker = resolve.resolution_path(run_dir, key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(run_dir).tasks[key].escalations_resolved_upto == 1
+    assert marker.is_file()  # MEASURED: nothing deletes it at re-arm
+
+    _redrive_escalates(run_dir, key, "raised after cycle 1", escalated=True)
+
+    # the `--no-interactive` / TUI gesture: no session ran, so nothing was accepted
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=False)
+
+    task = load_state(run_dir).tasks[key]
+    assert task.escalations_resolved_upto == 1  # NOT len(sessions) == 2
+    assert task.generation == 2  # positive control: this gesture DID re-arm
+    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 1"]
+    assert withheld == 1
+
+
+def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
+    """The count is the OPERATOR's, not the agent's: `bmad-loop-resolve/SKILL.md`
+    documents `escalations` as the list to resolve, and a number for entries the
+    session cannot see is nothing it can act on. Any spelling of a leak reddens this,
+    because the key set is compared whole rather than probed for one name."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered"], ["new"]])
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    _redrive_escalates(run_dir, key, "new one")
+
+    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    assert withheld == 2  # the count exists...
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert set(ctx) == {
+        "story_key",
+        "run_id",
+        "spec_file",
+        "baseline_commit",
+        "paused_reason",
+        "escalations",
+        "resolution_path",
+        "restore_supported",
+        "spec_reaches_the_redrive",
+        "redrive_base_ref",
+    }  # ...and reaches no field of the agent contract
 
 
 # ----------------------------------------------------------- run_session
@@ -2460,7 +2828,7 @@ class _FakeAdapter:
 
 def test_run_session_detects_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     def fake_subprocess_run(argv, cwd, env):
         # simulate the agent writing the resolution marker
@@ -2476,7 +2844,7 @@ def test_run_session_detects_resolution(tmp_path, monkeypatch):
 
 def test_run_session_no_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
     monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
     assert (
         resolve.run_session(
@@ -2490,7 +2858,7 @@ def test_run_session_clears_stale_marker(tmp_path, monkeypatch):
     """A marker left by a previous resolve of this story must not be read as
     this session's output (the agent that says 'already resolved' writes none)."""
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
     stale = resolve.resolution_path(run_dir, "6-4-cli-list-command")
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text('{"from": "last time"}', encoding="utf-8")
@@ -2604,9 +2972,7 @@ def test_build_context_stories_carries_manifest_entry(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md", source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
-    )
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
     st = ctx["stories"]
     assert st["spec_folder"] == "epic-1"
     assert st["story"]["title"] == "List command"
@@ -2630,9 +2996,7 @@ def test_build_context_stories_sentinel_indicator(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
-    )
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
     sent = ctx["stories"]["sentinel"]
     assert sent["kind"] == "unresolved"
     assert "intent too vague" in sent["blocking_condition"]
@@ -2642,9 +3006,7 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
     """Sprint mode leaves the context contract unchanged — no stories block."""
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert "stories" not in ctx
 
@@ -2666,9 +3028,9 @@ def test_build_context_leaves_an_out_of_mount_spec_unchanged(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
 
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_file"] == spec.as_posix()
 
@@ -2709,7 +3071,7 @@ def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
     state.spec_folder = "epic-1"
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+        _context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] == (wt / rel).as_posix()
     sent = ctx["stories"]["sentinel"]
@@ -2758,7 +3120,7 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
     state.spec_folder = "epic-1"
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+        _context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] == outside.as_posix()  # unchanged: absolute passes through
     sent = ctx["stories"]["sentinel"]
@@ -2780,9 +3142,9 @@ def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
     wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_reaches_the_redrive"] is False
 
@@ -2790,9 +3152,9 @@ def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
         tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
     )
     plain = json.loads(
-        resolve.build_context(
-            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
-        ).read_text(encoding="utf-8")
+        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
     )
     assert plain["spec_reaches_the_redrive"] is True
 
@@ -2815,9 +3177,9 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
     state.target_branch = "feat/the-pinned-one"
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     # the paired claim: the edit has no future, and THIS is the tree that does
     assert ctx["spec_reaches_the_redrive"] is False
@@ -2829,9 +3191,9 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
     )
     plain_state.target_branch = "feat/the-pinned-one"  # set, but no mount to make it apply
     plain = json.loads(
-        resolve.build_context(
-            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
-        ).read_text(encoding="utf-8")
+        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
     )
     assert plain["redrive_base_ref"] == "HEAD"
 
@@ -2878,7 +3240,7 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -2950,7 +3312,7 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -3009,7 +3371,7 @@ def _sentinel_run(
 
     sentinel = folder / f"{key}-unresolved.md"
     sentinel.write_text(
-        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\n" "Status: blocked\nintent too vague\n",
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
         encoding="utf-8",
     )
     mount = tmp_path / "wt"
@@ -3073,7 +3435,7 @@ def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redriv
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=isolated)
+    runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
 
     assert not sentinel.exists()  # the sentinel really was cleared on every row
     records = _upstream_records(run_dir)
@@ -3162,7 +3524,7 @@ def test_rearm_reads_the_upstream_artifacts_at_the_redrive_base_not_the_current_
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     records = _upstream_records(run_dir)
     assert bool(records) is warns
@@ -3197,7 +3559,7 @@ def test_rearm_exempts_a_stories_folder_configured_outside_the_project(
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert bool(_upstream_records(run_dir)) is not external
 
@@ -3239,7 +3601,9 @@ def test_rearm_of_a_sentinel_survives_a_project_that_is_not_a_repository(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == key  # no GitError
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True) == key
+    )  # no GitError
 
     assert not sentinel.exists()  # the destructive half still completed
     (rec,) = _upstream_records(run_dir)
@@ -3291,7 +3655,7 @@ def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_pat
     monkeypatch.chdir(tmp_path)
 
     # the flip: policy now says `none`, while the recorded mount still says otherwise
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["redrive"] == "in-place"
@@ -3348,7 +3712,7 @@ def test_rearm_in_place_proof_reads_the_working_tree_not_the_commit(tmp_path, mo
             root, spec_file=rel, worktree_path=str(mount), target_branch="main"
         )
         monkeypatch.chdir(root)
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
         fired = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
         assert bool(fired) is warns, f"corrected={corrected}"
@@ -3409,7 +3773,7 @@ def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_pat
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -3462,7 +3826,7 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
     monkeypatch.chdir(tmp_path)
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=True
+        run_dir, isolated_redrive=True, resolution_recorded=True
     )  # must not raise: this flip cannot reach the re-drive
 
     kinds = _kinds(run_dir)
@@ -3495,7 +3859,7 @@ def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkey
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     (unreachable,) = [e for e in kinds if e["kind"] == "rearm-spec-write-unreachable"]
@@ -3537,7 +3901,7 @@ def test_rearm_does_not_warn_when_the_spec_dir_is_shared_with_the_redrive(tmp_pa
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
     # and the flip really landed on the shared file the re-drive will read
@@ -3581,7 +3945,7 @@ def test_rearm_still_warns_for_a_spec_spelled_out_of_but_resolving_into_the_work
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spelled), worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
@@ -3620,7 +3984,7 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
@@ -3658,7 +4022,7 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel)  # worktree_path="" -> the fallback
     monkeypatch.chdir(tmp_path / "elsewhere")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     fm = verify.read_frontmatter(spec)
     assert fm["status"] == "ready-for-dev"  # the project-rooted copy was flipped
