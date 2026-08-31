@@ -29,6 +29,7 @@ from bmad_loop.deferredwork import (
     mark_done_many_reopenable,
     mark_open,
     mark_open_many,
+    mark_seen_again_many,
     next_seq,
     open_ids,
     parse_declaration,
@@ -144,6 +145,61 @@ def test_mark_done_missing_entry(tmp_path):
     path = write_ledger(tmp_path)
     snapshot = path.read_text(encoding="utf-8")
     assert not mark_done(path, "DW-99", "2026-06-11", "n/a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_seen_again_many_inserts_after_status(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, published = mark_seen_again_many(
+        path, ["DW-1"], "2026-08-31", "spec-deferral harvest of spec-2-2-b.md"
+    )
+    assert applied == [True]
+    text = path.read_text(encoding="utf-8")
+    assert published == text
+    assert "status: open\nseen-again: 2026-08-31 (spec-deferral harvest of spec-2-2-b.md)" in text
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-1"].open  # the line does not disturb status parsing
+    assert "seen-again: 2026-08-31" not in entries["DW-3"].body  # only the target
+
+
+def test_mark_seen_again_many_is_idempotent_on_replay(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest of x")[0] == [True]
+    snapshot = path.read_text(encoding="utf-8")
+    applied, published = mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest of x")
+    assert applied == [False] and published is None
+    assert path.read_text(encoding="utf-8") == snapshot
+    # a different sighting (new date) is a new line, not a dupe to skip
+    assert mark_seen_again_many(path, ["DW-1"], "2026-09-01", "harvest of x")[0] == [True]
+    assert path.read_text(encoding="utf-8").count("seen-again:") == 3  # DW-3 owns one
+
+
+def test_mark_seen_again_many_missing_id_is_false(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, published = mark_seen_again_many(path, ["DW-99", "DW-1"], "2026-08-31", "harvest of x")
+    assert applied == [False, True] and published is not None
+    assert "seen-again: 2026-08-31 (harvest of x)" in path.read_text(encoding="utf-8")
+    # a missing ledger applies nothing and creates nothing
+    missing = tmp_path / "absent" / "deferred-work.md"
+    assert mark_seen_again_many(missing, ["DW-1"], "2026-08-31", "x") == ([False], None)
+    assert not missing.exists()
+
+
+def test_mark_seen_again_many_sanitizes_the_note_to_one_line(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, _ = mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest\nof spec-x.md")
+    assert applied == [True]
+    text = path.read_text(encoding="utf-8")
+    assert "seen-again: 2026-08-31 (harvest of spec-x.md)" in text
+    # the break never minted a phantom entry or truncated DW-1's span
+    assert [e.id for e in parse_ledger(text)] == ["DW-1", "DW-2", "DW-3"]
+
+
+def test_mark_seen_again_many_raises_on_a_bad_date_without_writing(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError):
+        mark_seen_again_many(path, ["DW-1"], "08/31/2026", "x")
     assert path.read_text(encoding="utf-8") == snapshot
 
 

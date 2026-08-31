@@ -7002,8 +7002,9 @@ def test_review_strips_stale_auto_run_result_before_each_launch(project):
 def test_budget_exhausted_finalized_work_commits(project):
     """A finalized story (status: done, sprint done, verify green) whose review
     pass keeps recommending an independent follow-up is COMMITTED when the review
-    budget is exhausted — not rolled back. The lingering recommendation is
-    re-filed as a fresh open deferred-work entry, and the run records the event."""
+    budget is exhausted — not rolled back. The spent budget is journaled and the
+    run notifies; no deferred-work entry is filed (the process-exhaust ticket
+    class is retired)."""
     from bmad_loop import deferredwork
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -7030,12 +7031,16 @@ def test_budget_exhausted_finalized_work_commits(project):
     # the finalized work is committed, not reverted
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "review-budget-committed" in kinds and "story-deferred" not in kinds
-    # the lingering follow-up is preserved as a new open deferred-work entry
-    open_entries = [
-        e for e in deferredwork.parse_ledger(project.deferred_work.read_text()) if e.open
-    ]
-    assert any("origin: review-budget-followup" in e.body for e in open_entries)
+    assert "story-deferred" not in kinds
+    committed = [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    assert len(committed) == 1 and committed[0]["re_review_capped"] is False
+    assert "refiled" not in committed[0]
+    # the process-exhaust ticket class is retired: no ledger entry is filed
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
 
 
 def test_budget_exhausted_unfinalized_defers(project):
@@ -7491,7 +7496,7 @@ def test_followup_damping_converges_at_cap(project):
     """Default damping cap (1): a finalized story whose review keeps recommending
     an independent follow-up converges after honoring exactly ONE self-recommended
     follow-up. Round 1 spends the grant; round 2 (still recommending) is damped →
-    verify, refile, commit. The 3rd scripted review never runs, and — being the
+    verify, journal, commit. The 3rd scripted review never runs, and — being the
     expected steady state — the damped converge stays quiet (no ATTENTION)."""
     from bmad_loop import deferredwork
 
@@ -7514,13 +7519,15 @@ def test_followup_damping_converges_at_cap(project):
     assert "review-followup-damped" in kinds
     assert "review-budget-committed" not in kinds  # not the exhaustion path
     assert "story-deferred" not in kinds
-    # the lingering follow-up is preserved as exactly one open DW entry
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1
+    # the process-exhaust ticket class is retired: no ledger entry is filed
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
+    damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
+    assert len(damped) == 1 and damped[0]["re_review_capped"] is False
+    assert "refiled" not in damped[0]
     # damped convergence is the steady state — no review-budget ATTENTION notice
     # (the always-on run-finished notice is the only thing in the file).
     attention = engine.run_dir / "ATTENTION"
@@ -7532,7 +7539,7 @@ def test_followup_damping_converges_at_cap(project):
 def test_followup_damping_cap_zero_converges_immediately(project):
     """Cap 0: the orchestrator never honors a pass's own follow-up. The first
     finalized round that still recommends one is damped immediately — verify,
-    refile, commit — after a single review round, with nothing spent."""
+    journal, commit — after a single review round, with nothing spent."""
     from bmad_loop import deferredwork
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -7550,12 +7557,11 @@ def test_followup_damping_cap_zero_converges_immediately(project):
     assert task.followup_reviews_spent == 0  # cap 0 grants nothing to spend
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "review-followup-damped" in kinds
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
 
 
 def test_nonterminal_rounds_do_not_spend_damping_cap(project):
@@ -7628,8 +7634,8 @@ def test_followup_damping_resume_replay_does_not_double_count(project):
     """A host death in the post-session window of the grant-spending review round
     must not double-count the damping spend on resume. The recorded round-1 result
     replays (re-deriving the spend), then round 2 damps and converges: the story
-    reaches DONE with followup_reviews_spent == 1 (not 2) and exactly one refiled
-    entry — append_entry's open-dedupe keeps a replayed refile from duplicating.
+    reaches DONE with followup_reviews_spent == 1 (not 2) and no ledger entry —
+    the spent budget is journal-only.
     Modeled on test_resume_final_review_cycle_replays_clean_result."""
     from bmad_loop import deferredwork
 
@@ -7680,12 +7686,11 @@ def test_followup_damping_resume_replay_does_not_double_count(project):
     assert final.review_cycle == 2
     assert final.followup_reviews_spent == 1  # re-derived once, never double-counted
     assert len(adapter.sessions) == 1  # only round 2 re-ran; round 1 was replayed
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1  # exactly one, even across the crash/replay
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )  # journal-only, even across the crash/replay
 
 
 def _tail_death_review_effect(paths, story_key, *, followup: bool):
@@ -14251,6 +14256,132 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert [e["dw_ids"] for e in events] == [["DW-1"], ["DW-2"]]
     assert events[-1]["deduped"] == 1
+
+
+def _seeded_ledger(project, *, origin: str, source_spec: str, status: str = "open") -> None:
+    """One hand-written open entry, shaped like a harvest from ANOTHER spec."""
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### DW-1: {HARVEST_A['summary']}\n\n"
+        f"origin: {origin}\n"
+        f"location: {HARVEST_A['location']}\n"
+        f"source_spec: `{source_spec}`\n"
+        "severity: medium\n"
+        f"reason: {HARVEST_A['evidence']}\n"
+        f"status: {status}\n",
+        encoding="utf-8",
+    )
+
+
+def test_harvest_marks_a_cross_spec_duplicate_seen_again(project):
+    """DW-88 vs DW-65: an identical finding (same fingerprint) already harvested
+    from ANOTHER spec is a sighting, not new work — no entry is filed, the open
+    match gains a `seen-again:` line, the journal names it, and the finding never
+    enters `harvested_deferrals` (so the isolated carry cannot re-file it)."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1"]  # no new entry
+    assert "seen-again: " in entries[0].body
+    assert "(spec-deferral harvest of spec-1-1-a.md)" in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert event["deduped"] == 0
+    assert engine.state.tasks["1-1-a"].harvested_deferrals == []
+
+
+def test_harvest_marks_a_dw_prefixed_summary_seen_again(project):
+    """The DW-88 shape itself: a finding whose summary begins with an open
+    entry's own `DW-<n>:` id is that entry re-reported, whatever its
+    fingerprint or origin says."""
+    _seeded_ledger(
+        project,
+        origin="code review of spec-9-9-z.md, 2026-06-01",
+        source_spec="spec-9-9-z.md",
+    )
+    finding = {
+        "summary": "DW-1: the retry ceiling is still missing",
+        "evidence": "re-reported by a later review",
+        "location": "src/retry.py:90",
+    }
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[finding])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1"]
+    assert "seen-again: " in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert engine.state.tasks["1-1-a"].harvested_deferrals == []
+
+
+def test_harvest_seen_again_replay_adds_one_line_only(project):
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    assert engine.run().done == 1
+
+    task = engine.state.tasks["1-1-a"]
+    engine._harvest_spec_deferrals(task, {"spec_file": str(spec_path(project, "1-1-a"))})
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert text.count("seen-again: ") == 1  # the replay skipped its identical line
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [e["seen_again"] for e in events] == [["DW-1"], ["DW-1"]]
+    assert [e["dw_ids"] for e in events] == [[], []]
+
+
+def test_harvest_files_fresh_when_the_match_is_done(project):
+    """A closed entry never absorbs a sighting: recurrence after a close files a
+    fresh entry, consistent with `_apply_append`'s open-only dedupe scan."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(
+        project,
+        origin=f"spec-deferred {fp}",
+        source_spec="spec-9-9-z.md",
+        status="done 2026-06-05",
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1", "DW-2"]
+    assert entries[1].open and entries[1].title == HARVEST_A["summary"]
+    assert "seen-again: " not in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == ["DW-2"] and event["seen_again"] == []
 
 
 def test_ledger_digest_collapses_absent_and_empty_only():

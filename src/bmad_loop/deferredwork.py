@@ -1018,6 +1018,56 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return bool(mark_done_many(path, [dw_id], date, note))
 
 
+def mark_seen_again_many(
+    path: Path, dw_ids: Sequence[str], date: str, note: str
+) -> tuple[list[bool], str | None]:
+    """Stamp `seen-again: <date> (<note>)` under each entry's status line, in ONE
+    read and ONE atomic write. Returns one applied flag per id, plus the text it
+    published — None when it wrote nothing (every id missing, or already carrying
+    this exact line).
+
+    The writer half of the format doc's dedupe rule (deferred-work-format.md): a
+    finding that matches an existing entry is recorded as a sighting on that
+    entry, never as a duplicate entry. Idempotent per (id, date, note): a replay
+    stamping the same line is skipped, so a flag reads "this call inserted it",
+    not "the line is there". A missing id is False rather than an error — the
+    caller matched against a snapshot, and a rival may have archived the entry
+    since. A missing ledger applies nothing and takes no lock, like
+    :func:`mark_done_many`'s absent-file arm.
+
+    ONE locked read->edit->write (#286/#469): each insert lands on the text the
+    previous one produced (:func:`_find_entry` re-parses the evolving text, so
+    spans stay honest), and the published text is handed back from inside the
+    hold for the same ``post_engine_ledger_digest`` reasons as
+    :func:`append_entries_published`. `date` is orchestrator-owned and raises
+    when malformed; `note` is sanitized to one line (#305).
+    """
+    _require_iso_date(date)
+    line = f"seen-again: {date} ({_one_line(note)})"
+    if not dw_ids:
+        return [], None
+    if not path.is_file():
+        return [False for _ in dw_ids], None
+    with ledger_lock(path):
+        if not path.is_file():
+            return [False for _ in dw_ids], None
+        text = path.read_text(encoding="utf-8")
+        applied: list[bool] = []
+        for dw_id in dw_ids:
+            entry = _find_entry(text, dw_id)
+            if entry is None or line in entry.body:
+                applied.append(False)
+                continue
+            text = _insert_after_status(text, entry, line)
+            applied.append(True)
+        if not any(applied):
+            return applied, None
+        atomic_write_text(path, text)
+        # Returned from INSIDE the hold: this is the published text by
+        # construction, not a read-back that a rival could have moved.
+        return applied, text
+
+
 _MARK_DONE_TAIL_RE = re.compile(
     r"\nresolution:[ \t]*(.*)"
     r"\nresolution-undo:[ \t]*([0-9a-f]{64})[ \t]+"

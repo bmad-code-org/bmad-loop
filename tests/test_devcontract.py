@@ -1934,6 +1934,18 @@ def test_flatten_strips_a_join_space_at_the_clamp_boundary(tmp_path):
     assert finding.fingerprint == devcontract.harvest_fingerprint("s", finding.location)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("alpha betas gamma", "alpha", id="mid-word cut backs up to the boundary"),
+        pytest.param("alpha beta gamma", "alpha beta", id="cut at a word end keeps the full cut"),
+        pytest.param("a" * 30, "a" * 10, id="single unbroken token keeps the hard clamp"),
+    ],
+)
+def test_flatten_clamps_at_a_word_boundary(raw, expected):
+    assert devcontract._flatten(raw, 10) == expected
+
+
 def test_deferred_fingerprint_ignores_evidence_but_tracks_location(tmp_path):
     def fingerprint(path: Path, evidence: str, location: str) -> str:
         findings, _ = devcontract.parse_deferred_findings(

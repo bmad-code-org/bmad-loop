@@ -198,15 +198,23 @@ def harvest_fingerprint(*parts: str) -> str:
 
 
 def _flatten(value: Any, limit: int) -> str:
-    """Collapse a YAML scalar to one clamped line.
+    """Collapse a YAML scalar to one line clamped at a word boundary.
 
-    Strip after clamping because the cut can land on a join space. Keeping that
-    cleanup here makes the value written to the ledger and the value used in its
-    fingerprint identical.
+    A cut landing mid-word backs up to the last join space so the ledger never
+    records a truncated half-token; a cut ending exactly at a word end keeps the
+    full cut, and a single unbroken token longer than the limit keeps the hard
+    clamp. Fingerprints (``harvest_fingerprint(summary, location)``) therefore
+    drift only for over-limit multi-word values -- accepted.
     """
     if value is None:
         return ""
-    return " ".join(str(value).split())[:limit].strip()
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit]
+    head, sep, _ = text[:limit].rpartition(" ")
+    return head if sep else text[:limit]
 
 
 def _is_yaml_scalar(value: Any) -> bool:
