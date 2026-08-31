@@ -22,6 +22,18 @@ breaking changes may land in a minor release.
   line. Deliberately not widened to `run_verify_commands`, which has three legitimate callers
   on two roots.
 
+- **Source-scan parity guards for three invariants previously held only by docstring prose**
+  (DW-65, DW-66, DW-82). The task-directory artifact names move to one shared
+  `journal.TASK_CYCLE_ARTIFACTS` that both adapters and `resolve._gather_escalations` iterate,
+  and `tests/test_portability_guard.py` gains three detectors: a bare artifact literal outside
+  that constant, a session task id composed outside `engine._session_task_id`, and a journal
+  field name that neither `diagnostics`' redaction tables route nor the benign inventory
+  declares. Each carries positive and negative probes so a detector that stops detecting cannot
+  read as green, and an unresolvable `journal.append(**splat)`, a journal write whose kind is
+  not a string literal, and a benign entry whose producer has been deleted all fail loud rather
+  than being skipped. Journal field routing is graded per kind where `diagnostics` routes per
+  kind, and a declared forwarder's call sites (`plugins/bus.py::_log`) enter the inventory.
+
 - **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
   so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
   instead of re-deriving one. A `state.json` written before the field existed degrades to the
@@ -207,6 +219,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Alias the `story_keys` list on the `sweep-inflight-stranded` journal record. It carried raw
+  bundle story keys into `diagnose --dump`: the value fell through to `scrub_json`, which is the
+  identity on a list of identifier-shaped strings, while the singular `story_key` beside it was
+  already aliased.
 - Stop a second resolve cycle re-presenting escalations the human already answered
   (DW-11). Only a re-arm that accepted a `resolution.json` watermarks the session
   trail; later cycles show what came after it and print how many were withheld.
