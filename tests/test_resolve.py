@@ -782,6 +782,55 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
     assert next_step
 
 
+def test_rearm_completes_on_an_unreachable_spec_it_could_not_capture(tmp_path, monkeypatch):
+    """The preimage refusal is gated on the SAME pair as the flip's refusal, so a spec the
+    re-drive does not read keeps warn-and-continue.
+
+    This is the isolated shape the row above builds: `task_spec_path` anchors the writes on
+    the mount, and a re-armed task's mount is discarded before the re-drive reads anything,
+    so the readable file is the copy that is destroyed. `rearm-spec-write-unreachable` has
+    already recorded that fact by the time the preimage is captured.
+
+    Add one transient `EIO` on the first `read_bytes` of that spec and, gated on
+    `is_file()` ALONE, the re-arm aborted — demanding that the operator repair a file the
+    re-drive never opens, over a remedy that cannot change what it reads, at the cost of
+    the interactive resolve session. The unreadable preimage is an OBSERVATION on this
+    shape, and observations degrade: `spec_before` stays `None` and the re-arm completes.
+
+    Its sibling `tests/test_runs.py::test_rearm_refuses_a_spec_whose_bytes_it_could_not_capture`
+    holds the other half — on a REACHABLE spec the same fault still refuses, because there
+    the write it is about to publish is the one the re-drive will read.
+
+    Ablation: drop the `write_reaches_the_redrive` conjunct and this reddens with the
+    `RearmError` the reachable row expects, while that row stays green.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
+    )
+    real_read_bytes = Path.read_bytes
+    failed_once = []
+
+    def flaky(self):
+        if self == spec and not failed_once:
+            failed_once.append(1)
+            raise OSError(5, "Input/output error")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+
+    assert failed_once  # the fault really did land on the capture
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
+    # ...and the record that DOES describe this shape is still the one written
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert rec["spec_file"] == str(spec)
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"] == []
+
+
 def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_path):
     """The control for the row above: the in-place case is where those writes DO land,
     so a record there would fire on every ordinary re-arm."""
@@ -1775,20 +1824,21 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     An absolute `spec_file` beside a set `worktree_path` means the spec is lexically
     OUTSIDE the mount (`model._serialized_worktree_path` keeps a path verbatim exactly
     when `relative_to(worktree_path)` raises) — the shape a shared artifact directory
-    produces. `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY, so
-    a `confine_root` naming the worktree does not merely degrade the write the way the
-    three `_atomic_write_spec` writers do: it raises `UnconfinedWriteError`, which the
-    arm re-raises as "cannot restore ...". The operator was then left with the exact
-    state the undo exists to prevent — a spec carrying this re-arm's status flip and
-    stripped of its `## Auto Run Result`, on a story the run still calls ESCALATED —
-    plus a second error masking the first.
+    produces. `task_spec_root` answers the PROJECT there rather than the mount, which CAN
+    confine this spec, so the undo takes its confined arm and lands, and the original
+    fault is the one that surfaces — instead of an `UnconfinedWriteError` re-raised as
+    "cannot restore ..." over a spec left carrying this re-arm's status flip and stripped
+    of its `## Auto Run Result`, on a story the run still calls ESCALATED.
 
-    `task_spec_root` now answers the project for that shape, which CAN confine the
-    spec, so the restore lands and the original fault is the one that surfaces.
-
-    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
-    and this reddens twice — the `match=` fails on "cannot restore ... UnconfinedWrite
-    Error", and the byte comparison fails behind it.
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)` AND
+    make `_restore_rearmed_spec` take `atomic_write_bytes_confined` unconditionally; this
+    then reddens twice, on the `match=` and on the byte comparison behind it. Both halves
+    are needed because either one alone now rescues the write, and that redundancy is
+    deliberate — the root moved for this shape (graded directly by
+    `test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_spec`)
+    and the undo later gained the same lexical arm its three sibling writers have, which
+    is what carries a spec outside BOTH roots
+    (`test_rearm_restores_a_spec_outside_every_root_it_could_be_confined_to`).
     """
     _resolve_repo(tmp_path)
     wt = tmp_path / ".bmad-loop" / "runs" / "wt-mount"  # the mount, which holds no spec
@@ -1811,6 +1861,130 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
 
     assert spec.read_bytes() == before  # the undo reached a spec outside the mount
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
+def test_rearm_restores_a_spec_outside_every_root_it_could_be_confined_to(tmp_path, monkeypatch):
+    """The undo has to reach the spec wherever its three sibling writers reached it.
+
+    An artifacts folder configured OUTSIDE the checkout is supported configuration —
+    `bmadconfig` resolves one, `verify.spec_within_roots` trusts it, and
+    `_spec_is_shared_with_the_redrive` treats a spec that lands there as first-class and
+    reachable by the re-drive. On that shape neither candidate root can confine the path:
+    the mount cannot, and neither can the project, so `task_spec_root`'s fallback names a
+    root the spec is lexically outside of.
+
+    `frontmatter.set_frontmatter_status`, `verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` all select their writer on that same lexical test and
+    simply take the plain no-follow arm, so the flip, the strip and the re-stamp LAND.
+    `_restore_rearmed_spec` called `atomic_write_bytes_confined` unconditionally, so the
+    undo alone raised `UnconfinedWriteError` — the transaction's write set going
+    unhonoured on exactly the specs it was still able to break, and the operator left with
+    a flipped, stripped spec on a story the run still called ESCALATED plus a second error
+    masking the first. A writer that refuses where its siblings write is not extra safety.
+
+    The project deliberately sits UNDER `tmp_path` here so the spec can be a sibling of
+    it: that is the only way to build a path outside both roots without leaving the
+    fixture's tree.
+
+    The fault is raised from `save_state` rather than from a git probe because it must be
+    reached unconditionally: `_stale_restore_residue` returns before touching git when the
+    task carries no restore latch, so a `commits_above` injection would never fire here.
+
+    Ablation: make `_restore_rearmed_spec` call `atomic_write_bytes_confined`
+    unconditionally again and this reddens on the `match=` — the raise becomes
+    "cannot restore ... UnconfinedWriteError" instead of the fault the re-arm aborted on
+    — with the byte comparison reddening behind it.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    # the flip and the strip both LAND on this path (their writers degrade to the plain
+    # arm), so there is a real published write for the undo to put back
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == before
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
+
+
+def test_rearm_reports_a_failed_rollback_through_the_plain_arm(tmp_path, monkeypatch):
+    """The undo's `failed` outcome has to be reachable through BOTH of its writers.
+
+    `tests/test_runs.py::test_rearm_reports_a_rollback_that_itself_failed_and_keeps_the_original_fault`
+    injects at `runs.atomic_write_bytes_confined`, and its fixture always puts the spec
+    under the project, so it only ever grades the CONFINED arm. The plain
+    `atomic_write_bytes` arm added for the out-of-every-root shape had no `failed`
+    coverage at all — the sibling row above grades that arm's `"restored"` outcome only,
+    so a plain arm that raised the wrong type, or swallowed instead of raising, was
+    invisible.
+
+    Same three claims as the confined row, on the other writer: the `RearmError` names the
+    spec, the record says `failed`, and the ORIGINAL fault rides in the exception chain
+    because the restore raises WHILE that fault is being handled.
+
+    Ablation: make `_restore_rearmed_spec` take `atomic_write_bytes_confined`
+    unconditionally and this reddens on the INJECTED-fault assertion. That ablation is
+    the one that matters and the one the three claims above cannot catch on their own:
+    the confined writer refuses this out-of-root path with `UnconfinedWriteError`, which
+    IS an `OSError`, so it produces the same `RearmError`, the same `failed` record and
+    the same chained `MemoryError` — every claim stays true while the plain arm this row
+    exists for is never reached. Naming the injected error is what tells the two apart.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        raise MemoryError("nothing to do with the spec")
+
+    def no_space(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    # ONLY the undo's out-of-root writer: the flip and the strip reach this path through
+    # `verify` and `devcontract`, so this cannot pre-empt the writes it is meant to fail
+    # to undo
+    monkeypatch.setattr(runs, "atomic_write_bytes", no_space)
+
+    with pytest.raises(runs.RearmError, match="cannot restore") as excinfo:
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert str(spec) in str(excinfo.value)
+    # the fault the operator is shown is the one the PLAIN arm raised. Without this the
+    # row cannot tell its own writer apart from the confined one refusing the same path
+    assert "No space left on device" in str(excinfo.value)
+    chain = []
+    exc: BaseException | None = excinfo.value
+    while exc is not None:
+        chain.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    assert any(isinstance(e, MemoryError) for e in chain)  # the original fault survives
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "failed"
+    assert "MemoryError" in aborted["error"]
 
 
 def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
@@ -4161,7 +4335,10 @@ def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
     # reach a TUI operator, which never sees next_step
     assert "may be left part-written" in failed_msg
     assert "restore it from git" in failed_msg
-    assert failed_step == "Restore the spec from git, then re-run resolve"
+    # ...and it names a SECOND source, because the bytes the undo failed to write are gone
+    # with the process and an untracked or out-of-checkout spec has no committed copy
+    assert "or from your own copy" in failed_msg
+    assert failed_step == "Restore the spec from git or your own copy, then re-run resolve"
     # ...and it does NOT enumerate which writes landed: a fault inside
     # `strip_auto_run_result` reaches the guard with the flip published and the section
     # still present, so an enumeration would describe a state this record cannot know

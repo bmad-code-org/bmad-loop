@@ -3370,6 +3370,363 @@ def test_rearm_reports_a_rollback_that_itself_failed_and_keeps_the_original_faul
     assert "MemoryError" in aborted["error"]
 
 
+@pytest.mark.parametrize("append_fault", [TypeError, OSError])
+def test_rearm_keeps_the_original_fault_when_the_abort_record_cannot_be_written(
+    monkeypatch, tmp_path, append_fault
+):
+    """Writing the abort record is an OBSERVATION, and an observation that cannot be made
+    must not REPLACE the fault the operator is being told about.
+
+    `_rollback_rearm` journals `rearm-aborted` from a `finally` that runs while the
+    original fault is unwinding, so anything that append raises escapes in its place —
+    and the whole re-raise invariant this transaction is built on (the two pinned
+    `MemoryError` rows) dies quietly with it. The rollback itself has already completed
+    by then, so nothing about DW-79/DW-83 is at stake in that suppression; only the
+    breadcrumb is lost, and the operator still receives the fault that explains why.
+
+    BOTH rows matter and they grade different halves. `OSError` is the obvious shape (an
+    unwritable journal) and passes under either breadth. `TypeError` is the one that
+    grades the WIDTH: `Journal.append` serializes caller-supplied values and opens a
+    file, so `json.dumps` and the open can raise outside the filesystem taxonomy
+    entirely.
+
+    Ablation: narrow the catch back to `except OSError` and the `TypeError` row reddens
+    with `TypeError` where the `MemoryError` should be, while the `OSError` row stays
+    green — which is exactly why one row alone is no oracle.
+    """
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    before = spec.read_bytes()
+
+    def probe_boom(repo, baseline):
+        raise MemoryError("not a git answer")
+
+    real_append = Journal.append
+
+    def flaky(self, kind, **fields):
+        if kind == "rearm-aborted":
+            raise append_fault("the abort record could not be written")
+        return real_append(self, kind, **fields)
+
+    monkeypatch.setattr(runs.verify, "commits_above", probe_boom)
+    monkeypatch.setattr(Journal, "append", flaky)
+    with pytest.raises(MemoryError, match="not a git answer"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    # the rollback ran BEFORE the record was attempted, so the transaction still held
+    assert spec.read_bytes() == before
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    # ...and the suppressed append left no entry, which the acceptance criterion is
+    # deliberately conditioned on rather than promising one here
+    assert not _kinds(run_dir, "rearm-aborted")
+
+
+def test_rearm_lets_an_interrupt_from_the_abort_append_leave(monkeypatch, tmp_path):
+    """The abort record's append suppresses `Exception` and deliberately NOT
+    `KeyboardInterrupt` — the ONE place in this transaction where the breadth is narrower
+    than the guard's own `BaseException`, and the asymmetry has to be graded from the
+    side the sibling rows cannot reach.
+
+    It is sound only because of WHERE this `finally` runs: the rollback has already
+    completed by the time the record is attempted, so the spec is back to the bytes the
+    re-arm found and an interrupt escaping here cannot reproduce DW-79/DW-83. What IS at
+    stake is the operator's Ctrl-C. Swallowing it to keep a breadcrumb would answer a
+    stop they issued themselves with a `MemoryError` traceback, and would leave the
+    process running past the point they asked it to stop.
+
+    Ablation: broaden that catch to `except BaseException` and this reddens with the
+    `MemoryError` arriving in the interrupt's place. Neither row of
+    `test_rearm_keeps_the_original_fault_when_the_abort_record_cannot_be_written`
+    reddens there, because `TypeError` and `OSError` are both already `Exception`.
+    """
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    before = spec.read_bytes()
+
+    def probe_boom(repo, baseline):
+        raise MemoryError("not a git answer")
+
+    real_append = Journal.append
+
+    def interrupted(self, kind, **fields):
+        if kind == "rearm-aborted":
+            raise KeyboardInterrupt
+        return real_append(self, kind, **fields)
+
+    monkeypatch.setattr(runs.verify, "commits_above", probe_boom)
+    monkeypatch.setattr(Journal, "append", interrupted)
+    # the INTERRUPT is what leaves, not the fault the re-arm aborted on
+    with pytest.raises(KeyboardInterrupt):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    # ...and letting it through costs nothing: the rollback ran first, so the spec is as
+    # the re-arm found it and the story is still armed for a retry
+    assert spec.read_bytes() == before
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    assert not _kinds(run_dir, "rearm-aborted")
+
+
+def test_rearm_records_unknown_when_the_rollback_cannot_read_the_spec(monkeypatch, tmp_path):
+    """`unchanged` is earned ONLY by reading the file and proving it byte-equal, so an
+    undo that could not even LOOK must answer `unknown`.
+
+    This is the read-failure arm, and it is a different arm from the one the sentinel row
+    grades: there `original` is `None` and `_restore_rearmed_spec` returns before touching
+    the disk, so that row cannot reach this code at all. Here the preimage was captured
+    normally and the file is gone by the time the undo runs — another actor removed it
+    mid-window — so `read_bytes` raises, the undo declines to re-create a file it did not
+    delete, and it says so.
+
+    Folding that into `unchanged` asserted a byte-equality the producer never checked, and
+    the surfaces then told the operator the spec "was left exactly as the re-arm found
+    it" about a file that is not there.
+
+    Ablation: make the `except OSError` arm in `_restore_rearmed_spec` return
+    `"unchanged"` and this reddens on the recorded `rollback` first; drop that assertion
+    and the rendered message reddens behind it.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+
+    def vanishes(repo, baseline):
+        spec.unlink()  # a concurrent actor removes it AFTER the flip published
+        raise MemoryError("not a git answer")
+
+    monkeypatch.setattr(runs.verify, "commits_above", vanishes)
+    with pytest.raises(MemoryError, match="not a git answer"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert not spec.exists()  # the undo does NOT fight the actor that removed it
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["rollback"] == "unknown"
+    _severity, message, _next_step = runs.rearm_event_notice(aborted)
+    assert "could not confirm what it left on disk" in message
+    assert "left exactly as the re-arm found it" not in message
+
+
+def test_rearm_abort_without_a_spec_records_an_empty_locator(monkeypatch, tmp_path):
+    """A re-arm that never resolved a spec path writes `""` there, NOT the story key.
+
+    `spec_file` is the SPEC's locator on all five `rearm-*` kinds and
+    `diagnostics._JOURNAL_ALIAS_FIELDS` routes it by that field NAME into the `spec`
+    namespace. Falling back to the story key would push an identifier through the wrong
+    namespace — rendered as a spec that does not exist — and the notice would name it as
+    a file. The empty string routes nowhere and renders as `(none)`.
+
+    Ablation: replace the `""` fallback with `story_key` and both halves redden — the
+    field carries the key, and the notice names it where `(none)` belongs.
+    """
+    from bmad_loop.model import Phase
+
+    run = escalated_run(tmp_path, "r1", story_key="1-1-a", git_project=True)
+    run_dir = run.run_dir
+
+    def boom(run_dir_, state_):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    with pytest.raises(OSError, match="No space left on device"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["spec_file"] == ""
+    assert aborted["rollback"] == "unknown"  # no spec path ⇒ no claim about any file
+    _severity, message, _next_step = runs.rearm_event_notice(aborted)
+    assert "(none)" in message
+    assert "1-1-a" not in message
+
+
+def test_rearm_records_failed_when_the_rollback_write_is_interrupted(monkeypatch, tmp_path):
+    """An interrupt during the restore WRITE leaves the spec in exactly the state `failed`
+    describes — flipped and not put back — so that is what the record must say.
+
+    `_rollback_rearm`'s inner arm catches `BaseException` for this reason, and the breadth
+    is as load-bearing as the guard's own: the restore is a file write, and a Ctrl-C
+    landing in it is the ordinary way for one to be abandoned half-done. Under a narrowed
+    `except Exception` the interrupt skips the arm, `rollback` keeps its `unknown` floor,
+    and the `finally` then records "could not confirm what it left on disk" for a spec
+    the run knows perfectly well it left part-written — the one outcome whose remedy is
+    not moot.
+
+    Ablation: narrow that inner arm to `except Exception` and this reddens on the
+    recorded `rollback` (`unknown` for `failed`). The `KeyboardInterrupt` still
+    propagates either way, which is why the raise alone is no oracle.
+    """
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+
+    def probe_boom(repo, baseline):
+        raise MemoryError("not a git answer")
+
+    def interrupted(*_a, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runs.verify, "commits_above", probe_boom)
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["rollback"] == "failed"
+    # the record still names the fault the RE-ARM aborted on, not the interrupt
+    assert "MemoryError" in aborted["error"]
+    _severity, message, next_step = runs.rearm_event_notice(aborted)
+    assert "may be left part-written" in message
+    assert next_step.startswith("Restore the spec")
+
+
+def test_rearm_does_not_roll_back_a_commit_that_already_landed(monkeypatch, tmp_path):
+    """`save_state` commits by ATOMIC REPLACE, so a fault escaping the call does not prove
+    the transaction failed — and rolling the spec back after a commit that DID land builds
+    the mirror image of the defect this guard closes.
+
+    The rename is a single instant; the call around it is not. An interrupt delivered
+    between the replace and the return unwinds through the guard with `state.json` already
+    describing a PENDING, re-armed task. Undoing the spec there leaves persisted state
+    re-armed against a spec that is not, and reports it as "nothing was persisted, the
+    story is still escalated" — a false sentence on both operator surfaces, and a re-drive
+    that reads the escalated attempt's terminal status on its first save.
+
+    Control flow cannot see this (there is no statement after `save_state` on that path),
+    so the guard asks the DISK, the only witness of a rename. No `rearm-aborted` record is
+    written on this leg either: every rendering of that kind asserts nothing was
+    persisted, and there is no value of `rollback` that is true here.
+
+    Ablation: delete the `_rearm_commit_landed` check from the guard and this reddens on
+    the flipped-status assertion — the spec is rolled back underneath committed state —
+    with the abort-record assertion reddening behind it.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    real_save_state = runs.save_state
+
+    def commits_then_dies(run_dir_, state_):
+        real_save_state(run_dir_, state_)  # the atomic replace LANDS...
+        raise KeyboardInterrupt  # ...and the call is interrupted on its way out
+
+    monkeypatch.setattr(runs, "save_state", commits_then_dies)
+    with pytest.raises(KeyboardInterrupt):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    text = spec.read_text(encoding="utf-8")
+    assert "status: ready-for-dev" in text  # the flip STANDS beside the commit
+    assert "## Auto Run Result" not in text
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.PENDING
+    assert not _kinds(run_dir, "rearm-aborted")
+
+
+@pytest.mark.parametrize("probe_fault", [KeyboardInterrupt, OSError])
+def test_rearm_rolls_back_when_the_commit_probe_itself_fails(monkeypatch, tmp_path, probe_fault):
+    """`_rearm_commit_landed` is asked a question ON THE ERROR PATH, so a fault raised
+    ANSWERING it must not cost the rollback.
+
+    Its one call site sits inside the transaction guard's `except BaseException` arm and
+    runs BEFORE `_rollback_rearm`, so anything escaping the probe escapes the guard too
+    and the undo never happens — the spec left flipped to the re-drive's status and
+    stripped of its `## Auto Run Result`, against a task the run still calls ESCALATED,
+    with no `rearm-aborted` record. That is DW-79/DW-83 reached through the very code
+    added to prevent its mirror image, which is why the probe degrades to "not committed"
+    — roll back — on ANY fault rather than only on an `Exception`.
+
+    The probe reads and PARSES a file, so `KeyboardInterrupt` there is an ordinary
+    outcome, not a contrivance: `load_state` is a `read_text` plus a `json.loads` plus a
+    `RunState.from_dict`, and an operator's Ctrl-C lands wherever it lands.
+
+    Swallowing that interrupt costs nothing the operator asked for. The rollback is a
+    repair write whose omission IS the defect, and the guard's `raise` still propagates
+    the original `MemoryError` a spec-sized write later — which the last assertion pins.
+
+    BOTH rows matter and they grade different halves. `OSError` (a corrupt or unreadable
+    state file) passes under either breadth. `KeyboardInterrupt` is the one that grades
+    the WIDTH.
+
+    Ablation: narrow the probe's catch back to `except Exception` and the
+    `KeyboardInterrupt` row reddens — the spec comes back flipped and no abort record
+    exists — while the `OSError` row stays green, which is exactly why one row alone is
+    no oracle.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    before = spec.read_bytes()
+
+    def probe_boom(repo, baseline):
+        raise MemoryError("not a git answer")
+
+    real_load_state = runs.load_state
+    calls = []
+
+    def unreadable(run_dir_):
+        # `rearm_escalation` opens with its OWN `load_state`; only the probe's call,
+        # made from inside the guard arm, is the one under test
+        calls.append(1)
+        if len(calls) > 1:
+            raise probe_fault("the commit probe could not read the state file")
+        return real_load_state(run_dir_)
+
+    monkeypatch.setattr(runs.verify, "commits_above", probe_boom)
+    monkeypatch.setattr(runs, "load_state", unreadable)
+    with pytest.raises(MemoryError, match="not a git answer"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == before  # the rollback ran despite the probe failing
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["rollback"] == "restored"
+    assert "MemoryError" in aborted["error"]
+
+
+def test_rearm_refuses_a_spec_whose_bytes_it_could_not_capture(monkeypatch, tmp_path):
+    """The preimage read is the transaction's own precondition, so a spec that IS a file
+    and whose bytes could not be captured must FAIL BEFORE the first write.
+
+    That read is one syscall among many against a file three later writers open
+    independently, so a TRANSIENT fault (EIO on a network mount, a momentary EACCES,
+    ENFILE under load) can be followed by writes that all succeed. `spec_before` is then
+    `None`, the abort further down records `unknown` and puts nothing back, and the
+    re-arm exits with the flip published against a task still ESCALATED — DW-79/DW-83
+    reached through the guard's own preimage.
+
+    The fake fails only the FIRST read of this spec, which is what makes that reachable:
+    every later read succeeds, so without the refusal the re-arm runs to completion.
+
+    A path that is NOT a file keeps degrading to `None` — a missing spec, a dangling link
+    and a directory all answer `False` from every writer below, so there is genuinely
+    nothing to undo, and those shapes stay warn-and-continue.
+
+    Ablation: drop the `is_file()` refusal and this reddens with `DID NOT RAISE` — the
+    re-arm completes, the spec ends up flipped and stripped, and nothing records it.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    real_read_bytes = Path.read_bytes
+    before = real_read_bytes(spec)
+    failed_once = []
+
+    def flaky(self):
+        if self == spec and not failed_once:
+            failed_once.append(1)
+            raise OSError(5, "Input/output error")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+    with pytest.raises(runs.RearmError, match="refuses to write a spec it could not capture"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert real_read_bytes(spec) == before  # nothing was written, so nothing to undo
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["rollback"] == "unknown"  # no preimage ⇒ no claim about the file
+
+
 def test_ordinary_rearm_writes_no_abort_record(tmp_path):
     """The negative side of the transaction: a re-arm that reaches `save_state` must
     leave no trace of a rollback that never happened.
@@ -4285,10 +4642,13 @@ def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_
     `relative_to(worktree_path)` raises, so this pair means the spec is lexically
     outside the mount. `task_spec_path` passes an absolute path through untouched, so
     answering the worktree here names a root that can NEVER contain the anchored path:
-    `devcontract._atomic_write_spec` gates on the same lexical `is_relative_to` and
-    would silently take the plain no-follow arm — losing #593's O_NOFOLLOW walk — while
-    `_restore_rearmed_spec`, which calls `atomic_write_bytes_confined` directly, would
-    raise `UnconfinedWriteError` and turn a recoverable re-arm abort into a lost undo.
+    `devcontract._atomic_write_spec` gates on the same lexical `is_relative_to` and would
+    silently take the plain no-follow arm, losing #593's O_NOFOLLOW walk — and so would
+    `_restore_rearmed_spec`, the re-arm's undo, which now selects its writer the same
+    lexical way rather than calling `atomic_write_bytes_confined` directly. All four
+    degrade together, which is the point: the undo that once RAISED `UnconfinedWriteError`
+    here, turning a recoverable re-arm abort into a lost one, is the asymmetry that
+    parity removed.
 
     The project is not guaranteed to contain it either; where nothing does, the write
     lands on the arm it already took. That is not unconditional, and the exception is

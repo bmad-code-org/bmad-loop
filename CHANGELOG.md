@@ -241,8 +241,19 @@ breaking changes may land in a minor release.
   residue notices they echo from a `finally` can no longer describe files as excluded from a
   baseline that was never saved, and an outcome the undo could not confirm (the cleared
   sentinel among them) reports the abort without claiming the file is intact. A rollback that
-  cannot write still raises, naming the possibly part-written spec, with the original fault
-  kept in the exception chain.
+  cannot write still raises, naming the possibly part-written spec to restore from git _or_
+  your own copy — an untracked or out-of-checkout spec has no committed version to recover —
+  with the original fault kept in the exception chain. The undo picks its writer the same
+  lexical way the three spec writers it undoes do, so a spec in an artifacts folder configured
+  outside the checkout is restored rather than refused; it declines to write at all when the
+  spec's bytes could not be CAPTURED from a file that is there and that the re-drive will
+  actually read, since a transient read fault followed by successful writes would leave a
+  published flip with nothing to put back; and it leaves a re-arm whose `save_state`
+  demonstrably committed alone, because that rename can be interrupted on the way out and
+  undoing the spec beneath it mirrors the same defect. An ORDINARY failure of the abort
+  record's OWN journal write is suppressed whatever its type, so an observation that cannot
+  be made never replaces the fault the operator is being told about — an interrupt still
+  leaves, since by then the rollback has already run and the operator asked to stop.
 
 - Stop an LLM-authored preference escalation from aborting the review leg. `_review_and_commit`
   splats a review session's own `result.json` escalation entries into `journal.append`, so a

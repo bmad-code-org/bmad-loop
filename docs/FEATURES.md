@@ -142,12 +142,22 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   back), `unchanged` (the file was read and PROVED byte-identical — a refusal sequenced ahead
   of every write), `failed` (the restore itself could not write, so the spec may be part-written
   — that one raises rather than degrading, keeps the original fault in the exception chain, and
-  names the file to restore from git in both the message and its next step), or `unknown`. The
-  last covers everything the undo could not confirm, the cleared sentinel among them, and the
+  names the file to restore — from git _or_ your own copy, since the bytes it failed to write
+  are gone with the process and a spec is not necessarily tracked — in both the message and its
+  next step), or `unknown`. The last covers everything the undo could not confirm: the cleared
+  sentinel, a re-arm that resolved no spec path at all (the record then carries an empty
+  locator and the notice says `(none)`), and a spec that is gone or unreadable by the time the
+  undo looks, which it declines to re-create rather than fight whatever removed it. The
   surfaces then report that nothing was persisted and the story is still escalated WITHOUT
   claiming the file on disk is intact — an unconfirmed outcome must never render as the
   reassuring one. Without this record the surfaces described the residue of a re-arm that had
   been rolled back — files "excluded from the re-drive baseline" for a baseline never saved.
+  Two boundaries keep the undo honest. It refuses to write at all when it could not first
+  CAPTURE the spec's bytes from a file that is there — a transient read fault followed by
+  writes that succeed would otherwise leave a published flip with nothing to put back — and it
+  does NOT undo a re-arm whose `save_state` demonstrably committed, since that state write is
+  a single atomic rename whose call can still be interrupted on its way out, and rolling the
+  spec back underneath it would build the same defect mirrored.
   All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before
