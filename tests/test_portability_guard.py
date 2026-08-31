@@ -27,6 +27,8 @@ docstring prose alone:
   ``test_journal_kinds_are_literal_or_the_position_is_declared`` holding the kind
   half readable and ``test_journal_append_writes_only_accounted_fields`` covering
   the two names ``Journal.append`` mints itself, which no call site spells.
+* ``runs.rearm_escalation`` is called from exactly two places, each of which consults
+  liveness first — ``test_rearm_escalation_called_only_behind_a_liveness_gate``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -180,6 +183,43 @@ TASK_ARTIFACT_LITERAL_ALLOW = {
 # ``_resumable_session``'s resume match, and the ``-g<N>`` re-arm discriminator that
 # a hand-rolled fourth mint would omit (#705).
 SESSION_TASK_ID_CHOKEPOINT = {"engine.py": "_session_task_id"}
+
+# The complete set of ``runs.rearm_escalation`` call sites, as
+# ``(file, enclosing function)``. The re-arm transaction's own commit probe
+# (``runs._rearm_commit_landed``) proves "did MY save_state land?" with nothing but
+# ``(generation, phase)`` over the reloaded task, and that is a sufficient IDENTITY
+# only under a sole-writer model: no engine advancing the task underneath, and one
+# control command at a time. Its docstring argues that model from this enumeration.
+#
+# Prose cannot hold it. A third call site — or either existing gate deleted — leaves
+# every test in the repo green while the probe's premise quietly becomes false, and
+# the failure it opens is DW-79/DW-83's own shape: a spec left re-armed against a task
+# the run still calls ESCALATED. So the enumeration is scanned instead of asserted.
+#
+# Deliberately NOT a lock and not a durable per-re-arm token: the spec's ``Never``
+# forbids both (a lock only ``rearm_escalation`` takes excludes nobody; a token buys a
+# precision ``save_state`` cannot honour). It forbids no guard, and this is the cheap
+# half — it does not make overlapping callers safe, it makes the day someone adds one
+# impossible to miss. Overlapping control commands stay out of the model, as DW-93.
+REARM_ESCALATION_CALLERS = {
+    ("cli.py", "cmd_resolve"),
+    ("tui/app.py", "_do_rearm"),
+}
+
+# What counts as consulting liveness, matched as a substring of the callee's name
+# because the two sites legitimately spell it differently and neither spelling is more
+# correct: the CLI calls ``runs.engine_liveness`` directly, the TUI goes through
+# ``self._resolve_blocked_by_liveness`` (which reaches ``runs.liveness``, the pid-file
+# sibling sharing ``probe_liveness``). Pinning either exact name would redden on a
+# rename that changes nothing, while the substring still reddens on the deletion this
+# guard exists for.
+#
+# What the gate establishes is that the engine is not PROVABLY alive, not that it is
+# proven dead — ``"unknown"`` proceeds under ``--force`` in ``cmd_resolve``, and the
+# TUI counts it as blocking only for a pid-backed run. This guard therefore grades
+# that the result controls a terminating branch before the call; the caller-level
+# tests pin the exact alive/unknown policy on the two real surfaces.
+LIVENESS_GATE_MARK = "liveness"
 
 # The journal field names ``diagnostics`` routes BY NAME, read off the live module
 # rather than copied, so the guard cannot drift from the tables it grades: add a row
@@ -541,7 +581,7 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
 # ⚠️ STATED BOUND: a LOCALLY ALIASED handle is invisible. `j = self.journal` followed
 # by `j.append(kind, customer_email=x)` produces no finding (verified by running it
 # through `_scan_source`). No such site exists in the tree today, and resolving the
-# binding would be `_verify_call_aliases`' shape rather than a new idea — but the
+# binding would be `_call_aliases`' shape rather than a new idea — but the
 # guard does not do it, and a reader must not assume it does.
 JOURNAL_RECEIVERS = {"journal", "_journal"}
 
@@ -892,8 +932,8 @@ def _called_name(func: ast.expr) -> str | None:
     return None
 
 
-def _verify_call_aliases(tree: ast.AST, target: str) -> frozenset[str]:
-    """Bare names statically bound to one guarded verify-call target.
+def _call_aliases(tree: ast.AST, target: str) -> frozenset[str]:
+    """Bare names statically bound to one guarded call target.
 
     The call-site spelling alone misses the ordinary Python aliases a future
     caller may use: rename-on-import and a local assignment from either the
@@ -1179,6 +1219,70 @@ def _enclosing_function_nodes(tree: ast.AST) -> dict[int, ast.AST | None]:
     return nodes
 
 
+def _names_rearm_escalation(func: ast.expr, aliases: frozenset[str] = frozenset()) -> bool:
+    """True when ``func`` spells the re-arm transaction's entry point.
+
+    Qualified and bare spellings are direct matches; ``aliases`` adds ordinary
+    rename-on-import and assignment bindings. Matching an attribute without checking
+    its value means an unrelated ``x.rearm_escalation(...)`` also registers — that
+    false positive is a review prompt naming a real call to a function of that name,
+    which is the trade every sibling detector in this file makes.
+    """
+    return _names_guarded_verify_call(func, "rearm_escalation", aliases)
+
+
+def _block_exits(body: list[ast.stmt]) -> bool:
+    """Whether this simple guard body cannot fall through to the re-arm below it."""
+    return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
+
+
+def _liveness_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and LIVENESS_GATE_MARK in (_called_name(node.func) or "")
+
+
+def _top_level_liveness_bindings(fn: ast.AST, lineno: int) -> set[str]:
+    """Names bound by an earlier top-level liveness probe in ``fn``."""
+    bindings: set[str] = set()
+    assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    for stmt in fn.body:
+        if stmt.lineno >= lineno or not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = stmt.value
+        if value is None or not _liveness_call(value):
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        bindings.update(target.id for target in targets if isinstance(target, ast.Name))
+    return bindings
+
+
+def _test_uses_liveness(test: ast.expr, bindings: set[str]) -> bool:
+    return any(
+        _liveness_call(node) or (isinstance(node, ast.Name) and node.id in bindings)
+        for node in ast.walk(test)
+    )
+
+
+def _consults_liveness_before(fn: ast.AST | None, lineno: int) -> bool:
+    """True when a preceding liveness decision blocks fall-through to the re-arm.
+
+    The two real callers keep the gate in their top-level statement sequence: the TUI
+    calls its boolean helper directly in an ``if`` and the CLI binds ``engine_liveness``
+    before testing that result. Requiring a terminating guard body deliberately rejects
+    an ignored probe, a probe hidden in an uncalled nested function, and one conditional
+    on an unrelated outer branch. A more deeply factored gate is a review prompt rather
+    than a silent pass.
+    """
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    bindings = _top_level_liveness_bindings(fn, lineno)
+    for stmt in fn.body:
+        if stmt.lineno >= lineno or not isinstance(stmt, ast.If):
+            continue
+        if _block_exits(stmt.body) and _test_uses_liveness(stmt.test, bindings):
+            return True
+    return False
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -1202,8 +1306,9 @@ def _scan_source(src: str, rel: str):
     tree = ast.parse(src, filename=rel)
     docs = _docstring_node_ids(tree)
     env_aliases = _env_name_aliases(tree)
-    verify_command_aliases = _verify_call_aliases(tree, "verify_commands_outcome")
-    verify_classifier_aliases = _verify_call_aliases(tree, "verify_command_results_outcome")
+    verify_command_aliases = _call_aliases(tree, "verify_commands_outcome")
+    verify_classifier_aliases = _call_aliases(tree, "verify_command_results_outcome")
+    rearm_aliases = _call_aliases(tree, "rearm_escalation")
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -1687,6 +1792,24 @@ def _scan_source(src: str, rel: str):
             )
         )
 
+    # Every `rearm_escalation` CALL, carrying `(enclosing function, gated)` — the two
+    # facts `REARM_ESCALATION_CALLERS` is an enumeration of. The `def` in `runs.py` is
+    # not a Call and needs no exemption.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _names_rearm_escalation(node.func, rearm_aliases):
+            findings.append(
+                (
+                    "rearmcall",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    (
+                        enclosing_names.get(id(node)),
+                        _consults_liveness_before(enclosing_nodes.get(id(node)), node.lineno),
+                    ),
+                )
+            )
+
     return findings
 
 
@@ -1971,6 +2094,67 @@ def test_session_task_id_composed_only_at_the_chokepoint():
         "function instead, so the id keeps its whole-composition sanitize and its "
         "-g<N> re-arm generation suffix (#705):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_rearm_escalation_called_only_behind_a_liveness_gate():
+    """``runs.rearm_escalation`` is reached from exactly two places, and each consults
+    liveness before it.
+
+    ``runs._rearm_commit_landed`` decides whether the re-arm transaction COMMITTED —
+    and therefore whether to roll the spec back — from ``(generation, phase)`` over the
+    reloaded task, nothing more. Those two conjuncts are a sufficient identity only
+    while ``rearm_escalation`` is the sole writer of that run's ``state.json``, and that
+    model is argued from this enumeration: two callers, each behind a liveness
+    consultation, with no engine running. A third caller, or either gate deleted, makes
+    the premise false — and the defect it reopens is DW-79/DW-83's own: a spec left
+    flipped against a task the run still calls ESCALATED.
+
+    Note what the gate does and does not establish. It proves the engine is not
+    PROVABLY alive, not that it is dead: ``"alive"`` is refused outright, while
+    ``"unknown"`` proceeds under ``--force`` in ``cmd_resolve`` and counts as blocking
+    in the TUI only for a pid-backed run. So this grades the falsifiable half — that
+    an earlier liveness decision BLOCKS fall-through before the call. The rest of the
+    model (one control command at a time) is out of scope here and tracked as DW-93.
+
+    ``cli.cmd_resume`` is deliberately absent: it writes this run's ``state.json``
+    through ``_resume_paused_run``, so the sole-writer claim must account for it, but it
+    never re-arms and so is not a call site. Listing it here would make the enumeration
+    unfalsifiable in the direction that matters.
+
+    ⚠️ What this assertion grades, precisely — the two halves differ, and the
+    difference is the reason the probe rows below exist:
+
+    * the ENUMERATION, yes, in both directions and with multiplicity. The count is
+      non-empty on today's tree, so deleting the ``rearmcall`` emit reddens it — unlike the
+      sibling repo-wide "nothing is flagged" guards, which go green when their detector
+      dies. Adding a third call, even inside an existing caller, reddens it too.
+    * the GATE, no. Both sites are gated today, so ``ungated == []`` would survive a
+      ``_consults_liveness_before`` that always answered ``True`` — including one that
+      had lost its line-position check, which is the half a late gate would exploit.
+      ``REARM_CALL_PROBES`` is where that is caught, and the two are not
+      interchangeable.
+
+    Ablations to run against this row: drop the ``if
+    self._resolve_blocked_by_liveness(...)`` block from ``tui.TuiApp._do_rearm`` and the
+    gate half must redden naming ``tui/app.py``; add a call in a third function and the
+    count comparison must redden."""
+    findings = _of("rearmcall")
+    sites = _rearm_callsite_counts(findings)
+    declared = Counter(REARM_ESCALATION_CALLERS)
+    assert sites == declared, (
+        "the count of runs.rearm_escalation call sites moved. That enumeration is what "
+        "runs._rearm_commit_landed's (generation, phase) commit probe argues its "
+        "sole-writer premise from — a new caller needs that docstring revisited (and "
+        "DW-93 consulted), not this constant widened:\n"
+        f"  scanned:  {sorted(sites.elements())}\n"
+        f"  declared: {sorted(declared.elements())}"
+    )
+    ungated = [(rel, ln, txt) for _, rel, ln, txt, (_, gated) in findings if not gated]
+    assert ungated == [], (
+        "runs.rearm_escalation called without a preceding liveness refusal — the re-arm "
+        "mutates persisted state for a run it must know is not being driven:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in ungated)
     )
 
 
@@ -3343,6 +3527,145 @@ def test_session_task_id_exemption_is_scoped_to_the_chokepoint(label, rel, sourc
         f"a composed task id in {rel} here should "
         f"{'be refused' if is_offender else 'be allowed'}:\n{source}"
     )
+
+
+# The re-arm caller detector's probe matrix. Today's tree has exactly two `rearmcall`
+# findings and BOTH are gated, so the tree-wide guard's `ungated == []` half would stay
+# green with the gate logic deleted, or with its line-position check dropped — only
+# these rows redden. Each is driven through the real `_scan_source`.
+REARM_CALL_PROBES = [
+    # (label, source, expected enclosing function, expected `gated`)
+    (
+        "qualified-call-behind-the-gate",
+        "def cmd_resolve(args):\n"
+        "    live = runs.engine_liveness(run_dir)\n"
+        '    if live == "alive":\n'
+        "        return\n"
+        "    runs.rearm_escalation(run_dir, story_key)\n",
+        "cmd_resolve",
+        True,
+    ),
+    # The TUI's spelling, which reaches `runs.liveness` rather than `engine_liveness`.
+    # This is the row that makes the substring match load-bearing rather than lax.
+    (
+        "tui-spelling-of-the-gate",
+        "def _do_rearm(self, run_id, run_dir):\n"
+        "    if self._resolve_blocked_by_liveness(run_id, run_dir):\n"
+        "        return\n"
+        "    runs.rearm_escalation(run_dir, story_key)\n",
+        "_do_rearm",
+        True,
+    ),
+    # A rename-on-import third caller — the alias resolver's first ordinary shape.
+    (
+        "renamed-call-from-import",
+        "from .runs import rearm_escalation as rearm\n"
+        "def cmd_something(args):\n"
+        "    if runs.engine_liveness(run_dir):\n"
+        "        return\n"
+        "    rearm(run_dir, story_key)\n",
+        "cmd_something",
+        True,
+    ),
+    # Assignment aliases are just as callable as import aliases.
+    (
+        "assigned-call-alias",
+        "handler = runs.rearm_escalation\n"
+        "def cmd_something(args):\n"
+        "    if runs.engine_liveness(run_dir):\n"
+        "        return\n"
+        "    handler(run_dir, story_key)\n",
+        "cmd_something",
+        True,
+    ),
+    # Merely reading liveness is not a gate when the result is ignored.
+    (
+        "ignored-liveness-result",
+        "def cmd_something(args):\n"
+        "    live = runs.engine_liveness(run_dir)\n"
+        "    runs.rearm_escalation(run_dir, story_key)\n",
+        "cmd_something",
+        False,
+    ),
+    # Nor is a guard hidden in a closure that the caller never invokes.
+    (
+        "uninvoked-nested-guard",
+        "def cmd_something(args):\n"
+        "    def guard():\n"
+        "        if runs.engine_liveness(run_dir):\n"
+        "            return\n"
+        "    runs.rearm_escalation(run_dir, story_key)\n",
+        "cmd_something",
+        False,
+    ),
+    # An ungated third caller: the defect this guard exists for.
+    (
+        "no-gate-at-all",
+        "def cmd_something(args):\n    runs.rearm_escalation(run_dir, story_key)\n",
+        "cmd_something",
+        False,
+    ),
+    # The gate present but BELOW the call, which is not a gate. Without the line
+    # comparison in `_consults_liveness_before` this row reads as `True` and the whole
+    # position rule is unheld.
+    (
+        "gate-below-the-call",
+        "def cmd_something(args):\n"
+        "    runs.rearm_escalation(run_dir, story_key)\n"
+        "    live = runs.engine_liveness(run_dir)\n",
+        "cmd_something",
+        False,
+    ),
+]
+REARM_CALL_NON_PROBES = [
+    # The definition is not a call and needs no exemption.
+    ("the-definition", "def rearm_escalation(run_dir, story_key=None):\n    return None\n"),
+    # A different function whose name merely starts the same way.
+    ("similar-name", "def f():\n    runs.rearm_escalation_notice(run_dir)\n"),
+    # A mere mention as a value, not a call.
+    ("reference-not-a-call", "def f():\n    handler = runs.rearm_escalation\n"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,source,fn,gated", REARM_CALL_PROBES, ids=[p[0] for p in REARM_CALL_PROBES]
+)
+def test_rearm_call_detector_reports_the_site_and_its_gate(label, source, fn, gated):
+    """Each call shape is found, attributed to its enclosing function, and graded on
+    whether an earlier liveness guard blocks fall-through. `cli.py` is passed because
+    nothing in this detector is file-scoped — the enumeration lives in the tree-wide
+    assertion, not here."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "rearmcall"]
+    assert len(found) == 1, f"the {label!r} shape produced {len(found)} findings:\n{source}"
+    assert found[0][4] == (fn, gated), f"the {label!r} shape graded as {found[0][4]}"
+
+
+def _rearm_callsite_counts(findings) -> Counter:
+    """Call-site multiplicity, not just distinct enclosing functions."""
+    return Counter((rel, fn) for _, rel, _, _, (fn, _) in findings)
+
+
+def test_rearm_callsite_count_does_not_hide_a_second_call_in_one_function():
+    source = (
+        "def cmd_resolve(args):\n"
+        "    if runs.engine_liveness(run_dir):\n"
+        "        return\n"
+        "    runs.rearm_escalation(run_dir, first)\n"
+        "    runs.rearm_escalation(run_dir, second)\n"
+    )
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "rearmcall"]
+    assert _rearm_callsite_counts(found) == Counter({("cli.py", "cmd_resolve"): 2})
+
+
+@pytest.mark.parametrize(
+    "label,source", REARM_CALL_NON_PROBES, ids=[p[0] for p in REARM_CALL_NON_PROBES]
+)
+def test_rearm_call_detector_stays_silent_on_non_calls(label, source):
+    """A definition, a reference and a similarly-named neighbour are not call sites. A
+    detector that flagged these would push noise into the tree-wide enumeration, which
+    is an equality assertion and so fails on a false positive as loudly as on a miss."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "rearmcall"]
+    assert not found, f"the {label!r} shape produced a `rearmcall` finding:\n{source}"
 
 
 # The journal detector's probe matrix, as `(label, source, expected)` where
