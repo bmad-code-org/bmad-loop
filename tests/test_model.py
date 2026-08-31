@@ -291,6 +291,22 @@ def test_generation_defaults_zero_for_legacy_state():
     assert StoryTask.from_dict(doc).generation == 0
 
 
+def test_escalations_resolved_upto_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, escalations_resolved_upto=3)
+    assert StoryTask.from_dict(task.to_dict()).escalations_resolved_upto == 3
+
+
+def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
+    """A `state.json` written before DW-11 must resume UNFILTERED. 0 is the value
+    `resolve._gather_escalations` reads as "nothing answered yet", so every escalation
+    the run recorded is still shown and nothing is reported withheld — byte-for-byte
+    today's behavior. Any other default would hide entries the human never saw, on a
+    run that was mid-escalation across the upgrade."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["escalations_resolved_upto"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).escalations_resolved_upto == 0
+
+
 def test_resolved_redrive_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
