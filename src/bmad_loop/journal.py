@@ -63,6 +63,20 @@ VERIFY_DIR = "verify"
 # (``adapters/generic.py``) and ``messages.json`` (``adapters/opencode_http.py``).
 TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ("result.json", "escalation.json")
 
+# The field names ``Journal.append`` stamps onto an entry ITSELF, rather than taking
+# from its caller's keywords — see the ``setdefault`` pair in that method. No call
+# site spells either one, which makes them invisible to anything reading call sites
+# and easy for a consumer to mistake for a producer-supplied field.
+#
+# Spelled here, at the minting site, because two consumers need exactly this set and
+# a third copy is how they drift: ``diagnostics._scrub_entry`` must exempt them from
+# the fail-closed arm it applies to a declared-schema kind (they are engine-minted,
+# never LLM-authored, so collapsing ``log_pos`` to a presence marker would throw away
+# a byte offset for no safety gain), and ``tests/test_portability_guard.py`` needs
+# them to keep its static call-site scan from calling them dead. Both import this
+# name; neither restates the pair.
+SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
+
 
 class Journal:
     def __init__(self, run_dir: Path):

@@ -70,6 +70,12 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`bmad-loop diagnose --json` reports `schema_version: 3`.** Replacing a journal-entry value
+  with a presence key is a payload break under the additive-only rule, and the redaction fixes
+  above make two: a consumer reading `entry["question"]` on `decision-pending`, or an
+  off-schema key on `preference-escalation`, finds a `<name>_present` boolean instead. Exactly
+  what minted v2 for `patch` / `stashed_to`. Structure is otherwise unchanged.
+
 - **A story's `verification_sequence` now numbers its review passes too**, so the ordinals a
   `post_dev_verify` handler receives shift: for an unchanged run whose review gate sits between
   the dev and repair legs, the `fix` pass moves from 2 to 3. The ordinal was always documented
@@ -219,10 +225,25 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Alias the `story_keys` list on the `sweep-inflight-stranded` journal record. It carried raw
-  bundle story keys into `diagnose --dump`: the value fell through to `scrub_json`, which is the
-  identity on a list of identifier-shaped strings, while the singular `story_key` beside it was
-  already aliased.
+- Stop an LLM-authored preference escalation from aborting the review leg. `_review_and_commit`
+  splats a review session's own `result.json` escalation entries into `journal.append`, so a
+  result.json carrying a `kind` or `story_key` key raised `TypeError: got multiple values for
+argument` and failed the story; a `ts` key did not raise and instead silently replaced the
+  entry's real timestamp, skewing every relative offset a diagnostic dump derives from it. Those
+  three journal-owned names are now dropped before the splat.
+
+- Close three journal-field leaks into `diagnose`, all found by the new field-routing guard and
+  each reproduced through `diagnostics._scrub_entry`. On `preference-escalation`, whose keys are
+  LLM-authored (`engine._review_and_commit` splats a session's own `result.json` entries into
+  the journal), every key outside the record's declared `{type, severity, detail}` schema now
+  renders as `<name>_present`; the key NAME still ships, a bound stated on the routing entry and
+  accepted rather than collapsed. `decision-pending`'s `question` joins the free-text drop set —
+  a multi-word question collapsed only by accident of the fallback forbidding spaces, while a
+  one-token one shipped verbatim; no operator surface loses it, since the TUI reads the raw
+  journal. And `story_keys` is aliased element-wise on `sweep-inflight-stranded`, which carried
+  raw bundle story keys because the value fell through to `scrub_json` — the identity on a list
+  of identifier-shaped strings — while the singular `story_key` beside it was already aliased;
+  a non-list value on any key-list field now fails closed instead of taking that same path.
 - Stop a second resolve cycle re-presenting escalations the human already answered
   (DW-11). Only a re-arm that accepted a `resolution.json` watermarks the session
   trail; later cycles show what came after it and print how many were withheld.
