@@ -35,6 +35,7 @@ from .platform_util import (
     UnconfinedWriteError,
     _mkstemp_beside,
     atomic_replace,
+    atomic_write_bytes,
     atomic_write_bytes_confined,
     atomic_write_text_confined,
     create_exclusive_confined,
@@ -3040,20 +3041,20 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     shape: `model._serialized_worktree_path` keeps a path verbatim exactly when
     `relative_to(worktree_path)` raises, so the two spellings did not share a prefix.
     Returning the worktree there would name a root that can never contain the path
-    `task_spec_path` passes through — the three `_atomic_write_spec` writers would
-    silently take the plain no-follow arm (losing #593's O_NOFOLLOW walk) and
-    `_restore_rearmed_spec`, which calls the confined writer directly, would RAISE.
+    `task_spec_path` passes through — all FOUR writers of these bytes would silently take
+    the plain no-follow arm and lose #593's O_NOFOLLOW walk.
 
-    The project can often confine it. Where nothing can, the THREE `_atomic_write_spec`
-    writers land on the arm they already took — they select lexically, so an out-of-root
-    path simply takes the plain no-follow write as before. That is not true of every
-    writer: `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY with no
-    lexical arm, so for a spec outside both the mount and the project — the shared
+    The project can often confine it. Where nothing can, every writer of these bytes
+    lands on the arm it already took — they all select LEXICALLY, so an out-of-root path
+    simply takes the plain no-follow write as before. That parity is load-bearing and was
+    once broken: `_restore_rearmed_spec` called `atomic_write_bytes_confined` DIRECTLY
+    with no lexical arm, so for a spec outside both the mount and the project — the shared
     artifact dir `_spec_is_shared_with_the_redrive` treats as first-class and reachable —
-    it raises `UnconfinedWriteError` and the re-arm's undo is lost with the spec already
-    flipped and stripped. That asymmetry PRE-DATES this anchor (the previous body
-    returned the worktree there, which equally cannot confine the path) and is tracked
-    separately; it is named here so the paragraph is not read as covering it.
+    the flip, the strip and the re-stamp all LANDED while the re-arm's undo alone raised
+    `UnconfinedWriteError`, losing the rollback on precisely the specs it could still
+    break. A writer that refuses where its siblings write does not add safety here; it
+    subtracts the transaction. Do not re-introduce the asymmetry by "hardening" one of
+    the four in isolation.
 
     The arm is not unconditionally an improvement either, and that exception is graded by
     `test_task_spec_root_refuses_a_spec_the_project_cannot_reach`: `_atomic_write_spec`
@@ -3519,13 +3520,27 @@ def _restore_rearmed_spec(
     Folding those into one "nothing had to be put back" answer is what made the notice
     overclaim, so the distinction lives in the return type rather than in a comment.
 
-    Byte-verbatim and CONFINED, matching the writes it undoes: `atomic_write_text_confined`
-    would re-encode and translate newlines, so a CRLF spec would come back subtly
-    different from the file this re-arm found, and an unconfined write would drop the
-    `O_NOFOLLOW` walk of the parent components (#593) that every other write to this path
-    takes. A restore that itself fails RAISES rather than degrading — the spec is then
+    Byte-verbatim, never the text writer: `atomic_write_text_confined` would re-encode and
+    translate newlines, so a CRLF spec would come back subtly different from the file this
+    re-arm found.
+
+    And it picks its arm the SAME LEXICAL WAY the three writers it undoes do
+    (`frontmatter.set_frontmatter_status` states the rule; `verify.set_frontmatter_field`
+    and `devcontract._atomic_write_spec` restate it): under `confine_root`, through the
+    component-walking confined helper (#593); outside it, the plain `follow_symlinks=False`
+    write. Calling the confined helper unconditionally looked stricter and was strictly
+    worse — an artifacts folder configured OUTSIDE both the mount and the project is
+    supported configuration (`bmadconfig` resolves one, `verify.spec_within_roots` trusts
+    it, `_spec_is_shared_with_the_redrive` treats it as first-class), and there the flip,
+    the strip and the re-stamp all LAND while this undo alone raised
+    `UnconfinedWriteError`. The undo then reported `failed` on exactly the specs it was
+    able to break, which is the asymmetry `task_spec_root`'s docstring used to name as
+    out of scope. A restore that refuses where the writes succeeded is not extra safety;
+    it is the transaction's write set going unhonoured.
+
+    A restore that itself fails RAISES rather than degrading — the spec is then
     half-written and only the operator can settle it, which is the loudest thing this can
-    be. `UnconfinedWriteError` is an `OSError`, so the one arm covers both.
+    be. `UnconfinedWriteError` is an `OSError`, so the one arm still covers both.
     """
     if original is None:
         return "unknown"
@@ -3534,14 +3549,23 @@ def _restore_rearmed_spec(
             return "unchanged"
     except OSError:
         return "unknown"
+    confine_root = task_spec_root(task, state)
     try:
-        atomic_write_bytes_confined(spec_path, original, confine_root=task_spec_root(task, state))
+        if spec_path.is_relative_to(confine_root):
+            atomic_write_bytes_confined(
+                spec_path, original, confine_root=confine_root, require_writable_target=True
+            )
+        else:
+            atomic_write_bytes(
+                spec_path, original, follow_symlinks=False, require_writable_target=True
+            )
     except OSError as e:
         raise RearmError(
             f"cannot restore {spec_path} after a failed re-arm "
             f"({e.__class__.__name__}: {e}) — the spec may carry this re-arm's status "
             "flip and may have lost its `## Auto Run Result` section, while the story is "
-            "still escalated; restore the spec from git, then re-run resolve"
+            "still escalated; restore the spec from git or from your own copy, then "
+            "re-run resolve"
         ) from e
     return "restored"
 
@@ -3579,10 +3603,21 @@ def _rollback_rearm(
     transaction covers is the spec's BYTES from the first spec write onward; the deletion
     is outside that, so the record must not claim the tree is as the re-arm found it.
 
-    The record is journalled through a `finally` and only its OSError is suppressed.
-    Recording an abort is an OBSERVATION, and an observation that cannot be made must
-    not replace the fault the operator is being told about — while a restore failure is
-    a repair write, and repair writes raise.
+    The record is journalled through a `finally` and every `Exception` from that append
+    is suppressed. Recording an abort is an OBSERVATION, and an observation that cannot
+    be made must not replace the fault the operator is being told about — while a restore
+    failure is a repair write, and repair writes raise.
+
+    `Exception` and not `OSError`, which is the ONE place in this transaction where the
+    breadth is deliberately NARROWER than the guard's own `BaseException` and, at the
+    same time, wider than a filesystem taxonomy. Wider, because `Journal.append`
+    serializes caller-supplied values and opens a file: a `TypeError` or `ValueError` out
+    of `json.dumps`, or anything else this append can raise, would otherwise REPLACE the
+    fault the whole record exists to report — the `Always:` re-raise invariant the two
+    pinned `MemoryError` tests depend on. Narrower, because `KeyboardInterrupt` and
+    `SystemExit` must still leave: by the time this `finally` runs the rollback has
+    already completed, so an interrupt here cannot reproduce DW-79/DW-83, and discarding
+    the operator's Ctrl-C to keep a breadcrumb would be the worse trade.
     """
     # `unknown` is the floor, not `unchanged`: a re-arm that resolved no spec path made
     # no claim about any file, and the surfaces must not manufacture one for it.
@@ -3606,8 +3641,73 @@ def _rollback_rearm(
                 error=f"{error.__class__.__name__}: {error}",
                 rollback=rollback,
             )
-        except OSError:
+        except Exception:  # nosec B110 - the OBSERVATION must not replace the fault
+            # See the docstring: the ORIGINAL re-arm fault wins over ANY ordinary
+            # failure of this append, not just a filesystem one. `KeyboardInterrupt`
+            # and `SystemExit` are not `Exception` and still propagate.
             pass
+
+
+def _rearm_commit_landed(run_dir: Path, story_key: str, task: StoryTask) -> bool:
+    """Did `save_state` already COMMIT this re-arm, despite the fault now unwinding?
+
+    `journal.save_state` ends in `atomic_replace`, so the commit is a single rename that
+    either happened or did not — but the CALL can still fail after it: a `KeyboardInterrupt`
+    delivered between that rename and the return unwinds through the transaction guard
+    with `state.json` already describing a PENDING, re-armed task. Rolling the spec back
+    there does not restore the pre-re-arm world; it MANUFACTURES the mirror image of
+    DW-79/DW-83 — persisted state re-armed against a spec that is not — and then reports
+    it as "nothing was persisted, the story is still escalated", which is simply false.
+
+    The guard cannot know this from control flow (no assignment after `save_state` runs
+    on that path), so it ASKS THE DISK, which is the only witness of a rename. Both the
+    bumped `generation` and the reset `phase` must match the object `save_state` was
+    handed: `generation` alone would be satisfied by a state file this call never wrote
+    only if some other writer had minted the same bump, and `phase` alone moves for
+    reasons a re-arm does not own.
+
+    Degrades to `False` — roll back, the pre-existing behavior — on ANY failure to read
+    or parse the state file. This is observation feeding a repair decision, and the safe
+    default is the one that leaves the spec as the re-arm found it: a re-arm that did
+    NOT commit and is wrongly believed to have is the DW-79/DW-83 defect itself, while
+    the converse leaves a rolled-back spec beside committed state that the next resume
+    re-drives from a spec still carrying the escalated status — recoverable, and loud.
+
+    ANY failure means `BaseException`, and that breadth is the whole reason this probe is
+    safe to call where it is called. Its ONE call site sits inside the transaction guard's
+    `except BaseException` arm and runs BEFORE `_rollback_rearm`, so a fault escaping this
+    function escapes the guard too and the rollback never happens — leaving exactly the
+    spec-flipped-against-an-ESCALATED-task state the guard exists to end, now reached by
+    the code added to prevent its mirror image. `load_state` reads and parses a file, so a
+    `KeyboardInterrupt` or `SystemExit` delivered anywhere in it is not hypothetical, and
+    under `except Exception` it took precisely that path.
+
+    Swallowing an interrupt here is therefore the correct trade, and it is not a lost
+    Ctrl-C: the rollback is a REPAIR WRITE that must not be skipped, and the guard's own
+    `raise` still propagates the original re-arm fault immediately afterwards, so the
+    process still exits loudly — one spec-sized write later. This is the reverse of the
+    trade `_rollback_rearm`'s abort-record append makes, and the two are consistent
+    because the acts differ: recording is an observation and must never displace a fault,
+    while repairing is a write whose omission IS the defect. The abort record's append
+    remains the ONE place in this transaction whose breadth is narrower than the guard's.
+
+    No `rearm-aborted` record is written on the committed path either (the caller skips
+    the whole rollback). Every rendering of that kind asserts that nothing was persisted;
+    there is no value of `rollback` that is true here, and inventing one would put a
+    false sentence on both operator surfaces rather than leave the fault to speak.
+    """
+    try:
+        persisted = load_state(run_dir).tasks.get(story_key)
+    except BaseException:
+        # See the docstring: a fault escaping this probe escapes the guard arm that
+        # calls it and skips the rollback entirely, so an interrupt is absorbed here
+        # and the original fault still propagates from the guard's `raise` below.
+        return False
+    return (
+        persisted is not None
+        and persisted.generation == task.generation
+        and persisted.phase == task.phase
+    )
 
 
 def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: bool) -> str:
@@ -4085,12 +4185,47 @@ def rearm_escalation(
                         redrive="isolated" if isolated_redrive else "in-place",
                     )
                 # Captured immediately before the FIRST write, so an abort further down can
-                # put the spec back exactly as found. Unreadable degrades to `None`: the
-                # writes below answer such a path with `False` rather than an exception, so
-                # there would be nothing to undo either.
+                # put the spec back exactly as found.
+                #
+                # A path that is NOT a file here degrades to `None`, and that degrade is
+                # sound for the reason it always was: every writer below answers such a
+                # path with `False` rather than an exception, so there is nothing to undo.
+                # A missing spec, a dangling link and a directory all land there.
+                #
+                # A path that IS a file whose bytes could not be read is the opposite
+                # case, and it must FAIL BEFORE WRITING. The read below is one syscall
+                # among many against a file three later writers open independently, so a
+                # transient fault (EIO on a network mount, a momentary EACCES, ENFILE
+                # under load) can be followed by writes that all succeed — and the abort
+                # that follows would then find `spec_before is None`, record `unknown`,
+                # and re-raise with the flip PUBLISHED and nothing put back. That is
+                # DW-79/DW-83 reached through the transaction's own preimage. Refusing
+                # keeps the escalation armed for a retry.
+                #
+                # Gated on the SAME PAIR as the flip's refusal one screen below
+                # (`spec_path.is_file() and write_reaches_the_redrive`), because it is the
+                # same abort-vs-warn decision about the same file and the two must not
+                # disagree. `is_file` alone is not enough: under isolation the readable
+                # file is the worktree copy the re-drive DESTROYS before reading anything,
+                # so an abort there demands a repair to a file nothing opens — its remedy
+                # cannot change what the re-drive reads, and it costs the operator the
+                # interactive resolve session over a spec whose real reachability record
+                # (`rearm-spec-write-unreachable`) has already been written above. On that
+                # shape the unreadable preimage is an OBSERVATION, and observations
+                # degrade: `spec_before` stays `None`, the writes below no-op or land on a
+                # doomed copy, and any later abort records `unknown` rather than claiming
+                # a file it never captured.
                 try:
                     spec_before = spec_path.read_bytes()
-                except OSError:
+                except OSError as e:
+                    if spec_path.is_file() and write_reaches_the_redrive:
+                        raise RearmError(
+                            f"cannot read story spec {spec_path} before re-opening it for "
+                            f"the re-drive ({e.__class__.__name__}: {e}) — the re-arm "
+                            "refuses to write a spec it could not capture first, since a "
+                            "later abort would have nothing to put back; fix or replace "
+                            "the file, then re-run resolve"
+                        ) from e
                     spec_before = None
                 try:
                     flipped = verify.set_frontmatter_status(
@@ -4465,7 +4600,16 @@ def rearm_escalation(
         # to end: a spec re-armed on disk against a task still recorded as ESCALATED.
         # Narrowing this arm is a silent regression, so a test raises `KeyboardInterrupt`
         # through the window on purpose.
-        _rollback_rearm(journal, key, spec_path, spec_before, task, state, e)
+        #
+        # That breadth is also what makes the commit point AMBIGUOUS on exactly one path,
+        # and the check below is the price of it: `save_state` commits by `atomic_replace`
+        # and can still be interrupted between that rename and its return, so a fault
+        # arriving here does NOT prove the transaction failed. `_rearm_commit_landed` asks
+        # the disk — the only witness of a rename — and a committed re-arm is left alone:
+        # undoing the spec then would build the mirror image of the defect this guard
+        # closes, persisted state re-armed against a spec that is not.
+        if not _rearm_commit_landed(run_dir, key, task):
+            _rollback_rearm(journal, key, spec_path, spec_before, task, state, e)
         raise
     journal.append(
         "story-escalation-resolved",
@@ -4742,12 +4886,21 @@ def rearm_event_notice(
             # `## Auto Run Result` section still present, so the old sentence ("carrying
             # this re-arm's status flip and missing its `## Auto Run Result` section")
             # described a state this record cannot know it is in.
+            #
+            # Nor does it promise GIT alone. The bytes the undo failed to write lived only
+            # in this process and are gone with it, and a spec is not necessarily tracked:
+            # an untracked artifact, or one in an artifacts folder configured outside the
+            # checkout entirely (supported configuration — `bmadconfig` resolves one), has
+            # no committed copy to check out. Naming git as THE remedy sent that operator
+            # to a command with nothing to give them; naming it as ONE of two keeps the
+            # common case one word away without asserting a recovery that may not exist.
             return (
                 "warning",
                 f"the re-arm ABORTED ({error}) and putting the spec back FAILED — {spec} "
-                "may be left part-written, so restore it from git before re-running "
-                "resolve; nothing was persisted and the story is still escalated",
-                "Restore the spec from git, then re-run resolve",
+                "may be left part-written, so restore it from git or from your own copy "
+                "before re-running resolve; nothing was persisted and the story is still "
+                "escalated",
+                "Restore the spec from git or your own copy, then re-run resolve",
             )
         if rollback in ("restored", "unchanged"):
             return (

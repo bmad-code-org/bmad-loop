@@ -460,7 +460,7 @@ def test_advance_write_failure_raises_and_leaves_the_board_entire(tmp_path, monk
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_advance_writes_through_a_symlinked_board(tmp_path):
     """The row that grades this SITE's `follow_symlinks` argument — the DEFAULT
-    here, unlike the three spec writers, which pass False to match the
+    here, unlike the spec writers, which pass False to match the
     name-replacing `atomic_replace` they already had.
 
     The default is what preserves behaviour: `write_text` opened through a link, so
