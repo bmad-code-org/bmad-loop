@@ -225,6 +225,25 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An aborted re-arm no longer leaves the spec re-armed against an escalated task**
+  (DW-79, DW-83, DW-85). `runs.rearm_escalation` published the status flip and stripped the
+  stale `## Auto Run Result` about 250 lines before `save_state`, and only two of the aborts
+  in that window undid those writes — a failing `journal.append` from the stale-restore
+  residue pass, a non-git fault from the commits probe, or a failing `save_state` each escaped
+  with the spec flipped on disk while persisted state still said ESCALATED. The window is now
+  one transaction with `save_state` as its single commit point: any fault — an interrupt
+  included, which is why the guard catches `BaseException` — restores the spec's BYTES to what
+  the re-arm found and re-raises the original fault unchanged. Clearing a stories sentinel is
+  deliberately outside that scope: it unlinks a file rather than writing spec bytes, and
+  `_clear_sentinel` already preserves a copy and is idempotent on retry. The rollback journals
+  `rearm-aborted` carrying `restored`, `unchanged` (proved byte-identical), `failed` or
+  `unknown`, which `resolve` and the TUI render through the one shared routing table — so the
+  residue notices they echo from a `finally` can no longer describe files as excluded from a
+  baseline that was never saved, and an outcome the undo could not confirm (the cleared
+  sentinel among them) reports the abort without claiming the file is intact. A rollback that
+  cannot write still raises, naming the possibly part-written spec, with the original fault
+  kept in the exception chain.
+
 - Stop an LLM-authored preference escalation from aborting the review leg. `_review_and_commit`
   splats a review session's own `result.json` escalation entries into `journal.append`, so a
   result.json carrying a `kind` or `story_key` key raised `TypeError: got multiple values for

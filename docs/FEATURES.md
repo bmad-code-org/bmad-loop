@@ -126,6 +126,28 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   the re-drive mounts from does not already hold this checkout's copy of those two files, so a
   correction already committed there resumes in one gesture, and an in-place re-drive never records
   at all — it reads the main checkout, which is where the resolve session runs.
+  The whole re-arm is one **transaction**, and what it covers is stated narrowly: the SPEC's
+  BYTES, from the first spec write to `save_state`. That save is the commit point — until it
+  returns the run still calls the story escalated, so any fault escaping the window in between
+  (a journal write that fails, a non-git fault from the stale-restore commits probe, an
+  interrupt during one of the three git probes, or the state write itself) used to leave a spec
+  flipped to the re-drive's status and stripped of its `## Auto Run Result` against a task
+  nothing had moved. Every one of them now restores the spec to the bytes the re-arm found and
+  re-raises the original fault unchanged, so the escalation stays armed. One in-window tree
+  change is deliberately outside that scope: clearing a **sentinel** unlinks the file rather
+  than writing spec bytes, and it is not re-created, because `_clear_sentinel` already
+  preserves a copy under `{run_dir}/sentinels/` and a retried resolve re-clears it
+  idempotently. The re-arm says which of those it did. `rearm-aborted` is journalled from the
+  rollback and echoed by both surfaces, carrying `restored` (a write had landed and was put
+  back), `unchanged` (the file was read and PROVED byte-identical — a refusal sequenced ahead
+  of every write), `failed` (the restore itself could not write, so the spec may be part-written
+  — that one raises rather than degrading, keeps the original fault in the exception chain, and
+  names the file to restore from git in both the message and its next step), or `unknown`. The
+  last covers everything the undo could not confirm, the cleared sentinel among them, and the
+  surfaces then report that nothing was persisted and the story is still escalated WITHOUT
+  claiming the file on disk is intact — an unconfirmed outcome must never render as the
+  reassuring one. Without this record the surfaces described the residue of a re-arm that had
+  been rolled back — files "excluded from the re-drive baseline" for a baseline never saved.
   All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before
