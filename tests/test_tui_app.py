@@ -4998,10 +4998,11 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     already queued behind this toast.
 
     Ablation: make `runs.rearm_event_notice` return None for any one of these kinds
-    and this reddens on that kind's message alone. Drop "restore it from git" from the
-    `rearm-aborted` `failed` MESSAGE while keeping it in that arm's `next_step` and only
-    the remedy assertion reddens — which is the point of grading it here rather than on
-    the CLI, where the dropped half is still printed.
+    and this reddens on that kind's message alone. Drop the remedy
+    ("restore it from git or from your own copy") from the `rearm-aborted` `failed`
+    MESSAGE while keeping it in that arm's `next_step` and only the remedy assertion
+    reddens — which is the point of grading it here rather than on the CLI, where the
+    dropped half is still printed.
     """
     from bmad_loop import resolve, runs
     from bmad_loop.journal import Journal
@@ -5094,7 +5095,10 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     # surface with no `next_step`: without it a TUI operator is told the spec may be
     # part-written and given no remedy for it
     assert severity_of("may be left part-written") == "warning"
-    assert any("restore it from git" in n[0] for n in notes), notes
+    # the WHOLE remedy, not its first three words: the message names a second source
+    # because an untracked or out-of-checkout spec has no committed copy, and asserting
+    # only the "from git" prefix passes for a message that never gained the rest
+    assert any("restore it from git or from your own copy" in n[0] for n in notes), notes
     # the CLI's trailing imperative is omitted here: the resume is already queued
     assert not any("before resuming" in n[0] for n in notes), notes
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
