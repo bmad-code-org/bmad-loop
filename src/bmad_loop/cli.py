@@ -2965,10 +2965,16 @@ def _resolve_restore_patch(
 
 
 def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
-    """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
-    residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
-    `rearm-*` records the status flip, the advance and the re-stamp write. The commits
-    variant is the one the human must act on — nothing else will.
+    """Surface the events a just-completed re-arm journaled: the residue of the restore
+    attempt it abandoned — the `stale-restore-*` records AND `rearm-commits-probe-failed`,
+    all written by `runs._stale_restore_residue` — and the `rearm-*` records the status
+    flip, the advance and the re-stamp write. Split by PRODUCER, not on the prefix,
+    because the prefix does not partition them: the commits probe's failure record is
+    spelled `rearm-*` for the re-arm it degrades, not for the abandoned restore it
+    measures. The commits pair is what the human must act on — nothing else will tell
+    them — and it takes both, because `stale-restore-commits` is written only when the
+    probe ANSWERED: without its twin, that record's absence reads as "clean" whether or
+    not anyone could tell.
 
     Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
     echo and now carries the baseline family too, so a name from the narrower era
@@ -3266,8 +3272,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # In the `finally`, not after the `try`: `_stale_restore_residue` journals
         # BEFORE the re-stamp block that raises `RearmError`, so on that path the
         # records were already written and returning early threw them away — including
-        # `stale-restore-commits`, the one record whose whole point is that nothing
-        # else will tell the human. An abort is when that residue matters most: the
+        # the commits PAIR (`stale-restore-commits` when the probe answered,
+        # `rearm-commits-probe-failed` when it could not), whose whole point is that
+        # nothing else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
         hold_resume = _echo_rearm_events(run_dir, before_entries)
     print(

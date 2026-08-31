@@ -989,7 +989,8 @@ class BmadLoopApp(App[None]):
             # In the `finally`, matching `cli.cmd_resolve`. `_stale_restore_residue`
             # journals BEFORE the re-stamp block that raises `RearmError`, so on that
             # path the records were already written and returning early threw them
-            # away — including `stale-restore-commits`, the one record whose whole
+            # away — including the commits PAIR (`stale-restore-commits` when the probe
+            # answered, `rearm-commits-probe-failed` when it could not), whose whole
             # point is that nothing else will tell the human. This surface used to
             # `return` there while the CLI echoed, so the two DID drift on the abort
             # path even after they were unified on routing — and an abort is when the
