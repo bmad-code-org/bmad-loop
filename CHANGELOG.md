@@ -180,6 +180,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Tell a failed window listing apart from an empty session (#525). The tmux-family backend
+  folded every non-zero `list-windows` exit to `[]`, so a server erroring while its windows
+  were alive read as a crash and as a verified kill. Answer `[]` only when stderr proves the
+  session gone (measured on tmux 3.4 and psmux 3.3.8, overridable per backend); raise
+  otherwise, which callers already treat as "unknowable". `list_windows` and
+  `session_options` keep their sentinel but now warn when the failure proved nothing.
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's
