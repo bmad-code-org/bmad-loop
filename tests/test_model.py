@@ -474,7 +474,6 @@ _DEFERRED_STATE_KEYS = (
     "ledger_changed_before_harvest",
     "harvested_deferrals",
     "bundle_closes_intended",
-    "refiled_followups",
     "story_closes_intended",
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
@@ -483,7 +482,7 @@ _DEFERRED_STATE_KEYS = (
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All twelve fields are hand-enumerated in both serializers. Non-default
+    """All eleven fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -496,7 +495,6 @@ def test_deferred_work_state_fields_round_trip_through_json():
         ledger_changed_before_harvest=True,
         harvested_deferrals=[{"origin": "spec-deferred abc", "title": "finding"}],
         bundle_closes_intended=["DW-3", "DW-7"],
-        refiled_followups=[{"origin": "review-budget-followup", "title": "follow-up"}],
         story_closes_intended=["DW-4"],
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
@@ -512,9 +510,6 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.ledger_changed_before_harvest is True
     assert restored.harvested_deferrals == [{"origin": "spec-deferred abc", "title": "finding"}]
     assert restored.bundle_closes_intended == ["DW-3", "DW-7"]
-    assert restored.refiled_followups == [
-        {"origin": "review-budget-followup", "title": "follow-up"}
-    ]
     assert restored.story_closes_intended == ["DW-4"]
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
@@ -522,7 +517,7 @@ def test_deferred_work_state_fields_round_trip_through_json():
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the twelve keys.
+    """A state.json written before this package has none of the eleven keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -537,7 +532,6 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.ledger_changed_before_harvest is False
     assert restored.harvested_deferrals == []
     assert restored.bundle_closes_intended == []
-    assert restored.refiled_followups == []
     assert restored.story_closes_intended == []
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
@@ -563,21 +557,15 @@ def test_deferred_work_state_containers_do_not_alias_the_persisted_doc():
             {"title": "original", "metadata": {"labels": ["review"]}},
         ],
         bundle_closes_intended=["DW-1"],
-        refiled_followups=[{"title": "followup", "metadata": {"labels": ["review"]}}],
     ).to_dict()
     restored = StoryTask.from_dict(doc)
     restored.harvested_deferrals[0]["title"] = "mutated"
     restored.harvested_deferrals[0]["metadata"]["labels"].append("follow-up")
     restored.bundle_closes_intended.append("DW-2")
-    restored.refiled_followups[0]["title"] = "mutated"
-    restored.refiled_followups[0]["metadata"]["labels"].append("follow-up")
     assert doc["harvested_deferrals"] == [
         {"title": "original", "metadata": {"labels": ["review"]}},
     ]
     assert doc["bundle_closes_intended"] == ["DW-1"]
-    assert doc["refiled_followups"] == [
-        {"title": "followup", "metadata": {"labels": ["review"]}},
-    ]
 
 
 def test_deferred_work_state_container_defaults_are_not_shared():
@@ -585,10 +573,8 @@ def test_deferred_work_state_container_defaults_are_not_shared():
     other = StoryTask(story_key="1-2-b", epic=1)
     one.harvested_deferrals.append({"title": "one"})
     one.bundle_closes_intended.append("DW-1")
-    one.refiled_followups.append({"title": "one"})
     assert other.harvested_deferrals == []
     assert other.bundle_closes_intended == []
-    assert other.refiled_followups == []
 
 
 def test_restore_patch_round_trips():

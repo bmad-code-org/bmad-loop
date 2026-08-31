@@ -1783,10 +1783,10 @@ class WorktreeFlow:
         ``clean_incoming_collisions``' ``protected`` operand (#618).
 
         The sprint board and the deferred-work ledger, because those are the two
-        files the four post-merge carries name: ``_carry_harvested_deferrals``,
-        ``_carry_review_budget_followups`` and ``_carry_story_deferred_closes`` pass
-        ``paths.deferred_work`` and ``_carry_board_advance`` passes
-        ``paths.sprint_status``, all four to ``verify.commit_paths`` against this same
+        files the three post-merge carries name: ``_carry_harvested_deferrals``
+        and ``_carry_story_deferred_closes`` pass ``paths.deferred_work`` and
+        ``_carry_board_advance`` passes
+        ``paths.sprint_status``, all three to ``verify.commit_paths`` against this same
         ``repo``. That call stages by PATHSPEC — `git add -- :(literal)<path>` — so
         whatever the working tree holds at that path is committed no matter who wrote
         it, and a merge that walked past an operator's edit there hands the run its
