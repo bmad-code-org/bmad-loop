@@ -895,6 +895,61 @@ def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_stranded_bundle_story_keys_are_aliased_element_wise():
+    """`sweep-inflight-stranded` carries a LIST of story keys, and a list of
+    identifier-shaped strings is the one shape `scrub_json` passes through
+    untouched — `scrub_json(["1-1-acme-auth"]) == ["1-1-acme-auth"]`, verbatim.
+
+    So the plural field needs the same routing as the singular `story_key` beside
+    it, which was already aliased: `_JOURNAL_KEYLIST_FIELDS` reduces a list
+    element-wise, and the namespace selection has to send this one to `story` (not
+    to `dw`, which is only `dw_ids`) or one dump would carry two different aliases
+    for the same story. The epic lookup rides along, exactly as it does for `keys`.
+
+    Ablation: drop `story_keys` from `_JOURNAL_KEYLIST_FIELDS` and the alias
+    assertions redden with the raw keys coming back verbatim; flip the namespace
+    selection back to `"story" if k == "keys" else "dw"` and the cross-field
+    identity assertion reddens (a `dw-` alias for a story key).
+    """
+    other_key = "3.4-AcmeVaultRotation"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-inflight-stranded",
+            "story_keys": [STORY_KEY, other_key],
+        },
+        pseudo,
+        {STORY_KEY: 1, other_key: 3},
+        1.0,
+    )
+    # the SAME story, journalled singular by a neighbouring record, must resolve to
+    # the same alias — that identity is the whole reason this is aliased not dropped
+    singular = diagnostics._scrub_entry(
+        {"ts": 3.0, "kind": "sweep-bundle-recovered", "story_key": STORY_KEY},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert scrubbed["story_keys"] == [singular["story_key"], scrubbed["story_keys"][1]]
+    assert STORY_KEY not in scrubbed["story_keys"]
+    assert other_key not in scrubbed["story_keys"]
+    assert scrubbed["story_keys"][0] != scrubbed["story_keys"][1]
+    # the epic lookup still applies: `Pseudonymizer.alias` prefixes a story alias
+    # with `s<epic>`, so each element carries the epic it was looked up under —
+    # drop the `epic=` argument from the keylist branch and both prefixes become a
+    # bare `story-`
+    assert [a.split("-")[0] for a in scrubbed["story_keys"]] == ["s1", "s3"]
+    # …and nothing landed in the deferred-work namespace, which is where the old
+    # `"story" if k == "keys" else "dw"` selection would have put both of them
+    assert not [orig for ns, orig, _a in pseudo.entries() if ns == "dw"]
+
+    rendered = json.dumps([scrubbed, singular])
+    for canary in (STORY_KEY, other_key, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

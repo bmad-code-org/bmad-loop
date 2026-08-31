@@ -7,12 +7,26 @@ hard POSIX dependency can't sneak in unnoticed. Each sanctioned exception lives
 in an allowlisted file and — outside the wholesale tmux quarantine — carries a
 ``# portability:`` ack on its line, so exceptions stay deliberate.
 
-The same single-pass scan also carries the two non-POSIX quarantines that have the
+The same single-pass scan also carries the non-POSIX quarantines that have the
 identical shape: AGENTS.md's "New core env vars register in ``envvars.py``;
 plugin-owned env-var families stay with their plugin" — see
 ``test_bmad_loop_env_reads_only_in_the_registry`` — and its "all git subprocess
 calls go through the ``_run_git`` chokepoint in ``verify.py``" — see
 ``test_no_git_invocation_outside_verify``.
+
+Three later invariants ride the same machinery, each one previously held by
+docstring prose alone:
+
+* the task-directory artifact names are ``journal.TASK_CYCLE_ARTIFACTS`` and not a
+  literal repeated per reader/writer — ``test_task_cycle_artifacts_named_only_through_the_constant``
+* a session task id is composed only in ``engine._session_task_id`` —
+  ``test_session_task_id_composed_only_at_the_chokepoint``
+* every journal field name a call spells is either routed by ``diagnostics``'
+  redaction tables — by name, or by name-and-kind — or declared benign:
+  ``test_journal_fields_are_routed_or_declared_benign``, with
+  ``test_journal_kinds_are_literal_or_the_position_is_declared`` holding the kind
+  half readable and ``test_journal_append_writes_only_accounted_fields`` covering
+  the two names ``Journal.append`` mints itself, which no call site spells.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -21,12 +35,14 @@ seam / a platform helper) rather than widening an allowlist.
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
 
 import bmad_loop
-from bmad_loop import envvars
+from bmad_loop import diagnostics, envvars
+from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, Journal
 
 SRC = Path(bmad_loop.__file__).resolve().parent
 # Marker an allowlisted exception line must carry. Written as ``# portability: …``;
@@ -118,6 +134,374 @@ VERIFY_CLASSIFY_CHOKEPOINT = {
 # re-anchoring persisted state) instead.
 SPEC_ANCHOR_CHOKEPOINT = {"runs.py", "engine.py", "verify.py", "recovery_flow.py"}
 SPEC_PATH_FIELDS = {"spec_file", "dispatched_spec_file"}
+
+# ``(file, name)`` of the ONE assignment that may spell the task-directory artifact
+# names as literals: ``journal.TASK_CYCLE_ARTIFACTS`` itself. Constants inside that
+# assignment's value are the definition, not a copy, so the scan skips them — the
+# position idiom the git and verify exemptions use, rather than an allowlist entry
+# that would also wave through a bare literal anywhere else in journal.py.
+#
+# Paired with the FILE on purpose: the same tuple re-declared in another module is a
+# second copy, which is exactly what the guard exists to refuse.
+TASK_ARTIFACT_DEFINITION = ("journal.py", "TASK_CYCLE_ARTIFACTS")
+
+# ``rel -> enclosing function -> the artifact names it may still spell as a bare
+# literal``. Keyed by FUNCTION as well as by file — ``VERIFY_CLASSIFY_CHOKEPOINT``'s
+# idiom — because the sanction is a POSITION: a second bare `"result.json"` grown
+# anywhere else in `adapters/generic.py` would inherit a file-keyed exemption on its
+# path alone, which is both the drift the guard exists to catch and the thing this
+# comment used to claim was already impossible.
+#
+# Scoped by NAME inside that, for `ENV_READ_ALLOW`'s reason: being the sanctioned
+# position buys `_result_path` the one name it declares and nothing wider.
+#
+# `adapters/generic.py::_result_path` is the one sanctioned single-name read: it
+# answers "where does THIS task's result.json live", a genuinely single-artifact
+# question that folding into the loop would not express. It carries no claim about
+# `escalation.json`, so that name stays refused inside it.
+TASK_ARTIFACT_LITERAL_ALLOW = {
+    "adapters/generic.py": {"_result_path": frozenset({"result.json"})},
+}
+
+# The one file allowed to COMPOSE a session task id, and within it only inside
+# ``_session_task_id`` — keyed file -> the ONE enclosing function, like
+# ``VERIFY_CLASSIFY_CHOKEPOINT``. Every mint site (`engine.py` ×3, `resolve.py`)
+# calls it; none spells the format itself.
+#
+# The sanction is a POSITION, not the file: engine.py is where a fifth mint would
+# most naturally be written (it already binds `task_id` three times), so a file-wide
+# exemption would leave the invariant unguarded exactly where it matters. The
+# function's own docstring states why every caller must be byte-identical —
+# ``_resumable_session``'s resume match, and the ``-g<N>`` re-arm discriminator that
+# a hand-rolled fourth mint would omit (#705).
+SESSION_TASK_ID_CHOKEPOINT = {"engine.py": "_session_task_id"}
+
+# The journal field names ``diagnostics`` routes BY NAME, read off the live module
+# rather than copied, so the guard cannot drift from the tables it grades: add a row
+# there and the corresponding producer stops being an offender with no edit here.
+# Three tables, because these three are the by-name routing decisions — an alias, a
+# drop, or a key-list reduction. Anything else falls through to
+# ``sanitize.scrub_json``, which fails closed only by accident of a value's shape.
+#
+# ``_JOURNAL_KIND_ALIAS_FIELDS`` is deliberately NOT flattened in here. It routes by
+# ``(kind, name)``, and folding it into a by-name union says ``target`` is routed
+# everywhere — including on the ``board-advance-*`` family, where that module's own
+# comment says by-name routing would be WRONG. Flattened, the guard read
+# ``journal.append("unit-merge-failed", target=branch)`` — a NEW kind reusing the
+# name — as routed, while ``_scrub_entry`` handed it to ``scrub_json`` and shipped
+# the branch verbatim. See ``JOURNAL_KIND_ROUTED_FIELDS`` for the scoped form.
+JOURNAL_ROUTED_FIELDS = (
+    frozenset(diagnostics._JOURNAL_ALIAS_FIELDS)
+    | diagnostics._JOURNAL_DROP_FIELDS
+    | diagnostics._JOURNAL_KEYLIST_FIELDS
+)
+
+# ``kind -> the field names routed on THAT kind only``, read off the same module so
+# the guard still cannot drift from it. A name here is routed on its own kinds and
+# unrouted everywhere else, which is the distinction the flattened union destroyed.
+JOURNAL_KIND_ROUTED_FIELDS = {
+    kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
+}
+
+# ``kind -> field names declared benign on that kind alone`` — the kind-scoped twin of
+# ``JOURNAL_BENIGN_FIELDS``, and it exists for the same field the routing table does.
+# ``engine``'s board-advance carry paths journal ``target`` carrying a sprint STATUS
+# ("done"), not a branch; ``diagnostics``' ``_JOURNAL_KIND_ALIAS_FIELDS`` comment is
+# explicit that aliasing those would destroy the field a maintainer reads the record
+# for. Declared per kind rather than by adding ``target`` to the by-name benign set,
+# which would also wave through a branch-carrying ``target`` on a kind nobody has
+# looked at — exactly the hole the flattening left.
+JOURNAL_KIND_BENIGN_FIELDS = {
+    "board-advance-carried": frozenset({"target"}),
+    "board-advance-carry-failed": frozenset({"target"}),
+    "board-advance-carry-foreign-dirt": frozenset({"target"}),
+    "board-advance-carry-uncommitted": frozenset({"target"}),
+}
+
+# Every OTHER field name journalled today: a declared inventory, not a per-name
+# audit. Nobody has argued each of these is safe unrouted; what the list records is
+# that they are the set that existed when the guard landed. That is the whole claim,
+# and it is worth making — field name #132 cannot appear without someone deciding
+# whether it needs routing, which is the decision DW-82 measured nothing forcing.
+#
+# ⚠️ Adding a name here is that decision, made in the "no routing needed" direction.
+# Make it deliberately: a name carrying a story key, a branch, a sha, a spec
+# filename, a path, or free text belongs in a `diagnostics` table instead. Adding a
+# routing row there for a field that does not need one is equally wrong — it would
+# pseudonymize a value a maintainer reads the record for (see
+# `_JOURNAL_KIND_ALIAS_FIELDS`' `target` for that failure in the other direction).
+#
+# ⚠️ STATED BOUND, so nobody reads more into this than it says: the guard catches a
+# rename OUT of the tables into unclaimed space — the measured `patch` → `patch_path`
+# ablation. It does NOT catch a rename INTO a name one of these sets already holds.
+# Respell `recovery_flow.py`'s `patch=` as `path=`, `ref=` or `name=` and every
+# assertion here stays green while the value stops being dropped, because the guard
+# grades the NAME against a set and all three of those names are in it. Only
+# `tests/test_diagnostics.py` can see that, and only if it has a row for the record.
+JOURNAL_BENIGN_FIELDS = frozenset(
+    {
+        "action",
+        "actions",
+        "adapter",
+        "adapter_dev",
+        "adapter_review",
+        "already_resolved",
+        "attempt",
+        "blocked",
+        "blocking",
+        "budget",
+        "budget_mode",
+        "budget_weighted",
+        "bundles",
+        "bundles_not_run",
+        "cache_read_weight",
+        "cache_read_weight_was",
+        "cap",
+        "checkout_dirty",
+        "checkpoint",
+        "code_root_changed",
+        "command_index",
+        "commits",
+        "condition",
+        "contradiction",
+        "converted",
+        "count",
+        "cycle",
+        "cycles",
+        "decision",
+        "decisions",
+        "deduped",
+        "dropped",
+        "dw_id",
+        "effect",
+        "entries",
+        "entries_now",
+        "env_fault",
+        "env_fault_evidence",
+        "epic",
+        "errors",
+        "expired_clock",
+        "failed",
+        "field",
+        "files",
+        "finished",
+        "fired_at",
+        "flat_remainder",
+        "followup_damped",
+        "followup_review_recommended",
+        "frm",
+        "graceful",
+        "harvest_attempt",
+        "head",
+        "id_collisions",
+        "items",
+        "kept",
+        "key",
+        "ledger",
+        "log_pos",
+        "malformed",
+        "mode",
+        "model",
+        "name",
+        "next",
+        "normalized",
+        "ok",
+        "old_baseline",
+        "open",
+        "open_now",
+        "original",
+        "owed_after_implement",
+        "path",
+        "paths",
+        "phase",
+        "platform",
+        "plugin",
+        "plugins",
+        "policy_changed",
+        "preserve_ref",
+        "problem",
+        "question",
+        "rc",
+        "re_review_capped",
+        "rearmed",
+        "record",
+        "redrive",
+        "ref",
+        "refiled",
+        "refs",
+        "refused",
+        "remaining",
+        "reset_from",
+        "restore",
+        "returncode",
+        "role",
+        "run_id",
+        "run_type",
+        "security_config_changed",
+        "sentinel",
+        "sentinel_kind",
+        "session_status",
+        "session_vanished",
+        "signum",
+        "site",
+        "skip",
+        "source",
+        "spec_folder",
+        "stage",
+        "state_kind",
+        "status",
+        "stderr_bytes",
+        "stderr_captured_bytes",
+        "stderr_truncated",
+        "stdout_bytes",
+        "stdout_captured_bytes",
+        "stdout_truncated",
+        "strategy",
+        "teardown_s",
+        "to",
+        "tokens",
+        "tokens_weighted",
+        "tolerated",
+        "total",
+        "trigger",
+        "verification_sequence",
+        "verification_stage",
+        "via",
+        "weighted",
+        "workflow",
+        "worktree",
+        "zero_diff",
+    }
+)
+
+# Field names NO call site spells as a keyword, because ``Journal.append`` mints them
+# itself: ``entry.setdefault("log_task", …)`` and ``entry.setdefault("log_pos", size)``
+# on every entry written while a pane log is active. ``log_task`` is routed (a story
+# alias); ``log_pos`` is a byte offset and is declared benign above.
+#
+# The static scan reads CALL SITES, so it cannot see either of them — which means the
+# sibling guard's "every field name a journal producer writes" claim is true only of
+# the fields a call spells. ``test_journal_append_writes_only_accounted_fields``
+# closes that from the other side by RUNNING an append and reading the entry back;
+# this set is what stops the staleness check below from calling ``log_pos`` dead.
+JOURNAL_SELF_MINTED_FIELDS = frozenset({"log_task", "log_pos"})
+
+# ``(file, enclosing function) -> the field names that actually flow through it`` for
+# every ``journal.append(**name)`` whose keys are NOT statically resolvable. An
+# unresolved splat is a HOLE in the inventory above — the guard cannot tell whether a
+# new field arrived through it — so it fails loud and each hole is declared here with
+# why it is one, rather than being silently skipped. A new splat site anywhere else
+# reddens the guard until someone either makes its keys resolvable or adds a line here.
+#
+# All four are unresolvable for the same structural reason: the dict is not built
+# from literals in the calling function. The VALUES are an inventory read off the
+# producer, not an assertion the scan can check — they are what keeps the staleness
+# check on ``JOURNAL_BENIGN_FIELDS`` from calling a splat-borne name dead, and they
+# are the honest answer to "which names does this hole let through".
+JOURNAL_SPLAT_ALLOW = {
+    # `streams` keys are computed — `f"{kind}_path"` and its three siblings over a
+    # fixed (stdout, stderr) loop — so the resolver cannot read them and the argument
+    # for the hole is the POSITION. Said plainly because the previous comment argued
+    # by VALUE TYPE ("numbers and booleans") while the invariant it exempts is
+    # NAME-based: the two `*_path` names are routed (`_JOURNAL_DROP_FIELDS`); the
+    # other six are declared benign BY NAME, below. ⚠️ A NEW key added inside this
+    # `streams` dict is still invisible to the guard — that is what the hole IS, and
+    # no property of its value changes it.
+    ("engine.py", "_journal_verify_command_results"): frozenset(
+        {
+            "stdout_path",
+            "stderr_path",
+            "stdout_bytes",
+            "stderr_bytes",
+            "stdout_captured_bytes",
+            "stderr_captured_bytes",
+            "stdout_truncated",
+            "stderr_truncated",
+        }
+    ),
+    # `pref` comes from `preference_escalations(result_json)` — LLM-authored keys out
+    # of a session's own result.json. Not statically knowable in principle, not just
+    # in this scan; the redaction fallback is what covers it, and no inventory can be
+    # written for it at all.
+    ("engine.py", "_review_and_commit"): frozenset(),
+    # `self._session_end_extras(result)` is a method call, and that method builds its
+    # dict with `extras.update(...)` — unresolvable at the call site and at the
+    # definition. The names below are read off `engine._session_end_extras`, and five
+    # of them (`fired_at`, `teardown_s`, `expired_clock`, `budget_weighted`,
+    # `budget_mode`) have NO other producer anywhere: the previous comment's claim
+    # that these keys "are in the benign inventory because other sites journal them
+    # explicitly" was simply false. They are in it because THIS declaration puts them
+    # there. ⚠️ A new key added inside `_session_end_extras` is still invisible.
+    ("engine.py", "_run_session"): frozenset(
+        {
+            "fired_at",
+            "teardown_s",
+            "expired_clock",
+            "budget_weighted",
+            "budget",
+            "budget_mode",
+            "env_fault",
+            "env_fault_evidence",
+            "session_vanished",
+        }
+    ),
+    # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
+    # belong to each CALLER and there is no store in this function to resolve. The
+    # callers' keywords are read at their own sites — but ONLY because
+    # `JOURNAL_FORWARDERS` declares `_log` a journal write. Before that they were
+    # unreachable: `_is_journal_write` matched `.append(...)` alone, the four
+    # `self._log(...)` sites were never read, and `rc` and `blocking` sat in neither
+    # routing set with this guard green. That is what the old comment's "the scan
+    # reads them directly at their own sites" asserted and did not do.
+    ("plugins/bus.py", "_log"): frozenset(),
+}
+
+# ``(file, function name)`` of every helper that FORWARDS to ``journal.append`` with a
+# ``**kwargs`` of its own. A call to that NAME inside that FILE counts as a journal
+# write, so the forwarder's callers put their explicit keywords into the inventory
+# instead of stopping at a wall.
+#
+# The forwarder's own `self._journal.append(kind, **fields)` stays an unresolvable
+# splat — its parameter has no store to resolve — so both this entry and the
+# `JOURNAL_SPLAT_ALLOW` one are needed, and they say different things: this one makes
+# the CALLERS visible, that one declares the forwarder's own hole.
+JOURNAL_FORWARDERS = {("plugins/bus.py", "_log")}
+
+# ``(file, enclosing function)`` of every journal write whose KIND is not a string
+# literal. Kind-scoped routing (`JOURNAL_KIND_ROUTED_FIELDS` /
+# `JOURNAL_KIND_BENIGN_FIELDS`) cannot be evaluated at such a call, so — exactly like
+# an unresolvable splat — the site fails loud rather than being graded against a kind
+# the scan had to guess.
+#
+# Declaring a position waives the KIND resolution and NOTHING else: a kind-scoped
+# name at one of these sites is still refused, because nothing here can prove which
+# kind it lands on.
+JOURNAL_DYNAMIC_KIND_ALLOW = {
+    # `kind` is a keyword parameter defaulting to `review-skipped`, flipped to
+    # `review-skipped-awaiting-operator` by the park path. Journals `story_key` only.
+    ("engine.py", "_skip_review_and_commit"),
+    # `kind` is chosen by the two ledger-close call sites. Journals `story_key` and
+    # `dw_ids` only.
+    ("sweep.py", "_close_bundle_ledger_when_spec_status"),
+    # Four writes, each an f-string over the `family` loop variable:
+    # `attempt-preserve` / `attempt-preserve-dirty` × `-pruned` / `-prune-failed`.
+    ("recovery_flow.py", "prune_preserve_refs"),
+    # The forwarder passes its caller's `kind` straight through; every CALLER spells
+    # a literal, and `JOURNAL_FORWARDERS` is what lets the scan read them there.
+    ("plugins/bus.py", "_log"),
+}
+
+# The receivers a ``.append(...)`` call must hang off to be a journal write. Matched
+# on the trailing name so `self.journal`, a bare `journal` parameter and
+# `self._journal` (the plugin bus's optional handle) all resolve — the three
+# spellings in the tree.
+#
+# ⚠️ STATED BOUND: a LOCALLY ALIASED handle is invisible. `j = self.journal` followed
+# by `j.append(kind, customer_email=x)` produces no finding (verified by running it
+# through `_scan_source`). No such site exists in the tree today, and resolving the
+# binding would be `_verify_call_aliases`' shape rather than a new idea — but the
+# guard does not do it, and a reader must not assume it does.
+JOURNAL_RECEIVERS = {"journal", "_journal"}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
 # ack. process_host.py's Linux identity reader walks `/proc/<pid>/stat` behind a
@@ -534,6 +918,225 @@ def _names_verify_classifier(func: ast.expr, aliases: frozenset[str] = frozenset
     return _names_guarded_verify_call(func, "verify_command_results_outcome", aliases)
 
 
+def _is_str_composition(node: ast.expr) -> bool:
+    """Whether this expression BUILDS a string rather than naming one, in three
+    spellings — NOT "the three spellings a hand-minted task id can take", which is
+    an overclaim the shapes below cannot support.
+
+    ``JoinedStr`` is the f-string. ``BinOp`` with a str ``Constant`` on either side
+    covers both concatenation (``story + "-review-1"``) and percent formatting
+    (``"%s-dev-%d" % (key, n)``), whose operator is also a ``BinOp``. The third is
+    ``"…".format(…)`` on a literal receiver.
+
+    Three real compositions this deliberately does NOT recognise, verified silent:
+    ``"-".join([key, "dev", "1"])``, ``fmt % (key, n)`` where ``fmt`` is a Name bound
+    to the format string, and any of the three assembled a statement earlier and
+    forwarded through a variable. See the ``NOT COVERED`` note on the detector for
+    why the boundary sits where it does.
+
+    A ``Name``, ``Attribute``, ``Subscript`` or ordinary ``Call`` is deliberately NOT
+    a composition: those FORWARD a string someone else made, which is what every
+    sanctioned mint site does with the chokepoint's return value."""
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.BinOp) and any(
+        isinstance(side, ast.Constant) and isinstance(side.value, str)
+        for side in (node.left, node.right)
+    ):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    )
+
+
+def _is_bare_str(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _mint_candidates(node: ast.expr, depth: int = 0):
+    """``(sub-expression, depth)`` for every value position that could be minting a
+    string here, where depth counts the CALL boundaries crossed to reach it.
+
+    Conditionals and boolean fallbacks are descended at the same depth, since both
+    branches are the same value position (``task_id = f"…" if x else base``).
+
+    Call arguments are descended too, in EVERY position, because a call is the shape
+    a mint hides behind in both of them. In a return it is the sanitizer the
+    chokepoint itself uses — ``return safe_segment(f"{story_key}-{part}-{seq}{gen}")``
+    — and in a binding it is the same line copied into one: ``task_id =
+    safe_segment(f"{key}-dev-1")`` is the most likely fifth mint precisely because it
+    is the chokepoint's own body moved. Refusing to descend there left that shape
+    silent (verified), and it omits the ``-g<N>`` suffix, which is #705 re-opened.
+
+    Depth is what makes descending safe. A bare string Constant is a mint only at
+    depth 0 (``task_id = "triage-1"``); at depth it is an ARGUMENT and flagging it
+    would hit ``os.environ.get("BMAD_LOOP_TASK_ID")`` and the ``"dev"`` part in every
+    sanctioned ``_session_task_id(key, "dev", seq, gen)`` call. A COMPOSITION is a
+    mint at any depth: nothing legitimate hands a freshly built string to a call in a
+    ``task_id`` position."""
+    yield node, depth
+    if isinstance(node, ast.IfExp):
+        yield from _mint_candidates(node.body, depth)
+        yield from _mint_candidates(node.orelse, depth)
+    elif isinstance(node, ast.BoolOp):
+        for value in node.values:
+            yield from _mint_candidates(value, depth)
+    elif isinstance(node, ast.Call):
+        for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+            yield from _mint_candidates(arg, depth + 1)
+
+
+def _is_journal_write(node: ast.AST, rel: str) -> bool:
+    """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
+    each of the three receiver spellings the tree uses (see ``JOURNAL_RECEIVERS``),
+    or a call to one of this file's declared ``JOURNAL_FORWARDERS``.
+
+    The forwarder half is not a convenience. ``plugins/bus.py::_log`` takes its own
+    ``**fields`` and hands them to ``self._journal.append``, so its four call sites
+    spell keywords that reach the journal while matching nothing the ``.append``
+    scan looks at — `rc` and `blocking` were in neither routing set with this guard
+    green. Keyed ``(file, name)``: a ``_log`` elsewhere forwards to something else.
+
+    The receiver's qualifier is ignored for ``_called_name``'s reason: an aliased
+    MODULE handle reaches the same method. A locally aliased receiver is a stated
+    bound — see ``JOURNAL_RECEIVERS``."""
+    if not isinstance(node, ast.Call):
+        return False
+    name = _called_name(node.func)
+    if name is None:
+        return False
+    if (rel, name) in JOURNAL_FORWARDERS:
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and name == "append"
+        and _called_name(node.func.value) in JOURNAL_RECEIVERS
+    )
+
+
+def _dict_literal_keys(value: ast.expr) -> set[str] | None:
+    """The string keys of a dict literal, or None when any key is not a static
+    string. ``{**other}`` yields a ``None`` key node and is unresolvable by
+    definition; a conditional between two literals resolves to their union, which is
+    how ``engine._run_inner`` builds its ``extras``."""
+    if isinstance(value, ast.Dict):
+        keys: set[str] = set()
+        for key in value.keys:
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                return None
+            keys.add(key.value)
+        return keys
+    if isinstance(value, ast.IfExp):
+        body, orelse = _dict_literal_keys(value.body), _dict_literal_keys(value.orelse)
+        return None if body is None or orelse is None else body | orelse
+    return None
+
+
+def _journal_splat_keys(fn: ast.AST | None, name: str) -> set[str] | None:
+    """The keys a ``**name`` splat can carry, resolved through the same-function
+    literal stores that build it, or None when ANY store is not statically
+    resolvable.
+
+    Fails closed on purpose, in four directions, because a partially-resolved
+    splat would under-report and read as green: an augmented assignment
+    (``fields += …``), a method mutation (``fields.update(…)``,
+    ``fields.setdefault(…)``), a non-literal store (a computed subscript key, a
+    dict built from a call), and a SECOND NAME bound to the same dict
+    (``alias = fields``) each return None rather than the keys seen so far. A
+    splat with no store in the function at all — the forwarder shape, where ``name``
+    is a parameter — is unresolvable too, not vacuously empty.
+
+    The alias direction was the fourth leak in a docstring that claimed three:
+    ``fields = {"a": 1}`` / ``alias = fields`` / ``alias["customer_email"] = 2``
+    resolved to ``{"a"}``, because every store the resolver looks for is spelled on
+    the OTHER name. Matched narrowly — the assigned value must BE ``Name(name)``,
+    not merely mention it — so a read (``n = len(fields)``) still resolves."""
+    if fn is None:
+        return None
+    keys: set[str] = set()
+    stored = False
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if isinstance(node.value, ast.Name) and node.value.id == name:
+                return None
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    stored = True
+                    resolved = None if node.value is None else _dict_literal_keys(node.value)
+                    if resolved is None:
+                        return None
+                    keys |= resolved
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == name
+                ):
+                    stored = True
+                    if not (
+                        isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        return None
+                    keys.add(target.slice.value)
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                return None
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == name
+        ):
+            return None
+    return keys if stored else None
+
+
+def _enclosing_function_names(tree: ast.AST) -> dict[int, str | None]:
+    """``id(node) -> the name of the INNERMOST function definition containing it``
+    (None at module level).
+
+    ``ast`` nodes carry no parent link and ``ast.walk`` hands them out flat, so the
+    journal detector — whose splat resolution and whose ``JOURNAL_SPLAT_ALLOW`` key
+    are both scoped to the function a call sits in — has to build the mapping
+    itself. Innermost rather than outermost, because that is the scope a ``**name``
+    is stored in.
+
+    Deliberately different from the sanctioned-position sets built inside
+    ``_scan_source``: those use ``ast.walk(fn)``, which descends into nested defs so
+    a closure inside a sanctioned helper stays sanctioned. Here the innermost answer
+    is the correct one, and the two uses are not interchangeable."""
+    names: dict[int, str | None] = {id(tree): None}
+
+    def descend(node: ast.AST, fn: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            names[id(child)] = fn
+            inner = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+            descend(child, inner)
+
+    descend(tree, None)
+    return names
+
+
+def _enclosing_function_nodes(tree: ast.AST) -> dict[int, ast.AST | None]:
+    """The node-valued twin of :func:`_enclosing_function_names`, for the splat
+    resolver, which must WALK the enclosing function rather than name it."""
+    nodes: dict[int, ast.AST | None] = {id(tree): None}
+
+    def descend(node: ast.AST, fn: ast.AST | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            nodes[id(child)] = fn
+            inner = child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+            descend(child, inner)
+
+    descend(tree, None)
+    return nodes
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -608,6 +1211,52 @@ def _scan_source(src: str, rel: str):
         if isinstance(call, ast.Call)
         and _names_verify_classifier(call.func, verify_classifier_aliases)
     }
+
+    # String Constants that ARE the task-artifact list rather than a copy of it: the
+    # elements of `journal.TASK_CYCLE_ARTIFACTS`' own assignment. Skipped by id, so
+    # the definition needs no allowlist entry and a bare literal elsewhere in the
+    # same file is still refused (see TASK_ARTIFACT_DEFINITION).
+    artifact_definition_rel, artifact_definition_name = TASK_ARTIFACT_DEFINITION
+    artifact_definition_nodes = {
+        id(const)
+        for stmt in ast.walk(tree)
+        if rel == artifact_definition_rel
+        and isinstance(stmt, (ast.Assign, ast.AnnAssign))
+        and stmt.value is not None
+        and any(
+            isinstance(target, ast.Name) and target.id == artifact_definition_name
+            for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])
+        )
+        for const in ast.walk(stmt.value)
+        if isinstance(const, ast.Constant)
+    }
+
+    # Everything inside this file's ONE sanctioned task-id composition point, if it
+    # has one. Same `ast.walk(fn)` shape as the verify sets above — a nested def
+    # inside the chokepoint is still inside it — and empty in every other file,
+    # since `.get(rel)` is None there and no function is named None.
+    sanctioned_task_id_nodes = {
+        id(inner)
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and fn.name == SESSION_TASK_ID_CHOKEPOINT.get(rel)
+        for inner in ast.walk(fn)
+    }
+
+    # `return` statements inside a function whose NAME contains `task_id` — the
+    # second position a mint can hide in, and the one a helper like
+    # `_sweep_task_id` would use. Matched on the name substring rather than on a
+    # fixed list: naming the function after what it returns is the whole tell.
+    task_id_returns = {
+        id(ret)
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and "task_id" in fn.name
+        for ret in ast.walk(fn)
+        if isinstance(ret, ast.Return) and ret.value is not None
+    }
+
+    enclosing_names = _enclosing_function_names(tree)
+    enclosing_nodes = _enclosing_function_nodes(tree)
 
     def line_at(lineno: int) -> str:
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
@@ -712,6 +1361,94 @@ def _scan_source(src: str, rel: str):
             and _classify_posix_path(node.value)
         ):
             findings.append(("path", rel, node.lineno, line_at(node.lineno)))
+
+        # A task-directory artifact name spelled as a literal, outside the one
+        # assignment that defines the list. Matched by string EQUALITY, never by
+        # containment: the dev/sweep prompts name `result.json` inside a sentence
+        # ("…write tasks/<id>/result.json, then end your turn"), and flagging prose
+        # would get the allowlist widened until it meant nothing. Docstrings are
+        # skipped for the same reason the POSIX-path scan skips them. The finding
+        # carries `(name, enclosing function)`: the exemption is per-name AND per
+        # position, so a second literal in another function of an allowlisted file
+        # is still refused.
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docs
+            and id(node) not in artifact_definition_nodes
+            and node.value in TASK_CYCLE_ARTIFACTS
+        ):
+            findings.append(
+                (
+                    "taskartifact",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    (node.value, enclosing_names.get(id(node))),
+                )
+            )
+
+        # A journal write's field names. Explicit keywords are read straight off the
+        # call; a `**name` splat is resolved through the literal stores that built it
+        # in the same function, and emits ONE finding with a None name when it
+        # cannot be — an unresolvable splat is a hole in the inventory, so it fails
+        # loud rather than being skipped. Each finding carries
+        # `(field_or_None, enclosing_function, kind_or_None)`: the benign inventory
+        # is keyed by field, the splat exemption by position, and the KIND is what
+        # makes `diagnostics`' kind-scoped routing checkable at all.
+        #
+        # The kind is the first positional argument when it is a string literal, and
+        # None otherwise. None is not "no kind": it is "this scan cannot tell", and
+        # it emits its own `journalkind` finding so the site fails loud rather than
+        # being graded against a kind that had to be guessed.
+        if _is_journal_write(node, rel):
+            fn_name = enclosing_names.get(id(node))
+            first = node.args[0] if node.args else None
+            kind = (
+                first.value
+                if isinstance(first, ast.Constant) and isinstance(first.value, str)
+                else None
+            )
+            if kind is None:
+                findings.append(("journalkind", rel, node.lineno, line_at(node.lineno), fn_name))
+            for kw in node.keywords:
+                if kw.arg is not None:
+                    findings.append(
+                        (
+                            "journalfield",
+                            rel,
+                            node.lineno,
+                            line_at(node.lineno),
+                            (kw.arg, fn_name, kind),
+                        )
+                    )
+                    continue
+                resolved = (
+                    _journal_splat_keys(enclosing_nodes.get(id(node)), kw.value.id)
+                    if isinstance(kw.value, ast.Name)
+                    else None
+                )
+                if resolved is None:
+                    findings.append(
+                        (
+                            "journalfield",
+                            rel,
+                            node.lineno,
+                            line_at(node.lineno),
+                            (None, fn_name, kind),
+                        )
+                    )
+                else:
+                    for field in sorted(resolved):
+                        findings.append(
+                            (
+                                "journalfield",
+                                rel,
+                                node.lineno,
+                                line_at(node.lineno),
+                                (field, fn_name, kind),
+                            )
+                        )
 
         # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
         # *string* passed to getattr — not an attribute access — so it's clean)
@@ -839,6 +1576,74 @@ def _scan_source(src: str, rel: str):
             and node.args[0].attr in SPEC_PATH_FIELDS
         ):
             findings.append(("specanchor", rel, node.lineno, line_at(node.lineno)))
+
+    # A session task id COMPOSED rather than obtained from `engine._session_task_id`.
+    # Two value positions, because those are the two a fifth mint can occupy: a
+    # binding (`task_id = …`, `SessionSpec(task_id=…)`) and a return from a function
+    # named for what it returns. A forward — `task_id=spec.task_id`,
+    # `task_id=str(d["task_id"])`, `task_id=task_id` — reaches neither predicate,
+    # which is the distinction the whole detector rests on.
+    #
+    # Collected into a dict keyed by node id so a value matching through two
+    # candidate paths (a `.format()` call is both the candidate itself and the
+    # parent of its arguments) reports once.
+    #
+    # NOT COVERED, deliberately, and stated rather than implied. This is a review
+    # tripwire on the shapes the real mint sites use, not a sandbox; widening it is a
+    # decision, not a bug fix. Each of these was run through `_scan_source` and
+    # confirmed silent:
+    #
+    # * a store into a dict or an attribute — `record["task_id"] = f"…"`,
+    #   `self.task_id = f"…"`. Neither is a Name binding, a `task_id=` keyword, nor a
+    #   return from a `*task_id*` function.
+    # * an INTERMEDIATE VARIABLE: `tid = f"{key}-dev-1"` on one line and
+    #   `task_id=tid` on the next. The binding position holds a Name, which is a
+    #   forward as far as this detector can see; following it would mean the
+    #   flow-sensitive resolution `_journal_splat_keys` does for one dict, across
+    #   every string in the file.
+    # * `"-".join([key, "dev", "1"])` and `fmt % (key, n)` where `fmt` is a Name
+    #   bound to the format string — two more real ways to build a string that
+    #   `_is_str_composition` does not recognise (its own docstring lists them).
+    minted: dict[int, ast.expr] = {}
+
+    def record_mint(value: ast.expr, *, bare_at_depth: bool) -> None:
+        for candidate, depth in _mint_candidates(value):
+            if _is_str_composition(candidate) or (
+                _is_bare_str(candidate) and (depth == 0 or bare_at_depth)
+            ):
+                minted.setdefault(id(candidate), candidate)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "task_id" for t in node.targets):
+                record_mint(node.value, bare_at_depth=False)
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == "task_id"
+                and node.value is not None
+            ):
+                record_mint(node.value, bare_at_depth=False)
+        elif isinstance(node, ast.keyword) and node.arg == "task_id":
+            record_mint(node.value, bare_at_depth=False)
+        elif isinstance(node, ast.Return) and id(node) in task_id_returns:
+            # A function NAMED for the id it returns is already the whole tell, so a
+            # bare literal stays a finding at depth there (`return safe_segment("x")`)
+            # — unlike a binding, where a literal argument is the sanctioned
+            # chokepoint call's own `"dev"` part.
+            assert node.value is not None  # task_id_returns only holds valued returns
+            record_mint(node.value, bare_at_depth=True)
+
+    for mint in minted.values():
+        findings.append(
+            (
+                "taskid",
+                rel,
+                mint.lineno,
+                line_at(mint.lineno),
+                id(mint) in sanctioned_task_id_nodes,
+            )
+        )
 
     return findings
 
@@ -1017,6 +1822,310 @@ def test_spec_anchor_detector_stays_silent_on_the_anchored_form():
         "from pathlib import Path\np = Path(state.project)\n",
     ):
         assert not [f for f in _scan_source(src, "tui/app.py") if f[0] == "specanchor"]
+
+
+def _task_artifact_offenders(findings) -> list[tuple[str, int, str, str]]:
+    """The artifact-name literals no declared POSITION covers — the assertion's
+    whole policy, factored out so it can be graded on synthetic findings rather than
+    only on today's tree (the file's ``_env_read_offenders`` idiom).
+
+    Both halves of the key bite: the file, then the enclosing function inside it.
+    Dropping the function half exempts every ``"result.json"`` in
+    ``adapters/generic.py``, which is what the allowlist's comment already said was
+    not the case."""
+    return [
+        (rel, ln, txt, name)
+        for _, rel, ln, txt, (name, fn) in findings
+        if name not in TASK_ARTIFACT_LITERAL_ALLOW.get(rel, {}).get(fn, frozenset())
+    ]
+
+
+def test_task_cycle_artifacts_named_only_through_the_constant():
+    """The task-directory artifact names live in ``journal.TASK_CYCLE_ARTIFACTS``,
+    not as a literal in each site that touches them.
+
+    Three sites share the list: both adapters clear it in ``start_session`` (a
+    caller-supplied task_id may be reused, so a silent session must not inherit its
+    predecessor's outputs) and ``resolve._gather_escalations`` reads it back. They
+    were three independent literals, and the only parity claim was a sentence in a
+    test docstring — so a third artifact added to the reader would silently miss
+    both adapters, which is exactly how ``escalation.json`` reached the reader
+    before either adapter cleared it.
+
+    The exemption is per-POSITION and per-NAME, never per-file:
+    ``adapters/generic.py::_result_path`` answers a genuinely single-artifact
+    question and keeps ``"result.json"``, while ``"escalation.json"`` stays refused
+    inside it and BOTH names stay refused in every other function of that file.
+
+    ⚠️ What this assertion is worth on today's tree, said as candidly as its DW-66
+    sibling says it: almost nothing. There is exactly ONE `taskartifact` finding in
+    the whole tree and it is allowlisted, so the offender list is empty and would
+    stay empty with the detector deleted. ``TASK_ARTIFACT_PROBES`` and
+    ``TASK_ARTIFACT_SCOPE_CASES`` are what grade the detector and the scoping; this
+    row grades the tree, and the tree is currently clean.
+
+    ⚠️ And what it protects is narrower than "the constant is the list". It refuses
+    the constant being UN-DONE — a name pulled back out into a literal at any of the
+    three sites. It does NOT catch the constant being OUT-GROWN: a genuinely new
+    artifact spelled only in the reader produces no finding at all, because the
+    detector matches the names the constant already holds. Verified — a
+    ``(task_dir / "verdict.json")`` added to ``resolve.py`` is silent here, and the
+    parity it would break is the parity this guard exists for.
+
+    Ablation: respell either adapter's loop as
+    ``(task_dir / "escalation.json").unlink(missing_ok=True)`` and this reddens
+    naming that file and line."""
+    offenders = _task_artifact_offenders(_of("taskartifact"))
+    assert offenders == [], (
+        "a tasks/<task_id>/ artifact named as a bare literal — iterate "
+        "journal.TASK_CYCLE_ARTIFACTS so the readers and both adapters cannot "
+        "drift apart on the list:\n"
+        + "\n".join(f"  {rel}:{ln}: {name!r} — {txt.strip()}" for rel, ln, txt, name in offenders)
+    )
+
+
+def _session_task_id_offenders(findings) -> list[tuple[str, int, str]]:
+    """The chokepoint invariant as a filter: a composed task id is sanctioned only
+    in a ``SESSION_TASK_ID_CHOKEPOINT`` file AND only inside that file's one listed
+    enclosing function — the file alone is not enough, for the reason the git and
+    verify-classifier exemptions are not file-wide."""
+    return [(rel, ln, txt) for _, rel, ln, txt, at_chokepoint in findings if not at_chokepoint]
+
+
+def test_session_task_id_composed_only_at_the_chokepoint():
+    """Every session task id is composed in ``engine._session_task_id`` and nowhere
+    else.
+
+    The four mint sites (``engine.py`` ×3, ``resolve.py``) all call it and bind or
+    pass the result; none spells the format. That is what makes
+    ``_resumable_session``'s resume match byte-identical to what ``_run_session``
+    stored, and what carries the ``-g<N>`` re-arm generation discriminator a
+    hand-rolled fifth mint would omit — silently re-opening #705, correctly
+    everywhere it was exercised and wrong only on a re-armed run.
+
+    Nothing forbade a fifth. This does: a composition or a bare literal in a
+    ``task_id`` binding, or returned from a function named for the id it makes, is
+    refused wherever it is spelled. A FORWARD is not a mint and stays silent — see
+    ``SESSION_TASK_ID_PROBES`` / ``SESSION_TASK_ID_NON_PROBES`` for that boundary as
+    rows rather than prose.
+
+    ⚠️ What this assertion grades, precisely — the halves are NOT the same, and
+    both ablations were run rather than reasoned about:
+
+    * the SANCTION, yes. The chokepoint's own ``return safe_segment(f"…")`` is a
+      real finding on today's tree, cleared only by its position, so emptying
+      ``SESSION_TASK_ID_CHOKEPOINT`` reddens this naming ``engine.py:393``. That is
+      more than the sibling guards' repo-wide assertions can say for themselves.
+    * the DETECTOR, no. Delete the ``taskid`` emit and this goes green with an empty
+      finding list — indistinguishable from an invariant that holds.
+      ``SESSION_TASK_ID_PROBES`` is where that is caught, and the two are not
+      interchangeable.
+
+    Ablation: respell ``resolve.py``'s mint as
+    ``task_id=f"{story_key}-resolve-1"`` and this reddens naming that line."""
+    offenders = _session_task_id_offenders(_of("taskid"))
+    assert offenders == [], (
+        "a session task id composed outside engine._session_task_id — call that "
+        "function instead, so the id keeps its whole-composition sanitize and its "
+        "-g<N> re-arm generation suffix (#705):\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
+    """The routing invariant as a filter, in the two directions a finding can fail:
+    a field name that neither ``diagnostics`` nor the benign inventory accounts for,
+    and a ``**splat`` whose keys could not be resolved at a position that has not
+    declared itself a hole.
+
+    Routing is checked BY NAME first and then BY KIND, mirroring ``_scrub_entry``'s
+    own order rather than a flattened union of the two. A kind-scoped name — today
+    only ``target`` — is routed on its own kinds, declared benign on the
+    ``board-advance-*`` family that carries a sprint status under the same name, and
+    an offender everywhere else, INCLUDING at a call whose kind the scan could not
+    resolve. That is the case a by-name union got wrong in the dangerous direction:
+    ``journal.append("unit-merge-failed", target=branch)`` read as routed."""
+    offenders: list[tuple[str, int, str, str]] = []
+    for _, rel, ln, txt, (field, fn, kind) in findings:
+        where = f"{fn}()" if fn else "<module>"
+        if field is None:
+            if (rel, fn) not in JOURNAL_SPLAT_ALLOW:
+                offenders.append((rel, ln, txt, f"unresolvable **splat in {where}"))
+            continue
+        if field in JOURNAL_ROUTED_FIELDS or field in JOURNAL_BENIGN_FIELDS:
+            continue
+        if kind is not None and (
+            field in JOURNAL_KIND_ROUTED_FIELDS.get(kind, frozenset())
+            or field in JOURNAL_KIND_BENIGN_FIELDS.get(kind, frozenset())
+        ):
+            continue
+        on = f"on {kind!r}" if kind is not None else "on a non-literal kind"
+        offenders.append((rel, ln, txt, f"{field!r} {on} in {where}"))
+    return offenders
+
+
+def _journal_kind_offenders(findings) -> list[tuple[str, int, str]]:
+    """Journal writes whose KIND is not a string literal, at a position that has not
+    declared itself one. Their fields cannot be graded against kind-scoped routing at
+    all, so — like an unresolvable splat — they fail loud rather than pass by
+    default."""
+    return [
+        (rel, ln, txt)
+        for _, rel, ln, txt, fn in findings
+        if (rel, fn) not in JOURNAL_DYNAMIC_KIND_ALLOW
+    ]
+
+
+def test_journal_fields_are_routed_or_declared_benign():
+    """Every field name a journal producer SPELLS AT A CALL is either routed by
+    ``diagnostics`` — by name, or by name-and-kind — or listed in the benign
+    inventory.
+
+    Two bounds on "every field name a journal producer writes", which is what this
+    docstring used to claim, and neither is a detail. ``Journal.append`` mints
+    ``log_task`` and ``log_pos`` itself with ``setdefault``, so no call spells them
+    and this scan cannot see them (``JOURNAL_SELF_MINTED_FIELDS``;
+    ``test_journal_append_writes_only_accounted_fields`` is the row that actually
+    covers them). And a field arriving through a declared ``JOURNAL_SPLAT_ALLOW``
+    hole is inventoried there by hand, not observed here.
+
+    Routing is NOT flat, which the earlier wording implied by folding
+    ``_JOURNAL_KIND_ALIAS_FIELDS`` into one by-name union. ``target`` is aliased on
+    three merge kinds and deliberately left alone on the ``board-advance-*`` family,
+    where it carries a sprint status — so it is checked per kind, and
+    ``journal.append("unit-merge-failed", target=branch)``, a new kind reusing the
+    name, is refused here rather than sailing through to ``scrub_json``.
+
+    Nothing coupled the producers to the tables, and the tables route by field NAME.
+    A measured ablation — renaming ``recovery_flow.py``'s ``patch=`` to
+    ``patch_path=`` — left every row of ``tests/test_diagnostics.py`` green while
+    the field dropped out of ``_JOURNAL_DROP_FIELDS`` and started shipping in
+    ``--dump`` output. That is the failure this refuses, and it is a rename rather
+    than an exotic shape.
+
+    Direction matters, and the reverse would not work. Several routing rows are
+    deliberately defensive (``paused_story_key``, ``bundle``, ``detail``,
+    ``suggestion``, ``blocker``, ``stdout_path``) and have no static kwarg producer,
+    so a "no dead row" assertion would need a large allowlist of CORRECT entries
+    while catching nothing this direction misses. A rename shows up here as a NEW
+    unrouted name — which is precisely the measured ablation.
+
+    What the benign inventory claims is narrow and stated plainly on
+    ``JOURNAL_BENIGN_FIELDS``: it is the set of unrouted names that existed when the
+    guard landed, not a per-name safety audit. The guard's real assertion is that
+    the NEXT name cannot appear without someone deciding which side it belongs on.
+
+    A ``**splat`` is resolved through the literal stores that build it; when it
+    cannot be, the site fails loud unless ``JOURNAL_SPLAT_ALLOW`` declares it a
+    known hole with a reason. A silently-skipped splat would be a standing hole in
+    the inventory — the guard would keep passing while new fields arrived through
+    it.
+
+    Ablation: rename ``recovery_flow.py``'s ``patch=`` to ``patch_path=`` and this
+    reddens naming the new field."""
+    offenders = _journal_field_offenders(_of("journalfield"))
+    assert offenders == [], (
+        "a journal field is neither routed by diagnostics' redaction tables nor "
+        "declared benign — decide which it is: add a row to the right table in "
+        "diagnostics.py if it carries an identifier, a path or free text, or list "
+        "it in JOURNAL_BENIGN_FIELDS if it does not:\n"
+        + "\n".join(f"  {rel}:{ln}: {what} — {txt.strip()}" for rel, ln, txt, what in offenders)
+    )
+
+
+def test_journal_kinds_are_literal_or_the_position_is_declared():
+    """A journal write whose KIND is not a string literal cannot be graded against
+    ``diagnostics``' kind-scoped routing, so it fails loud at an undeclared position
+    — the same stance the guard takes on an unresolvable ``**splat``, and for the
+    same reason: a site the scan cannot read must not read as clean.
+
+    Seven such writes exist, at four positions, and all four journal only by-name
+    routed fields today (``JOURNAL_DYNAMIC_KIND_ALLOW`` records which). Declaring one
+    waives the kind resolution and nothing else: a kind-scoped name at one of them is
+    still refused by the sibling assertion, because nothing can prove which kind it
+    lands on.
+
+    Ablation: empty ``JOURNAL_DYNAMIC_KIND_ALLOW`` and this reddens naming all four
+    positions."""
+    offenders = _journal_kind_offenders(_of("journalkind"))
+    assert offenders == [], (
+        "a journal write whose kind is not a string literal, at a position that has "
+        "not declared itself one — pass a literal kind, or add the position to "
+        "JOURNAL_DYNAMIC_KIND_ALLOW with what it journals:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_journal_field_guard_actually_saw_the_producers():
+    """The sibling assertion is an ABSENCE, so it is green both when every field is
+    accounted for and when the scan stopped finding journal writes at all. This is
+    the half that cannot be: empty the inventories and the guard must name a real
+    producer, which proves the scan reached them.
+
+    Also pins the three shapes the scan must not lose — the routed names really are
+    produced (so ``JOURNAL_ROUTED_FIELDS`` is coupled to live producers rather than
+    to a copied list), every declared splat hole still exists (so a stale
+    ``JOURNAL_SPLAT_ALLOW`` entry cannot sit there sanctioning nothing), and every
+    declared BENIGN name still has a producer.
+
+    That last one is the direction nothing held before. The benign inventory is a
+    pre-approval list, so a name whose producer was deleted does not just sit there
+    inertly: it pre-approves a future, unrelated field that happens to reuse the
+    spelling, with no one making the decision the inventory exists to force. The two
+    exemptions are the names no CALL can spell — what ``Journal.append`` mints itself
+    and what arrives through a declared splat hole."""
+    findings = _of("journalfield")
+    produced = {field for _, _, _, _, (field, _, _) in findings if field is not None}
+    assert len(produced) > 100, f"the scan found only {len(produced)} journal fields"
+    assert produced & JOURNAL_ROUTED_FIELDS, "no routed field has a static producer"
+    holes = {(rel, fn) for _, rel, _, _, (field, fn, _) in findings if field is None}
+    assert holes == set(JOURNAL_SPLAT_ALLOW), (
+        "JOURNAL_SPLAT_ALLOW no longer matches the unresolvable splats in the tree; "
+        f"undeclared: {sorted(holes - set(JOURNAL_SPLAT_ALLOW))}, "
+        f"stale: {sorted(set(JOURNAL_SPLAT_ALLOW) - holes)}"
+    )
+    unscannable = JOURNAL_SELF_MINTED_FIELDS.union(*JOURNAL_SPLAT_ALLOW.values())
+    stale = JOURNAL_BENIGN_FIELDS - produced - unscannable
+    assert stale == set(), (
+        "JOURNAL_BENIGN_FIELDS names fields no producer writes any more — a benign "
+        "entry outlives its producer as a standing pre-approval for the next field "
+        "that reuses the name. Delete them, or record where they now come from in "
+        f"JOURNAL_SPLAT_ALLOW / JOURNAL_SELF_MINTED_FIELDS: {sorted(stale)}"
+    )
+
+
+def test_journal_append_writes_only_accounted_fields(tmp_path):
+    """The static guard reads CALL SITES, and ``Journal.append`` adds two field names
+    that no call site spells: ``entry.setdefault("log_task", …)`` and
+    ``entry.setdefault("log_pos", size)``. Both were invisible to it, and ``log_pos``
+    was in neither routing set while the guard stayed green — so the sibling's claim
+    about "every field a producer writes" was false by two names.
+
+    This closes it from the only side that can: RUN an append, read the JSONL line
+    back, and hold every key it actually contains to the same two inventories. A
+    third ``setdefault`` cannot be added to ``Journal.append`` without landing in one
+    of them.
+
+    Ablation: add ``entry.setdefault("log_seq", 0)`` to ``Journal.append`` and this
+    row reddens naming ``log_seq`` while every static assertion above stays green —
+    which is the whole point of the row existing beside them."""
+    run_dir = tmp_path / "run"
+    j = Journal(run_dir)
+    j.set_active_log("1-1-story-dev-1")
+    j.append("run-start", run_type="stories")
+
+    lines = (run_dir / JOURNAL_FILE).read_text(encoding="utf-8").splitlines()
+    entry = json.loads(lines[-1])
+    minted = set(entry) - {"ts", "kind"}
+    assert (
+        "log_pos" in minted and "log_task" in minted
+    ), f"Journal.append stopped stamping the pane-log pointer: {sorted(minted)}"
+    unaccounted = minted - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
+    assert unaccounted == set(), (
+        "Journal.append writes a field name neither routed by diagnostics nor "
+        "declared benign — the static guard cannot see a field the append mints "
+        f"itself, so decide which side it belongs on here: {sorted(unaccounted)}"
+    )
 
 
 def test_no_hardcoded_posix_paths():
@@ -1821,6 +2930,699 @@ def test_env_read_allowlist_is_scoped_by_family_not_by_file(label, rel, key, is_
         f"{rel} reading {key} should {'be refused' if is_offender else 'be allowed'}; "
         f"declared families for that file: {ENV_READ_ALLOW.get(rel, ())}"
     )
+
+
+# The artifact-literal detector's probe matrix. Today's tree has exactly ONE
+# `taskartifact` finding (generic.py's `_result_path`, allowlisted), so deleting the
+# detector branch leaves every tree-wide assertion green — only these rows redden.
+#
+# Every source below is BUILT BY ITERATING `TASK_CYCLE_ARTIFACTS` rather than by
+# indexing it. Two reasons, and the second is the load-bearing one: a renamed
+# artifact cannot leave a probe grading a string nothing produces any more, and a
+# constant that SHRINKS cannot raise `IndexError` while this module is being
+# imported. That error arrives at COLLECTION and takes every guard in this file down
+# with it — the POSIX, git, env-read and spec-anchor ones included — which is a very
+# large blast radius for a one-line edit in `journal.py`. Iteration degrades to
+# fewer rows instead, and `test_artifact_probe_tables_are_not_empty` states the floor.
+_ARTIFACT_TUPLE_SRC = ", ".join(f'"{name}"' for name in TASK_CYCLE_ARTIFACTS)
+TASK_ARTIFACT_PROBES = [
+    *(
+        (f"unlink-literal:{name}", f'(task_dir / "{name}").unlink(missing_ok=True)\n')
+        for name in TASK_CYCLE_ARTIFACTS
+    ),
+    *(
+        (f"read-literal:{name}", f'doc = json.loads((d / "{name}").read_text())\n')
+        for name in TASK_CYCLE_ARTIFACTS
+    ),
+    # The re-introduced pair, in the shape the extraction removed: an inline tuple
+    # in a for-loop, which is how the reader spelled it.
+    ("inline-tuple-loop", f"for fname in ({_ARTIFACT_TUPLE_SRC}):\n    pass\n"),
+    # A second module re-declaring the constant is a COPY, not the definition — the
+    # definition skip is keyed to journal.py (see TASK_ARTIFACT_DEFINITION).
+    ("constant-redeclared-elsewhere", f"TASK_CYCLE_ARTIFACTS = ({_ARTIFACT_TUPLE_SRC})\n"),
+]
+TASK_ARTIFACT_NON_PROBES = [
+    # The detector matches string EQUALITY, never containment: the dev and sweep
+    # prompts name the artifact inside a sentence, and flagging prose is how a
+    # tripwire gets allowlisted into meaninglessness.
+    *(
+        (
+            f"prompt-prose:{name}",
+            f'PROMPT = "Write your verdict to tasks/<id>/{name}, then stop."\n',
+        )
+        for name in TASK_CYCLE_ARTIFACTS
+    ),
+    *(
+        (f"docstring-prose:{name}", f'def f():\n    """Reads {name} beside it."""\n    return 1\n')
+        for name in TASK_CYCLE_ARTIFACTS
+    ),
+    # A different artifact in the same directory: the guard's claim is about the
+    # SHARED list, not about every filename a task dir holds. `heartbeat.json` and
+    # `messages.json` are real siblings that stay outside it (see the constant).
+    ("sibling-artifact", 'p = task_dir / "prompt.txt"\n'),
+    ("adapter-owned-sibling", 'p = task_dir / "heartbeat.json"\n'),
+    # The sanctioned spelling everywhere: iterate the constant.
+    (
+        "iterating-the-constant",
+        "for artifact in TASK_CYCLE_ARTIFACTS:\n    (task_dir / artifact).unlink(missing_ok=True)\n",
+    ),
+]
+
+
+def test_artifact_probe_tables_are_not_empty():
+    """The tables above are derived from `TASK_CYCLE_ARTIFACTS` by iteration, which
+    is what stops a shrunk constant erroring this module's collection — but the same
+    derivation would quietly EMPTY a parametrized table, and an empty parametrize
+    passes for exactly the reason an empty scan does. This is that floor, stated as
+    a requirement rather than left to an `IndexError` nobody would read as one."""
+    assert len(TASK_CYCLE_ARTIFACTS) >= 2, (
+        "TASK_CYCLE_ARTIFACTS is down to "
+        f"{list(TASK_CYCLE_ARTIFACTS)}; the scope cases below need one allowlisted "
+        "name and one refused name to tell a name-scoped exemption from a file-wide one"
+    )
+    assert TASK_ARTIFACT_PROBES and TASK_ARTIFACT_NON_PROBES and TASK_ARTIFACT_SCOPE_CASES
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TASK_ARTIFACT_PROBES, ids=[p[0] for p in TASK_ARTIFACT_PROBES]
+)
+def test_task_artifact_detector_flags_every_literal_spelling(label, source):
+    """Each way of re-introducing a literal produces a `taskartifact` finding, driven
+    through the same `_scan_source` the real scan uses."""
+    found = [f for f in _scan_source(source, "sweep.py") if f[0] == "taskartifact"]
+    assert found, f"the {label!r} spelling produced no `taskartifact` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TASK_ARTIFACT_NON_PROBES, ids=[p[0] for p in TASK_ARTIFACT_NON_PROBES]
+)
+def test_task_artifact_detector_stays_silent_on_lookalikes(label, source):
+    """The complement: prose that CONTAINS the name, a docstring, a sibling
+    filename, and the sanctioned loop over the constant are all silent."""
+    found = [f for f in _scan_source(source, "sweep.py") if f[0] == "taskartifact"]
+    assert not found, f"the {label!r} shape was flagged; it is not a copied list:\n{source}"
+
+
+# The artifact exemption's scoping, as rows: `(rel, source, is_offender)`. On the
+# real tree a file-scoped allowlist and this position-and-name-scoped one are
+# indistinguishable — generic.py's single literal is the only finding — so only
+# synthetic sources can tell them apart, and only they carry the drift that does not
+# exist yet. Built by iterating the allowlist and the constant, so a rename cannot
+# leave a row grading a name nothing declares.
+_ALLOWED_IN_GENERIC = TASK_ARTIFACT_LITERAL_ALLOW["adapters/generic.py"]["_result_path"]
+TASK_ARTIFACT_SCOPE_CASES = [
+    # The sanctioned single-name read: one artifact, named because the question is
+    # about that one artifact — and named INSIDE the one function that asks it.
+    *(
+        (
+            f"generic-result-path:{name}",
+            "adapters/generic.py",
+            f'def _result_path(self, task_id):\n    return self.tasks_dir / task_id / "{name}"\n',
+            False,
+        )
+        for name in sorted(_ALLOWED_IN_GENERIC)
+    ),
+    # …which buys that file NOTHING about the other name. This is the case a
+    # file-wide allowlist drops on the path alone — and it is the exact drift the
+    # extraction removed.
+    *(
+        (
+            f"generic-other-name:{name}",
+            "adapters/generic.py",
+            f'def _result_path(self, task_id):\n    (task_dir / "{name}").unlink(missing_ok=True)\n',
+            True,
+        )
+        for name in TASK_CYCLE_ARTIFACTS
+        if name not in _ALLOWED_IN_GENERIC
+    ),
+    # …and it buys no OTHER FUNCTION of that file the allowlisted name either. A
+    # file-keyed allowlist waves this through on the path alone, which is what the
+    # allowlist's comment claimed was already impossible and was not.
+    *(
+        (
+            f"generic-other-function:{name}",
+            "adapters/generic.py",
+            f'def start_session(self, spec):\n    (task_dir / "{name}").unlink(missing_ok=True)\n',
+            True,
+        )
+        for name in sorted(_ALLOWED_IN_GENERIC)
+    ),
+    # A module-level literal in the allowlisted file has no enclosing function at
+    # all, so it cannot inherit a function-keyed exemption.
+    *(
+        (f"generic-module-level:{name}", "adapters/generic.py", f'STALE = "{name}"\n', True)
+        for name in sorted(_ALLOWED_IN_GENERIC)
+    ),
+    # The twin adapter has no entry at all, so even the allowlisted NAME is refused
+    # there: nothing in it answers a single-artifact question.
+    *(
+        (
+            f"opencode-literal:{name}",
+            "adapters/opencode_http.py",
+            f'def _result_path(self, task_id):\n    return self.tasks_dir / task_id / "{name}"\n',
+            True,
+        )
+        for name in sorted(_ALLOWED_IN_GENERIC)
+    ),
+    # journal.py's own definition is not a copy — skipped by POSITION, so it needs
+    # no allowlist entry and cannot cover a literal elsewhere in the file.
+    (
+        "journal-definition",
+        "journal.py",
+        f"TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\n",
+        False,
+    ),
+    *(
+        (
+            f"journal-bare-literal-beside-it:{name}",
+            "journal.py",
+            f"TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\n"
+            f'STALE = "{name}"\n',
+            True,
+        )
+        for name in TASK_CYCLE_ARTIFACTS
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    TASK_ARTIFACT_SCOPE_CASES,
+    ids=[c[0] for c in TASK_ARTIFACT_SCOPE_CASES],
+)
+def test_task_artifact_allowlist_is_scoped_by_position_and_name(label, rel, source, is_offender):
+    """Being allowlisted buys a file's ONE declared function the artifact NAMES it
+    declares, and nothing wider. Without this, `TASK_ARTIFACT_LITERAL_ALLOW` could go
+    back to a set of paths — or to a file -> names map — and every assertion in this
+    file would stay green."""
+    findings = [f for f in _scan_source(source, rel) if f[0] == "taskartifact"]
+    offenders = _task_artifact_offenders(findings)
+    assert bool(offenders) is is_offender, (
+        f"an artifact literal in {rel} here should "
+        f"{'be refused' if is_offender else 'be allowed'}:\n{source}"
+    )
+
+
+# The task-id detector's probe matrix. Today's tree has exactly one `taskid`
+# finding — the chokepoint's own return — so the tree-wide guard would stay green
+# with the composition branches deleted; only these rows redden.
+SESSION_TASK_ID_PROBES = [
+    ("fstring-assignment", 'task_id = f"{task.story_key}-dev-{task.attempt}"\n'),
+    ("concat-in-keyword", 'spec = SessionSpec(task_id=story + "-review-1", prompt=p)\n'),
+    ("percent-format", 'task_id = "%s-dev-%d" % (key, seq)\n'),
+    ("str-format", 'task_id = "{}-dev-1".format(key)\n'),
+    ("bare-literal-keyword", 'spec = SessionSpec(task_id="triage-1", prompt=p)\n'),
+    ("annotated-assignment", 'task_id: str = f"{key}-sweep-1"\n'),
+    # A helper named for what it returns, in both the bare and the wrapped shape —
+    # the wrapped one is how a fifth mint copied from the chokepoint would look.
+    ("returned-from-task_id_fn", 'def _sweep_task_id(key):\n    return f"{key}-sweep"\n'),
+    (
+        "returned-through-sanitizer",
+        'def _sweep_task_id(key):\n    return safe_segment(f"{key}-sweep")\n',
+    ),
+    # Both branches of a conditional are the same value position.
+    ("conditional-branch", 'task_id = base if base else f"{key}-dev-1"\n'),
+    # The chokepoint's own `return safe_segment(f"…")` copied into a BINDING and into
+    # a KEYWORD — the most likely fifth mint, because it is the sanctioned line moved
+    # rather than a new idea, and the one that silently drops the `-g<N>` re-arm
+    # suffix (#705). Both were silent before the binding and keyword legs descended
+    # through call arguments.
+    ("binding-wrapped-in-sanitizer", 'task_id = safe_segment(f"{key}-dev-1")\n'),
+    (
+        "keyword-wrapped-in-sanitizer",
+        'spec = SessionSpec(task_id=safe_segment(f"{key}-dev-1"), prompt=p)\n',
+    ),
+    # …and one level further in, since a wrapper can nest.
+    ("binding-wrapped-twice", 'task_id = safe_segment(str(f"{key}-dev-1"))\n'),
+]
+SESSION_TASK_ID_NON_PROBES = [
+    # The sanctioned call, and the three FORWARD shapes. A forward is not a mint,
+    # and this is the distinction the whole detector rests on.
+    ("chokepoint-call", 'task_id = _session_task_id(key, "dev", 1, gen)\n'),
+    ("forward-attribute", "handle = SessionHandle(task_id=spec.task_id, native_id=w)\n"),
+    ("forward-coerced", 'task_id = str(entry.get("task_id", ""))\n'),
+    ("forward-name", "handle = SessionHandle(task_id=task_id, native_id=w)\n"),
+    # The parts handed TO the chokepoint are not the id. The binding leg DOES descend
+    # into call arguments now, so this row is what makes the depth rule load-bearing:
+    # a bare literal is a mint only at depth 0, or the `"dev"` in every sanctioned
+    # mint site becomes a finding.
+    ("chokepoint-call-with-literal-part", 'task_id = _session_task_id(k, "dev", n, gen)\n'),
+    (
+        "chokepoint-keyword-with-literal-part",
+        'spec = SessionSpec(task_id=_session_task_id(k, "dev", n, gen), prompt=p)\n',
+    ),
+    # The same rule is what keeps the env read silent — `events.py` and both hook
+    # scripts spell exactly this, and the variable name is a `task_id` binding.
+    ("env-read", 'task_id = os.environ.get("BMAD_LOOP_TASK_ID")\n'),
+    ("env-read-with-default", 'task_id = os.environ.get("BMAD_LOOP_TASK_ID", "probe")\n'),
+    # The shapes the detector deliberately does not reach, pinned as rows so the
+    # boundary is executed rather than only described in the `NOT COVERED` comment.
+    ("intermediate-variable", 'tid = f"{key}-dev-1"\nspec = SessionSpec(task_id=tid)\n'),
+    ("join-composition", 'task_id = "-".join([key, "dev", "1"])\n'),
+    ("percent-against-a-name", "task_id = fmt % (key, seq)\n"),
+    # A composition bound to something else entirely — the detector is scoped to the
+    # `task_id` positions, not to f-strings at large.
+    ("composition-elsewhere", 'log_name = f"{task_id}.log"\n'),
+    # A *task_id* function that FORWARDS: its returned literal-keyed subscript is
+    # not a string Constant in a value position (`tui.data.active_task_id`).
+    (
+        "task_id_fn-forwards",
+        'def active_task_id(entries):\n    return str(entries[-1]["task_id"])\n',
+    ),
+    # Prose is a docstring Expr, never a binding or a return value.
+    (
+        "prose-in-docstring",
+        'def f():\n    """Ids look like task_id = f\'{key}-dev-1\'."""\n    return 1\n',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), SESSION_TASK_ID_PROBES, ids=[p[0] for p in SESSION_TASK_ID_PROBES]
+)
+def test_session_task_id_detector_flags_every_mint_shape(label, source):
+    """Each spelling of a hand-minted id produces a `taskid` finding. `sweep.py` is
+    an unsanctioned file, so a finding here is also an offender."""
+    found = [f for f in _scan_source(source, "sweep.py") if f[0] == "taskid"]
+    assert found, f"the {label!r} shape produced no `taskid` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    SESSION_TASK_ID_NON_PROBES,
+    ids=[p[0] for p in SESSION_TASK_ID_NON_PROBES],
+)
+def test_session_task_id_detector_stays_silent_on_forwards(label, source):
+    """The complement: the chokepoint call, the three forward shapes, the literal
+    PARTS handed to the chokepoint, the environment read every hook script uses, a
+    composition bound elsewhere, and prose are all silent — a guard that flags
+    forwards would be allowlisted away within a week.
+
+    The last three rows are the DISCLOSED gaps rather than desired silences:
+    an intermediate variable, `str.join`, and `%` against a Name-bound format
+    string. They are here so the boundary is executed and cannot drift into a
+    coverage claim the detector does not make."""
+    found = [f for f in _scan_source(source, "sweep.py") if f[0] == "taskid"]
+    assert not found, f"the {label!r} shape was flagged; it is not a mint:\n{source}"
+
+
+# The task-id exemption's scoping, as rows: `(rel, source, is_offender)`.
+SESSION_TASK_ID_SCOPE_CASES = [
+    # The real chokepoint, in the shape it ships.
+    (
+        "sanctioned-chokepoint",
+        "engine.py",
+        "def _session_task_id(story_key, part, seq, generation):\n"
+        '    gen = f"-g{generation}" if generation > 0 else ""\n'
+        '    return safe_segment(f"{story_key}-{part}-{seq}{gen}")\n',
+        False,
+    ),
+    # Being engine.py is NOT enough: it already binds `task_id` three times, so a
+    # file-wide exemption would leave the invariant unguarded exactly where a fifth
+    # mint would be written.
+    (
+        "engine-other-function",
+        "engine.py",
+        "def _run_sweep(self, task):\n"
+        '    task_id = f"{task.story_key}-sweep-{task.attempt}"\n'
+        "    return task_id\n",
+        True,
+    ),
+    # The name does not travel: the same function grown in another module cannot
+    # sanction itself, which is why the sanction pairs the function with the FILE.
+    (
+        "chokepoint-name-in-another-file",
+        "sweep.py",
+        "def _session_task_id(story_key, part, seq, generation):\n"
+        '    return safe_segment(f"{story_key}-{part}-{seq}")\n',
+        True,
+    ),
+    # The measured ablation: resolve.py's mint respelled as an f-string.
+    (
+        "resolve-respelled",
+        "resolve.py",
+        'spec = SessionSpec(task_id=f"{story_key}-resolve-1", prompt=p)\n',
+        True,
+    ),
+    # …and its real spelling stays silent there.
+    (
+        "resolve-real-spelling",
+        "resolve.py",
+        'spec = SessionSpec(task_id=_session_task_id(story_key, "resolve", 1, generation), prompt=p)\n',
+        False,
+    ),
+    # A nested def inside the chokepoint is still inside it (`ast.walk` descends),
+    # matching how the verify sanctions treat closures.
+    (
+        "nested-inside-chokepoint",
+        "engine.py",
+        "def _session_task_id(story_key, part, seq, generation):\n"
+        "    def compose():\n"
+        '        return f"{story_key}-{part}-{seq}"\n'
+        "    return safe_segment(compose())\n",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    SESSION_TASK_ID_SCOPE_CASES,
+    ids=[c[0] for c in SESSION_TASK_ID_SCOPE_CASES],
+)
+def test_session_task_id_exemption_is_scoped_to_the_chokepoint(label, rel, source, is_offender):
+    """Being engine.py buys the file its `_session_task_id` body and nothing wider.
+    Without this, the sanction could go back to a bare file set and every assertion
+    here would stay green — the difference only shows up on a fifth mint, which is
+    the only kind a tripwire is for."""
+    findings = [f for f in _scan_source(source, rel) if f[0] == "taskid"]
+    offenders = _session_task_id_offenders(findings)
+    assert bool(offenders) is is_offender, (
+        f"a composed task id in {rel} here should "
+        f"{'be refused' if is_offender else 'be allowed'}:\n{source}"
+    )
+
+
+# The journal detector's probe matrix, as `(label, source, expected)` where
+# `expected` is the exact set of field names the scan must extract — `None` standing
+# for an unresolvable splat. Asserting the SET rather than "something was found" is
+# what makes a partial splat resolution fail here instead of quietly under-reporting.
+JOURNAL_FIELD_PROBES = [
+    # The three receiver spellings in the tree.
+    ("self-journal", 'self.journal.append("k", story_key=s, patch=p)\n', {"story_key", "patch"}),
+    ("bare-journal", 'journal.append("k", branch=b)\n', {"branch"}),
+    ("private-journal", "self._journal.append(kind, plugin=name)\n", {"plugin"}),
+    # A splat resolved through the literal stores that build it, in both store
+    # shapes and across the conditional-dict form `engine._run_inner` uses.
+    (
+        "splat-dict-literal",
+        "def f(self):\n"
+        '    fields = {"story_key": k, "checkpoint": "story"}\n'
+        '    self.journal.append("k", **fields)\n',
+        {"story_key", "checkpoint"},
+    ),
+    (
+        "splat-subscript-store",
+        "def f(self):\n"
+        '    fields = {"story_key": k}\n'
+        '    fields["reason"] = "graceful-stop"\n'
+        '    self.journal.append("k", **fields)\n',
+        {"story_key", "reason"},
+    ),
+    (
+        "splat-conditional-dict",
+        "def f(self):\n"
+        '    extras = {"via": stop.via} if stop.via is not None else {}\n'
+        '    self.journal.append("k", **extras)\n',
+        {"via"},
+    ),
+    # Explicit keywords and a splat on the SAME call: both halves are collected, so
+    # a resolvable splat does not shadow its siblings and vice versa.
+    (
+        "splat-mixed-with-explicit",
+        'def f(self):\n    d = {"a": 1}\n    self.journal.append("k", b=2, **d)\n',
+        {"a", "b"},
+    ),
+    # The unresolvable shapes, each of which must fail LOUD rather than resolve to
+    # the keys seen so far — a partially-resolved splat is a silent hole.
+    (
+        "splat-computed-key",
+        'def f(self):\n    d = {}\n    d[f"{kind}_path"] = p\n    self.journal.append("k", **d)\n',
+        {None},
+    ),
+    (
+        "splat-update-mutation",
+        'def f(self):\n    d = {"a": 1}\n    d.update(b=2)\n    self.journal.append("k", **d)\n',
+        {None},
+    ),
+    (
+        "splat-augmented-store",
+        'def f(self):\n    d = {"a": 1}\n    d += other\n    self.journal.append("k", **d)\n',
+        {None},
+    ),
+    (
+        "splat-nested-splat",
+        'def f(self):\n    d = {"a": 1, **other}\n    self.journal.append("k", **d)\n',
+        {None},
+    ),
+    (
+        "splat-from-call",
+        'def f(self):\n    self.journal.append("k", **self._extras(result))\n',
+        {None},
+    ),
+    (
+        "splat-parameter-forwarder",
+        "def _log(self, kind, **fields):\n    self._journal.append(kind, **fields)\n",
+        {None},
+    ),
+    ("splat-at-module-level", 'journal.append("k", **fields)\n', {None}),
+    # The fourth direction the resolver has to fail closed in: a SECOND NAME bound to
+    # the same dict, mutated through the alias. Every store the resolver looks for is
+    # spelled on `alias`, so the tracked name resolves to `{"a"}` and the new field
+    # is invisible — a partially-resolved splat reading as green, which is precisely
+    # what the other three rows exist to prevent.
+    (
+        "splat-aliased-then-mutated",
+        "def f(self):\n"
+        '    fields = {"a": 1}\n'
+        "    alias = fields\n"
+        '    alias["customer_email"] = 2\n'
+        '    self.journal.append("k", **fields)\n',
+        {None},
+    ),
+    # …and a plain READ of the dict is not an alias, so it still resolves.
+    (
+        "splat-read-not-aliased",
+        'def f(self):\n    fields = {"a": 1}\n    n = len(fields)\n'
+        '    self.journal.append("k", **fields)\n',
+        {"a"},
+    ),
+]
+# The forwarder leg, which needs its own `rel` because `JOURNAL_FORWARDERS` is keyed
+# `(file, name)`: `(label, rel, source, expected)`. Without the declaration the plugin
+# bus's four `self._log(...)` sites were a wall — the scan saw only the `.append`
+# inside `_log`, which is an unresolvable splat, so `rc` and `blocking` reached the
+# journal while sitting in neither routing set with the guard green.
+JOURNAL_FORWARDER_PROBES = [
+    (
+        "declared-forwarder-call",
+        "plugins/bus.py",
+        'self._log("plugin-hook", plugin=lp.name, stage=hook.stage, rc=rc, blocking=True)\n',
+        {"plugin", "stage", "rc", "blocking"},
+    ),
+    # The declaration is keyed by FILE as well as name: a `_log` in another module
+    # forwards to something else entirely and must stay invisible.
+    ("forwarder-name-in-another-file", "stories_engine.py", 'self._log("k", rc=rc)\n', set()),
+    # …and it does not turn every call in the declared file into a journal write.
+    ("other-call-in-forwarder-file", "plugins/bus.py", 'self._emit("k", rc=rc)\n', set()),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "expected"),
+    JOURNAL_FORWARDER_PROBES,
+    ids=[p[0] for p in JOURNAL_FORWARDER_PROBES],
+)
+def test_journal_forwarder_calls_enter_the_inventory(label, rel, source, expected):
+    """A declared forwarder's CALL SITES are journal writes, so their explicit
+    keywords are graded like any other producer's — and the declaration is scoped to
+    the one file that owns the forwarder."""
+    found = {f[4][0] for f in _scan_source(source, rel) if f[0] == "journalfield"}
+    assert found == expected, f"the {label!r} shape resolved to {sorted(found, key=str)}:\n{source}"
+
+
+JOURNAL_FIELD_NON_PROBES = [
+    # `.append` on anything that is not a journal handle — the method name alone is
+    # the most common in the language, so anchoring on the receiver is load-bearing.
+    ("list-append", "results.append(SessionResult(status=s, stop_seen=True))\n"),
+    ("attribute-list-append", "self.entries.append(dict(kind=k, story_key=s))\n"),
+    # A journal write with no fields at all produces nothing to route.
+    ("kind-only", 'self.journal.append("run-start")\n'),
+    # Prose naming the call is a Constant, not a Call.
+    ("prose-in-docstring", 'def f():\n    """Calls journal.append(patch=p)."""\n    return 1\n'),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "expected"),
+    JOURNAL_FIELD_PROBES,
+    ids=[p[0] for p in JOURNAL_FIELD_PROBES],
+)
+def test_journal_field_detector_extracts_the_declared_names(label, source, expected):
+    """The names (and the unresolvable-splat marker) the scan must extract from each
+    producer shape. Deleting the splat resolver, or letting it return the keys it
+    managed to see, reddens exactly the rows that describe that behaviour — which
+    the tree-wide assertion cannot, since it is an absence."""
+    found = {f[4][0] for f in _scan_source(source, "sweep.py") if f[0] == "journalfield"}
+    assert found == expected, f"the {label!r} shape resolved to {sorted(found, key=str)}:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    JOURNAL_FIELD_NON_PROBES,
+    ids=[p[0] for p in JOURNAL_FIELD_NON_PROBES],
+)
+def test_journal_field_detector_stays_silent_on_non_journal_appends(label, source):
+    """The complement: `.append` on a list, on some other attribute, a kind-only
+    journal write, and prose are all silent. Without this the detector could pass
+    every row above by flagging every `.append` in the tree."""
+    found = [f for f in _scan_source(source, "sweep.py") if f[0] == "journalfield"]
+    assert not found, f"the {label!r} shape was flagged as a journal field:\n{source}"
+
+
+# The journal offender filter's scoping, as rows:
+# `(rel, fn, field, kind, is_offender)`. On the real tree every field is accounted
+# for, so a filter that accepted EVERYTHING would look identical — only synthetic
+# findings separate them.
+JOURNAL_FIELD_SCOPE_CASES = [
+    # The measured DW-82 ablation: a routed field renamed by its producer. `patch`
+    # is routed (dropped); `patch_path` is nothing, and the dump leaks.
+    ("routed-name", "recovery_flow.py", "_restore", "patch", "stale-restore", False),
+    ("renamed-off-the-table", "recovery_flow.py", "_restore", "patch_path", "stale-restore", True),
+    # A declared-benign name stays silent, and a name in neither set is refused
+    # wherever it appears — the inventory is global, not per-file.
+    ("declared-benign", "engine.py", "_run_inner", "attempt", "run-start", False),
+    ("undeclared-new-field", "engine.py", "_run_inner", "customer_email", "run-start", True),
+    ("undeclared-in-another-file", "sweep.py", "_triage", "customer_email", "sweep-start", True),
+    # KIND-SCOPED routing, which a flattened by-name union got wrong in the dangerous
+    # direction. `target` is aliased to a branch on exactly three merge kinds …
+    ("kind-alias-on-its-own-kind", "worktree_flow.py", "_merge", "target", "unit-merged", False),
+    # … and is NOT routed on a new kind that reuses the name. Flattened, this passed
+    # while `_scrub_entry` handed the branch to `scrub_json` verbatim.
+    ("kind-alias-on-a-new-kind", "worktree_flow.py", "_merge", "target", "unit-merge-failed", True),
+    # … nor at a call whose kind the scan could not resolve: nothing there can prove
+    # which kind it lands on, so the name is not routed by default.
+    ("kind-alias-on-a-non-literal-kind", "worktree_flow.py", "_merge", "target", None, True),
+    # The board-advance family carries a sprint STATUS under the same name, declared
+    # benign per kind rather than by widening the by-name set.
+    (
+        "kind-benign-on-its-own-kind",
+        "engine.py",
+        "_advance_board",
+        "target",
+        "board-advance-carried",
+        False,
+    ),
+    # …and that declaration does not travel to a kind outside the family either.
+    (
+        "kind-benign-on-another-kind",
+        "engine.py",
+        "_advance_board",
+        "target",
+        "board-advance-invented",
+        True,
+    ),
+    # An unresolvable splat is refused unless its POSITION is a declared hole …
+    ("undeclared-splat", "sweep.py", "_triage", None, "sweep-start", True),
+    ("declared-splat-hole", "plugins/bus.py", "_log", None, None, False),
+    # … and the declaration does not travel: the same function name in another
+    # module, or another function in the same module, is still a hole.
+    ("declared-hole-wrong-file", "stories_engine.py", "_log", None, None, True),
+    ("declared-hole-wrong-function", "plugins/bus.py", "_dispatch", None, None, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "fn", "field", "kind", "is_offender"),
+    JOURNAL_FIELD_SCOPE_CASES,
+    ids=[c[0] for c in JOURNAL_FIELD_SCOPE_CASES],
+)
+def test_journal_field_offenders_split_routed_benign_and_holes(
+    label, rel, fn, field, kind, is_offender
+):
+    """The filter's decision, as rows: routed by name, routed on THIS kind, declared
+    benign globally or on this kind, or an offender — and, for a splat, whether its
+    `(file, function)` is a declared hole.
+
+    Pins two scopings the real tree cannot show. `JOURNAL_SPLAT_ALLOW` is keyed by
+    POSITION rather than by function name (no two of its four holes share a name),
+    and kind-scoped routing is keyed by KIND rather than flattened by name (every
+    `target` in the tree today sits on a kind that routes or declares it)."""
+    offenders = _journal_field_offenders(
+        [("journalfield", rel, 1, f"journal.append(k, {field}=v)", (field, fn, kind))]
+    )
+    assert bool(offenders) is is_offender, (
+        f"{rel}::{fn} journalling {field!r} on kind {kind!r} should "
+        f"{'be refused' if is_offender else 'be allowed'}"
+    )
+
+
+# The dynamic-kind declaration's scoping, as rows: `(rel, fn, is_offender)`.
+JOURNAL_KIND_SCOPE_CASES = [
+    ("declared-position", "plugins/bus.py", "_log", False),
+    ("declared-position-recovery", "recovery_flow.py", "prune_preserve_refs", False),
+    # The declaration does not travel by function name, nor by file.
+    ("undeclared-function-same-file", "plugins/bus.py", "_dispatch", True),
+    ("declared-name-another-file", "stories_engine.py", "_log", True),
+    ("undeclared-position", "sweep.py", "_triage", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "fn", "is_offender"),
+    JOURNAL_KIND_SCOPE_CASES,
+    ids=[c[0] for c in JOURNAL_KIND_SCOPE_CASES],
+)
+def test_journal_kind_declaration_is_scoped_by_position(label, rel, fn, is_offender):
+    """A non-literal kind is waived at the exact `(file, function)` that declared
+    itself, and nowhere else — the `JOURNAL_SPLAT_ALLOW` idiom, for the same reason:
+    a site the scan cannot read must not read as clean because a same-named function
+    elsewhere is allowed to be unreadable."""
+    offenders = _journal_kind_offenders([("journalkind", rel, 1, "journal.append(kind)", fn)])
+    assert bool(offenders) is is_offender, (
+        f"a non-literal kind in {rel}::{fn} should "
+        f"{'be refused' if is_offender else 'be allowed'}"
+    )
+
+
+def test_journal_kind_probes_flag_a_non_literal_kind():
+    """The detector half: a journal write whose kind is a Name, an f-string or a
+    call emits a `journalkind` finding, and a literal one does not. Without this the
+    tree-wide assertion is green with the emit deleted."""
+    for source in (
+        "def f(self):\n    self.journal.append(kind, story_key=s)\n",
+        'def f(self):\n    self.journal.append(f"{family}-pruned", count=n)\n',
+        "def f(self):\n    self.journal.append(_kind_for(x), count=n)\n",
+        "def f(self):\n    self.journal.append(**everything)\n",
+    ):
+        assert [f for f in _scan_source(source, "sweep.py") if f[0] == "journalkind"], source
+    for source in (
+        'def f(self):\n    self.journal.append("run-start", story_key=s)\n',
+        "def f(self):\n    results.append(kind)\n",
+    ):
+        assert not [f for f in _scan_source(source, "sweep.py") if f[0] == "journalkind"], source
+
+
+def test_journal_routing_tables_are_read_from_diagnostics():
+    """`JOURNAL_ROUTED_FIELDS` and `JOURNAL_KIND_ROUTED_FIELDS` are built from the
+    live `diagnostics` tables, not copied, so the guard cannot drift from the module
+    it grades. Asserted rather than left to the comment: a future refactor that
+    inlined the names would pass every other test here while quietly freezing the
+    routing set."""
+    for table in (
+        diagnostics._JOURNAL_ALIAS_FIELDS,
+        diagnostics._JOURNAL_DROP_FIELDS,
+        diagnostics._JOURNAL_KEYLIST_FIELDS,
+    ):
+        assert set(table) <= JOURNAL_ROUTED_FIELDS
+    assert JOURNAL_KIND_ROUTED_FIELDS == {
+        kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
+    }
+    # …and the kind-scoped names are deliberately NOT in the by-name union. This is
+    # the assertion that would have caught the flattening: `target` routed by name
+    # says the board-advance family is covered when `_scrub_entry` does not cover it.
+    for row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.values():
+        assert not set(row) & JOURNAL_ROUTED_FIELDS, (
+            "a kind-scoped field name leaked into the by-name routed union; "
+            "`_scrub_entry` consults `_JOURNAL_KIND_ALIAS_FIELDS` per kind, so a "
+            "by-name claim about it is false on every other kind"
+        )
+    # and the sets are disjoint: a routed name must never also be declared
+    # benign, which would make the routing row unfalsifiable from this side.
+    assert not JOURNAL_ROUTED_FIELDS & JOURNAL_BENIGN_FIELDS
+    for kind, row in JOURNAL_KIND_ROUTED_FIELDS.items():
+        assert not row & JOURNAL_KIND_BENIGN_FIELDS.get(kind, frozenset())
+        assert not row & JOURNAL_BENIGN_FIELDS
 
 
 def test_guard_actually_scanned_files():

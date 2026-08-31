@@ -29,6 +29,7 @@ from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
@@ -3137,30 +3138,39 @@ def test_start_session_resets_reused_task_log(tmp_path):
     assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
 
 
-def test_start_session_drops_a_reused_task_dirs_escalation(tmp_path):
-    """The sweep skill writes `escalation.json` into tasks/<task_id>/ and
-    `resolve._gather_escalations` reads it beside result.json. A re-armed run reuses
-    task_ids, so a prior cycle's escalation left there is handed to whatever session
-    lands on the id next — the same reuse hazard result.json's unlink already covers,
-    against a third reader. An ABSENT file must still start cleanly (missing_ok)."""
+def test_start_session_drops_every_reused_task_cycle_artifact(tmp_path):
+    """A re-armed run reuses task_ids, so anything a prior cycle left in
+    tasks/<task_id>/ is handed to whatever session lands on the id next — and
+    `resolve._gather_escalations` reads those files back to decide what to show the
+    operator. An ABSENT file must still start cleanly (missing_ok).
+
+    Iterates `journal.TASK_CYCLE_ARTIFACTS` rather than naming the files, so this
+    covers the list rather than today's two entries: a third artifact added to the
+    constant is asserted here with no edit. The parity with
+    `OpencodeHTTPAdapter.start_session` used to be a claim in a docstring — both
+    adapters now loop over the same constant, and
+    `test_portability_guard.test_task_cycle_artifacts_named_only_through_the_constant`
+    refuses a bare literal that would let one drift from the other."""
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
-    stale = task_dir / "escalation.json"
-    stale.write_text(
-        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
-        encoding="utf-8",
-    )
+    assert TASK_CYCLE_ARTIFACTS, "the constant is the list under test; an empty one is vacuous"
+    stale = [task_dir / name for name in TASK_CYCLE_ARTIFACTS]
+    for path in stale:
+        path.write_text(
+            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+            encoding="utf-8",
+        )
 
     adapter.start_session(make_spec(tmp_path, task_id=task_id))
-    assert not stale.exists()
+    assert [p for p in stale if p.exists()] == []
 
-    # ...and with the file already gone the unlink is a no-op, not an error. What this
-    # second call asserts is that it RETURNS (the missing_ok path); re-asserting the
-    # file's absence would only restate the line above, since nothing re-created it.
+    # ...and with the files already gone the unlinks are no-ops, not errors. What this
+    # second call asserts is that it RETURNS (the missing_ok path); re-asserting their
+    # absence would only restate the line above, since nothing re-created them.
     assert adapter.start_session(make_spec(tmp_path, task_id=task_id)) is not None
 
 

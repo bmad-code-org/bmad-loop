@@ -276,8 +276,15 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "stashed_to",
     }
 )
-# Journal fields whose value is a LIST of story keys (sprint unknown-keys).
-_JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids"})
+# Journal fields whose value is a LIST of identifiers, aliased element-wise rather
+# than dropped so a dump stays correlatable. Two namespaces live here: `keys`
+# (sprint unknown-keys) and `story_keys` (`sweep._warn_stranded_bundles`, the
+# bundle keys a cycle left in flight) are story keys; `dw_ids` are deferred-work
+# ids. The fallback is what makes this routing necessary rather than cosmetic —
+# `scrub_json` is the IDENTITY on a list of identifier-shaped strings, so an
+# unrouted `story_keys` shipped its keys verbatim while the singular `story_key`
+# beside it in the neighbouring record was aliased.
+_JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
 # rather than scrubbed, since a single-token API key or repo name could be
@@ -735,7 +742,10 @@ def _scrub_entry(
         if k in _JOURNAL_DROP_FIELDS:
             out[f"{k}_present"] = v is not None and v != ""
         elif k in _JOURNAL_KEYLIST_FIELDS and isinstance(v, list):
-            ns = "story" if k == "keys" else "dw"
+            # Namespace by field, not by "everything that is not `keys`": both
+            # story-key list fields must land in the SAME namespace as the singular
+            # `story_key`, or one dump would carry two aliases for one story.
+            ns = "dw" if k == "dw_ids" else "story"
             out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
         elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
             ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]
