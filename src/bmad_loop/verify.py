@@ -3744,11 +3744,16 @@ def verify_dev(
 
     Checks the claimed spec exists, carries the fixed ``auto-dev`` workflow tag,
     sits at the expected status (``in-review`` when a separate review session
-    follows, ``done`` when review is disabled), records a baseline matching the
-    orchestrator's, has produced changes since that baseline (every leg but the
-    park — see ``operator_park`` below), and that the story's sprint-status was
-    advanced to the matching stage. Returns a retryable VerifyOutcome on any
-    mismatch, escalates on git failure, passes otherwise.
+    follows, ``done`` when review is disabled), has produced changes (every leg
+    but the park — see ``operator_park`` below), and that the story's
+    sprint-status was advanced to the matching stage. Returns a retryable
+    VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+
+    The spec's baseline frontmatter is an OPTIONAL attestation: a usable
+    ``baseline_revision`` or legacy ``baseline_commit`` claim is checked against
+    the accepted orchestrator baseline, while absence of both claims is accepted.
+    Absence does not waive proof-of-work; without a claim, changes are still
+    measured from the orchestrator-recorded ``task.baseline_commit``.
 
     ``operator_park`` (``[operator] enabled``, engine-supplied) adds one more
     accepted spec/sprint pair: ``(awaiting-operator, awaiting-operator)``, the

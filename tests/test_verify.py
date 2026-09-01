@@ -6657,6 +6657,25 @@ def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project
     assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
+def test_verify_dev_accepts_an_optional_baseline_claim_but_still_requires_work(project):
+    """A missing baseline claim is valid, but it does not disable proof-of-work:
+    the orchestrator-owned task baseline remains the measurement authority."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", OMIT)
+    body = sp.read_text()
+    assert "baseline_revision:" not in body and "baseline_commit:" not in body
+
+    no_work = verify.verify_dev(task, project, dev_result(sp))
+    assert not no_work.ok and "no changes in worktree since baseline commit" in no_work.reason
+
+    (project.project / "src.txt").write_text("real work\n")
+    git(project.project, "add", "src.txt")
+    git(project.project, "commit", "-q", "-m", "real work after task baseline")
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
 def test_verify_dev_baseline_gate_prefers_the_fresh_revision_over_a_stale_legacy_key(project):
     """#716: a spec carrying BOTH keys is what `runs.rearm_escalation` produces —
     it inserts `baseline_revision` and never removes a pre-existing
