@@ -4896,8 +4896,8 @@ class Engine:
         session can still have authored ledger-only work, and path-granular Git
         evidence distinguishes that existing diff from the engine harvest about
         to run. External ledgers cannot satisfy the project proof gate. An
-        attribution probe that raises keeps the path excluded, so uncertainty
-        never credits the engine's own append as session work.
+        attribution probe that raises or returns unknown keeps the path excluded,
+        so uncertainty never credits the engine's own append as session work.
         """
         if not task.baseline_commit:
             return False
@@ -4913,12 +4913,20 @@ class Engine:
         except ValueError:
             return False
         try:
-            return verify.path_changed_since(
+            changed = verify._changes_since(
                 root,
                 task.baseline_commit,
-                rel,
+                literal_path=rel,
                 baseline_untracked=task.baseline_untracked,
             )
+            if changed is None:
+                self.journal.append(
+                    "legacy-ledger-attribution-failed",
+                    story_key=task.story_key,
+                    error="git could not determine whether the ledger changed",
+                )
+                return False
+            return changed
         except (verify.GitError, OSError, RuntimeError) as e:
             self.journal.append(
                 "legacy-ledger-attribution-failed",
