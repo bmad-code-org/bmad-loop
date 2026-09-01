@@ -1,4 +1,16 @@
-"""Run-directory discovery and helpers shared by the CLI and the TUI."""
+"""Run-directory discovery and helpers shared by the CLI and the TUI.
+
+The public story-spec ownership and confinement seam consists of four helpers:
+
+* :func:`task_spec_path` anchors a persisted ``StoryTask.spec_file`` on the tree
+  that owned the task when it was recorded.
+* :func:`task_spec_root` names the matching root used to confine writes to that
+  anchored spec.
+* :func:`task_stories_root` locates the workspace tree from which the run reads
+  its stories folder; it is a read locator, not a spec-write confinement root.
+* :func:`spec_reaches_the_redrive` reports whether an edit at the persisted-task
+  anchor will survive to the workspace used by the next attempt.
+"""
 
 from __future__ import annotations
 
@@ -2990,14 +3002,24 @@ def validate_restore_latch(
 
 
 def task_spec_path(task: StoryTask, state: RunState) -> Path:
-    """The recorded spec path, re-anchored on the tree it was persisted relative to.
+    """The persisted-task spec anchor, re-based on the tree it was recorded relative to.
+
+    Use this when an operation must address the tree recorded by the task. A bare
+    basename is joined directly to :func:`task_spec_root`; it is NOT probed against the
+    project and has no implementation-artifacts fallback. To bind either a
+    session-reported path or a persisted spelling inside the current active
+    ``ProjectPaths``, use :func:`verify.resolve_spec_path`, which probes project-first
+    and then falls back under the implementation-artifacts directory. Recovery uses
+    ``recovery_flow.RecoveryFlow._attempt_owned_spec`` instead: for a bare basename it
+    probes both locations and accepts the binding only when exactly one trusted regular
+    file exists.
 
     `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
     RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
     that against the process cwd is not merely unreachable — it is actively wrong:
     `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
-    same `_bmad-output/specs/...` layout, so a bare `Path(task.spec_file)` names the main
-    checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
+    same implementation-artifacts-relative path, so a bare `Path(task.spec_file)` names
+    the main checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
     accepts it (it genuinely is under `project`), and the status flip and the baseline
     re-stamp both land on a file the run never used while the worktree's real spec is
     left on the escalated attempt's sha.

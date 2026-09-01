@@ -114,7 +114,16 @@ class RecoveryFlow:
         return tuple(out)
 
     def _attempt_owned_spec(self, task: StoryTask) -> tuple[Path, str | None] | None:
-        """Resolve this attempt's bound spec and its exact Git exclusion.
+        """Bind recovery restoration to this attempt's spec and exact Git exclusion.
+
+        This is the restore authority for the dispatched attempt, not an ordinary
+        path lookup. Operations on the tree recorded by a task use
+        ``runs.task_spec_path``, which anchors a bare basename directly on that tree.
+        Binding a reported or persisted spelling inside the current active
+        ``ProjectPaths`` uses ``verify.resolve_spec_path``, which chooses an existing
+        project candidate or falls back under implementation artifacts. Here a bare
+        basename probes both locations and is accepted only when exactly one trusted
+        regular-file candidate exists.
 
         Relative persisted paths may name either a project-relative file or a
         basename under the configured implementation-artifacts directory. The

@@ -1071,8 +1071,8 @@ class BmadLoopApp(App[None]):
         raw value: `model.StoryTask._serialized_worktree_path` persists an isolated
         unit's spec RELATIVE to the mounted worktree root and `from_dict` reads it back
         raw, so a bare `Path(task.spec_file)` resolves against the TUI process cwd —
-        where the main checkout carries the very same `_bmad-output/specs/...` layout
-        and answers with the WRONG tree's copy of the story spec."""
+        where the main checkout carries the same implementation-artifacts-relative
+        path and answers with the WRONG tree's copy of the story spec."""
         task = self._paused_task(state)
         if task is None or not task.spec_file:
             return None, "", True

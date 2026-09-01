@@ -651,8 +651,8 @@ def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_
     `StoryTask._serialized_worktree_path` persists an isolated unit's `spec_file`
     RELATIVE to the mounted worktree and `from_dict` reads it back raw, so the raw
     value handed to the agent was a bare relpath. The `bmad-loop-resolve` session runs
-    from the PROJECT root, where the main checkout carries the very same
-    `_bmad-output/specs/...` layout — so that relpath resolved, silently, onto the
+    from the PROJECT root, where the main checkout carries the same
+    implementation-artifacts-relative path — so that relpath resolved, silently, onto the
     main checkout's twin, and the human and the agent edited a spec the run never used
     while `rearm_escalation` (which re-anchors through `task_spec_path`) flipped the
     worktree's. `build_context` now emits the same re-anchor the re-arm writes
@@ -1318,8 +1318,8 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     relative to the mounted worktree root — no worktree prefix — and `from_dict` reads
     it back raw, so a bare `Path(task.spec_file)` resolves against the process cwd.
     That is not merely unreachable, it is actively WRONG: `bmad-loop resolve` runs from
-    the project root, and the main checkout carries the very same
-    `_bmad-output/specs/...` layout. `is_file()` answered True on the wrong file,
+    the project root, and the main checkout carries the same
+    implementation-artifacts-relative path. `is_file()` answered True on the wrong file,
     `confine_root` accepted it (it genuinely is under `project`), and both the status
     flip AND the baseline re-stamp landed on a spec the run never used, while the
     worktree's real spec kept the escalated attempt's sha and the re-drive re-wedged.

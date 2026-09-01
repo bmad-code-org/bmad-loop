@@ -131,7 +131,7 @@ VERIFY_CLASSIFY_CHOKEPOINT = {
 # Everywhere else the field arrives from `load_state`, and
 # `_serialized_worktree_path` persists an isolated unit's spec RELATIVE to the mount.
 # A bare `Path(...)` there resolves against the READER's cwd — the main checkout,
-# which carries the same `_bmad-output/specs/...` layout and answers with the wrong
+# which carries the same implementation-artifacts-relative path and answers with the wrong
 # tree's copy. That defect shipped in `tui/app.py::_paused_spec`, where it reached a
 # destructive write, and was then re-found one surface at a time in `resolve.py`,
 # `sweep.py`, `stories_engine.py` and `worktree_flow.py` across four review rounds.
@@ -1955,8 +1955,8 @@ def test_spec_path_resolved_only_through_the_anchor():
     loads state from disk must say WHICH tree the value is relative to. The four
     allowlisted files run inside that tree already; everything else — the TUI, the
     resolve-context builder, the sweep and stories engines, the read-model
-    projections — does not, and the main checkout carries an identical
-    ``_bmad-output/specs/...`` layout that answers a bare ``Path(...)`` with the wrong
+    projections — does not, and the main checkout carries the same
+    implementation-artifacts-relative path that answers a bare ``Path(...)`` with the wrong
     copy. That is not a hypothetical: it shipped in ``tui/app.py::_paused_spec``,
     where ``_do_replan`` then WROTE to the main checkout's file and the operator's
     replan silently did not happen.
