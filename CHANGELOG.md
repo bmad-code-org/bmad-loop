@@ -263,6 +263,10 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- **Treat embedded-NUL verify commands and working directories as typed environment
+  faults** (DW-53, DW-54), while documenting that stream retention degrades but
+  journal record writes remain fail-loud.
+
 - Make successful escalation re-arms return authoritative ordered notices and a resume-hold
   verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
 - **An accepted spec reached through a link out of the unit worktree no longer counts as
