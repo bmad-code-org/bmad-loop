@@ -85,6 +85,13 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
+  become `path_present`; stale-restore and merge filename lists become counts.
+
+- **Sanitize remaining diagnostic journal identifiers.** Commit residue and sentinel
+  names are aliased explicitly, excluded and merge filenames are counted, overloaded
+  paths are presence-only, and derived fields win same-named raw-field collisions.
+
 - **Remove the unused whole-artifact-folder exclusion helper** (DW-15). Proof-of-work
   exclusions remain file-granular and rollback protection keeps its workspace-rooted
   path derivation.
