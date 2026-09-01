@@ -581,7 +581,17 @@ Three frozen dataclasses cross the seam:
 
 Required (abstract):
 
-- `start_session(spec) -> SessionHandle` — launch the session.
+- `start_session(spec) -> SessionHandle` — launch the session. An adapter that
+  persists the standard `tasks/<id>/` directory must reset its shared cycle
+  artifacts when an id is reused: after creating the task directory and before
+  launching the session, remove every file named by
+  `journal.TASK_CYCLE_ARTIFACTS` (shared artifacts: [`result.json`,
+  `escalation.json`]).
+  Use missing-safe deletion; a missing artifact is a normal no-op and must not
+  make startup fail. This tuple covers only artifacts shared across adapters and
+  readers. Adapter-private breadcrumbs such as `heartbeat.json`,
+  `resultless-stops.jsonl`, `session-lifecycle.jsonl`, and `messages.json` remain
+  outside the shared cleanup contract and are managed by their owning adapter.
 - `wait_for_completion(handle, spec) -> SessionResult` — block until the session
   ends (or stalls/times out), then report status. Poll
   `runs.read_stop_request_mode(run_dir) == "hard"` on both sides of the loop's
