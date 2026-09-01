@@ -9,13 +9,20 @@ for an LLM deciding how to handle failure). This module is the thin Python shim
 that turns that on-disk spec into the legacy result dict that verify.py /
 escalation.py already consume, so the rest of the pipeline stays unchanged.
 
-DOCTRINE — never trust prose for a gate. The frontmatter `status:` read straight
-off disk is authoritative; the `## Auto Run Result` prose is only used to route
-the blocked→PAUSE decision and to carry a human-readable detail. Where the two
-disagree we surface it (`status_consistent=False`) so the caller can fail safe
-(treat a mismatch as a retry rather than silently proceeding). Every real
-deterministic gate (git baseline, worktree-changed, sprint advancement, dw_id
-match) still runs in verify.py against actual on-disk state.
+DOCTRINE — never let terminal prose override populated frontmatter status. The
+frontmatter `status:` read straight off disk is authoritative whenever it is
+present. A genuine `## Auto Run Result` marker has three narrow roles: its
+status/detail route the blocked→PAUSE decision; its status is a compatibility
+fallback that may populate the synthesized result when frontmatter is blank or
+missing; and proof that the current session authored the marker supplies
+attempt ownership for `park_asserted`. From that compatibility result, `done`
+alone may be reconciled onto disk, `blocked` routes to PAUSE, and
+`awaiting-operator` remains subject to the on-disk frontmatter/status gate.
+Where the marker and populated frontmatter disagree we surface it
+(`status_consistent=False`) so the caller can fail safe (treat a mismatch as a
+retry rather than silently proceeding). Every real deterministic gate (git
+baseline, worktree-changed, sprint advancement, dw_id match) still runs in
+verify.py against actual on-disk state.
 """
 
 from __future__ import annotations
