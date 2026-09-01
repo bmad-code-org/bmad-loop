@@ -86,7 +86,11 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 # serialized to `journal.jsonl` and read back, and JSON has no tuple type, so every
 # sequence arrives as a `list` and takes the same arm it always did. The new arm is
 # reachable only by a shape no round-tripped entry can hold.
-SCHEMA_VERSION = 3
+# v4 removes the overloaded journal-entry `path` value in favour of `path_present`
+# and replaces `stale-restore-excluded.files` with `files_count`. The same release
+# explicitly aliases `stale-restore-commits.commits` and `sentinel-cleared.sentinel`;
+# those two fields keep their names, but their values no longer carry source ids.
+SCHEMA_VERSION = 4
 DEFAULT_JOURNAL_CAP = 200
 
 # Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
@@ -202,8 +206,8 @@ _JOURNAL_ALIAS_FIELDS = {
 # Kind-scoped routing, consulted BEFORE the by-name table above and losing to
 # `_JOURNAL_DROP_FIELDS`, which is stricter than any alias.
 #
-# It exists for ONE field, and the by-name rule genuinely cannot express it: `target`
-# carries the target BRANCH on the three merge kinds below and a sprint STATUS on the
+# `target` is the field for which a by-name rule genuinely cannot work: it carries
+# the target BRANCH on the three merge kinds below and a sprint STATUS on the
 # `board-advance-*` family (`board-advance-carried`, `-carry-failed`,
 # `-carry-foreign-dirt`, `-carry-uncommitted`). Aliasing it by NAME would pseudonymize
 # statuses as branches, turning a legible `"target": "done"` into `branch-3f2a` and
@@ -223,13 +227,16 @@ _JOURNAL_ALIAS_FIELDS = {
 # correlate, silently skipping the carry replay so a resumed sweep re-triages work that
 # already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
 #
-# A closed set, not a growing one: any NEW producer should pick a name the by-name table
-# already routes (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than
-# add a row here.
+# Any new branch producer should pick a name the by-name table already routes
+# (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than add a target
+# row here. `sentinel` is scoped for a different reason: its sole producer carries a
+# spec basename, so that known shape is aliased without making the same claim about a
+# future kind that reuses the generic name.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "unit-merge-started": {"target": "branch"},
     "unit-merged": {"target": "branch"},
     "resume-unit-merge": {"target": "branch"},
+    "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -335,6 +342,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # and spec filename. Drop rather than create a second spec correlation;
         # the fallback redacts it only by virtue of its current separators.
         "stashed_to",
+        # An overloaded path spelling used for a generated sweep intent and for
+        # isolated worktrees. None of those host/customer paths adds useful
+        # correlation beyond the record's story key, so every kind gets the same
+        # presence-only treatment.
+        "path",
     }
 )
 # Journal fields whose value is a LIST of identifiers, aliased element-wise rather
@@ -346,6 +358,21 @@ _JOURNAL_DROP_FIELDS = frozenset(
 # unrouted `story_keys` shipped its keys verbatim while the singular `story_key`
 # beside it in the neighbouring record was aliased.
 _JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
+
+# Kind-scoped container policies for names whose other producers carry a different
+# shape. `commits` is a SHA list on the stale-restore record but an integer count on
+# `rollback-manual-required`, so a by-name list rule would destroy that useful count.
+# Filename lists are reduced to counts rather than aliases: filename correlation
+# adds no diagnostic value and would put the proprietary names into the legend.
+_JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
+    "stale-restore-commits": {"commits": "commit"},
+}
+_JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
+    "merge-preflight-refused": frozenset({"tolerated"}),
+    "merge-target-cleaned": frozenset({"paths"}),
+    "merge-target-tolerated": frozenset({"paths"}),
+    "stale-restore-excluded": frozenset({"files"}),
+}
 
 # ``kind -> the field names that kind's record is DECLARED to carry``. On a kind
 # listed here the usual ``scrub_json`` fallback is replaced by a fail-closed one:
@@ -837,6 +864,45 @@ def _alias_input(value: Any, ns: str) -> Any:
     return _PATH_SEP_RE.split(value)[-1] or value
 
 
+def _reserved_output_names(
+    entry: dict,
+    kind_aliases: dict[str, str],
+    kind_keylists: dict[str, str],
+    kind_countlists: frozenset[str],
+    declared: frozenset[str] | None,
+) -> frozenset[str]:
+    """Names synthesized from this complete raw entry.
+
+    Computing them before the entry is traversed makes a derived presence marker or
+    count authoritative when the source also contains that name, independent of JSON
+    key order. The branches deliberately mirror `_scrub_entry`'s routing precedence:
+    a routed alias on a declared-schema kind does not also generate a presence name.
+    """
+    # ``ts_offset`` is synthesized before the raw fields are traversed. It is never
+    # a meaningful producer field, so reserve it even for a malformed entry whose
+    # timestamp cannot produce the derived value; a caller-supplied value must not
+    # replace the truthful offset or leak through the generic scrubber.
+    generated: set[str] = {"ts_offset"}
+    for key, value in entry.items():
+        if key in ("ts", "kind"):
+            continue
+        if key in _JOURNAL_DROP_FIELDS:
+            generated.add(f"{key}_present")
+        elif key in _JOURNAL_KEYLIST_FIELDS:
+            if not isinstance(value, list):
+                generated.add(f"{key}_present")
+        elif key in kind_keylists:
+            if not isinstance(value, list):
+                generated.add(f"{key}_present")
+        elif key in kind_countlists:
+            generated.add(f"{key}_{'count' if isinstance(value, list) else 'present'}")
+        elif key in kind_aliases or key in _JOURNAL_ALIAS_FIELDS:
+            continue
+        elif declared is not None and key not in declared and key not in SELF_MINTED_FIELDS:
+            generated.add(f"{key}_present")
+    return frozenset(generated)
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -847,11 +913,10 @@ def _scrub_entry(
     verbatim, identifier fields aliased, free-text fields collapsed to a presence
     boolean, and every remaining/unknown field scrub_json'd.
 
-    Two kinds of field never reach that last fallback, because for them
-    ``scrub_json`` fails closed only by accident of a value's shape. A name in
-    ``_JOURNAL_KEYLIST_FIELDS`` carrying something other than a list collapses to a
-    presence key, and on a kind with a declared schema
-    (``_JOURNAL_KIND_SCHEMAS``) so does every key the schema does not name."""
+    Several field classes never reach that last fallback, because for them
+    ``scrub_json`` fails closed only by accident of a value's shape. Identifier-list
+    and count-list policies validate their containers, while a kind with a declared
+    schema (``_JOURNAL_KIND_SCHEMAS``) collapses every unnamed key to presence."""
     out: dict[str, Any] = {}
     ts = entry.get("ts")
     if isinstance(ts, (int, float)) and first_ts is not None:
@@ -862,9 +927,19 @@ def _scrub_entry(
     # `looks_like_identifier` is not one of the three below anyway, and keying on the
     # placeholder would silently unroute every entry in a dump that had one.
     by_kind = _JOURNAL_KIND_ALIAS_FIELDS.get(kind, {})
+    kind_keylists = _JOURNAL_KIND_KEYLIST_FIELDS.get(kind, {})
+    kind_countlists = _JOURNAL_KIND_COUNTLIST_FIELDS.get(kind, frozenset())
     declared = _JOURNAL_KIND_SCHEMAS.get(kind)
+    reserved_outputs = _reserved_output_names(
+        entry, by_kind, kind_keylists, kind_countlists, declared
+    )
     for k, v in entry.items():
         if k in ("ts", "kind"):
+            continue
+        if k in reserved_outputs:
+            # A raw field cannot overwrite a value derived from another field in this
+            # entry. The reservation is computed above from the complete shape, so
+            # this is deterministic in both source-key orders.
             continue
         kind_ns = by_kind.get(k)
         if k in _JOURNAL_DROP_FIELDS:
@@ -888,6 +963,17 @@ def _scrub_entry(
                 # A presence marker rather than an alias because the shape is
                 # genuinely unknown: a dict or an int has no sensible alias, and the
                 # one thing worth reporting is that the field was set.
+                out[f"{k}_present"] = v is not None and v != ""
+        elif k in kind_keylists:
+            if isinstance(v, list):
+                ns = kind_keylists[k]
+                out[k] = [pseudo.alias(x, ns=ns) for x in v]
+            else:
+                out[f"{k}_present"] = v is not None and v != ""
+        elif k in kind_countlists:
+            if isinstance(v, list):
+                out[f"{k}_count"] = len(v)
+            else:
                 out[f"{k}_present"] = v is not None and v != ""
         elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
             ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]

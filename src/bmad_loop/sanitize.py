@@ -413,7 +413,10 @@ class Pseudonymizer:
         # collision re-hash with a counter until the alias is free.
         counter = 0
         while True:
-            material = self._salt + value.encode("utf-8")
+            # Journal strings can carry surrogateescape code points when a POSIX
+            # filename contains undecodable bytes.  Hash those values losslessly
+            # instead of letting one malformed identifier make its run unreadable.
+            material = self._salt + value.encode("utf-8", errors="surrogatepass")
             if counter:
                 material += counter.to_bytes(4, "big")
             alias = f"{prefix}-{hashlib.blake2s(material, digest_size=6).hexdigest()}"
