@@ -3164,36 +3164,6 @@ def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Pat
     return True
 
 
-def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
-    """Repo-relative posix prefixes of the orchestrator-owned BMAD artifact
-    folders (the output root and the implementation/planning artifact dirs),
-    relative to ``paths.project``. Folders configured outside the project tree
-    are skipped — nothing to exclude there.
-
-    NO PRODUCTION CALLER. Both consumers it was written for have moved: the
-    dev/bundle proof-of-work gate now composes its excludes file-granularly through
-    ``verify_dev_exclude_relpaths``, rooted on ``paths.repo_root`` where git runs
-    (#716), and rollback protection builds its own list against the workspace root in
-    ``RecoveryFlow.protected_relpaths``. Its ``paths.project`` anchor is therefore
-    inert rather than correct — do not cite it as evidence that project-rooting is
-    right for anything, and re-derive the root if a caller is ever added."""
-    out: list[str] = []
-    for folder in (
-        paths.output_folder,
-        paths.implementation_artifacts,
-        paths.planning_artifacts,
-    ):
-        try:
-            rel = folder.relative_to(paths.project).as_posix()
-        except ValueError:
-            continue  # configured outside the project tree; nothing to exclude here
-        # A folder == project root yields ".", which as an exclude prefix would
-        # disable change detection for the whole tree — drop it.
-        if rel and rel != ".":
-            out.append(rel)
-    return tuple(out)
-
-
 def verify_dev_exclude_relpaths(
     paths: ProjectPaths,
     spec_path: Path,
@@ -3203,12 +3173,10 @@ def verify_dev_exclude_relpaths(
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     its probe (`_changes_since`, via `_verify_shared_gates.proof_of_work_probe`) —
-    file-granularity, unlike `artifact_relpaths`' whole-folder
-    exclusion. `artifact_relpaths` has NO production caller left: rollback
-    protection builds its own list in `recovery_flow.protected_relpaths` against
-    `workspace.root`, and `Engine._protected_relpaths` merely delegates there. Do
-    not adopt it as a shortcut — it is still anchored on `paths.project`, which is
-    #716's root cause. Deliberately does NOT exclude `output_folder`:
+    deliberately file-granular. Rollback protection is a separate concern: it
+    builds its own list in `RecoveryFlow.protected_relpaths` against
+    `workspace.root`, and `Engine._protected_relpaths` merely delegates there.
+    Deliberately does NOT exclude `output_folder`:
     in the standard layout it is the parent directory of `implementation_artifacts`/
     `planning_artifacts`, so excluding it as a directory prefix would swallow those
     two folders' content right back out of view via the same git-pathspec prefix
@@ -3991,8 +3959,8 @@ def verify_dev_stories(
     # A plan-halt leg produced only its own spec (the plan), which proof-of-work
     # already excludes; skip it (extra_exclude=None) and record the plan spec.
     # Otherwise stories mode adds the spec folder's stories/ subdir + stories.yaml
-    # on top of the gate's own file-granular exclude — NOT the whole-folder
-    # artifact_relpaths, so a story whose entire authorized scope is ledger/spec
+    # on top of the gate's own file-granular exclude — NOT a whole-folder artifact
+    # exclusion, so a story whose entire authorized scope is ledger/spec
     # reconciliation doesn't register as a false "no changes". Engine-written
     # paths compose only on that live-gate leg; ``None`` must remain ``None`` for
     # plan halt rather than being combined with a tuple.
