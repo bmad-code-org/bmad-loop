@@ -2628,7 +2628,7 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
         rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
     ):
         seen.append(load_state(rd).code_root)
-        return key
+        return _rearm_outcome(key)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
 
@@ -2729,7 +2729,11 @@ def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, mo
 
     run_dir = _escalated_run(tmp_path, "r1")  # no _bmad/bmm/config.yaml anywhere
     rearmed: list = []
-    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **k: rearmed.append(key) or key)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, key, **k: rearmed.append(key) or _rearm_outcome(key),
+    )
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
 
     argv = ["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]
@@ -2754,10 +2758,29 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
         rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
     ):
         journal = Journal(rd)
-        journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
-        journal.append("stale-restore-unparseable", story_key=key, patch="b.patch", error="OSErr")
-        journal.append("stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c"])
-        return key
+        entries = (
+            {
+                "kind": "stale-restore-excluded",
+                "story_key": key,
+                "patch": "a.patch",
+                "files": ["new.txt"],
+            },
+            {
+                "kind": "stale-restore-unparseable",
+                "story_key": key,
+                "patch": "b.patch",
+                "error": "OSErr",
+            },
+            {
+                "kind": "stale-restore-commits",
+                "story_key": key,
+                "old_baseline": "f" * 40,
+                "commits": ["c"],
+            },
+        )
+        for entry in entries:
+            journal.append(entry["kind"], **{k: v for k, v in entry.items() if k != "kind"})
+        return _rearm_outcome(key, *entries)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -2766,9 +2789,15 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     )
 
     err = capsys.readouterr().err
-    assert "excluded the abandoned restore's new files from the re-drive baseline: new.txt" in err
-    assert "could not read the abandoned restore patch (b.patch)" in err
-    assert "1 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    ordered_messages = (
+        "excluded the abandoned restore's new files from the re-drive baseline: new.txt",
+        "could not read the abandoned restore patch (b.patch)",
+        "1 commit(s) sit below the re-drive's new baseline (ffffffffffff..)",
+    )
+    assert all(message in err for message in ordered_messages)
+    assert [err.index(message) for message in ordered_messages] == sorted(
+        err.index(message) for message in ordered_messages
+    )
     assert "FROM-LAST-TIME.txt" not in err
 
 
@@ -2796,22 +2825,24 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
         rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
     ):
         journal = Journal(rd)
-        journal.append(
-            "rearm-baseline-advance-failed",
-            story_key=key,
-            repo=str(tmp_path),
-            baseline="a" * 40,
-            error="GitError: not a git repository",
-        )
-        journal.append(
-            "rearm-baseline-restamped",
-            story_key=key,
-            spec_file="spec.md",
-            overwritten="b" * 40,
-            baseline="c" * 40,
-            restore=False,
-        )
-        return key
+        advance = {
+            "kind": "rearm-baseline-advance-failed",
+            "story_key": key,
+            "repo": str(tmp_path),
+            "baseline": "a" * 40,
+            "error": "GitError: not a git repository",
+        }
+        restamped = {
+            "kind": "rearm-baseline-restamped",
+            "story_key": key,
+            "spec_file": "spec.md",
+            "overwritten": "b" * 40,
+            "baseline": "c" * 40,
+            "restore": False,
+        }
+        for entry in (advance, restamped):
+            journal.append(entry["kind"], **{k: v for k, v in entry.items() if k != "kind"})
+        return _rearm_outcome(key, advance, restamped)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -2856,7 +2887,7 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
                 baseline="c" * 40,
                 restore=restore,
             )
-            return key
+            return _journal_rearm_outcome(rd, key)
 
         return fake_rearm
 
@@ -2884,8 +2915,8 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize("outcome", ["ok", "rearm-error"])
 def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outcome):
-    """An undecodable byte in journal.jsonl costs the echo, never the gesture — and
-    never the exit code.
+    """An undecodable journal cannot suppress an authoritative successful hold, and
+    cannot replace the original error on an aborted call.
 
     The counterpart to `test_escalation_rearm_survives_a_corrupt_journal` in the TUI,
     which had no CLI twin: the TUI's reads were guarded while `cmd_resolve`'s two were
@@ -2906,9 +2937,20 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
     ):
         if outcome == "rearm-error":
             raise runs.RearmError("cannot re-open story spec /x/spec.md")
-        return key
+        return runs.RearmOutcome(
+            key,
+            (
+                runs.RearmNotice(
+                    "warning",
+                    "authoritative hold from the successful re-arm",
+                    "Commit the corrected spec before resuming",
+                ),
+            ),
+            True,
+        )
 
-    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    resumed: list[str] = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd.name) or 0)
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     run_dir = _escalated_run(tmp_path, "r1")
     (run_dir / JOURNAL_FILE).write_bytes(
@@ -2924,6 +2966,8 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
         assert "cannot re-open story spec" in err
     else:
         assert rc == 0
+        assert resumed == []
+        assert "authoritative hold from the successful re-arm" in err
 
 
 def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
@@ -2948,7 +2992,7 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
             spec_file="wt/specs/s1.md",
             baseline="c" * 40,
         )
-        return key
+        return _journal_rearm_outcome(rd, key)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -3080,7 +3124,7 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
             rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
         ):
             Journal(rd).append(kind, story_key=key, **fields)
-            return key
+            return _journal_rearm_outcome(rd, key)
 
         return fake_rearm
 
@@ -3123,6 +3167,19 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     assert "NOT resuming in this gesture" not in out
     assert resumed == ["r2"]  # ...and it still resumes: an advisory is not a proof
 
+    _escalated_run(tmp_path, "r3")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, key, **kwargs: runs.RearmOutcome(key, (), True),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r3", "--no-interactive", "--resume"]) == 0
+    )
+    out, _err = capsys.readouterr()
+    assert "NOT resuming in this gesture" in out
+    assert resumed == ["r2"]  # a hold is authoritative even when it has no notice
+
 
 def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys):
     """This surface renders `severity: message; next_step`; the TUI renders `message`.
@@ -3159,7 +3216,7 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
         journal.append(  # table row whose next_step is ""
             "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1"]
         )
-        return key
+        return _journal_rearm_outcome(rd, key)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -3206,7 +3263,7 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
             error=f"GitError: git rev-list {baseline}..HEAD failed in /code: "
             "not a git repository",
         )
-        return key
+        return _journal_rearm_outcome(rd, key)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -3315,7 +3372,7 @@ def test_resolve_context_uses_live_project_after_project_rename(tmp_path, monkey
         "run_session",
         lambda adapter, project, *a, **k: seen.setdefault("cwd", project) or True,
     )
-    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: key)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: _rearm_outcome(key))
 
     assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
 
@@ -3347,7 +3404,7 @@ def test_resolve_context_uses_live_configured_code_root(project, monkeypatch, ca
         return True
 
     monkeypatch.setattr(resolve, "run_session", fake_session)
-    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: key)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: _rearm_outcome(key))
 
     argv = ["resolve", "--project", str(project.project), "r1", "--no-resume"]
     assert cli.main(argv) == 0
@@ -3590,6 +3647,23 @@ def _escalated_trail_run(tmp_path, run_id="r1", *, details=("first cycle",)):
         )
     save_state(run_dir, state)
     return run_dir
+
+
+def _rearm_outcome(key: str, *entries: dict) -> runs.RearmOutcome:
+    notices = tuple(
+        runs.RearmNotice(*notice)
+        for entry in entries
+        if (notice := runs.rearm_event_notice(entry)) is not None
+    )
+    return runs.RearmOutcome(
+        key, notices, any(runs.rearm_holds_the_resume(entry) for entry in entries)
+    )
+
+
+def _journal_rearm_outcome(run_dir: Path, key: str) -> runs.RearmOutcome:
+    from bmad_loop.journal import Journal
+
+    return _rearm_outcome(key, *Journal(run_dir).entries())
 
 
 def _redrive_escalates(run_dir, detail):
@@ -4227,7 +4301,7 @@ def test_resolve_rereads_isolation_after_the_agent_session(
         rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
     ):
         seen.append(isolated_redrive)
-        return key
+        return _rearm_outcome(key)
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
     monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0))

@@ -246,6 +246,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
+
 - **Document spec baseline frontmatter as an optional `verify_dev` attestation**
   (DW-51), with no-claim acceptance and no-work refusal regressions anchored to
   the orchestrator-recorded baseline.
