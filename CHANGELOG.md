@@ -164,9 +164,10 @@ breaking changes may land in a minor release.
 
 - **Re-arm writes the spec the run actually used, and reports every write it could not make**
   (#640). `StoryTask` persists `spec_file` relative to the worktree and re-arm resolved it against
-  the process cwd, where the main checkout carries the same layout — so the status flip and the
-  baseline re-stamp landed on the WRONG file while the worktree's real spec kept the escalated
-  attempt's sha. The recorded path is now re-anchored on the worktree before either write.
+  the process cwd, where the main checkout carries the same implementation-artifacts-relative
+  path — so the status flip and the baseline re-stamp landed on the WRONG file while the
+  worktree's real spec kept the escalated attempt's sha. The recorded path is now re-anchored on
+  the worktree before either write.
   Separately, both frontmatter writers answer a spec they cannot move with `False` rather than an
   exception and those returns were discarded; they now journal `rearm-baseline-restamp-skipped` and
   `rearm-spec-flip-skipped`, on genuine failure only — re-arm reads the status back, so an ordinary
@@ -245,6 +246,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Document the three story-spec path resolvers and their distinct ownership
+  contracts** (DW-17, DW-18, DW-36). Persisted-task anchoring, session-reported
+  candidate probing, and exact attempt recovery binding now cross-reference one
+  another and spell out their different bare-basename results; production prose
+  also names the real implementation-artifacts-relative layout.
 - **An artifact the escalation walk cannot stat is recorded as unreadable rather than absent**
   (DW-11). `resolve._gather_escalations` classified each task-cycle artifact with
   `Path.is_file()` outside its guard, and that probe's answer to EACCES splits by interpreter.

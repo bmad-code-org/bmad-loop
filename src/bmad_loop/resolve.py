@@ -374,7 +374,7 @@ def build_context(
         # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
         # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
         # from the project root, where the main checkout carries the same
-        # `_bmad-output/specs/...` layout — the raw value would name the wrong
+        # implementation-artifacts-relative path — the raw value would name the wrong
         # tree's copy. `task_spec_path` provides the persisted anchor; when the whole
         # project moved, `_rebase_recorded_project_path` carries that project-owned
         # spelling onto the live session root without resolving it through the OS.
