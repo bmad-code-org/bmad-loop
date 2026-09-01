@@ -84,6 +84,23 @@ def test_every_emitted_context_key_is_documented(skill_md):
     )
 
 
+def test_skill_documents_escalation_ordering_and_global_uniqueness(skill_md):
+    """The context consumer can rely on the reader's cross-session guarantees.
+
+    These assertions are deliberately separate so removing either the ordering
+    promise or the global de-duplication promise fails the contract guard.
+    """
+    after_schema = skill_md.split("}\n```\n\n", maxsplit=1)[1]
+    contract_lines = after_schema.split("\n\n", maxsplit=1)[0].splitlines()
+
+    assert "The `escalations` array is ordered newest-first." in contract_lines
+    assert (
+        "Across the entire gathered context, each distinct escalation appears exactly once."
+        in contract_lines
+    )
+    assert len(contract_lines) == 2
+
+
 def test_skill_routes_project_artifacts_and_code_work_to_their_distinct_roots(skill_md):
     """Mentioning both keys is inert unless the skill explains the operational split.
 
