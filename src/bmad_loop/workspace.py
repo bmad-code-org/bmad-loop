@@ -24,6 +24,7 @@ from pathlib import Path
 from . import verify
 from .bmadconfig import ProjectPaths
 from .platform_util import safe_ref_segment, safe_segment
+from .recovery_flow import attempt_preserve_ref_name
 
 # Per-unit worktrees live under the run dir (.bmad-loop/runs/<run_id>/worktrees/),
 # which `bmad-loop init` already gitignores — so unit checkouts never show up as
@@ -112,10 +113,11 @@ def open_unit_workspace(
     """Mount a fresh worktree for `unit_key` and return its rebased workspace.
 
     The worktree is mounted under the run dir (see unit_worktrees_dir), not under
-    .git/. The unit branch is cut from `base` (the target branch's HEAD). When the
-    branch already exists (branch_per=run re-mounting the shared run branch
-    across serial units) it is re-checked-out from its own HEAD instead, so it
-    keeps the commits earlier units already landed on it.
+    .git/. A new unit branch is cut from a pinned resolution of ``base``. Existing
+    run-scoped branches reattach at their own pinned tip so earlier landed units
+    remain reachable. Existing story-scoped branches are abandoned-attempt state:
+    commits unique to their named tip are parked under ``attempt-preserve/*``, then
+    the story branch is compare-and-swap reset to the pinned base before remount.
     """
     branch = unit_branch_name(run_id, unit_key, branch_per)
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
@@ -125,6 +127,26 @@ def open_unit_workspace(
         raise verify.GitError(
             f"cannot resolve worktree mount path for {unit_key} ({unresolved_wt}): {e}"
         ) from e
+    # Pin every moving input before the first mutation. A story branch is an
+    # attempt-local name: reclaim preserves any commits unique to its old tip,
+    # then resets it to the requested base with compare-and-swap semantics. A run
+    # branch is cumulative and deliberately keeps its own tip across remounts.
+    pinned_base = verify.rev_parse_revision(repo_root, base)
+    branch_tip: str | None = None
+    if verify.branch_exists(repo_root, branch):
+        branch_tip = verify.rev_parse_revision(repo_root, f"refs/heads/{branch}")
+    if branch_tip is not None and branch_per == "story":
+        commits = verify.commits_above(repo_root, pinned_base, branch_tip)
+        if commits:
+            preserve_ref = attempt_preserve_ref_name(run_id, branch_tip)
+            verify.preserve_commits(
+                repo_root,
+                pinned_base,
+                preserve_ref,
+                commits=commits,
+                revision=branch_tip,
+            )
+        verify.reset_branch_if_tip(repo_root, branch, pinned_base, branch_tip)
     wt.parent.mkdir(parents=True, exist_ok=True)
     # Reclaim whatever still occupies this unit's mount point before adding.
     # `wt` and `branch` are both DETERMINISTIC in (run_id, unit_key, run_dir), so a
@@ -139,17 +161,35 @@ def open_unit_workspace(
     # keeps that preservation intact for the in-place run and spends the orphan only
     # when a mount actually needs its path.
     #
-    # The BRANCH is deliberately not passed: `discard_worktree` would force-delete it,
-    # and under `branch_per=run` this name is the SHARED run branch carrying commits
-    # earlier units already landed. Dropping only the worktree frees the checkout that
-    # blocks `worktree_add` while leaving those commits reachable, so the
-    # `branch_exists` fork below still re-mounts the branch from its own HEAD.
+    # The BRANCH is deliberately not passed: `discard_worktree` would force-delete it.
+    # A run-scoped name carries commits earlier units landed; a story-scoped name has
+    # already been safely reset above. Dropping only the worktree frees the checkout
+    # that blocks `worktree_add` without introducing a second ref mutation here.
     discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
-    if verify.branch_exists(repo_root, branch):
+    if branch_tip is not None:
         verify.worktree_add(repo_root, wt, branch, create=False)
+        if branch_per == "story":
+            try:
+                mounted_tip = verify.rev_parse_head(wt)
+                current_tip = verify.rev_parse_revision(repo_root, f"refs/heads/{branch}")
+                if mounted_tip != pinned_base or current_tip != pinned_base:
+                    raise verify.GitError(
+                        f"story branch {branch} moved after reclaim reset: "
+                        f"expected {pinned_base}, mounted {mounted_tip}, current {current_tip}"
+                    )
+            except (verify.GitError, OSError):
+                # The branch may have moved after the reset CAS but before checkout.
+                # Drop only the mount we just created; the rival ref is evidence and
+                # must not be reset or deleted by this failure cleanup.
+                discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
+                raise
     else:
-        verify.worktree_add(repo_root, wt, branch, base=base, create=True)
-    baseline = verify.rev_parse_head(wt)
+        verify.worktree_add(repo_root, wt, branch, base=pinned_base, create=True)
+    # A story checkout was already verified against the pinned base above.  Do
+    # not re-read its symbolic HEAD after that boundary: a rival ref move in this
+    # final window would record unverified history as the attempt baseline even
+    # though the mounted index and files still represent ``pinned_base``.
+    baseline = pinned_base if branch_per == "story" else verify.rev_parse_head(wt)
     return UnitWorkspace(
         workspace=Workspace(root=wt, paths=paths.rebased(wt)),
         repo_root=repo_root,

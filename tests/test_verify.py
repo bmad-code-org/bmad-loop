@@ -6755,6 +6755,77 @@ def test_commits_above_lists_attempt_commits_newest_first(project):
     assert commits == [head]
 
 
+def test_pinned_revision_preservation_does_not_follow_checkout_head(project):
+    """A named story tip, not whichever branch the caller has checked out, is parked."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "story-tip")
+    (repo / "story.txt").write_text("story\n", encoding="utf-8")
+    git(repo, "add", "story.txt")
+    git(repo, "commit", "-q", "-m", "story work")
+    story_tip = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "main")
+    (repo / "main.txt").write_text("main\n", encoding="utf-8")
+    git(repo, "add", "main.txt")
+    git(repo, "commit", "-q", "-m", "main moved")
+    main_tip = verify.rev_parse_head(repo)
+
+    commits = verify.commits_above(repo, baseline, story_tip)
+    ref = verify.preserve_commits(
+        repo,
+        baseline,
+        "attempt-preserve/run-story",
+        commits=commits,
+        revision=story_tip,
+    )
+
+    assert ref == "attempt-preserve/run-story"
+    assert git(repo, "rev-parse", ref) == story_tip
+    assert git(repo, "rev-parse", ref) != main_tip
+
+
+def test_reset_branch_if_tip_refuses_a_concurrent_move(project):
+    """CAS failure leaves the rival tip intact.
+
+    INVERSE ablation: replace ``update-ref <new> <old>`` with an unconditional
+    branch force-update and this test loses ``rival_tip``.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    git(repo, "branch", "story", baseline)
+    git(repo, "checkout", "-q", "story")
+    git(repo, "commit", "--allow-empty", "-q", "-m", "old story tip")
+    old_tip = verify.rev_parse_head(repo)
+    git(repo, "commit", "--allow-empty", "-q", "-m", "rival advances")
+    rival_tip = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "main")
+
+    with pytest.raises(verify.GitError):
+        verify.reset_branch_if_tip(repo, "story", baseline, old_tip)
+
+    assert git(repo, "rev-parse", "story") == rival_tip
+
+
+def test_reset_branch_if_tip_does_not_follow_symbolic_story_ref(project):
+    """A story ref must never redirect its reset onto the branch it names.
+
+    Ablation: remove ``--no-deref`` and update-ref resets ``main`` through the
+    symbolic story ref instead of replacing the named ref itself.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    (repo / "advance-symbolic-main.txt").write_text("main stays here\n", encoding="utf-8")
+    git(repo, "add", "advance-symbolic-main.txt")
+    git(repo, "commit", "-q", "-m", "advance main before symbolic reset")
+    main_tip = verify.rev_parse_head(repo)
+    git(repo, "symbolic-ref", "refs/heads/story", "refs/heads/main")
+
+    verify.reset_branch_if_tip(repo, "story", baseline, main_tip)
+
+    assert verify.rev_parse_head(repo) == main_tip
+    assert git(repo, "rev-parse", "refs/heads/story") == baseline
+
+
 def test_preserve_commits_survives_reset_and_gc(project):
     """The parked ref keeps committed attempt work reachable through the exact
     destructive sequence safe_rollback performs (reset --hard baseline) and a gc."""

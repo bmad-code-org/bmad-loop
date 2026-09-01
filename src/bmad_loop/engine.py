@@ -1434,54 +1434,21 @@ class Engine:
         `attempt_dirty` and `_rollback_cleanup_plan` both read as "nothing here is this
         attempt's to remove", and the same one `sweep`'s migration refusal already uses.
         """
-        discard_worktree(
-            self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
-        )
+        discard_worktree(self.paths.repo_root, task.worktree_path, "", run_dir=self.run_dir)
         # before the clears below: the relativization is measured against this field
         task.release_mount_owned_state()
         task.worktree_path = ""
         task.branch = ""
 
     def _release_orphaned_mount(self, task: StoryTask) -> None:
-        """Give up a mount live policy has stopped treating as isolated, and say so.
+        """Release mount ownership for a restart that will run in main.
 
-        Reached when `isolation` flipped `worktree -> none` across a resume: policy is
-        re-read every resume and a change is journaled, never refused, so a task can
-        arrive still recording the previous attempt's mount while execution happens in
-        the MAIN workspace. `_finish_inflight` re-anchors `spec_file` INTO that mount
-        first and unconditionally — the anchor must precede the `isolated` gate,
-        because the relative spelling resolves against the main checkout, which carries
-        the identical layout, and `recovery_flow` would restore over the operator's own
-        copy. Every non-isolated leg that then proceeds has to UNDO that anchor, or it
-        consumes a `spec_file` absolutized into a tree this run will not enter again:
-        `_dispatched_spec_for_attempt` resolves it `strict=True`, raises, and leaves the
-        attempt unbound, and an explicit-spec prompt meets the snapshot gate with
-        nothing bound.
-
-        FOUR call sites, not one. The restart arm carried this first, but the three
-        continuation arms — the spec-approval `DEV_VERIFY` leg, the recorded-result
-        `_resumable_session` leg and the `COMMITTING` finalizer — each finish their work
-        and `return` without ever reaching it, so they were left consuming the anchored
-        path. A helper rather than a hoist above the arm dispatch: the restart arm asks
-        `_refuse_gated_story` FIRST and that can raise `RunPaused`, and the anchored
-        spelling is load-bearing until an arm commits to acting. Releasing above the
-        dispatch would undo it for a task that never proceeds.
-
-        The BASELINE goes with the spec: `baseline_commit`/`baseline_untracked` were
-        measured inside the mount, and handing them to `_rollback_or_pause` against the
-        main checkout makes a unit's empty untracked snapshot read every untracked file
-        in the operator's own checkout as this attempt's debris. The CLAIM goes too —
-        `worktree_path` is how `runs` answers which tree owns the state this task has
-        already persisted (`task_spec_root`, `task_stories_root`), so keeping it set
-        anchors those readers on a tree the run has left. Clearing it is not deleting
-        the tree: the directory stays where it is and the journal names it, and
-        `workspace.open_unit_workspace` reclaims it if a later flip back to `worktree`
-        needs its deterministic path.
-
-        Does NOT fix `redrive_base_ref` / `spec_reaches_the_redrive`, and never could:
-        those describe the re-drive rather than the attempt, and `bmad-loop resolve`
-        asks them in a SEPARATE process before this resume runs. They take the live
-        isolation mode as a parameter instead — see `runs.redrive_base_ref`.
+        Accepted continuations never call this helper: their persisted mount owns
+        the verified work regardless of live policy, so they reopen, finish, merge,
+        and only then tear down normally. This is restart-only, after the story gate
+        permits replacement work. The spec binding, attempt snapshot, baselines,
+        worktree claim, and branch claim all leave together; the directory itself is
+        retained and journaled for recovery or a later deterministic remount.
         """
         if not task.worktree_path:
             return
@@ -1638,28 +1605,19 @@ class Engine:
             if task.terminal:
                 continue
             if task.worktree_path:
-                # Re-anchor BEFORE the `isolated` gate, because that gate is live
-                # policy (`self._isolated`) while the relative spelling is persisted
-                # state: `model._serialized_worktree_path` relativizes whenever
-                # `worktree_path` is set, and `from_dict` reads it back raw. Two arms
-                # below then act on a task whose paths `reopen_unit` never
-                # re-absolutized — an `isolation` flip across a resume (policy is
-                # re-read and only journaled, never refused), and the restart arm,
-                # which discards the mount and clears `worktree_path` before it saves.
-                # Either way the raw value resolves against the MAIN checkout, which
-                # carries the same layout, so `recovery_flow._attempt_owned_spec` finds
-                # exactly one candidate, `spec_within_roots` accepts it, and the
-                # snapshot restore rewrites the operator's own copy. Anchoring here
-                # names the tree that actually owned the attempt; when that tree is
-                # gone the binding is unresolvable and recovery refuses it loudly.
+                # Portable spec paths are persisted relative to their recorded mount.
+                # Re-anchor before dispatching recovery: accepted continuations reopen
+                # that mount regardless of live policy, while a restart must release
+                # ownership before it can begin in main or a replacement worktree.
                 task.rebase_spec_paths_on(Path(task.worktree_path))
-            isolated = self._isolated and task.worktree_path
-            if isolated and task.defer_reason is not None:
+            mounted = bool(task.worktree_path)
+            restart_isolated = self._isolated and mounted
+            if mounted and task.defer_reason is not None:
                 # _defer records its reason before carrying harvested findings.
                 # A read/commit fault (or host loss before the terminal advance)
                 # can therefore leave a rejected result in the same DEV_VERIFY +
                 # spec_file shape as a verified spec-approval pause. A persisted
-                # defer reason on a nonterminal isolated task is that interrupted
+                # defer reason on a nonterminal mounted task is that interrupted
                 # decision's intent; finish it before any session-replay arm.
                 self.journal.append("resume-defer", story_key=task.story_key)
                 unit = self._reopen_unit(task)
@@ -1674,7 +1632,7 @@ class Engine:
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
                 # dispatches the right leg): dev verified on disk.
-                if isolated:
+                if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
@@ -1705,7 +1663,7 @@ class Engine:
                     continuation = functools.partial(
                         self._review_and_commit, task, resume_result=result
                     )
-                if isolated:
+                if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
@@ -1727,7 +1685,7 @@ class Engine:
                 # and finalize_commit tolerates both the pre- and post-squash
                 # crash states (#115).
                 self.journal.append("resume-commit", story_key=task.story_key)
-                if isolated:
+                if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
@@ -1767,7 +1725,7 @@ class Engine:
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )
-                if isolated:
+                if restart_isolated:
                     # drop the half-built worktree; _run_story mounts a fresh one
                     self._discard_unit_for_restart(task)
                 else:
@@ -1777,7 +1735,7 @@ class Engine:
                     # recovery refuse loudly instead of rewriting the main checkout.
                     self._release_orphaned_mount(task)
 
-                if not isolated and task.baseline_commit:
+                if not restart_isolated and task.baseline_commit:
                     # latch resolved_redrive so the corrected spec stays protected
                     # through every reset of this re-drive, not just this first one
                     task.resolved_redrive = task.resolved_redrive or task.rearmed
@@ -2056,7 +2014,7 @@ class Engine:
         ctx = self._emit("pre_story", task)
         if self._vetoed(ctx, task):
             return
-        if self._isolated:
+        if self._isolated or task.worktree_path:
             self._run_isolated(task, self._drive_story)
         else:
             # in-place (non-isolated) ready gate: a plugin (e.g. a shared-mode

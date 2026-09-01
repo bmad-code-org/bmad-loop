@@ -583,6 +583,19 @@ def rev_parse_head(repo: Path) -> str:
     return out
 
 
+def rev_parse_revision(repo: Path, revision: str) -> str:
+    """Resolve ``revision`` to one pinned commit sha.
+
+    Callers that will mutate refs must not carry a moving branch name across the
+    mutation boundary. ``^{commit}`` also refuses non-commit objects instead of
+    handing a later worktree/reset operation an object with different semantics.
+    """
+    rc, out, detail = _git_out(repo, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    if rc != 0:
+        raise GitError(f"git rev-parse --verify {revision} failed in {repo}: {detail}")
+    return out
+
+
 def last_commit_for(repo: Path, path: Path) -> str:
     """Sha of the most recent commit touching ``path``, or ``""`` when no commit
     does (an untracked or deleted-without-history file) or the path lies outside
@@ -1467,34 +1480,39 @@ def path_ignored(repo: Path, path: Path) -> bool:
     return proc.returncode == 0
 
 
-def commits_above(repo: Path, baseline: str) -> list[str]:
-    """Commit shas reachable from HEAD but not from ``baseline`` — the commits an
-    attempt added on top of its pre-attempt baseline, in ``git rev-list`` order (do
-    not assume a strict newest-first / HEAD-first ordering across merges or clock
-    skew; callers that need the tip should read HEAD directly). Empty when HEAD is
-    at or behind baseline. Raises GitError on a git failure (a bad baseline is a
+def commits_above(repo: Path, baseline: str, revision: str = "HEAD") -> list[str]:
+    """Commit shas reachable from ``revision`` but not from ``baseline`` — the
+    commits an attempt added on top of its pre-attempt baseline, in ``git rev-list``
+    order (do not assume a strict newest-first ordering across merges or clock skew;
+    callers that need the tip should resolve it directly). Empty when the revision
+    is at or behind baseline. Raises GitError on a git failure (a bad baseline is a
     real error, never quietly "no commits").
 
     Reads stdout ALONE (`_git_out`): git exits 0 while still warning on stderr, and
     against the merged stream that warning is a phantom sha handed to
-    :func:`preserve_commits` — "Empty when HEAD is at or behind baseline" stops
+    :func:`preserve_commits` — "empty when the revision is at/below baseline" stops
     holding on any host whose git config warns (#442)."""
-    rc, out, detail = _git_out(repo, "rev-list", f"{baseline}..HEAD")
+    rc, out, detail = _git_out(repo, "rev-list", f"{baseline}..{revision}")
     if rc != 0:
-        raise GitError(f"git rev-list {baseline}..HEAD failed in {repo}: {detail}")
+        raise GitError(f"git rev-list {baseline}..{revision} failed in {repo}: {detail}")
     return [line for line in out.splitlines() if line]
 
 
 def preserve_commits(
-    repo: Path, baseline: str, ref_name: str, commits: list[str] | None = None
+    repo: Path,
+    baseline: str,
+    ref_name: str,
+    commits: list[str] | None = None,
+    *,
+    revision: str = "HEAD",
 ) -> str | None:
-    """Park the commits an attempt made above ``baseline`` under a branch at HEAD
+    """Park the commits an attempt made above ``baseline`` under a branch at ``revision``
     so a following ``git reset --hard baseline`` cannot orphan them — they survive
     `git gc` and are recoverable by name, not just via the reflog. Returns
-    ``ref_name`` on success; ``None`` when there is nothing to preserve (HEAD at/
-    below baseline) or the branch could not be created (the caller must then refuse
-    to reset rather than silently destroy committed work). ``-f`` because a retry
-    within the same run may re-preserve the same head under the same name.
+    ``ref_name`` on success; ``None`` when there is nothing to preserve (the
+    revision is at/below baseline). Creation failures raise, so the caller must
+    refuse to reset rather than silently destroy committed work. ``-f`` because a
+    retry within the same run may re-preserve the same tip under the same name.
 
     ``commits`` lets a caller that already ran :func:`commits_above` pass the result
     in to skip a second ``git rev-list`` subprocess; ``None`` self-fetches (keeps the
@@ -1505,12 +1523,12 @@ def preserve_commits(
     of this module), so a caller can never mistake a preservation failure for a
     harmless no-op and reset past committed work."""
     if commits is None:
-        commits = commits_above(repo, baseline)
+        commits = commits_above(repo, baseline, revision)
     if not commits:
         return None
-    rc, out = _git(repo, "branch", "-f", ref_name, "HEAD")
+    rc, out = _git(repo, "branch", "-f", ref_name, revision)
     if rc != 0:
-        raise GitError(f"git branch -f {ref_name} HEAD failed in {repo}: {out}")
+        raise GitError(f"git branch -f {ref_name} {revision} failed in {repo}: {out}")
     return ref_name
 
 
@@ -2132,6 +2150,23 @@ def delete_branch(repo: Path, name: str, force: bool = False) -> None:
         raise GitError(f"git branch -d {name} failed in {repo}: {out}")
 
 
+def reset_branch_if_tip(repo: Path, name: str, revision: str, expected_tip: str) -> None:
+    """Move a branch to a pinned revision only while its tip is unchanged.
+
+    ``git update-ref <ref> <new> <old>`` is the compare-and-swap primitive: a
+    concurrently advanced branch makes the command fail rather than losing the
+    rival commit. The caller resolves both shas before destructive follow-up.
+    """
+    ref = f"refs/heads/{name}"
+    # A refs/heads name can itself be symbolic.  The default update-ref behavior
+    # dereferences it, which could reset the target branch (including main) instead
+    # of the attempt-local story ref.  --no-deref replaces that name itself while
+    # preserving the expected-old CAS for ordinary and symbolic refs.
+    rc, out = _git(repo, "update-ref", "--no-deref", ref, revision, expected_tip)
+    if rc != 0:
+        raise GitError(f"git update-ref {ref} {revision} {expected_tip} failed in {repo}: {out}")
+
+
 def worktree_add(
     repo: Path, path: Path, branch: str, base: str | None = None, *, create: bool = True
 ) -> None:
@@ -2202,20 +2237,83 @@ def worktree_prune(repo: Path) -> None:
 def worktree_list(repo: Path) -> list[Path]:
     """Paths of every worktree attached to `repo` (the main checkout first).
 
-    Reads stdout ALONE (`_git_out`) so the record parse does not depend on no
-    stderr line ever starting with ``"worktree "``. The advisories measured for
+    Reads stdout alone through NUL-delimited porcelain so paths may contain
+    newlines and the record parse does not depend on no stderr line ever starting
+    with ``"worktree "``. The advisories measured for
     #442 — an unknown `core.fsyncMethod` value and its family — do NOT start that
     way, so the `startswith` filter screens them out and this parse was correct by
     accident rather than by construction; the filter stays as a second, independent
     screen."""
-    rc, out, detail = _git_out(repo, "worktree", "list", "--porcelain")
-    if rc != 0:
+    proc = _run_git(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+        repo,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).strip()
         raise GitError(f"git worktree list failed in {repo}: {detail}")
     paths = []
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            paths.append(Path(line[len("worktree ") :]))
+    for field in proc.stdout.split("\0"):
+        if field.startswith("worktree "):
+            paths.append(Path(field[len("worktree ") :]))
     return paths
+
+
+def worktree_is_registered(repo: Path, path: Path) -> bool:
+    """Whether ``path`` is this repository's exact live linked worktree.
+
+    Directory existence is insufficient for recovery: a deleted ``.git`` marker
+    below the main checkout makes git silently discover the parent repository,
+    while a replacement repository at the same path can have its own valid
+    toplevel. Require all three identities to agree: the persisted path is not a
+    symlink, the main repository still lists it, and git invoked there reports
+    both that exact toplevel and the main repository's common git directory.
+
+    Ordinary git refusal reads as ``False`` so the recovery caller can escalate
+    with its recorded-mount message. Spawn/timeout faults raised by ``_git_out``
+    remain typed and fail loud.
+    """
+    if path.is_symlink():
+        return False
+    try:
+        candidate = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    registered = False
+    for listed in worktree_list(repo):
+        try:
+            if listed.resolve(strict=True) == candidate:
+                registered = True
+                break
+        except (OSError, RuntimeError):
+            continue
+    if not registered:
+        return False
+
+    def git_path(root: Path, raw: str) -> Path:
+        value = Path(raw)
+        return (value if value.is_absolute() else root / value).resolve(strict=True)
+
+    def path_out(root: Path, *args: str) -> tuple[int, str]:
+        proc = _run_git(["git", "-C", str(root), *args], root)
+        # Git terminates this scalar with one newline.  Removing exactly that
+        # delimiter preserves whitespace/newlines that belong to the path itself.
+        return proc.returncode, proc.stdout.removesuffix("\n")
+
+    rc, top = path_out(candidate, "rev-parse", "--show-toplevel")
+    if rc != 0:
+        return False
+    rc, mounted_common = path_out(candidate, "rev-parse", "--git-common-dir")
+    if rc != 0:
+        return False
+    rc, repo_common = path_out(repo, "rev-parse", "--git-common-dir")
+    if rc != 0:
+        return False
+    try:
+        return Path(top).resolve(strict=True) == candidate and git_path(
+            candidate, mounted_common
+        ) == git_path(repo, repo_common)
+    except (OSError, RuntimeError):
+        return False
 
 
 def dirty_paths(repo: Path) -> dict[str, str]:
