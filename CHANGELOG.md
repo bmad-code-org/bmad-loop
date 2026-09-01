@@ -45,6 +45,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
+
 - **psmux sessions now live in a per-project registry** (#537). bmad-loop points
   `PSMUX_DATA_DIR` at `<state root>/<project>/_mux`, so a prune in one project cannot address
   another's servers at all. A bare `psmux ls` no longer shows them — `bmad-loop mux` prints the
@@ -180,6 +182,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Tell a failed window listing apart from an empty session: liveness raises when the failure is unproven, metadata keeps its sentinel and warns (#525).
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's

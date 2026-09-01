@@ -1387,12 +1387,26 @@ def _ctl_prune_fake(
                     raise OSError("server gone")
                 if kill == "undecodable":
                     raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+                if kill == "unproven-nonzero":
+                    # A server that errored while its windows are alive: rc 1,
+                    # and a stderr that proves nothing about the session. psmux
+                    # 3.3.8's verbatim answer to a listing whose auth the live
+                    # server rejected — the shape #525 is about.
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr="psmux: Invalid session key"
+                    )
                 if kill == "session-gone":
                     # rc 1, not rc 0 with empty stdout: real tmux answers a
                     # vanished session with a nonzero exit and list_window_ids
                     # folds it to [] — same verdict, and the path the transport
-                    # actually takes.
-                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+                    # actually takes. The stderr is tmux 3.4's verbatim wording
+                    # and is load-bearing since #525: it is what makes this a
+                    # PROVED vanish rather than a listing that merely failed,
+                    # and an rc 1 without it now lands in `unverifiable`
+                    # instead (test_prune_ctl_windows_..._unproven_nonzero).
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr=f"can't find session: {launch.CTL_SESSION}"
+                    )
                 gone = {a[-1] for a in killed} if kill == "lands" else set()
                 return subprocess.CompletedProcess(
                     argv, 0, stdout="\n".join(r[0] for r in rows if r[0] not in gone), stderr=""
@@ -1490,15 +1504,45 @@ def test_prune_ctl_windows_undecodable_liveness_is_a_transport_fault(monkeypatch
 def test_prune_ctl_windows_reads_an_empty_listing_as_the_session_going_with_it(
     monkeypatch, tmp_path: Path
 ):
-    """`[]` is the seam's "no windows", not a failed probe (only a transport fault
-    raises) — a ctl session that died with its last window really did take the
-    candidate, so pessimism here would report a phantom survivor forever."""
+    """`[]` is the seam's "no windows", not a failed probe — a ctl session that
+    died with its last window really did take the candidate, so pessimism here
+    would report a phantom survivor forever.
+
+    The other half of #525's discrimination, and the reason narrowing the
+    sentinel could not simply be "raise on rc != 0": a vanished session exits
+    non-zero too, and turning THAT into `unverifiable` is the same dishonest
+    report from the other side — one that every subsequent cleanup re-reports
+    and nothing ever clears."""
     _ctl_prune_fake(monkeypatch, tmp_path, kill="session-gone")
 
     assert launch.prune_ctl_windows(tmp_path) == (
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
         [],
         [],
+    )
+
+
+def test_prune_ctl_windows_unproven_nonzero_listing_claims_nothing(monkeypatch, tmp_path: Path):
+    """A listing that exits non-zero WITHOUT proving the session gone is a failed
+    probe, and the kills it was meant to verify stay unverifiable (#525).
+
+    This is the exact over-optimistic report #435 exists to eliminate, reached
+    by the one route it left open: the backend folded every non-zero exit to
+    `[]`, so a server erroring while its windows are alive answered "this
+    session has no windows" and every candidate was classified verifiably
+    removed — with no error anywhere and nothing to re-try.
+
+    Ablation: drop the `_session_proved_gone` guard in
+    `BaseTmuxBackend.list_window_ids` (return `[]` on any non-zero exit) and
+    this fails on `removed` carrying both windows, while its `session-gone`
+    sibling above still passes — the two together pin the discrimination
+    rather than either direction alone."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="unproven-nonzero")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
     )
 
 

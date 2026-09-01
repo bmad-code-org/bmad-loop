@@ -749,19 +749,19 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     set membership either way, so the verdict costs one extra round trip instead
     of N. A transport fault raises and nothing can be claimed there.
 
-    Two ceilings, both deliberate:
+    One ceiling, deliberate: the membership test pairs list_windows' `window_id`
+    column with list_window_ids. The seam states its symmetry rules pairwise and
+    this pair is stated because of THIS caller — a backend qualifying one side
+    and not the other reads every candidate as removed, which is #435 restored
+    on the optimistic side, with no error anywhere.
 
-    - The membership test pairs list_windows' `window_id` column with
-      list_window_ids. The seam states its symmetry rules pairwise and this pair
-      is stated because of THIS caller — a backend qualifying one side and not
-      the other reads every candidate as removed, which is #435 restored on the
-      optimistic side, with no error anywhere.
-    - `[]` is read as "the session went with its last window". The seam's `[]`
-      is wider than that: BaseTmuxBackend folds EVERY nonzero exit to `[]`, so a
-      server that errors while its windows live would report them removed. The
-      common cause by far is the session really being gone, and pessimism there
-      would invent a phantom survivor on every future sweep. Narrowing the
-      sentinel is a change to the engine's liveness probe, not to this function.
+    `[]` is read as "the session went with its last window", and since #525 the
+    seam means exactly that: a listing that merely FAILED raises instead of
+    folding to `[]`, so it lands in `unverifiable` below rather than reporting
+    every candidate removed. The narrow reading is what keeps the pessimism
+    honest in the other direction too — a genuinely vanished session still
+    answers `[]`, so its kills are reported as removed instead of leaving a
+    phantom survivor for every future sweep to re-report.
     """
     mux = get_multiplexer()
     candidates = _ctl_window_candidates(project)

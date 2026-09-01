@@ -4770,6 +4770,41 @@ def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp
     assert not runs.live_session_may_be_ours(tmp_path, "ctl")
 
 
+def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
+    tmp_path, monkeypatch
+):
+    """The accepted ceiling of #732, pinned so it cannot be closed by accident.
+
+    The two tests above cover a listing that *fails*. This one covers the
+    listing that succeeds and is wrong: psmux reaps a live session's registry
+    entry on any `has-session` whose 500 ms connect does not land, and until the
+    server's registry maintenance re-writes it `ls` exits 0 with that session
+    simply missing — no error, no stderr. (That maintenance runs on a nominal
+    5 s check in the server's own loop, so the window has no hard bound; 1.7 s
+    was one measured sample.) The guard therefore cannot tell "absent" from
+    "omitted", and removal proceeds. That is the documented trade, not an
+    oversight; a change that makes an empty or short listing block instead has
+    to delete this test and read why.
+
+    The third case is the positive control that makes the first two mean
+    something: the same guard, same fixtures, answers True the moment the
+    listing does name the session, so the two Falses are answers rather than a
+    harness that cannot say anything else."""
+    name = runs.session_name("20260826-000000-run1")
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
+    assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+
+    # Non-empty and still omitting it: a reap takes one session's entry, not the
+    # registry, so "the listing came back with rows in it" is no reassurance either.
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([runs.session_name("other")]))
+    assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([name]))
+    assert runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+
+
 def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monkeypatch):
     """End to end through the sweep: a `bmad-loop-ctl-foo` session minted by an
     older release (`--run-id ctl-foo`), untagged, with this project's dead run

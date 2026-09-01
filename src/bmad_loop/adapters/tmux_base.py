@@ -6,7 +6,9 @@ invocation and POSIX-shell trailer lives here (and in its POSIX leaf
 the native-Windows :mod:`.psmux_backend` leaf — can subclass :class:`BaseTmuxBackend` and
 swap only class attributes (:attr:`BaseTmuxBackend._BINARY` for the spawned
 binary, :attr:`BaseTmuxBackend._ENCODING` / :attr:`BaseTmuxBackend._ERRORS`
-for output decoding — a scrubbed
+for output decoding, :attr:`BaseTmuxBackend._SESSION_GONE_STDERR` for the stderr
+wordings that prove a session is gone rather than a listing merely failed, #525
+— a scrubbed
 per-call ``env`` is a ``_run`` parameter, and an :meth:`BaseTmuxBackend._run`
 override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
 ``_parked_trailer``, ``_source_prefix``, ``_window_launch`` and the
@@ -65,6 +67,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: mid-capture. Honored even where :attr:`_ENCODING` is None, so POSIX keeps
     #: the locale codec and only stops being strict. A leaf may still override.
     _ERRORS: str | None = "backslashreplace"
+    #: stderr fragments (matched case-insensitively, as substrings) that PROVE
+    #: the target session is gone, as opposed to a listing that merely failed.
+    #: This is the whole discrimination rule behind :meth:`_session_proved_gone`
+    #: — see it for why the answer has to be stderr and why the tuple is narrow.
+    #: A tmux-family leaf whose multiplexer words this differently overrides the
+    #: tuple; psmux deliberately does not (its own wordings are covered — see
+    #: the note in :mod:`.psmux_backend`).
+    _SESSION_GONE_STDERR: tuple[str, ...] = ("no server running", "can't find session")
     #: Diagnostic from the last :meth:`version` probe (see
     #: :meth:`TerminalMultiplexer.version_error`). A class-level default so an
     #: instance that never probed answers None instead of AttributeError.
@@ -108,6 +118,99 @@ class BaseTmuxBackend(TerminalMultiplexer):
         if check and proc.returncode != 0:
             raise TmuxError(f"{self._BINARY} {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
         return proc
+
+    def _session_proved_gone(self, proc: subprocess.CompletedProcess[str]) -> bool:
+        """Whether a non-zero listing exit PROVES the session no longer exists.
+
+        The discrimination the seam's ``[]`` rests on (#525). A non-zero exit
+        covers two unrelated answers: the session is gone (an ordinary,
+        knowable fact) and the listing could not be taken at all (a server that
+        errored while its windows are alive, a rejected auth, an unreachable
+        port). Folding both to ``[]`` reports the second as "this session has
+        no windows" — a death the engine acts on and a kill the prune reports
+        as verified.
+
+        Only stderr can tell them apart: the exit CODE cannot (both multiplexers
+        exit 1 for everything), and a confirming ``has_session`` round trip
+        cannot either — that predicate folds every non-zero exit to False by its
+        own documented contract, so it answers "gone" for exactly the auth and
+        timeout faults this discrimination exists to catch.
+
+        The tuple is an ALLOWLIST, deliberately: an unrecognized wording is
+        unknowable, never proof. The failure mode of a too-narrow tuple (a
+        vanished session read as unverifiable) is loud and self-clearing; a
+        too-wide one silently restores the bug. Measured rather than assumed,
+        on tmux 3.4 and psmux 3.3.8 — see the ``_SESSION_GONE_STDERR`` rows in
+        tests/test_multiplexer.py, which carry the transcript. Neither binary
+        localizes these strings, so a case-insensitive substring match is enough.
+
+        Both operands are folded, not just the captured text: the case-folding is
+        a promise to the OVERRIDING leaf, and folding one side only would honor it
+        for the base's own (already lower-case) tuple while silently breaking a
+        leaf that spelled its fragment the way its binary prints it. A BLANK
+        fragment is dropped rather than matched: ``"" in err`` is true for every
+        error there is, and ``" " in err`` for very nearly as many — any message
+        with a space in it. Either is #525 restored in full and in silence, from
+        an authoring slip (a trailing comma, a fragment built from config) that
+        no reviewer would see, so the two slips that could reintroduce the bug
+        cannot. The fragment is dropped, not stripped: a leaf that meant a
+        leading space meant it, and silently re-anchoring its fragment would
+        substitute a different rule for the one it declared.
+        """
+        err = proc.stderr.lower()
+        return any(f.lower() in err for f in self._SESSION_GONE_STDERR if f.strip())
+
+    def _warn_unproven_listing(
+        self, verb: str, proc: subprocess.CompletedProcess[str] | BaseException
+    ) -> None:
+        """Say out loud that a METADATA listing failed for a reason other than the
+        session being gone (#525).
+
+        The same lens as :meth:`list_window_ids`, the opposite conclusion: these
+        callers read tags and window rows, not liveness, and their sentinel
+        degrades toward doing NOTHING — an empty candidate list prunes nothing,
+        an unread tag reads as untagged and is left alone — so the documented
+        ``[]`` / ``{}`` stays. What was missing is the signal: a server erroring
+        on every call made the tool behave as if the sessions it manages had
+        simply stopped existing, with nothing on stderr to say why. Silent for a
+        genuinely gone session, which is an answer, not a fault.
+
+        Takes the completed process OR the transport exception that replaced one:
+        a timeout and a spawn that died prove no more about the session than an
+        unrecognized non-zero exit does, and the caller's sentinel is the same,
+        so the signal must be too.
+
+        The one failure left deliberately silent is a multiplexer that is not
+        installed at all: a box without one has no sessions to report on, so the
+        absence is an answer rather than a fault (the standing reading, see
+        :meth:`list_sessions`). That check lives HERE, gating only the
+        diagnostic, and must not be hoisted into the callers as an early return.
+        A ``shutil.which`` short-circuit ahead of :meth:`_run` decides the
+        RETURN VALUE from the ambient PATH, which makes the seam unreachable
+        through the one spawn primitive — every caller and every test that
+        injects a transport gets the sentinel no matter what it injected, and
+        the divergence hides on whichever platform happens to have the binary.
+        Gating the warning costs one failed exec on a binary-less box and keeps
+        the answer where the contract says it comes from.
+
+        Warn-only by construction, like every other diagnostic in this module:
+        under the TUI stderr is captured for the app's whole run (see
+        ``tui/app.py``), so this is a CLI-visible signal.
+        """
+        if not shutil.which(self._BINARY):
+            return
+        if isinstance(proc, BaseException):
+            outcome, detail = "failed", f"{type(proc).__name__}: {proc}"
+        else:
+            if self._session_proved_gone(proc):
+                return
+            outcome = f"exited {proc.returncode}"
+            detail = proc.stderr.strip() or "(no stderr)"
+        print(
+            f"warning: {self._BINARY} {verb} {outcome} without proving "
+            f"the session gone; reading it as empty: {detail}",
+            file=sys.stderr,
+        )
 
     def _tmux(self, *args: str) -> str:
         # The strict form: a non-zero exit already raises TmuxError inside _run.
@@ -190,9 +293,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
             proc = self._run(
                 ["list-sessions", "-F", f"#{{session_name}}\t#{{{option}}}"], check=False
             )
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # UnicodeError for the reason list_window_ids names it: a leaf that
+            # overrides _ERRORS back to a strict handler raises a ValueError-family
+            # decode error neither other arm covers, and this method's contract is
+            # warn-and-sentinel, never a raise.
+            self._warn_unproven_listing("list-sessions", exc)
             return {}
         if proc.returncode != 0:  # no server / no sessions
+            self._warn_unproven_listing("list-sessions", proc)
             return {}
         options: dict[str, str] = {}
         for line in proc.stdout.splitlines():
@@ -318,11 +427,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # display-message -t <dead-window> exits 0 with empty output, so list the
         # session's window ids and check membership instead.
         #
-        # A transport failure (timeout / missing binary) must RAISE, not return [].
-        # window_alive() is the engine's liveness probe; a sentinel [] would falsely
-        # read as "window dead -> session crashed" on a mere tmux hang. The honest
-        # answer to "is it alive?" is "unknowable" -> MultiplexerError. A real dead
-        # window still returns [] via the returncode != 0 path below (no exception).
+        # A failed listing must RAISE, not return []. window_alive() is the engine's
+        # liveness probe; a sentinel [] would falsely read as "window dead -> session
+        # crashed". The honest answer to "is it alive?" is "unknowable" ->
+        # MultiplexerError. That covers the transport failures below (timeout /
+        # missing binary / decode) AND a non-zero exit that does not prove the
+        # session is gone (#525) — see _session_proved_gone for the discrimination
+        # and why an exit code alone cannot make it. A session that really vanished
+        # still returns [] (no exception): the prune must be able to report its
+        # kills as removed rather than invent a phantom survivor.
         #
         # UnicodeError is a transport failure too. _run no longer decodes strictly
         # on any platform (_ERRORS is backslashreplace, #380), so this arm is now
@@ -339,7 +452,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
         except (subprocess.TimeoutExpired, OSError, UnicodeError) as exc:
             raise TmuxError(f"{self._BINARY} list-windows failed: {exc}") from exc
         if probe.returncode != 0:
-            return []
+            if self._session_proved_gone(probe):
+                return []
+            raise TmuxError(
+                f"{self._BINARY} list-windows on {session} exited {probe.returncode} "
+                f"without proving the session gone: {probe.stderr.strip() or '(no stderr)'}"
+            )
         return probe.stdout.split()
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
@@ -447,12 +565,26 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
 
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
+        # No missing-binary pre-gate here, deliberately, unlike list_sessions /
+        # session_options: those two answer "what exists" and may decide that from
+        # the ambient PATH, but this one is reached with a session already in hand
+        # and its answer must come from _run — the one spawn primitive the seam
+        # documents. A `shutil.which` short-circuit ahead of it returns the
+        # sentinel without consulting the transport at all, so an injected _run is
+        # never asked, and the behavior silently diverges by whether the binary
+        # happens to be on THIS box's PATH. The no-multiplexer silence this was
+        # reaching for is gated inside _warn_unproven_listing instead, where it
+        # costs a failed exec and nothing else.
         fmt = "\t".join(f"#{{{field}}}" for field in fields)
         try:
             probe = self._run(["list-windows", "-t", f"={session}", "-F", fmt], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # UnicodeError as in session_options: a strict-codec leaf must get the
+            # documented sentinel, not a raw decode error out of a best-effort op.
+            self._warn_unproven_listing("list-windows", exc)
             return []
         if probe.returncode != 0:
+            self._warn_unproven_listing("list-windows", probe)
             return []
         rows: list[tuple[str, ...]] = []
         for line in probe.stdout.splitlines():
