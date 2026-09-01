@@ -250,6 +250,25 @@ def test_path_changed_since_detects_one_tracked_path(project):
     assert verify.path_changed_since(project.project, baseline, "src.txt") is True
 
 
+def test_path_changed_since_treats_tracked_pathspec_magic_literally(project):
+    """A tracked exact-path probe must not interpret brackets as pathspec magic.
+
+    Ablation: remove the `:(literal)` prefix in `_changes_since` and Git reports
+    the modified bracketed path clean, so both assertions fail.
+    """
+    repo = project.project
+    rel = "tracked[1].txt"
+    (repo / rel).write_text("baseline\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "tracked literal path baseline")
+    baseline = verify.rev_parse_head(repo)
+
+    (repo / rel).write_text("changed\n", encoding="utf-8")
+
+    assert verify._changes_since(repo, baseline, literal_path=rel) is True
+    assert verify.path_changed_since(repo, baseline, rel) is True
+
+
 def test_path_changed_since_respects_the_untracked_baseline(project):
     baseline = verify.rev_parse_head(project.project)
     (project.project / "ledger[1].md").write_text("finding\n", encoding="utf-8")
@@ -266,6 +285,30 @@ def test_path_changed_since_respects_the_untracked_baseline(project):
         "ledger[1].md",
         baseline_untracked=["ledger[1].md"],
     )
+
+
+def test_path_changed_since_routes_the_literal_path_through_the_tri_state(project, monkeypatch):
+    """The literal-path public boundary owns only the fail-open collapse; the
+    centralized tri-state probe owns the quiet diff and its literal pathspec.
+
+    Ablation: restore an inline `_git(..., "diff", "--quiet", ...)` body in
+    `path_changed_since` and this fails because `_changes_since` is never called.
+    """
+    seen = {}
+
+    def probe(repo, baseline, exclude=(), **kwargs):
+        seen.update(repo=repo, baseline=baseline, exclude=exclude, kwargs=kwargs)
+        return None
+
+    monkeypatch.setattr(verify, "_changes_since", probe)
+
+    assert verify.path_changed_since(project.project, "baseline", "ledger[1].md") is True
+    assert seen == {
+        "repo": project.project,
+        "baseline": "baseline",
+        "exclude": (),
+        "kwargs": {"literal_path": "ledger[1].md", "baseline_untracked": None},
+    }
 
 
 def test_attempt_dirty_excludes_untracked_artifact(project):
@@ -1131,6 +1174,27 @@ def test_verify_dev_proof_of_work_gate_still_fails_open_on_a_refused_probe(proje
     spellings apart."""
     task, sp = _residue_free(project, status="done", sprint="done", baseline=OMIT)
     task.baseline_commit = "0" * 40
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert out.ok
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_proof_gate_fails_open_on_untracked_enumeration_fault(project, monkeypatch):
+    """A clean tracked diff followed by a failed untracked enumeration is an
+    unanswerable proof, not an escalation. The ordinary gate keeps its established
+    fail-open policy and accepts the attempt.
+
+    Ablation: delete `_changes_since`'s `except GitError: return None` and this
+    changes from a passing outcome to a raised/escalated Git fault.
+    """
+    task, sp = _residue_free(project, status="done", sprint="done")
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
 
     out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
 
@@ -3102,9 +3166,41 @@ def test_stories_relpaths_is_empty_when_resolution_is_uncertain(project, monkeyp
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
     # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
     # is NO code change — proof-of-work is skipped and the plan spec is recorded.
+    # Post-baseline stories bookkeeping is excluded from the observation too.
     spec_folder = project.planning_artifacts / "epic-a"
     task = make_stories_task(project, "1")
     sp = write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    (spec_folder / "stories.yaml").write_text("stories: []\n", encoding="utf-8")
+    write_story(spec_folder, "2", "sibling", "ready-for-dev", task.baseline_commit)
+    (project.repo_root / "engine-owned.txt").write_text(
+        "orchestrator bookkeeping\n", encoding="utf-8"
+    )
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+        engine_written=("engine-owned.txt",),
+    )
+    assert out.ok  # no code change required for a plan
+    assert task.spec_file == str(sp)
+    assert out.plan_halt_zero_diff is True
+
+
+def test_verify_dev_stories_plan_halt_observes_a_non_zero_diff(project):
+    """The skipped gate is observed even when it would have passed: the marker
+    still authorizes the halt, while the independent observation reports residue.
+
+    Ablation: replace the skipped-proof observation with a constant clean answer
+    and this fails without changing plan-halt acceptance.
+    """
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    (project.repo_root / "src.txt").write_text("changed during planning\n", encoding="utf-8")
+
     out = verify.verify_dev_stories(
         task,
         project,
@@ -3113,8 +3209,39 @@ def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
         review_enabled=False,
         plan_halt=True,
     )
-    assert out.ok  # no code change required for a plan
-    assert task.spec_file == str(sp)
+
+    assert out.ok
+    assert out.plan_halt_zero_diff is False
+
+
+def test_verify_dev_stories_plan_halt_untracked_fault_is_unknown(project, monkeypatch):
+    """A bookkeeping probe fault cannot reject an otherwise valid plan halt; the
+    returned observation is unknown so the engine can journal JSON null.
+
+    Ablation: delete `_changes_since`'s untracked `GitError` normalization and
+    this still passes only if the outer skipped-proof observer catches it; remove
+    that catch as well and the fault escapes. The helper-level sibling pins the
+    normalization itself.
+    """
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+
+    assert out.ok
+    assert out.plan_halt_zero_diff is None
 
 
 def test_verify_dev_stories_plan_halt_rejects_non_plan_status(project):
@@ -3148,6 +3275,7 @@ def test_verify_dev_stories_plan_halt_requires_marker(project):
         plan_halt=True,
     )
     assert not out.ok and "no plan_halt marker" in out.reason
+    assert out.plan_halt_zero_diff is None
 
 
 def test_plan_halt_status_matches_devcontract():
@@ -6310,6 +6438,31 @@ def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(
     head = verify.rev_parse_head(project.project)
     assert verify._changes_since(project.project, head) is False
     assert verify.has_changes_since(project.project, head) is False
+
+
+@pytest.mark.parametrize("literal_path", [None, "src.txt"], ids=["whole-tree", "literal-path"])
+def test_changes_since_reports_untracked_enumeration_fault_as_unknown(
+    project, monkeypatch, literal_path
+):
+    """Tracked diff and untracked enumeration are halves of one tri-state answer.
+    Once the clean tracked half succeeds, a `GitError` from the untracked half is
+    unknown too; both public boolean boundaries then fail open to changed.
+
+    Ablation: delete `_changes_since`'s `except GitError: return None` and both
+    rows raise instead of reaching either fail-open boundary.
+    """
+    baseline = verify.rev_parse_head(project.project)
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
+
+    assert verify._changes_since(project.project, baseline, literal_path=literal_path) is None
+    if literal_path is None:
+        assert verify.has_changes_since(project.project, baseline) is True
+    else:
+        assert verify.path_changed_since(project.project, baseline, literal_path) is True
 
 
 def test_has_changes_since_subtracts_baseline_untracked(project):

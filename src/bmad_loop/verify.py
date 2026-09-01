@@ -786,6 +786,7 @@ def _changes_since(
     baseline: str,
     exclude: tuple[str, ...] = (),
     *,
+    literal_path: str | None = None,
     baseline_untracked: list[str] | None = None,
     include_untracked: bool = True,
 ) -> bool | None:
@@ -801,6 +802,11 @@ def _changes_since(
     ``observe_skipped_proof`` arm) files "the gate would have found changes"
     about a question git never answered.
 
+    ``literal_path`` selects the exact-path form used by
+    :func:`path_changed_since`; ``None`` selects the whole-tree form. Both forms
+    share this one quiet-diff invocation and the same untracked-fault handling,
+    while preserving their established pathspec and baseline-snapshot semantics.
+
     This is the body BOTH proof arms reach, and by only one route: the
     `proof_of_work_probe` closure in :func:`_verify_shared_gates`, which is what
     actually makes "the observation measures exactly what the gate would have"
@@ -810,19 +816,29 @@ def _changes_since(
     body decides is what an unanswerable git call looks like; each arm then reads
     that `None` under its own policy.
 
-    :func:`has_changes_since` is the fail-open COLLAPSE of this tri-state, kept for
-    the gates that want it — it folds `None` into `True` and is what a caller
-    should reach for unless it can act on "git would not answer"."""
-    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
+    :func:`has_changes_since` and :func:`path_changed_since` are the fail-open
+    COLLAPSES of this tri-state — each folds `None` into `True` at its public
+    boolean boundary."""
+    pathspecs = (
+        (f":(literal){literal_path}",)
+        if literal_path is not None
+        else (".", *_exclude_specs(exclude))
+    )
+    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", *pathspecs)
     if rc not in (0, 1):
         return None
     if rc != 0:
         return True
     if not include_untracked:
         return False
-    created = untracked_files(repo)
+    try:
+        created = untracked_files(repo)
+    except GitError:
+        return None
     if baseline_untracked is not None:
         created -= set(baseline_untracked)
+    if literal_path is not None:
+        return literal_path in created
     created = {p for p in created if not _path_under_any(p, exclude)}
     return bool(created)
 
@@ -843,19 +859,19 @@ def path_changed_since(
     counting every ordinary untracked path. Ignored paths are absent from
     :func:`untracked_files` and therefore cannot become proof of work here.
 
-    Any non-zero diff result fails open toward "changed", matching what the
-    proof-of-work gate does with :func:`_changes_since`'s unanswerable `None` (and
-    what :func:`has_changes_since` collapses it to). The literal pathspec is
+    Both a diff refusal and an untracked-enumeration fault fail open toward
+    "changed", matching :func:`has_changes_since`. The literal pathspec is
     required for operator-configured ledger paths containing Git wildmatch
-    characters.
+    characters. The tri-state body owns that pathspec so this caller cannot drift
+    from whole-tree proof handling.
     """
-    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", f":(literal){rel}")
-    if rc != 0:
-        return True
-    untracked = untracked_files(repo)
-    if rel not in untracked:
-        return False
-    return baseline_untracked is None or rel not in set(baseline_untracked)
+    answer = _changes_since(
+        repo,
+        baseline,
+        literal_path=rel,
+        baseline_untracked=baseline_untracked,
+    )
+    return True if answer is None else answer
 
 
 def attempt_dirty(
@@ -3498,15 +3514,11 @@ def _verify_shared_gates(
     gate would have passed and one it would have refused are otherwise
     indistinguishable after the fact.
 
-    Exactly one of the two skipping legs asks for it, and the asymmetry is
-    deliberate rather than an omission: only sprint mode's PARK passes it.
-    ``verify_dev_stories``' plan halt skips the gate and observes nothing, because
-    it already has an independent cross-check a park has no equivalent for — a
-    clean plan-halt carries ``devcontract``'s ``plan_halt`` marker in its
-    result.json (``rj.get("plan_halt") is not True`` refuses the leg outright), so
-    a died-mid-flight ``ready-for-dev`` cannot reach the skip in the first place. A
-    park's status is self-asserted with no such marker, which is why it is the leg
-    that needs a record of what the waived gate would have found.
+    Both skipping legs ask for it. Sprint mode's park and stories mode's plan halt
+    have independent selectors — the park's session-authored assertion and the
+    plan halt's strict ``result_json`` marker — while the observation records only
+    what each waived gate would have found. It never replaces either selector and
+    never changes acceptance.
 
     The two parameters are MUTUALLY EXCLUSIVE by construction: ``extra_exclude``
     gates and ``observe_skipped_proof`` observes, and the arms below are ``if`` /
@@ -3996,7 +4008,10 @@ def verify_dev_stories(
     and baseline gates still run, and ``task.spec_file`` is still recorded. A
     ``plan_halt`` leg also requires the ``result_json`` to carry the ``plan_halt``
     marker ``devcontract`` emits on a clean plan-halt, so a died-mid-flight
-    ``ready-for-dev`` can't be mistaken for a successful plan.
+    ``ready-for-dev`` can't be mistaken for a successful plan. A passing halt
+    returns what the skipped proof gate would have found as
+    ``VerifyOutcome.plan_halt_zero_diff``; that observation never affects the
+    marker cross-check or the outcome.
     """
     # Deferred to avoid a verify<->stories import cycle: stories imports
     # read_frontmatter/status_of from this module at top level, so verify must not
@@ -4042,34 +4057,33 @@ def verify_dev_stories(
     else:
         expected = "in-review" if review_enabled else "done"
 
-    # A plan-halt leg produced only its own spec (the plan), which proof-of-work
-    # already excludes; skip it (extra_exclude=None) and record the plan spec.
-    # Otherwise stories mode adds the spec folder's stories/ subdir + stories.yaml
-    # on top of the gate's own file-granular exclude — NOT a whole-folder artifact
-    # exclusion, so a story whose entire authorized scope is ledger/spec
-    # reconciliation doesn't register as a false "no changes". Engine-written
-    # paths compose only on that live-gate leg; ``None`` must remain ``None`` for
-    # plan halt rather than being combined with a tuple.
+    # Stories mode adds the spec folder's stories/ subdir + stories.yaml on top of
+    # the gate's own file-granular exclude — NOT a whole-folder artifact exclusion,
+    # so a story whose entire authorized scope is ledger/spec reconciliation
+    # doesn't register as a false "no changes". A plan-halt leg produced only its
+    # own spec (the plan), so it skips the gate but passes this same tuple to the
+    # observer: the journal answer must measure exactly the gate that was waived,
+    # including engine-written paths.
+    stories_exclude = _stories_relpaths(paths.repo_root, spec_folder) + engine_written
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        extra_exclude=(
-            None
-            if plan_halt
-            # Rooted where the proof-of-work gate invokes git (`paths.repo_root`),
-            # not on `paths.project`: a pathspec relative to the other root matches
-            # nothing and the exclusion evaporates without an error (#716).
-            else _stories_relpaths(paths.repo_root, spec_folder) + engine_written
-        ),
+        # Rooted where the proof-of-work gate invokes git (`paths.repo_root`), not
+        # on `paths.project`: a pathspec relative to the other root matches nothing
+        # and the exclusion evaporates without an error (#716).
+        extra_exclude=None if plan_halt else stories_exclude,
+        observe_skipped_proof=stories_exclude if plan_halt else None,
     )
     if gate.outcome is not None:
         return gate.outcome
 
     task.spec_file = str(spec_path)
-    return VerifyOutcome.passed()
+    return VerifyOutcome.passed(
+        plan_halt_zero_diff=(gate.skipped_proof_zero_diff if plan_halt else None)
+    )
 
 
 def _stories_relpaths(root: Path, spec_folder: Path) -> tuple[str, ...]:
