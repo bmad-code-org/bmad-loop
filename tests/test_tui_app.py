@@ -3561,6 +3561,131 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
         assert strips == [(spec, project.project)]
 
 
+async def test_plan_checkpoint_replan_restores_preimage_when_result_strip_fails(
+    project, monkeypatch
+):
+    """The reset and result strip are one TUI transaction, including confinement.
+
+    The real status reset commits first; the injected second-stage fault then forces
+    the helper to restore the byte-for-byte preimage. Using an isolated worktree also
+    pins that both the forward status write and rollback carry the caller's owning
+    root into the confined atomic writer.
+
+    Ablation: delete the rollback write in ``reset_spec_for_replan`` and this reddens
+    on byte identity because the spec remains at ``status: draft``.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_atomic_write = devcontract._atomic_write_spec
+
+    writes = 0
+
+    def fail_second_atomic_write(p, text, **kw):
+        nonlocal writes
+        writes += 1
+        roots.append(kw["confine_root"])
+        if writes == 2:
+            raise OSError("injected result-strip write failure")
+        return real_atomic_write(p, text, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "_atomic_write_spec", fail_second_atomic_write)
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    original = (
+        b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n# worktree plan for 1\r\n"
+        b"\r\n## Auto Run Result\r\n\r\n- Status: blocked\r\n\r\nstale terminal result\r\n"
+    )
+    spec.write_bytes(original)
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("injected result-strip write failure" in m for m in notifications(app)),
+        )
+        assert app.is_running
+    assert spec.read_bytes() == original
+    assert calls == []
+    assert roots == [wt, wt, wt]
+
+
+async def test_plan_checkpoint_replan_does_not_strip_when_reset_refuses(project, monkeypatch):
+    """An unchanged reset must not independently commit the result-strip half."""
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        spec_status="draft",
+        blocked_result="stale terminal result",
+    )
+    original = spec.read_bytes()
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("could not reset" in m for m in notifications(app)))
+    assert spec.read_bytes() == original
+    assert calls == []
+
+
+async def test_plan_checkpoint_replan_rollback_failure_stays_loud(project, monkeypatch):
+    """A failed undo escapes to the TUI error path and still cannot resume."""
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    writes = 0
+    real_atomic_write = devcontract._atomic_write_spec
+
+    def fail_rollback(p, text, **kw):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("injected rollback failure")
+        return real_atomic_write(p, text, **kw)
+
+    def fail_strip(p, **kw):
+        raise OSError("injected result-strip failure")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "_atomic_write_spec", fail_rollback)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", fail_strip)
+    _run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        blocked_result="stale terminal result",
+    )
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("injected rollback failure" in m for m in notifications(app)),
+        )
+        assert app.is_running
+    assert calls == []
+
+
 def _unit_worktree(root: Path, run_id: str = "20260611-100000-aaaa", unit: str = "1") -> Path:
     """The UNRESOLVED spelling of where `workspace.open_unit_workspace` mounts a unit.
 
@@ -3625,7 +3750,10 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
     wt = _unit_worktree(project.project)
     _run_dir, spec = _stories_paused_run(
-        project.project, stage="plan-checkpoint", worktree_path=str(wt)
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
     )
     twin = project.project / spec.relative_to(wt)
     untouched = twin.read_bytes()
@@ -3637,6 +3765,7 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
     assert verify.read_frontmatter(spec)["status"] == "draft"
+    assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     assert twin.read_bytes() == untouched
     assert roots == [wt, wt]
 

@@ -733,6 +733,41 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
     return True
 
 
+def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+    """Reset a spec to ``draft`` and strip its stale result transactionally.
+
+    The TUI exposes those two writes as one operator action. Capture the exact
+    preimage before the status write and restore it through the same confined
+    atomic writer if either stage faults after changing (or removing) the file,
+    so a failed replan never publishes only its first half. A reset that makes no
+    change is a refusal, not permission to strip the result independently.
+
+    Rollback deliberately catches ``BaseException`` so an interrupt between the
+    two writes cannot leave a partial replan. A fault that leaves the preimage
+    untouched does not rewrite it. If the restore itself fails, that failure
+    escapes; otherwise the original stage failure is re-raised.
+    """
+    original = spec_path.read_bytes()
+    try:
+        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        if not reset:
+            if not spec_path.is_file():
+                raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
+            return False
+        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        if not stripped and not spec_path.is_file():
+            raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
+    except BaseException:
+        try:
+            unchanged = spec_path.read_bytes() == original
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+        raise
+    return True
+
+
 # Provenance stamped into a synthesized `## Auto Run Result` section so a human
 # (or a later re-derivation) can tell an orchestrator-repaired marker from one
 # the skill wrote itself. Single line (no internal newlines) so the writer's

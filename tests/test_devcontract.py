@@ -1062,6 +1062,104 @@ def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
     assert "## Intent\n\nbody\n" in text
 
 
+# --------------------------------------------------------- reset_spec_for_replan
+
+
+def test_reset_spec_for_replan_does_not_rewrite_unchanged_reset_refusal(tmp_path, monkeypatch):
+    """A pre-write frontmatter refusal propagates without an unnecessary undo."""
+    sp = tmp_path / "spec.md"
+    original = b"---\nstatus: |\n  ready-for-dev\n---\n\nbody\n"
+    sp.write_bytes(original)
+    writes: list[tuple] = []
+    monkeypatch.setattr(
+        devcontract,
+        "_atomic_write_spec",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
+    assert writes == []
+
+
+def test_reset_spec_for_replan_restores_when_reset_commits_then_interrupts(tmp_path, monkeypatch):
+    """An interrupt after reset's atomic replace still rolls the transaction back."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+    real_reset = devcontract.reset_spec_status
+    interrupt = KeyboardInterrupt("interrupt after reset commit")
+
+    def reset_then_interrupt(*args, **kwargs):
+        assert real_reset(*args, **kwargs) is True
+        raise interrupt
+
+    monkeypatch.setattr(devcontract, "reset_spec_status", reset_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert caught.value is interrupt
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_when_reset_finds_spec_missing(tmp_path, monkeypatch):
+    """A vanished spec during reset is restored rather than treated as a refusal."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+
+    def vanish_during_reset(*args, **kwargs):
+        sp.unlink()
+        return False
+
+    monkeypatch.setattr(devcontract, "reset_spec_status", vanish_during_reset)
+
+    with pytest.raises(FileNotFoundError, match="vanished during status reset"):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_on_baseexception_from_strip(tmp_path, monkeypatch):
+    """The strip-stage guard is intentionally broader than ``Exception``."""
+
+    class StripAbort(BaseException):
+        pass
+
+    sp = tmp_path / "spec.md"
+    original = b"---\nstatus: ready-for-dev\n---\n\n## Auto Run Result\n"
+    sp.write_bytes(original)
+    abort = StripAbort("abort result strip")
+
+    def abort_strip(*args, **kwargs):
+        raise abort
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", abort_strip)
+
+    with pytest.raises(StripAbort) as caught:
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert caught.value is abort
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_when_strip_finds_spec_missing(tmp_path, monkeypatch):
+    """A vanished spec is a failed transaction, not a successful no-section strip."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+    real_strip = devcontract.strip_auto_run_result
+
+    def vanish_then_strip(*args, **kwargs):
+        sp.unlink()
+        return real_strip(*args, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", vanish_then_strip)
+
+    with pytest.raises(FileNotFoundError, match="vanished during result strip"):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
+
+
 def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
     """Destructive-op guard: a `## Auto Run Result` fenced inside a 4-backtick
     block that contains a lone inner ``` line must be preserved (no-op). Line
