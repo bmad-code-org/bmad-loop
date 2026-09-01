@@ -2715,6 +2715,53 @@ def test_gather_escalations_skips_a_non_utf8_artifact(tmp_path):
     assert [e["detail"] for e in ctx["escalations"]] == ["still readable"]
 
 
+def test_gather_escalations_skips_an_unreadable_existence_probe(tmp_path, monkeypatch):
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    unreadable = task_dir / "result.json"
+    sibling = {"severity": "CRITICAL", "detail": "sibling survives"}
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [sibling]}), encoding="utf-8"
+    )
+    real_is_file = Path.is_file
+
+    def is_file_with_permission_error(candidate):
+        if candidate == unreadable:
+            raise PermissionError("task directory is not searchable")
+        return real_is_file(candidate)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "is_file", is_file_with_permission_error)
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["escalations"] == [sibling]
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"])
+def test_gather_escalations_skips_a_nonfinite_artifact(tmp_path, constant):
+    """A numeric spelling decoded as non-finite poisons only its own artifact; a valid
+    sibling still reaches context, whose output is accepted by a strict parser."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_text(
+        '{"escalations":[{"severity":"CRITICAL","detail":' + constant + "}]}",
+        encoding="utf-8",
+    )
+    sibling = {"severity": "CRITICAL", "detail": "sibling survives", "score": 0.5}
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [sibling]}), encoding="utf-8"
+    )
+
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+    assert ctx["escalations"] == [sibling]
+
+
 def test_gather_escalations_skips_a_plain_json_value_error(tmp_path, monkeypatch):
     """`json.loads` raises plain ValueError, not JSONDecodeError, when an integer
     exceeds Python's configured digit limit. That malformed file costs only its
@@ -2797,14 +2844,11 @@ def test_gather_escalations_skips_a_canonicalization_recursion_error(tmp_path, m
 
 @pytest.mark.parametrize("bad", [None, 1, "x", {}])
 def test_gather_escalations_skips_a_non_list_escalations_field(tmp_path, monkeypatch, bad):
-    """DW-70/73's other half. `escalation.critical_escalations` iterates
-    `escalations` with no list guard of its own, so `{"escalations": null}` raised
-    `TypeError` straight out of `build_context`. The guard sits in this caller; the
-    shared predicate stays the single definition of CRITICAL.
+    """The shared selector owns the list guard, including for resolve artifacts.
 
-    Every parameter must fail when the list guard is ablated. ``None`` and ``1``
-    raise without it; the call trace below distinguishes the iterable ``"x"`` and
-    ``{}`` shapes, which the shared filter would otherwise accept as empty."""
+    Every parameter fails when that shared guard is ablated. The call trace also
+    proves this reader delegates malformed shapes instead of retaining a private
+    guard that could drift from engine and sweep behavior."""
     run_dir, state, task = _escalated_run(tmp_path)
     task_dir = _task_dir(run_dir, task)
     (task_dir / "result.json").write_text(json.dumps({"escalations": bad}), encoding="utf-8")
@@ -2826,13 +2870,28 @@ def test_gather_escalations_skips_a_non_list_escalations_field(tmp_path, monkeyp
 
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert filtered == [
+        {"escalations": bad},
         {
             "escalations": [
                 {"severity": "CRITICAL", "detail": "sibling survives"},
             ]
-        }
+        },
     ]
     assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+@pytest.mark.parametrize(
+    "nonfinite", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+)
+def test_build_context_refuses_nonfinite_in_memory_values(tmp_path, nonfinite):
+    run_dir, state, _task = _escalated_run(tmp_path)
+    state.paused_reason = nonfinite
+    path = resolve.context_path(run_dir, "6-4-cli-list-command")
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    assert not path.exists()
 
 
 def test_gather_escalations_preference_only_yields_nothing(tmp_path):
