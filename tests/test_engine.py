@@ -16340,7 +16340,10 @@ def test_legacy_replay_derives_session_ledger_attribution_before_harvest(project
     ]
 
 
-def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
+@pytest.mark.parametrize("untracked_fault", [False, True], ids=["answered", "unknown"])
+def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(
+    project, monkeypatch, untracked_fault
+):
     """Missing attribution must not let the upgrade's own append satisfy proof."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -16369,6 +16372,18 @@ def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
     _downgrade_harvest_state_to_legacy(engine)
 
     resumed, adapter = resume_engine(project, engine, [])
+    untracked_calls = 0
+    real_untracked_files = verify.untracked_files
+
+    def fault_once(repo):
+        nonlocal untracked_calls
+        untracked_calls += 1
+        if untracked_calls == 1:
+            raise verify.GitError("untracked enumeration failed")
+        return real_untracked_files(repo)
+
+    if untracked_fault:
+        monkeypatch.setattr(verify, "untracked_files", fault_once)
     summary = resumed.run()
 
     assert summary.deferred == 1 and not summary.done and not summary.crashed
@@ -16378,6 +16393,12 @@ def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
     decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
     assert [decision["action"] for decision in decisions] == ["defer"]
     assert "no changes in worktree" in decisions[0]["reason"]
+    if untracked_fault:
+        assert untracked_calls >= 2  # attribution faulted; the later proof gate re-probed
+        failed = [
+            e for e in resumed.journal.entries() if e["kind"] == "legacy-ledger-attribution-failed"
+        ]
+        assert failed and "could not determine" in failed[-1]["error"]
 
 
 def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(project):

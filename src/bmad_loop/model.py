@@ -949,6 +949,13 @@ class VerifyOutcome:
     # A waived gate is recorded whatever the probe managed to say; `None` is a
     # truthful field value, not a reason to withhold the record.
     park_zero_diff: bool | None = None
+    # Stories plan halts waive the same proof-of-work gate for a different
+    # reason: the accepted output is the plan spec itself. Keep their observation
+    # independent of the park-only pair above — the result.json `plan_halt`
+    # marker remains the authority for which leg ran, while this field reports
+    # only what the waived gate would have found. `True` / `False` / `None` have
+    # the same no-diff / diff / unknown meanings as `park_zero_diff`.
+    plan_halt_zero_diff: bool | None = None
 
     @classmethod
     def passed(
@@ -956,11 +963,13 @@ class VerifyOutcome:
         *,
         park_proof_skipped: bool = False,
         park_zero_diff: bool | None = None,
+        plan_halt_zero_diff: bool | None = None,
     ) -> "VerifyOutcome":
         return cls(
             ok=True,
             park_proof_skipped=park_proof_skipped,
             park_zero_diff=park_zero_diff,
+            plan_halt_zero_diff=plan_halt_zero_diff,
         )
 
     @classmethod

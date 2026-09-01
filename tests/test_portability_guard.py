@@ -335,6 +335,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "followup_damped",
         "followup_review_recommended",
         "frm",
+        "generation",
         "graceful",
         "harvest_attempt",
         "head",
@@ -1887,6 +1888,62 @@ def test_no_git_invocation_outside_verify():
         "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_proof_quiet_diff_is_owned_by_the_central_tri_state_probe():
+    """Production has one proof-of-work quiet-diff body across the source tree.
+    Whole-tree and literal public callers route through `_changes_since`;
+    `attempt_dirty` retains the one separate quiet diff whose contract is rollback
+    ownership, not proof of work.
+
+    Ablation: restore `path_changed_since`'s inline `_git(..., "diff",
+    "--quiet", ...)` body and this fails twice — the unexpected owner appears and
+    the literal caller no longer calls the tri-state probe.
+    """
+    quiet_diff_owners: list[tuple[str, str]] = []
+    tri_state_callers: Counter[tuple[str, str]] = Counter()
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, rel: str) -> None:
+            self.rel = rel
+            self.functions: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            owner = self.functions[-1] if self.functions else "<module>"
+            callee = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute) else None
+            )
+            if callee == "_changes_since":
+                tri_state_callers[(self.rel, owner)] += 1
+            if (
+                callee == "_git"
+                and len(node.args) >= 3
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "diff"
+                and isinstance(node.args[2], ast.Constant)
+                and node.args[2].value == "--quiet"
+            ):
+                quiet_diff_owners.append((self.rel, owner))
+            self.generic_visit(node)
+
+    for source in SRC.rglob("*.py"):
+        rel = source.relative_to(SRC).as_posix()
+        Visitor(rel).visit(ast.parse(source.read_text(encoding="utf-8")))
+
+    assert Counter(quiet_diff_owners) == Counter(
+        {("verify.py", "_changes_since"): 1, ("verify.py", "attempt_dirty"): 1}
+    )
+    assert tri_state_callers[("verify.py", "has_changes_since")] == 1
+    assert tri_state_callers[("verify.py", "path_changed_since")] == 1
 
 
 def _verify_command_offenders(findings) -> list[tuple[str, int, str]]:
