@@ -363,7 +363,11 @@ def test_synth_awaiting_operator_is_terminal_and_folds_actions(tmp_path):
         auto_run="awaiting-operator",
         actions="['buy example.com', 'publish the TXT record']",
     )
-    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+    out = devcontract.synthesize_result(
+        sp,
+        story_key="1-1-a",
+        park_marker_session_authored=True,
+    )
 
     assert out.status_consistent
     rj = out.result_json
@@ -422,7 +426,7 @@ def test_synth_repaired_park_marker_cannot_assert_session_ownership(tmp_path):
     )
 
 
-def test_synth_preexisting_genuine_park_marker_cannot_assert_session_ownership(tmp_path):
+def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_provenance(tmp_path):
     sp = _spec(
         tmp_path / "s.md",
         status="awaiting-operator",
@@ -430,11 +434,7 @@ def test_synth_preexisting_genuine_park_marker_cannot_assert_session_ownership(t
         actions="['do it']",
     )
 
-    rj = devcontract.synthesize_result(
-        sp,
-        story_key="1-1-a",
-        park_marker_session_authored=False,
-    ).result_json
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
 
     assert rj["park_asserted"] is False
 
@@ -444,6 +444,15 @@ def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
 
     assert devcontract.auto_run_result_fingerprint(marker) != (
         devcontract.auto_run_result_fingerprint(marker + "\n" + marker)
+    )
+
+
+def test_auto_run_result_fingerprint_detects_an_in_place_marker_rewrite():
+    before = "## Auto Run Result\n\nStatus: done\n"
+    after = "## Auto Run Result\n\nStatus: awaiting-operator\n"
+
+    assert devcontract.auto_run_result_fingerprint(before) != (
+        devcontract.auto_run_result_fingerprint(after)
     )
 
 

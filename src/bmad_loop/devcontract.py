@@ -352,7 +352,7 @@ def synthesize_result(
     story_key: str | None,
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
-    park_marker_session_authored: bool = True,
+    park_marker_session_authored: bool = False,
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 

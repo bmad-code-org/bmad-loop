@@ -4814,6 +4814,178 @@ def test_new_session_marker_asserts_park_after_launch_capture(tmp_path, monkeypa
     assert rj is not None and rj["park_asserted"] is True
 
 
+def test_marker_readback_without_launch_capture_fails_closed(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_launch_capture_precedes_transport_that_writes_park_marker(tmp_path, monkeypatch):
+    """A child that finishes during transport startup still owns its new marker."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    def launch(_adapter, _spec):
+        ours.write_text(
+            "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+            "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+            "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+        )
+        os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+        return _dev_handle(launched_ns=launch_floor)
+
+    monkeypatch.setattr(generic.GenericAdapter, "start_session", launch)
+
+    handle = adapter.start_session(spec)
+    rj = adapter._result_json(handle, spec, wait=False)
+
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_in_place_marker_rewrite_asserts_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: done\nFinished.\n"
+    )
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_deleting_older_marker_does_not_assert_retained_last_marker(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    final_marker = "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    prefix = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+    )
+    ours.write_text(prefix + "## Auto Run Result\n\nStatus: done\nOld.\n\n" + final_marker)
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(prefix + final_marker)
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_moved_launch_marker_does_not_assert_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    old = impl / "spec-old.md"
+    ours = impl / "spec-3-1-foo.md"
+    old.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    launch_floor = old.stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    old.rename(ours)
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_unrelated_unreadable_markdown_does_not_poison_new_spec_capture(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "notes.md").write_bytes(b"\xff")
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = (impl / "notes.md").stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_unreadable_launch_spec_fails_closed_after_becoming_readable(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_bytes(b"\xff")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
+
+
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
     """Same regression through the #224 missing-marker fallback, which #261 predates
     but which added a second identical mtime-only scan of the shared dir. A foreign
