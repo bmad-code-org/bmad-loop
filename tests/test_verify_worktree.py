@@ -6,6 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import subprocess
+import sys
 
 import pytest
 from conftest import git, make_git_noisy, refuse_to_resolve
@@ -115,6 +116,17 @@ def test_worktree_list_reads_stdout_alone(project, monkeypatch):
     monkeypatch.setattr(verify.subprocess, "run", noisy_run)
 
     assert [p.resolve() for p in verify.worktree_list(repo)] == [repo.resolve()]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Win32 forbids newlines in filenames")
+def test_worktree_list_preserves_newlines_in_paths(project, tmp_path):
+    """NUL-delimited porcelain keeps a valid newline inside one path record."""
+    repo = project.project
+    wt = tmp_path / "wt\nline"
+    verify.worktree_add(repo, wt, "newline-path", "main")
+
+    assert wt.resolve() in [path.resolve() for path in verify.worktree_list(repo)]
+    assert verify.worktree_is_registered(repo, wt)
 
 
 def test_worktree_add_create_defaults_to_head(project, tmp_path):

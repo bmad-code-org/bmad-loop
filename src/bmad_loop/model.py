@@ -587,6 +587,30 @@ class StoryTask:
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
 
+    def relativize_project_local_accepted_spec(self, project: Path) -> None:
+        """Make a canonical project-local accepted spec portable to a worktree.
+
+        Only the accepted ``spec_file`` is normalized. Prior-attempt dispatch path
+        and snapshot fields remain byte-for-byte untouched until fresh attempt
+        binding replaces them after the mount opens. Relative values already carry
+        the intended authority, while external, missing, unresolvable, and
+        symlink-external absolute values keep their original spelling. Resolving
+        both sides before containment prevents a lexical in-project path through an
+        outward symlink from being redirected into a replacement checkout.
+        """
+        raw = self.spec_file
+        if not raw or not Path(raw).is_absolute():
+            return
+        try:
+            project_root = project.resolve(strict=True)
+            target = Path(raw).resolve(strict=True)
+            relative = target.relative_to(project_root)
+        except (OSError, RuntimeError, ValueError):
+            return
+        if not target.is_file():
+            return
+        self.spec_file = relative.as_posix()
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
         dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")

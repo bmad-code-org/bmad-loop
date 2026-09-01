@@ -1876,6 +1876,35 @@ def test_preserve_attempt_commits_parks_committed_work(project):
     assert task.preserve_ref == ref  # #333: the ref reaches run state, not just the journal
 
 
+def test_preserve_attempt_commits_pins_the_observed_head(project, monkeypatch):
+    """Range enumeration and ref creation use one HEAD observed before either."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project))
+    task = _task(repo)
+    baseline = task.baseline_commit
+    assert baseline is not None
+    git(repo, "checkout", "-q", "-b", "unrelated", baseline)
+    git(repo, "commit", "--allow-empty", "-q", "-m", "unrelated commit")
+    unrelated = rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "attempt", baseline)
+    git(repo, "commit", "--allow-empty", "-q", "-m", "attempt commit")
+    intended = rev_parse_head(repo)
+    real_commits_above = verify.commits_above
+
+    def move_then_enumerate(repo, baseline, revision="HEAD"):
+        assert revision == intended
+        git(repo, "checkout", "-q", "unrelated")
+        return real_commits_above(repo, baseline, revision)
+
+    monkeypatch.setattr(verify, "commits_above", move_then_enumerate)
+
+    flow.preserve_attempt_commits(task, allow_pause=True)
+
+    assert rev_parse_head(repo) == unrelated
+    assert task.preserve_ref is not None
+    assert git(repo, "rev-parse", task.preserve_ref) == intended
+
+
 def test_preserve_attempt_commits_noop_without_commits(project):
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws)
@@ -1968,8 +1997,8 @@ def test_preserve_attempt_commits_pauses_when_range_unenumerable(project, monkey
 
 
 def test_preserve_attempt_commits_pauses_when_head_read_fails(project, monkeypatch):
-    # The second unguarded call (#343): the range enumerated fine, but the tip the
-    # ref would park at could not be read — still work we cannot park.
+    # The pinned-tip read fails before range enumeration; uncertainty still means
+    # there may be work above baseline that cannot safely be reset away.
     repo = project.project
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws)
