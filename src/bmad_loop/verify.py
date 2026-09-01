@@ -3257,9 +3257,18 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
 
 
 def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
-    """A session-reported ``spec_file`` as a concrete path: an absolute value passes
-    through untouched, a relative one is probed against ``paths.project`` and falls
-    back to ``paths.implementation_artifacts``.
+    """Probe a session-reported ``spec_file`` candidate into a concrete path.
+
+    This lookup binds a reported or persisted spelling inside the current active
+    ``ProjectPaths``. The spelling may come directly from a disposable session or be
+    read from a task and rebound for a current or fresh workspace. An absolute value
+    passes through untouched. A relative value — including a bare basename — is probed
+    against ``paths.project`` first and falls back under
+    ``paths.implementation_artifacts``. When an operation must instead address the tree
+    recorded by the task, use :func:`runs.task_spec_path`, which anchors a bare basename
+    directly on that tree without this fallback. Recovery uses
+    ``recovery_flow.RecoveryFlow._attempt_owned_spec`` to bind restoration to exactly
+    one trusted regular-file candidate after probing both locations.
 
     Neither branch promises the result exists — the fallback is returned unprobed
     when the project candidate is not a file — so every caller re-tests
