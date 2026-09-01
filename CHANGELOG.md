@@ -246,6 +246,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Document spec baseline frontmatter as an optional `verify_dev` attestation**
+  (DW-51), with no-claim acceptance and no-work refusal regressions anchored to
+  the orchestrator-recorded baseline.
+
 - **Restore the original spec when a TUI replan cannot strip its stale result**
   (DW-33), keeping the status reset and result removal atomic before resume.
 
