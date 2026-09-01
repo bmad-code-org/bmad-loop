@@ -162,7 +162,12 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before
-  resuming" advice, since it otherwise resumes in the same gesture. Each re-arm also bumps a per-task
+  resuming" advice, since it otherwise resumes in the same gesture. A successful re-arm returns
+  those rendered notices and its hold verdict as one immutable authoritative outcome, captured
+  only after each journal append succeeds and in append order. The CLI and TUI consume that
+  outcome directly, so an unreadable journal cannot erase a successfully appended hold from the
+  combined re-arm/resume gesture; best-effort journal diffing remains only for diagnostics already
+  appended by a call that aborts before it can return an outcome. Each re-arm also bumps a per-task
   **generation**, so the re-minted session id cannot collide with the abandoned attempt's record — ids
   already on disk keep their exact spelling, since the suffix appears only above generation zero
   (#705). Sweep migration and triage tasks make the same rollover automatically when an

@@ -248,6 +248,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
+
 - **A remount parks an orphaned worktree's uncommitted work before reclaiming its path.**
   `open_unit_workspace` force-removed whatever stood at the deterministic mount path, so the
   directory an isolation flip had "retained for recovery" lost its tracked edits and

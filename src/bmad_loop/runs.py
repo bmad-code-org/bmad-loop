@@ -3961,6 +3961,45 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     )
 
 
+@dataclass(frozen=True)
+class RearmNotice:
+    """One operator-facing notice produced by a successful re-arm."""
+
+    severity: Literal["note", "warning"]
+    message: str
+    next_step: str
+
+
+@dataclass(frozen=True)
+class RearmOutcome:
+    """Authoritative result of a successfully persisted escalation re-arm."""
+
+    story_key: str
+    notices: tuple[RearmNotice, ...]
+    hold_resume: bool
+
+
+class _RearmJournal(Journal):
+    """Journal writer that captures successful re-arm notices at append time."""
+
+    def __init__(self, run_dir: Path):
+        super().__init__(run_dir)
+        self.notices: list[RearmNotice] = []
+        self.hold_resume = False
+
+    def append(self, kind: str, **fields: Any) -> None:
+        # Capture only after the durable append succeeds. The synthetic entry contains
+        # every producer-supplied field the shared classifiers consume; Journal's
+        # self-minted timestamp/log fields are not part of either contract.
+        super().append(kind, **fields)
+        entry = {"kind": kind, **fields}
+        self.hold_resume = rearm_holds_the_resume(entry) or self.hold_resume
+        rendered = rearm_event_notice(entry)
+        if rendered is not None:
+            severity, message, next_step = rendered
+            self.notices.append(RearmNotice(severity, message, next_step))
+
+
 def rearm_escalation(
     run_dir: Path,
     story_key: str | None = None,
@@ -3969,7 +4008,7 @@ def rearm_escalation(
     isolated_redrive: bool,
     resolution_recorded: bool,
     project_root: Path | None = None,
-) -> str:
+) -> RearmOutcome:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
     Flips the escalated task out of its terminal ESCALATED phase back to
@@ -4082,7 +4121,9 @@ def rearm_escalation(
     The generation bump stays UNCONDITIONAL beside the gated stamp: it answers session-id
     reuse (#705), which an abandoned attempt needs exactly as much as a resolved one.
 
-    Returns the re-armed story key. Raises RearmError when the run is not paused at
+    Returns the authoritative re-arm outcome: the story key, the ordered notices
+    whose journal appends succeeded during this call, and whether one of the appended
+    records holds the combined re-arm/resume gesture. Raises RearmError when the run is not paused at
     the escalation stage, the target story is not escalated, or a supplied
     `restore_patch` fails `validate_restore_latch` (the shared precondition set —
     sentinel wedge, spec-less escalation, worktree isolation).
@@ -4116,7 +4157,7 @@ def rearm_escalation(
     # names a directory that is no longer there. See the `project_root` note above.
     live_project = project_root if project_root is not None else Path(state.project)
 
-    journal = Journal(run_dir)
+    journal = _RearmJournal(run_dir)
     # Read before the unconditional overwrite below: they describe the restore
     # attempt this re-arm is abandoning, and the residue block needs both.
     old_latch = task.restore_patch
@@ -4790,7 +4831,7 @@ def rearm_escalation(
         baseline=task.baseline_commit or "",
         restore=bool(restore_patch),
     )
-    return key
+    return RearmOutcome(key, tuple(journal.notices), journal.hold_resume)
 
 
 def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:

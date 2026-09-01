@@ -6298,7 +6298,7 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
     assert (
         runs.rearm_escalation(
             engine.run_dir, "1-1-a", isolated_redrive=True, resolution_recorded=True
-        )
+        ).story_key
         == "1-1-a"
     )
 

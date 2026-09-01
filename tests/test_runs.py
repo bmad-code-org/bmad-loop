@@ -3055,6 +3055,12 @@ def _kinds(run_dir, prefix="stale-restore-"):
     return [e for e in Journal(run_dir).entries() if e["kind"].startswith(prefix)]
 
 
+def _rendered_rearm_notice(entry):
+    rendered = runs.rearm_event_notice(entry)
+    assert rendered is not None
+    return runs.RearmNotice(*rendered)
+
+
 def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     """The abandoned attempt's applied new files must NOT be blessed as
     pre-existing, or finalize_commit's `add -A` sweeps them into the corrected
@@ -3072,7 +3078,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     """
     run_dir, _spec, patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(
+    outcome = runs.rearm_escalation(
         run_dir, isolated_redrive=False, resolution_recorded=True
     )  # from-scratch re-arm replaces the latch
 
@@ -3084,6 +3090,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
     assert excluded[0]["patch"] == str(patch)
+    assert outcome.notices == (_rendered_rearm_notice(excluded[0]),)
     # the probe ran and answered "none" — neither commit record may appear
     assert not _kinds(run_dir, "stale-restore-commits")
     assert not _kinds(run_dir, "rearm-commits-probe-failed")
@@ -3117,7 +3124,7 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     git(tmp_path, "add", "committed.txt")
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
 
-    runs.rearm_escalation(
+    outcome = runs.rearm_escalation(
         run_dir, isolated_redrive=False, resolution_recorded=True
     )  # must not raise RearmError
 
@@ -3128,7 +3135,11 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     assert "FileNotFoundError" in unparseable[0]["error"]
     assert not _kinds(run_dir, "stale-restore-excluded")
     # the unreadable patch must not also cost the human the commits warning
-    assert _kinds(run_dir, "stale-restore-commits")
+    (commits,) = _kinds(run_dir, "stale-restore-commits")
+    assert outcome.notices == (
+        _rendered_rearm_notice(unparseable[0]),
+        _rendered_rearm_notice(commits),
+    )
 
 
 def test_rearm_without_a_stale_latch_journals_no_stale_restore_events(tmp_path):
@@ -3156,7 +3167,7 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
     old_baseline = load_state(run_dir).tasks["1-1-a"].baseline_commit
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.baseline_commit != old_baseline  # baseline advanced past the commit
@@ -3164,6 +3175,11 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     assert len(warned) == 1
     assert warned[0]["old_baseline"] == old_baseline
     assert warned[0]["commits"] == [git(tmp_path, "rev-parse", "HEAD")]
+    (excluded,) = _kinds(run_dir, "stale-restore-excluded")
+    assert outcome.notices == (
+        _rendered_rearm_notice(excluded),
+        _rendered_rearm_notice(warned[0]),
+    )
 
 
 def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_path):
@@ -3191,7 +3207,7 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     task.baseline_commit = "0" * 39 + "1"  # sha-shaped, but names no object
     save_state(run_dir, state)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -3211,6 +3227,10 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     excluded = _kinds(run_dir, "stale-restore-excluded")
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
+    assert outcome.notices == (
+        _rendered_rearm_notice(excluded[0]),
+        _rendered_rearm_notice(probe[0]),
+    )
 
 
 def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
