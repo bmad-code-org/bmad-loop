@@ -82,6 +82,10 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **Remove the unused whole-artifact-folder exclusion helper** (DW-15). Proof-of-work
+  exclusions remain file-granular and rollback protection keeps its workspace-rooted
+  path derivation.
+
 - **Resolve context builds only the mode-specific details its consumer uses.**
   Non-stories runs skip stories-root lookup, and stories sentinels report null frozen-spec
   reachability without probing a spec they do not edit.
@@ -470,9 +474,9 @@ resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` 
   gate probe — the commit-identity lookup, both ancestry checks and `has_changes_since` — asked the
   BMAD project directory about it, so a marker only the project tree held satisfied proof of work
   and a correct attempt was refused forever. The four probes now share the git root, and so do the
-  three exclude sources that feed them. `artifact_relpaths` is deliberately untouched: it has no
-  production caller, and rollback protection builds its own list against the workspace root. No
-  effect where the two roots coincide, which is every other configuration.
+  three file-granular exclude sources that feed them. Rollback protection independently builds its
+  own list against the workspace root. No effect where the two roots coincide, which is every other
+  configuration.
 
 - **`bmad-loop resolve` advances the re-arm baseline in the code tree, and says so when it cannot**
   (#640). The advance read HEAD of the BMAD project directory rather than the git root, and
