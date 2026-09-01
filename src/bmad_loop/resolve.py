@@ -15,6 +15,7 @@ edited frozen spec on disk plus the resolution marker.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -35,6 +36,17 @@ from .runs import (
 )
 
 RESOLVE_DIR = "resolve"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON float: {value}")
+    return parsed
 
 
 def _story_dir(run_dir: Path, story_key: str) -> Path:
@@ -154,7 +166,7 @@ def _gather_escalations(
       global across the pass, not per directory; it removes only exact repeats,
       so a directory holding CRITICAL A in one file and A + B in the other still
       yields both.
-    * the ``except`` tuple and the ``list`` check — ``build_context`` is an
+    * the ``except`` tuple and shared list guard — ``build_context`` is an
       OBSERVATION path: a malformed artifact must cost its own contents and
       nothing more, never raise out to the interactive resolve command.
       ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError`` (the same
@@ -162,11 +174,9 @@ def _gather_escalations(
       also raise a plain ``ValueError`` when an integer exceeds Python's configured
       digit limit. Deeply nested input can raise ``RecursionError`` while either
       parsing the document or canonicalizing an entry, so both operations live
-      under the same artifact-level guard. Meanwhile,
-      ``critical_escalations`` iterates ``escalations`` with no list guard of its
-      own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
-      here. The guard belongs in this caller; the shared predicate stays the
-      single definition of CRITICAL.
+      under the same artifact-level guard. ``critical_escalations`` owns the
+      list-only shape guard shared by every control-loop caller, so malformed
+      ``escalations`` values contribute nothing here just as they do elsewhere.
 
     The watermark is a FOURTH concern layered onto that same single walk, not a
     second pass: ``reversed(task.sessions)`` reaches the unanswered tail first, so
@@ -194,11 +204,15 @@ def _gather_escalations(
         task_dir = run_dir / "tasks" / session.task_id
         for fname in TASK_CYCLE_ARTIFACTS:
             fpath = task_dir / fname
-            if not fpath.is_file():
-                continue
             try:
-                doc = json.loads(fpath.read_text(encoding="utf-8"))
-                if not isinstance(doc, dict) or not isinstance(doc.get("escalations"), list):
+                if not fpath.is_file():
+                    continue
+                doc = json.loads(
+                    fpath.read_text(encoding="utf-8"),
+                    parse_constant=_reject_json_constant,
+                    parse_float=_parse_finite_json_float,
+                )
+                if not isinstance(doc, dict):
                     continue
                 artifact_entries: dict[str, dict[str, Any]] = {}
                 for esc in critical_escalations(doc):
@@ -351,7 +365,7 @@ def build_context(
         context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
     return path, withheld
 
 
