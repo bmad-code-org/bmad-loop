@@ -2350,10 +2350,70 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     reaped port file on a 5 s tick, source-read at v3.3.8), a binary's PATH
     presence is per-process while the server is not, and the listing is
     load-sensitive; so a "proof of absence" either wedges every removal behind
-    `--force` or quietly accepts a refutable proof. The degrade above is the
-    guard's owner's documented trade, kept deliberately; the measured cost of
-    the unobservable-multiplexer window is filed for that owner to revisit
-    rather than overturned here.
+    `--force` or quietly accepts a refutable proof.
+
+    Revisited with the cost measured (#732), and the degrade is KEPT — not for
+    want of a stronger read, but because the more dangerous of the two costs
+    reaches this function as an ordinary answer. On psmux 3.3.8 a live session's
+    registry entry is reaped by any `has-session` whose 500 ms connect does not
+    land, and until the server's registry maintenance re-writes it the listing
+    does not name that session while reporting no fault at all: exit **0**, no
+    stderr (measured; the listing empty in that run because the session was the
+    only one, the server pid alive throughout, the entry back 1.7 s later).
+    That maintenance runs when the server's own loop notices 5 s have elapsed —
+    a nominal interval, not a scheduling guarantee, so 1.7 s is a sample and 5 s
+    is not a bound. The listing therefore does not fail, it answers wrongly —
+    and the read this guard makes is the one with no discrimination in it at
+    all. ``mux_sessions()`` lands on ``BaseTmuxBackend.list_sessions``, which
+    returns ``[]`` under the three conditions its own comment names — the binary
+    is missing, no server is running, or the query fails, that last one being
+    the raise — and says nothing about which (the
+    diagnostic #525 added, ``_warn_unproven_listing``, is on ``session_options``
+    and the window path, not here). The reap does not even reach those
+    branches: the exit is 0. So
+    there is neither a signal to condition on nor a word on stderr about it.
+
+    The second cost lasts as long as its cause: a process whose PATH lacks the
+    binary reads every session as absent for as long as that PATH does (measured
+    through the seam — the sessions reappear when PATH is restored), because the
+    binary is per-process while the server is not. That one is no mystery to the
+    transport: ``list_sessions`` decides it from ``shutil.which`` on purpose,
+    being one of the two methods that report what exists, and folds it into the
+    same ``[]`` deliberately (its own comment: the absence of sessions and the
+    absence of the multiplexer are indistinguishable here). The fold is the
+    seam's decision; what reaches this function is its result.
+
+    What the two costs share is not a shape but a verdict. A reap takes one
+    session's entry, so its listing may still name every other session on the
+    box; a missing binary yields nothing at all. Both arrive as the same
+    *negative membership* — this run's name is not in the listing — which is
+    exactly what a genuinely dead session produces, and there is no fourth
+    answer to distinguish them by.
+
+    The named alternatives were weighed and refused. Retry-with-delay, in the
+    shape this guard could hold, pays a delay on every removal that finds no
+    session — the common case — once per run inside `clean`; a retry hoisted to
+    command scope would pay it once, but neither can bound a window whose close
+    is a nominal tick rather than a deadline. A tag-first read draws on the same
+    listing and is blind in exactly the same window. Warning whenever the
+    multiplexer is unusable fires on every box that simply has no multiplexer,
+    which is the noise ``BaseTmuxBackend._warn_unproven_listing`` already stays
+    silent about. What is left is the accepted ceiling, written down here and in
+    docs/FEATURES.md so an operator meets it as a documented limit rather than a
+    surprise.
+
+    The psmux half is a *defect*, not a design: four sibling reap sites in that
+    binary gate on `ConnectionRefused` precisely because "a timeout means
+    busy-but-alive and must not be deleted" (its own comment), the `has-session`
+    site does not, and tmux 3.4 blocks rather than reaps under the same
+    treatment (measured). Reported as psmux/psmux#622, which is the thing to
+    watch. Retiring it takes two parties, though, and an upstream fix alone is
+    not enough: the reap window closes for this project once a psmux release
+    repairs that site AND the supported floor is raised to that release or
+    later, since an installed 3.3.8 keeps reaping whatever master does. And it
+    retires only itself — the PATH case is ours, and so are the two arms above
+    it, a backend that cannot be selected and a listing that raises. What that
+    fix removes is one measured case, not the ceiling.
 
     Two registry-root-era additions on that unchanged contract:
 
