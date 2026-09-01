@@ -335,7 +335,7 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
-def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
+def test_rebase_spec_paths_on_reanchors_both_ownership_fields(tmp_path):
     """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
 
     `to_dict` relativizes `spec_file` and `dispatched_spec_file` together, so a
@@ -343,7 +343,7 @@ def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
     values are already anchored (a spec outside the mount persists verbatim) and
     must pass through, which is also what makes the call idempotent.
     """
-    mount = Path("/repo/.bmad-loop/runs/r1/worktrees/1-1-a")
+    mount = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1-1-a"
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
@@ -362,7 +362,7 @@ def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
     assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
 
 
-def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
+def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched(tmp_path):
     """An out-of-mount spec and an unbound field are both already correct.
 
     `_serialized_worktree_path` keeps a path verbatim exactly when
@@ -372,10 +372,10 @@ def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
     becoming the mount root: `Path("")` is `.`, so a bare join would answer the
     tree root, which is a write target, not a spec.
     """
-    outside = str(Path("/elsewhere/spec.md"))
+    outside = str(tmp_path / "outside" / "spec.md")
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=outside)
 
-    task.rebase_spec_paths_on(Path("/repo/wt"))
+    task.rebase_spec_paths_on(tmp_path / "alternate-root" / "wt")
 
     assert task.spec_file == outside
     assert task.dispatched_spec_file is None

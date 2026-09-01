@@ -1069,11 +1069,12 @@ def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
     # this assertion no row in the repo observed ANY `gates.notify` body, so every
     # notification site could be reverted to a bare `task.spec_file` with the suite green.
     #
-    # Ablation: revert `_pause_plan_checkpoint`'s notify to `task.spec_file` and this
-    # reddens — the bare relpath appears and the anchored path does not.
+    # INVERSE ablation: replace only `_pause_plan_checkpoint`'s notification
+    # `_operator_spec_path(task)` call with `task.spec_file`; this focused test
+    # reddens because the bare relpath appears and the anchored path does not.
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert str(wt / rel) in attention
-    assert f"review {rel}," not in attention  # not the un-anchored spelling
+    assert f"review the planned spec {rel}," not in attention
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
