@@ -39,7 +39,16 @@ from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, SpecSnapshot
+from .base import (
+    CodingCLIAdapter,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    SpecSnapshot,
+    reset_task_prompt,
+    validate_adapter_artifact_paths,
+    validated_task_directory,
+)
 
 # Re-exported for importers that predate the env_fault module split (#194 landed
 # these names on this module); the definitions now live in .env_fault. The
@@ -538,9 +547,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        task_dir = self.tasks_dir / spec.task_id
+        task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        validate_adapter_artifact_paths(
+            task_dir,
+            tuple(
+                task_dir / name
+                for name in (
+                    "heartbeat.json",
+                    "resultless-stops.jsonl",
+                    "session-lifecycle.jsonl",
+                )
+            ),
+        )
+        validate_adapter_artifact_paths(
+            self.logs_dir,
+            (self.logs_dir / f"{spec.task_id}.log",),
+        )
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
+        reset_task_prompt(task_dir, spec.prompt)
         # Task ids are supplied by the caller, so defensively reset cycle-scoped
         # outputs if one is reused. A silent session must not inherit a stale result.
         # The list is `journal.TASK_CYCLE_ARTIFACTS` rather than two literals here:

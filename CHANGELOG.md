@@ -246,6 +246,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Confine built-in adapter task directories** (DW-74), refusing unsafe task ids and
+  symlink- or junction-redirected task directories before prompt, artifact, log, or
+  transport side effects.
+
 - **Treat embedded-NUL verify commands and working directories as typed environment
   faults** (DW-53, DW-54), while documenting that stream retention degrades but
   journal record writes remain fail-loud.
