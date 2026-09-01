@@ -4168,12 +4168,13 @@ class CommandResult:
     code at all: the child was never started. The typical cause is the ``cwd``
     it was to run in — missing, not a directory, or unsearchable — and the
     message names that directory as context, but the fault is caught as any
-    spawn-time ``OSError`` and the set is not closed: a missing shell, EMFILE
-    or ENOMEM reach the same field, and the wrapped exception is what says
-    which. ``None`` on every result that came from a process that actually ran —
-    including a timeout, which ran and hung. It is LAST and defaulted because the
-    construction sites pass three to seven POSITIONAL arguments; a field inserted
-    anywhere else would silently re-bind them.
+    spawn-time ``OSError`` or ``ValueError`` and the set is not closed: a missing
+    shell, EMFILE, ENOMEM, or an embedded NUL reach the same field, and the
+    wrapped exception is what says which. ``None`` on every result that came from
+    a process that actually ran — including a timeout, which ran and hung. It is
+    LAST and defaulted because the construction sites pass three to seven
+    POSITIONAL arguments; a field inserted anywhere else would silently re-bind
+    them.
     """
 
     command: str
@@ -4432,17 +4433,6 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 errors="replace",
                 timeout=COMMAND_TIMEOUT_S,
             )
-            stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
-            stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
-            # merged from the ceilinged streams, not the raw pair: 2000 chars sits
-            # far below the ceiling, so the tail is identical while the full
-            # concatenation — a transient copy of both whole streams — is not built.
-            output = (stdout + stderr)[-2000:]
-            results.append(
-                CommandResult(
-                    command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
-                )
-            )
         except subprocess.TimeoutExpired as exc:
             # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
             # is exactly the one that may have been spewing output when it died.
@@ -4451,15 +4441,18 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
             results.append(
                 CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
             )
-        except OSError as exc:
+            continue
+        except (OSError, ValueError) as exc:
             # The child was never started, so no exit status exists to classify:
             # `subprocess.run` raises out of the fork/exec (or CreateProcess)
             # itself when `cwd` is unusable — FileNotFoundError (missing),
             # NotADirectoryError (a regular file, or a path beneath one),
-            # PermissionError (a directory without +x). `except OSError` rather
-            # than the three names because they are the reachable shapes TODAY,
-            # not a closed set: the base class is what the platform actually
-            # guarantees, and one uncaught sibling here crashes the whole run.
+            # PermissionError (a directory without +x) — or raises ValueError
+            # before spawn when the command or cwd contains an embedded NUL.
+            # The OSError arm uses the base class rather than the three names
+            # because they are the reachable OS shapes TODAY, not a closed set:
+            # the base class is what the platform actually guarantees, and one
+            # uncaught sibling here crashes the whole run.
             #
             # Translated instead of raised, the same doctrine `_run_git` follows
             # for the faults that land before a return code exists (#343): left
@@ -4487,6 +4480,23 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                     spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
                 )
             )
+            continue
+
+        # Keep result processing outside the spawn-fault handler. A ValueError
+        # here is a programmer defect, not rejected process configuration, and
+        # must remain fail-loud rather than being mislabeled as an environment
+        # fault.
+        stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
+        stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
+        # merged from the ceilinged streams, not the raw pair: 2000 chars sits
+        # far below the ceiling, so the tail is identical while the full
+        # concatenation — a transient copy of both whole streams — is not built.
+        output = (stdout + stderr)[-2000:]
+        results.append(
+            CommandResult(
+                command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
+            )
+        )
     return results
 
 
