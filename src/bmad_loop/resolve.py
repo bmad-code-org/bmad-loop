@@ -15,6 +15,7 @@ edited frozen spec on disk plus the resolution marker.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -37,6 +38,17 @@ from .runs import (
 )
 
 RESOLVE_DIR = "resolve"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON float: {value}")
+    return parsed
 
 
 def _story_dir(run_dir: Path, story_key: str) -> Path:
@@ -142,7 +154,7 @@ def _gather_escalations(
       global across the pass, not per directory; it removes only exact repeats,
       so a directory holding CRITICAL A in one file and A + B in the other still
       yields both.
-    * the ``except`` tuple and the ``list`` check — ``build_context`` is an
+    * the ``except`` tuple and shared list guard — ``build_context`` is an
       OBSERVATION path: a malformed artifact must cost its own contents and
       nothing more, never raise out to the interactive resolve command.
       ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError`` (the same
@@ -150,11 +162,13 @@ def _gather_escalations(
       also raise a plain ``ValueError`` when an integer exceeds Python's configured
       digit limit. Deeply nested input can raise ``RecursionError`` while either
       parsing the document or canonicalizing an entry, so both operations live
-      under the same artifact-level guard. Meanwhile,
-      ``critical_escalations`` iterates ``escalations`` with no list guard of its
-      own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
-      here. The guard belongs in this caller; the shared predicate stays the
-      single definition of CRITICAL.
+      under the same artifact-level guard. ``critical_escalations`` owns the
+      list-only shape guard shared by every control-loop caller, so malformed
+      ``escalations`` values contribute nothing here just as they do elsewhere.
+      This reader re-checks the shape only AFTER that selector has run, and not
+      to avoid a crash: the recheck decides whether the artifact counts as READ,
+      so a wrong-shaped one reaches ``skipped`` instead of passing for an empty
+      one — see that parameter's note below.
     * the ``stat`` classification and its ``S_ISREG`` check — deciding ABSENT from
       UNREADABLE cannot go through ``Path.is_file()``, whose error behavior splits by
       interpreter. Through 3.13 it re-raises anything outside
@@ -240,7 +254,11 @@ def _gather_escalations(
             if not S_ISREG(st.st_mode):
                 continue
             try:
-                doc = json.loads(fpath.read_text(encoding="utf-8"))
+                doc = json.loads(
+                    fpath.read_text(encoding="utf-8"),
+                    parse_constant=_reject_json_constant,
+                    parse_float=_parse_finite_json_float,
+                )
                 if not isinstance(doc, dict):
                     raise ValueError("artifact is not a JSON object")
                 if "escalations" not in doc:
@@ -249,11 +267,23 @@ def _gather_escalations(
                     # skip — counting it as one would withhold coverage from every
                     # resolve cycle, permanently.
                     continue
-                if not isinstance(doc["escalations"], list):
-                    raise ValueError("'escalations' is not a list")
                 artifact_entries: dict[str, dict[str, Any]] = {}
                 for esc in critical_escalations(doc):
                     artifact_entries.setdefault(json.dumps(esc, sort_keys=True), esc)
+                if not isinstance(doc["escalations"], list):
+                    # Deliberately AFTER the selector, and no longer a crash guard:
+                    # ``escalation._escalation_list`` absorbs a non-list at the shared
+                    # predicate, which is the single definition of what CONTRIBUTES and
+                    # must run for this artifact too, so this reader keeps no private
+                    # shape guard that could drift from the engine and sweep callers.
+                    # What the predicate cannot answer is whether the artifact was
+                    # READ, and that is this walk's own question: an ``escalations`` key
+                    # holding the wrong shape is, from here, indistinguishable from a
+                    # file truncated mid-write. Raise so it reaches ``skipped`` by the
+                    # same ``except`` the other read faults use, and the watermark
+                    # cannot launder it into durable coverage. Nothing is discarded —
+                    # the selector already answered a non-list with no entries.
+                    raise ValueError("'escalations' is not a list")
             except (OSError, ValueError, RecursionError):
                 if skipped is not None and target is found:
                     skipped.add(str(fpath))
@@ -420,7 +450,7 @@ def build_context(
         context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
     return path, withheld, len(unreadable)
 
 

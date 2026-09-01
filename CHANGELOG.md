@@ -270,6 +270,9 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- Reject malformed session escalation/result artifacts and non-finite resolve JSON
+  (DW-86, DW-89).
+
 - **Confine built-in adapter task directories** (DW-74), refusing unsafe task ids and
   symlink- or junction-redirected task directories before prompt, artifact, log, or
   transport side effects.
