@@ -246,6 +246,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Restore the original spec when a TUI replan cannot strip its stale result**
+  (DW-33), keeping the status reset and result removal atomic before resume.
+
 - **Document the three story-spec path resolvers and their distinct ownership
   contracts** (DW-17, DW-18, DW-36). Persisted-task anchoring, session-reported
   candidate probing, and exact attempt recovery binding now cross-reference one
