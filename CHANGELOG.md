@@ -251,6 +251,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
 - **The review-budget rescue and the timeout salvage route on the tree in hand, not on
   live policy.** Both selected on `scm.isolation` alone, so an accepted continuation that
   reopened a recorded mount after a `"worktree" -> "none"` flip took the in-place arm: the

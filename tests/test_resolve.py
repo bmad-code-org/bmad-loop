@@ -10,7 +10,7 @@ from conftest import escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
-from bmad_loop.journal import load_state, save_state
+from bmad_loop.journal import JOURNAL_FILE, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
@@ -832,10 +832,10 @@ def test_rearm_flips_phase_and_spec_status(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    key = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-    assert key == "6-4-cli-list-command"
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert outcome.story_key == "6-4-cli-list-command"
     state = load_state(run_dir)
-    task = state.tasks[key]
+    task = state.tasks[outcome.story_key]
     assert task.phase == Phase.PENDING
     assert task.attempt == 0
     assert task.review_cycle == 0
@@ -899,7 +899,7 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
         tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["story_key"] == "6-4-cli-list-command"
@@ -911,6 +911,29 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
     assert severity == "warning"
     assert "commit the corrected spec" in message
     assert next_step
+    assert runs.RearmNotice(severity, message, next_step) in outcome.notices
+    assert outcome.hold_resume is True
+
+
+def test_rearm_real_hold_survives_an_unreadable_journal(tmp_path):
+    """Successful control flow comes from the outcome, never a journal re-read."""
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
+    )
+    journal = run_dir / JOURNAL_FILE
+    journal.write_bytes(b"\xff\xfe pre-existing non-UTF-8 journal\n")
+    with pytest.raises(UnicodeDecodeError):
+        journal.read_text(encoding="utf-8")
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+
+    assert outcome.hold_resume is True
+    assert len(outcome.notices) == 1
+    assert "land in a tree it discards" in outcome.notices[0].message
+    assert "Commit the corrected spec" in outcome.notices[0].next_step
 
 
 def test_rearm_completes_on_an_unreachable_spec_it_could_not_capture(tmp_path, monkeypatch):
@@ -1533,8 +1556,8 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    returned = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-    assert returned == key
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert outcome.story_key == key
 
     # sentinel deleted from disk, a copy preserved under the run dir
     assert not sentinel.exists()
@@ -1703,7 +1726,7 @@ def test_rearm_rejects_restore_patch_for_a_worktree_executed_task(tmp_path):
     assert task.restore_patch is None
     # a from-scratch re-arm of the same task is unaffected — the guard is latch-only
     assert (
-        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True).story_key
         == "6-4-cli-list-command"
     )
 
@@ -2394,7 +2417,8 @@ def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
     )
 
     assert (
-        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True) == key
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True).story_key
+        == key
     )  # must not raise
     assert not sentinel.exists()  # cleared by deletion
     assert (run_dir / "sentinels" / f"{key}-unresolved.md").is_file()  # copy preserved
@@ -4084,12 +4108,14 @@ def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redriv
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
 
     assert not sentinel.exists()  # the sentinel really was cleared on every row
     records = _upstream_records(run_dir)
     assert bool(records) is warns
+    assert outcome.hold_resume is warns
     if not warns:
+        assert outcome.notices == ()
         return
     (rec,) = records
     # the FOLDER the correction lands in — the main checkout's, not `task_stories_root`'s
@@ -4102,6 +4128,28 @@ def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redriv
     assert severity == "warning"
     assert "SPEC.md" in message and "stories.yaml" in message
     assert next_step == "Commit the corrected SPEC.md / stories.yaml on `main` before resuming"
+    assert outcome.notices == (runs.RearmNotice(severity, message, next_step),)
+
+
+def test_rearm_hold_is_independent_of_notice_rendering(tmp_path, monkeypatch):
+    """A hold record remains authoritative even when it has no renderable notice."""
+    run_dir, _, _ = _sentinel_run(
+        tmp_path, committed_intent=WEDGED_INTENT, working_intent=CORRECTED_INTENT
+    )
+    monkeypatch.chdir(tmp_path)
+    real_notice = runs.rearm_event_notice
+    monkeypatch.setattr(
+        runs,
+        "rearm_event_notice",
+        lambda entry: (
+            None if entry.get("kind") == "rearm-upstream-write-unreachable" else real_notice(entry)
+        ),
+    )
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+
+    assert outcome.hold_resume is True
+    assert outcome.notices == ()
 
 
 @pytest.mark.parametrize(
@@ -4250,13 +4298,19 @@ def test_rearm_of_a_sentinel_survives_a_project_that_is_not_a_repository(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    assert (
-        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True) == key
+    outcome = runs.rearm_escalation(
+        run_dir, isolated_redrive=True, resolution_recorded=True
     )  # no GitError
+    assert outcome.story_key == key
 
     assert not sentinel.exists()  # the destructive half still completed
     (rec,) = _upstream_records(run_dir)
     assert runs.rearm_holds_the_resume(rec) is True
+    assert outcome.hold_resume is True
+    # The upstream hold is appended before the baseline diagnostics and must remain
+    # first in the immutable outcome.
+    assert "sentinel was cleared" in outcome.notices[0].message
+    assert "could not advance the re-drive baseline" in outcome.notices[1].message
 
 
 def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_path, monkeypatch):
