@@ -2229,6 +2229,58 @@ def test_unusable_cwd_yields_one_result_per_command(tmp_path):
     assert "second-check" not in outcome.reason and "third-check" not in outcome.reason
 
 
+def test_embedded_nul_command_is_an_environment_fault_and_later_command_runs(tmp_path):
+    """A pre-spawn ValueError is typed without shortening the result list.
+
+    The valid second command proves the loop continues after rejecting only the
+    first command. Ablation: remove ``ValueError`` from the spawn handler and the
+    raw exception escapes before the second command runs.
+    """
+    invalid = f"{_OK}\x00ignored"
+    policy = Policy(verify=VerifyPolicy(commands=(invalid, _OK)))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    assert [result.command for result in results] == [invalid, _OK]
+    rejected, completed = results
+    assert rejected.returncode == verify.SPAWN_FAULT_RC
+    assert rejected.spawn_error is not None and "ValueError" in rejected.spawn_error
+    assert "ValueError" in rejected.output_tail
+    assert completed.returncode == 0 and completed.spawn_error is None
+    outcome = verify.verify_command_results_outcome(results, tmp_path)
+    assert not outcome.ok and outcome.env_fault
+    assert not outcome.retryable and not outcome.fixable
+
+
+def test_embedded_nul_cwd_yields_one_spawn_fault_per_command(tmp_path):
+    """An invalid cwd rejects every spawn but still yields one typed result each."""
+    cwd = Path(f"{tmp_path}\x00invalid")
+    commands = (_OK, _OK)
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, cwd)
+
+    assert [result.command for result in results] == list(commands)
+    assert all(result.returncode == verify.SPAWN_FAULT_RC for result in results)
+    assert all(result.spawn_error and "ValueError" in result.spawn_error for result in results)
+    outcome = verify.verify_command_results_outcome(results, cwd)
+    assert not outcome.ok and outcome.env_fault
+    assert not outcome.retryable and not outcome.fixable
+
+
+def test_value_error_after_process_creation_remains_fail_loud(tmp_path, monkeypatch):
+    """Only subprocess creation ValueErrors belong to the spawn-fault taxonomy."""
+
+    def broken_result_processing(_text, _max_bytes):
+        raise ValueError("result processing defect")
+
+    monkeypatch.setattr(verify, "byte_tail", broken_result_processing)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    with pytest.raises(ValueError, match="result processing defect"):
+        verify.run_verify_commands(policy, tmp_path)
+
+
 def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch):
     """The handler is `except OSError`, not three named cwd classes — and the
     record must not describe every one of them as a directory problem.

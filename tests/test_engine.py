@@ -499,6 +499,27 @@ def test_verify_stream_capture_disabled_writes_no_files_and_still_journals(proje
     assert entry["output_tail"] == "tail"
 
 
+def test_verify_result_journal_append_failure_propagates(project, monkeypatch):
+    """The durable record is fail-loud even though stream retention can degrade.
+
+    Ablation: remove the append or catch its OSError and the expected exception
+    is not raised.
+    """
+    engine = _capture_engine(project, 0)
+
+    def failing_append(*_args, **_kwargs):
+        raise OSError("journal.jsonl is not writable")
+
+    monkeypatch.setattr(engine.journal, "append", failing_append)
+
+    with pytest.raises(OSError, match="journal.jsonl is not writable"):
+        engine._journal_verify_command_results(
+            StoryTask(story_key="1-1-a", epic=1),
+            "dev",
+            (verify.CommandResult("pytest -q", 0, "tail"),),
+        )
+
+
 def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(project, monkeypatch):
     """A failed retain is an observation loss, never a lost run (AGENTS.md).
 

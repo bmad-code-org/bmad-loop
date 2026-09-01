@@ -4786,12 +4786,12 @@ class Engine:
         still lands, still carrying the full byte count, because "nothing was
         retained" and "the command was silent" are different facts.
 
-        This is observation, so it degrades and never raises (AGENTS.md).  An
-        ``OSError`` from the write — ENOSPC, a read-only run dir, ENAMETOOLONG on
-        a path this composition did not shorten enough — is journalled as
-        ``capture_error`` beside a null pointer and the verification continues.
-        The alternative is a lost log killing a dev pass whose commands passed,
-        which trades a diagnostic for the run it was there to diagnose.
+        Stream retention is best-effort observation.  An ``OSError`` from the
+        stream write — ENOSPC, a read-only run dir, ENAMETOOLONG on a path this
+        composition did not shorten enough — is journalled as ``capture_error``
+        beside a null pointer and verification continues.  The journal record
+        itself is durable run state, not degradable capture: ``Journal.append``
+        remains unguarded and any failure propagates fail-loud.
 
         No results means no records, and therefore no sequence: the ordinal is
         allocated only when at least one record lands, so it never runs ahead of

@@ -246,6 +246,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Treat embedded-NUL verify commands and working directories as typed environment
+  faults** (DW-53, DW-54), while documenting that stream retention degrades but
+  journal record writes remain fail-loud.
+
 - Make successful escalation re-arms return authoritative ordered notices and a resume-hold
   verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
 
