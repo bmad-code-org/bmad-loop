@@ -237,6 +237,119 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-teardown-degraded" not in kinds
 
 
+def test_local_absolute_ignored_accepted_spec_is_seeded_and_bound_in_mount(project):
+    """Relativizing an accepted spec also delivers it to a tracked-only checkout."""
+    rel = "_bmad-output/implementation-artifacts/accepted-untracked.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    observed: dict[str, object] = {}
+
+    def bind_then_defer(current):
+        engine._bind_dispatched_spec_for_attempt(current)
+        observed["path"] = current.dispatched_spec_file
+        observed["snapshot"] = current.dispatched_spec_snapshot
+        observed["root"] = engine.workspace.root
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, bind_then_defer)
+
+    mounted_root = observed["root"]
+    assert isinstance(mounted_root, Path)
+    assert observed["path"] == str(mounted_root / rel)
+    assert observed["snapshot"] == b"accepted operator bytes\n"
+
+
+def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
+    """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
+    rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"ignored accepted bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    old_dispatch = str(project.project / ".bmad-loop" / "runs" / "old" / "spec.md")
+    old_snapshot = b"prior dispatch bytes\x00"
+    task = StoryTask(
+        "1-1-a",
+        1,
+        spec_file=str(accepted),
+        dispatched_spec_file=old_dispatch,
+        dispatched_spec_snapshot=old_snapshot,
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: dict[str, object] = {}
+
+    def bind_fresh_attempt(current):
+        observed["prior_path"] = current.dispatched_spec_file
+        observed["prior_snapshot"] = current.dispatched_spec_snapshot
+        engine._bind_dispatched_spec_for_attempt(current)
+        observed["accepted"] = current.spec_file
+        observed["bound"] = current.dispatched_spec_file
+        observed["snapshot"] = current.dispatched_spec_snapshot
+        observed["root"] = engine.workspace.root
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, bind_fresh_attempt)
+
+    mounted_root = observed["root"]
+    assert isinstance(mounted_root, Path)
+    assert observed["prior_path"] == old_dispatch
+    assert observed["prior_snapshot"] == old_snapshot
+    assert observed["accepted"] == rel
+    assert observed["bound"] == str(mounted_root / rel)
+    assert observed["snapshot"] == b"ignored accepted bytes\n"
+
+
+def test_relocated_accepted_spec_disappearance_does_not_bind_fallback(project):
+    """A normalized absolute spec keeps its exact project-path authority.
+
+    Ablation: resolve the seed through the ordinary relative fallback and omit
+    the mounted-file gate; the nested fallback is bound after the accepted source
+    disappears between normalization and seeding.
+    """
+    from bmad_loop.engine import RunPaused
+
+    rel = "_bmad-output/implementation-artifacts/accepted-race.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+    fallback = project.implementation_artifacts / rel
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    fallback.write_bytes(b"unrelated fallback bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    real_open = engine._worktree_flow._open_unit_workspace
+
+    def open_then_remove_source(*args, **kwargs):
+        unit = real_open(*args, **kwargs)
+        accepted.unlink()
+        return unit
+
+    engine._worktree_flow._open_unit_workspace = open_then_remove_source
+    drove: list[bool] = []
+
+    with pytest.raises(RunPaused, match="accepted spec.*disappeared"):
+        engine._run_isolated(task, lambda _task: drove.append(True))
+
+    assert drove == []
+    assert task.phase == Phase.ESCALATED
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount(project, tmp_path):
     """A shared install outside the repo passes main's through-link resolution but
@@ -1317,15 +1430,19 @@ def test_started_merge_replay_failure_does_not_carry_harvest(project, monkeypatc
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
-    worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
-    source = rev_parse_head(project.project)
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    source = rev_parse_head(unit.path)
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=Phase.DONE,
-        worktree_path=str(worktree),
-        branch="bmad-loop/test-run/1-1-a",
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
         commit_sha=source,
         harvested_deferrals=[_harvest_record()],
     )
@@ -1974,6 +2091,151 @@ def test_worktree_reopen_reabsolutizes_both_spec_ownership_paths(project, tmp_pa
     assert task.dispatched_spec_file == outside_dispatched
 
 
+def test_reopen_rejects_existing_directory_that_is_not_the_recorded_worktree(project, monkeypatch):
+    """A plain directory below main must not make git fall back to main on resume."""
+    from bmad_loop.engine import RunPaused
+
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    fake = engine.run_dir / "worktrees" / "plain-directory"
+    fake.mkdir(parents=True)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(fake),
+        branch="bmad-loop/test-run/1-1-a",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_reopen_rejects_symlink_alias_to_recorded_worktree(project, monkeypatch):
+    """A retargetable alias is not the exact persisted mount ownership claim."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    alias = unit.path.parent / "recorded-alias"
+    alias.symlink_to(unit.path, target_is_directory=True)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(alias),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("checkout", ["wrong-branch", "detached"])
+def test_reopen_rejects_registered_mount_on_wrong_recorded_branch(project, monkeypatch, checkout):
+    """Registration is not ownership when the linked checkout changed branch."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    if checkout == "wrong-branch":
+        git(unit.path, "checkout", "-q", "-b", "operator-branch")
+    else:
+        git(unit.path, "checkout", "-q", "--detach")
+    assert verify.worktree_is_registered(project.project, unit.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="not recorded branch"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("damage", ["missing-marker", "foreign-repository"])
+def test_reopen_rejects_corrupted_but_registered_mount(project, monkeypatch, damage):
+    """Toplevel and common-dir identity fail closed before any continuation."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    if damage == "missing-marker":
+        (unit.path / ".git").unlink()
+    else:
+        shutil.rmtree(unit.path)
+        unit.path.mkdir()
+        git(unit.path, "init", "-q")
+        git(unit.path, "config", "user.email", "test@example.com")
+        git(unit.path, "config", "user.name", "Test User")
+        git(unit.path, "commit", "--allow-empty", "-q", "-m", "foreign root")
+    assert unit.path.resolve() in [path.resolve() for path in worktree_list(project.project)]
+    assert not verify.worktree_is_registered(project.project, unit.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
 def test_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(project, monkeypatch):
     """The restart arm destroys the only tree that can resolve the persisted spelling.
 
@@ -2304,25 +2566,16 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
     assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
 
 
-def test_isolation_flip_releases_the_mount_on_the_continuation_arms_too(project, monkeypatch):
-    """Every non-isolated leg undoes the re-anchor, not just the restart arm.
+def test_isolation_flip_keeps_the_mount_for_an_accepted_continuation(project, monkeypatch):
+    """Recorded ownership wins over live policy until accepted work is integrated.
 
-    `_finish_inflight` re-anchors `spec_file` INTO the recorded mount unconditionally,
-    above the `isolated` gate. Three arms below then reach the MAIN workspace on their
-    non-isolated legs and `return` without ever reaching the restart arm that first
-    carried the release — the spec-approval `DEV_VERIFY` continuation graded here, the
-    recorded-result `_resumable_session` continuation and the `COMMITTING` finalizer.
-    Left unreleased, each continues with `spec_file` absolutized into a mount the run
-    has already left: `_dispatched_spec_for_attempt` resolves that `strict=True`,
-    raises, and leaves the attempt unbound, and an explicit-spec prompt meets the
-    snapshot gate with nothing bound.
+    The worktree path is persisted state while ``self._isolated`` is live policy for
+    the next attempt. A verified DEV_VERIFY continuation must therefore reopen the
+    exact mount after ``worktree -> none`` instead of releasing its accepted spec and
+    running in main.
 
-    Graded at the moment the continuation RUNS, not on the saved state — the defect is
-    what the arm consumes, and a later save could launder it. That is also why this
-    cannot be folded into the restart-arm row above: that one never enters an arm.
-
-    Ablation: drop `self._release_orphaned_mount(task)` from the `DEV_VERIFY` else-leg
-    and `seen["spec_file"]` becomes the absolute path into the mount.
+    Ablation: gate the DEV_VERIFY reopen on ``self._isolated`` and the observed paths
+    are released to main (and ``isolation-flip-orphaned-worktree`` is journaled).
     """
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     in_place = Policy(
@@ -2333,17 +2586,23 @@ def test_isolation_flip_releases_the_mount_on_the_continuation_arms_too(project,
     engine, _ = make_engine(project, [], policy=in_place)
     assert not engine._isolated  # the premise: live policy says in-place
 
-    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    mount = unit.path
     rel = "_bmad-output/accepted.md"
     (mount / rel).parent.mkdir(parents=True, exist_ok=True)
     (mount / rel).write_text("# spec\n", encoding="utf-8")
 
     task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
-    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.worktree_path = str(mount)  # persisted ownership survives the policy flip
+    task.branch = unit.branch
     task.spec_file = rel  # persisted RELATIVE, as `_serialized_worktree_path` writes it
     task.dispatched_spec_file = rel
     task.dispatched_spec_snapshot = b"pre-launch bytes"
-    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_commit = unit.baseline
     task.baseline_untracked = []
     engine.state.tasks["1-1-a"] = task
 
@@ -2362,14 +2621,11 @@ def test_isolation_flip_releases_the_mount_on_the_continuation_arms_too(project,
     engine._finish_inflight()
 
     assert seen, "the DEV_VERIFY continuation arm never ran"
-    # the arm acts on the spelling the MAIN workspace re-probes, not the orphan's
-    assert seen["spec_file"] == rel
-    assert seen["spec_file"] != str(mount / rel)
-    assert seen["dispatched"] is None  # the attempt died with its tree
-    assert seen["worktree_path"] == ""  # the claim is dropped BEFORE the arm acts
-    assert seen["baseline_commit"] is None  # unit operands never reach the main checkout
-    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
-    assert mount.is_dir()  # released, not deleted
+    assert seen["spec_file"] == str(mount / rel)
+    assert seen["dispatched"] == str(mount / rel)
+    assert seen["worktree_path"] == str(mount)
+    assert seen["baseline_commit"] == rev_parse_head(project.project)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
 
 
 def test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path(project):
@@ -2414,6 +2670,265 @@ def test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path(project)
     assert (second.path / "landed.txt").read_text(encoding="utf-8") == "earlier unit\n"
 
 
+def test_story_remount_preserves_named_tip_and_restarts_from_pinned_base(project):
+    """Story branches are attempt-local while the preserve ref keeps abandoned work."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    (first.path / "abandoned.txt").write_text("old attempt\n", encoding="utf-8")
+    git(first.path, "add", "abandoned.txt")
+    git(first.path, "commit", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+
+    (project.project / "advanced.txt").write_text("new base\n", encoding="utf-8")
+    git(project.project, "add", "advanced.txt")
+    git(project.project, "commit", "-q", "-m", "advance requested base")
+    pinned_base = rev_parse_head(project.project)
+
+    second = open_unit_workspace(*args)
+
+    preserve_ref = f"attempt-preserve/test-run-{old_tip[:8]}"
+    assert rev_parse_head(second.path) == pinned_base
+    assert not (second.path / "abandoned.txt").exists()
+    assert (second.path / "advanced.txt").read_text(encoding="utf-8") == "new base\n"
+    assert git(project.project, "rev-parse", preserve_ref) == old_tip
+
+
+def test_story_remount_without_unique_commits_still_moves_to_advanced_base(project):
+    """Reset is unconditional for story scope, not coupled to preservation work.
+
+    Ablation: nest ``reset_branch_if_tip`` under ``if commits`` and this leaves the
+    replacement at the original base because there is no abandoned commit to park.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    old_base = rev_parse_head(first.path)
+
+    (project.project / "advanced-without-abandoned.txt").write_text("new base\n")
+    git(project.project, "add", "advanced-without-abandoned.txt")
+    git(project.project, "commit", "-q", "-m", "advance requested base")
+    advanced = rev_parse_head(project.project)
+
+    second = open_unit_workspace(*args)
+
+    assert old_base != advanced
+    assert rev_parse_head(second.path) == advanced
+    assert (second.path / "advanced-without-abandoned.txt").read_text() == "new base\n"
+
+
+def test_new_story_workspace_uses_base_sha_pinned_before_ref_moves(project, monkeypatch):
+    """A moving requested branch cannot change the operation's selected snapshot."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    real_resolve = verify.rev_parse_revision
+    observed: dict[str, str] = {}
+
+    def resolve_then_advance(repo, revision):
+        pinned = real_resolve(repo, revision)
+        if revision == "main" and "pinned" not in observed:
+            observed["pinned"] = pinned
+            (project.project / "late-base-move.txt").write_text("too late\n")
+            git(project.project, "add", "late-base-move.txt")
+            git(project.project, "commit", "-q", "-m", "concurrent base move")
+            observed["advanced"] = rev_parse_head(project.project)
+        return pinned
+
+    monkeypatch.setattr(verify, "rev_parse_revision", resolve_then_advance)
+    unit = open_unit_workspace(
+        project.project,
+        project,
+        "test-run",
+        "1-1-pinned",
+        "main",
+        "story",
+        project.project / ".bmad-loop" / "runs" / "test-run",
+    )
+
+    assert observed["pinned"] != observed["advanced"]
+    assert rev_parse_head(unit.path) == observed["pinned"]
+    assert not (unit.path / "late-base-move.txt").exists()
+
+
+def test_story_remount_preservation_failure_keeps_old_tip_and_mount(project, monkeypatch):
+    """Preservation must complete before either the story ref or mount is discarded.
+
+    INVERSE ablation: catch the preservation error and continue to reset/discard;
+    then the old branch tip and mounted directory assertions fail.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    monkeypatch.setattr(
+        verify,
+        "preserve_commits",
+        lambda *_a, **_k: (_ for _ in ()).throw(verify.GitError("preserve refused")),
+    )
+
+    with pytest.raises(verify.GitError, match="preserve refused"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == old_tip
+    assert first.path.is_dir()
+
+
+def test_story_remount_cas_failure_keeps_concurrent_tip_and_mount(project, monkeypatch):
+    """A rival branch move after preservation is never overwritten by reclaim.
+
+    INVERSE ablation: remove the expected-old operand from ``update-ref`` and the
+    concurrently created tip is reset to main instead of surviving.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    real_reset = verify.reset_branch_if_tip
+    rival: dict[str, str] = {}
+
+    def move_then_reset(repo, name, revision, expected_tip):
+        git(first.path, "commit", "--allow-empty", "-q", "-m", "concurrent story move")
+        rival["tip"] = rev_parse_head(first.path)
+        real_reset(repo, name, revision, expected_tip)
+
+    monkeypatch.setattr(verify, "reset_branch_if_tip", move_then_reset)
+
+    with pytest.raises(verify.GitError, match="update-ref"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == rival["tip"]
+    assert git(project.project, "rev-parse", f"attempt-preserve/test-run-{old_tip[:8]}") == old_tip
+    assert first.path.is_dir()
+
+
+def test_story_remount_rejects_branch_move_after_reset_before_checkout(project, monkeypatch):
+    """The second race window cannot smuggle a rival tip into the replacement."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    pinned = rev_parse_head(project.project)
+    real_add = verify.worktree_add
+
+    def move_then_add(repo, path, branch, base=None, *, create=True):
+        if not create:
+            git(repo, "update-ref", f"refs/heads/{branch}", old_tip, pinned)
+        real_add(repo, path, branch, base, create=create)
+
+    monkeypatch.setattr(verify, "worktree_add", move_then_add)
+
+    with pytest.raises(verify.GitError, match="moved after reclaim reset"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == old_tip
+    assert not first.path.exists()
+
+
+def test_story_remount_does_not_reread_head_after_tip_validation(project, monkeypatch):
+    """A final moving HEAD read cannot replace the already-validated baseline.
+
+    Ablation: restore ``baseline = rev_parse_head(wt)`` and the injected rival
+    move lands between validation and that read, returning the rival as baseline.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    pinned = rev_parse_head(project.project)
+    real_head = verify.rev_parse_head
+    reads = 0
+
+    def move_on_redundant_head_read(repo):
+        nonlocal reads
+        if Path(repo).resolve() == first.path.resolve():
+            reads += 1
+            if reads == 2:
+                git(project.project, "update-ref", f"refs/heads/{first.branch}", old_tip, pinned)
+        return real_head(repo)
+
+    monkeypatch.setattr(verify, "rev_parse_head", move_on_redundant_head_read)
+
+    second = open_unit_workspace(*args)
+
+    assert reads == 1
+    assert second.baseline == pinned
+
+
+def test_restart_discard_retains_shared_run_branch_history(project):
+    """Restart teardown frees the mount without deleting a cumulative run ref."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    engine, _ = make_engine(project, [], policy=wt_policy(branch_per="run"))
+    args = (
+        project.project,
+        project,
+        "test-run",
+        "1-1-a",
+        "main",
+        "run",
+        engine.run_dir,
+    )
+    first = open_unit_workspace(*args)
+    (first.path / "landed-before-restart.txt").write_text("retained\n")
+    git(first.path, "add", "landed-before-restart.txt")
+    git(first.path, "commit", "-q", "-m", "landed before restart")
+    landed_tip = rev_parse_head(first.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        worktree_path=str(first.path),
+        branch=first.branch,
+        baseline_commit=first.baseline,
+    )
+
+    engine._discard_unit_for_restart(task)
+    second = open_unit_workspace(*args)
+
+    assert rev_parse_head(second.path) == landed_tip
+    assert (second.path / "landed-before-restart.txt").read_text() == "retained\n"
+
+
+def test_story_remount_bad_base_fails_before_discard(project):
+    """An unresolvable requested base leaves the existing story workspace intact."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    first = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", run_dir
+    )
+    tip = rev_parse_head(first.path)
+
+    with pytest.raises(verify.GitError, match="missing-base"):
+        open_unit_workspace(
+            project.project,
+            project,
+            "test-run",
+            "1-1-a",
+            "missing-base",
+            "story",
+            run_dir,
+        )
+
+    assert rev_parse_head(first.path) == tip
+    assert first.path.is_dir()
+
+
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     gated = Policy(
@@ -2435,9 +2950,14 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     state = load_state(engine.run_dir)
     state.clear_pause()
     adapter = MockAdapter([wt_review_effect(project, "1-1-a", clean=True)])
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
     resumed = Engine(
         paths=project,
-        policy=gated,
+        policy=in_place,
         adapter=adapter,
         run_dir=engine.run_dir,
         journal=engine.journal,
@@ -2450,6 +2970,144 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
     assert worktree_clean(project.project)
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+def test_isolation_flip_replays_recorded_session_in_mount_and_lands_it(project, monkeypatch, role):
+    """Completed dev/review results retain their recorded workspace through merge.
+
+    Ablation: gate the recorded-result reopen on live isolation and each row writes
+    the continuation marker in main directly, leaving no unit merge evidence.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    phase = Phase.DEV_RUNNING if role == "dev" else Phase.REVIEW_RUNNING
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=phase,
+        attempt=1,
+        review_cycle=1,
+        baseline_commit=unit.baseline,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+    )
+    task.record_session(
+        SessionRecord(
+            task_id=f"1-1-a-{role}-1",
+            role=role,
+            status="completed",
+            result_json={"workflow": f"recorded-{role}"},
+        )
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: list[Path] = []
+
+    def continue_in_recorded_workspace(*_args, **_kwargs):
+        observed.append(engine.workspace.root)
+        marker = engine.workspace.root / f"continued-{role}.txt"
+        marker.write_text(f"{role}\n", encoding="utf-8")
+        git(engine.workspace.root, "add", marker.name)
+        git(engine.workspace.root, "commit", "-q", "-m", f"continue {role}")
+        task.phase = Phase.DONE
+
+    target = "_drive_story" if role == "dev" else "_review_and_commit"
+    monkeypatch.setattr(engine, target, continue_in_recorded_workspace)
+
+    engine._finish_inflight()
+
+    assert observed == [unit.path]
+    assert (project.project / f"continued-{role}.txt").read_text(encoding="utf-8") == f"{role}\n"
+    assert "unit-merged" in journal_kinds(engine)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
+    assert not unit.path.exists()
+
+
+def test_isolation_flip_finishes_mounted_defer_before_teardown(project):
+    """A persisted defer decision is completed where its rejected work lives."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none", keep_failed=False),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.DEV_VERIFY,
+        baseline_commit=unit.baseline,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        defer_reason="accepted rejection",
+    )
+    engine.state.tasks[task.story_key] = task
+    rejected = unit.path / "rejected-work.txt"
+    rejected.write_text("preserve in failed patch\n", encoding="utf-8")
+
+    engine._finish_inflight()
+
+    assert task.phase == Phase.DEFERRED
+    assert "resume-defer" in journal_kinds(engine)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
+    assert not unit.path.exists()
+    patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
+    assert "rejected-work.txt" in patch.read_text(encoding="utf-8")
+    assert "preserve in failed patch" in patch.read_text(encoding="utf-8")
+
+
+def test_isolation_flip_missing_mount_escalates_before_continuation(project, monkeypatch):
+    """Missing recorded ownership never falls back to a continuation in main.
+
+    Ablation: select reopening from live isolation and the finalizer spy runs in the
+    main checkout instead of the task escalating.
+    """
+    from bmad_loop.engine import RunPaused
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(engine.run_dir / "worktrees" / "gone"),
+        branch="bmad-loop/test-run/1-1-a",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="is gone"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
 
 
 def test_worktree_crash_restart_discards_stale_worktree(project):
@@ -2540,9 +3198,14 @@ def test_worktree_resume_committing_finishes_and_merges(project):
     state = load_state(engine.run_dir)
     state.clear_pause()
     adapter = MockAdapter([])
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
     resumed = Engine(
         paths=project,
-        policy=wt_policy(),
+        policy=in_place,
         adapter=adapter,
         run_dir=engine.run_dir,
         journal=engine.journal,

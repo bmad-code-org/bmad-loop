@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
     SWEEP_REFUSED_DIRTY,
@@ -378,6 +379,124 @@ def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
 
     assert task.spec_file == outside
     assert task.dispatched_spec_file is None
+
+
+def test_project_local_absolute_accepted_spec_becomes_canonical_relative(tmp_path):
+    project = tmp_path / "project"
+    spec = project / "artifacts" / "spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("spec\n", encoding="utf-8")
+    (project / "hop").mkdir()
+    raw = str(project / "hop" / ".." / "artifacts" / "spec.md")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == "artifacts/spec.md"
+
+
+def test_prior_attempt_binding_survives_accepted_spec_relocation(tmp_path):
+    """Only accepted-spec portability changes before fresh attempt binding."""
+    project = tmp_path / "project"
+    spec = project / "spec.md"
+    project.mkdir()
+    spec.write_text("spec\n", encoding="utf-8")
+    old_dispatch = str(tmp_path / "old-worktree" / "spec.md")
+    old_snapshot = b"prior attempt bytes\x00"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(spec),
+        dispatched_spec_file=old_dispatch,
+        dispatched_spec_snapshot=old_snapshot,
+    )
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == "spec.md"
+    assert task.dispatched_spec_file == old_dispatch
+    assert task.dispatched_spec_snapshot == old_snapshot
+
+
+def test_external_and_symlink_external_accepted_specs_keep_their_spelling(tmp_path):
+    project = tmp_path / "project"
+    external = tmp_path / "external"
+    project.mkdir()
+    external.mkdir()
+    spec = external / "spec.md"
+    spec.write_text("spec\n", encoding="utf-8")
+    link = project / "linked"
+    link.symlink_to(external, target_is_directory=True)
+
+    for raw in (str(spec), str(link / "spec.md")):
+        task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+        task.relativize_project_local_accepted_spec(project)
+        assert task.spec_file == raw
+
+
+def test_relative_accepted_spec_keeps_its_exact_spelling():
+    """A relative value already carries the intended dispatch authority.
+
+    Ablation: delete the absolute-path guard and ``./pyproject.toml`` is normalized
+    to ``pyproject.toml``.
+    """
+    raw = "./pyproject.toml"
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(Path.cwd())
+
+    assert task.spec_file == raw
+
+
+def test_missing_absolute_accepted_spec_is_unchanged(tmp_path):
+    """A missing target has no canonical containment fact to transfer.
+
+    INVERSE ablation: resolve the target non-strictly; the missing in-project
+    spelling is rewritten despite having no accepted artifact.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    raw = str(project / "missing.md")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
+
+
+def test_non_file_absolute_accepted_spec_is_unchanged(tmp_path):
+    """A contained directory cannot gain relative fallback authority.
+
+    Ablation: remove the regular-file guard and the accepted directory is
+    rewritten to a relative spelling that can probe an unrelated artifact root.
+    """
+    project = tmp_path / "project"
+    directory = project / "artifacts" / "spec.md"
+    directory.mkdir(parents=True)
+    raw = str(directory)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
+
+
+def test_resolution_fault_accepted_spec_is_unchanged(tmp_path, monkeypatch):
+    """Uncertain canonical containment fails safe with the exact original spelling.
+
+    INVERSE ablation: fall back to lexical containment after the resolution error;
+    the faulted in-project absolute value is rewritten.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    faulted = project / "faulted.md"
+    refuse_to_resolve(monkeypatch, faulted)
+    raw = str(faulted)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
 
 
 def test_dispatched_spec_snapshot_round_trips_byte_exactly():
