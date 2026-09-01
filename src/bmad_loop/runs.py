@@ -2366,12 +2366,14 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     and the read this guard makes is the one with no discrimination in it at
     all. ``mux_sessions()`` lands on ``BaseTmuxBackend.list_sessions``, which
     returns ``[]`` under the three conditions its own comment names — the binary
-    is missing, no server is running, or the query fails, that last one being
-    the raise — and says nothing about which (the
-    diagnostic #525 added, ``_warn_unproven_listing``, is on ``session_options``
-    and the window path, not here). The reap does not even reach those
-    branches: the exit is 0. So
-    there is neither a signal to condition on nor a word on stderr about it.
+    is missing, no server is running, or the query itself fails — and says
+    nothing about which. None of the three raises: the bundled backend folds
+    ``SubprocessError`` and ``OSError`` into that same sentinel, and only an
+    out-of-tree backend raises ``MultiplexerError`` here. Nor does the
+    diagnostic #525 added: ``_warn_unproven_listing`` sits on
+    ``session_options`` and the window path, not on this one. And the reap
+    reaches none of those branches anyway, because its exit is 0. So there is
+    neither a signal to condition on nor a word on stderr about it.
 
     The second cost lasts as long as its cause: a process whose PATH lacks the
     binary reads every session as absent for as long as that PATH does (measured

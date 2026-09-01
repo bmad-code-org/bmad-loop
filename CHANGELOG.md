@@ -45,15 +45,7 @@ breaking changes may land in a minor release.
 
 ### Changed
 
-- **Document the live-session removal guard's measured ceiling** (#732). `delete`, `archive` and
-  `clean` still remove a run directory when a listing omits a live session; the cost is now
-  measured rather than open. On psmux 3.3.8 a `has-session` whose 500 ms connect misses reaps a
-  live session's registry entry, and `ls` then exits 0 without it until the server's next registry
-  tick; and a process whose PATH lacks the binary reads every session as absent. Both reach the
-  guard as the same verdict a dead session produces — this run's name is not in the listing — so it
-  keeps accepting them. The psmux reap is an upstream defect, reported as psmux/psmux#622; the
-  window closes once a release fixes it and the supported floor moves to that release or later.
-  Behavior is unchanged.
+- Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
 
 - **psmux sessions now live in a per-project registry** (#537). bmad-loop points
   `PSMUX_DATA_DIR` at `<state root>/<project>/_mux`, so a prune in one project cannot address
