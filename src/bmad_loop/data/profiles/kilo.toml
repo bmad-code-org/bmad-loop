@@ -1,0 +1,21 @@
+# Kilo (kilocode) — an OpenCode fork driven over its local HTTP server
+# (`kilo serve`), same hookless transport as the `opencode-http` family.
+# `adapter = "kilo-http"` selects the bundled KiloHttpAdapter, which injects the
+# KILO_* env vars kilo reads and authenticates with the basic-auth username
+# `kilo` (both differ from the OPENCODE_* contract of the opencode.toml profile).
+name = "kilo"
+binary = "kilo"
+adapter = "kilo-http"
+prompt_template = "Use the {skill} skill now: {args}"
+usage_parser = "none"
+skill_tree = ".claude/skills"
+first_run_note = "run `kilo auth login` once on this machine; headless kilo servers reuse the stored credentials"
+
+# env_fault_patterns deliberately UNSEEDED: the base family's patterns are pinned
+# to OpenCode's captured `error.error=...` lines in the `serve --print-logs`
+# logfmt, and no kilo outage line has been captured yet to seed a kilo-specific
+# pattern against. Leave inert (no env-fault auto-pause) rather than ship an
+# unverified claim; seed from a real captured kilo line when one exists.
+
+[hooks]
+dialect = "none"

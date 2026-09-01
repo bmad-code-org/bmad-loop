@@ -260,10 +260,10 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
-`opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
-profile like `opencode-http` installs its skills but registers no hooks (it signals over
-HTTP/SSE).
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `opencode-http` (alias
+`opencode`), or `kilo` — `init` errors on an unknown profile and lists the valid ones. A
+hookless profile like `opencode-http`/`kilo` installs its skills but registers no hooks (it
+signals over HTTP/SSE).
 
 ### First-run notes
 

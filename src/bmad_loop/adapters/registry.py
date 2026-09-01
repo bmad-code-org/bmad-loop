@@ -68,6 +68,7 @@ from .entrypoints import record_load_error
 # never a literal). GENERIC is the `profile.adapter` default.
 GENERIC = "generic"
 OPENCODE_HTTP = "opencode-http"
+KILO_HTTP = "kilo-http"
 
 
 class AdapterError(Exception):
@@ -132,13 +133,29 @@ def _opencode_http_builder() -> AdapterBuilder:
     )
 
 
+def _kilo_http_builder() -> AdapterBuilder:
+    from .kilo_http import (
+        KiloDevAdapter,
+        KiloHttpAdapter,
+        OpencodeServerError,
+    )
+
+    return AdapterBuilder(
+        plain=KiloHttpAdapter,
+        dev=KiloDevAdapter,
+        construct_error=(OpencodeServerError,),
+    )
+
+
 # The bundled kinds, as (name, needs_mux, load-thunk). A module constant, not
 # mutable registry state, so detect_adapters can label a row builtin-vs-external
 # without the fixtures having to snapshot it. `generic` drives tmux + hooks and
-# needs the multiplexer; `opencode-http` is hookless HTTP/SSE and does not.
+# needs the multiplexer; `opencode-http`/`kilo-http` are hookless HTTP/SSE and
+# do not.
 _BUILTIN_ADAPTERS: tuple[tuple[str, bool, Callable[[], AdapterBuilder]], ...] = (
     (GENERIC, True, _generic_builder),
     (OPENCODE_HTTP, False, _opencode_http_builder),
+    (KILO_HTTP, False, _kilo_http_builder),
 )
 _BUILTIN_NAMES = frozenset(name for name, _, _ in _BUILTIN_ADAPTERS)
 

@@ -88,14 +88,15 @@ def test_builtin_profiles_load():
     # sentences: the "Unable to connect to API" connection failure and the
     # provider 5xx pair; still no quota cause, since no captured Claude Code
     # usage-limit line exists) and opencode-http (the serve process's
-    # `error.error="AI_APICallError: …"` field). The other four stay inert on
+    # `error.error="AI_APICallError: …"` field). The others stay inert on
     # purpose: patterns for them could only be written from strings scraped off
     # public issue trackers, and an unverified pattern that fires on a healthy
-    # session pauses the whole run. Precision is asserted in
+    # session pauses the whole run. kilo is among the inert set — no captured
+    # kilo outage line exists yet to seed against. Precision is asserted in
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "antigravity", "kilo"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
@@ -107,8 +108,18 @@ def test_builtin_profiles_load():
     assert opencode.skill_tree == ".claude/skills"
     assert opencode.usage_parser == "none"
     assert opencode.binary == "opencode"
-    # every hook-driven built-in stays non-hookless
-    for name in sorted(set(profiles) - {"opencode-http"}):
+    # kilo is the second hookless builtin: same HTTP/SSE transport, driven by the
+    # kilo-http adapter kind against the `kilo` binary
+    kilo = profiles["kilo"]
+    assert kilo.hookless is True
+    assert kilo.hooks.dialect == "none"
+    assert kilo.adapter == "kilo-http"
+    assert kilo.binary == "kilo"
+    assert kilo.skill_tree == ".claude/skills"
+    assert kilo.usage_parser == "none"
+    # every hook-driven built-in stays non-hookless (kilo is the only sibling of
+    # opencode-http in the HTTP/SSE family)
+    for name in sorted(set(profiles) - {"opencode-http", "kilo"}):
         assert profiles[name].hookless is False
 
 
@@ -189,13 +200,14 @@ def test_unknown_profile_raises():
 
 def test_adapter_field_defaults_to_generic_and_parses():
     """The adapter kind is read at parse time: unset defaults to the bundled tmux
-    generic; opencode-http declares its HTTP adapter kind. Asserted across ALL
-    built-ins, not two spot checks — a profile silently defaulting to `generic`
-    would dispatch to the tmux adapter, which cannot host it."""
+    generic; opencode-http and kilo declare their HTTP adapter kinds. Asserted
+    across ALL built-ins, not spot checks — a profile silently defaulting to
+    `generic` would dispatch to the tmux adapter, which cannot host it."""
     profiles = load_profiles()
     assert profiles["opencode-http"].adapter == "opencode-http"
+    assert profiles["kilo"].adapter == "kilo-http"
     assert {name for name, p in profiles.items() if p.adapter == "generic"} == (
-        set(profiles) - {"opencode-http"}
+        set(profiles) - {"opencode-http", "kilo"}
     )
 
 

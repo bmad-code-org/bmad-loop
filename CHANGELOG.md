@@ -9,6 +9,18 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Kilo adapter (`kilo` profile, `kilo-http` kind).** Kilo (`kilocode`, an OpenCode fork)
+  is driven over its local HTTP/SSE server exactly like `opencode-http` — one headless
+  `kilo serve` per session, **no tmux window** — via a `KiloHttpAdapter` that extends the
+  OpenCode HTTP adapter. The fork differs from OpenCode in exactly two facts the adapter
+  overrides: it reads `KILO_*` env vars (`KILO_SERVER_PASSWORD`,
+  `KILO_CONFIG_CONTENT`, `KILO_DISABLE_EXTERNAL_SKILLS`) rather than `OPENCODE_*`, and its
+  server basic-auth username is `kilo`, not `opencode`. Everything else — the HTTP/SSE API
+  surface, SSE event frames, and usage schema — is identical to OpenCode. Needs the same
+  `[opencode]` extra for httpx; auth once globally with `kilo auth login`; skills live in
+  `.claude/skills/`; set `model` as `provider/model`. `env_fault_patterns` are intentionally
+  unseeded pending a captured kilo outage line.
+
 - **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
   so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
   instead of re-deriving one. A `state.json` written before the field existed degrades to the
