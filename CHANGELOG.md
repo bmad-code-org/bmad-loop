@@ -263,6 +263,10 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- **Confine built-in adapter task directories** (DW-74), refusing unsafe task ids and
+  symlink- or junction-redirected task directories before prompt, artifact, log, or
+  transport side effects.
+
 - **Treat embedded-NUL verify commands and working directories as typed environment
   faults** (DW-53, DW-54), while documenting that stream retention degrades but
   journal record writes remain fail-loud.

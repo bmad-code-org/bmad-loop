@@ -150,7 +150,15 @@ from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import (
+    CodingCLIAdapter,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    reset_task_prompt,
+    validate_adapter_artifact_paths,
+    validated_task_directory,
+)
 from .env_fault import EnvFaultMixin
 from .generic import (
     BUDGET_NUDGE_TEXT,
@@ -619,9 +627,20 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # -------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        task_dir = self.tasks_dir / spec.task_id
+        task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        validate_adapter_artifact_paths(
+            task_dir,
+            (task_dir / "messages.json",),
+        )
+        log_paths = [
+            self.logs_dir / f"{spec.task_id}.log",
+            self.logs_dir / f"{spec.task_id}.server.out",
+        ]
+        if self.sse_trace:
+            log_paths.append(self.logs_dir / f"{spec.task_id}.sse.jsonl")
+        validate_adapter_artifact_paths(self.logs_dir, tuple(log_paths))
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
+        reset_task_prompt(task_dir, spec.prompt)
         # Task ids are supplied by the caller, so defensively reset cycle-scoped
         # outputs if one is reused. A silent session must not inherit a stale result.
         # Iterating `journal.TASK_CYCLE_ARTIFACTS` is what makes the parity with
