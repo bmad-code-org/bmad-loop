@@ -839,8 +839,7 @@ class BmadLoopApp(App[None]):
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=confine_root)
-            devcontract.strip_auto_run_result(spec_path, confine_root=confine_root)
+            reset = devcontract.reset_spec_for_replan(spec_path, confine_root=confine_root)
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
