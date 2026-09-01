@@ -34,6 +34,7 @@ from conftest import (
     plant_root_markers,
     refuse_to_resolve,
     review_effect,
+    scripted_verify_runner,
     set_sprint,
     spec_path,
     write_gated_ledger,
@@ -184,7 +185,11 @@ def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch)
     capture = _PostDevVerifyCaptureBus()
     engine._bus = capture
     result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     summary = engine.run()
 
@@ -238,7 +243,11 @@ def test_review_gate_verify_commands_are_journalled_under_the_review_stage(proje
         ),
     )
     result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     summary = engine.run()
 
@@ -544,7 +553,10 @@ def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(proje
     monkeypatch.setattr(
         verify,
         "run_verify_commands",
-        lambda policy, cwd: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+        scripted_verify_runner(
+            project.repo_root,
+            lambda: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+        ),
     )
 
     def _enospc(*_args, **_kwargs):
@@ -773,7 +785,11 @@ def _dev_then_fix_run(project, monkeypatch, capture):
             [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
         ]
     )
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
     return engine, engine.run()
 
 
@@ -881,7 +897,11 @@ def test_a_critical_session_emits_post_dev_verify_on_both_legs(project, monkeypa
             [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
         ]
     )
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
 
     summary = engine.run()
 
@@ -2438,7 +2458,10 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
     monkeypatch.setattr(
         verify,
         "run_verify_commands",
-        lambda policy, cwd: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+        scripted_verify_runner(
+            project.repo_root,
+            lambda: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+        ),
     )
 
     assert engine.run().done == 1
@@ -2553,11 +2576,11 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
 #
 # `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
 # — which `Workspace.default` sets to `paths.repo_root`, the CODE tree. Both of its
-# stages (`dev` and `fix`) were unpinned: every other engine row mocks
-# `verify.run_verify_commands` with a `lambda policy, cwd:` that DISCARDS the cwd,
-# so moving the root back to `paths.project` left the whole suite green. These two
-# rows therefore run the real commands, and use `conftest.nested_repo_root_paths`
-# so the two roots are genuinely different directories.
+# stages (`dev` and `fix`) once had only cwd-discarding scripted doubles, so moving
+# the root back to `paths.project` left the whole suite green. The shared scripted
+# helper now pins the default-root scenarios too; these two rows still run real
+# commands under `conftest.nested_repo_root_paths` to grade the divergent behavior
+# an operator sees.
 
 
 @pytest.mark.parametrize("marker_root", ["repo_root", "project"])
