@@ -248,6 +248,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
+
 - **`worktree list -z` is gated on git 2.36; the 2.34 support floor keeps the newline
   parse.** The NUL-delimited listing was issued unconditionally, and Ubuntu 22.04's stock
   2.34.1 rejects the switch (exit 129), so every isolated-task resume escalated instead of

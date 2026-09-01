@@ -868,7 +868,7 @@ class BmadLoopApp(App[None]):
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
-    def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
+    def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> None:
         """Toast the re-arm records `cli._echo_rearm_events` prints, same table.
 
         Reads through `runs.journal_entries_or_none`, shared with the CLI so the two
@@ -880,24 +880,26 @@ class BmadLoopApp(App[None]):
         The table's `next_step` is deliberately dropped: it reads "... before
         resuming", and this path resumes in the same gesture.
 
-        Returns True when a record HOLDS that gesture (`runs.rearm_holds_the_resume`),
-        which is the one case where the dropped imperative was load-bearing rather than
-        moot — `_do_rearm` stops instead of resuming, and says so in its own words.
+        This is abort-only diagnostic recovery. A raised call has no authoritative
+        outcome, so this path must not infer a hold from partial journal residue.
         """
         after = runs.journal_entries_or_none(run_dir)
         if before is None or after is None:
-            return False
-        holds = False
+            return
         for entry in after[len(before) :]:
-            # before the routing table can drop it: a `None` notice means "nothing to
-            # toast", never "nothing to decide"
-            holds = runs.rearm_holds_the_resume(entry) or holds
             notice = runs.rearm_event_notice(entry)
             if notice is None:
                 continue
             severity, message, _next_step = notice
             self.notify(message, severity="warning" if severity == "warning" else "information")
-        return holds
+
+    def _echo_rearm_notices(self, notices: tuple[runs.RearmNotice, ...]) -> None:
+        """Toast a successful re-arm's authoritative notices in append order."""
+        for notice in notices:
+            self.notify(
+                notice.message,
+                severity="warning" if notice.severity == "warning" else "information",
+            )
 
     def _do_rearm(
         self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
@@ -966,9 +968,9 @@ class BmadLoopApp(App[None]):
             if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
                 self.notify(moved, severity="warning")
         before_entries = runs.journal_entries_or_none(run_dir)
-        hold_resume = False
+        outcome: runs.RearmOutcome | None = None
         try:
-            runs.rearm_escalation(
+            outcome = runs.rearm_escalation(
                 run_dir,
                 story_key,
                 isolated_redrive=isolation == "worktree",
@@ -1001,7 +1003,10 @@ class BmadLoopApp(App[None]):
             # path even after they were unified on routing — and an abort is when the
             # residue matters most: the re-arm half-ran and the operator has to decide
             # what to do with the tree.
-            hold_resume = self._echo_rearm_events(run_dir, before_entries)
+            if outcome is None:
+                self._echo_rearm_events(run_dir, before_entries)
+        assert outcome is not None
+        self._echo_rearm_notices(outcome.notices)
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "
@@ -1009,7 +1014,7 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
         self.notify(f"re-armed {story_key}")
-        if hold_resume:
+        if outcome.hold_resume:
             # The half of the gesture that still worked is kept: the story IS re-armed
             # and persisted. What stops is the resume this surface folds in behind it,
             # because the warning above proved the re-drive would read a spec it cannot
