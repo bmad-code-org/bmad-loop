@@ -2781,7 +2781,8 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
 
 
 _SPEC_WITH_ARR = (
-    "---\ntitle: t\nstatus: blocked\n---\n\n## Intent\n\nbody\n"
+    "---\ntitle: t\nstatus: blocked\noperator_actions:\n"
+    "  - publish the TXT record\n---\n\n## Intent\n\nbody\n"
     "\n## Auto Run Result\n\n- Status: blocked\n\nboom\n"
 )
 
@@ -2821,7 +2822,10 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
     assert task.restore_patch is None  # stale latch cleared
-    assert "status: ready-for-dev" in spec.read_text()
+    text = spec.read_text()
+    assert "status: ready-for-dev" in text
+    assert verify.operator_actions_of(verify.read_frontmatter(spec)) == ("publish the TXT record",)
+    assert "## Auto Run Result" not in text  # stale attempt authority stripped
     entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
     assert entry["restore"] is False
 
