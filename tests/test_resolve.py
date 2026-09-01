@@ -550,6 +550,8 @@ def test_build_context_gathers_critical_escalations(tmp_path):
     path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == "6-4-cli-list-command"
+    assert ctx["project_root"] == tmp_path.as_posix()
+    assert ctx["code_root"] == tmp_path.as_posix()
     assert ctx["spec_file"] == spec.as_posix()
     assert ctx["baseline_commit"] == "abc123"
     details = [e["detail"] for e in ctx["escalations"]]
@@ -559,6 +561,90 @@ def test_build_context_gathers_critical_escalations(tmp_path):
     # serialized via as_posix(): forward slashes only, so the context contract is
     # identical across OSes (no backslashes leak in on Windows).
     assert "\\" not in ctx["resolution_path"]
+
+
+def test_build_context_names_a_divergent_recorded_code_root(tmp_path):
+    """The session cwd remains the project, but the agent contract separately names
+    the persisted tree where this run's code and git work belong. Neither spelling is
+    canonicalized; only the stable POSIX serialization is applied.
+
+    The same-root legacy fallback is covered by the preceding test, whose state has an
+    empty `repo_root` and therefore emits the project for both fields.
+    """
+    code_root = tmp_path / "code" / ".." / "recorded-code"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md", repo_root=code_root)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert ctx["project_root"] == tmp_path.as_posix()
+    assert ctx["code_root"] == code_root.as_posix()
+    assert ctx["project_root"] != ctx["code_root"]
+
+
+def test_build_context_prefers_supplied_live_roots_over_recorded_launch_roots(tmp_path):
+    """A project rename and a paused-run config edit can move both live roots while
+    state.json still names launch-time locations. The CLI-supplied snapshot wins in
+    the payload; recorded roots remain only the observation-failure fallback."""
+    recorded_project = tmp_path / "recorded-project"
+    recorded_code = tmp_path / "recorded-code"
+    live_project = tmp_path / "live-project"
+    live_code = tmp_path / "live-code"
+    run_dir, state, _ = _escalated_run(
+        recorded_project,
+        spec_file="/abs/spec.md",
+        repo_root=recorded_code,
+    )
+
+    path, _withheld = resolve.build_context(
+        state,
+        run_dir,
+        "6-4-cli-list-command",
+        isolation="",
+        project_root=live_project,
+        code_root=live_code,
+    )
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["project_root"] == live_project.as_posix()
+    assert ctx["code_root"] == live_code.as_posix()
+    assert recorded_project.as_posix() not in {ctx["project_root"], ctx["code_root"]}
+    assert recorded_code.as_posix() not in {ctx["project_root"], ctx["code_root"]}
+
+
+def test_build_context_rebases_project_owned_artifacts_after_project_rename(tmp_path):
+    """The live project root and every project-owned path in the payload move
+    together; otherwise the resolver is told its cwd is the renamed project while
+    its story manifest and frozen spec still point into the vanished old spelling.
+    """
+    key = "6-4-cli-list-command"
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    folder = live_project / "epic-1"
+    _stories_manifest(folder, [{"id": key, "title": "Live title", "description": "d"}])
+    live_spec = folder / "stories" / f"{key}-live-title.md"
+    live_spec.parent.mkdir(parents=True, exist_ok=True)
+    live_spec.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    recorded_spec = recorded_project / live_spec.relative_to(live_project)
+    run_dir, state, _ = _escalated_run(
+        recorded_project,
+        spec_file=str(recorded_spec),
+        source="stories",
+        spec_folder="epic-1",
+    )
+
+    path, _withheld = resolve.build_context(
+        state,
+        run_dir,
+        key,
+        isolation="",
+        project_root=live_project,
+        code_root=live_project,
+    )
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["project_root"] == live_project.as_posix()
+    assert ctx["spec_file"] == live_spec.as_posix()
+    assert ctx["stories"]["story"]["title"] == "Live title"
 
 
 def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_path, monkeypatch):
@@ -2194,9 +2280,8 @@ _BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
 
 
 def test_build_context_tolerates_non_utf8_present_spec(tmp_path):
-    """A non-UTF-8 PRESENT story spec makes resolve_story_spec's frontmatter read
-    raise UnicodeDecodeError; build_context must degrade to best-effort (folder-only)
-    stories context, not crash the resolve command."""
+    """A non-UTF-8 ordinary story spec cannot turn into sentinel guidance merely
+    because its name or bytes are observed; persisted task state remains authoritative."""
     key = "6-4-cli-list-command"
     stories_dir = tmp_path / "stories"
     stories_dir.mkdir(parents=True)
@@ -2216,7 +2301,13 @@ def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
     stories_dir = tmp_path / "stories"
     stories_dir.mkdir(parents=True)
     (stories_dir / f"{key}-unresolved.md").write_bytes(_BAD_UTF8)  # undecodable sentinel
-    run_dir, state, _ = _escalated_run(tmp_path, source="stories", sentinel_kind="unresolved")
+    sentinel = stories_dir / f"{key}-unresolved.md"
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        source="stories",
+        spec_file=str(sentinel),
+        sentinel_kind="unresolved",
+    )
 
     path = _context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
@@ -3068,6 +3159,8 @@ def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
     assert set(ctx) == {
         "story_key",
         "run_id",
+        "project_root",
+        "code_root",
         "spec_file",
         "baseline_commit",
         "paused_reason",
@@ -3226,6 +3319,7 @@ def test_run_session_detects_resolution(tmp_path, monkeypatch):
     _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     def fake_subprocess_run(argv, cwd, env):
+        assert cwd == str(tmp_path)  # supplied project is the process/session boundary cwd
         # simulate the agent writing the resolution marker
         resolve.resolution_path(run_dir, "6-4-cli-list-command").write_text("{}", encoding="utf-8")
 
@@ -3388,13 +3482,46 @@ def test_build_context_stories_sentinel_indicator(tmp_path):
         "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
         encoding="utf-8",
     )
-    run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+    )
     state.spec_folder = "epic-1"
 
     ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
     sent = ctx["stories"]["sentinel"]
     assert sent["kind"] == "unresolved"
     assert "intent too vague" in sent["blocking_condition"]
+    assert ctx["spec_reaches_the_redrive"] is None
+
+
+def test_build_context_keeps_recorded_sentinel_mode_after_its_file_disappears(tmp_path):
+    """The persisted detection verdict survives an absent sentinel file.
+
+    The missing file only removes the best-effort blocking-condition text; it must
+    not turn the next resolve session into an ordinary frozen-spec flow.
+    """
+    key = "6-4-cli-list-command"
+    folder = tmp_path / "epic-1"
+    _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+    sentinel = folder / "stories" / f"{key}-unresolved.md"
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
+    assert ctx["stories"]["sentinel"] == {
+        "kind": "unresolved",
+        "path": sentinel.as_posix(),
+        "blocking_condition": "",
+    }
+    assert ctx["spec_reaches_the_redrive"] is None
 
 
 def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
@@ -3404,6 +3531,82 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
         _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert "stories" not in ctx
+
+
+def test_build_context_sprint_mode_does_not_resolve_a_stories_root(tmp_path, monkeypatch):
+    """A sprint context has no consumer for stories-root data, so it performs no
+    stories-only filesystem lookup.
+
+    Ablation: move `task_stories_root` back above the source gate and this fails at
+    the planted seam rather than passing from an absent `stories` payload alone.
+    """
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")
+    monkeypatch.setattr(
+        resolve,
+        "task_stories_root",
+        lambda *_a, **_k: pytest.fail("stories root resolved for sprint context"),
+    )
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert "stories" not in ctx
+
+
+@pytest.mark.parametrize("sentinel_kind", ["unresolved", "ambiguous"])
+def test_build_context_sentinel_does_not_probe_frozen_spec_reachability(
+    tmp_path, monkeypatch, sentinel_kind
+):
+    """A stories sentinel is explicitly not a frozen spec, so reachability is null
+    without invoking the helper that answers whether a frozen-spec edit survives.
+
+    Ablation: compute reachability before discovering the sentinel and the planted
+    helper fails; merely overwriting the result with null afterwards is insufficient.
+    """
+    key = "6-4-cli-list-command"
+    folder = tmp_path / "epic-1"
+    _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+    sentinel = folder / "stories" / f"{key}-{sentinel_kind}.md"
+    sentinel.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind=sentinel_kind,
+    )
+    state.spec_folder = "epic-1"
+    monkeypatch.setattr(
+        resolve,
+        "spec_reaches_the_redrive",
+        lambda *_a, **_k: pytest.fail("sentinel spec reachability was probed"),
+    )
+
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
+    assert "sentinel" in ctx["stories"]
+    assert ctx["stories"]["sentinel"]["kind"] == sentinel_kind
+    assert ctx["spec_reaches_the_redrive"] is None
+
+
+def test_build_context_sentinel_shaped_ordinary_spec_keeps_reachability(tmp_path):
+    """A real stories spec may legally use a sentinel-shaped basename. Only the
+    persisted detection verdict selects sentinel mode, matching re-arm; the basename
+    alone must not erase ordinary frozen-spec reachability or add sentinel guidance."""
+    key = "6-4-cli-list-command"
+    folder = tmp_path / "epic-1"
+    _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+    spec = folder / "stories" / f"{key}-unresolved.md"
+    spec.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(spec),
+        source="stories",
+        sentinel_kind="",
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
+    assert "sentinel" not in ctx["stories"]
+    assert ctx["spec_reaches_the_redrive"] is True
 
 
 def test_build_context_leaves_an_out_of_mount_spec_unchanged(tmp_path):
@@ -3461,7 +3664,12 @@ def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
 
     rel = f"epic-1/stories/{key}-unresolved.md"
     run_dir, state, _ = _escalated_run(
-        tmp_path, run_id, spec_file=rel, source="stories", worktree_path=str(wt)
+        tmp_path,
+        run_id,
+        spec_file=rel,
+        source="stories",
+        sentinel_kind="unresolved",
+        worktree_path=str(wt),
     )
     state.spec_folder = "epic-1"
 
@@ -3488,17 +3696,18 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
 
     There `task_spec_root` answers the PROJECT — a write-confinement decision — while the
     story manifest still lives in the mount, exactly where `stories_engine._stories_folder`
-    looks for it.
+    looks for it. Sentinel identity is no longer inferred from the decoy filenames; the
+    distinct manifest titles grade the stories-root choice instead.
 
     Ablation: revert `_stories_context`'s root to `task_spec_root(task, state)` and this
-    reddens on the blocking condition — it reports the decoy twin's."""
+    reddens on the story title — it reports the decoy twin's."""
     key = "6-4-cli-list-command"
     run_id = "20260613-111429-6a14"
     wt = tmp_path / ".bmad-loop" / "runs" / run_id / "worktrees" / "1"
 
-    for root, condition in ((wt, "the mount's real halt"), (tmp_path, "the decoy twin")):
+    for root, condition in ((wt, "the mount's real intent"), (tmp_path, "the decoy twin")):
         folder = root / "epic-1"
-        _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+        _stories_manifest(folder, [{"id": key, "title": condition, "description": "d"}])
         (folder / "stories" / f"{key}-unresolved.md").write_text(
             f"---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\n{condition}\n",
             encoding="utf-8",
@@ -3518,10 +3727,8 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
         _context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] == outside.as_posix()  # unchanged: absolute passes through
-    sent = ctx["stories"]["sentinel"]
-    assert "the mount's real halt" in sent["blocking_condition"]
-    assert "decoy" not in sent["blocking_condition"]
-    assert Path(sent["path"]).is_relative_to(wt)  # the mount, NOT task_spec_root's project
+    assert ctx["stories"]["story"]["title"] == "the mount's real intent"
+    assert "sentinel" not in ctx["stories"]  # task never recorded a sentinel verdict
 
 
 def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):

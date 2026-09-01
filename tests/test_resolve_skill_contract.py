@@ -84,6 +84,25 @@ def test_every_emitted_context_key_is_documented(skill_md):
     )
 
 
+def test_skill_routes_project_artifacts_and_code_work_to_their_distinct_roots(skill_md):
+    """Mentioning both keys is inert unless the skill explains the operational split.
+
+    Each assertion grades a separate instruction the divergent-root resolution needs:
+    where the session starts, where BMAD artifact/spec work stays, and where code/git
+    work belongs. Removing the substantive guidance while leaving the schema keys
+    documented therefore fails this contract rather than passing the key census above.
+    """
+    normalized = " ".join(skill_md.split())
+
+    assert "session's working directory is always `project_root`" in normalized
+    assert (
+        "artifact and spec work remains anchored under `project_root` (or at the explicit "
+        "absolute paths in this context)"
+    ) in normalized
+    assert "When the roots differ" in normalized
+    assert "any code fix or commit the human must make belongs under `code_root`" in normalized
+
+
 def test_skill_branches_on_the_in_place_remedy(skill_md):
     """`spec_reaches_the_redrive: false` has TWO remedies, and the wrong one is lost
     work in the other direction.
@@ -153,3 +172,14 @@ def test_skill_branches_on_spec_reachability(skill_md):
     assert "cut fresh from `redrive_base_ref`" in normalized
     # and the prohibition names whose job the landing is, rather than just refusing it
     assert "is the HUMAN's step" in normalized
+
+
+def test_skill_explains_null_reachability_for_stories_sentinels(skill_md):
+    """A sentinel retains a path but deliberately has no frozen-spec verdict, so
+    the general null definition must not tell the agent that no path was recorded.
+    """
+    normalized = " ".join(skill_md.split())
+
+    assert "no ordinary frozen spec to edit" in normalized
+    assert "stories mode recorded a sentinel path instead" in normalized
+    assert "follow the sentinel guidance below" in normalized
