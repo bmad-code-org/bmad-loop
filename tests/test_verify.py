@@ -40,8 +40,11 @@ def make_task(paths, story_key="1-1-a"):
     return task
 
 
-def dev_result(sp):
-    return {"workflow": "auto-dev", "spec_file": str(sp)}
+def dev_result(sp, *, park_asserted: object = False):
+    result = {"workflow": "auto-dev", "spec_file": str(sp)}
+    if park_asserted is not OMIT:
+        result["park_asserted"] = park_asserted
+    return result
 
 
 def _codec_rejects_bad_byte() -> bool:
@@ -853,11 +856,9 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     (awaiting-operator, awaiting-operator) either way — so the flag must not reach
     the outcome, and the `True` leg is what would catch a future edit that let it.
 
-    `park_eligible=True` is the engine-side half of the selector the skip now
-    needs: the orchestrator's answer, recorded at dispatch, that this phase could
-    newly ELECT a park rather than inherit one (DW-1). Without it this row fails
-    on proof-of-work — which is exactly what
-    `test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work` asserts.
+    `park_asserted=True` is the current session's independent marker assertion.
+    Without it this row fails on proof-of-work — exactly what the strict-value
+    sibling asserts.
     `park_zero_diff` is the accepted skip's record: the tree really was residue-free,
     and the outcome says so instead of the skip passing silently (DW-6)."""
     task, sp = _residue_free(
@@ -867,10 +868,9 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=review_enabled,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -878,14 +878,14 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     assert out.park_proof_skipped is True and out.park_zero_diff is True
 
 
-@pytest.mark.parametrize("park_eligible", [False, True])
+@pytest.mark.parametrize("park_asserted", [False, True])
 @pytest.mark.parametrize("operator_park", [False, True])
 @pytest.mark.parametrize(
     "status, sprint, review_enabled",
     [("in-review", "review", True), ("done", "done", False)],
 )
 def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
-    project, status, sprint, review_enabled, operator_park, park_eligible
+    project, status, sprint, review_enabled, operator_park, park_asserted
 ):
     """The control for the row above, and the reason that row proves anything: the
     SAME residue-free tree at an ordinary terminal must still be refused. Without
@@ -906,13 +906,9 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     `test_engine.py` that are about harvest, not about park. A run with parking
     enabled but a session that finished ordinarily must still owe a diff.
 
-    `park_eligible` is parametrized for the identical reason, one selector later:
-    the skip is now `parked and park_eligible`, so the engine-side half is the
-    other input that could widen it past the park. Rewriting it as
-    `None if park_eligible` — the dispatch-time expectation alone, ignoring the
-    observed status — is green everywhere without this dimension, and it would let
-    every ordinary session on a story that had never parked skip proof-of-work
-    entirely. Neither half selects the skip on its own.
+    `park_asserted` is parametrized for the identical reason, one selector later:
+    the assertion alone must not widen the waiver past an observed park. Neither
+    half selects the skip on its own.
 
     Ablation: delete the `if extra_exclude is not None and task.baseline_commit:`
     proof-of-work block in `_verify_shared_gates` and all four rows fail on
@@ -923,10 +919,9 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=park_asserted),
         review_enabled=review_enabled,
         operator_park=operator_park,
-        park_eligible=park_eligible,
     )
 
     assert not out.ok and out.retryable
@@ -935,7 +930,12 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     assert out.park_proof_skipped is False and out.park_zero_diff is None
 
 
-def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
+@pytest.mark.parametrize(
+    "park_asserted",
+    [OMIT, False, None, 0, 1, "true"],
+    ids=["missing", "false", "null", "zero", "one", "truthy-string"],
+)
+def test_verify_dev_unasserted_park_with_no_residue_owes_proof_of_work(project, park_asserted):
     """DW-1, and the reason the row above needs its new argument: the skip used to
     be selected entirely by state a fresh session can INHERIT — the policy flag
     plus the spec's own status. A spec an earlier attempt left at
@@ -943,18 +943,12 @@ def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
     nothing at all, so a re-drive over it selected #676's relaxation and verified
     green on someone else's park declaration.
 
-    `park_eligible=False` is the orchestrator saying "the bound spec was ALREADY
-    parked when I dispatched this". The park is not refused for being inherited —
-    it is merely held to proof-of-work like every other terminal, and this tree has
-    none to show. Note the reason: the ordinary proof-of-work message, not a
-    park-specific refusal, because the eligibility flag gates the SKIP and nothing
-    else.
+    Missing, false, null, numeric, and truthy-string assertions are all held to
+    proof-of-work like every other terminal, and this tree has none to show. The
+    ordinary proof-of-work message proves the assertion gates only the waiver.
 
-    This row and `test_verify_dev_park_with_no_code_residue_passes` differ in
-    exactly one argument over byte-identical state, which is what makes either one
-    evidence. Ablation: rewrite the selector as `skip_proof = parked` (drop the
-    `and park_eligible`) and this fails on `assert not out.ok` while its twin stays
-    green — the pre-DW-1 behavior exactly."""
+    Ablation: rewrite the selector as `skip_proof = parked` and every row fails on
+    `assert not out.ok` while the asserted twin stays green."""
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
@@ -962,10 +956,9 @@ def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=park_asserted),
         review_enabled=False,
         operator_park=True,
-        park_eligible=False,
     )
 
     assert not out.ok and out.retryable
@@ -982,8 +975,8 @@ def test_verify_dev_ineligible_park_with_a_real_diff_still_passes(project):
     on its own and passes — status pair, actions list, workflow tag, baseline match
     and sprint pair all still select on the OBSERVED status exactly as before.
 
-    This is the row that would catch the over-correction: making `park_eligible`
-    select the park's status pair as well (rather than only the skip) turns a
+    This is the row that catches making `park_asserted` select the park's status
+    pair as well (rather than only the skip), which turns a
     legitimate repair-then-park into a status mismatch, and refuses work that was
     actually done. `park_zero_diff` stays None because no skip fired — a passing
     park is not automatically a recorded one."""
@@ -995,7 +988,6 @@ def test_verify_dev_ineligible_park_with_a_real_diff_still_passes(project):
         dev_result(sp),
         review_enabled=False,
         operator_park=True,
-        park_eligible=False,
     )
 
     assert out.ok
@@ -1018,10 +1010,9 @@ def test_verify_dev_elected_park_with_code_residue_records_a_non_zero_diff(proje
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1064,10 +1055,9 @@ def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monk
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1115,10 +1105,9 @@ def test_verify_dev_park_zero_diff_is_unknown_when_git_refuses_the_probe(project
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1181,10 +1170,9 @@ def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(projec
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1218,10 +1206,9 @@ def test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes(project
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
         engine_written=("ledger.md",),
     )
 
@@ -1248,13 +1235,11 @@ def test_verify_dev_park_still_faces_the_workflow_tag_gate(project):
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
-    rj = {"workflow": "quick-dev", "spec_file": str(sp)}
+    rj = {"workflow": "quick-dev", "spec_file": str(sp), "park_asserted": True}
 
-    # park_eligible=True so the skip really is in place: without it proof-of-work
+    # park_asserted=True so the skip really is in place: without it proof-of-work
     # would also refuse this tree and the row would pass for a compound reason.
-    out = verify.verify_dev(
-        task, project, rj, review_enabled=False, operator_park=True, park_eligible=True
-    )
+    out = verify.verify_dev(task, project, rj, review_enabled=False, operator_park=True)
 
     assert not out.ok and out.retryable
     assert "auto-dev" in out.reason
@@ -1281,16 +1266,15 @@ def test_verify_dev_park_still_faces_the_baseline_match_gate(project):
         baseline="deadbeef" * 5,
     )
 
-    # Same reason as the workflow-tag row above: with park_eligible left False the
+    # Same reason as the workflow-tag row above: with park_asserted left False the
     # tree would also owe proof-of-work, and baseline-match would stop being the
     # only thing that could refuse here.
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert not out.ok and out.retryable
@@ -7376,13 +7360,7 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         parameter = inspect.signature(fn).parameters["engine_written"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert "operator_park" in inspect.signature(verify.verify_dev).parameters
-    # The park skip's second selector (DW-1). Keyword-only for the same reason
-    # `engine_written` is: `verify_dev`'s positional tail is `review_enabled`, and
-    # a positional eligibility flag would be one transposed argument away from
-    # silently authorizing the skip on every leg.
-    park_eligible = inspect.signature(verify.verify_dev).parameters["park_eligible"]
-    assert park_eligible.kind is inspect.Parameter.KEYWORD_ONLY
-    assert park_eligible.default is False
+    assert "park_eligible" not in inspect.signature(verify.verify_dev).parameters
 
 
 # --------------------------------------------------- the git support floor (GIT_FLOOR)

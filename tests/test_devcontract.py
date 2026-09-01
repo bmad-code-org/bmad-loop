@@ -182,6 +182,7 @@ def test_synth_success_maps_baseline_revision(tmp_path):
     assert rj["spec_file"] == str(sp)
     assert rj["baseline_commit"] == "abc123def456abc123def456abc123def456abcd"
     assert rj["escalations"] == []
+    assert rj["park_asserted"] is False
     assert "dw_ids" not in rj
 
 
@@ -368,6 +369,7 @@ def test_synth_awaiting_operator_is_terminal_and_folds_actions(tmp_path):
     rj = out.result_json
     assert rj is not None and rj["status"] == "awaiting-operator"
     assert rj["operator_actions"] == ["buy example.com", "publish the TXT record"]
+    assert rj["park_asserted"] is True
 
 
 def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
@@ -381,6 +383,68 @@ def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
 
     assert out.result_json["escalations"] == []
     assert "followup_review_recommended" not in out.result_json
+    assert out.result_json["park_asserted"] is False
+
+
+def test_synth_park_assertion_uses_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine park cannot authorize a later result."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run=None,
+        actions="['do it']",
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: awaiting-operator\n```\n"
+            "\n## Auto Run Result\n\nStatus: awaiting-operator\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    assert (
+        devcontract.synthesize_result(sp, story_key="1-1-a").result_json["park_asserted"] is False
+    )
+
+
+def test_synth_repaired_park_marker_cannot_assert_session_ownership(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run=None,
+        actions="['do it']",
+        body_extra=(
+            "\n## Auto Run Result\n\nStatus: awaiting-operator\n\n"
+            f"{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n"
+        ),
+    )
+
+    assert (
+        devcontract.synthesize_result(sp, story_key="1-1-a").result_json["park_asserted"] is False
+    )
+
+
+def test_synth_preexisting_genuine_park_marker_cannot_assert_session_ownership(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run="awaiting-operator",
+        actions="['do it']",
+    )
+
+    rj = devcontract.synthesize_result(
+        sp,
+        story_key="1-1-a",
+        park_marker_session_authored=False,
+    ).result_json
+
+    assert rj["park_asserted"] is False
+
+
+def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
+    marker = "## Auto Run Result\n\nStatus: awaiting-operator\n"
+
+    assert devcontract.auto_run_result_fingerprint(marker) != (
+        devcontract.auto_run_result_fingerprint(marker + "\n" + marker)
+    )
 
 
 @pytest.mark.parametrize(
