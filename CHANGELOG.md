@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Interactive resolve context names both the BMAD project root and the run's code
+  root.** `bmad-loop resolve` warns before a divergent-root session launches, while
+  keeping the session project-rooted and directing code fixes and commits to the code
+  root.
+
 - **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
   The warn-only probe that lists the commits an abandoned attempt left below the re-drive's
   new baseline used to swallow its `GitError` and write nothing — byte-identical to finding
@@ -76,6 +81,10 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **Resolve context builds only the mode-specific details its consumer uses.**
+  Non-stories runs skip stories-root lookup, and stories sentinels report null frozen-spec
+  reachability without probing a spec they do not edit.
 
 - **`bmad-loop diagnose --json` reports `schema_version: 3`.** Replacing a journal-entry value
   with a presence key is a payload break under the additive-only rule, and the redaction fixes
