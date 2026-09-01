@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from conftest import (
     _OK,
     _exists_run,
+    _file_exists_cmd,
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
@@ -45,7 +47,14 @@ from bmad_loop.install import (
 )
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
-from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.policy import (
+    GatesPolicy,
+    LimitsPolicy,
+    NotifyPolicy,
+    Policy,
+    ScmPolicy,
+    VerifyPolicy,
+)
 from bmad_loop.verify import (
     branch_exists,
     current_branch,
@@ -235,6 +244,60 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
     # a clean teardown degrades nothing (gh-139): no warning event is emitted
     assert "worktree-teardown-degraded" not in kinds
+
+
+def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(project, monkeypatch):
+    """A relative dev command is rooted on the live isolated checkout.
+
+    The marker exists only under the mounted unit worktree and is gitignored, so
+    its successful real command pins execution without merging test residue back
+    to the main checkout. The classifier spy delegates to production and pins the
+    second cwd hop independently.
+
+    Ablation: hand `project.repo_root` to either verifier call in
+    `Engine._verify_commands_with_results`; execution then records rc 1, while a
+    classifier-only change leaves the command green but reddens the cwd assertion.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = Path(".bmad-loop") / "runs" / "unit-only-verify.marker"
+    assert not (project.repo_root / marker).exists()
+    mounted: dict[str, Path] = {}
+    base_effect = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def dev_with_marker(spec):
+        mounted["root"] = spec.cwd.resolve()
+        marker_path = spec.cwd / marker
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("unit only\n", encoding="utf-8")
+        return base_effect(spec)
+
+    classified: list[Path] = []
+    real_classify = verify.verify_command_results_outcome
+
+    def spy_classify(results, cwd):
+        classified.append(cwd.resolve())
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
+    policy = replace(
+        wt_policy(),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker.as_posix()),)),
+    )
+    engine, _ = make_engine(project, [dev_with_marker], policy=policy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    unit_root = mounted["root"]
+    assert unit_root != project.repo_root.resolve()
+    assert not (project.repo_root / marker).exists()
+    (dev_record,) = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "verify-command-result" and entry["verification_stage"] == "dev"
+    ]
+    assert dev_record["returncode"] == 0
+    assert classified and all(cwd == unit_root for cwd in classified)
 
 
 def test_local_absolute_ignored_accepted_spec_is_seeded_and_bound_in_mount(project):

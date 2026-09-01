@@ -115,6 +115,35 @@ test:
   review sessions do and the orchestrator re-verifies; the bundle twins write none, because
   bundles have no sprint-status entry.)
 
+Divergent-root tests choose a topology for the distinction they need to prove:
+
+- **Default** (`project`) keeps `project == repo_root`. Use it for ordinary sandbox behavior,
+  never for an assertion that claims to distinguish those roots.
+- **Sibling** places `repo_root` beside or otherwise outside the BMAD project. Lower-level seam
+  rows may hand-build this shape (`test_verify.py::_repo_root_override`); caller/config coverage
+  writes it with `write_repo_root_override` and reloads it through `load_paths`. Use it to prove
+  that code commands run in the configured root while artifact reads stay in the project.
+  Artifact-derived excludes correctly collapse to `()` from the disjoint code tree; a non-empty
+  project-relative spelling may still match nothing there, so this shape cannot grade pathspec
+  selection by outcome alone.
+- **Nested monorepo** (`nested_repo_root_paths`) puts the BMAD project at `<repo>/app`, writes
+  and commits `_bmad/bmm/config.yaml`, and returns `load_paths(app)`. Use it when both right-
+  and wrong-root pathspecs must be non-empty and separable: the correct value carries `app/`,
+  while the wrong value can select a plausible outer-tree decoy. The helper accepts alias
+  spellings but returns canonical paths and commits every seed/config file, so fixture residue
+  cannot masquerade as session work.
+- **Isolated worktree** adds a third live root. Use a real relative command against a marker
+  created only in the mounted unit worktree; assert the main checkout lacks it, the command
+  record passed, and classification received the same mounted cwd. Keep the marker under a
+  gitignored generated-state path so it cannot merge back as proof of work.
+
+Every divergent-root row guards its premise before its outcome: compare resolved roots, assert
+the nested parent relation when nesting matters, and for cwd tests plant/probe both directions
+(`plant_root_markers`, `REPO_ROOT_MARKER_CMD`, `PROJECT_MARKER_CMD`). A positive marker identifies
+the intended root; the opposite-root marker rules out the tempting alternative. When a wrong
+root could still name a real path, create that decoy and assert the selected value rather than
+asserting only that some path is absent or a gate refused.
+
 **`MockAdapter` is production code** — `src/bmad_loop/adapters/mock.py`, shipped in the wheel,
 scripted with a list of `SessionResult`s or `callable(spec) -> SessionResult` effects. It is
 not reachable from configuration (no `mock` profile exists; `runsetup.make_adapters` builds

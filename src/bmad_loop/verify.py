@@ -3404,11 +3404,13 @@ def verify_dev_exclude_relpaths(
     describes. The requirement buys a caller who must think about the root, not a
     checker that knows the right answer.
 
-    A relpath computed against the wrong root does not raise: it simply
-    matches nothing on git's side, so the exclusion silently disappears and a bare
-    status flip starts counting as real work. The latched `restore_patch` is
-    anchored on the SAME root for the same reason (a relative latch names a path
-    in the tree it will be applied to)."""
+    The wrong-root symptom depends on topology. With disjoint sibling project and
+    code roots, a code-root relative artifact path collapses to ``()`` and a
+    project-root spelling is non-empty but still matches nothing in the code tree.
+    In a nested monorepo both spellings are non-empty: omitting the project prefix
+    can select a plausible outer-tree file instead of the nested artifact. The
+    latched `restore_patch` is anchored on the SAME root for the same reason (a
+    relative latch names a path in the tree it will be applied to)."""
     candidates: list[Path] = [paths.sprint_status, spec_path]
     if restore_patch:
         candidates.append(resolve_restore_path(restore_patch, root))
@@ -4170,9 +4172,11 @@ def _stories_relpaths(root: Path, spec_folder: Path) -> tuple[str, ...]:
     Empty when the spec folder is outside that tree (nothing to exclude there).
 
     ``root`` is the tree git is invoked against — `paths.repo_root` at the one
-    production call site, which under the `repo_root` override is NOT
-    `paths.project` (the spec folder then sits outside the code tree and this
-    correctly returns ``()``)."""
+    production call site. Under a disjoint sibling `repo_root` override the spec
+    folder sits outside the code tree and this correctly returns ``()``. Under a
+    nested-monorepo override it remains inside that tree and returns non-empty
+    paths carrying the project prefix; dropping that prefix would instead name a
+    plausible outer-tree location."""
     from .stories import STORIES_FILENAME, STORIES_SUBDIR
 
     try:
