@@ -21,6 +21,7 @@ fallback.
 
 from __future__ import annotations
 
+import copy
 import enum
 import hashlib
 import json
@@ -420,13 +421,23 @@ class _ResultFileMixin:
 
     def _read_result(self, task_id: str) -> dict | None:
         path = self._result_path(task_id)
-        if not path.is_file():
-            return None
         try:
+            if not path.is_file():
+                return None
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            if not isinstance(data, dict):
+                return None
+            # Plugin HookContext makes this same defensive copy before exposing
+            # result data, so reject a shape that would recurse there while the
+            # artifact is still inside the shared observation boundary.
+            copy.deepcopy(data)
+            # JSON accepts escaped lone surrogates, but the default ATTENTION
+            # sink writes reasons as UTF-8. Validate every parsed string without
+            # imposing stricter numeric semantics on completed session results.
+            json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except (OSError, ValueError, RecursionError):
             return None
-        return data if isinstance(data, dict) else None
+        return data
 
     def _await_result(self, task_id: str, grace_s: float = RESULT_GRACE_S) -> dict | None:
         deadline = time.monotonic() + grace_s
