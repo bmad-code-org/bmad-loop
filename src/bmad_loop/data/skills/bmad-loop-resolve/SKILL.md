@@ -49,6 +49,9 @@ These environment variables are set:
 }
 ```
 
+The `escalations` array is ordered newest-first.
+Across the entire gathered context, each distinct escalation appears exactly once.
+
 The interactive session's working directory is always `project_root`. That tree holds
 the BMAD artifacts and specs you inspect or clarify. `code_root` is the tree where the
 run's code and git work belong; it may be different. When the roots differ, do not
