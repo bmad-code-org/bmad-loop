@@ -14,12 +14,104 @@ treating every CLI as a dumb terminal:
 
 from __future__ import annotations
 
+import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..model import TokenUsage
+from ..platform_util import is_link_like, safe_segment
+
+
+class AdapterTaskDirectoryError(ValueError):
+    """A built-in adapter refused an unsafe or redirected task directory."""
+
+
+def validated_task_directory(tasks_dir: Path, task_id: str) -> Path:
+    """Return ``tasks/<task_id>`` only when its authored name is confined.
+
+    Validation is deliberately identity-based rather than sanitizing: callers use
+    ``task_id`` for handles, environment, logs, and artifacts, so rewriting it here
+    would split one session across multiple identities.  The link-like check covers
+    both symlinks and Windows directory junctions through ``platform_util``.
+
+    This is a pre-write boundary, not descriptor-anchored I/O; callers must invoke
+    it before any operation derived from the task id.
+    """
+    if safe_segment(task_id) != task_id:
+        raise AdapterTaskDirectoryError(
+            f"unsafe adapter task id {task_id!r}: expected one clean path segment"
+        )
+
+    if is_link_like(tasks_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter tasks directory is a symlink or junction: {tasks_dir}"
+        )
+
+    task_dir = tasks_dir / task_id
+    if is_link_like(task_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter task directory is a symlink or junction: {task_dir}"
+        )
+    return task_dir
+
+
+def validate_adapter_artifact_paths(root_dir: Path, paths: tuple[Path, ...]) -> None:
+    """Refuse redirecting or special standing entries before adapter writes.
+
+    A regular file with one link is the only existing leaf an adapter may open in
+    place.  Symlinks, junctions, hardlinks, FIFOs, and devices can redirect or
+    block a later write; callers provide every leaf they will write during the
+    session and invoke this boundary before mutating any task or log artifact.
+    """
+    if is_link_like(root_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter artifact directory is a symlink or junction: {root_dir}"
+        )
+
+    for path in paths:
+        if is_link_like(path):
+            raise AdapterTaskDirectoryError(f"adapter artifact is a symlink or junction: {path}")
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AdapterTaskDirectoryError(
+                f"cannot inspect adapter artifact before writing: {path}"
+            ) from exc
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise AdapterTaskDirectoryError(
+                f"adapter artifact is special or multiply linked: {path}"
+            )
+
+
+def reset_task_prompt(task_dir: Path, prompt: str) -> None:
+    """Write ``prompt.txt`` without following a redirecting filesystem entry.
+
+    A normal single-link file is truncated in place so its inode and metadata keep
+    the clean-session behavior.  A symlink, hardlink, FIFO, or device is unlinked
+    first so the replacement is an ordinary file and no outside target is touched.
+    """
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        entry = prompt_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise AdapterTaskDirectoryError(
+            f"cannot inspect adapter prompt before writing: {prompt_path}"
+        ) from exc
+    else:
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            try:
+                prompt_path.unlink()
+            except OSError as exc:
+                raise AdapterTaskDirectoryError(
+                    f"cannot replace unsafe adapter prompt: {prompt_path}"
+                ) from exc
+    prompt_path.write_text(prompt + "\n", encoding="utf-8")
 
 
 @dataclass(frozen=True)
