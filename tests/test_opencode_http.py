@@ -25,8 +25,14 @@ import pytest
 from conftest import write_script_launcher
 
 from bmad_loop import runs
+from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
+from bmad_loop.adapters.base import (
+    AdapterTaskDirectoryError,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+)
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
 from bmad_loop.adapters.opencode_http import (
     _RESET,
@@ -1289,6 +1295,253 @@ def test_missing_binary_is_a_clean_error(tmp_path):
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     with pytest.raises(OpencodeServerError, match="not found on PATH"):
         adapter.start_session(spec)
+
+
+@pytest.mark.parametrize(
+    "task_id_kind", ["absolute", "parent-traversal", "empty", "windows-reserved"]
+)
+def test_start_session_refuses_unconfined_task_id_without_side_effects(tmp_path, task_id_kind):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_ids = {
+        "absolute": str(outside),
+        "parent-traversal": str(Path("..") / ".." / "outside"),
+        "empty": "",
+        "windows-reserved": "CON",
+    }
+    task_id = task_ids[task_id_kind]
+    escaped_log = adapter.logs_dir / f"{task_id}.server.out"
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="expected one clean path segment"):
+        adapter.start_session(spec)
+
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert not escaped_log.exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    try:
+        task_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert task_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.txt").write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    adapter.tasks_dir.rmdir()
+    try:
+        adapter.tasks_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert adapter.tasks_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == adapter.tasks_dir)
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        prompt_path.symlink_to(outside_prompt)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert not prompt_path.is_symlink()
+    assert prompt_path.read_text(encoding="utf-8") == "p\n"
+    assert adapter._sessions == {}
+
+
+def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        os.link(outside_prompt, prompt_path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert prompt_path.stat().st_ino != outside_prompt.stat().st_ino
+    assert prompt_path.read_text(encoding="utf-8") == "p\n"
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_redirected_messages_before_mutation(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    task_dir = adapter.tasks_dir / "clean-task"
+    task_dir.mkdir()
+    outside = tmp_path / "outside-messages.json"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (task_dir / "messages.json").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (task_dir / "prompt.txt").exists()
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+@pytest.mark.parametrize("suffix", [".log", ".server.out", ".sse.jsonl"])
+def test_start_session_refuses_redirected_log_path_before_mutation(tmp_path, suffix):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside.log"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (adapter.logs_dir / f"clean-task{suffix}").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_redirected_logs_root_before_mutation(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "clean-task.server.out"
+    outside_file.write_text("theirs", encoding="utf-8")
+    adapter.logs_dir.rmdir()
+    try:
+        adapter.logs_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside_file.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_junction_like_task_directory_before_mutation(tmp_path, monkeypatch):
+    """The adapter consumes the shared predicate's Windows-junction verdict.
+
+    platform_util's reparse-tag tests own junction detection itself; an ordinary
+    directory standing in here makes this composition arm run on every platform.
+    """
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    (task_dir / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (task_dir / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in task_dir.iterdir()}
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert {path.name: path.read_bytes() for path in task_dir.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
 
 
 def test_start_session_drops_every_reused_task_cycle_artifact(tmp_path):

@@ -23,8 +23,15 @@ import pytest
 import regex
 
 from bmad_loop import devcontract, runs
+from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
+from bmad_loop.adapters.base import (
+    AdapterTaskDirectoryError,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    SpecSnapshot,
+)
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
@@ -3102,8 +3109,10 @@ class _StartSessionMux:
 
     def __init__(self):
         self.piped: list[tuple[str, Path]] = []
+        self.windows: list[tuple[str, str, Path]] = []
 
     def new_window(self, session_name, window_name, cwd, env, cmd):
+        self.windows.append((session_name, window_name, Path(cwd)))
         return "@1"
 
     def pipe_pane(self, window_id, log_file):
@@ -3113,6 +3122,283 @@ class _StartSessionMux:
         # The crash-path diagnosis probe (#489) asks this; these tests are about a
         # window that died under a session that is still very much there.
         return True
+
+
+@pytest.mark.parametrize(
+    "task_id_kind", ["absolute", "parent-traversal", "empty", "windows-reserved"]
+)
+def test_start_session_refuses_unconfined_task_id_without_side_effects(tmp_path, task_id_kind):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_ids = {
+        "absolute": str(outside),
+        "parent-traversal": str(Path("..") / ".." / "outside"),
+        "empty": "",
+        "windows-reserved": "CON",
+    }
+    task_id = task_ids[task_id_kind]
+    escaped_log = adapter.logs_dir / f"{task_id}.log"
+
+    with pytest.raises(AdapterTaskDirectoryError, match="expected one clean path segment"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert not escaped_log.exists()
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    try:
+        task_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert task_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.txt").write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    adapter.tasks_dir.rmdir()
+    try:
+        adapter.tasks_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert adapter.tasks_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path, monkeypatch):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == adapter.tasks_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        prompt_path.symlink_to(outside_prompt)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert not prompt_path.is_symlink()
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+    assert len(mux.windows) == 1
+    assert len(mux.piped) == 1
+
+
+def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        os.link(outside_prompt, prompt_path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert prompt_path.stat().st_ino != outside_prompt.stat().st_ino
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+
+
+def test_start_session_preserves_existing_regular_prompt_inode(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    prompt_path = task_dir / "prompt.txt"
+    prompt_path.write_text("old", encoding="utf-8")
+    inode = prompt_path.stat().st_ino
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert prompt_path.stat().st_ino == inode
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["heartbeat.json", "resultless-stops.jsonl", "session-lifecycle.jsonl"],
+)
+def test_start_session_refuses_redirected_task_artifact_before_mutation(tmp_path, artifact_name):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    task_dir = adapter.tasks_dir / "clean-task"
+    task_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (task_dir / artifact_name).symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (task_dir / "prompt.txt").exists()
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+@pytest.mark.parametrize("redirect_kind", ["root", "junction-like-root", "log-file"])
+def test_start_session_refuses_redirected_log_path_before_mutation(
+    tmp_path, redirect_kind, monkeypatch
+):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "theirs.log"
+    outside_file.write_text("theirs", encoding="utf-8")
+    try:
+        if redirect_kind == "root":
+            adapter.logs_dir.rmdir()
+            adapter.logs_dir.symlink_to(outside, target_is_directory=True)
+        elif redirect_kind == "junction-like-root":
+            monkeypatch.setattr(
+                adapter_base,
+                "is_link_like",
+                lambda path: Path(path) == adapter.logs_dir,
+            )
+        else:
+            (adapter.logs_dir / "clean-task.log").symlink_to(outside_file)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact (directory )?is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert outside_file.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_junction_like_task_directory_before_mutation(tmp_path, monkeypatch):
+    """The adapter consumes the shared predicate's Windows-junction verdict.
+
+    platform_util's reparse-tag tests own junction detection itself; an ordinary
+    directory standing in here makes this composition arm run on every platform.
+    """
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    (task_dir / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (task_dir / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in task_dir.iterdir()}
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert {path.name: path.read_bytes() for path in task_dir.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_validated_task_directory_refuses_direct_junction_verdict(tmp_path, monkeypatch):
+    tasks_dir = tmp_path / "tasks"
+    task_dir = tasks_dir / "clean-task"
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="task directory is a symlink"):
+        adapter_base.validated_task_directory(tasks_dir, "clean-task")
 
 
 def test_start_session_resets_reused_task_log(tmp_path):
