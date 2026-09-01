@@ -242,14 +242,22 @@ JOURNAL_ROUTED_FIELDS = (
 )
 
 # ``kind -> the field names routed on THAT kind only``, read off the same module so
-# the guard still cannot drift from it. A name here is routed on its own kinds and
-# unrouted everywhere else, which is the distinction the flattened union destroyed.
-JOURNAL_KIND_ROUTED_FIELDS = {
-    kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
-}
+# the guard still cannot drift from it. Alias, identifier-list, and count-list rules
+# share this inventory because all three claim the same `(kind, field)` boundary.
+JOURNAL_KIND_ROUTING_TABLES = (
+    diagnostics._JOURNAL_KIND_ALIAS_FIELDS,
+    diagnostics._JOURNAL_KIND_KEYLIST_FIELDS,
+    diagnostics._JOURNAL_KIND_COUNTLIST_FIELDS,
+)
+JOURNAL_KIND_ROUTED_FIELDS: dict[str, frozenset[str]] = {}
+for _routing_table in JOURNAL_KIND_ROUTING_TABLES:
+    for _kind, _row in _routing_table.items():
+        JOURNAL_KIND_ROUTED_FIELDS[_kind] = JOURNAL_KIND_ROUTED_FIELDS.get(
+            _kind, frozenset()
+        ) | frozenset(_row)
 
 # ``kind -> field names declared benign on that kind alone`` — the kind-scoped twin of
-# ``JOURNAL_BENIGN_FIELDS``, and it exists for the same field the routing table does.
+# ``JOURNAL_BENIGN_FIELDS`` for overloaded names whose other shapes are routed.
 # ``engine``'s board-advance carry paths journal ``target`` carrying a sprint STATUS
 # ("done"), not a branch; ``diagnostics``' ``_JOURNAL_KIND_ALIAS_FIELDS`` comment is
 # explicit that aliasing those would destroy the field a maintainer reads the record
@@ -261,6 +269,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
     "board-advance-carry-uncommitted": frozenset({"target"}),
+    # The stale-restore record carries SHA strings under this name and is routed;
+    # this recovery notice carries only the already-derived integer count.
+    "rollback-manual-required": frozenset({"commits"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -306,7 +317,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "checkpoint",
         "code_root_changed",
         "command_index",
-        "commits",
         "condition",
         "contradiction",
         "converted",
@@ -328,7 +338,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "expired_clock",
         "failed",
         "field",
-        "files",
         "finished",
         "fired_at",
         "flat_remainder",
@@ -369,8 +378,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "open_now",
         "original",
         "owed_after_implement",
-        "path",
-        "paths",
         "phase",
         "platform",
         "plugin",
@@ -408,7 +415,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "run_type",
         "security_config_changed",
         "seen_again",
-        "sentinel",
         "sentinel_kind",
         "session_status",
         "session_vanished",
@@ -431,7 +437,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "to",
         "tokens",
         "tokens_weighted",
-        "tolerated",
         "total",
         "trigger",
         "verification_sequence",
@@ -2262,11 +2267,10 @@ def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     declared itself a hole.
 
     Routing is checked BY NAME first and then BY KIND, mirroring ``_scrub_entry``'s
-    own order rather than a flattened union of the two. A kind-scoped name — today
-    only ``target`` — is routed on its own kinds, declared benign on the
-    ``board-advance-*`` family that carries a sprint status under the same name, and
-    an offender everywhere else, INCLUDING at a call whose kind the scan could not
-    resolve. That is the case a by-name union got wrong in the dangerous direction:
+    own order rather than a flattened union of the two. A kind-scoped name is routed
+    only on its declared shapes and is an offender everywhere else unless that other
+    shape is explicitly benign. That includes a call whose kind the scan could not
+    resolve. `target` is the dangerous example: flattening it made
     ``journal.append("unit-merge-failed", target=branch)`` read as routed."""
     offenders: list[tuple[str, int, str, str]] = []
     for _, rel, ln, txt, (field, fn, kind) in findings:
@@ -4067,19 +4071,25 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         diagnostics._JOURNAL_KEYLIST_FIELDS,
     ):
         assert set(table) <= JOURNAL_ROUTED_FIELDS
-    assert JOURNAL_KIND_ROUTED_FIELDS == {
-        kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
-    }
+    expected_kind_routing: dict[str, frozenset[str]] = {}
+    for table in JOURNAL_KIND_ROUTING_TABLES:
+        for kind, row in table.items():
+            expected_kind_routing[kind] = expected_kind_routing.get(kind, frozenset()) | frozenset(
+                row
+            )
+    assert JOURNAL_KIND_ROUTED_FIELDS == expected_kind_routing
     # …and the kind-scoped names are deliberately NOT in the by-name union. This is
     # the assertion that would have caught the flattening: `target` routed by name
     # says the board-advance family is covered when `_scrub_entry` does not cover it.
-    for row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.values():
-        assert not set(row) & JOURNAL_ROUTED_FIELDS, (
-            "a kind-scoped field name leaked into the by-name routed union; "
-            "`_scrub_entry` consults `_JOURNAL_KIND_ALIAS_FIELDS` per kind, so a "
-            "by-name claim about it is false on every other kind"
-        )
-    # `_JOURNAL_KIND_SCHEMAS` is the FOURTH table `_scrub_entry` consults, and it was
+    for table in JOURNAL_KIND_ROUTING_TABLES:
+        for row in table.values():
+            assert not set(row) & JOURNAL_ROUTED_FIELDS, (
+                "a kind-scoped field name leaked into the by-name routed union; "
+                "`_scrub_entry` consults its kind tables per kind, so a by-name "
+                "claim about it is false on every other kind"
+            )
+    # `_JOURNAL_KIND_SCHEMAS` is the fail-closed schema table `_scrub_entry` consults,
+    # and it was
     # coupled to this guard by prose alone: deleting its `preference-escalation` row
     # left every assertion here green while the fail-closed arm stopped running and
     # `customer="AcmeVault"` went back to shipping verbatim (measured). Read it here
