@@ -248,6 +248,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
+
 - **The TUI escalation modal reads the spec the re-arm will write.** `_paused_spec` and
   `_paused_spec_root` anchored on the recorded `state.project` while `_do_rearm` flips the
   copy under the live project, so a run opened from a moved project showed the old tree's

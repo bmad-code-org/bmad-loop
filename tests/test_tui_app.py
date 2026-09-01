@@ -41,6 +41,7 @@ from textual.widgets import (
 
 from bmad_loop import bmadconfig, documents
 from bmad_loop import policy as policy_mod
+from bmad_loop import runs as runs_mod
 from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.journal import Journal, save_state
@@ -88,6 +89,21 @@ from bmad_loop.tui.widgets import (
     story_checkpoint_cell,
     story_state_cell,
 )
+
+
+def _rearm_outcome(key: str, *entries: dict) -> runs_mod.RearmOutcome:
+    notices = tuple(
+        runs_mod.RearmNotice(*notice)
+        for entry in entries
+        if (notice := runs_mod.rearm_event_notice(entry)) is not None
+    )
+    return runs_mod.RearmOutcome(
+        key, notices, any(runs_mod.rearm_holds_the_resume(entry) for entry in entries)
+    )
+
+
+def _journal_rearm_outcome(run_dir: Path, key: str) -> runs_mod.RearmOutcome:
+    return _rearm_outcome(key, *Journal(run_dir).entries())
 
 
 def make_run(
@@ -4723,7 +4739,7 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
     monkeypatch.setattr(
         runs,
         "rearm_escalation",
-        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -4837,7 +4853,7 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project,
     def fake_rearm(rd, sk, *, isolated_redrive, resolution_recorded, project_root=None):
         seen.append(isolated_redrive)
         roots.append(project_root)
-        return "ready-for-dev"
+        return _rearm_outcome(sk)
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
@@ -4901,7 +4917,7 @@ async def test_escalation_rearm_refuses_when_the_policy_cannot_be_read(project, 
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev"
+        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk)
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -4962,7 +4978,7 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     monkeypatch.setattr(
         runs,
         "rearm_escalation",
-        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -5020,7 +5036,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
             baseline="a" * 40,
             error="GitError: not a git repository",
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5074,7 +5090,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
 
     def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         seen.append(load_state(rd).code_root)
-        return "ready-for-dev"
+        return _rearm_outcome(sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5266,7 +5282,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             error="OSError: [Errno 28] No space left on device",
             rollback="failed",
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5326,6 +5342,19 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     # the CLI's trailing imperative is omitted here: the resume is already queued
     assert not any("before resuming" in n[0] for n in notes), notes
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
+    ordered_messages = (
+        "2 commit(s) sit below the re-drive's new baseline",
+        "excluded the abandoned restore's new files",
+        "could not list the commits above the abandoned attempt's baseline",
+        "is not a readable file from here",
+        "could not be re-opened to `ready-for-dev`",
+        "may be left part-written",
+    )
+    positions = [
+        next(i for i, note in enumerate(notes) if message in note[0])
+        for message in ordered_messages
+    ]
+    assert positions == sorted(positions)
 
 
 async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatch):
@@ -5369,7 +5398,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
             spec_file="wt/specs/s1.md",
             baseline="c" * 40,
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5400,6 +5429,46 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     # the record that proved it still renders, and its warning sibling did not hold
     assert any("land in a tree it discards" in n for n in notes)
     assert any("is not a readable file from here" in n for n in notes)
+
+
+async def test_escalation_rearm_holds_without_a_renderable_notice(project, monkeypatch):
+    """The authoritative hold is independent of whether there is a toast to render."""
+    from bmad_loop import resolve, runs
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **kwargs: runs.RearmOutcome(sk, (), True),
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in note for note in notes))
+
+    assert calls == []
+    assert any("re-armed 1" in note for note in notes)
 
 
 async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
@@ -5464,7 +5533,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
 
 
 async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch):
-    """An undecodable byte in journal.jsonl costs the echo, never the gesture.
+    """An undecodable journal cannot suppress a successful authoritative hold.
 
     `_do_rearm` reads the journal twice to diff what the re-arm appended, and before
     that echo existed it read it not at all — so `Journal.entries()`' strict UTF-8
@@ -5481,7 +5550,7 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     `re-armed 1` notice ever fires.
     """
     from bmad_loop import resolve, runs
-    from bmad_loop.journal import JOURNAL_FILE, Journal
+    from bmad_loop.journal import JOURNAL_FILE
 
     calls: list[str] = []
     notes: list[str] = []
@@ -5490,10 +5559,15 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
     def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
-        Journal(rd).append(
-            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        return runs.RearmOutcome(
+            sk,
+            (
+                runs.RearmNotice(
+                    "warning", "authoritative hold from the successful re-arm", "ignored"
+                ),
+            ),
+            True,
         )
-        return "ready-for-dev"
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5520,11 +5594,12 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
         await pilot.click(await ready(pilot, "#act-rearm"))
-        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-    # the re-arm ran and the run resumed: the corruption cost only the echo
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+    # the re-arm ran, its outcome rendered, and the authoritative hold stopped resume
     assert any("re-armed 1" in n for n in notes)
     assert not any("re-arm failed" in n for n in notes), notes
-    assert not any("commit(s) sit below" in n for n in notes), notes
+    assert any("authoritative hold from the successful re-arm" in n for n in notes), notes
+    assert calls == []
 
 
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
