@@ -343,14 +343,14 @@ argument` and failed the story; a `ts` key did not raise and instead silently re
   an environment fault, and escalated — budget untouched, re-armable.
   `bmad-loop confirm --reverify` reports it as a refusal too. A command that merely times out
   is unchanged: still an ordinary fixable retry.
-- Require a dispatch-time expectation before an `awaiting-operator` park skips proof-of-work,
-  so a re-drive cannot verify green by inheriting an earlier in-run park; inherited parks with
+- Require the current session's genuine `awaiting-operator` Auto Run Result marker before a
+  park skips proof-of-work, so previous-run, out-of-band, and re-armed specs cannot inherit
+  waiver authority through retained frontmatter or operator actions; unasserted parks with
   real changes still pass (#335, #676). Journal each waived artifact-gate pass as
   `park-proof-of-work-skipped`, with `zero_diff` reporting no non-excluded residue (`true`),
   residue (`false`), or an unanswerable probe (`null`). The record does not mean the park
-  committed; use the later `story-awaiting-operator` event for that. Cross-run, out-of-band,
-  and re-armed parks remain deferred. On upgrade, an in-flight legacy park defaults ineligible
-  and may retry; re-running the story is sufficient.
+  committed; use the later `story-awaiting-operator` event for that. Missing, repaired, legacy,
+  and malformed assertions fail closed to the ordinary proof gate.
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's

@@ -28,7 +28,7 @@ import shlex
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
@@ -1269,6 +1269,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             time.sleep(RESULT_POLL_S)
 
 
+class _SessionStarter(Protocol):
+    """Next concrete adapter in the dev mixin's cooperative MRO."""
+
+    def start_session(self, spec: SessionSpec) -> SessionHandle: ...
+
+
 class _DevSynthesisMixin(_ResultFileMixin):
     """Result synthesis for the generic ``bmad-build-auto`` skill, shared by
     every transport that drives it (tmux today; see GenericDevAdapter for the
@@ -1327,6 +1333,71 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # apply — this budget is not a counter and touches no stall counters).
         self._contract_nudge_sent: set[str] = set()
         self._contract_nudge_enabled = self.policy.limits.dev_contract_nudge
+        # Marker identities present immediately before each real session launch.
+        # The adapter, not whole-file mtime, owns this attempt-relative evidence:
+        # touching another part of a parked spec must not make its retained marker
+        # look session-authored. None means launch capture was incomplete and
+        # therefore fails closed for the waiver.
+        self._launch_auto_run_results: dict[str, dict[str, tuple[int, str]] | None] = {}
+
+    @staticmethod
+    def _marker_path_key(path: Path) -> str:
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path.absolute())
+
+    def _capture_launch_auto_run_results(self, spec: SessionSpec) -> None:
+        """Snapshot real result markers before the child can write its spec."""
+        paths: list[Path] = []
+        complete = True
+        if spec.expected_spec:
+            expected = Path(spec.expected_spec)
+            paths = [expected if expected.is_absolute() else Path(spec.cwd) / expected]
+        else:
+            for artifacts in self._artifact_dirs(spec.cwd):
+                try:
+                    paths.extend(artifacts.glob("*.md"))
+                except OSError:
+                    complete = False
+
+        captured: dict[str, tuple[int, str]] = {}
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeDecodeError):
+                complete = False
+                continue
+            fingerprint = devcontract.auto_run_result_fingerprint(text)
+            if fingerprint[0]:
+                captured[self._marker_path_key(path)] = fingerprint
+        self._launch_auto_run_results[spec.task_id] = captured if complete else None
+
+    def start_session(self, spec: SessionSpec) -> SessionHandle:
+        self._capture_launch_auto_run_results(spec)
+        # The mixin is shared by two unrelated concrete transports. Keep the
+        # cooperative MRO dispatch rather than naming either host explicitly;
+        # the protocol gives Pyright the host contract without adding a runtime
+        # base that could alter method resolution.
+        return cast(_SessionStarter, super()).start_session(spec)
+
+    def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
+        """Whether the live marker differs from this session's launch marker."""
+        if spec.task_id not in self._launch_auto_run_results:
+            # Direct read-back callers predate launch capture; production always
+            # enters through start_session. Preserve that diagnostic/test seam.
+            return True
+        captured = self._launch_auto_run_results[spec.task_id]
+        if captured is None:
+            return False
+        try:
+            current = devcontract.auto_run_result_fingerprint(spec_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            return False
+        launch = captured.get(self._marker_path_key(spec_path), (0, ""))
+        return current != launch
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
@@ -1418,10 +1489,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
         observation and the M1 launch-snapshot gate all still apply — scoped to the
         one legitimate path instead of a shared directory.
 
-        No launch-snapshot gate is needed on the marker branch itself: the
+        No whole-file launch-snapshot gate is needed on the marker branch itself: the
         pre-review-launch strip (`Engine._reset_spec_for_review`) REMOVES the
         marker, so a spec carrying one again has necessarily changed bytes since the
         snapshot and the gate would be a no-op (`_snapshot_verdict` → NEUTRAL).
+        Marker-level launch capture still runs for every real session: it prevents
+        an unrelated post-launch touch from lending a retained park marker to the
+        new attempt.
 
         Note this deliberately does NOT fall back to the scan when the expected spec
         yields nothing: a session that did not write the spec it owed produced no
@@ -1447,7 +1521,12 @@ class _DevSynthesisMixin(_ResultFileMixin):
         story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or None
         raw_dw_ids = (spec.env.get("BMAD_LOOP_DW_IDS") or "").split(",")
         dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
-        return devcontract.synthesize_result(spec_path, story_key=story_key, dw_ids=dw_ids or None)
+        return devcontract.synthesize_result(
+            spec_path,
+            story_key=story_key,
+            dw_ids=dw_ids or None,
+            park_marker_session_authored=self._park_marker_session_authored(spec_path, spec),
+        )
 
     def _observe_tick(self, handle: SessionHandle, spec: SessionSpec) -> None:
         """Mid-session status-transition observation (#276 M2), called each

@@ -3924,8 +3924,26 @@ def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkey
     assert rj["baseline_commit"] == "abc123"
     assert rj["synthesized_from_frontmatter"] is True
     assert rj["escalations"] == []
+    assert rj["park_asserted"] is False
     # the harvest pass writes no breadcrumb
     assert len(_breadcrumbs(adapter)) == 1
+
+
+def test_frontmatter_fallback_park_cannot_assert_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    markerless_park = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n"
+    )
+    (impl / "spec-3-1-foo.md").write_text(markerless_park)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+
+    assert rj["status"] == "awaiting-operator"
+    assert rj["park_asserted"] is False
+    assert rj["synthesized_from_frontmatter"] is True
 
 
 def test_frontmatter_fallback_stamps_story_key_and_dw_ids(tmp_path, monkeypatch):
@@ -4733,6 +4751,67 @@ def test_expected_spec_synthesizes_its_own_marker_spec(tmp_path, monkeypatch):
     assert rj is not None and rj["status"] == "done"
     assert rj["story_key"] == "3-1"
     assert rj["spec_file"] == str(ours)
+
+
+@pytest.mark.parametrize("known_spec", [False, True], ids=["scan", "known-spec"])
+def test_prelaunch_park_marker_survives_unrelated_touch_without_asserting_ownership(
+    tmp_path, monkeypatch, known_spec
+):
+    """A whole-file mtime bump cannot lend a retained park marker to this session."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    parked = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    ours.write_text(parked)
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    if known_spec:
+        spec = dataclasses.replace(spec, expected_spec=str(ours))
+
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    # Rewrite only the body before the retained marker, then lift whole-file mtime
+    # past launch. The old implementation treated that mtime as marker provenance.
+    ours.write_text(parked.replace("# Story", "# Story\n\nUnrelated post-launch touch."))
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["status"] == "awaiting-operator"
+    assert rj["park_asserted"] is False
+
+
+def test_new_session_marker_asserts_park_after_launch_capture(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
 
 
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):

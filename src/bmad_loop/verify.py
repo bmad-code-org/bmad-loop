@@ -3726,7 +3726,6 @@ def verify_dev(
     review_enabled: bool = True,
     *,
     operator_park: bool = False,
-    park_eligible: bool = False,
     engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
@@ -3748,14 +3747,13 @@ def verify_dev(
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
 
-    The proof-of-work gate is skipped on a park that this attempt was in a
-    position to newly ELECT — ``skip_proof = parked and park_eligible``, a
-    two-part selector. ``parked`` is what the session left behind (the observed
-    spec status, plus the policy flag); ``park_eligible`` is what the orchestrator
-    knew at dispatch (:meth:`Engine._park_eligible_at_dispatch`, captured on the
-    fresh entry into ``Engine._dev_phase`` from the same instant and the same
-    condition as ``task.baseline_commit``): the story's bound spec did NOT already
-    read ``awaiting-operator``. Both halves are load-bearing. The skip exists
+    The proof-of-work gate is skipped only when the observed park intersects a
+    strict current-session result assertion — ``skip_proof = parked and
+    rj.get("park_asserted") is True``. ``parked`` comes from the independently
+    observed spec status plus policy. ``park_asserted`` is minted by
+    :func:`devcontract.synthesize_result` only from the last genuine, non-fenced
+    ``## Auto Run Result`` marker whose status is ``awaiting-operator``. Both
+    halves are load-bearing. The skip exists
     because a park's whole output can legitimately be its own spec's park
     declaration plus the board sync, both of which proof-of-work already excludes,
     so demanding a diff read a correct park as "no changes since baseline commit"
@@ -3769,32 +3767,15 @@ def verify_dev(
     (``Engine._finalize_commit_phase``), and a reset discards that too, onto an
     ``attempt-preserve/*`` ref.
 
-    What the eligibility half defends is narrow and worth naming exactly. Before
-    it, the relaxation was selected entirely by state a fresh session could
-    INHERIT rather than produce: a spec an earlier attempt left at
-    ``awaiting-operator`` still reads ``awaiting-operator`` to the next session
-    that does nothing at all, so a re-drive over that spec selected the skip and
-    verified green on someone else's declaration, relaxing #676's skip for an
-    attempt that produced nothing. Requiring the
-    orchestrator's own dispatch-time answer means the leg that skips proof-of-work
-    is the leg that actually authored the park. It does NOT defend against a
-    session that elects a park it did not earn — one that writes the frontmatter,
-    lists plausible actions and implements nothing is eligible by construction and
-    still passes, because the actions gate tests list non-emptiness and never
-    content. It is a check on WHICH ATTEMPT owns the park, not on whether the park
-    is honest, and it is captured per PHASE rather than per attempt: a fixable
-    repair deliberately keeps the previous session's tree, so re-observing would
-    make every repair of a malformed park ineligible and fail it on the gate it
-    just re-armed.
+    The assertion establishes attempt ownership, not honesty or a second status
+    authority. A frontmatter-only fallback, a legacy result, a malformed value,
+    or a marker carrying the orchestrator's missing-marker repair note cannot
+    authorize the waiver. Those parks are not otherwise refused: they take the
+    ordinary proof-of-work arm, so one carrying a real diff still passes. Crash
+    and fixable-retry replay preserve the already synthesized result rather than
+    deriving authority from retained frontmatter or ``operator_actions``.
 
-    An INELIGIBLE park is not refused — it is merely held to proof-of-work like
-    any other terminal. The park's status pair, ``operator_actions``
-    non-emptiness, workflow tag, baseline match and sprint pair all keep selecting
-    on the observed status alone, so an inherited park carrying a real diff passes
-    exactly as before; only the residue-free one now owes the diff it never
-    produced.
-
-    Nothing else relaxes on the eligible leg either — the ``operator_actions``
+    Nothing else relaxes on the asserted leg either — the ``operator_actions``
     gate above still refuses a park that enumerates nothing, and the workflow-tag,
     status, baseline-match and sprint-pair gates all still run. Two of those four
     are not independent evidence on this leg, and saying so is the point: the
@@ -3805,8 +3786,8 @@ def verify_dev(
     this gate runs, so it confirms the orchestrator's own write landed rather than
     anything the session did. What still binds a park to the attempt the
     orchestrator actually launched is the workflow tag, the baseline match, the
-    non-empty actions list — and now the dispatch-time eligibility, which is the
-    only one of the four the session cannot influence at all. Baseline-match also
+    non-empty actions list and the independent result-marker assertion.
+    Baseline-match also
     accepts a claim NEWER than the recorded baseline whenever it is a
     HEAD-reachable descendant, and the comment guarding that branch names the
     compensating control: such a commit "may have arrived in the shared checkout
@@ -3879,12 +3860,10 @@ def verify_dev(
         actions = _operator_actions_gate(fm, task.story_key)
         if actions is not None:
             return actions
-    # The two-part selector: the session's observed park AND the orchestrator's
-    # dispatch-time answer that this phase could newly elect one. Deliberately a
-    # separate name from `parked` — every other park gate below still keys on
-    # `parked` alone, and collapsing the two would silently widen this expectation
-    # from "may skip proof-of-work" to "may park at all" (#335, #676).
-    skip_proof = parked and park_eligible
+    # The two-part selector: the independently observed park AND the strict
+    # current-session marker assertion. Every other park gate below still keys on
+    # `parked` alone; the result assertion authorizes only this waiver (#335, #676).
+    skip_proof = parked and rj.get("park_asserted") is True
 
     # With review disabled, the dev session runs its own internal review and
     # finalizes straight to done; otherwise it hands off at in-review. A park
@@ -3897,12 +3876,12 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        # Proof-of-work is the one gate an ELECTED park skips (``extra_exclude=None``,
+        # Proof-of-work is the one gate an ASSERTED park skips (``extra_exclude=None``,
         # the callee-blessed spelling): such a park's whole residue can legitimately
         # be the spec and the board, both already excluded (#676). The park paragraph
         # in this function's docstring carries the reasoning and, more importantly,
-        # what the skip does NOT relax. An inherited park (`park_eligible=False`)
-        # takes the ordinary arm and owes a diff like every other terminal.
+        # what the skip does NOT relax. An unasserted park takes the ordinary arm
+        # and owes a diff like every other terminal.
         extra_exclude=None if skip_proof else engine_written,
         # Same tuple, no gate: when the skip fires the probe still runs, purely so
         # the accepted park's zero-diff answer can be journaled (#676).
