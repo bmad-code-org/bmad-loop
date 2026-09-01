@@ -2680,6 +2680,33 @@ def test_e2e_dev_synthesizes_terminal_spec(tmp_path, fake_opencode):
     assert_server_gone(rec)
 
 
+def test_e2e_dev_retained_park_marker_is_not_reowned_by_unrelated_rewrite(tmp_path, fake_opencode):
+    """The HTTP transport also captures marker provenance before prompting."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec_path = impl / "spec-3-1-foo.md"
+    parked = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    spec_path.write_text(parked)
+    spec = make_dev_spec(
+        tmp_path,
+        rec,
+        "completed",
+        spec_path,
+        spec_text=parked.replace("# Story", "# Story\n\nUnrelated session edit."),
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "awaiting-operator"
+    assert result.result_json["park_asserted"] is False
+    assert_server_gone(rec)
+
+
 def test_e2e_dev_stories_mode_resolves_by_id(tmp_path, fake_opencode, monkeypatch):
     """Folder+id dispatch (BMAD_LOOP_SPEC_FOLDER): the story spec is resolved
     at its deterministic id-keyed path — never via the mtime scan."""

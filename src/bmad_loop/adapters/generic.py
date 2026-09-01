@@ -1336,9 +1336,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Marker identities present immediately before each real session launch.
         # The adapter, not whole-file mtime, owns this attempt-relative evidence:
         # touching another part of a parked spec must not make its retained marker
-        # look session-authored. None means launch capture was incomplete and
-        # therefore fails closed for the waiver.
-        self._launch_auto_run_results: dict[str, dict[str, tuple[int, str]] | None] = {}
+        # look session-authored. A task-level None means directory enumeration was
+        # incomplete; a path-level None means that one launch file was unreadable.
+        # Both fail closed at the affected scope without letting an unrelated bad
+        # Markdown file suppress a newly created, readable story spec.
+        self._launch_auto_run_results: dict[str, dict[str, tuple[int, str] | None] | None] = {}
 
     @staticmethod
     def _marker_path_key(path: Path) -> str:
@@ -1361,18 +1363,19 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 except OSError:
                     complete = False
 
-        captured: dict[str, tuple[int, str]] = {}
+        captured: dict[str, tuple[int, str] | None] = {}
         for path in paths:
+            key = self._marker_path_key(path)
             try:
                 text = path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 continue
             except (OSError, UnicodeDecodeError):
-                complete = False
+                captured[key] = None
                 continue
             fingerprint = devcontract.auto_run_result_fingerprint(text)
             if fingerprint[0]:
-                captured[self._marker_path_key(path)] = fingerprint
+                captured[key] = fingerprint
         self._launch_auto_run_results[spec.task_id] = captured if complete else None
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
@@ -1386,9 +1389,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
     def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
         """Whether the live marker differs from this session's launch marker."""
         if spec.task_id not in self._launch_auto_run_results:
-            # Direct read-back callers predate launch capture; production always
-            # enters through start_session. Preserve that diagnostic/test seam.
-            return True
+            # Production always enters through start_session. A direct diagnostic
+            # read-back has no attempt-relative evidence and therefore fails closed.
+            return False
         captured = self._launch_auto_run_results[spec.task_id]
         if captured is None:
             return False
@@ -1396,8 +1399,22 @@ class _DevSynthesisMixin(_ResultFileMixin):
             current = devcontract.auto_run_result_fingerprint(spec_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             return False
-        launch = captured.get(self._marker_path_key(spec_path), (0, ""))
-        return current != launch
+        key = self._marker_path_key(spec_path)
+        if key in captured:
+            launch = captured[key]
+            if launch is None:
+                return False
+            # Appending another marker is authorship even when its text repeats;
+            # an in-place rewrite is authorship when the final section changes.
+            # Deleting older sections while retaining the same final marker is not.
+            return current[0] > launch[0] or (current[0] == launch[0] and current[1] != launch[1])
+
+        # A marker moved or copied from another launch path is inherited evidence,
+        # not a marker authored by this attempt. A genuinely new marker whose text
+        # happens to collide also fails closed; byte identity cannot prove authorship.
+        if current in (fingerprint for fingerprint in captured.values() if fingerprint):
+            return False
+        return current[0] > 0
 
     def _probe_alive(self, handle: SessionHandle) -> bool | None:
         """Liveness of the session's native surface (tmux window, server
