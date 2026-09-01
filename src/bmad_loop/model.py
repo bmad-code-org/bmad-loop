@@ -304,20 +304,6 @@ class StoryTask:
     # owes, and nothing re-derives it once the session that wrote the spec is
     # gone).
     operator_actions: list[str] = field(default_factory=list)
-    # Whether THIS dev phase was in a position to newly elect a park: captured
-    # once, on the fresh entry into `Engine._dev_phase` (`resume_result is None`),
-    # from the same instant and the same condition as `baseline_commit` — so the
-    # expectation and the diff it guards share one anchor. False when the bound
-    # spec was ALREADY at `awaiting-operator` on entry (an earlier attempt's park
-    # is on disk, so a park observed afterwards may be inherited rather than
-    # elected), when parking is disabled, or when the spec could not be read at
-    # all (fail closed). It gates exactly one thing: `verify_dev`'s proof-of-work
-    # skip on the park leg (#335, #676). Every other park gate still selects on the
-    # observed status alone, so an ineligible park with a real diff still passes.
-    # Deliberately per-PHASE, not per-attempt: a fixable repair keeps the previous
-    # session's tree, so re-observing would make every repair of a malformed park
-    # ineligible and fail it on the gate it just re-armed.
-    park_eligible: bool = False
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -466,7 +452,6 @@ class StoryTask:
             ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
-            "park_eligible": self.park_eligible,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -678,19 +663,6 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
-            # `is True`, not `bool(...)`, and this is the one field on this task
-            # where the difference is load-bearing. Every sibling bool above
-            # merely restores bookkeeping; this one AUTHORIZES a gate to be
-            # waived, so its failure direction is not symmetric — a wrong False
-            # costs one retryable proof-of-work refusal, a wrong True re-opens
-            # the inheritance hole the field exists to close (#335, #676). Under
-            # `bool()` every truthy non-boolean grants the waiver, and the
-            # likeliest one is the string "false" (a hand-edited state.json, a
-            # bridge that stringifies JSON scalars): `bool("false")` is True.
-            # Only a real JSON `true` may authorize; anything else — absent,
-            # null, a string, a number — fails closed onto the ordinary gated
-            # path, where an honest park with a real diff still passes.
-            park_eligible=d.get("park_eligible") is True,
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),

@@ -1121,6 +1121,7 @@ def dev_effect(
     write_src: bool = True,
     closes_deferred: object = None,
     operator_actions: object = None,
+    park_asserted: object = OMIT,
     deferred=None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
@@ -1179,6 +1180,9 @@ def dev_effect(
                 "verification": [],
                 "escalations": [],
                 "followup_review_recommended": followup_review,
+                "park_asserted": (
+                    final_status == "awaiting-operator" if park_asserted is OMIT else park_asserted
+                ),
             },
         )
 

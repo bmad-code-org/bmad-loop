@@ -159,6 +159,24 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     return AutoRunResult(present=True, status=status, detail=body.strip())
 
 
+def auto_run_result_fingerprint(text: str) -> tuple[int, str]:
+    """Identity of the current last real Auto Run Result marker.
+
+    The count distinguishes a newly appended marker even when its text repeats
+    the previous result verbatim; the digest distinguishes an in-place rewrite.
+    Fenced examples remain invisible through the shared heading reader.
+    """
+    matches = _section_headings(text)
+    if not matches:
+        return (0, "")
+    last = matches[-1]
+    section = text[last.start() : _next_heading_start(text, last.end())]
+    return (
+        len(matches),
+        hashlib.sha256(section.encode("utf-8"), usedforsecurity=False).hexdigest(),
+    )
+
+
 # ------------------------------------------------ deferred review findings
 #
 # Since BMAD-METHOD #2640 the dev primitive records findings triaged as `defer`
@@ -334,6 +352,7 @@ def synthesize_result(
     story_key: str | None,
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
+    park_marker_session_authored: bool = True,
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -410,6 +429,16 @@ def synthesize_result(
         "baseline_commit": baseline,
         "status": status,
         "escalations": escalations,
+        # Attempt ownership comes only from the current session's terminal marker.
+        # Frontmatter-only fallback is deliberately insufficient, and a marker
+        # written later by the orchestrator's missing-marker repair cannot
+        # retroactively authorize the session that omitted it.
+        "park_asserted": (
+            arr.present
+            and arr.status == AWAITING_OPERATOR
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
