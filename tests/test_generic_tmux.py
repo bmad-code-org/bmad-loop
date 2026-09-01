@@ -7,6 +7,7 @@ exactly what each CLI's hook registration produces), exercising spawn / env
 propagation / hook-signal waiting / kill end-to-end for any profile.
 """
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -198,6 +199,91 @@ def test_read_result_variants(tmp_path):
     assert adapter._read_result("t1") is None  # malformed
     (task_dir / "result.json").write_text('["not a dict"]')
     assert adapter._read_result("t1") is None  # wrong shape
+    (task_dir / "result.json").write_bytes(_BAD_UTF8)
+    assert adapter._read_result("t1") is None  # invalid UTF-8
+    (task_dir / "result.json").write_text('{"clean": true}')
+    assert adapter._read_result("t1") == {"clean": True}  # valid rewrite
+
+
+def test_read_result_degrades_a_plain_decoder_value_error(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    marker = '{"value":"decoder-value-error"}'
+    (task_dir / "result.json").write_text(marker)
+    real_loads = json.loads
+
+    def loads_with_value_error(data, *args, **kwargs):
+        if data == marker:
+            raise ValueError("synthetic decoder value error")
+        return real_loads(data, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(generic.json, "loads", loads_with_value_error)
+        assert adapter._read_result("t1") is None
+
+    valid_unicode = {"escalations": [{"severity": "PREFERENCE", "detail": "café 🚀"}]}
+    (task_dir / "result.json").write_text(
+        json.dumps(valid_unicode, ensure_ascii=False), encoding="utf-8"
+    )
+    assert adapter._read_result("t1") == valid_unicode
+
+
+def test_read_result_degrades_a_decoder_recursion_error(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    depth = sys.getrecursionlimit() * 20
+    nested = '{"value":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+    with pytest.raises(RecursionError):
+        json.loads(nested)
+
+    (task_dir / "result.json").write_text(nested)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_degrades_an_unreadable_existence_probe(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    path = adapter._result_path("t1")
+    real_is_file = Path.is_file
+
+    def is_file_with_permission_error(candidate):
+        if candidate == path:
+            raise PermissionError("task directory is not searchable")
+        return real_is_file(candidate)
+
+    monkeypatch.setattr(Path, "is_file", is_file_with_permission_error)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_rejects_data_that_plugin_deepcopy_cannot_handle(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    depth = sys.getrecursionlimit() // 2
+    nested = '{"value":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+    parsed = json.loads(nested)
+    with pytest.raises(RecursionError):
+        copy.deepcopy(parsed)
+    (task_dir / "result.json").write_text(nested)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_rejects_lone_surrogates_and_recovers_after_rewrite(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    escaped_surrogate = '{"escalations":[{"severity":"CRITICAL","detail":"\\ud800"}]}'
+    parsed = json.loads(escaped_surrogate)
+    with pytest.raises(UnicodeEncodeError):
+        json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+    (task_dir / "result.json").write_text(escaped_surrogate)
+
+    assert adapter._read_result("t1") is None
+
     (task_dir / "result.json").write_text('{"clean": true}')
     assert adapter._read_result("t1") == {"clean": True}
 
