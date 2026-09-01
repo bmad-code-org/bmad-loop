@@ -117,6 +117,100 @@ def test_write_repo_root_override_refuses_a_relative_code_root(project):
     assert not (project.project / conftest.BMAD_CONFIG_REL).exists()
 
 
+def test_scripted_verify_runner_refuses_the_wrong_canonical_cwd(tmp_path):
+    """A cwd-discarding command double cannot hide a caller-root regression.
+
+    Ablation: delete the cwd equality assertion in `scripted_verify_runner` and
+    this row fails because the wrong-root call no longer raises.
+    """
+    expected = tmp_path / "expected"
+    wrong = tmp_path / "wrong"
+    expected.mkdir()
+    wrong.mkdir()
+    runner = conftest.scripted_verify_runner(expected, lambda: ["scripted"])
+
+    with pytest.raises(AssertionError, match="wrong root"):
+        runner(None, wrong)
+
+    assert runner(None, expected / ".." / expected.name) == ["scripted"]
+
+
+def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(project):
+    """The nested fixture is a production-loadable config, not a hand-built snapshot.
+
+    Ablation: short-circuit `worktree_isolation_conflict` for the worktree mode
+    and this row fails because the divergent loaded config is no longer refused.
+    """
+    paths = conftest.nested_repo_root_paths(project)
+
+    assert bmadconfig.load_paths(paths.project) == paths
+    assert paths.project == paths.project.resolve()
+    assert paths.repo_root == paths.repo_root.resolve()
+    assert paths.project.parent == paths.repo_root
+    config_rel = (paths.project / conftest.BMAD_CONFIG_REL).relative_to(paths.repo_root)
+    assert conftest.git(paths.repo_root, "ls-files", "--error-unmatch", config_rel.as_posix())
+    assert bmadconfig.worktree_isolation_conflict(paths, "none") is None
+    conflict = bmadconfig.worktree_isolation_conflict(paths, "worktree")
+    assert conflict is not None and "not supported" in conflict
+
+
+def test_nested_repo_root_paths_canonicalizes_a_dotdot_input(project):
+    """A portable alias spelling cannot collapse pathspecs through mixed roots."""
+    alias = project.project / ".." / project.project.name
+    assert alias != alias.resolve()
+    assert alias.resolve() == project.project.resolve()
+    aliased = replace(
+        project,
+        project=alias,
+        implementation_artifacts=alias / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=alias / "_bmad-output" / "planning-artifacts",
+        output_folder=alias / "_bmad-output",
+        repo_root=alias,
+    )
+
+    paths = conftest.nested_repo_root_paths(aliased)
+
+    assert all(
+        path == path.resolve()
+        for path in (
+            paths.project,
+            paths.implementation_artifacts,
+            paths.planning_artifacts,
+            paths.output_folder,
+            paths.repo_root,
+        )
+    )
+    assert paths.project.parent == paths.repo_root == project.project.resolve()
+    spec = paths.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.verify_dev_exclude_relpaths(paths, spec, root=paths.repo_root)
+    assert verify._stories_relpaths(paths.repo_root, paths.planning_artifacts / "epic-a")
+
+
+def test_nested_repo_root_paths_seeds_the_complete_init_ignore_shape(project):
+    """Nested generated state cannot become proof-of-work residue."""
+    paths = conftest.nested_repo_root_paths(project)
+    expected = [
+        ".bmad-loop/runs/",
+        ".bmad-loop/cache/",
+        ".bmad-loop/policy.toml",
+        "_bmad/render/",
+    ]
+    assert (paths.project / ".gitignore").read_text(encoding="utf-8").splitlines() == expected
+
+    candidates = [
+        ".bmad-loop/runs/run/state.json",
+        ".bmad-loop/cache/plugin/cache.bin",
+        ".bmad-loop/policy.toml",
+        "_bmad/render/skill/workflow.md",
+    ]
+    for rel in candidates:
+        path = paths.project / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("generated\n", encoding="utf-8")
+    ignored = conftest.git(paths.repo_root, "check-ignore", *[f"app/{rel}" for rel in candidates])
+    assert ignored.splitlines() == [f"app/{rel}" for rel in candidates]
+
+
 def test_nested_repo_root_paths_refuses_a_nonempty_index(project):
     """Its seed commit must never absorb setup another fixture already staged."""
     staged = project.project / "staged.txt"
@@ -152,6 +246,25 @@ def test_nested_repo_root_paths_refuses_an_existing_nested_project(project):
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
     assert not (nested / "src.txt").exists()
     assert not (nested / ".gitignore").exists()
+
+
+def test_nested_repo_root_paths_refuses_a_dangling_nested_symlink(project):
+    """A dangling `app` alias hits the helper precondition before any writes."""
+    nested = project.project / conftest.NESTED_SUBDIR
+    missing = project.project / "missing-app-target"
+    try:
+        nested.symlink_to(missing, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    assert nested.is_symlink() and not nested.exists()
+    status_before = conftest.git(project.project, "status", "--porcelain")
+
+    with pytest.raises(AssertionError, match="already exists or is a symlink"):
+        conftest.nested_repo_root_paths(project)
+
+    assert nested.is_symlink() and not nested.exists()
+    assert not missing.exists()
+    assert conftest.git(project.project, "status", "--porcelain") == status_before
 
 
 def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(project, tmp_path):
