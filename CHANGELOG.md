@@ -248,6 +248,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
+  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
+
 - **A looped `*.md` symlink under an artifact dir no longer aborts every unpinned dev
   session on Python 3.11.** `_marker_path_key`'s `resolve()` guard caught only `OSError`,
   but a symlink loop raises `RuntimeError` on the support floor (3.13 resolves it
