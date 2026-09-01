@@ -2964,7 +2964,7 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
+def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> None:
     """Surface the events a just-completed re-arm journaled: the residue of the restore
     attempt it abandoned — the `stale-restore-*` records AND `rearm-commits-probe-failed`,
     all written by `runs._stale_restore_residue` — and the `rearm-*` records the status
@@ -2993,33 +2993,30 @@ def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bo
     the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
     relocate.
 
-    Returns True when one of those records HOLDS the resume
-    (`runs.rearm_holds_the_resume`): the caller re-arms and resumes in a single gesture,
-    and a record proving the re-drive cannot route has to break that gesture, or its own
-    "before resuming" imperative is already unactionable the moment it prints. The
-    question is asked here because this is the one walk over the entries the re-arm
-    added, and the answer has to survive the `finally` it is computed in."""
+    This is abort-only diagnostic recovery: a raised call has no authoritative outcome,
+    so the journal is the only place to recover records that were appended before the
+    abort. It deliberately does not infer a resume hold for a call that did not succeed."""
     after = runs.journal_entries_or_none(run_dir)
     if before is None or after is None:
         # Either end of the diff is unreadable, so there is no trustworthy "new since
         # the re-arm" window. Skip rather than guess: this runs from a `finally`, and a
         # raise here would replace the `RearmError` the operator needs, while treating a
         # failed read as "no entries seen" would replay the whole journal as new. The
-        # hold degrades with the echo, for the same reason: an unproven hold is a guess,
-        # and this is what the gesture did before either existed.
-        return False
-    holds = False
+        return
     for entry in after[len(before) :]:
-        # asked of every entry, BEFORE the routing table can drop it — a `None` notice
-        # means "nothing to print here", never "nothing to decide here"
-        holds = runs.rearm_holds_the_resume(entry) or holds
         notice = runs.rearm_event_notice(entry)
         if notice is None:
             continue
         severity, message, next_step = notice
         tail = f"; {next_step}" if next_step else ""
         print(f"{severity}: {message}{tail}", file=sys.stderr)
-    return holds
+
+
+def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
+    """Render a successful re-arm's authoritative notices in append order."""
+    for notice in notices:
+        tail = f"; {notice.next_step}" if notice.next_step else ""
+        print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -3308,9 +3305,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
             print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
-    hold_resume = False
+    outcome: runs.RearmOutcome | None = None
     try:
-        runs.rearm_escalation(
+        outcome = runs.rearm_escalation(
             run_dir,
             story_key,
             restore_patch=restore_patch,
@@ -3333,7 +3330,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # `rearm-commits-probe-failed` when it could not), whose whole point is that
         # nothing else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
-        hold_resume = _echo_rearm_events(run_dir, before_entries)
+        if outcome is None:
+            _echo_rearm_events(run_dir, before_entries)
+    assert outcome is not None
+    _echo_rearm_notices(outcome.notices)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")
@@ -3341,7 +3341,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
-    if hold_resume:
+    if outcome.hold_resume:
         # The re-arm SUCCEEDED — the task is armed and persisted — so this is a 0, and it
         # stops the GESTURE, not the run. `--resume` does not override it: that flag
         # skips the confirmation prompt, while the hold is not a question but a proof
