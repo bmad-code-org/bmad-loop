@@ -2119,6 +2119,33 @@ def test_task_cycle_artifacts_named_only_through_the_constant():
     )
 
 
+def test_task_cycle_artifact_docs_track_the_canonical_tuple():
+    """The run inventory and extension boundary keep pace with the shared list."""
+    project_root = Path(__file__).resolve().parents[1]
+    features = (project_root / "docs/FEATURES.md").read_text(encoding="utf-8")
+    inventory = features.split("- All run state in", 1)[1].split("\n- ", 1)[0]
+    guide = (project_root / "docs/adapter-authoring-guide.md").read_text(encoding="utf-8")
+    start_session_contract = guide.split("- `start_session", 1)[1].split(
+        "- `wait_for_completion", 1
+    )[0]
+
+    def shared_artifacts(contract: str) -> set[str]:
+        listing = contract.split("shared artifacts: [", 1)[1].split("]", 1)[0]
+        return set(listing.split("`")[1::2])
+
+    canonical = set(TASK_CYCLE_ARTIFACTS)
+    assert shared_artifacts(inventory) == canonical
+    assert shared_artifacts(start_session_contract) == canonical
+
+    assert "`journal.TASK_CYCLE_ARTIFACTS`" in start_session_contract
+    assert (
+        "after creating the task directory and before\n  launching the session"
+        in start_session_contract
+    )
+    assert "a missing artifact is a normal no-op" in start_session_contract
+    assert "Adapter-private breadcrumbs" in start_session_contract
+
+
 def _session_task_id_offenders(findings) -> list[tuple[str, int, str]]:
     """The chokepoint invariant as a filter: a composed task id is sanctioned only
     in a ``SESSION_TASK_ID_CHOKEPOINT`` file AND only inside that file's one listed
