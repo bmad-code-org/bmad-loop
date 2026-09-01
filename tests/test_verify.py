@@ -3056,10 +3056,10 @@ def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
     """T3 regression: a stories-mode story whose entire authorized diff is
     ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)
     must pass proof-of-work, not false-negative "no changes". Guards the file-granular
-    exclude port off #79 — the old whole-folder `artifact_relpaths` exclusion
-    swallowed the ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-
-    changes.md in stories mode (verify_dev_exclude_relpaths excludes only the
-    session's own spec + sprint-status, so sibling ledger content counts)."""
+    exclude port off #79 — the old whole-folder artifact exclusion swallowed the
+    ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-changes.md in stories
+    mode (verify_dev_exclude_relpaths excludes only the session's own spec +
+    sprint-status, so sibling ledger content counts)."""
     spec_folder = project.planning_artifacts / "epic-a"
     task = make_stories_task(project, "1")
     sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
@@ -6286,48 +6286,6 @@ def test_verify_dev_stories_refuses_bookkeeping_only_changes_under_the_monorepo_
     ).ok
 
 
-def test_artifact_relpaths_returns_in_repo_folders(project):
-    """The orchestrator-owned artifact folders, repo-relative posix."""
-    rels = verify.artifact_relpaths(project)
-    assert "_bmad-output/implementation-artifacts" in rels
-    assert "_bmad-output/planning-artifacts" in rels
-    assert all(r and r != "." for r in rels)
-
-
-def test_artifact_relpaths_drops_dot_when_folder_is_project_root(project):
-    """A folder configured == project root yields "."; it must be dropped so it
-    can't become a whole-tree exclude that disables the proof-of-work gate."""
-    paths = dataclasses.replace(project, output_folder=project.project)
-    rels = verify.artifact_relpaths(paths)
-    assert "." not in rels and "" not in rels
-    # the real sub-dirs are still excluded; only the root-collapsing "." is dropped
-    assert "_bmad-output/implementation-artifacts" in rels
-
-
-def test_has_changes_since_excludes_artifact_only_edit(project):
-    """A change confined to the artifact folders is not proof of dev work."""
-    baseline = verify.rev_parse_head(project.project)
-    # root-level _bmad-output edit (bundle/ledger) + nested impl-artifact edit:
-    # both must be excluded, proving artifact_relpaths covers output_folder too.
-    (project.output_folder / "ledger.json").write_text("bookkeeping\n")
-    (project.implementation_artifacts / "spec-x.md").write_text("bookkeeping\n")
-    assert verify.has_changes_since(project.project, baseline) is True  # unscoped
-    assert (
-        verify.has_changes_since(
-            project.project, baseline, exclude=verify.artifact_relpaths(project)
-        )
-        is False
-    )
-    # a real source edit still counts
-    (project.project / "src.txt").write_text("real\n")
-    assert (
-        verify.has_changes_since(
-            project.project, baseline, exclude=verify.artifact_relpaths(project)
-        )
-        is True
-    )
-
-
 def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(project):
     """The two-function split, at its own layer: `_changes_since` answers the
     tri-state and `has_changes_since` is its fail-open collapse.
@@ -6393,10 +6351,9 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
 
 
 def test_verify_dev_exclude_relpaths_is_file_granular(project):
-    """Unlike artifact_relpaths (whole-folder), this excludes only the
-    sprint-status ledger and the session's own claimed spec file — sibling
-    artifact-folder content (deferred-work.md, other stories' specs) is left
-    un-excluded so it can register as real work."""
+    """Excludes only the sprint-status ledger and the session's own claimed spec
+    file — sibling artifact-folder content (deferred-work.md, other stories' specs)
+    is left un-excluded so it can register as real work."""
     sp = spec_path(project, "1-1-a")
     rels = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
     assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
