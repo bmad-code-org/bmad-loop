@@ -1133,20 +1133,9 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
 
     `_session_task_id` composes `safe_segment(f"{story_key}-{part}-{seq}{gen}")`, and
     #705 added `gen` — a `-g<N>` suffix emitted only above generation zero. That
-    changed the grammar this parser documents, and nothing recorded either half of it.
-
-    The `-g1` row pins a DOCUMENTED LIMITATION, not a desired outcome: the suffix
-    fails `seq.isdigit()` and the whole id comes back as the story key. It is
-    unreachable today because every `session-start` has carried `story_key` since #153
-    phase 1, so the entries this fallback actually sees predate generations entirely.
-    It is pinned precisely because that reasoning is an assumption about the CALLER:
-    widen the fallback to entries that can carry `-gN` and this row is where the
-    breakage surfaces, instead of a bogus `1-1-a-dev-1-g1` row appearing in the
-    active-agent view.
-
-    Ablation: drop the `seq.isdigit()` term and the `-g1` row changes answer (it then
-    peels `g1` as if it were a sequence); change the emitted suffix shape in
-    `engine._session_task_id` and the last row reddens.
+    changed the grammar this parser documents. Only a final numeric generation
+    component is peeled; generation-like malformed or nonterminal components retain
+    the existing best-effort fallback behavior.
     """
     # the ordinary unsuffixed shape: the recorded role is peeled with its seq
     assert data._story_key_from_task_id("1-1-a-dev-1", "dev") == "1-1-a"
@@ -1156,6 +1145,13 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
     # not the expected shape at all — returned verbatim
     assert data._story_key_from_task_id("nonsense", "dev") == "nonsense"
 
-    # generation-suffixed (#705): NOT parsed, returned whole. Unreachable today.
-    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a-dev-1-g1"
-    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a-dev-1-g12"
+    # generation-suffixed (#705): one terminal numeric generation is peeled
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a"
+    # malformed and nonterminal generation-like components are not suffixes
+    assert data._story_key_from_task_id("1-1-a-dev-1-g", "dev") == "1-1-a-dev-1-g"
+    assert data._story_key_from_task_id("1-1-a-dev-1-gx", "dev") == "1-1-a-dev-1-gx"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g0", "dev") == "1-1-a-dev-1-g0"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"

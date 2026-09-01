@@ -607,18 +607,16 @@ def _story_key_from_task_id(task_id: str, role: str) -> str:
     predates story-key stamping (#153 phase 1). The id is
     ``safe_segment(f"{story_key}-{part}-{seq}{gen}")`` where ``part`` is the role, or
     a workflow label for labeled plugin sessions, and ``gen`` is a ``-g<N>`` re-arm
-    generation suffix emitted only above zero (#705). This parser handles the
-    unsuffixed shape ONLY: a ``-g1`` tail fails the ``seq.isdigit()`` test below and
-    returns the whole id. That is unreachable rather than latent-correct — every
-    session-start has carried ``story_key`` since #153 phase 1, so the entries this
-    fallback sees are exactly the ones that predate generations — but widen the
-    fallback and this is the assumption that breaks. So peel the trailing
-    ``-{part}-{seq}``: drop the numeric seq, then the recorded role when it
-    matches (the common case), else one more ``-`` group (best-effort, since a
-    label is not recoverable from the entry)."""
+    generation suffix emitted only above zero (#705). Peel one optional terminal
+    generation suffix, then peel the trailing ``-{part}-{seq}``: drop the numeric
+    seq, then the recorded role when it matches (the common case), else one more
+    ``-`` group (best-effort, since a label is not recoverable from the entry).
+    Malformed shapes return the original task id unchanged."""
+    original = task_id
+    task_id = re.sub(r"-g[1-9][0-9]*\Z", "", task_id)
     head, sep, seq = task_id.rpartition("-")
     if not sep or not seq.isdigit():
-        return task_id  # not the expected shape — best we can do
+        return original  # not the expected shape — best we can do
     if role and head.endswith(f"-{role}"):
         return head[: -(len(role) + 1)]
     parent = head.rpartition("-")[0]
