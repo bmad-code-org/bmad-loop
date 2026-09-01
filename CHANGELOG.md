@@ -258,6 +258,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Reject malformed session escalation/result artifacts and non-finite resolve JSON
+  (DW-86, DW-89).
+
 - **Confine built-in adapter task directories** (DW-74), refusing unsafe task ids and
   symlink- or junction-redirected task directories before prompt, artifact, log, or
   transport side effects.
