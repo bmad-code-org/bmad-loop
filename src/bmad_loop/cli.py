@@ -3116,9 +3116,31 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.interactive:
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
+        # The interactive session uses the CURRENT CLI project as cwd. Its code root
+        # must come from the CURRENT config too: both can have moved since state.json
+        # was written. This is best-effort observation only; the mandatory config
+        # re-read after the human conversation remains the authority for re-arm.
+        try:
+            pre_session_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pre_session_code_root = state.code_root
+        else:
+            pre_session_code_root = pre_session_paths.repo_root
         _ctx_path, withheld, unreadable = resolve.build_context(
-            state, run_dir, story_key, isolation=pol.scm.isolation
+            state,
+            run_dir,
+            story_key,
+            isolation=pol.scm.isolation,
+            project_root=project,
+            code_root=pre_session_code_root,
         )
+        if pre_session_code_root != project:
+            print(
+                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                "code fixes and commits belong in the run's code root at "
+                f"{pre_session_code_root.as_posix()!r}",
+                file=sys.stderr,
+            )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -3248,6 +3270,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
+        if args.interactive and paths.repo_root != pre_session_code_root:
+            print(
+                "error: the code root changed during the resolve session from "
+                f"{pre_session_code_root.as_posix()!r} to {paths.repo_root.as_posix()!r}; "
+                "the agent's guidance no longer names the tree the re-drive would use. "
+                "No re-arm was performed; reconcile the code change, then run resolve again.",
+                file=sys.stderr,
+            )
+            return 1
         # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
         # below — because aiming the mirror at the tree config.yaml names is only
         # correct for a configuration the orchestrator will actually run, and this is

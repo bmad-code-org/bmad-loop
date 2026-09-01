@@ -3246,6 +3246,181 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
 
 
+def test_resolve_warns_about_divergent_roots_before_the_session(tmp_path, monkeypatch, capsys):
+    """The advisory names both trees before the interactive boundary while the
+    session still receives the project as its cwd root.
+
+    Ablation: move the warning below `run_session` and the in-session assertion fails;
+    switch the launch root to `state.code_root` and the project assertion fails.
+    """
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    code_root = tmp_path / "code\nroot\x1b[31m"
+    state = load_state(run_dir)
+    state.repo_root = str(code_root)
+    save_state(run_dir, state)
+    context_roots: dict[str, Path] = {}
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def fake_context(*args, **kwargs):
+        context_roots["project"] = kwargs["project_root"]
+        context_roots["code"] = kwargs["code_root"]
+        return None, 0
+
+    monkeypatch.setattr(resolve, "build_context", fake_context)
+
+    def fake_session(adapter, project, rd, story_key, **kwargs):
+        err = capsys.readouterr().err
+        assert "resolve session stays project-rooted" in err
+        assert repr(tmp_path.as_posix()) in err
+        assert repr(code_root.as_posix()) in err
+        assert "\x1b" not in err  # terminal escape is rendered as the literal "\\x1b"
+        assert len(err.splitlines()) == 1  # embedded newline did not inject another line
+        assert "code fixes and commits belong" in err
+        assert project == tmp_path
+        return True
+
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+    assert context_roots == {"project": tmp_path, "code": code_root}
+
+
+def test_resolve_context_uses_live_project_after_project_rename(tmp_path, monkeypatch, capsys):
+    """The current CLI project is both session cwd and context root even when the
+    persisted launch-time project path names the pre-rename location."""
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1")
+    old_project = tmp_path.parent / "project-before-rename"
+    state = load_state(run_dir)
+    state.project = str(old_project)
+    state.repo_root = str(old_project)
+    save_state(run_dir, state)
+    seen: dict[str, Path] = {}
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def fake_context(*args, **kwargs):
+        seen["project"] = kwargs["project_root"]
+        seen["code"] = kwargs["code_root"]
+        return None, 0
+
+    monkeypatch.setattr(resolve, "build_context", fake_context)
+    monkeypatch.setattr(
+        resolve,
+        "run_session",
+        lambda adapter, project, *a, **k: seen.setdefault("cwd", project) or True,
+    )
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: key)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == {"project": tmp_path, "code": tmp_path, "cwd": tmp_path}
+    assert str(old_project) not in capsys.readouterr().err
+
+
+def test_resolve_context_uses_live_configured_code_root(project, monkeypatch, capsys):
+    """A paused run may record an old code root, but the pre-session context and
+    warning must name the config root the mandatory post-session re-stamp will use."""
+    from bmad_loop import resolve, runs
+
+    _run_dir, moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    seen: dict[str, Path] = {}
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def fake_context(*args, **kwargs):
+        seen["project"] = kwargs["project_root"]
+        seen["code"] = kwargs["code_root"]
+        return None, 0
+
+    monkeypatch.setattr(resolve, "build_context", fake_context)
+
+    def fake_session(*args, **kwargs):
+        err = capsys.readouterr().err
+        assert repr(project.project.as_posix()) in err
+        assert repr(moved.as_posix()) in err
+        assert recorded.as_posix() not in err
+        return True
+
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **kwargs: key)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-resume"]
+    assert cli.main(argv) == 0
+    assert seen == {"project": project.project, "code": moved.resolve()}
+
+
+def test_resolve_refuses_to_rearm_when_code_root_changes_during_session(
+    project, monkeypatch, capsys
+):
+    """The context snapshot and the re-drive must name the same code tree.
+
+    A config edit while the interactive conversation is open otherwise lets the
+    human follow the supplied guidance in the old tree before the command silently
+    re-arms and resumes in the new one.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1")
+    moved = project.project / "code-after-session"
+    moved.mkdir()
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0))
+
+    def move_code_root_during_session(*args, **kwargs):
+        _configure_repo_root(project, moved)
+        return True
+
+    monkeypatch.setattr(resolve, "run_session", move_code_root_during_session)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed after the context's code root went stale"),
+    )
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-resume"]
+    assert cli.main(argv) == 1
+
+    state = load_state(run_dir)
+    assert state.tasks["s1"].phase == Phase.ESCALATED
+    err = capsys.readouterr().err
+    assert "code root changed during the resolve session" in err
+    assert project.project.as_posix() in err
+    assert moved.resolve().as_posix() in err
+    assert "No re-arm was performed" in err
+
+
+def test_resolve_same_root_launches_without_a_divergence_warning(tmp_path, monkeypatch, capsys):
+    """Legacy and ordinary same-root runs stay quiet. The session call is the
+    positive control that the absent warning did not result from an early return.
+
+    Ablation: make the warning unconditional and this fails on stderr.
+    """
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")  # empty repo_root: legacy fallback to project
+    launched: list[Path] = []
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0))
+    monkeypatch.setattr(
+        resolve,
+        "run_session",
+        lambda adapter, project, *a, **k: launched.append(project) or True,
+    )
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert launched == [tmp_path]
+    assert "resolve session stays project-rooted" not in capsys.readouterr().err
+
+
 def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkeypatch):
     """`cmd_resolve` hands the resolve session the generation it read off the task — a
     real value, not a constant. The row seeds a NON-zero generation deliberately:
