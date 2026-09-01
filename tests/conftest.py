@@ -3,7 +3,6 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
-import dataclasses
 import io
 import json
 import shutil
@@ -17,7 +16,7 @@ import yaml
 
 from bmad_loop import cli, documents, envvars, platform_util, runs
 from bmad_loop.adapters.base import SessionResult, SessionSpec
-from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
 from bmad_loop.journal import save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
@@ -214,6 +213,25 @@ def _file_exists_cmd(path) -> str:
     if sys.platform == "win32":
         return f'if exist "{path}\\NUL" (exit 1) else if exist "{path}" (exit 0) else (exit 1)'
     return f'test -f "{path}"'
+
+
+def scripted_verify_runner(expected_root: Path, next_results):
+    """Return a scripted ``run_verify_commands`` double that pins its cwd.
+
+    ``next_results`` is a zero-argument callable so callers can return one fixed
+    result list, advance an iterator, or provide an iterator fallback without
+    this helper changing the scenario's existing script semantics.
+    """
+    expected = expected_root.resolve()
+
+    def run(_policy, cwd: Path):
+        actual = cwd.resolve()
+        assert (
+            actual == expected
+        ), f"scripted verify runner called in the wrong root: expected {expected}, got {actual}"
+        return next_results()
+
+    return run
 
 
 def passes_once(marker) -> str:
@@ -661,8 +679,8 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     """The MONOREPO shape of the override: `repo_root` an ANCESTOR of `project`.
 
     The BMAD project lives at ``<repo>/app`` inside a checkout whose root is the
-    git root — `repo_root` stays `paths.project` (the sandbox repo) while
-    `project` and all three artifact dirs move under ``app/``.
+    git root. The helper writes the same config shape production loads, then
+    returns :func:`load_paths`' canonical snapshot rather than hand-building one.
 
     Why a second shape at all. `tests/test_verify.py::_repo_root_override` builds
     the SIBLING shape, where the artifact tree is disjoint from the code tree — so
@@ -681,10 +699,11 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     for the reason `plant_root_markers` gives: a session's edit to a TRACKED file
     is proof of work the attempt's baseline snapshot cannot absorb.
 
-    Also writes ``app/.gitignore`` with the `bmad-loop init` run-state entry.
+    Also writes ``app/.gitignore`` with all four entries `bmad-loop init` owns.
     Init writes that file next to the project it initializes, and the sandbox
-    template's own root-anchored ``.bmad-loop/runs/`` does not match a nested one —
-    so without it a nested engine run's journal would show up as untracked work.
+    template's root-anchored entries do not match nested state — so without the
+    nested file run state, caches, policy, and renderer output can show up as
+    untracked work.
 
     The subdirectory is FIXED at `NESTED_SUBDIR` rather than a parameter because
     every consumer's assertions spell the ``app/`` prefix literally. A parameter
@@ -697,20 +716,21 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     naming neither the helper nor the precondition. Both guards below fail with
     the precondition instead.
     """
-    assert paths.project == paths.repo_root, (
+    assert paths.project.resolve() == paths.repo_root.resolve(), (
         "nested_repo_root_paths builds the divergence; it cannot be applied to paths "
         "that already have one. Pass the plain `project` fixture."
     )
-    staged = git(paths.project, "diff", "--cached", "--name-only")
+    repo_root = paths.project.resolve()
+    staged = git(repo_root, "diff", "--cached", "--name-only")
     assert not staged, (
         "nested_repo_root_paths commits its seed files and requires an empty index; "
         f"already staged: {staged}"
     )
-    project = paths.project / NESTED_SUBDIR
-    assert not project.exists(), (
-        f"{NESTED_SUBDIR}/ already exists under {paths.project}: this helper seeds and "
-        "COMMITS it, so a second call (or a caller that pre-created it) would reach "
-        "`git commit` with nothing staged."
+    project = repo_root / NESTED_SUBDIR
+    assert not project.exists() and not project.is_symlink(), (
+        f"{NESTED_SUBDIR}/ already exists or is a symlink under {repo_root}: this helper "
+        "seeds and COMMITS it, so a second call (or a caller that pre-created it) would "
+        "reach setup/commit with an opaque filesystem or git error."
     )
     output_folder = project / "_bmad-output"
     impl = output_folder / "implementation-artifacts"
@@ -718,17 +738,29 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     impl.mkdir(parents=True, exist_ok=True)
     plan.mkdir(parents=True, exist_ok=True)
     (project / "src.txt").write_text("original\n", encoding="utf-8")
-    (project / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
-    git(paths.project, "add", f"{NESTED_SUBDIR}/src.txt", f"{NESTED_SUBDIR}/.gitignore")
-    git(paths.project, "commit", "-q", "-m", f"seed the {NESTED_SUBDIR}/ project")
-    return dataclasses.replace(
-        paths,
+    (project / ".gitignore").write_text(
+        "\n".join(
+            (
+                ".bmad-loop/runs/",
+                ".bmad-loop/cache/",
+                ".bmad-loop/policy.toml",
+                "_bmad/render/",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    configured = ProjectPaths(
         project=project,
         implementation_artifacts=impl,
         planning_artifacts=plan,
         output_folder=output_folder,
-        repo_root=paths.project,
+        repo_root=repo_root,
     )
+    write_repo_root_override(configured, repo_root)
+    git(repo_root, "add", NESTED_SUBDIR)
+    git(repo_root, "commit", "-q", "-m", f"seed the {NESTED_SUBDIR}/ project")
+    return load_paths(project)
 
 
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"

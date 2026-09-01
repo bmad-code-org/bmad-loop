@@ -6300,6 +6300,32 @@ def test_verify_dev_exclude_relpaths_separates_the_two_roots_in_a_monorepo(proje
     assert (paths.repo_root / from_project[0]) != paths.sprint_status
 
 
+def test_verify_dev_exclude_relpaths_roots_restore_patch_on_the_outer_repo(project):
+    """A relative restore latch selects the code-root file, not a nested decoy.
+
+    Both candidates exist so the assertion grades root selection by value; an
+    absence-only assertion would pass if setup simply forgot to create the decoy.
+
+    Ablation: resolve `restore_patch` against `paths.project` instead of `root`
+    and the final equality selects `app/restore.patch`, reddening this row.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project.parent == paths.repo_root
+    outer = paths.repo_root / "restore.patch"
+    decoy = paths.project / "restore.patch"
+    outer.write_text("outer\n", encoding="utf-8")
+    decoy.write_text("nested decoy\n", encoding="utf-8")
+    assert outer.is_file() and decoy.is_file() and outer.resolve() != decoy.resolve()
+    sp = paths.implementation_artifacts / "spec-1-1-a.md"
+
+    relpaths = verify.verify_dev_exclude_relpaths(paths, sp, "restore.patch", root=paths.repo_root)
+
+    restore_rel = relpaths[-1]
+    assert restore_rel == "restore.patch"
+    assert (paths.repo_root / restore_rel).resolve() == outer.resolve()
+    assert (paths.repo_root / restore_rel).resolve() != decoy.resolve()
+
+
 def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
     """Same rule, same shape, for the stories-mode exclude.
 
