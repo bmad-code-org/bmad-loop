@@ -44,22 +44,25 @@ class Decision:
     reason: str = ""
 
 
-def critical_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
     if not result_json:
         return []
+    escalations = result_json.get("escalations", [])
+    return escalations if isinstance(escalations, list) else []
+
+
+def critical_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [
         e
-        for e in result_json.get("escalations", [])
+        for e in _escalation_list(result_json)
         if isinstance(e, dict) and str(e.get("severity", "")).upper() == SEVERITY_CRITICAL
     ]
 
 
 def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not result_json:
-        return []
     return [
         e
-        for e in result_json.get("escalations", [])
+        for e in _escalation_list(result_json)
         if isinstance(e, dict) and str(e.get("severity", "")).upper() != SEVERITY_CRITICAL
     ]
 
