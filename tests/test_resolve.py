@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import escalated_run, git
+from conftest import escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
@@ -2637,8 +2637,7 @@ def test_gather_escalations_skips_a_json_recursion_error(tmp_path):
     """
     run_dir, state, task = _escalated_run(tmp_path)
     task_dir = _task_dir(run_dir, task)
-    depth = sys.getrecursionlimit() * 20
-    nested = "[" * depth + "0" + "]" * depth
+    nested = json_recursion_payload()
     malformed = '{"escalations":[{"severity":"CRITICAL","detail":' + nested + "}]}"
     with pytest.raises(RecursionError):
         json.loads(malformed)
