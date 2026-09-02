@@ -664,7 +664,7 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
 }
 
 # Every literal journal KIND written today: a declared inventory, not a per-kind
-# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. Kind #201 cannot
+# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. Kind #205 cannot
 # appear without someone deciding, in the same PR, what covers the record it
 # introduces: a routing row in `diagnostics` if any field carries an identifier, a
 # path or free text, and a test row asserting the record at the layer that reads it
@@ -676,15 +676,24 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
 # staleness arm sees the union of producers, so removing ONE writer of a shared
 # kind (the shared headings below, `run-stop` included) reddens nothing by itself.
 #
-# ⚠️ STATED BOUNDS. Dynamic kinds — the f-string family in
-# `recovery_flow.prune_preserve_refs`, the parameter defaults in
-# `engine._skip_review_and_commit`, the chosen kinds of
-# `sweep._close_bundle_ledger_when_spec_status` — are NOT rows here: their
-# POSITIONS are declared in `JOURNAL_DYNAMIC_KIND_ALLOW` and governed by the
-# literalness test, so the kinds they mint (e.g. `attempt-preserve-pruned`,
-# `review-skipped`) never enter this inventory. And a locally aliased journal
-# handle — a named one, or one bound from `Journal(run_dir)` — is invisible to the
-# whole journal scan (`JOURNAL_RECEIVERS`' bound), this emit included.
+# A declared dynamic-kind position (`JOURNAL_DYNAMIC_KIND_ALLOW`) writes a
+# parameter, not a literal, so its kinds enter here through the literals that reach
+# it from outside: the `kind="..."` a caller hands `engine._skip_review_and_commit`
+# or `sweep._close_bundle_ledger_when_spec_status`, and each one's parameter
+# default (`review-skipped`, `sweep-bundle-closed`) — a second `journalkindliteral`
+# arm reads both, keyed by the same `(file, name)` as the position.
+#
+# ⚠️ STATED BOUNDS. Truly dynamic kinds — the f-string family in
+# `recovery_flow.prune_preserve_refs` — are NOT rows here: the position is declared
+# and governed by the literalness test, and the kinds it mints (e.g.
+# `attempt-preserve-pruned`) never enter this inventory. And every receiver shape
+# the journal scan cannot see is a hole in this emit too (`JOURNAL_RECEIVERS`'
+# bound): a locally aliased handle, a `Journal` SUBCLASS constructed inline
+# (`_RearmJournal(run_dir).append(...)`), the `super().append(...)` inside such a
+# subclass's override, and a constructor reached through an import alias. On
+# today's tree the only subclass instance is bound to the `journal` name and its
+# override forwards its parameter kind, so no literal is missed — but the bound is
+# the scan's, not the tree's.
 JOURNAL_KINDS = frozenset(
     {
         # cli.py
@@ -738,6 +747,8 @@ JOURNAL_KINDS = frozenset(
         "review-not-recommended",
         "review-result",
         "review-retry",
+        "review-skipped",
+        "review-skipped-awaiting-operator",
         "review-timeout-salvage",
         "review-timeout-salvage-failed",
         "review-verify-failed",
@@ -862,8 +873,10 @@ JOURNAL_KINDS = frozenset(
         "migrate-duplicate-ids",
         "sweep-bundle-close-carried",
         "sweep-bundle-close-carry-uncommitted",
+        "sweep-bundle-closed",
         "sweep-bundle-name-discarded",
         "sweep-bundle-name-normalized",
+        "sweep-bundle-reclosed",
         "sweep-bundle-reopened",
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
@@ -915,10 +928,15 @@ JOURNAL_KINDS = frozenset(
 # ⚠️ STATED BOUND: a LOCALLY ALIASED handle is invisible. `j = self.journal` followed
 # by `j.append(kind, customer_email=x)` produces no finding (verified by running it
 # through `_scan_source`), and a handle bound from the constructor —
-# `j = Journal(run_dir)` then `j.append(...)` — is the same shape. No such site
-# exists in the tree today, and resolving the binding would be `_call_aliases`'
-# shape rather than a new idea — but the guard does not do it, and a reader must
-# not assume it does.
+# `j = Journal(run_dir)` then `j.append(...)` — is the same shape. So is anything
+# the constructor arm's bare-name anchor does not spell: a SUBCLASS constructed
+# inline (`_RearmJournal(run_dir).append(...)` — `runs._RearmJournal(Journal)`
+# exists), the `super().append(kind, **fields)` inside that subclass's override
+# (runs.py's fifth receiver spelling, a `super` Call), and `Journal` reached
+# through an import alias. None of these carries a literal the tree misses today
+# (the subclass's one instance is bound to `journal`; its override forwards a
+# parameter kind), and resolving them would be `_call_aliases`' shape rather than a
+# new idea — but the guard does not do it, and a reader must not assume it does.
 JOURNAL_RECEIVERS = {"journal", "_journal"}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
@@ -1408,11 +1426,31 @@ def _mint_candidates(node: ast.expr, depth: int = 0):
             yield from _mint_candidates(arg, depth + 1)
 
 
+def _kind_param_default(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The string-literal default of ``fn``'s ``kind`` parameter — positional-or-
+    keyword or keyword-only — or None when there is no such parameter or its default
+    is not a string literal. The declared dynamic-kind positions mint their fallback
+    kind here (``review-skipped``, ``sweep-bundle-closed``), and nothing else in
+    the scan reads a parameter default."""
+    args = fn.args
+    positional = args.posonlyargs + args.args
+    padded: list[ast.expr | None] = [None] * (len(positional) - len(args.defaults))
+    padded.extend(args.defaults)
+    for arg, default in [*zip(positional, padded), *zip(args.kwonlyargs, args.kw_defaults)]:
+        if arg.arg == "kind":
+            if isinstance(default, ast.Constant) and isinstance(default.value, str):
+                return default.value
+            return None
+    return None
+
+
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
     """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
-    each of the four receiver spellings the tree uses: the three named handles (see
+    each of the four receiver spellings the scan reads: the three named handles (see
     ``JOURNAL_RECEIVERS``) and the constructor-inline ``Journal(run_dir).append(...)``
-    — or a call to one of this file's declared ``JOURNAL_FORWARDERS``.
+    — or a call to one of this file's declared ``JOURNAL_FORWARDERS``. The tree's
+    fifth spelling, ``super().append(...)`` inside ``runs._RearmJournal``'s override,
+    is a stated bound (``JOURNAL_RECEIVERS``), not a receiver.
 
     The forwarder half is not a convenience. ``plugins/bus.py::_log`` takes its own
     ``**fields`` and hands them to ``self._journal.append``, so its four call sites
@@ -1439,7 +1477,8 @@ def _is_journal_write(node: ast.AST, rel: str) -> bool:
     # is an ast.Call, so the named-handle match above can never see it — runs.py's
     # stop/restamp records (and their kinds and fields) went unscanned exactly this
     # way. Name-anchored on `Journal` like the handle arm, so a lookalike
-    # constructor stays silent.
+    # constructor stays silent — and so, by the same anchor, does a subclass
+    # constructor or an import alias (the stated bound on `JOURNAL_RECEIVERS`).
     return isinstance(receiver, ast.Call) and _called_name(receiver.func) == "Journal"
 
 
@@ -2199,6 +2238,46 @@ def _scan_source(src: str, rel: str):
                 )
             )
 
+    # The literal kinds that reach a declared dynamic-kind POSITION from outside it:
+    # a `kind="..."` keyword at a call to one of this file's
+    # `JOURNAL_DYNAMIC_KIND_ALLOW` functions, and that function's own `kind`
+    # parameter default. The write inside such a position spells a parameter, so
+    # the journal-write arm above reports it as `journalkind` and nothing more —
+    # which is how `review-skipped-awaiting-operator` and its three siblings
+    # reached the journal with no inventory row anyone had to decide on (review
+    # pass 2). Same `journalkindliteral` finding, same inventory; keyed `(file,
+    # name)` exactly like the position it serves, so a same-named callee in a file
+    # that declares no such position stays silent.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and (rel, _called_name(node.func)) in JOURNAL_DYNAMIC_KIND_ALLOW
+        ):
+            for kw in node.keywords:
+                if (
+                    kw.arg == "kind"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    findings.append(
+                        (
+                            "journalkindliteral",
+                            rel,
+                            node.lineno,
+                            line_at(node.lineno),
+                            kw.value.value,
+                        )
+                    )
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (rel, node.name) in JOURNAL_DYNAMIC_KIND_ALLOW
+        ):
+            default = _kind_param_default(node)
+            if default is not None:
+                findings.append(
+                    ("journalkindliteral", rel, node.lineno, line_at(node.lineno), default)
+                )
+
     # Every refusal-helper DEFINITION (`_refuse_*` / `_reject_*`) and every
     # #414-family isolation-refusal CALL — the two surfaces `REFUSAL_HELPER_DEFS`
     # and `ISOLATION_CONFLICT_CALLERS` enumerate. The def side needs no alias
@@ -2886,39 +2965,84 @@ def test_journal_kind_inventory_is_complete():
     `JOURNAL_KINDS`: it sees the union of producers, so one writer of a SHARED
     kind can drop it without reddening anything while another still writes it.
 
-    Dynamic kinds are deliberately absent (`JOURNAL_KINDS`' stated bound): a
-    non-literal kind emits no `journalkindliteral` finding, and the sibling
-    literalness test above governs whether its POSITION may be dynamic at all.
-    Consumer-side kind parity — readers matching kinds by literal — stays DW-82's,
-    out of scope here.
+    A declared dynamic-kind position writes a parameter, so its kinds are read
+    where a literal reaches it — a caller's `kind="..."` keyword, or the parameter
+    default — by the emit's second arm (`JOURNAL_KINDS`' header); only the f-string
+    family is absent, by `JOURNAL_KINDS`' stated bound, and the sibling literalness
+    test above governs whether a POSITION may be dynamic at all. Consumer-side kind
+    parity — readers matching kinds by literal — stays DW-82's, out of scope here.
 
     Anti-vacuity is structural: the declared set is non-empty, so deleting the
     `journalkindliteral` emit reddens the staleness arm with the entire inventory
     rather than passing green.
 
-    Ablation: delete the `journalkindliteral` emit and this reddens with all 200
+    Both arms are graded from ONE scan in ONE assertion
+    (`_journal_kind_inventory_drift`): as two sequential asserts a rename reported
+    only the undeclared spelling, and the stale row surfaced a run later, after the
+    new row had landed (review pass 2).
+
+    Ablation: delete the `journalkindliteral` emit and this reddens with all 204
     rows stale; duplicate engine.py's epic-boundary write under the kind
-    `"guard-ablation-probe"` and ONLY this test reddens, naming the kind and
-    site."""
-    findings = _of("journalkindliteral")
+    `"guard-ablation-probe"` and ONLY this test reddens, naming the kind and site;
+    add `self._skip_review_and_commit(task, kind="guard-ablation-probe")` to
+    engine.py and ONLY this test reddens, naming the call; rename engine.py's
+    `epic-boundary` write and the ONE failure names both the new spelling and the
+    stale row."""
+    undeclared, stale = _journal_kind_inventory_drift(_of("journalkindliteral"))
+    assert (undeclared, stale) == ([], set()), (
+        "the literal journal kinds and JOURNAL_KINDS disagree. A kind a producer "
+        "writes but no row declares — add its row IN THE SAME PR as what covers its "
+        "record: a diagnostics routing row if any field carries an identifier, a "
+        "path or free text, and the test asserting the record at the layer that "
+        "reads it; or drop the write. A row no producer writes any more — delete it "
+        "and retire its routing/test rows deliberately, because a stale row "
+        "pre-approves the next record that reuses the name:\n"
+        + "\n".join(
+            f"  undeclared {rel}:{ln}: {kind!r} — {txt.strip()}"
+            for rel, ln, txt, kind in undeclared
+        )
+        + ("\n" if undeclared and stale else "")
+        + "\n".join(f"  stale row: {kind!r}" for kind in sorted(stale))
+    )
+
+
+def _journal_kind_inventory_drift(
+    findings,
+) -> tuple[list[tuple[str, int, str, str]], set[str]]:
+    """Both arms of the kind inventory from one set of `journalkindliteral`
+    findings: the literal kinds written but undeclared (with their sites), and the
+    declared rows nothing writes any more. Returned together so the inventory test
+    can grade them in one assertion — a rename is one defect with two faces."""
     scanned = {kind for _, _, _, _, kind in findings}
     undeclared = [
         (rel, ln, txt, kind) for _, rel, ln, txt, kind in findings if kind not in JOURNAL_KINDS
     ]
-    assert undeclared == [], (
-        "a journal producer writes a literal kind that JOURNAL_KINDS does not "
-        "declare — add the kind's row IN THE SAME PR as what covers its record: a "
-        "diagnostics routing row if any field carries an identifier, a path or "
-        "free text, and the test asserting the record at the layer that reads it; "
-        "or drop the write:\n"
-        + "\n".join(f"  {rel}:{ln}: {kind!r} — {txt.strip()}" for rel, ln, txt, kind in undeclared)
-    )
-    stale = JOURNAL_KINDS - scanned
-    assert stale == set(), (
-        "JOURNAL_KINDS declares kinds no producer writes any more — a stale row "
-        "pre-approves the next record that reuses the name; delete these rows and "
-        f"retire their routing/test rows deliberately: {sorted(stale)}"
-    )
+    return undeclared, JOURNAL_KINDS - scanned
+
+
+def test_journal_kind_inventory_drift_reports_a_rename_on_both_arms():
+    """A rename is one undeclared spelling AND one stale row, from the same findings.
+
+    Ablation: make `_journal_kind_inventory_drift` return the stale arm only when
+    the undeclared arm is empty (the sequential-assert shape) and this reddens."""
+    synthetic = [
+        ("journalkindliteral", "engine.py", 1, f'journal.append("{kind}")', kind)
+        for kind in sorted(JOURNAL_KINDS)
+        if kind != "epic-boundary"
+    ] + [
+        (
+            "journalkindliteral",
+            "engine.py",
+            7728,
+            'self.journal.append("epic-boundary-renamed", epic=e)',
+            "epic-boundary-renamed",
+        )
+    ]
+    undeclared, stale = _journal_kind_inventory_drift(synthetic)
+    assert [(rel, ln, kind) for rel, ln, _, kind in undeclared] == [
+        ("engine.py", 7728, "epic-boundary-renamed")
+    ]
+    assert stale == {"epic-boundary"}
 
 
 def test_journal_field_guard_actually_saw_the_producers():
@@ -4867,6 +4991,28 @@ def test_journal_kind_literal_probes_extract_the_kind():
             "plugin-loaded",
         ),
         ('def f(self):\n    self._log("plugin-hook", rc=rc)\n', "plugins/bus.py", "plugin-hook"),
+        # The kinds a declared dynamic-kind POSITION receives from outside it: the
+        # literal `kind=` a caller hands it, and the position's own parameter
+        # default — keyword-only (`engine._skip_review_and_commit`) or
+        # positional-or-keyword (`sweep._close_bundle_ledger_when_spec_status`).
+        # The write inside spells a parameter, so nothing else reads these.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, kind="review-skipped-awaiting-operator")\n',
+            "engine.py",
+            "review-skipped-awaiting-operator",
+        ),
+        (
+            'def _skip_review_and_commit(self, task, *, kind="review-skipped"):\n'
+            "    self.journal.append(kind, story_key=s)\n",
+            "engine.py",
+            "review-skipped",
+        ),
+        (
+            "def _close_bundle_ledger_when_spec_status(self, task, spec_file, status, "
+            'kind="sweep-bundle-closed"):\n    return None\n',
+            "sweep.py",
+            "sweep-bundle-closed",
+        ),
     ):
         found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
         assert found == [kind], f"extracted {found} from:\n{source}"
@@ -4892,6 +5038,17 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
             'def f():\n    """journal.append("prose-kind") is described here."""\n    return 1\n',
             "sweep.py",
         ),
+        # The forwarder-kind arm is keyed `(file, name)` like the position it
+        # serves: the same call in a file that declares no such position, a
+        # `kind=` keyword on an undeclared callee, a non-literal `kind=` at the
+        # declared position, and a non-string default on its def are all silent.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, kind="review-skipped")\n',
+            "sweep.py",
+        ),
+        ('def f(self):\n    self.emit(kind="review-skipped")\n', "engine.py"),
+        ("def f(self):\n    self._skip_review_and_commit(task, kind=chosen)\n", "engine.py"),
+        ("def _skip_review_and_commit(self, task, *, kind=None):\n    return None\n", "engine.py"),
     ):
         assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
 
