@@ -70,7 +70,7 @@ from .documents import (
     validate_document,
 )
 from .engine import Engine
-from .journal import Journal, load_state, save_state
+from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
 from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
 from .process_host import ProcessHostError
@@ -2554,9 +2554,8 @@ def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
     return 0
 
 
-def _resume_paused_run(project: Path, run_dir: Path) -> int:
-    """Resume the engine for a paused/interrupted run. Shared by `resume` and
-    the re-arm step of `resolve`."""
+def _prepare_resume_locked(project: Path, run_dir: Path):
+    """Publish resume state while the caller holds this run's state lock."""
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -2806,6 +2805,30 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
+    return paths, state, pol, journal, new_digest, profiles
+
+
+def _resume_paused_run(project: Path, run_dir: Path) -> int:
+    """Resume a paused/interrupted run without holding its lock across execution."""
+    with state_lock(run_dir):
+        # Repeat the command's liveness decision after exclusion.  A concurrent
+        # resume publishes its pid under this same hold, so the waiter refuses
+        # instead of reloading the predecessor's old paused state and double-driving.
+        if runs.engine_liveness(run_dir) == "alive":
+            print(
+                f"run {run_dir.name} is still live — resuming would double-drive it; "
+                "stop it first",
+                file=sys.stderr,
+            )
+            return 1
+        prepared = _prepare_resume_locked(project, run_dir)
+    if isinstance(prepared, int):
+        return prepared
+    paths, state, pol, journal, new_digest, profiles = prepared
+
+    # Adapter construction and the engine lifetime are deliberately outside the
+    # state hold.  The pid/state publication above makes a rival control command
+    # observe this process as live while these unbounded operations proceed.
     composed = runsetup.compose_resume(
         project=project,
         paths=paths,
@@ -3255,6 +3278,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     try:
         paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError) as e:
+        paths = None
         # An observation, so it degrades: without the config this process cannot NAME
         # the tree, and re-pointing the mirror at a guess is the one outcome worse than
         # leaving it alone. The re-arm then reads the root the run recorded — precisely
@@ -3302,23 +3326,59 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
             return rc
-        if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
-            print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
     outcome: runs.RearmOutcome | None = None
     try:
-        outcome = runs.rearm_escalation(
-            run_dir,
-            story_key,
-            restore_patch=restore_patch,
-            isolated_redrive=pol.scm.isolation == "worktree",
-            resolution_recorded=resolution_recorded,
-            # The tree this invocation is acting in, which is also the tree
-            # `build_context` published a `spec_file` from. `state.project` is where the
-            # run was LAUNCHED and nothing re-stamps it, so a moved project would have
-            # the agent edit one file and the re-arm flip another.
-            project_root=project,
-        )
+        with state_lock(run_dir):
+            # The pre-session checks intentionally stay lock-free; this is the
+            # mutation boundary, so repeat every state/liveness precondition from
+            # the snapshot left by the preceding writer before restamping anything.
+            fresh_state = load_state(run_dir)
+            if fresh_state.paused_stage != PAUSE_ESCALATION:
+                print(
+                    f"run {args.run_id} is not paused at an escalation "
+                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-arm. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
+            if paths is not None:
+                if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                    print(f"warning: {moved}", file=sys.stderr)
+            outcome = runs.rearm_escalation(
+                run_dir,
+                story_key,
+                restore_patch=restore_patch,
+                isolated_redrive=pol.scm.isolation == "worktree",
+                resolution_recorded=resolution_recorded,
+                # The tree this invocation is acting in, which is also the tree
+                # `build_context` published a `spec_file` from. `state.project` is where the
+                # run was LAUNCHED and nothing re-stamps it, so a moved project would have
+                # the agent edit one file and the re-arm flip another.
+                project_root=project,
+            )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

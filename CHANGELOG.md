@@ -258,6 +258,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Serialize every run-state writer and control read-modify-write transaction with one canonical per-run advisory lock (DW-93).
+
 - Let interactive resolve present `paused_reason` when watermark filtering leaves no newer
   recorded escalation detail, without recovering or inventing an escalation (DW-91).
 
