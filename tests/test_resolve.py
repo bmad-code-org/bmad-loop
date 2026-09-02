@@ -597,7 +597,7 @@ def test_build_context_prefers_supplied_live_roots_over_recorded_launch_roots(tm
         repo_root=recorded_code,
     )
 
-    path, _withheld = resolve.build_context(
+    path, _withheld, _unreadable = resolve.build_context(
         state,
         run_dir,
         "6-4-cli-list-command",
@@ -633,7 +633,7 @@ def test_build_context_rebases_project_owned_artifacts_after_project_rename(tmp_
         spec_folder="epic-1",
     )
 
-    path, _withheld = resolve.build_context(
+    path, _withheld, _unreadable = resolve.build_context(
         state,
         run_dir,
         key,
