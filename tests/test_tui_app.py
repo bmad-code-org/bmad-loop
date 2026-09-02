@@ -4452,6 +4452,54 @@ async def test_archive_live_run_refused_without_calling(project, monkeypatch):
         assert not isinstance(app.screen, ConfirmModal)
 
 
+@pytest.mark.parametrize(
+    "key, helper, failure, expected",
+    [
+        ("D", "delete_run", runs_mod.LiveEngineError("engine resumed"), "delete failed"),
+        (
+            "D",
+            "delete_run",
+            runs_mod.StateRootError("no usable state root"),
+            "delete failed",
+        ),
+        ("A", "archive_run", runs_mod.LiveEngineError("engine resumed"), "archive failed"),
+        (
+            "A",
+            "archive_run",
+            runs_mod.StateRootError("no usable state root"),
+            "archive failed",
+        ),
+    ],
+)
+async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
+    project, monkeypatch, key, helper, failure, expected
+):
+    """The modal's liveness sample is advisory. A later lifecycle or state-lock
+    refusal is toasted from the worker, and the dashboard forget happens only on
+    success.
+
+    Ablation: omit either new exception type from the worker catch and the worker
+    dies without the expected notification. Verified.
+    """
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(runs_mod, helper, fail)
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(expected in note for note in notifications(app)))
+        assert dashboard(app).selected_run_id == run_dir.name
+
+    assert run_dir.is_dir()
+
+
 # ------------------------------------------------------------ graceful stop (S)
 
 

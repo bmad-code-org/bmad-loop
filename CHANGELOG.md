@@ -270,6 +270,10 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- Serialize run deletion/archive against resume (DW-94), refusing a newly live
+  engine under the per-run lock and preventing a waiting resume from recreating a
+  run cleanup already removed.
+
 - Serialize every run-state writer and control read-modify-write transaction with one canonical per-run advisory lock (DW-93).
 
 - Let interactive resolve present `paused_reason` when watermark filtering leaves no newer

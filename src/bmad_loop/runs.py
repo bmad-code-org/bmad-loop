@@ -122,6 +122,16 @@ class LiveSessionError(Exception):
     message the CLI/TUI surface verbatim."""
 
 
+class LiveEngineError(Exception):
+    """A destructive run-lifecycle transaction found a provably live engine.
+
+    Unlike :class:`LiveSessionError`, this refusal is authoritative even when the
+    operator requested ``force``: force may stop the engine before entering the
+    transaction, but it never licenses removing a run a rival resume claimed in
+    the meantime. ``str()`` is the operator-facing message surfaces report.
+    """
+
+
 # How long stop_run waits for a signalled engine to exit before falling back to
 # marking the run stopped itself.
 _STOP_WAIT_S = 10.0
@@ -2583,10 +2593,24 @@ def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> No
         node = parent
 
 
-def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
-    """Permanently remove a run directory. Callers enforce the engine-liveness
-    guard; the session guard is enforced here (see :func:`_refuse_live_session`),
-    which raises :class:`LiveSessionError` instead of removing.
+def delete_run(
+    project: Path,
+    run_dir: Path,
+    *,
+    force: bool = False,
+    _expected_composer_pid: int | None = None,
+    _expected_composer_claim: os.stat_result | None = None,
+) -> None:
+    """Permanently remove a run directory under one lifecycle transaction.
+
+    Engine liveness is re-checked after acquiring the canonical per-run state
+    lock and a provably live engine raises :class:`LiveEngineError`. The private
+    ``_expected_composer_pid`` and ``_expected_composer_claim`` escape exists only
+    for ``runsetup``'s failed launch unwind: that composer may remove its own live
+    pid publication only while the freshly read pid and the directory it
+    exclusively created still match. It does not bypass the independent
+    live-session guard, and a rival pid publication or replacement directory
+    refuses the unwind.
 
     ``force`` is the operator's explicit override and skips that guard, accepting
     the leak on their own say-so. It deliberately does not kill the session
@@ -2598,21 +2622,48 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     the operator accepting a leaked session, never a licence to rmtree a path
     outside the runs dir."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
-    if not force:
-        _refuse_live_session(project, run_dir.name, "delete")
-    shutil.rmtree(run_dir)
-    # after the run dir, never before: a raise above leaves the run whole, and a
-    # whole run keeps its control plane (see _discard_state_dir).
-    _discard_state_dir(project, run_dir.name)
+    with state_lock(run_dir):
+        if _expected_composer_claim is not None:
+            try:
+                current_claim = run_dir.stat(follow_symlinks=False)
+            except OSError as e:
+                raise LiveEngineError(
+                    f"run {run_dir.name} changed directory ownership — refusing to delete it"
+                ) from e
+            if not os.path.samestat(_expected_composer_claim, current_claim):
+                raise LiveEngineError(
+                    f"run {run_dir.name} changed directory ownership — refusing to delete it"
+                )
+        published_pid = read_pid(run_dir)
+        if (
+            _expected_composer_pid is not None
+            and published_pid is not None
+            and published_pid != _expected_composer_pid
+        ):
+            raise LiveEngineError(
+                f"run {run_dir.name} changed engine ownership — refusing to delete it"
+            )
+        if _expected_composer_pid is None and engine_liveness(run_dir) == "alive":
+            raise LiveEngineError(
+                f"run {run_dir.name} is still live — refusing to delete it; stop it first"
+            )
+        if not force:
+            _refuse_live_session(project, run_dir.name, "delete")
+        shutil.rmtree(run_dir)
+        # after the run dir, never before: a raise above leaves the run whole, and a
+        # whole run keeps its control plane (see _discard_state_dir).
+        _discard_state_dir(project, run_dir.name)
 
 
 def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
-    place so a partial archive never appears. Callers enforce the engine-liveness
-    guard; the session guard is enforced here (see :func:`_refuse_live_session`,
-    and :func:`delete_run` for ``force``) and runs before the tarball is written,
-    so a refusal leaves nothing behind.
+    place so a partial archive never appears. Engine liveness is re-checked under
+    the canonical per-run state lock; that exclusion remains held through archive
+    publication, source removal, and control-state discard. The session guard is
+    enforced here too (see :func:`_refuse_live_session` and :func:`delete_run` for
+    ``force``), before any archive path is created, so a refusal leaves nothing
+    behind.
 
     The tarball holds the run dir only, so since #494 an archive no longer carries
     the run's ``events/``: the channel moved out of the tree, and its files are
@@ -2624,8 +2675,18 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     for the reason the session guard runs early: a refusal must leave no archive
     directory and no tarball behind."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
-    if not force:
-        _refuse_live_session(project, run_dir.name, "archive")
+    with state_lock(run_dir):
+        if engine_liveness(run_dir) == "alive":
+            raise LiveEngineError(
+                f"run {run_dir.name} is still live — refusing to archive it; stop it first"
+            )
+        if not force:
+            _refuse_live_session(project, run_dir.name, "archive")
+        return _archive_run_locked(project, run_dir)
+
+
+def _archive_run_locked(project: Path, run_dir: Path) -> Path:
+    """Archive ``run_dir`` while its caller owns :func:`state_lock`."""
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
