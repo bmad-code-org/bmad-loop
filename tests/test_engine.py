@@ -10792,6 +10792,17 @@ def test_verify_env_fault_pauses_dev_without_burning_budget(project):
     assert decision["env_fault"] is True
 
 
+def _spawn_error_names(message: str, path: Path) -> bool:
+    """Whether a spawn-error record names ``path``.
+
+    `verify` interpolates the exception itself, and ``OSError.__str__`` renders
+    its ``filename`` through ``repr``, which doubles every backslash. On POSIX
+    that is a no-op and the raw path matches; on Windows the path never appears
+    literally, so collapse the escaping before looking for it.
+    """
+    return str(path) in message.replace("\\\\", "\\")
+
+
 def test_unusable_verify_cwd_pauses_the_run_instead_of_crashing_it(project, monkeypatch):
     """The DW-2 headline, end to end: a `cwd` the verify child cannot be started
     in PAUSES the run; it does not end it as a crash.
@@ -10848,7 +10859,7 @@ def test_unusable_verify_cwd_pauses_the_run_instead_of_crashing_it(project, monk
     assert decision["env_fault"] is True
     # the discriminator reached the record, for the out-of-process reader
     record = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"][-1]
-    assert record["spawn_error"] and str(missing) in record["spawn_error"]
+    assert record["spawn_error"] and _spawn_error_names(record["spawn_error"], missing)
     assert record["returncode"] == verify.SPAWN_FAULT_RC
 
 
@@ -10922,7 +10933,7 @@ def test_review_spawn_fault_is_journalled_and_pauses_without_a_fix(project, monk
     ]
     (record,) = records
     assert record["returncode"] == verify.SPAWN_FAULT_RC
-    assert record["spawn_error"] and str(failed_cwd) in record["spawn_error"]
+    assert record["spawn_error"] and _spawn_error_names(record["spawn_error"], failed_cwd)
     failed = [
         entry for entry in engine.journal.entries() if entry["kind"] == "review-verify-failed"
     ][-1]

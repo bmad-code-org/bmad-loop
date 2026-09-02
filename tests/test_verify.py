@@ -2245,7 +2245,17 @@ def test_unusable_cwd_escalates_as_an_environment_fault(tmp_path):
     assert "command not found / not executable" not in out.reason
     # The exception already rides `spawn_error`, which is interpolated as the
     # environment-fault reason. Repeating `output_tail` would print it twice.
-    assert out.reason.count("FileNotFoundError") == 1
+    # The type is the platform's, not a fixed name: POSIX raises
+    # FileNotFoundError for a missing cwd, Windows a different OSError
+    # subclass. Derive it from the same spawn so the once-only check holds
+    # on both rather than pinning one platform's spelling.
+    try:
+        subprocess.run([sys.executable, "-c", ""], cwd=cwd, check=False)
+    except OSError as exc:
+        spawn_exc = type(exc).__name__
+    else:  # pragma: no cover - a missing cwd is not spawnable
+        pytest.fail("spawn into a missing cwd unexpectedly succeeded")
+    assert out.reason.count(spawn_exc) == 1
 
 
 def test_rc_env_fault_keeps_its_own_explanatory_clause(tmp_path):
