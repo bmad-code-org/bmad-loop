@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
+  three enumerate-vs-declare inventories: the 200 literal journal kinds (`JOURNAL_KINDS`,
+  fed by a literal-kind emit that also sees kind-only and constructor-inline
+  `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
+  to), the `_refuse_*`/`_reject_*` helper definitions counted with multiplicity
+  (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call sites counted
+  with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal helper, or refusal
+  call site reddens CI until its row lands; the row is the PR-time decision, and the
+  failure message demands the covering test land beside it. Each new detector arm carries
+  must-flag and must-stay-silent probe rows.
+
 - **Interactive resolve context names both the BMAD project root and the run's code
   root.** `bmad-loop resolve` warns before a divergent-root session launches, keeps the
   session project-rooted, and directs code fixes and commits to the code root. The
