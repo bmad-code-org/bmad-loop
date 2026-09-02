@@ -270,6 +270,9 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- Let interactive resolve present `paused_reason` when watermark filtering leaves no newer
+  recorded escalation detail, without recovering or inventing an escalation (DW-91).
+
 - Reject malformed session escalation/result artifacts and non-finite resolve JSON
   (DW-86, DW-89).
 
