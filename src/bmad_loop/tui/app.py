@@ -1425,10 +1425,10 @@ class BmadLoopApp(App[None]):
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.delete_run(self.project, run_dir)
-        except (OSError, runs.LiveSessionError) as e:
-            # LiveSessionError is the #419 backstop: the confirm above gates on engine
-            # liveness, which an orphaned session passes. Surface it like any other
-            # failed removal rather than letting it kill the worker thread.
+        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+            # The modal's liveness sample is advisory. Surface authoritative
+            # lifecycle refusals and lock/removal failures here rather than letting
+            # them kill the worker thread or forgetting a run that still exists.
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)
@@ -1464,9 +1464,9 @@ class BmadLoopApp(App[None]):
     def _archive_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             dest = runs.archive_run(self.project, run_dir)
-        except (OSError, runs.LiveSessionError) as e:
-            # see _delete_run_worker: the confirm's guard is engine-keyed, this one
-            # is session-keyed (#419).
+        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+            # Same worker boundary as delete: report the authoritative transaction,
+            # not the earlier modal sample.
             self.call_from_thread(self.notify, f"archive failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)
