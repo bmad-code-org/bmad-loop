@@ -17,6 +17,7 @@ from conftest import (
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
+    assert_run_state_lock_held,
     escalated_run,
     fault_read_text,
     git,
@@ -2546,6 +2547,88 @@ def test_resolve_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
     assert "proceeding anyway (--force)" in capsys.readouterr().err
     assert resumed == [run_dir]
     assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING  # past the gate, re-armed
+
+
+def test_resolve_reloads_state_after_waiting_for_mutation_lock(tmp_path, monkeypatch, capsys):
+    """Ablation: delete cmd_resolve's fresh in-lock state check and both concurrent
+    gestures reach rearm_escalation instead of the waiter refusing the rival's result."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("double re-armed"))
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["s1"].phase = Phase.PENDING
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", rival_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+
+    assert rc == 1
+    assert "no escalated story" in capsys.readouterr().err
+
+
+def test_resolve_refuses_a_newer_escalation_after_waiting_for_mutation_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """A same-story re-escalation can have the same phase after a rival re-drive.
+
+    Ablation: delete the generation comparison in ``cmd_resolve`` and this stale
+    gesture consumes the newer escalation even though its resolve session never saw it.
+    """
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    original_generation = load_state(run_dir).tasks["s1"].generation
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("stale rearm"))
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["s1"].generation = original_generation + 1
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", rival_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+
+    assert rc == 1
+    assert "changed while resolve was in progress" in capsys.readouterr().err
+
+
+def test_resolve_retains_outer_lock_through_rearm_call(tmp_path, monkeypatch):
+    run_dir = _escalated_run(tmp_path, "r1")
+    rearms: list[Path] = []
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: 0)
+
+    def checked_rearm(rd, key, **_kwargs):
+        assert_run_state_lock_held(rd)
+        rearms.append(rd)
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", checked_rearm)
+
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    assert rearms == [run_dir]
 
 
 def test_resolve_no_escalated_story(tmp_path, capsys):
@@ -5271,8 +5354,99 @@ def _paused_run_for_resume(project, monkeypatch, *, snapshot=LAUNCH_SNAPSHOT, **
         **state_kwargs,
     )
     monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    # These tests call the private helper repeatedly in one pytest process to inspect
+    # successive policy snapshots. A real command exits or keeps driving after
+    # publishing its pid; suppress that unrelated liveness artifact in this harness.
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
     return run_dir
+
+
+def test_resume_rechecks_liveness_inside_the_state_lock(tmp_path, monkeypatch, capsys):
+    """Ablation: remove _resume_paused_run's in-lock liveness check and preparation
+    runs even though a rival resume published its pid while this caller waited."""
+    import contextlib
+
+    entered = False
+
+    @contextlib.contextmanager
+    def recording_lock(_run_dir):
+        nonlocal entered
+        entered = True
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", recording_lock)
+
+    def liveness(_run_dir):
+        assert entered
+        return "alive"
+
+    monkeypatch.setattr(cli.runs, "engine_liveness", liveness)
+    monkeypatch.setattr(cli, "_prepare_resume_locked", lambda *_a: pytest.fail("double drove"))
+
+    assert cli._resume_paused_run(tmp_path, tmp_path / "run") == 1
+    assert "double-drive" in capsys.readouterr().err
+
+
+def test_resume_liveness_and_publication_share_one_lock_acquisition(tmp_path, monkeypatch):
+    """The freshness check and preparation are one uninterrupted transaction.
+
+    Ablation: split ``_resume_paused_run`` into consecutive lock blocks around the
+    liveness check and preparation; both in-lock assertions still pass, but the
+    acquisition-count assertion reddens because a rival can enter between them.
+    """
+    import contextlib
+
+    acquisitions = 0
+    active = False
+
+    @contextlib.contextmanager
+    def recording_lock(_run_dir):
+        nonlocal acquisitions, active
+        acquisitions += 1
+        assert not active
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    def liveness(_run_dir):
+        assert active
+        return "dead"
+
+    def prepare(_project, _run_dir):
+        assert active
+        return 1
+
+    monkeypatch.setattr(cli, "state_lock", recording_lock)
+    monkeypatch.setattr(cli.runs, "engine_liveness", liveness)
+    monkeypatch.setattr(cli, "_prepare_resume_locked", prepare)
+
+    assert cli._resume_paused_run(tmp_path, tmp_path / "run") == 1
+    assert acquisitions == 1
+
+
+def test_resume_retains_outer_lock_through_pid_publication(project, monkeypatch):
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    publications: list[str] = []
+    real_save = cli.save_state
+
+    def checked_write_pid(target):
+        assert_run_state_lock_held(target)
+        publications.append("pid")
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        publications.append("state")
+        real_save(target, state)
+
+    monkeypatch.setattr(cli.runs, "write_pid", checked_write_pid)
+    monkeypatch.setattr(cli, "save_state", checked_save)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert publications == ["pid", "state"]
 
 
 def _state_reading_engine(seen):

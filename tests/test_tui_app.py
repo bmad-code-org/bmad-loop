@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    assert_run_state_lock_held,
     git,
     install_bmad_config,
     make_validate_document,
@@ -3496,7 +3497,11 @@ def _stories_paused_run(
     if blocked_result:
         body += f"\n## Auto Run Result\n\n- Status: blocked\n\n{blocked_result}\n"
     spec.write_text(body, encoding="utf-8")
-    task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
+    task = StoryTask(
+        story_key=story_key,
+        epic=0,
+        phase=Phase.ESCALATED if stage == "escalation" else Phase.DEV_VERIFY,
+    )
     task.spec_file = str(spec)
     if worktree_path:
         task.worktree_path = worktree_path
@@ -5127,6 +5132,187 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
 
     assert seen == [moved.resolve()]
     assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+
+
+def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypatch):
+    """Ablation: delete _do_rearm's second liveness check and the TUI re-arms after
+    a rival resume published its pid while this gesture waited for the state lock."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260611-100000-aaaa"
+    checks: list[str] = []
+
+    def liveness_gate(_self, _run_id, _run_dir):
+        checks.append("checked")
+        return len(checks) == 2
+
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", liveness_gate)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("double re-armed"))
+
+    BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+
+    assert checks == ["checked", "checked"]
+
+
+def test_escalation_rearm_reloads_state_before_restamping(project, monkeypatch):
+    """Ablation: delete _do_rearm's fresh state check and the TUI restamps a run
+    whose escalation a rival already consumed while this gesture waited for the lock."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: rival resolved this escalation.",
+    )
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **_kwargs: notes.append(str(message)),
+    )
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["1"].phase = Phase.PENDING
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", rival_first)
+    monkeypatch.setattr(runs, "restamp_code_root", lambda *_a: pytest.fail("stale restamp"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("double re-armed"))
+
+    BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+
+    assert any("no longer paused at escalation" in note for note in notes)
+
+
+def test_escalation_rearm_refuses_a_newer_generation_from_an_open_review(project, monkeypatch):
+    """An old modal must not consume a later escalation for the same story.
+
+    Ablation: delete ``_do_rearm``'s generation comparison and the rival's newer
+    escalation reaches ``rearm_escalation`` even though the modal never displayed it.
+    """
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: the original escalation.",
+    )
+    expected_generation = load_state(run_dir).tasks["1"].generation
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **_kwargs: notes.append(str(message)),
+    )
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["1"].generation = expected_generation + 1
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", rival_first)
+    monkeypatch.setattr(runs, "restamp_code_root", lambda *_a: pytest.fail("stale restamp"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("stale rearm"))
+
+    BmadLoopApp(project.project)._do_rearm(
+        run_dir.name,
+        run_dir,
+        "1",
+        expected_generation=expected_generation,
+    )
+
+    assert any("changed while its review was open" in note for note in notes)
+
+
+def test_escalation_rearm_retains_outer_lock_through_rearm_call(project, monkeypatch):
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    rearms: list[Path] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+
+    def checked_rearm(rd, key, **_kwargs):
+        assert_run_state_lock_held(rd)
+        rearms.append(rd)
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", checked_rearm)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "notify", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert rearms == [run_dir]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("lock unavailable"), runs_mod.StateRootError("no usable state root")],
+)
+def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, failure):
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    notes: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("wrote unlocked"))
+
+    @contextlib.contextmanager
+    def refusing_lock(_run_dir):
+        raise failure
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", refusing_lock)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda message, **kwargs: notes.append((str(message), kwargs.get("severity"))),
+    )
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert notes == [(f"re-arm failed: {failure}", "error")]
 
 
 async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(

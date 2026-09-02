@@ -18,7 +18,7 @@ from bmad_loop import cli, documents, envvars, platform_util, runs
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
-from bmad_loop.journal import save_state
+from bmad_loop.journal import STATE_FILE, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
@@ -67,6 +67,14 @@ needs_strict_codec = pytest.mark.skipif(
     reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
     "would exercise the strict decode this fix is about",
 )
+
+
+def assert_run_state_lock_held(run_dir: Path) -> None:
+    """Fail unless this process already owns the canonical logical state lock."""
+    sidecar = runs.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    with pytest.raises(OSError):
+        with platform_util.file_lock(sidecar, blocking=False):
+            pytest.fail("the run-state publication boundary was outside its outer lock")
 
 
 def opencode_runs() -> bool:
