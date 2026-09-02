@@ -456,6 +456,67 @@ def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, mo
     assert doc["archived"] == [] and doc["deleted"] == []
 
 
+@pytest.mark.parametrize(
+    "hard, helper_name, result_key, other_key",
+    [
+        (False, "archive_run", "archived", "deleted"),
+        (True, "delete_run", "deleted", "archived"),
+    ],
+)
+def test_cmd_clean_json_records_a_resumed_engine_and_continues_siblings(
+    project, monkeypatch, capsys, hard, helper_name, result_key, other_key
+):
+    """A runs-layer lifecycle refusal is per-run data, never a partial JSON
+    document or an abort that prevents later candidates from being reclaimed."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    sibling = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
+    for run_dir in (racer, sibling):
+        save_state(
+            run_dir,
+            RunState(run_id=run_dir.name, project=str(repo), started_at="x", finished=True),
+        )
+    real_cleanup = getattr(runs, helper_name)
+
+    def racing_cleanup(project_path, run_dir):
+        if run_dir == racer:
+            raise runs.LiveEngineError("engine resumed")
+        return real_cleanup(project_path, run_dir)
+
+    monkeypatch.setattr(runs, helper_name, racing_cleanup)
+
+    extra = ("--hard",) if hard else ()
+    doc = _clean_json(repo, capsys, "--retain", "0", *extra)
+
+    assert doc["protected"] == [racer.name]
+    assert doc[result_key] == [sibling.name]
+    assert doc[other_key] == []
+    assert racer.is_dir() and not sibling.exists()
+
+
+def test_cmd_clean_text_identifies_a_resumed_engine(project, monkeypatch, capsys):
+    """Text mode distinguishes an engine resume from an agent-session race."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(
+        racer,
+        RunState(run_id=racer.name, project=str(repo), started_at="x", finished=True),
+    )
+
+    def racing_archive(_project, _run_dir):
+        raise runs.LiveEngineError("engine resumed")
+
+    monkeypatch.setattr(runs, "archive_run", racing_archive)
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    _out, err = capsys.readouterr()
+    assert f"run {racer.name}: engine resumed mid-clean — not removed" in err
+    assert "agent session appeared mid-clean" not in err
+
+
 def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(
     project, monkeypatch, capsys
 ):

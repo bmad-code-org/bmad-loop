@@ -2522,6 +2522,127 @@ def test_delete_run(tmp_path):
     assert not run_dir.exists()
 
 
+def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, monkeypatch):
+    """Resume-first ordering: the decisive probe runs after lock acquisition and
+    leaves both the run and its control plane untouched.
+
+    Ablation: remove the in-lock ``engine_liveness`` gate and the run disappears;
+    move it above ``state_lock`` and the lock assertion fails. Verified.
+    """
+    run_dir = _make_state_run(tmp_path, "r1")
+    state_dir = _seed_state_dir(tmp_path, "r1")
+
+    def live(target):
+        assert_run_state_lock_held(target)
+        return "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", live)
+    monkeypatch.setattr(
+        runs,
+        "_refuse_live_session",
+        lambda *_args: pytest.fail("session guard ran before authoritative engine probe"),
+    )
+    with pytest.raises(runs.LiveEngineError, match="refusing to delete"):
+        runs.delete_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert state_dir.is_dir()
+
+
+def test_delete_run_holds_lifecycle_lock_through_removal_and_state_discard(tmp_path, monkeypatch):
+    """The authoritative probe, directory removal, and control-plane tail are one
+    uninterrupted transaction. Moving either mutation outside the hold reddens.
+    """
+    run_dir = _make_state_run(tmp_path, "r1")
+    removed: list[str] = []
+    real_rmtree = runs.shutil.rmtree
+
+    def dead(target):
+        assert_run_state_lock_held(target)
+        return "dead"
+
+    def checked_rmtree(target, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        removed.append("run")
+        return real_rmtree(target, *args, **kwargs)
+
+    def checked_discard(_project, _run_id):
+        assert_run_state_lock_held(run_dir)
+        removed.append("state")
+
+    monkeypatch.setattr(runs, "engine_liveness", dead)
+    monkeypatch.setattr(runs.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(runs, "_discard_state_dir", checked_discard)
+
+    runs.delete_run(tmp_path, run_dir)
+
+    assert removed == ["run", "state"]
+
+
+def test_failed_composition_pid_bypasses_only_its_own_live_engine(tmp_path, monkeypatch):
+    """The narrow composer token keeps the independent session guard active."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    composer_claim = run_dir.stat(follow_symlinks=False)
+    runs.write_pid(run_dir)
+    checked: list[str] = []
+
+    def session_guard(_project, run_id, _action):
+        checked.append(run_id)
+
+    monkeypatch.setattr(runs, "_refuse_live_session", session_guard)
+    runs.delete_run(
+        tmp_path,
+        run_dir,
+        _expected_composer_pid=os.getpid(),
+        _expected_composer_claim=composer_claim,
+    )
+
+    assert checked == ["r1"]
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("operation", [runs.delete_run, runs.archive_run])
+def test_lifecycle_containment_is_checked_before_lock_acquisition(tmp_path, monkeypatch, operation):
+    """A hostile path is refused without deriving or taking any state lock."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "state.json").write_text("{}", encoding="utf-8")
+
+    def unexpected_lock(_run_dir):
+        pytest.fail("containment must run before state-lock acquisition")
+
+    monkeypatch.setattr(runs, "state_lock", unexpected_lock)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        operation(project, outside)
+
+    assert outside.is_dir()
+
+
+def test_delete_run_refuses_before_removal_when_state_lock_cannot_be_named(tmp_path, monkeypatch):
+    """The lifecycle lock is mandatory: without a state root cleanup cannot
+    rendezvous with resume, so failure leaves the run intact and surfaces."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+
+    with pytest.raises(runs.StateRootError, match="no root"):
+        runs.delete_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+
+
+def test_archive_run_refuses_before_staging_when_state_lock_cannot_be_named(tmp_path, monkeypatch):
+    """Archive cannot stage or remove anything when its mandatory lock fails."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+
+    with pytest.raises(runs.StateRootError, match="no root"):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
 def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
     """#494 moved the events channel out of the project tree, so removing the run
     dir stopped removing everything the run owns. Without this tail every delete
@@ -2539,19 +2660,18 @@ def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
 @pytest.mark.parametrize(
     "attr, exc",
     [
-        ("state_root", runs.StateRootError("no root")),
         ("project_tag", OSError("cannot canonicalize")),
         ("project_tag", RuntimeError("Symlink loop from '/p'")),
     ],
-    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+    ids=["unresolvable-project", "symlink-loop-project"],
 )
 def test_delete_run_survives_a_counterpart_it_cannot_name(tmp_path, monkeypatch, attr, exc):
     """The counterpart removal is a never-raise tail (#139 teardown doctrine).
 
-    Every row is the counterpart being *unnameable*, which is the only failure
-    that can escape: an environment with no derivable state root, and a project
-    the OS refuses to canonicalize (#552). Removal failures are absorbed
-    separately, by `ignore_errors`.
+    Every row is a project the OS refuses to canonicalize (#552) only after the
+    mandatory lifecycle lock was named. Removal failures are absorbed separately,
+    by `ignore_errors`. A missing state root now refuses before removal because
+    cleanup cannot safely rendezvous with resume without that lock.
 
     The `RuntimeError` row is not a hypothetical type: `project_tag` resolves
     before digesting, and below 3.13 `Path.resolve` reports a symlink loop as
@@ -4391,6 +4511,80 @@ def test_archive_run(tmp_path):
     assert "20260611-100000-aaaa/journal.jsonl" in names
 
 
+def test_archive_run_refuses_a_live_engine_before_staging(tmp_path, monkeypatch):
+    """Resume-first ordering leaves source, destination, and control state whole."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    state_dir = _seed_state_dir(tmp_path, run_dir.name)
+
+    def live(target):
+        assert_run_state_lock_held(target)
+        return "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", live)
+    monkeypatch.setattr(
+        runs,
+        "_refuse_live_session",
+        lambda *_args: pytest.fail("session guard ran before authoritative engine probe"),
+    )
+    with pytest.raises(runs.LiveEngineError, match="refusing to archive"):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert state_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
+def test_archive_run_holds_one_lock_through_snapshot_publish_and_removal(tmp_path, monkeypatch):
+    """Snapshot, durable publication, source removal, and control cleanup all
+    remain inside the same lifecycle hold.
+
+    Ablation: moving the liveness gate, tar add, replace, rmtree, or discard outside
+    the hold fails at that seam. Verified.
+    """
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "payload").write_text("data", encoding="utf-8")
+    order: list[str] = []
+    real_add = runs.tarfile.TarFile.add
+    real_replace = runs.atomic_replace
+    real_rmtree = runs.shutil.rmtree
+
+    def dead(target):
+        assert_run_state_lock_held(target)
+        order.append("probe")
+        return "dead"
+
+    def checked_add(self, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        order.append("snapshot")
+        return real_add(self, *args, **kwargs)
+
+    def checked_replace(src, dest):
+        assert_run_state_lock_held(run_dir)
+        order.append("publish")
+        return real_replace(src, dest)
+
+    def checked_rmtree(target, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        order.append("remove")
+        return real_rmtree(target, *args, **kwargs)
+
+    def checked_discard(_project, _run_id):
+        assert_run_state_lock_held(run_dir)
+        order.append("discard")
+
+    monkeypatch.setattr(runs, "engine_liveness", dead)
+    monkeypatch.setattr(runs.tarfile.TarFile, "add", checked_add)
+    monkeypatch.setattr(runs, "atomic_replace", checked_replace)
+    monkeypatch.setattr(runs.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(runs, "_discard_state_dir", checked_discard)
+
+    runs.archive_run(tmp_path, run_dir)
+
+    assert order[0] == "probe"
+    assert order[-3:] == ["publish", "remove", "discard"]
+    assert order[1:-3] and set(order[1:-3]) == {"snapshot"}
+
+
 def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch):
     """#363's filename half, and it needs its own test because NOTHING else grades
     it: on the happy path `atomic_replace` consumes the temp under either spelling,
@@ -4459,6 +4653,9 @@ def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
 
     assert (run_dir / "state.json").is_file()  # the run survives a failed archive
     assert list((tmp_path / ".bmad-loop" / "archive").iterdir()) == []  # no temp left
+    sidecar = runs.lock_path_for(run_dir / "state.json", follow_final_symlink=False)
+    with platform_util.file_lock(sidecar, blocking=False):
+        pass  # the original archive error released lifecycle exclusion
 
 
 def test_archive_run_temp_is_created_exclusively_at_0600(tmp_path, monkeypatch):
