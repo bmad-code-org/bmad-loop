@@ -3267,7 +3267,7 @@ def test_resolve_warns_about_divergent_roots_before_the_session(tmp_path, monkey
     def fake_context(*args, **kwargs):
         context_roots["project"] = kwargs["project_root"]
         context_roots["code"] = kwargs["code_root"]
-        return None, 0
+        return None, 0, 0
 
     monkeypatch.setattr(resolve, "build_context", fake_context)
 
@@ -3307,7 +3307,7 @@ def test_resolve_context_uses_live_project_after_project_rename(tmp_path, monkey
     def fake_context(*args, **kwargs):
         seen["project"] = kwargs["project_root"]
         seen["code"] = kwargs["code_root"]
-        return None, 0
+        return None, 0, 0
 
     monkeypatch.setattr(resolve, "build_context", fake_context)
     monkeypatch.setattr(
@@ -3335,7 +3335,7 @@ def test_resolve_context_uses_live_configured_code_root(project, monkeypatch, ca
     def fake_context(*args, **kwargs):
         seen["project"] = kwargs["project_root"]
         seen["code"] = kwargs["code_root"]
-        return None, 0
+        return None, 0, 0
 
     monkeypatch.setattr(resolve, "build_context", fake_context)
 
@@ -3372,7 +3372,7 @@ def test_resolve_refuses_to_rearm_when_code_root_changes_during_session(
     moved = project.project / "code-after-session"
     moved.mkdir()
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0))
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
 
     def move_code_root_during_session(*args, **kwargs):
         _configure_repo_root(project, moved)
@@ -3408,7 +3408,7 @@ def test_resolve_same_root_launches_without_a_divergence_warning(tmp_path, monke
     _escalated_run(tmp_path, "r1")  # empty repo_root: legacy fallback to project
     launched: list[Path] = []
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0))
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(
         resolve,
         "run_session",
