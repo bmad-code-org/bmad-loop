@@ -10,10 +10,11 @@ breaking changes may land in a minor release.
 ### Added
 
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
-  three enumerate-vs-declare inventories: the 200 literal journal kinds (`JOURNAL_KINDS`,
-  fed by a literal-kind emit that also sees kind-only and constructor-inline
+  three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
+  fed by a literal-kind emit that also sees kind-only writes, constructor-inline
   `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
-  to), the `_refuse_*`/`_reject_*` helper definitions counted with multiplicity
+  to — and the `kind=` literals and parameter defaults that reach a declared dynamic-kind
+  position), the `_refuse_*`/`_reject_*` helper definitions counted with multiplicity
   (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call sites counted
   with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal helper, or refusal
   call site reddens CI until its row lands; the row is the PR-time decision, and the
