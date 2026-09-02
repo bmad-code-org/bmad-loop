@@ -11891,6 +11891,13 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
     assert Engine._stop_signals_owner is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "pins the POSIX half of the gate by faking sys.platform; the faked branch's\n"
+        "imports (fcntl) do not exist on Windows, so the row can only run off win32"
+    ),
+)
 def test_non_windows_sigint_still_stops_run(project, monkeypatch):
     import bmad_loop.engine as engine_mod
 
