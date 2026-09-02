@@ -14,8 +14,8 @@ plugin-owned env-var families stay with their plugin" — see
 calls go through the ``_run_git`` chokepoint in ``verify.py``" — see
 ``test_no_git_invocation_outside_verify``.
 
-Three later invariants ride the same machinery, each one previously held by
-docstring prose alone:
+Later invariants ride the same machinery, each one previously held by docstring
+prose alone (or by nothing):
 
 * the task-directory artifact names are ``journal.TASK_CYCLE_ARTIFACTS`` and not a
   literal repeated per reader/writer — ``test_task_cycle_artifacts_named_only_through_the_constant``
@@ -29,6 +29,12 @@ docstring prose alone:
   the two names ``Journal.append`` mints itself, which no call site spells.
 * ``runs.rearm_escalation`` is called from exactly two places, each of which consults
   liveness first — ``test_rearm_escalation_called_only_behind_a_liveness_gate``.
+* every literal journal KIND is a declared ``JOURNAL_KINDS`` row —
+  ``test_journal_kind_inventory_is_complete``.
+* every ``_refuse_*``/``_reject_*`` helper definition and every #414-family
+  isolation-refusal call site is enumerated —
+  ``test_refusal_helper_inventory_is_complete`` and
+  ``test_isolation_conflict_refusal_sites_are_enumerated``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -223,6 +229,51 @@ RUN_STATE_TRANSACTIONS = {
     ("tui/app.py", "_do_rearm"),
 }
 
+# The two refusal surfaces review iteration 6 kept re-finding by hand, enumerated so
+# a NEW one reddens CI until its row lands — the row being the PR-time decision
+# whose failure message demands the covering test land beside it (the journal-kind
+# inventory below is the third surface of that shape).
+#
+# Every `_refuse_*` / `_reject_*` helper DEFINITION in the tree, as
+# `(file, def name)`. The prefix pair is the tree's whole refusal-helper naming
+# convention today; a helper named outside it is invisible here — a stated bound,
+# not coverage. The guard forces the decision only on names that claim to be
+# refusals, and deliberately adds no runtime abstraction (no RefusalError, no
+# registry): the inventory is the test file's, not the product's.
+REFUSAL_HELPER_DEFS = {
+    ("cli.py", "_reject_bad_run_id"),
+    ("cli.py", "_reject_isolation_conflict"),
+    ("cli.py", "_reject_under_floor_git"),
+    ("engine.py", "_refuse_gated_story"),
+    ("platform_util.py", "_refuse_unwritable_target"),
+    ("platform_util.py", "_refuse_unwritable_target_at"),
+    ("resolve.py", "_reject_json_constant"),
+    ("runs.py", "_refuse_live_session"),
+    ("runs.py", "_refuse_uncontained_run_dir"),
+}
+
+# Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole
+# producer of the isolation-under-repo-root refusal text, plus its rc-returning CLI
+# wrapper `_reject_isolation_conflict` — as `(file, enclosing function) -> count`.
+# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because `cmd_resolve`
+# legitimately calls the wrapper twice: post-confirm is the authority, and the
+# pre-session arm spares the operator a full interactive session on a pair knowable
+# from config — the `96aa09a9` fix, which landed with no structural gate naming it.
+# Accepted cost (human decision 2026-09-02): every future caller of the predicate
+# touches a row here in the same PR.
+ISOLATION_CONFLICT_CALLERS = {
+    ("cli.py", "_reject_isolation_conflict"): 1,  # the wrapper's own predicate call
+    ("cli.py", "cmd_run"): 1,
+    ("cli.py", "cmd_sweep"): 1,
+    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm re-read
+    ("cli.py", "cmd_validate"): 1,  # reports a Finding rather than aborting
+    ("cli.py", "_prepare_resume_locked"): 1,  # behind both `resume` and the re-arm
+    ("cli.py", "_warn_preflight_would_abort"): 1,  # the dry-run honesty banner
+    ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises — no rc channel
+    ("tui/app.py", "_guarded"): 1,  # the pre-launch toast guard
+    ("tui/app.py", "_do_rearm"): 1,
+}
+
 # What counts as consulting liveness, matched as a substring of the callee's name
 # because the two sites legitimately spell it differently and neither spelling is more
 # correct: the CLI calls ``runs.engine_liveness`` directly, the TUI goes through
@@ -354,6 +405,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "errors",
         "expired_clock",
         "failed",
+        "fallback",
         "field",
         "finished",
         "fired_at",
@@ -396,6 +448,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "original",
         "owed_after_implement",
         "phase",
+        "pid",
         "platform",
         "plugin",
         "plugins",
@@ -610,16 +663,262 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
     ("plugins/bus.py", "_log"),
 }
 
-# The receivers a ``.append(...)`` call must hang off to be a journal write. Matched
-# on the trailing name so `self.journal`, a bare `journal` parameter and
-# `self._journal` (the plugin bus's optional handle) all resolve — the three
-# spellings in the tree.
+# Every literal journal KIND written today: a declared inventory, not a per-kind
+# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. Kind #201 cannot
+# appear without someone deciding, in the same PR, what covers the record it
+# introduces: a routing row in `diagnostics` if any field carries an identifier, a
+# path or free text, and a test row asserting the record at the layer that reads it
+# — the decision review iteration 6 kept discovering had been skipped.
+#
+# Generated from the scan, hand-reviewed, grouped by producer module; a kind two
+# modules write sits under a shared heading. A deleted or renamed kind reddens the
+# staleness direction too — PROVIDED no other producer still writes it: the
+# staleness arm sees the union of producers, so removing ONE writer of a shared
+# kind (the shared headings below, `run-stop` included) reddens nothing by itself.
+#
+# ⚠️ STATED BOUNDS. Dynamic kinds — the f-string family in
+# `recovery_flow.prune_preserve_refs`, the parameter defaults in
+# `engine._skip_review_and_commit`, the chosen kinds of
+# `sweep._close_bundle_ledger_when_spec_status` — are NOT rows here: their
+# POSITIONS are declared in `JOURNAL_DYNAMIC_KIND_ALLOW` and governed by the
+# literalness test, so the kinds they mint (e.g. `attempt-preserve-pruned`,
+# `review-skipped`) never enter this inventory. And a locally aliased journal
+# handle — a named one, or one bound from `Journal(run_dir)` — is invisible to the
+# whole journal scan (`JOURNAL_RECEIVERS`' bound), this emit included.
+JOURNAL_KINDS = frozenset(
+    {
+        # cli.py
+        "run-resume",
+        # engine.py
+        "board-advance-carried",
+        "board-advance-carry-failed",
+        "board-advance-carry-foreign-dirt",
+        "board-advance-carry-uncommitted",
+        "console-ctrl-ignored",
+        "defer-ledger-restore-diverged",
+        "deferred-artifacts-stashed",
+        "deferred-close-duplicate-id",
+        "deferred-close-external-ledger",
+        "deferred-close-ledger-unavailable",
+        "deferred-close-malformed",
+        "deferred-close-reopen-unmatched",
+        "deferred-close-rollback-failed",
+        "deferred-close-rolled-back",
+        "deferred-close-skipped-out-of-tree",
+        "deferred-close-unmatched",
+        "dev-decision",
+        "epic-boundary",
+        "fix-decision",
+        "fix-harvest-failed",
+        "harvest-carried",
+        "harvest-carry-uncommitted",
+        "isolation-flip-orphaned-worktree",
+        "ledger-baseline-probe-failed",
+        "ledger-restore-failed",
+        "ledger-restore-skipped-diverged",
+        "ledger-scope-probe-failed",
+        "ledger-snapshot-missing",
+        "ledger-tracked-probe-failed",
+        "legacy-ledger-attribution-failed",
+        "max-stories-reached",
+        "notify-desktop-unavailable",
+        "operator-index-failed",
+        "park-proof-of-work-skipped",
+        "park-record-rollback-failed",
+        "plugin-veto",
+        "plugins-active",
+        "preference-escalation",
+        "resume-defer",
+        "resume-ledger-carry",
+        "resume-review",
+        "resume-unit-merge",
+        "resume-verify",
+        "review-budget-committed",
+        "review-followup-damped",
+        "review-not-recommended",
+        "review-result",
+        "review-retry",
+        "review-timeout-salvage",
+        "review-timeout-salvage-failed",
+        "review-verify-failed",
+        "run-complete",
+        "run-crash",
+        "run-paused",
+        "run-stop-finalize-error",
+        "session-end",
+        "session-rescued-post-kill",
+        "session-start",
+        "session-synthesized-from-frontmatter",
+        "spec-deferrals-harvested",
+        "spec-deferrals-malformed",
+        "spec-deferrals-skipped-out-of-tree",
+        "spec-marker-repair-failed",
+        "spec-marker-repair-skipped",
+        "spec-marker-repaired",
+        "spec-read-failed",
+        "spec-reconcile-skipped-out-of-tree",
+        "spec-status-reconciled",
+        "sprint-status-unknown-keys",
+        "stop-request-discarded",
+        "story-awaiting-operator",
+        "story-deferred",
+        "story-deferred-close-carried",
+        "story-deferred-close-carry-uncommitted",
+        "story-deferred-closed",
+        "story-done",
+        "story-gate-unreadable",
+        "story-gated",
+        "story-skipped",
+        "story-start",
+        "sweep-auto-failed",
+        "sweep-auto-finished",
+        "sweep-auto-not-started",
+        "sweep-auto-skipped-dirty",
+        "sweep-auto-suppressed",
+        "sweep-auto-trigger",
+        "token-budget-exceeded",
+        "verify-command-result",
+        "workflow-end",
+        "workflow-start",
+        # engine.py + runs.py (runs.py's writer is the constructor-inline spelling)
+        "run-stop",
+        # engine.py + sweep.py
+        "resume-commit",
+        "resume-restart",
+        # engine.py + worktree_flow.py
+        "story-escalated",
+        # plugins/bus.py
+        "plugin-hook",
+        "plugin-hook-error",
+        # plugins/bus.py + plugins/registry.py
+        "plugin-error",
+        # plugins/loader.py
+        "plugin-skipped",
+        # plugins/registry.py
+        "plugin-loaded",
+        "plugin-untrusted",
+        # recovery_flow.py
+        "attempt-commits-preserved",
+        "attempt-preserve-enumerate-failed",
+        "attempt-preserve-failed",
+        "attempt-restore-failed",
+        "attempt-restored",
+        "attempt-worktree-preserve-failed",
+        "attempt-worktree-preserved",
+        "rollback-auto",
+        "rollback-dirty-check-failed",
+        "rollback-manual-required",
+        "rollback-owned-spec-baseline-read-failed",
+        "rollback-owned-spec-baseline-status-failed",
+        "rollback-owned-spec-manual-required",
+        "rollback-owned-spec-normalized",
+        "rollback-owned-spec-restored",
+        "rollback-owned-spec-snapshot-missing",
+        "rollback-owned-spec-unavailable",
+        "rollback-owned-spec-unpreservable",
+        "rollback-owned-spec-unreadable",
+        "rollback-reset-failed",
+        "rollback-skipped-clean",
+        # runs.py
+        "rearm-aborted",
+        "rearm-baseline-advance-failed",
+        "rearm-baseline-restamp-skipped",
+        "rearm-baseline-restamped",
+        "rearm-code-root-restamped",
+        "rearm-commits-probe-failed",
+        "rearm-spec-flip-skipped",
+        "rearm-spec-write-unreachable",
+        "rearm-upstream-write-unreachable",
+        "run-stop-undelivered",
+        "sentinel-cleared",
+        "stale-restore-commits",
+        "stale-restore-excluded",
+        "stale-restore-unparseable",
+        "story-escalation-resolved",
+        # runsetup.py
+        "composition-unwind-failed",
+        "run-start",
+        # stories_engine.py
+        "checkpoint-pause",
+        "checkpoint-resume",
+        "checkpoint-skip-last",
+        "deferred-close-declaration-unreadable",
+        "plan-halt",
+        "plan-halt-proof-of-work-skipped",
+        "sentinel-detected",
+        "stories-escalation-unresolved",
+        "stories-manifest-unreadable",
+        "stories-selector-unknown",
+        "stories-validated",
+        "stories-wedged",
+        # sweep.py
+        "bundle-start",
+        "decision-answered",
+        "decision-pending",
+        "decision-preanswered",
+        "decision-preanswers-pruned",
+        "decision-skipped-unattended",
+        "migrate-decision",
+        "migrate-duplicate-ids",
+        "sweep-bundle-close-carried",
+        "sweep-bundle-close-carry-uncommitted",
+        "sweep-bundle-name-discarded",
+        "sweep-bundle-name-normalized",
+        "sweep-bundle-reopened",
+        "sweep-bundle-skipped",
+        "sweep-bundles-truncated",
+        "sweep-cycle",
+        "sweep-decisions-only",
+        "sweep-inflight-redrive",
+        "sweep-inflight-stranded",
+        "sweep-intent-regenerated",
+        "sweep-ledger-commit",
+        "sweep-migrated",
+        "sweep-migration-restore-diverged",
+        "sweep-nothing-open",
+        "sweep-repeat-done",
+        "sweep-resolved-closed",
+        "sweep-return-no-client",
+        "sweep-returned-after-decisions",
+        "sweep-triage-reload-failed",
+        "sweep-triage-result",
+        "triage-decision",
+        # worktree_flow.py
+        "merge-preflight-refused",
+        "merge-target-cleaned",
+        "merge-target-tolerated",
+        "scm-failed-diff-unlimited",
+        "target-branch",
+        "target-branch-checkout",
+        "target-branch-created",
+        "unit-closed",
+        "unit-merge-started",
+        "unit-merged",
+        "worktree-exclude-degraded",
+        "worktree-kept",
+        "worktree-module-skills-dropped",
+        "worktree-open-failed",
+        "worktree-opened",
+        "worktree-seed-dropped",
+        "worktree-seed-skipped",
+        "worktree-teardown-degraded",
+    }
+)
+
+# The NAMED-HANDLE receivers a ``.append(...)`` call must hang off to be a journal
+# write. Matched on the trailing name so `self.journal`, a bare `journal` parameter
+# and `self._journal` (the plugin bus's optional handle) all resolve. The tree's
+# fourth spelling — the constructor-inline `Journal(run_dir).append(...)` that
+# runs.py's stop/restamp records use — is a Call receiver, not a name, and is
+# matched structurally in `_is_journal_write` rather than through this set.
 #
 # ⚠️ STATED BOUND: a LOCALLY ALIASED handle is invisible. `j = self.journal` followed
 # by `j.append(kind, customer_email=x)` produces no finding (verified by running it
-# through `_scan_source`). No such site exists in the tree today, and resolving the
-# binding would be `_call_aliases`' shape rather than a new idea — but the
-# guard does not do it, and a reader must not assume it does.
+# through `_scan_source`), and a handle bound from the constructor —
+# `j = Journal(run_dir)` then `j.append(...)` — is the same shape. No such site
+# exists in the tree today, and resolving the binding would be `_call_aliases`'
+# shape rather than a new idea — but the guard does not do it, and a reader must
+# not assume it does.
 JOURNAL_RECEIVERS = {"journal", "_journal"}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
@@ -1111,8 +1410,9 @@ def _mint_candidates(node: ast.expr, depth: int = 0):
 
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
     """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
-    each of the three receiver spellings the tree uses (see ``JOURNAL_RECEIVERS``),
-    or a call to one of this file's declared ``JOURNAL_FORWARDERS``.
+    each of the four receiver spellings the tree uses: the three named handles (see
+    ``JOURNAL_RECEIVERS``) and the constructor-inline ``Journal(run_dir).append(...)``
+    — or a call to one of this file's declared ``JOURNAL_FORWARDERS``.
 
     The forwarder half is not a convenience. ``plugins/bus.py::_log`` takes its own
     ``**fields`` and hands them to ``self._journal.append``, so its four call sites
@@ -1130,11 +1430,17 @@ def _is_journal_write(node: ast.AST, rel: str) -> bool:
         return False
     if (rel, name) in JOURNAL_FORWARDERS:
         return True
-    return (
-        isinstance(node.func, ast.Attribute)
-        and name == "append"
-        and _called_name(node.func.value) in JOURNAL_RECEIVERS
-    )
+    if not (isinstance(node.func, ast.Attribute) and name == "append"):
+        return False
+    receiver = node.func.value
+    if _called_name(receiver) in JOURNAL_RECEIVERS:
+        return True
+    # The constructor-inline spelling: `Journal(run_dir).append(...)`. The receiver
+    # is an ast.Call, so the named-handle match above can never see it — runs.py's
+    # stop/restamp records (and their kinds and fields) went unscanned exactly this
+    # way. Name-anchored on `Journal` like the handle arm, so a lookalike
+    # constructor stays silent.
+    return isinstance(receiver, ast.Call) and _called_name(receiver.func) == "Journal"
 
 
 def _dict_literal_keys(value: ast.expr) -> set[str] | None:
@@ -1268,6 +1574,23 @@ def _names_rearm_escalation(func: ast.expr, aliases: frozenset[str] = frozenset(
     return _names_guarded_verify_call(func, "rearm_escalation", aliases)
 
 
+def _names_isolation_refusal(
+    func: ast.expr,
+    predicate_aliases: frozenset[str] = frozenset(),
+    wrapper_aliases: frozenset[str] = frozenset(),
+) -> bool:
+    """True when ``func`` spells a #414-family refusal entry point: the
+    ``bmadconfig.worktree_isolation_conflict`` predicate or its rc-returning CLI
+    wrapper ``_reject_isolation_conflict``. Both names are guarded because a new
+    surface can reach the refusal through either — the ``96aa09a9`` site did so
+    through the wrapper — and each resolves its own alias set. Same reach and
+    computed-name bound as the sibling detectors, and the same trade: an unrelated
+    ``x.worktree_isolation_conflict(...)`` is a review prompt, not a miss."""
+    return _names_guarded_verify_call(
+        func, "worktree_isolation_conflict", predicate_aliases
+    ) or _names_guarded_verify_call(func, "_reject_isolation_conflict", wrapper_aliases)
+
+
 def _block_exits(body: list[ast.stmt]) -> bool:
     """Whether this simple guard body cannot fall through to the re-arm below it."""
     return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
@@ -1346,6 +1669,8 @@ def _scan_source(src: str, rel: str):
     verify_command_aliases = _call_aliases(tree, "verify_commands_outcome")
     verify_classifier_aliases = _call_aliases(tree, "verify_command_results_outcome")
     rearm_aliases = _call_aliases(tree, "rearm_escalation")
+    isolation_aliases = _call_aliases(tree, "worktree_isolation_conflict")
+    isolation_wrapper_aliases = _call_aliases(tree, "_reject_isolation_conflict")
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -1595,6 +1920,14 @@ def _scan_source(src: str, rel: str):
             )
             if kind is None:
                 findings.append(("journalkind", rel, node.lineno, line_at(node.lineno), fn_name))
+            else:
+                # The literal-kind twin, and the KIND inventory's only feed. NOT
+                # derivable from the `journalfield` rows below, although each of
+                # those carries the kind: a kind-only write (`run-complete` and
+                # three siblings) has no keyword row to ride on.
+                findings.append(
+                    ("journalkindliteral", rel, node.lineno, line_at(node.lineno), kind)
+                )
             for kw in node.keywords:
                 if kw.arg is not None:
                     findings.append(
@@ -1844,6 +2177,29 @@ def _scan_source(src: str, rel: str):
                         enclosing_names.get(id(node)),
                         _consults_liveness_before(enclosing_nodes.get(id(node)), node.lineno),
                     ),
+                )
+            )
+
+    # Every refusal-helper DEFINITION (`_refuse_*` / `_reject_*`) and every
+    # #414-family isolation-refusal CALL — the two surfaces `REFUSAL_HELPER_DEFS`
+    # and `ISOLATION_CONFLICT_CALLERS` enumerate. The def side needs no alias
+    # resolution (a definition IS its name); the call side resolves both guarded
+    # names through `_call_aliases`, exactly like the re-arm detector above.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+            ("_refuse_", "_reject_")
+        ):
+            findings.append(("refusaldef", rel, node.lineno, line_at(node.lineno), node.name))
+        if isinstance(node, ast.Call) and _names_isolation_refusal(
+            node.func, isolation_aliases, isolation_wrapper_aliases
+        ):
+            findings.append(
+                (
+                    "isolationcall",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    enclosing_names.get(id(node)),
                 )
             )
 
@@ -2294,6 +2650,85 @@ def test_run_state_writer_and_transaction_inventory_is_complete():
     assert _production_call_sites("state_lock") == RUN_STATE_TRANSACTIONS
 
 
+def test_refusal_helper_inventory_is_complete():
+    """Every `_refuse_*`/`_reject_*` helper definition in the tree has a declared
+    row, in both directions. Review iteration 6 (and four bot rounds after it) kept
+    finding one shape by hand — a refusal landed with no test row, caught only by a
+    later review pass — and the journal-FIELD inventory beside this one is the gate
+    that caught `reaches_redrive`; this is the same gate for the refusal surface. A
+    row here is the PR-time decision, not the test itself: the helper's refusal
+    behavior still needs its own test landed with the row.
+
+    Anti-vacuity is structural, the exact-inventory property the rearm Counter
+    relies on: the declared side is non-empty, so a scan that stops finding
+    definitions reddens the staleness direction instead of passing green.
+
+    Graded as a Counter WITH multiplicity, not a set of names —
+    `ISOLATION_CONFLICT_CALLERS`' rationale, applied to definitions: a SECOND def
+    of a declared name in the same file (a platform-conditional twin, say) is a new
+    refusal body the emit reports twice, and a set comparison absorbed it silently
+    (measured). Every declared row's count is 1 today, which `Counter` over the set
+    encodes.
+
+    Ablation: delete the `refusaldef` emit and this reddens with all nine declared
+    rows stale; add `def _refuse_nothing()` to `runs.py` and this reddens naming
+    it; add a platform-conditional TWIN def of `_refuse_live_session` to `runs.py`
+    and the count comparison reddens with the set of names unchanged."""
+    findings = _of("refusaldef")
+    scanned = Counter((rel, name) for _, rel, _, _, name in findings)
+    declared = Counter(REFUSAL_HELPER_DEFS)
+    changed = {key for key in set(scanned) | set(declared) if scanned[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: {name} — {txt.strip()}"
+        for _, rel, ln, txt, name in findings
+        if (rel, name) in changed
+    ]
+    assert scanned == declared, (
+        "the `_refuse_*`/`_reject_*` helper definitions moved. A NEW helper — a "
+        "second same-named def in one file included — lands WITH its (file, name) "
+        "row and the test asserting what it refuses in the same PR; a helper no "
+        "module defines any more loses its row, which otherwise stands as a "
+        "pre-approval for the next helper that reuses the name:\n"
+        f"  scanned:  {sorted(scanned.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
+def test_isolation_conflict_refusal_sites_are_enumerated():
+    """The #414 refusal is reached from exactly the declared call sites, counted
+    WITH multiplicity — both the `bmadconfig.worktree_isolation_conflict` predicate
+    and its CLI wrapper `_reject_isolation_conflict`, so a new surface reaching the
+    pair through either spelling reddens this row. That is the `96aa09a9` shape:
+    `cmd_resolve`'s pre-session refusal landed as a wrapper call with no test row,
+    and nothing structural named the omission until a review pass did.
+
+    Multiplicity is load-bearing on today's tree — `cmd_resolve` legitimately calls
+    the wrapper twice, so a set of keys would absorb a third call there silently
+    (`test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function`
+    pins the counting itself).
+
+    Ablation: delete the `isolationcall` emit and this reddens (eleven declared,
+    zero scanned); add a third `_reject_isolation_conflict` call inside
+    `cmd_resolve` and the count comparison reddens naming the site."""
+    findings = _of("isolationcall")
+    sites = _isolation_callsite_counts(findings)
+    declared = Counter(ISOLATION_CONFLICT_CALLERS)
+    changed = {key for key in set(sites) | set(declared) if sites[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: in {fn or '<module>'} — {txt.strip()}"
+        for _, rel, ln, txt, fn in findings
+        if (rel, fn) in changed
+    ]
+    assert sites == declared, (
+        "the #414-family refusal call sites moved (worktree_isolation_conflict / "
+        "_reject_isolation_conflict). A new surface refusing the pair lands WITH "
+        "its own refusal test in the same PR; a removed one deletes its row — "
+        "update ISOLATION_CONFLICT_CALLERS only alongside that decision:\n"
+        f"  scanned:  {sorted(sites.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
 def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     """The routing invariant as a filter, in the two directions a finding can fail:
     a field name that neither ``diagnostics`` nor the benign inventory accounts for,
@@ -2414,6 +2849,56 @@ def test_journal_kinds_are_literal_or_the_position_is_declared():
         "not declared itself one — pass a literal kind, or add the position to "
         "JOURNAL_DYNAMIC_KIND_ALLOW with what it journals:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_journal_kind_inventory_is_complete():
+    """Every literal journal kind a producer writes is a declared `JOURNAL_KINDS`
+    row, in both directions — the enumerate-vs-declare gate for the kind axis. The
+    ~196 literal kinds had no inventory at all: a new record kind could land, with
+    or without a test row, and only a later review pass would ask what covers it.
+    Now the question is asked by CI, at PR time, on the diff that introduces the
+    kind.
+
+    Both directions matter. A NEW kind fails the undeclared arm naming its file,
+    line and kind; a RENAME fails both arms at once — the new spelling undeclared,
+    the old row stale — so the old row cannot survive as a pre-approval for the
+    next kind that reuses it. The staleness arm's bound is stated on
+    `JOURNAL_KINDS`: it sees the union of producers, so one writer of a SHARED
+    kind can drop it without reddening anything while another still writes it.
+
+    Dynamic kinds are deliberately absent (`JOURNAL_KINDS`' stated bound): a
+    non-literal kind emits no `journalkindliteral` finding, and the sibling
+    literalness test above governs whether its POSITION may be dynamic at all.
+    Consumer-side kind parity — readers matching kinds by literal — stays DW-82's,
+    out of scope here.
+
+    Anti-vacuity is structural: the declared set is non-empty, so deleting the
+    `journalkindliteral` emit reddens the staleness arm with the entire inventory
+    rather than passing green.
+
+    Ablation: delete the `journalkindliteral` emit and this reddens with all 200
+    rows stale; duplicate engine.py's epic-boundary write under the kind
+    `"guard-ablation-probe"` and ONLY this test reddens, naming the kind and
+    site."""
+    findings = _of("journalkindliteral")
+    scanned = {kind for _, _, _, _, kind in findings}
+    undeclared = [
+        (rel, ln, txt, kind) for _, rel, ln, txt, kind in findings if kind not in JOURNAL_KINDS
+    ]
+    assert undeclared == [], (
+        "a journal producer writes a literal kind that JOURNAL_KINDS does not "
+        "declare — add the kind's row IN THE SAME PR as what covers its record: a "
+        "diagnostics routing row if any field carries an identifier, a path or "
+        "free text, and the test asserting the record at the layer that reads it; "
+        "or drop the write:\n"
+        + "\n".join(f"  {rel}:{ln}: {kind!r} — {txt.strip()}" for rel, ln, txt, kind in undeclared)
+    )
+    stale = JOURNAL_KINDS - scanned
+    assert stale == set(), (
+        "JOURNAL_KINDS declares kinds no producer writes any more — a stale row "
+        "pre-approves the next record that reuses the name; delete these rows and "
+        f"retire their routing/test rows deliberately: {sorted(stale)}"
     )
 
 
@@ -3803,15 +4288,196 @@ def test_rearm_call_detector_stays_silent_on_non_calls(label, source):
     assert not found, f"the {label!r} shape produced a `rearmcall` finding:\n{source}"
 
 
+# The refusal-helper detector's matrix: `(label, source, expected def names)`. The
+# surface is DEFINITIONS — a new `_refuse_*`/`_reject_*` helper is a new refusal
+# behavior that must land with an inventory row and its own test — so calls,
+# lookalike prefixes and prose must all stay silent or the inventory fills with
+# noise it cannot force a decision about.
+REFUSAL_DEF_PROBES = [
+    (
+        "plain-def",
+        "def _refuse_live_session(project, run_id, verb):\n    return None\n",
+        {"_refuse_live_session"},
+    ),
+    (
+        "reject-spelling",
+        "def _reject_bad_run_id(run_id):\n    return None\n",
+        {"_reject_bad_run_id"},
+    ),
+    (
+        "async-def",
+        "async def _refuse_slow_probe(target):\n    return None\n",
+        {"_refuse_slow_probe"},
+    ),
+    # A method is a definition too — `engine.Engine._refuse_gated_story` is one of
+    # the nine rows the real tree declares.
+    (
+        "method-def",
+        "class Engine:\n    def _refuse_gated_story(self, story_key):\n        return None\n",
+        {"_refuse_gated_story"},
+    ),
+]
+REFUSAL_DEF_NON_PROBES = [
+    # A CALL is not a definition: call sites belong to each helper's own tests, and
+    # flagging them would report every use as a new refusal behavior.
+    ("call-not-a-def", 'def f():\n    _refuse_live_session(project, run_id, "stop")\n'),
+    # The prefix is `_refuse_`/`_reject_` WITH the trailing underscore: a name that
+    # merely starts `_refus` is not claiming to be a refusal helper.
+    ("similar-prefix", "def _refusal_note(story_key):\n    return None\n"),
+    # …and a public spelling makes no `_refuse_*` claim either.
+    ("public-spelling", "def refuse_everything():\n    return None\n"),
+    # Prose naming a helper is a Constant, not a def.
+    ("prose", 'def f():\n    """Calls _refuse_live_session first."""\n    return 1\n'),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "expected"), REFUSAL_DEF_PROBES, ids=[p[0] for p in REFUSAL_DEF_PROBES]
+)
+def test_refusal_def_detector_flags_every_definition_shape(label, source, expected):
+    """Each definition shape is found and reported by name. `runs.py` is passed
+    because nothing in this detector is file-scoped — the enumeration lives in the
+    tree-wide inventory test, not here.
+
+    Ablation: delete the `refusaldef` emit and every row here reddens."""
+    found = {f[4] for f in _scan_source(source, "runs.py") if f[0] == "refusaldef"}
+    assert found == expected, f"the {label!r} shape resolved to {sorted(found)}:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), REFUSAL_DEF_NON_PROBES, ids=[p[0] for p in REFUSAL_DEF_NON_PROBES]
+)
+def test_refusal_def_detector_stays_silent_on_lookalikes(label, source):
+    """A call, a lookalike prefix, a public spelling and prose are not refusal-helper
+    definitions. The inventory is an equality assertion, so a false positive fails as
+    loudly as a miss.
+
+    Ablation: widen the emit's prefix match to `_refus` and the similar-prefix row
+    reddens."""
+    found = [f for f in _scan_source(source, "runs.py") if f[0] == "refusaldef"]
+    assert not found, f"the {label!r} shape produced a `refusaldef` finding:\n{source}"
+
+
+# The #414-family call detector's matrix: `(label, source, expected enclosing
+# function)`. Both spellings of the refusal are probed — the `bmadconfig` predicate
+# and the rc-returning CLI wrapper — because a new surface can reach the pair
+# through either, and the `96aa09a9` site (cmd_resolve's pre-session arm) arrived
+# through the wrapper.
+ISOLATION_CALL_PROBES = [
+    (
+        "qualified-predicate-call",
+        "def cmd_validate(args):\n"
+        "    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)\n",
+        "cmd_validate",
+    ),
+    (
+        "bare-wrapper-call",
+        "def cmd_run(args):\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n",
+        "cmd_run",
+    ),
+    # A rename-on-import and an assignment alias are just as callable — the
+    # `_call_aliases` shapes, one per guarded name.
+    (
+        "renamed-predicate-import",
+        "from .bmadconfig import worktree_isolation_conflict as conflict_for\n"
+        "def f(args):\n"
+        "    conflict_for(paths, isolation)\n",
+        "f",
+    ),
+    (
+        "assigned-wrapper-alias",
+        "check = _reject_isolation_conflict\ndef f(args):\n    check(paths, pol)\n",
+        "f",
+    ),
+]
+ISOLATION_CALL_NON_PROBES = [
+    # The definitions are not calls. The wrapper's own predicate call is a real
+    # finding on today's tree — `("cli.py", "_reject_isolation_conflict")` is a row
+    # of the declared Counter — so the bodies here are stubs on purpose.
+    (
+        "predicate-definition",
+        "def worktree_isolation_conflict(paths, isolation):\n    return None\n",
+    ),
+    ("wrapper-definition", "def _reject_isolation_conflict(paths, pol):\n    return None\n"),
+    # A different function whose name merely embeds the guarded one.
+    ("similar-name", "def f():\n    worktree_isolation_conflicts(paths)\n"),
+    ("reference-not-a-call", "def f():\n    handler = bmadconfig.worktree_isolation_conflict\n"),
+    (
+        "prose",
+        'def f():\n    """bmadconfig.worktree_isolation_conflict(paths, mode) decides."""\n'
+        "    return 1\n",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "fn"), ISOLATION_CALL_PROBES, ids=[p[0] for p in ISOLATION_CALL_PROBES]
+)
+def test_isolation_call_detector_reports_the_site(label, source, fn):
+    """Each call shape is found and attributed to its enclosing function — the key
+    the declared Counter is built on. `cli.py` is passed because nothing in this
+    detector is file-scoped.
+
+    Ablation: delete the `isolationcall` emit and every row here reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert len(found) == 1, f"the {label!r} shape produced {len(found)} findings:\n{source}"
+    assert found[0][4] == fn, f"the {label!r} shape attributed to {found[0][4]!r}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ISOLATION_CALL_NON_PROBES, ids=[p[0] for p in ISOLATION_CALL_NON_PROBES]
+)
+def test_isolation_call_detector_stays_silent_on_non_calls(label, source):
+    """Definitions, a similarly-named neighbour, a bare reference and prose are not
+    call sites. The tree-wide assertion is a Counter equality, so a false positive
+    fails as loudly as a miss.
+
+    Ablation: relax `_names_guarded_verify_call`'s name equality to a substring
+    match and the similar-name row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert not found, f"the {label!r} shape produced an `isolationcall` finding:\n{source}"
+
+
+def _isolation_callsite_counts(findings) -> Counter:
+    """Call-site multiplicity, not just distinct enclosing functions — the
+    `_rearm_callsite_counts` idiom, and load-bearing on the real tree:
+    `cli.cmd_resolve` legitimately calls the wrapper twice."""
+    return Counter((rel, fn) for _, rel, _, _, fn in findings)
+
+
+def test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function():
+    """Ablation: collapse `_isolation_callsite_counts` to a set of keys and this
+    reddens — `cmd_resolve` would then absorb a third call silently."""
+    source = (
+        "def cmd_resolve(args):\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n"
+    )
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert _isolation_callsite_counts(found) == Counter({("cli.py", "cmd_resolve"): 2})
+
+
 # The journal detector's probe matrix, as `(label, source, expected)` where
 # `expected` is the exact set of field names the scan must extract — `None` standing
 # for an unresolvable splat. Asserting the SET rather than "something was found" is
 # what makes a partial splat resolution fail here instead of quietly under-reporting.
 JOURNAL_FIELD_PROBES = [
-    # The three receiver spellings in the tree.
+    # The four receiver spellings in the tree.
     ("self-journal", 'self.journal.append("k", story_key=s, patch=p)\n', {"story_key", "patch"}),
     ("bare-journal", 'journal.append("k", branch=b)\n', {"branch"}),
     ("private-journal", "self._journal.append(kind, plugin=name)\n", {"plugin"}),
+    # The constructor-inline spelling `Journal(run_dir).append(...)` — three live
+    # sites in runs.py use it, and the receiver is an ast.Call, so the named-handle
+    # match alone left them (and their kinds and fields) entirely unscanned.
+    (
+        "constructor-inline-receiver",
+        'def f(run_dir):\n    Journal(run_dir).append("k", pid=1)\n',
+        {"pid"},
+    ),
     # A splat resolved through the literal stores that build it, in both store
     # shapes and across the conditional-dict form `engine._run_inner` uses.
     (
@@ -3936,6 +4602,10 @@ JOURNAL_FIELD_NON_PROBES = [
     # the most common in the language, so anchoring on the receiver is load-bearing.
     ("list-append", "results.append(SessionResult(status=s, stop_seen=True))\n"),
     ("attribute-list-append", "self.entries.append(dict(kind=k, story_key=s))\n"),
+    # A constructor that merely ends in a `.append` is not a journal write unless
+    # the constructed thing IS a Journal — the constructor arm is name-anchored
+    # exactly like the handle arm.
+    ("constructor-lookalike", 'NotAJournal(run_dir).append("k", pid=1)\n'),
     # A journal write with no fields at all produces nothing to route.
     ("kind-only", 'self.journal.append("run-start")\n'),
     # Prose naming the call is a Constant, not a Call.
@@ -4091,6 +4761,58 @@ def test_journal_kind_probes_flag_a_non_literal_kind():
         "def f(self):\n    results.append(kind)\n",
     ):
         assert not [f for f in _scan_source(source, "sweep.py") if f[0] == "journalkind"], source
+
+
+def test_journal_kind_literal_probes_extract_the_kind():
+    """The kind inventory's detector half: a journal write whose kind IS a string
+    literal emits that kind — including a kind-only write (`run-complete` and three
+    siblings), which the FIELD detector never reports because there is no keyword
+    to carry it, and a declared forwarder's call site, whose kind would otherwise
+    stop at `plugins/bus.py::_log`'s wall.
+
+    Ablation: delete the `journalkindliteral` emit and every row here reddens."""
+    for source, rel, kind in (
+        (
+            'def f(self):\n    self.journal.append("run-start", story_key=s)\n',
+            "sweep.py",
+            "run-start",
+        ),
+        # The kind-only shape: no keywords, so no `journalfield` finding exists to
+        # derive the kind from — this emit is the only reader.
+        ('def f(self):\n    journal.append("run-complete")\n', "engine.py", "run-complete"),
+        (
+            'def f(self):\n    self._journal.append("plugin-loaded", plugin=name)\n',
+            "plugins/registry.py",
+            "plugin-loaded",
+        ),
+        ('def f(self):\n    self._log("plugin-hook", rc=rc)\n', "plugins/bus.py", "plugin-hook"),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == [kind], f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
+    """The complement: a non-literal kind (the literalness test's territory), an
+    `.append` on a non-journal receiver, a forwarder NAME outside its declared
+    file, and prose are all silent — the inventory must not fill itself with
+    strings that never reach `Journal.append`.
+
+    Ablation: drop `_is_journal_write`'s receiver anchor (accept any `.append`) and
+    the list-append row reddens."""
+    for source, rel in (
+        ("def f(self):\n    self.journal.append(kind, story_key=s)\n", "sweep.py"),
+        (
+            'def f(self):\n    self.journal.append(f"{family}-pruned", count=n)\n',
+            "recovery_flow.py",
+        ),
+        ('def f(self):\n    results.append("done")\n', "sweep.py"),
+        ('def f(self):\n    self._log("plugin-hook", rc=rc)\n', "stories_engine.py"),
+        (
+            'def f():\n    """journal.append("prose-kind") is described here."""\n    return 1\n',
+            "sweep.py",
+        ),
+    ):
+        assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
 
 
 def test_journal_routing_tables_are_read_from_diagnostics():
