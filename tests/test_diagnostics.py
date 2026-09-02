@@ -85,6 +85,7 @@ def _seed_run(
     extra_journal=None,
     sweeps_triggered=(),
     sweeps_refused=None,
+    repo_root="",
 ):
     """Build a run dir loaded with canaries in every readable sink.
 
@@ -129,6 +130,7 @@ def _seed_run(
     state = RunState(
         run_id=run_id,
         project=f"{HOME_PATH}",
+        repo_root=repo_root,
         started_at="2026-06-27T12:00:00",
         run_type="story",
         target_branch=BRANCH,
@@ -2387,8 +2389,20 @@ def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
 
     Without this the assertion above passes for a hardcoded `True`, and the field
     stops carrying the one bit it exists to carry.
+
+    Seeds `repo_root` EQUAL to `project`, which is what makes this the ordinary
+    layout rather than the legacy one. `repo_root_diverges` is
+    `bool(state.repo_root) and Path(state.repo_root) != Path(state.project)`, so a
+    run with no recorded root short-circuits on the first term and the equality arm
+    is never evaluated — the row would be named for a layout it does not build.
+    `runsetup` writes the field unconditionally on every run, equal to `project`
+    unless a `repo_root:` override exists, so this is the modal shape an operator's
+    dump carries.
+
+    Ablation: drop the `repo_root=` argument and the row still passes, on the legacy
+    guard instead of the comparison.
     """
-    run_dir = _seed_run(project.project)
+    run_dir = _seed_run(project.project, repo_root=f"{HOME_PATH}")
     diag, _pseudo, _combined = _render_all([run_dir])
     (run,) = diag.runs
 
@@ -2461,8 +2475,13 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
 
 
 def test_the_markdown_report_says_no_for_the_ordinary_layout(project):
-    """The rendered line distinguishes; a hardcoded "yes" would pass the test above."""
-    run_dir = _seed_run(project.project)
+    """The rendered line distinguishes; a hardcoded "yes" would pass the test above.
+
+    Seeds `repo_root` equal to `project` for the same reason as its JSON twin: an
+    unset root answers `no` through the legacy guard without ever reaching the
+    comparison.
+    """
+    run_dir = _seed_run(project.project, repo_root=f"{HOME_PATH}")
     pseudo = sanitize.Pseudonymizer()
     diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     md = diagnostics.render_markdown(diag, pseudo=pseudo)

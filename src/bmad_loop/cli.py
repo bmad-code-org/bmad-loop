@@ -277,15 +277,22 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
     1 to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the three :class:`~engine.Engine` construction sites that return an
-    rc to a human: `cmd_run`, `cmd_sweep`, and `_resume_paused_run` — the shared
-    helper behind both `resume` and `resolve`'s re-arm. The fourth such site, the
-    auto-triggered child sweep in `_sweep_factory`, shares the refusal but not this
-    disposition: it has no rc channel, so it raises (see the comment there).
-    Keyed on Engine construction rather than on "loads policy.toml", which is a
-    wider set that does not all provision — `_configure_mux` reads the file on
-    every command and builds nothing; `cmd_validate` and `cmd_clean` load it and
-    never mount a worktree.
+    Called from the four sites that return an rc to a human: `cmd_run`, `cmd_sweep`,
+    `_resume_paused_run` — the shared helper behind both `resume` and `resolve`'s
+    re-arm — and `cmd_resolve`, which calls it TWICE: once before the interactive
+    session and once after the config re-read that authorises the re-arm. A fifth
+    site, the auto-triggered child sweep in `_sweep_factory`, shares the refusal but
+    not this disposition: it has no rc channel, so it raises (see the comment there).
+
+    Keyed on provisioning-or-arming a run against the config, NOT on Engine
+    construction: `cmd_resolve` constructs no Engine and delegates to
+    `_resume_paused_run` for that, but `runs.rearm_escalation` mutates persisted run
+    state — advancing the attempt baseline and re-stamping the spec — against the
+    same `repo_root` this refuses, and it does so BEFORE the delegate is reached. A
+    refusal keyed on Engine construction alone therefore arrives after the damage.
+    Both keyings exclude the same wider "loads policy.toml" set, which does not all
+    provision — `_configure_mux` reads the file on every command and builds nothing;
+    `cmd_validate` and `cmd_clean` load it and never mount a worktree.
 
     `validate` deliberately does not call this — it reports rather than aborts, so
     it renders the same message as a Finding and keeps running its other gates."""
@@ -300,8 +307,8 @@ def _reject_under_floor_git(project: Path) -> int | None:
     """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
     `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the same four Engine-construction sites as
-    `_reject_isolation_conflict`, with the same split of dispositions: an rc to a
+    Called from the four Engine-construction sites, with the same split of
+    dispositions as `_reject_isolation_conflict`: an rc to a
     human from `cmd_run`, `cmd_sweep` and `_resume_paused_run`, and a raise from the
     auto-triggered child sweep in `_sweep_factory`, which has no rc channel.
 
@@ -3140,18 +3147,43 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # gesture.
     resolution_recorded = False
     if args.interactive:
-        adapters = _make_adapters(project, run_dir, pol)
-        model = pol.adapter.resolved("dev").model
         # The interactive session uses the CURRENT CLI project as cwd. Its code root
         # must come from the CURRENT config too: both can have moved since state.json
         # was written. This is best-effort observation only; the mandatory config
         # re-read after the human conversation remains the authority for re-arm.
+        #
+        # Read BEFORE `_make_adapters` so the refusal below can precede it. Ordering
+        # only, no new failure mode: `load_paths` is a read, and the arm that cannot
+        # read degrades exactly as it did when it sat lower.
         try:
             pre_session_paths = bmadconfig.load_paths(project)
         except (bmadconfig.BmadConfigError, OSError):
             pre_session_code_root = state.code_root
         else:
             pre_session_code_root = pre_session_paths.repo_root
+            # Refuse the unsupported config BEFORE the interactive session, not only
+            # after it. Both inputs are already in hand here — `pol` was loaded at the
+            # top of this function and is being read for `isolation` two calls below —
+            # so the late refusal alone let an operator build adapters, converse with a
+            # full agent session and answer the re-arm prompt, only to be handed rc 1
+            # for a configuration knowable before any of it. `cmd_run` and `cmd_sweep`
+            # refuse the same config before provisioning anything; this restores the
+            # parity, and honours the rule the restore latch states one screen down
+            # ("validate before the interactive resolve session, not after a whole
+            # agent conversation the abort would throw away"). Ahead of the adapter
+            # build for the same reason `cmd_run` puts it ahead of the queue and
+            # worktree-clean gates: this one says the configuration cannot run at all,
+            # so an adapter fault reported first would send the operator at the wrong
+            # problem — and would be refused again anyway.
+            #
+            # It does NOT replace the refusal after the confirm: that one re-reads the
+            # config, which is the authority for the re-arm and is the only check the
+            # `--no-interactive` path reaches. This is a strictly earlier exit on the
+            # same predicate, so an operator who declines still gets no config lecture.
+            if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
+                return rc
+        adapters = _make_adapters(project, run_dir, pol)
+        model = pol.adapter.resolved("dev").model
         _ctx_path, withheld = resolve.build_context(
             state,
             run_dir,

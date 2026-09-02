@@ -409,6 +409,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # turned out to be wrong.
         "rc",
         "re_review_capped",
+        "reaches_redrive",
         "rearmed",
         "record",
         "redrive",
