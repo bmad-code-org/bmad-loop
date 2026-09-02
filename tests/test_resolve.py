@@ -1432,6 +1432,31 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
 
+@pytest.mark.parametrize("isolated", [True, False])
+def test_rearm_records_the_redrive_mode_on_a_skipped_flip(tmp_path, isolated):
+    """The mode rides the record because the renderer cannot re-derive it.
+
+    Same argument as `refused` one field above: the operator surfaces read this journal
+    OUT OF PROCESS, with neither the task nor the live policy to measure. The sibling
+    `rearm-spec-write-unreachable` already writes exactly this field for exactly this
+    reason; before it, the flip-skipped renderer inferred the mount from
+    `reaches_redrive` and told an isolated run it mounts no worktree.
+
+    Both legs use the same unreachable-spec shape, so the mode is the only thing that
+    varies — the record must follow `isolated_redrive`, not the run's shape.
+
+    Ablation: drop the `redrive=` kwarg from the producer's `journal.append` and both
+    legs redden on `KeyError`; hard-code either literal and one leg reddens.
+    """
+    _resolve_repo(tmp_path)
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
+
+    runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
+
+    (flip,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
+    assert flip["redrive"] == ("isolated" if isolated else "in-place")
+
+
 @pytest.mark.parametrize("repo", [True, False])
 def test_rearm_records_an_unreachable_spec_even_when_the_advance_failed(tmp_path, repo):
     """The two #640 degrades COMPOSE; they do not substitute for each other.
@@ -4847,11 +4872,16 @@ def test_rearm_event_notice_does_not_promise_a_worktree_to_a_run_without_one():
 
     `refused = spec_path.is_file() and write_reaches_the_redrive`. The sibling row above
     feeds only the SECOND failure — a worktree-local copy the re-drive discards — and
-    pins "COMMITTED spec" as correct for it. On the first failure nothing is mounted and
-    nothing is discarded: the re-drive reads that same path, so telling the operator the
-    failed flip is harmless is wrong at exactly the moment it is not. The producer's own
-    row `test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable` builds that
+    pins "COMMITTED spec" as correct for it. On the first failure the re-drive reads that
+    same path, so telling the operator the failed flip is harmless is wrong at exactly
+    the moment it is not. The producer's own row
+    `test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable` builds that
     state, with an empty `worktree_path` and a missing spec.
+
+    The IN-PLACE leg is the one graded here, and it says so on the record: "mounts no
+    worktree" is a claim about the mode, not about reachability, and
+    `test_rearm_event_notice_takes_the_mount_claim_from_the_record` grades the two legs
+    where inferring it from `reaches_redrive` asserted the opposite of the truth.
 
     A record written before `reaches_redrive` existed keeps the wording it was written
     under — asserted, because the alternative is a reader silently re-classifying old
@@ -4868,7 +4898,9 @@ def test_rearm_event_notice_does_not_promise_a_worktree_to_a_run_without_one():
         "refused": False,
     }
 
-    _, unreadable, unreadable_step = runs.rearm_event_notice({**entry, "reaches_redrive": True})
+    _, unreadable, unreadable_step = runs.rearm_event_notice(
+        {**entry, "reaches_redrive": True, "redrive": "in-place"}
+    )
     assert "COMMITTED spec" not in unreadable
     assert "mounts no worktree" in unreadable
     assert unreadable_step  # this leg HAS a remedy: the recorded path is wrong
@@ -4879,6 +4911,54 @@ def test_rearm_event_notice_does_not_promise_a_worktree_to_a_run_without_one():
     # a pre-`reaches_redrive` record is not re-classified
     _, legacy, _ = runs.rearm_event_notice(entry)
     assert "COMMITTED spec" in legacy
+
+
+def test_rearm_event_notice_takes_the_mount_claim_from_the_record():
+    """`reaches_redrive` does NOT imply "no worktree", and inferring it asserted the
+    opposite of the truth on the isolated leg.
+
+    `spec_reaches_the_redrive`'s isolated arm answers True through
+    `_spec_is_shared_with_the_redrive` — an artifact dir configured outside the project
+    tree, reachable precisely BECAUSE every checkout sees that one file, with a worktree
+    very much mounted. The renderer runs out of process and cannot re-derive the mode, so
+    the producer records it, exactly as the sibling `rearm-spec-write-unreachable` does.
+
+    Only the mount clause is at stake: "the re-drive reads that same path" is what
+    `reaches_redrive` alone proves, and it is asserted on every leg here.
+
+    An ABSENT `redrive` drops the clause rather than defaulting. The sibling's
+    "absent means isolated" is sound only because its in-place arm is newer than the
+    field; this kind was journalled from BOTH modes before the field existed, so absent
+    is genuinely unknown and a guess would be the same defect in the other direction.
+
+    Ablation: hard-code `mode = "in-place"` and the isolated and absent legs redden;
+    default the lookup to `"isolated"` (the sibling's rule) and the absent leg reddens
+    alone.
+    """
+    entry = {
+        "kind": "rearm-spec-flip-skipped",
+        "spec_file": "specs/s1.md",
+        "status": "ready-for-dev",
+        "refused": False,
+        "reaches_redrive": True,
+    }
+
+    _, isolated, isolated_step = runs.rearm_event_notice({**entry, "redrive": "isolated"})
+    assert "mounts no worktree" not in isolated
+    assert "outside the worktree it mounts" in isolated
+    assert "reads that same path" in isolated
+    assert isolated_step  # the remedy is the same one: the recorded path is wrong
+
+    _, in_place, _ = runs.rearm_event_notice({**entry, "redrive": "in-place"})
+    assert "mounts no worktree" in in_place
+    assert "reads that same path" in in_place
+
+    # pre-`redrive` record: no mode claim at all, and no guess in either direction
+    _, legacy, legacy_step = runs.rearm_event_notice(entry)
+    assert "mounts no worktree" not in legacy
+    assert "outside the worktree it mounts" not in legacy
+    assert "reads that same path" in legacy
+    assert legacy_step
 
 
 def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
@@ -5040,6 +5120,40 @@ def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     # and it is asked first — a raise here would replace the outcome the operator needs
     assert runs.rearm_holds_the_resume(3) is False
     assert runs.rearm_holds_the_resume(None) is False
+
+
+def test_rearm_holds_the_resume_on_the_flip_no_repair_here_can_reach():
+    """The third qualifying record, and the reason this is keyed on FLAGS not the kind.
+
+    `rearm-spec-flip-skipped` covers three outcomes under one kind. On the
+    `reaches_redrive and not refused` leg the producer has already proven futility the
+    same way the two kinds above do: `refused = spec_path.is_file() and
+    write_reaches_the_redrive`, so reaching-and-not-refused means the flip addressed the
+    copy the re-drive reads AND that path is not a readable file here — the re-drive
+    reads the same path and sees the escalated attempt's status. That arm's next_step
+    says "check the recorded spec path BEFORE RESUMING", which was a lie on the two
+    surfaces that re-arm and resume in one gesture.
+
+    The other two arms must not hold, and keying on the bare kind would have taken them
+    with it. `refused` raises `RearmError` from the producer, so there is no resume to
+    hold. The remaining arm carries no next_step at all — its imperative belongs to
+    `rearm-spec-write-unreachable`, which holds the resume itself.
+
+    Ablation: restore the bare two-kind tuple and the first assertion reddens; drop the
+    `not entry.get("refused")` conjunct and the refused leg reddens; drop the
+    `reaches_redrive` conjunct and the discarded-copy leg reddens.
+    """
+    entry = {"kind": "rearm-spec-flip-skipped", "spec_file": "specs/s1.md"}
+
+    assert runs.rearm_holds_the_resume({**entry, "reaches_redrive": True, "refused": False}) is True
+    # the abort: no resume happens at all, so there is nothing to hold
+    assert runs.rearm_holds_the_resume({**entry, "reaches_redrive": True, "refused": True}) is False
+    # the worktree-local copy the re-drive discards: no next_step, no hold
+    assert (
+        runs.rearm_holds_the_resume({**entry, "reaches_redrive": False, "refused": False}) is False
+    )
+    # a pre-`reaches_redrive` record proves nothing and must not be re-classified
+    assert runs.rearm_holds_the_resume(entry) is False
 
 
 def test_rearm_event_notice_ignores_a_non_mapping_entry():
