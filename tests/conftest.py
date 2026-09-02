@@ -153,6 +153,26 @@ def force_psmux_backend(monkeypatch):
     multiplexer.get_multiplexer.cache_clear()
 
 
+def json_recursion_payload() -> str:
+    """A nested value the real decoder cannot parse without recursing too deep.
+
+    The depth is discovered rather than hardcoded. 3.13 raises at ``limit * 20``;
+    3.14 decodes that iteratively and only recurses far deeper, where the
+    threshold follows the C stack rather than ``sys.getrecursionlimit()``.
+    Probing keeps callers regression tests for a genuine ``RecursionError``
+    rather than a synthetic stand-in.
+    """
+    limit = sys.getrecursionlimit()
+    for multiplier in (20, 100, 500, 2000):
+        depth = limit * multiplier
+        payload = "[" * depth + "0" + "]" * depth
+        try:
+            json.loads(payload)
+        except RecursionError:
+            return payload
+    pytest.skip("the json decoder does not recurse at any probed depth on this interpreter")
+
+
 def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     """Write a fake CLI launcher for the host OS."""
     directory = Path(directory)
