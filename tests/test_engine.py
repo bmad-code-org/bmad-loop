@@ -11836,6 +11836,7 @@ def test_journal_log_position_covers_post_session_entries(project):
 )
 def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_name, fallback_signum):
     import bmad_loop.engine as engine_mod
+    from bmad_loop import journal as journal_mod
 
     signum = getattr(signal, signal_name, fallback_signum)
     if signal_name == "SIGBREAK":
@@ -11854,6 +11855,14 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
         return previous[sig]
 
     monkeypatch.setattr(engine_mod.sys, "platform", "win32")
+
+    @contextlib.contextmanager
+    def native_test_lock(_path):
+        # This Linux-hosted test patches the process-wide sys.platform token only to
+        # drive Engine's Windows signal branch; msvcrt is intentionally unavailable.
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", native_test_lock)
     monkeypatch.setattr(signal, "signal", fake_signal)
     monkeypatch.setattr(engine_mod, "kill_session", lambda rid: None)
 

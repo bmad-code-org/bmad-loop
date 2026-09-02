@@ -26,7 +26,7 @@ from tomlkit.exceptions import ParseError
 
 from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
 from ..adapters.multiplexer import MultiplexerError, mux_usable
-from ..journal import load_state
+from ..journal import load_state, state_lock
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -34,6 +34,7 @@ from ..model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
+    Phase,
     RunState,
     StoryTask,
 )
@@ -723,6 +724,8 @@ class BmadLoopApp(App[None]):
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
         story_key = state.paused_story_key or "?"
+        task = state.tasks.get(story_key)
+        expected_generation = task.generation if task is not None else None
         spec_path, spec_text, readable = self._paused_spec(state)
         title, description = self._story_context(state, story_key)
         restore_recorded = self._restore_recorded(run_dir, story_key)
@@ -751,7 +754,13 @@ class BmadLoopApp(App[None]):
                     return
                 self._launch_resolve(run_id)
             elif verb == "rearm":
-                self._do_rearm(run_id, run_dir, story_key, restore_recorded=restore_recorded)
+                self._do_rearm(
+                    run_id,
+                    run_dir,
+                    story_key,
+                    restore_recorded=restore_recorded,
+                    expected_generation=expected_generation,
+                )
 
         self.push_screen(modal, done)
 
@@ -902,7 +911,13 @@ class BmadLoopApp(App[None]):
             )
 
     def _do_rearm(
-        self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
+        self,
+        run_id: str,
+        run_dir: Path,
+        story_key: str,
+        *,
+        restore_recorded: bool = False,
+        expected_generation: int | None = None,
     ) -> None:
         """Re-arm a resolved escalation + resume — the `resolve --no-interactive`
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
@@ -945,6 +960,7 @@ class BmadLoopApp(App[None]):
         try:
             paths = bmadconfig.load_paths(self.project)
         except (bmadconfig.BmadConfigError, OSError) as e:
+            paths = None
             self.notify(
                 f"cannot read the project config to confirm the code root ({e}) — "
                 "re-arming against the root this run recorded",
@@ -965,25 +981,52 @@ class BmadLoopApp(App[None]):
             if conflict is not None:
                 self.notify(conflict, severity="error")
                 return
-            if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
-                self.notify(moved, severity="warning")
         before_entries = runs.journal_entries_or_none(run_dir)
         outcome: runs.RearmOutcome | None = None
         try:
-            outcome = runs.rearm_escalation(
-                run_dir,
-                story_key,
-                isolated_redrive=isolation == "worktree",
-                # DW-11. This gesture runs no resolve session, so it accepted nothing:
-                # the escalation watermark must not advance. A `resolution.json` on
-                # disk is NOT evidence to the contrary here — `_restore_recorded`
-                # already records the governing fact for this surface, that a stale
-                # marker is indistinguishable from a fresh one, which is why this path
-                # declines the restore latch too. Stamping on its presence would bury
-                # escalations raised since the marker was written.
-                resolution_recorded=False,
-            )
-        except RearmError as e:
+            with state_lock(run_dir):
+                # Repeat the liveness decision after exclusion.  Config/policy work
+                # above is deliberately lock-free; only this bounded restamp+re-arm
+                # mutation gesture is serialized.
+                if self._resolve_blocked_by_liveness(run_id, run_dir):
+                    return
+                fresh_state = load_state(run_dir)
+                fresh_task = fresh_state.tasks.get(story_key)
+                if (
+                    fresh_state.paused_stage != PAUSE_ESCALATION
+                    or fresh_task is None
+                    or fresh_task.phase != Phase.ESCALATED
+                ):
+                    self.notify(
+                        f"run {run_id} is no longer paused at escalation for {story_key} "
+                        "— not re-arming",
+                        severity="warning",
+                    )
+                    return
+                if expected_generation is not None and fresh_task.generation != expected_generation:
+                    self.notify(
+                        f"the escalation for {story_key} changed while its review was open "
+                        "— not re-arming",
+                        severity="warning",
+                    )
+                    return
+                if paths is not None:
+                    if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                        self.notify(moved, severity="warning")
+                outcome = runs.rearm_escalation(
+                    run_dir,
+                    story_key,
+                    isolated_redrive=isolation == "worktree",
+                    # DW-11. This gesture runs no resolve session, so it accepted nothing:
+                    # the escalation watermark must not advance. A `resolution.json` on
+                    # disk is NOT evidence to the contrary here — `_restore_recorded`
+                    # already records the governing fact for this surface, that a stale
+                    # marker is indistinguishable from a fresh one, which is why this path
+                    # declines the restore latch too. Stamping on its presence would bury
+                    # escalations raised since the marker was written.
+                    resolution_recorded=False,
+                )
+        except (RearmError, OSError, runs.StateRootError) as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
         finally:

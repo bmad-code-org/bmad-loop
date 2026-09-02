@@ -16,16 +16,19 @@ at the end of the file.
 
 import dataclasses
 import shutil
+import threading
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from bmad_loop import bmadconfig
+from bmad_loop import journal as journal_mod
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import Journal, load_state, state_lock
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -434,6 +437,96 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.repo_root == str(paths.repo_root)
     assert persisted.code_root == paths.repo_root
     assert persisted.code_root != Path(persisted.project)
+
+
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch, run_type):
+    """A rival explicit-id resume cannot enter after state.json becomes readable
+    but before the fresh composer publishes engine.pid."""
+    run_dir = runs.run_dir_for(tmp_path, RUN_ID)
+    stamp_entered = threading.Event()
+    rival_attempted = threading.Event()
+    release_stamp = threading.Event()
+    rival_observed: list[tuple[bool, bool]] = []
+    errors: list[BaseException] = []
+    real_file_lock = journal_mod.file_lock
+
+    @contextmanager
+    def observed_file_lock(path, *args, **kwargs):
+        if threading.current_thread().name == "rival-resume":
+            rival_attempted.set()
+        with real_file_lock(path, *args, **kwargs):
+            yield
+
+    def paused_stamp(_project, _run_id, _digest):
+        stamp_entered.set()
+        assert release_stamp.wait(2)
+
+    monkeypatch.setattr(journal_mod, "file_lock", observed_file_lock)
+    monkeypatch.setattr(runs, "write_trusted_config_digest", paused_stamp)
+
+    def compose() -> None:
+        try:
+            if run_type == "run":
+                runsetup.compose_run(
+                    project=tmp_path,
+                    paths=_fake_paths(tmp_path),
+                    policy=policy_mod.loads(""),
+                    run_id=RUN_ID,
+                    epic_filter=None,
+                    story_filter=None,
+                    max_stories=None,
+                    stories_on=False,
+                    spec_folder="",
+                    sweep_factory=lambda _trigger, *, started: None,
+                    make_adapters=_accepting_adapters,
+                    engine_cls=_AcceptingEngine,
+                    stories_engine_cls=_AcceptingEngine,
+                    trusted_config_digest="deadbeef",
+                )
+            else:
+                runsetup.compose_sweep(
+                    project=tmp_path,
+                    paths=_fake_paths(tmp_path),
+                    policy=policy_mod.loads(""),
+                    run_id=RUN_ID,
+                    prompting=False,
+                    decisions_only=False,
+                    max_bundles=None,
+                    repeat=None,
+                    max_cycles=None,
+                    trigger="auto",
+                    make_adapters=_accepting_adapters,
+                    sweep_engine_cls=_AcceptingEngine,
+                    trusted_config_digest="deadbeef",
+                )
+        except BaseException as e:
+            errors.append(e)
+
+    def rival_resume() -> None:
+        try:
+            with state_lock(run_dir):
+                rival_observed.append(
+                    ((run_dir / "state.json").is_file(), (run_dir / "engine.pid").is_file())
+                )
+        except BaseException as e:
+            errors.append(e)
+
+    composer = threading.Thread(target=compose, name="composer")
+    rival = threading.Thread(target=rival_resume, name="rival-resume")
+    composer.start()
+    assert stamp_entered.wait(2)
+    assert (run_dir / "state.json").is_file()
+    assert not (run_dir / "engine.pid").exists()
+    rival.start()
+    assert rival_attempted.wait(2)
+    assert rival_observed == []
+    release_stamp.set()
+    composer.join(2)
+    rival.join(2)
+
+    assert errors == []
+    assert rival_observed == [(True, True)]
 
 
 @pytest.fixture

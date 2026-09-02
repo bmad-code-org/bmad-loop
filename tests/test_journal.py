@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
+from contextlib import contextmanager
 
 import pytest
 
 from bmad_loop import journal as journal_mod
-from bmad_loop import platform_util
-from bmad_loop.journal import Journal, load_state, save_state
+from bmad_loop import platform_util, runs
+from bmad_loop.journal import Journal, load_state, save_state, state_lock
 from bmad_loop.model import RunState
 
 
@@ -20,6 +22,7 @@ def test_save_state_retries_transient_sharing_violation(tmp_path, monkeypatch):
     """On win32, os.replace denied by a concurrent reader is retried, not fatal."""
     monkeypatch.setattr(platform_util.sys, "platform", "win32")
     monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)  # no real backoff
+    monkeypatch.setattr(journal_mod, "file_lock", contextmanager(lambda _path: iter((None,))))
 
     real_replace = os.replace
     calls = {"n": 0}
@@ -36,6 +39,220 @@ def test_save_state_retries_transient_sharing_violation(tmp_path, monkeypatch):
 
     assert calls["n"] == 3
     assert load_state(tmp_path).run_id == "r1"
+
+
+def test_state_lock_holds_the_canonical_run_sidecar(tmp_path):
+    run_dir = tmp_path / "run"
+    lock_path = runs.lock_path_for(run_dir / journal_mod.STATE_FILE, follow_final_symlink=False)
+
+    with state_lock(run_dir):
+        with pytest.raises(OSError):
+            with platform_util.file_lock(lock_path, blocking=False):
+                pytest.fail("a rival acquired the held run-state sidecar")
+
+
+def test_state_lock_same_run_nesting_acquires_os_lock_once(tmp_path, monkeypatch):
+    acquired: list[object] = []
+
+    @contextmanager
+    def recording_lock(path):
+        acquired.append(path)
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", recording_lock)
+
+    with state_lock(tmp_path):
+        with state_lock(tmp_path / "."):
+            save_state(
+                tmp_path,
+                RunState(run_id="r1", project="p", started_at="2026-09-01T00:00:00"),
+            )
+
+    assert acquired == [
+        runs.lock_path_for(tmp_path / journal_mod.STATE_FILE, follow_final_symlink=False)
+    ]
+
+
+def test_state_lock_same_run_symlink_spellings_acquire_os_lock_once(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    alias = tmp_path / "run-alias"
+    try:
+        alias.symlink_to(run_dir, target_is_directory=True)
+    except (NotImplementedError, OSError) as e:
+        pytest.skip(f"directory symlinks unavailable: {e}")
+    acquired: list[object] = []
+
+    @contextmanager
+    def recording_lock(path):
+        acquired.append(path)
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", recording_lock)
+
+    with state_lock(run_dir):
+        with state_lock(alias):
+            pass
+
+    assert acquired == [
+        runs.lock_path_for(run_dir / journal_mod.STATE_FILE, follow_final_symlink=False)
+    ]
+
+
+def test_state_lock_identity_survives_replacing_a_final_state_symlink(tmp_path):
+    """Ablation: follow the final state.json symlink in state_lock and nested
+    save_state changes sidecars when atomic_replace replaces the link."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("{}", encoding="utf-8")
+    state_path = run_dir / journal_mod.STATE_FILE
+    state_path.symlink_to(elsewhere)
+    logical_lock = runs.lock_path_for(state_path, follow_final_symlink=False)
+
+    # The default remains referent-based for ledgers and every other caller.
+    assert runs.lock_path_for(state_path) == runs.lock_path_for(elsewhere)
+    assert runs.lock_path_for(state_path) != logical_lock
+
+    with state_lock(run_dir):
+        save_state(
+            run_dir,
+            RunState(run_id="r1", project="p", started_at="2026-09-01T00:00:00"),
+        )
+        assert not state_path.is_symlink()
+        with state_lock(run_dir / "."):
+            with pytest.raises(OSError):
+                with platform_util.file_lock(logical_lock, blocking=False):
+                    pytest.fail("a rival acquired the original logical sidecar")
+
+    assert elsewhere.read_text(encoding="utf-8") == "{}"
+    assert load_state(run_dir).run_id == "r1"
+
+
+def test_state_lock_refuses_different_run_nesting_before_second_acquire(tmp_path, monkeypatch):
+    acquired: list[object] = []
+
+    @contextmanager
+    def recording_lock(path):
+        acquired.append(path)
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", recording_lock)
+
+    with state_lock(tmp_path / "one"):
+        with pytest.raises(RuntimeError, match="different runs"):
+            with state_lock(tmp_path / "two"):
+                pytest.fail("cross-run nesting was allowed")
+
+    assert len(acquired) == 1
+
+
+def test_state_lock_failure_clears_thread_guard(tmp_path, monkeypatch):
+    acquired: list[object] = []
+
+    @contextmanager
+    def recording_lock(path):
+        acquired.append(path)
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", recording_lock)
+
+    with pytest.raises(ValueError, match="boom"):
+        with state_lock(tmp_path / "one"):
+            raise ValueError("boom")
+    with state_lock(tmp_path / "two"):
+        pass
+
+    assert len(acquired) == 2
+
+
+def test_save_state_acquisition_error_writes_nothing(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+
+    @contextmanager
+    def refusing_lock(_path):
+        raise OSError("lock unavailable")
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", refusing_lock)
+
+    with pytest.raises(OSError, match="lock unavailable"):
+        save_state(
+            run_dir,
+            RunState(run_id="r1", project="p", started_at="2026-09-01T00:00:00"),
+        )
+
+    assert not run_dir.exists()
+
+
+def test_save_state_root_error_writes_nothing(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+
+    def no_state_root(_path, **_kwargs):
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.setattr(runs, "lock_path_for", no_state_root)
+
+    with pytest.raises(runs.StateRootError, match="no state root"):
+        save_state(
+            run_dir,
+            RunState(run_id="r1", project="p", started_at="2026-09-01T00:00:00"),
+        )
+
+    assert not run_dir.exists()
+
+
+def test_two_concurrent_saves_never_share_the_fixed_temp_file(tmp_path, monkeypatch):
+    """Ablation: remove save_state's state_lock and the second replace enters while
+    the first is paused, so both calls race on state.json.tmp and one loses it."""
+    real_replace = journal_mod.atomic_replace
+    real_file_lock = journal_mod.file_lock
+    first_entered = threading.Event()
+    second_attempted = threading.Event()
+    release_first = threading.Event()
+    replace_threads: list[str] = []
+
+    @contextmanager
+    def observed_file_lock(path):
+        if threading.current_thread().name == "second":
+            second_attempted.set()
+        with real_file_lock(path):
+            yield
+
+    def controlled_replace(src, dst):
+        replace_threads.append(threading.current_thread().name)
+        if len(replace_threads) == 1:
+            first_entered.set()
+            assert release_first.wait(2)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(journal_mod, "atomic_replace", controlled_replace)
+    monkeypatch.setattr(journal_mod, "file_lock", observed_file_lock)
+    errors: list[BaseException] = []
+
+    def writer(run_id: str) -> None:
+        try:
+            save_state(
+                tmp_path,
+                RunState(run_id=run_id, project="p", started_at="2026-09-01T00:00:00"),
+            )
+        except BaseException as e:
+            errors.append(e)
+
+    first = threading.Thread(target=writer, args=("first",), name="first")
+    second = threading.Thread(target=writer, args=("second",), name="second")
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert second_attempted.wait(2)
+    assert replace_threads == ["first"]
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert errors == []
+    assert sorted(replace_threads) == ["first", "second"]
+    assert load_state(tmp_path).run_id in {"first", "second"}
 
 
 def _planted_verify_symlink(tmp_path):

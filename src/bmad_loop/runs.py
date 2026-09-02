@@ -40,7 +40,7 @@ from .adapters.multiplexer import (
     mux_usable,
 )
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
-from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
+from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
@@ -1370,7 +1370,7 @@ def accepted_tags(project: Path) -> frozenset[str]:
     return frozenset({project_tag(project), str(project.resolve())})
 
 
-def lock_path_for(data_path: Path) -> Path:
+def lock_path_for(data_path: Path, *, follow_final_symlink: bool = True) -> Path:
     """The advisory-lock sidecar for a mutable data file:
     ``<state root>/locks/<sha256(resolved path)[:16]>-<basename>.lock``.
 
@@ -1399,7 +1399,15 @@ def lock_path_for(data_path: Path) -> Path:
     usable state root (see :func:`state_root`); the caller fails rather than
     silently locking somewhere else.
     """
-    resolved = data_path.resolve()
+    # Run-state publication atomically replaces ``state.json``.  Its transaction
+    # lock therefore needs the identity of that *logical directory entry*, not the
+    # current referent of a planted final-component symlink: following that link
+    # would change the sidecar halfway through an outer transaction when
+    # ``save_state`` replaces it.  Other mutable artifacts retain the historical
+    # referent-based behavior by default (notably shared external ledgers).
+    resolved = (
+        data_path.resolve() if follow_final_symlink else data_path.parent.resolve() / data_path.name
+    )
     digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
     return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
 
@@ -2100,6 +2108,14 @@ def request_graceful_stop(run_dir: Path) -> str:
 
 
 def stop_run(run_dir: Path) -> bool:
+    """Stop the engine generation current at completion of the gesture."""
+    while True:
+        result = _stop_run_once(run_dir)
+        if result is not None:
+            return result
+
+
+def _stop_run_once(run_dir: Path) -> bool | None:
     """Stop a live run. Returns False if it was already finished.
 
     The request is delivered two ways at once, and the engine wins whichever race
@@ -2181,6 +2197,7 @@ def stop_run(run_dir: Path) -> bool:
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
         pid = None
+    addressed_engine = (pid, identity)
     # Whether this call ever proved the engine dead. Only a confirmed death licenses
     # the fallback below to discard the request we lodged: while the engine may still
     # be running, that file is the one channel left that can stop it (on native
@@ -2268,8 +2285,53 @@ def stop_run(run_dir: Path) -> bool:
     # addresses the registry this process exported, and `cleanup`'s legacy pass is
     # what reaches a session left in an older one.
     kill_session(run_dir.name)
-    state = load_state(run_dir)
-    if state.stopped:
+
+    already_stopped = False
+    finished_during_stop = False
+    retry_new_engine = False
+    clear_request = False
+    with state_lock(run_dir):
+        # Authoritative post-delivery snapshot.  A rival writer that completed while
+        # stop was signalling is observed here, after exclusion, rather than being
+        # overwritten by the stale state loaded at entry.
+        state = load_state(run_dir)
+        current_engine = read_pid_identity(run_dir)
+        current_liveness = engine_liveness(run_dir)
+        rival_published_engine = current_liveness != "dead" and current_engine != addressed_engine
+        if state.finished:
+            # The engine completed while the stop channels were in flight.  Its
+            # terminal state is authoritative; do not rewrite it as a fallback stop.
+            finished_during_stop = True
+            clear_request = current_liveness == "dead"
+        elif rival_published_engine:
+            # Resume publishes pid + state under this same lock.  If that happened
+            # while this attempt was signalling an older generation, release before
+            # delivering to the new process and retry from its fresh identity.
+            retry_new_engine = True
+        elif state.stopped:
+            already_stopped = True
+            clear_request = True
+        elif engine_may_live and not lodged:
+            Journal(run_dir).append("run-stop-undelivered", pid=pid)
+            raise StopRunError(
+                f"run {run_dir.name}: the stop request could not be written to the run "
+                "directory and the engine could not be proved dead, so no stop is pending. "
+                "Its agent session was killed as a backstop. Free space in the run directory "
+                "and retry, or stop the process yourself"
+            )
+        else:
+            state.stopped = True
+            save_state(run_dir, state)
+            clear_request = not engine_may_live
+
+    if clear_request:
+        clear_graceful_stop(run_dir)
+    if finished_during_stop:
+        return False
+    if retry_new_engine:
+        return None
+
+    if already_stopped:
         # The engine honored the stop and is gone, and its own `run-stop` already
         # stands in the journal. Stamping `fallback=True` on top would describe an
         # engine that did its own teardown as one that had to be stopped from
@@ -2286,47 +2348,11 @@ def stop_run(run_dir: Path) -> bool:
         # re-stop at its first item. Safe on the `engine_may_live` paths too: a
         # written `stopped` *is* the engine reporting it honored the request, so
         # there is no live consumer left to strand.
-        clear_graceful_stop(run_dir)
         return True
 
-    # Neither channel was delivered: nothing is lodged, and we never proved the engine
-    # dead. This is the one outcome `stop` must not report as success — the operator is
-    # left believing a request is in flight that was never written, while an engine we
-    # could not signal keeps mutating the project. The pid-reuse guard above already
-    # refuses for its own path; these are its siblings, and the only reason they stayed
-    # quiet is that they clear `pid` and skip that block. Not a regression — on the
-    # merge-base this was the state of *every* refused signal, because `stop_run` cleared
-    # the request as its first statement — but the earlier decision to report success
-    # rested on the request being retained, which is exactly what did not happen here.
-    #
-    # Placement is load-bearing, twice over. It sits *after* the session backstop
-    # because refusing to report a stop is no reason to leak the window, and *after* the
-    # `state.stopped` return because a run the engine already honored must not be
-    # reported as a failure. Journal the attempt before raising: the `run-stop` append
-    # below is skipped, and an unrecorded stop attempt is its own trap.
-    if engine_may_live and not lodged:
-        Journal(run_dir).append("run-stop-undelivered", pid=pid)
-        raise StopRunError(
-            f"run {run_dir.name}: the stop request could not be written to the run "
-            "directory and the engine could not be proved dead, so no stop is pending. "
-            "Its agent session was killed as a backstop. Free space in the run directory "
-            "and retry, or stop the process yourself"
-        )
-
-    # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
-    # the request first — nothing is left alive to consume it, and a file outliving
-    # the run it asked to stop is a trap for the next resume.
-    #
-    # Unless we never actually proved that. Where the engine may still be running,
-    # the request stays lodged and the stop is genuinely still in flight: the engine
-    # honors the file at its next poll and writes `stopped` itself. Discarding it here
-    # would leave a live engine with no channel left while we report the run stopped —
-    # the stale-request trap above is the lesser of the two, and it only bites a run
-    # that is later resumed, which this one cannot be until that engine exits.
-    if not engine_may_live:
-        clear_graceful_stop(run_dir)
-    state.stopped = True
-    save_state(run_dir, state)
+    # The locked branch above performed the external fallback's final
+    # read-modify-write.  The journal remains outside the state transaction: it is
+    # append-only observation, not part of state publication.
     Journal(run_dir).append("run-stop", pid=pid, fallback=True)
     return True
 
@@ -3688,41 +3714,18 @@ def _rearm_commit_landed(run_dir: Path, story_key: str, task: StoryTask) -> bool
     only if some other writer had minted the same bump, and `phase` alone moves for
     reasons a re-arm does not own.
 
-    Those two conjuncts are a sufficient identity ONLY because `rearm_escalation` runs as
-    the SOLE writer of this run's `state.json`, and that model is the probe's premise
-    rather than an assumption left implicit. Exactly TWO call sites reach this
-    transaction — `cli.cmd_resolve` and `tui.TuiApp._do_rearm` — and each consults
-    liveness before any side effect: :func:`engine_liveness` in the CLI, its pid-file
-    sibling :func:`liveness` in the TUI (`probe_liveness` is the shared body). A third
-    control command, `cli.cmd_resume`, never re-arms but DOES write this run's
-    `state.json` (through `_resume_paused_run`), which is why the sole-writer claim has
-    to account for it as well as for the two callers.
-    `tests/test_portability_guard.py::test_rearm_escalation_called_only_behind_a_liveness_gate`
-    holds that enumeration, which is otherwise prose a third call site could falsify
-    silently.
+    Those two conjuncts are a sufficient identity because the entire re-arm — including
+    this error-path probe — runs inside :func:`journal.state_lock`. Every state writer
+    participates through the self-locking :func:`journal.save_state`, and every external
+    read-modify-write gesture holds the same canonical run sidecar from its deciding read
+    through publication. Therefore no rival can supply the observed generation/phase
+    while this transaction is in flight: a waiter reloads only after this hold exits.
 
-    Those gates establish that no engine is PROVABLY ALIVE — not that one is proven
-    dead — and the premise rests on the difference, so it is stated rather than rounded
-    off. `"alive"` is refused outright at all three. `"unknown"` is not: `cmd_resolve`
-    proceeds on it under `--force`, `cmd_resume` warns and proceeds by design (it is the
-    recovery path that rewrites engine.pid), and the TUI counts it as blocking only for a
-    pid-backed run. So the model this probe leans on is the engine stopped AND the
-    operator driving one control command at a time. Under it only THIS caller can have
-    moved either field, which is exactly what the exact-phase predicate reports — the
-    predicate is correct for the reason it is narrow.
-
-    Two overlapping control commands are OUTSIDE that model rather than handled by it,
-    and deliberately so. `journal.save_state` stages through a FIXED `state.json.tmp`
-    sibling before its `atomic_replace` — the collision `_write_stop_request` documents
-    under #379, which names the stop-request file as the ONE control file with genuinely
-    *concurrent* writers — so two overlapping re-arms lose a `save_state` to
-    `FileNotFoundError` long before this probe's identity could matter. Answering them
-    here was weighed and declined: a lock taken by only `rearm_escalation` excludes
-    nobody (the honest fix is a run-level one shared with `_resume_paused_run` and the
-    engine's own `save_state`), and a durable per-re-arm token stamped on `StoryTask`
-    would buy this probe a precision the `save_state` writer beneath it cannot honour, at
-    the cost of a new persisted model field. Tracked as DW-93; the probe stays two
-    conjuncts over the reloaded task.
+    The two operator call sites still repeat liveness under their outer transaction
+    holds. That is a separate safety rule: serialization prevents stale publication,
+    while liveness prevents deliberately taking a turn after an engine known to be live.
+    The portability guard keeps both the writer/transaction inventory and the two re-arm
+    surface gates executable rather than relying on this prose.
 
     Degrades to `False` — roll back, the pre-existing behavior — on ANY failure to read
     or parse the state file. This is observation feeding a repair decision, and the safe
@@ -3861,22 +3864,23 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     run has changed repositories, and the paths are the half that would put an
     attacker-controlled string on their terminal.
     """
-    state = load_state(run_dir)
-    new = str(repo_root)
-    if state.repo_root == new:
-        return None
-    moved = bool(state.repo_root)
-    state.repo_root = new
-    save_state(run_dir, state)
-    if not moved:
-        return None
-    return (
-        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
-        "this run started — the re-drive works in the tree configured now, while the "
-        "baselines, preserve refs and branches this run already recorded name objects "
-        "in the previous one. Restore the previous `repo_root:` value if you did not "
-        "intend the move."
-    )
+    with state_lock(run_dir):
+        state = load_state(run_dir)
+        new = str(repo_root)
+        if state.repo_root == new:
+            return None
+        moved = bool(state.repo_root)
+        state.repo_root = new
+        save_state(run_dir, state)
+        if not moved:
+            return None
+        return (
+            f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+            "this run started — the re-drive works in the tree configured now, while the "
+            "baselines, preserve refs and branches this run already recorded name objects "
+            "in the previous one. Restore the previous `repo_root:` value if you did not "
+            "intend the move."
+        )
 
 
 @dataclass(frozen=True)
@@ -3919,6 +3923,25 @@ class _RearmJournal(Journal):
 
 
 def rearm_escalation(
+    run_dir: Path,
+    story_key: str | None = None,
+    *,
+    restore_patch: str | None = None,
+    isolated_redrive: bool,
+    resolution_recorded: bool,
+) -> RearmOutcome:
+    """Run the complete spec/git/state re-arm transaction under the run lock."""
+    with state_lock(run_dir):
+        return _rearm_escalation_locked(
+            run_dir,
+            story_key,
+            restore_patch=restore_patch,
+            isolated_redrive=isolated_redrive,
+            resolution_recorded=resolution_recorded,
+        )
+
+
+def _rearm_escalation_locked(
     run_dir: Path,
     story_key: str | None = None,
     *,
