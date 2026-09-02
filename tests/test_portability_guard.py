@@ -1409,15 +1409,16 @@ def _scan_source(src: str, rel: str):
     }
 
     # Everything inside this file's ONE sanctioned task-id composition point, if it
-    # has one. Same `ast.walk(fn)` shape as the verify sets above — a nested def
-    # inside the chokepoint is still inside it — and empty in every other file,
-    # since `.get(rel)` is None there and no function is named None.
+    # has one. Same `_function_body_nodes(fn)` shape as the verify sets above — a
+    # nested def inside the chokepoint is still inside it, a decorator or default is
+    # not — and empty in every other file, since `.get(rel)` is None there and no
+    # function is named None.
     sanctioned_task_id_nodes = {
         id(inner)
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         and fn.name == SESSION_TASK_ID_CHOKEPOINT.get(rel)
-        for inner in ast.walk(fn)
+        for inner in _function_body_nodes(fn)
     }
 
     # `return` statements inside a function whose NAME contains `task_id` — the
@@ -3577,6 +3578,28 @@ SESSION_TASK_ID_SCOPE_CASES = [
         '        return f"{story_key}-{part}-{seq}"\n'
         "    return safe_segment(compose())\n",
         False,
+    ),
+    # A decorator and a default argument are evaluated where the chokepoint is
+    # DEFINED, not inside its body, so a mint parked in one is a fifth mint wearing
+    # the chokepoint's name. The body's own return stays sanctioned in both rows, so
+    # the offence is the decorator/default alone. ABLATION: restore
+    # `for inner in ast.walk(fn)` in `sanctioned_task_id_nodes` and both rows FAIL.
+    (
+        "decorator-bypass",
+        "engine.py",
+        '@register(SessionSpec(task_id=f"{story_key}-dev-1", prompt=p))\n'
+        "def _session_task_id(story_key, part, seq, generation):\n"
+        "    return safe_segment(story_key)\n",
+        True,
+    ),
+    (
+        "default-arg-bypass",
+        "engine.py",
+        "def _session_task_id(\n"
+        '    story_key, part, seq, generation, *, spec=SessionSpec(task_id=f"{k}-dev-1", prompt=p)\n'
+        "):\n"
+        "    return safe_segment(story_key)\n",
+        True,
     ),
 ]
 
