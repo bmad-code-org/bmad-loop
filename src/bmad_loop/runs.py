@@ -3541,14 +3541,30 @@ def _restore_rearmed_spec(
     A restore that itself fails RAISES rather than degrading — the spec is then
     half-written and only the operator can settle it, which is the loudest thing this can
     be. `UnconfinedWriteError` is an `OSError`, so the one arm still covers both.
+
+    `unknown` is reserved for the two shapes that are ANSWERS rather than failures to
+    look: nothing was captured, and the spec is gone. A read that merely could not be
+    performed is neither, and must not short-circuit the undo — see the `except` arms.
     """
     if original is None:
         return "unknown"
     try:
         if spec_path.read_bytes() == original:
             return "unchanged"
-    except OSError:
+    except FileNotFoundError:
+        # The one read fault that is an ANSWER about the disk: the spec is gone, so there
+        # are no bytes carrying this re-arm's flip and nothing for the undo to put back.
         return "unknown"
+    except OSError:
+        # Every other read fault (EIO, EMFILE, a transient EACCES) says nothing about
+        # what is ON DISK — and this read is only the "already identical, skip the write"
+        # shortcut. Answering `unknown` here abandoned the restore on exactly the runs
+        # that still needed it: the spec keeps the flip and the stripped result section
+        # while `save_state` leaves the story ESCALATED, which is the split state this
+        # whole transaction exists to prevent. Fall through and attempt the write; it
+        # raises `RearmError` if it cannot land, which is the loud outcome the docstring
+        # above promises. The cost of being wrong here is one redundant identical write.
+        pass
     confine_root = task_spec_root(task, state)
     try:
         if spec_path.is_relative_to(confine_root):
