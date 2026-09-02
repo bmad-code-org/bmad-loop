@@ -2871,6 +2871,57 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
 
 
+def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
+    project, monkeypatch, capsys
+):
+    """The sibling above passes `--no-interactive`, so it pins the refusal only against
+    the WRITES. Nothing pinned it against the agent conversation, and that is the half an
+    operator pays for: `cmd_run` and `cmd_sweep` refuse this config before doing any
+    work, while `resolve` built adapters, ran a full interactive session, and handed back
+    rc 1 for a pair knowable before any of it — throwing the conversation away.
+
+    Graded on `run_session` never being reached, not on the exit code: the post-confirm
+    refusal returns the same 1 from the same predicate, so an rc assertion alone passes
+    with the hoist deleted. `_make_adapters` is failed rather than stubbed for the same
+    reason — it is the first thing the interactive arm does, so it fails EARLIER than
+    `run_session` if the refusal is merely moved down a few lines rather than removed.
+
+    The post-confirm refusal stays the authority and is deliberately not disturbed: it
+    re-reads the config after a conversation of unbounded length, and it is the only one
+    the `--no-interactive` path reaches.
+
+    Ablation: delete the `_reject_isolation_conflict` call from the `else:` branch of
+    `pre_session_paths` and this reddens on `_make_adapters` while the sibling row above
+    stays green.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters for a refused config")
+    )
+    monkeypatch.setattr(
+        resolve, "run_session", lambda *a, **k: pytest.fail("conversed under a refused config")
+    )
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+
+    # no --no-interactive: this is the path the sibling row cannot reach
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    assert cli.main(argv) == 1
+
+    assert REFUSAL in capsys.readouterr().err
+    state = load_state(run_dir)
+    assert state.repo_root == str(recorded)  # nothing was written on the way out
+    assert state.tasks["s1"].phase == Phase.ESCALATED
+
+
 def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
     """Reading config.yaml to learn the tree is an OBSERVATION, so it degrades: without
     it this process cannot name the code root, and re-pointing the mirror at a guess is
@@ -2953,7 +3004,8 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
 
     err = capsys.readouterr().err
     ordered_messages = (
-        "excluded the abandoned restore's new files from the re-drive baseline: new.txt",
+        "excluded the abandoned restore's new files from the re-drive baseline this "
+        "re-arm computed: new.txt",
         "could not read the abandoned restore patch (b.patch)",
         "1 commit(s) sit below the re-drive's new baseline (ffffffffffff..)",
     )
