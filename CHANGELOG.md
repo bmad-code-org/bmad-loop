@@ -12,7 +12,9 @@ breaking changes may land in a minor release.
 - **Interactive resolve context names both the BMAD project root and the run's code
   root.** `bmad-loop resolve` warns before a divergent-root session launches, while
   keeping the session project-rooted and directing code fixes and commits to the code
-  root.
+  root. The re-arm writes the same tree the context published: `runs.rearm_escalation`
+  takes the live project root from `resolve` and the TUI, so a moved project no longer
+  has the agent edit one copy of the spec while the re-arm flips another.
 
 - **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
   The warn-only probe that lists the commits an abandoned attempt left below the re-drive's
@@ -324,6 +326,11 @@ argument` and failed the story; a `ts` key did not raise and instead silently re
   raw bundle story keys because the value fell through to `scrub_json` — the identity on a list
   of identifier-shaped strings — while the singular `story_key` beside it was already aliased;
   a non-list value on any key-list field now fails closed instead of taking that same path.
+- Carry an isolated unit's harvested ledger findings when a defer runs under a
+  recorded mount after `[scm] isolation` was edited to `none` mid-pause. Resume reopens
+  the mount regardless of live policy, but the defer routed on live policy alone: it
+  reset the main repo, skipped the carry, and the findings died with the deleted
+  worktree. `_defer` now routes on the tree in hand, matching `_run_story`.
 - Stop a second resolve cycle re-presenting escalations the human already answered
   (DW-11). Only a re-arm that accepted a `resolution.json` watermarks the session
   trail; later cycles show what came after it and print how many were withheld. A

@@ -3316,6 +3316,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             restore_patch=restore_patch,
             isolated_redrive=pol.scm.isolation == "worktree",
             resolution_recorded=resolution_recorded,
+            # The tree this invocation is acting in, which is also the tree
+            # `build_context` published a `spec_file` from. `state.project` is where the
+            # run was LAUNCHED and nothing re-stamps it, so a moved project would have
+            # the agent edit one file and the re-arm flip another.
+            project_root=project,
         )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)

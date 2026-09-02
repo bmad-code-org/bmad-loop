@@ -2864,6 +2864,147 @@ def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
     assert task.restore_patch is None  # the latch never landed either
 
 
+def _renamed_project_pair(tmp_path):
+    """A run whose `state.project` names the tree it LAUNCHED in, plus a live tree
+    holding the same spec at the same relative position — the shape a project move
+    leaves behind.
+
+    Both copies exist deliberately, and that is what makes the rows below falsifiable:
+    a real rename deletes the old tree, so a re-arm aimed at it would merely no-op and
+    "the live spec is unflipped" could not tell a wrong target from no write at all.
+    With both present, exactly one file changes and the assertion names which.
+    """
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    for root in (recorded_project, live_project):
+        root.mkdir()
+        (root / "spec.md").write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    recorded_spec = recorded_project / "spec.md"
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        attempt=2,
+        spec_file=str(recorded_spec),
+    )
+    return run.run_dir, recorded_spec, live_project / "spec.md", live_project
+
+
+def test_rearm_flips_the_spec_in_the_live_project_after_a_rename(tmp_path):
+    """`resolve.build_context` publishes a `spec_file` REBASED onto the live CLI
+    project, because `state.project` is the launch-time spelling and nothing re-stamps
+    it — `restamp_code_root` moves the CODE root, and there is no project counterpart.
+    The re-arm resolved the same task through `task_spec_path` against that recorded
+    project, so after a rename the agent edited one file and the re-arm flipped
+    another. In the real shape the recorded tree is gone, so the flip silently no-ops
+    (every writer answers an absent path with `False`), the baseline re-stamp is
+    skipped, and the re-drive wedges on the escalated attempt's status with the
+    escalation spent.
+
+    Both halves are asserted, because a fix that wrote BOTH files would satisfy the
+    first alone.
+
+    Ablation: revert `_live_spec_path` to a bare `task_spec_path` and this reddens on
+    the live spec's unchanged status. `_live_spec_root` is graded by the row below
+    instead, and deliberately: ablating the ROOT alone is invisible here, because every
+    writer answers an out-of-root path by silently dropping to the unconfined arm —
+    the write still lands, it just loses #593's O_NOFOLLOW walk. That silent degrade is
+    the hazard `task_spec_root`'s own docstring names, so the invariant has to be
+    asserted directly rather than inferred from an outcome that cannot see it."""
+    run_dir, recorded_spec, live_spec, live_project = _renamed_project_pair(tmp_path)
+
+    runs.rearm_escalation(
+        run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(live_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) != "ready-for-dev"
+    assert "## Auto Run Result" not in live_spec.read_text(encoding="utf-8")
+    assert "## Auto Run Result" in recorded_spec.read_text(encoding="utf-8")
+
+
+def test_live_spec_root_still_confines_the_live_spec_path(tmp_path):
+    """The pair moves together or not at all. `task_spec_root` is the confinement claim
+    about the very path `task_spec_path` produces, so rebasing one alone hands the four
+    writers of these bytes a path outside their own root — which none of them refuses.
+    They drop to the plain write and #593's O_NOFOLLOW walk of the parent components is
+    gone, with no signal anywhere. Nothing downstream can observe that, so the
+    containment is asserted here, at the seam that has to preserve it.
+
+    Ablation: revert either helper to its un-rebased original and this reddens — the
+    root one on containment, the path one on the root's own identity."""
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    for root in (recorded_project, live_project):
+        root.mkdir()
+        (root / "spec.md").write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        spec_file=str(recorded_project / "spec.md"),
+    )
+    task = run.state.tasks["1-1-a"]
+
+    spec_path = runs._live_spec_path(task, run.state, live_project)
+    spec_root = runs._live_spec_root(task, run.state, live_project)
+
+    assert spec_path == live_project / "spec.md"
+    assert spec_root == live_project
+    assert spec_path.is_relative_to(spec_root)  # the confined arm stays reachable
+
+
+def test_rearm_without_a_live_project_writes_the_tree_the_run_recorded(tmp_path):
+    """The default is byte-for-byte today's behavior, and that is the whole argument
+    for it being optional: `None` does not stand in for a fact only the caller holds
+    (the way a defaulted `isolated_redrive` would), it names the same tree the caller
+    would have passed on every run whose project has not moved.
+
+    Ablation: make the parameter required, or default it to anything but
+    `state.project`, and this reddens."""
+    run_dir, recorded_spec, live_spec, _live_project = _renamed_project_pair(tmp_path)
+
+    runs.rearm_escalation(run_dir, "1-1-a", isolated_redrive=False, resolution_recorded=False)
+
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(live_spec)) != "ready-for-dev"
+
+
+def test_rearm_leaves_a_spec_outside_the_recorded_project_alone(tmp_path):
+    """`rebase_recorded_project_path` is spelling arithmetic over the recorded project
+    PREFIX, so an artifact dir configured outside the project tree — the shared
+    external layout `[stories] source` allows, and the one shape
+    `_spec_is_shared_with_the_redrive` treats as reachable under isolation — is not
+    project-owned and must pass through untouched. Rebasing it would relocate a file
+    every checkout already shares onto a tree that does not contain it.
+
+    Ablation: drop the `relative_to` guard's `except ValueError: return path` arm and
+    this reddens on an unflipped external spec."""
+    external = tmp_path / "shared-artifacts"
+    external.mkdir()
+    spec = external / "spec.md"
+    spec.write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    recorded_project = tmp_path / "project-before-rename"
+    recorded_project.mkdir()
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    run = escalated_run(recorded_project, "r1", story_key="1-1-a", attempt=2, spec_file=str(spec))
+
+    runs.rearm_escalation(
+        run.run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(spec)) == "ready-for-dev"
+
+
 def test_rearm_resets_followup_reviews_spent(tmp_path):
     """A human-resolved re-drive gets a fresh damping budget: rearm_escalation
     zeroes followup_reviews_spent alongside review_cycle, so the clean rebuild

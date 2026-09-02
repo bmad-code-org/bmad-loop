@@ -6742,7 +6742,30 @@ class Engine:
 
     def _defer(self, task: StoryTask, reason: str) -> None:
         task.defer_reason = reason
-        if self._isolated:
+        # `self._isolated` is LIVE policy (`_worktree_flow.isolated` reads
+        # `scm.isolation`), and it is not the whole question. `_finish_inflight`
+        # decides its arms on `mounted = bool(task.worktree_path)` and reopens a
+        # recorded mount REGARDLESS of live policy — an accepted continuation owns
+        # the verified work in that tree, so it finishes there and merges. A run
+        # flipped `"worktree" -> "none"` while paused therefore reaches this method
+        # with the workspace swapped onto a mount, while `_isolated` answers False:
+        # the in-place arm below then rolls the MAIN repo back and never carries the
+        # harvest, and `_integrate_unit` deletes the mount on the way out. The
+        # findings that unit harvested are gone, and a ledger row nothing will ever
+        # re-file is invisible to every later sweep.
+        #
+        # `or task.worktree_path` and not `task.worktree_path` alone: isolation can be
+        # live with no mount yet recorded (a defer before `run_isolated` stores the
+        # path), and that shape must keep the isolated arm rather than fall through to
+        # a main-repo reset. A restart in the other direction never reaches here with a
+        # stale path — `_release_orphaned_mount` clears it before replacement work
+        # begins, which is what keeps this test about the tree actually in hand.
+        #
+        # The same pair, spelled the same way, already decides `_run_story`'s arms. The
+        # two are one question — does this task's work live in a mount — and a defer
+        # that answered it differently from the dispatch that produced the work is the
+        # shape this fixes.
+        if self._isolated or task.worktree_path:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).

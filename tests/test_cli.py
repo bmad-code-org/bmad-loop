@@ -2575,6 +2575,47 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+def test_resolve_rearms_the_spec_in_the_project_it_was_invoked_on(tmp_path, monkeypatch):
+    """`--project` names the tree this invocation acts in, and the re-arm's spec writes
+    have to land there.
+
+    `state.project` is the LAUNCH-TIME project and nothing re-stamps it — `resolve`
+    aims the CODE root through `runs.restamp_code_root` before it re-arms, and there is
+    no project counterpart. So after a project move `task_spec_path` resolved under a
+    directory that is no longer the one the operator (and `build_context`, which
+    rebases the `spec_file` it publishes) is working in. In the real shape the old tree
+    is gone and the flip silently no-ops, so the re-drive wedges on the escalated
+    attempt's status with the escalation already spent.
+
+    Both trees carry a copy on purpose: with only the live one present, "the live spec
+    flipped" could not tell a correctly-aimed write from a wrongly-aimed one that
+    happened to fall through to the same path.
+
+    Ablation: drop `project_root=project` from `cmd_resolve`'s `rearm_escalation` call
+    and this reddens on both assertions at once."""
+    from bmad_loop.journal import load_state, save_state
+
+    live_project = tmp_path / "project-after-rename"
+    recorded_project = tmp_path / "project-before-rename"
+    for root in (live_project, recorded_project):
+        root.mkdir()
+        (root / "spec.md").write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    recorded_spec = recorded_project / "spec.md"
+    live_spec = live_project / "spec.md"
+    run_dir = _escalated_run(live_project, "r1", spec_file=str(recorded_spec))
+    state = load_state(run_dir)
+    state.project = str(recorded_project)  # the launch-time spelling state keeps
+    save_state(run_dir, state)
+
+    rc = cli.main(
+        ["resolve", "--project", str(live_project), "r1", "--no-interactive", "--no-resume"]
+    )
+
+    assert rc == 0
+    assert "ready-for-dev" in live_spec.read_text(encoding="utf-8")
+    assert "ready-for-dev" not in recorded_spec.read_text(encoding="utf-8")
+
+
 # ------------------------------------ resolve aims the code root before it re-arms
 
 # `_resume_paused_run` re-stamps the persisted code root because the engine it arms
@@ -2625,7 +2666,13 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
     seen: list = []
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         seen.append(load_state(rd).code_root)
         return key
@@ -2751,7 +2798,13 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     Journal(run_dir).append("stale-restore-excluded", story_key="s1", files=["FROM-LAST-TIME.txt"])
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         journal = Journal(rd)
         journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
@@ -2793,7 +2846,13 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
     _escalated_run(tmp_path, "r1")
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         journal = Journal(rd)
         journal.append(
@@ -2846,7 +2905,13 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
 
     def rearm_with(restore: bool):
         def fake_rearm(
-            rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+            rd,
+            key,
+            *,
+            restore_patch=None,
+            isolated_redrive=False,
+            resolution_recorded=False,
+            project_root=None,
         ):
             Journal(rd).append(
                 "rearm-baseline-restamped",
@@ -2902,7 +2967,13 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
     from bmad_loop.journal import JOURNAL_FILE
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         if outcome == "rearm-error":
             raise runs.RearmError("cannot re-open story spec /x/spec.md")
@@ -2940,7 +3011,13 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
     _escalated_run(tmp_path, "r1")
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         Journal(rd).append(
             "rearm-baseline-restamp-skipped",
@@ -3007,7 +3084,13 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
     _escalated_run(tmp_path, "r1")
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         # journalled first, exactly as the real residue pass is ordered
         Journal(rd).append(
@@ -3077,7 +3160,13 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
 
     def rearm_journalling(kind, **fields):
         def fake_rearm(
-            rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+            rd,
+            key,
+            *,
+            restore_patch=None,
+            isolated_redrive=False,
+            resolution_recorded=False,
+            project_root=None,
         ):
             Journal(rd).append(kind, story_key=key, **fields)
             return key
@@ -3146,7 +3235,13 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
     _escalated_run(tmp_path, "r1")
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         journal = Journal(rd)
         journal.append(  # table row with a next_step
@@ -3197,7 +3292,13 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
     baseline = "b" * 40
 
     def fake_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         Journal(rd).append(
             "rearm-commits-probe-failed",
@@ -4338,7 +4439,13 @@ def test_resolve_rereads_isolation_after_the_agent_session(
     seen: list[bool] = []
 
     def recording_rearm(
-        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        rd,
+        key,
+        *,
+        restore_patch=None,
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=None,
     ):
         seen.append(isolated_redrive)
         return key
