@@ -542,6 +542,23 @@ def _scan():
     return findings
 
 
+def _function_body_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+    """Every node in ``fn``'s BODY, nested defs included.
+
+    ``ast.walk(fn)`` also hands back the decorators, the default arguments and the
+    return annotation — expressions Python evaluates where the function is DEFINED,
+    not calls made from inside it. A sanctioned-position set built from the full
+    walk therefore sanctions a call written in a decorator or a default, which is
+    exactly the bypass those sets exist to refuse.
+
+    Walking each body statement instead keeps the nested-def descent the sets rely
+    on: a closure inside a sanctioned helper stays sanctioned, and that closure's
+    OWN decorators and defaults stay in too, because those are evaluated in the
+    enclosing body.
+    """
+    return [node for stmt in fn.body for node in ast.walk(stmt)]
+
+
 def _scan_source(src: str, rel: str):
     """The whole per-file scan, over one source string → the same
     ``(kind, rel, lineno, line_text)`` tuples ``_scan`` collects.
@@ -581,16 +598,17 @@ def _scan_source(src: str, rel: str):
     # so the walk can tag each finding with the position bit instead of trying to
     # rediscover its enclosing function from a bare node.
     #
-    # Nested defs are covered because `ast.walk` descends into the function body,
-    # and the enclosing-name check is paired with a FILE check in the offender
-    # filter — a `_verify_review_commands` grown in some other module must not
-    # sanction itself by name alone.
+    # Nested defs are covered because `_function_body_nodes` walks each body
+    # statement, and the enclosing-name check is paired with a FILE check in the
+    # offender filter — a `_verify_review_commands` grown in some other module must
+    # not sanction itself by name alone. Decorators and defaults are NOT the body,
+    # so a call parked in one does not sanction itself.
     sanctioned_verify_command_calls = {
         id(call)
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         and fn.name == VERIFY_COMMANDS_SANCTIONED_CALLER
-        for call in ast.walk(fn)
+        for call in _function_body_nodes(fn)
         if isinstance(call, ast.Call)
         and _names_verify_commands_outcome(call.func, verify_command_aliases)
     }
@@ -604,7 +622,7 @@ def _scan_source(src: str, rel: str):
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         and fn.name == VERIFY_CLASSIFY_CHOKEPOINT.get(rel)
-        for call in ast.walk(fn)
+        for call in _function_body_nodes(fn)
         if isinstance(call, ast.Call)
         and _names_verify_classifier(call.func, verify_classifier_aliases)
     }
@@ -1550,8 +1568,9 @@ VERIFY_COMMANDS_SCOPE_CASES = [
         "    return classify(policy, paths.repo_root, on_results=on_results)\n",
         False,
     ),
-    # A nested def inside the helper is still inside it — `ast.walk` descends, and
-    # a closure that forwards the composition is not a second call site.
+    # A nested def inside the helper is still inside it — `_function_body_nodes`
+    # walks each body statement and `ast.walk` descends from there, and a closure
+    # that forwards the composition is not a second call site.
     (
         "nested-inside-helper",
         "verify.py",
@@ -1578,6 +1597,27 @@ VERIFY_COMMANDS_SCOPE_CASES = [
         "cli.py",
         'def _reverify(project, cwd):\n    """Deliberately NOT verify_commands_outcome."""\n',
         False,
+    ),
+    # A decorator and a default argument are evaluated where the function is
+    # DEFINED, not inside its body, so a composition parked in one is a second call
+    # site wearing the sanctioned helper's name. `ast.walk(fn)` hands both back and
+    # would sanction them; `_function_body_nodes` does not. ABLATION for these two
+    # rows: restore `for call in ast.walk(fn)` in `sanctioned_verify_command_calls`
+    # and both must go green-as-allowed, i.e. FAIL here.
+    (
+        "default-arg-bypass",
+        "verify.py",
+        "def _verify_review_commands(policy, paths, *, outcome=verify_commands_outcome(POLICY, ROOT)):\n"
+        "    return outcome\n",
+        True,
+    ),
+    (
+        "decorator-bypass",
+        "verify.py",
+        "@register(verify_commands_outcome(POLICY, ROOT))\n"
+        "def _verify_review_commands(policy, paths):\n"
+        "    return None\n",
+        True,
     ),
 ]
 
@@ -1705,6 +1745,24 @@ VERIFY_CLASSIFY_SCOPE_CASES = [
         "def _verify_review_commands(policy, paths):\n"
         '    """Kept separate from verify_command_results_outcome."""\n',
         False,
+    ),
+    # The decorator/default bypass, for the classifier half. Same reason as the
+    # wrapper rows above. ABLATION: restore `for call in ast.walk(fn)` in
+    # `sanctioned_classify_calls` and both rows must FAIL.
+    (
+        "default-arg-bypass",
+        "verify.py",
+        "def verify_commands_outcome(policy, cwd, *, outcome=verify_command_results_outcome(RESULTS, ROOT)):\n"
+        "    return outcome\n",
+        True,
+    ),
+    (
+        "decorator-bypass",
+        "verify.py",
+        "@register(verify_command_results_outcome(RESULTS, ROOT))\n"
+        "def verify_commands_outcome(policy, cwd):\n"
+        "    return None\n",
+        True,
     ),
 ]
 

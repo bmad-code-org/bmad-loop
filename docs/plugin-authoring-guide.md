@@ -532,7 +532,8 @@ which now narrows to that stage: the journalling half of it has landed.
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
 None of these carries the review gate's `[verify] commands` results — that gate
-runs the commands and retains nothing. See the boundary note above `### Review`.
+journals every command it runs, stream captures included, but publishes nothing to
+a hook context. See the boundary note above `### Review`.
 
 ### Commit
 
