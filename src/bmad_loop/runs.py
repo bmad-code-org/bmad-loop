@@ -3001,6 +3001,35 @@ def validate_restore_latch(
     return None
 
 
+def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path) -> Path:
+    """Move a project-owned persisted path with a renamed project, lexically.
+
+    Run state intentionally keeps the LAUNCH-TIME project string — nothing re-stamps
+    `state.project` the way `restamp_code_root` re-stamps the code root — while both
+    surfaces that resolve an escalation run from the LIVE CLI project. Paths outside
+    the recorded project are shared/external and remain untouched. This is spelling
+    arithmetic only: do not introduce filesystem canonicalization here, at either
+    caller's boundary.
+
+    Lives in `runs` rather than in `resolve` because BOTH sides of one gesture need
+    the identical answer, and `resolve` already imports this module (the reverse is a
+    cycle). `resolve.build_context` hands the agent a `spec_file` to edit;
+    `rearm_escalation` flips the status of the file it then re-drives from. Rebasing
+    one and not the other is not a cosmetic split — after a project move the agent
+    edits the live copy while the re-arm writes a path under a directory that no
+    longer exists, so the flip silently no-ops and the re-drive wedges on the
+    escalated attempt's status.
+    """
+    recorded_project = Path(state.project)
+    if project_root == recorded_project:
+        return path
+    try:
+        relative = path.relative_to(recorded_project)
+    except ValueError:
+        return path
+    return project_root / relative
+
+
 def task_spec_path(task: StoryTask, state: RunState) -> Path:
     """The persisted-task spec anchor, re-based on the tree it was recorded relative to.
 
@@ -3163,6 +3192,25 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
     except OSError:
         return Path(state.project)
     return mount
+
+
+def _live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
+    """`task_spec_path` carried onto the tree the caller is acting in.
+
+    The pair below is the WRITE side of `rearm_escalation`: the file it flips and
+    re-stamps, and the root every writer confines that edit to. They move together
+    because `task_spec_root` is the confinement claim about the very path
+    `task_spec_path` produces — rebasing one alone would hand the writers a path
+    outside their own root, and all four of them answer that by silently dropping to
+    the unconfined arm (see `task_spec_root` for why that matters).
+    """
+    return rebase_recorded_project_path(task_spec_path(task, state), state, project_root)
+
+
+def _live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path:
+    """`task_spec_root` carried onto the tree the caller is acting in — the confine
+    root for the path `_live_spec_path` names. See there."""
+    return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
@@ -3902,6 +3950,7 @@ def rearm_escalation(
     restore_patch: str | None = None,
     isolated_redrive: bool,
     resolution_recorded: bool,
+    project_root: Path | None = None,
 ) -> str:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
@@ -3987,6 +4036,31 @@ def rearm_escalation(
     and both non-interactive callers know by construction that no session ran. Do not
     unlink the marker here either — the TUI's Re-arm button is gated on its presence.
 
+    `project_root` is the LIVE CLI project, and it exists so this function writes the
+    file `resolve.build_context` told the agent to edit. `state.project` is the
+    LAUNCH-TIME project and nothing re-stamps it (unlike `state.code_root`, which
+    `restamp_code_root` re-points just before both callers reach here), so after a
+    project move `task_spec_path` resolves under a directory that no longer exists:
+    the status flip and the baseline re-stamp both silently no-op — every writer
+    answers an absent path with `False` rather than an exception — while the agent's
+    correction sits in the live tree the re-drive actually reads. The re-drive then
+    wedges on the escalated attempt's status and the escalation is spent.
+    `build_context` already rebases the `spec_file` it publishes, through the very
+    helper used here, so the two sides now name one file.
+
+    `None` means "the project this run recorded", which is byte-for-byte today's
+    behavior and the correct answer for every run whose project has not moved — the
+    default is safe in a way `isolated_redrive`'s would not be, because it does not
+    stand in for a fact only the caller holds; it names the same tree the caller
+    would pass. It is optional for that reason and to match `build_context`'s own
+    signature, which takes the live roots the same way.
+
+    Scope is the WRITE TARGET and its confinement root, not the reachability verdicts
+    beside them. Those read `task.spec_file`, which is relative for every run that
+    records one under the project, and answer without consulting `state.project` at
+    all; the two that can consult it degrade toward WARNING on an unresolvable path,
+    which is the safe direction and already their documented contract.
+
     The generation bump stays UNCONDITIONAL beside the gated stamp: it answers session-id
     reuse (#705), which an abandoned attempt needs exactly as much as a resolved one.
 
@@ -4018,6 +4092,11 @@ def rearm_escalation(
         err = validate_restore_latch(state, task, key, worktree_isolation=isolated_redrive)
         if err is not None:
             raise RearmError(err)
+
+    # The tree this gesture is ACTING IN, for the paths below that WRITE. `state.project`
+    # is where the run was launched and nothing re-stamps it, so after a project move it
+    # names a directory that is no longer there. See the `project_root` note above.
+    live_project = project_root if project_root is not None else Path(state.project)
 
     journal = Journal(run_dir)
     # Read before the unconditional overwrite below: they describe the restore
@@ -4095,7 +4174,7 @@ def rearm_escalation(
     # proof the tree is untouched.
     try:
         if task.spec_file:
-            spec_path = task_spec_path(task, state)
+            spec_path = _live_spec_path(task, state, live_project)
             # Stories mode only: a fixed-slug pre-planning-halt sentinel
             # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
             # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -4303,7 +4382,9 @@ def rearm_escalation(
                     spec_before = None
                 try:
                     flipped = verify.set_frontmatter_status(
-                        spec_path, target_status, confine_root=task_spec_root(task, state)
+                        spec_path,
+                        target_status,
+                        confine_root=_live_spec_root(task, state, live_project),
                     )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
@@ -4410,7 +4491,7 @@ def rearm_escalation(
                     # as it found it — a stripped result section on a spec the re-arm then
                     # refused would be the one edit nothing else records.
                     devcontract.strip_auto_run_result(
-                        spec_path, confine_root=task_spec_root(task, state)
+                        spec_path, confine_root=_live_spec_root(task, state, live_project)
                     )
                 except verify.FrontmatterWriteError as e:
                     # The spec reads fine but carries `status:` in a shape no line
@@ -4578,7 +4659,7 @@ def rearm_escalation(
         # block also returns `False` from both writers. That shape is caught by the flip's
         # `flipped` check above and, here, by `overwritten` staying empty.
         if task.spec_file:
-            spec_path = task_spec_path(task, state)
+            spec_path = _live_spec_path(task, state, live_project)
             if not spec_path.is_file():
                 # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
                 # made the two #640 legs shadow each other: on a project that is not a
@@ -4613,7 +4694,7 @@ def rearm_escalation(
                         spec_path,
                         "baseline_revision",
                         task.baseline_commit,
-                        confine_root=task_spec_root(task, state),
+                        confine_root=_live_spec_root(task, state, live_project),
                     )
                 except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                     # FrontmatterWriteError joins the tuple rather than getting its own

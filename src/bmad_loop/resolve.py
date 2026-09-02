@@ -27,6 +27,7 @@ from .journal import TASK_CYCLE_ARTIFACTS
 from .model import RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
+    rebase_recorded_project_path,
     redrive_base_ref,
     spec_reaches_the_redrive,
     task_spec_path,
@@ -45,36 +46,18 @@ def context_path(run_dir: Path, story_key: str) -> Path:
     return _story_dir(run_dir, story_key) / "context.json"
 
 
-def _rebase_recorded_project_path(path: Path, state: RunState, project_root: Path) -> Path:
-    """Move a project-owned persisted path with a renamed project, lexically.
-
-    Run state intentionally keeps the launch-time project string, while the resolve
-    session runs from the live CLI project. Paths outside the recorded project are
-    shared/external and remain untouched. This is spelling arithmetic only: do not
-    introduce filesystem canonicalization at the context serialization boundary.
-    """
-    recorded_project = Path(state.project)
-    if project_root == recorded_project:
-        return path
-    try:
-        relative = path.relative_to(recorded_project)
-    except ValueError:
-        return path
-    return project_root / relative
-
-
 def _context_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
     """Resolve the stories tree against the live project after a project move."""
     if task is not None and task.worktree_path:
         recorded_mount = Path(task.worktree_path)
-        live_mount = _rebase_recorded_project_path(recorded_mount, state, project_root)
+        live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
         if live_mount != recorded_mount:
             try:
                 if live_mount.is_dir():
                     return live_mount
             except OSError:
                 pass
-    return _rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
+    return rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
 
 
 def resolution_path(run_dir: Path, story_key: str) -> Path:
@@ -288,7 +271,7 @@ def build_context(
     current_project_root = project_root if project_root is not None else Path(state.project)
     current_code_root = code_root if code_root is not None else state.code_root
     context_spec_path = (
-        _rebase_recorded_project_path(task_spec_path(task, state), state, current_project_root)
+        rebase_recorded_project_path(task_spec_path(task, state), state, current_project_root)
         if task and task.spec_file
         else None
     )
@@ -340,7 +323,7 @@ def build_context(
         # from the project root, where the main checkout carries the same
         # implementation-artifacts-relative path — the raw value would name the wrong
         # tree's copy. `task_spec_path` provides the persisted anchor; when the whole
-        # project moved, `_rebase_recorded_project_path` carries that project-owned
+        # project moved, `rebase_recorded_project_path` carries that project-owned
         # spelling onto the live session root without resolving it through the OS.
         # as_posix() for the same reason `resolution_path` below uses it — the
         # context contract is one string on every OS — and because the value this

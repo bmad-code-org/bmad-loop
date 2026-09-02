@@ -972,6 +972,12 @@ class BmadLoopApp(App[None]):
                 run_dir,
                 story_key,
                 isolated_redrive=isolation == "worktree",
+                # The live project this dashboard was launched against, matching
+                # `cli.cmd_resolve`: the re-arm's spec writes have to land in the tree
+                # the operator is looking at, not in the one the run recorded at launch.
+                # `self.project` rather than `paths.project` because the `load_paths`
+                # arm above may have degraded without binding `paths` at all.
+                project_root=self.project,
                 # DW-11. This gesture runs no resolve session, so it accepted nothing:
                 # the escalation watermark must not advance. A `resolution.json` on
                 # disk is NOT evidence to the contrary here — `_restore_recorded`

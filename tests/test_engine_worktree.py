@@ -1153,6 +1153,120 @@ def test_carry_harvest_dedupe_stays_status_agnostic(project):
     assert task.harvest_carry_commit_pending is False  # nothing novel, so no latch
 
 
+def _in_place_policy():
+    """`wt_policy`'s mirror: the live mode a mid-pause `isolation = "none"` edit
+    leaves behind, with everything else identical so the two rows differ in one
+    field only."""
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+        limits=LimitsPolicy(),
+    )
+
+
+def test_defer_under_a_recorded_mount_carries_the_harvest_after_an_isolation_flip(
+    project, monkeypatch
+):
+    """`_defer` routes on the tree in hand, not on live policy alone.
+
+    `_finish_inflight` picks its arms on `mounted = bool(task.worktree_path)` and
+    reopens a recorded mount REGARDLESS of live policy — an accepted continuation owns
+    the verified work in that tree. So a run whose `scm.isolation` was edited
+    `"worktree" -> "none"` while it was paused re-enters this decision with the
+    workspace swapped onto a mount while `self._isolated` answers False. Gated on
+    policy alone, the in-place arm then reset the MAIN repo and skipped
+    `_carry_harvested_deferrals` entirely, and `_integrate_unit` deleted the mount on
+    the way out: the unit's harvested findings had no durable home left, and a ledger
+    row nothing will re-file is invisible to every later sweep.
+
+    `rolled` is the positive control and the discriminator — this row would also pass
+    on an engine that simply did nothing, so it pins WHICH arm ran, not merely that the
+    harvest survived.
+
+    Ablation: restore the bare `if self._isolated:` gate and this reddens on an empty
+    ledger, with the main-repo rollback recorded instead."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,  # the phase the budget-exhausted defer fires from
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+    assert rolled == []  # no reset into the main repo under a live mount
+    assert task.phase == Phase.DEFERRED
+
+
+def test_defer_with_no_recorded_mount_still_takes_the_in_place_arm(project, monkeypatch):
+    """The other half of the widened gate. `or task.worktree_path` must not swallow the
+    ordinary in-place defer, whose whole job is the rollback the isolated arm skips —
+    an in-place task carries `""`, and nothing else about this row differs from its
+    sibling above.
+
+    Ablation: widen the gate to an unconditional `True` (or drop the `worktree_path`
+    truthiness test so `Path("")` logic creeps back in) and this reddens on an
+    un-rolled-back tree and a harvest carried where none should be."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    assert task.worktree_path == ""  # MEASURED: the discriminator is the empty one
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert rolled == ["1-1-a"]  # the in-place reset DID run
+    assert _harvest_carry_events(engine) == []  # and no unit ledger was carried
+    assert task.phase == Phase.DEFERRED
+
+
+def test_defer_under_live_isolation_with_no_mount_yet_keeps_the_isolated_arm(project, monkeypatch):
+    """Isolation can be LIVE with no mount recorded — a defer reached before
+    `run_isolated` stores the path. That shape must keep the isolated arm rather than
+    fall through to a main-repo reset, which is why the gate is
+    `self._isolated OR worktree_path` and not the path alone.
+
+    Ablation: narrow the gate to `if task.worktree_path:` and this reddens on a
+    rollback that should never have run."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])  # wt_policy: isolation IS live
+    assert engine._isolated is True
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert rolled == []
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+
 def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     """A tracked ledger persistence fault cannot be reported as a completed carry."""
     project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
