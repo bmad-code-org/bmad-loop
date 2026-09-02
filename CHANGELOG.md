@@ -255,6 +255,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Serialize run deletion/archive against resume (DW-94), refusing a newly live
+  engine under the per-run lock and preventing a waiting resume from recreating a
+  run cleanup already removed.
+
 - Serialize every run-state writer and control read-modify-write transaction with one canonical per-run advisory lock (DW-93).
 
 - Let interactive resolve present `paused_reason` when watermark filtering leaves no newer
