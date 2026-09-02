@@ -1,6 +1,7 @@
 """Run-directory helper tests."""
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -3559,7 +3560,7 @@ def test_rearm_records_unknown_when_the_rollback_cannot_read_the_spec(monkeypatc
     the surfaces then told the operator the spec "was left exactly as the re-arm found
     it" about a file that is not there.
 
-    Ablation: make the `except OSError` arm in `_restore_rearmed_spec` return
+    Ablation: make the `except FileNotFoundError` arm in `_restore_rearmed_spec` return
     `"unchanged"` and this reddens on the recorded `rollback` first; drop that assertion
     and the rendered message reddens behind it.
     """
@@ -3582,6 +3583,54 @@ def test_rearm_records_unknown_when_the_rollback_cannot_read_the_spec(monkeypatc
     _severity, message, _next_step = runs.rearm_event_notice(aborted)
     assert "could not confirm what it left on disk" in message
     assert "left exactly as the re-arm found it" not in message
+
+
+def test_rearm_restores_the_spec_when_the_rollbacks_read_only_faults(monkeypatch, tmp_path):
+    """A read that could not be PERFORMED is not evidence the spec is fine.
+
+    The row above grades the one read fault that ANSWERS something: the file is gone, so
+    nothing on disk carries the flip and there is nothing to put back. Every other fault
+    — EIO, EMFILE, a transient EACCES — says nothing about what is on disk, and this read
+    is only the "already identical, skip the write" shortcut. Answering `unknown` there
+    abandoned the undo on exactly the runs that still needed it: `save_state` leaves the
+    story ESCALATED while the spec keeps the re-arm's status flip and its stripped
+    `## Auto Run Result`, which is the split state this whole transaction exists to
+    prevent.
+
+    The fault is armed only for the ROLLBACK's read. The preimage capture upstream goes
+    through the same call, and faulting that instead degrades `original` to `None` and
+    grades the sentinel arm — a different row entirely, which is why the arming flag is
+    set from inside the fake that triggers the abort.
+
+    Ablation: fold the two `except` arms back into one `except OSError: return "unknown"`
+    and this reddens on the spec's bytes first, then on the recorded `rollback`.
+    """
+    from bmad_loop.model import Phase
+
+    run_dir, spec, _patch = _stale_restore_tree(tmp_path)
+    found = spec.read_bytes()
+    real_read_bytes = Path.read_bytes
+    armed: list[bool] = []
+
+    def only_during_the_rollback(self):
+        if armed and self == spec:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_read_bytes(self)
+
+    def boom(repo, baseline):
+        armed.append(True)  # the flip and the preimage capture are already behind us
+        raise MemoryError("not a git answer")
+
+    monkeypatch.setattr(runs.verify, "commits_above", boom)
+    monkeypatch.setattr(Path, "read_bytes", only_during_the_rollback)
+    with pytest.raises(MemoryError, match="not a git answer"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    armed.clear()  # let the assertions read the file back
+
+    assert spec.read_bytes() == found  # the flip WAS undone, not abandoned
+    assert load_state(run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+    (aborted,) = _kinds(run_dir, "rearm-aborted")
+    assert aborted["rollback"] == "restored"
 
 
 def test_rearm_abort_without_a_spec_records_an_empty_locator(monkeypatch, tmp_path):
