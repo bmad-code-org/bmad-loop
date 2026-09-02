@@ -3016,11 +3016,20 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
       MISSING value, not a divergent one: it migrates silently, and calling it a move
       would fire the warning once on every pre-upgrade run.
 
+    The journal line is graded on the same three rows, because it is the DURABLE half
+    and the return value is not: the caller prints that string to stderr or a TUI toast
+    and it is gone. Worse, this re-stamp is what makes `cli._resume_paused_run`'s own
+    `code_root_changed` record read `false` later in the same gesture — both sides read
+    `bmadconfig.load_paths` on one project, so once the mirror is aimed the compare
+    NECESSARILY agrees. Without this line the one gesture where the root actually moved
+    is the one that leaves no trace, while plain `resume` still writes one.
+
     Ablation: drop the `if not moved: return None` arm and `legacy` reddens on the
     message; return the message without the `save_state` and `moved` reddens on the
-    persisted root while the other two rows still pass.
+    persisted root while the other two rows still pass; delete the `journal.append` and
+    `moved` reddens on the record alone, with every message assertion still green.
     """
-    from bmad_loop.journal import STATE_FILE
+    from bmad_loop.journal import STATE_FILE, Journal
 
     run = escalated_run(tmp_path, "r1", story_key="s1")
     now = tmp_path / "code"
@@ -3048,6 +3057,17 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
         assert str(tmp_path / "was") not in message
     else:
         assert message is None
+
+    # ...and the move is RECORDED, on exactly the row that moved
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert len(records) == (1 if recorded == "moved" else 0)
+    if records:
+        # `code_root_changed` is resume's own field name, so a reader correlates the two
+        # surfaces without knowing which one wrote the line
+        assert records[0]["code_root_changed"] is True
+        assert records[0]["repo"] == str(now)
 
 
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):

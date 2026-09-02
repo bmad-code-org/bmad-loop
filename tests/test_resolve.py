@@ -4945,7 +4945,14 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("files", 3), ("files", None), ("files", [1, 2]), ("commits", 3), ("commits", None)],
+    [
+        ("files", 3),
+        ("files", None),
+        ("files", [1, 2]),
+        ("files", "new.txt"),
+        ("commits", 3),
+        ("commits", None),
+    ],
 )
 def test_rearm_event_notice_survives_a_journal_shape_json_admits(field, value):
     """A malformed journal line must not raise out of either surface's `finally`.
@@ -4972,6 +4979,32 @@ def test_rearm_event_notice_survives_a_journal_shape_json_admits(field, value):
     severity, message, _ = notice
     assert severity in ("note", "warning")
     assert isinstance(message, str)
+
+
+def test_rearm_event_notice_does_not_spell_a_bare_string_field_letter_by_letter():
+    """The one shape `_journal_sequence`'s guard exists for, and the one its sibling
+    parametrization cannot grade.
+
+    That row asserts only that no exception escapes, which a widened guard satisfies
+    too. `_journal_sequence`'s docstring gives the actual reason it refuses to iterate
+    a `str`: `", ".join("abc")` renders `"a, b, c"`, so a bare string would reach the
+    operator spelled out one character at a time. Nothing pinned that until here.
+
+    Scoped honestly: no first-party producer can emit this. Both writers of these
+    fields pass lists (`verify.patch_new_files`, `verify.commits_above`), so the guard
+    is defensive against a hand-edited or third-party journal line — the same threat
+    model the sibling row's docstring invokes, `Journal.entries()` doing `json.loads`
+    with no shape filter.
+
+    Ablation: widen the guard to `isinstance(value, (list, tuple, str))` and this
+    reddens on `n, e, w`; every row of the sibling parametrization stays green.
+    """
+    notice = runs.rearm_event_notice({"kind": "stale-restore-excluded", "files": "new.txt"})
+
+    assert notice is not None
+    _severity, message, _next_step = notice
+    assert "new.txt" in message
+    assert "n, e, w" not in message
 
 
 def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
@@ -5004,6 +5037,46 @@ def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
     # nothing to do to THIS file; `rearm-spec-write-unreachable` carries the remedy on
     # exactly the legs that still have one, and holds the resume behind it
     assert step == ""
+
+
+def test_rearm_event_notice_does_not_promise_a_worktree_to_a_run_without_one():
+    """`refused=False` is reached for TWO disjoint reasons, and the record's own
+    discriminator is what tells them apart out of process.
+
+    `refused = spec_path.is_file() and write_reaches_the_redrive`. The sibling row above
+    feeds only the SECOND failure — a worktree-local copy the re-drive discards — and
+    pins "COMMITTED spec" as correct for it. On the first failure nothing is mounted and
+    nothing is discarded: the re-drive reads that same path, so telling the operator the
+    failed flip is harmless is wrong at exactly the moment it is not. The producer's own
+    row `test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable` builds that
+    state, with an empty `worktree_path` and a missing spec.
+
+    A record written before `reaches_redrive` existed keeps the wording it was written
+    under — asserted, because the alternative is a reader silently re-classifying old
+    journals it cannot re-derive the answer for.
+
+    Ablation: delete the `if entry.get("reaches_redrive")` branch and the first leg
+    reddens on the worktree sentence; return the new branch unconditionally and the
+    absent-field leg reddens instead.
+    """
+    entry = {
+        "kind": "rearm-spec-flip-skipped",
+        "spec_file": "specs/s1.md",
+        "status": "ready-for-dev",
+        "refused": False,
+    }
+
+    _, unreadable, unreadable_step = runs.rearm_event_notice({**entry, "reaches_redrive": True})
+    assert "COMMITTED spec" not in unreadable
+    assert "mounts no worktree" in unreadable
+    assert unreadable_step  # this leg HAS a remedy: the recorded path is wrong
+
+    _, discarded, _ = runs.rearm_event_notice({**entry, "reaches_redrive": False})
+    assert "COMMITTED spec" in discarded
+
+    # a pre-`reaches_redrive` record is not re-classified
+    _, legacy, _ = runs.rearm_event_notice(entry)
+    assert "COMMITTED spec" in legacy
 
 
 def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
