@@ -34,6 +34,14 @@ from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
 
+# A bump the filesystem can actually record. NTFS stores ~100ns ticks (FAT, 2s),
+# so a 1ns increment rounds away on Windows and the rewritten marker never reads
+# as newer than the launch capture — the readback then fails closed and
+# `_result_json` returns None. ext4 keeps the nanosecond, which is why a 1ns bump
+# only ever reddened the Windows legs. A whole second clears every granularity
+# these tests can meet, and matches the bump already used elsewhere in this file.
+_MTIME_TICK_NS = 10**9
+
 HAVE_TMUX = sys.platform != "win32" and shutil.which("tmux") is not None
 
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI was
@@ -4782,7 +4790,7 @@ def test_prelaunch_park_marker_survives_unrelated_touch_without_asserting_owners
     # Rewrite only the body before the retained marker, then lift whole-file mtime
     # past launch. The old implementation treated that mtime as marker provenance.
     ours.write_text(parked.replace("# Story", "# Story\n\nUnrelated post-launch touch."))
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["status"] == "awaiting-operator"
@@ -4808,7 +4816,7 @@ def test_new_session_marker_asserts_park_after_launch_capture(tmp_path, monkeypa
         "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
         "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
     )
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is True
@@ -4845,7 +4853,7 @@ def test_launch_capture_precedes_transport_that_writes_park_marker(tmp_path, mon
             "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
             "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
         )
-        os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
         return _dev_handle(launched_ns=launch_floor)
 
     monkeypatch.setattr(generic.GenericAdapter, "start_session", launch)
@@ -4878,7 +4886,7 @@ def test_in_place_marker_rewrite_asserts_session_ownership(tmp_path, monkeypatch
         "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
         "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
     )
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is True
@@ -4904,7 +4912,7 @@ def test_deleting_older_marker_does_not_assert_retained_last_marker(tmp_path, mo
     handle = adapter.start_session(spec)
 
     ours.write_text(prefix + final_marker)
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is False
@@ -4930,7 +4938,7 @@ def test_moved_launch_marker_does_not_assert_session_ownership(tmp_path, monkeyp
     handle = adapter.start_session(spec)
 
     old.rename(ours)
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is False
@@ -4955,7 +4963,7 @@ def test_unrelated_unreadable_markdown_does_not_poison_new_spec_capture(tmp_path
         "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
         "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
     )
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is True
@@ -4980,7 +4988,7 @@ def test_unreadable_launch_spec_fails_closed_after_becoming_readable(tmp_path, m
         "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
         "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
     )
-    os.utime(ours, ns=(launch_floor + 1, launch_floor + 1))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is False
