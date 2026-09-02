@@ -2811,6 +2811,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
 def _resume_paused_run(project: Path, run_dir: Path) -> int:
     """Resume a paused/interrupted run without holding its lock across execution."""
     with state_lock(run_dir):
+        # Cleanup removes the run under this same hold. A resume that resolved the
+        # path before cleanup won must not let Journal/save_state recreate it after
+        # its wait ends.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
         # Repeat the command's liveness decision after exclusion.  A concurrent
         # resume publishes its pid under this same hold, so the waiter refuses
         # instead of reloading the predecessor's old paused state and double-driving.
@@ -4073,6 +4079,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -4093,6 +4102,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         return rc
     try:
         dest = runs.archive_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -4363,15 +4375,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if not dry:
                         runs.archive_run(project, run_dir)
                     archived.append(run_dir.name)
-            except runs.LiveSessionError:
-                # A session appeared between the loop-top guard and here — a resume
-                # of a stopped run, racing this clean. The chokepoint refused the
-                # removal; record the run instead of letting one racing run abort
-                # the whole invocation. Correct the estimate down to what actually
-                # went. The wider race — every mutation in this loop against a
-                # concurrent resume — is older than this guard (`reclaimable` is
-                # sampled in the loop above and never re-read) and is tracked in
-                # issue #533.
+            except (runs.LiveEngineError, runs.LiveSessionError) as e:
+                # A session or engine appeared between the loop-top sample and the
+                # authoritative removal transaction. Record this run instead of
+                # letting one racer abort the whole invocation, then continue with
+                # its siblings. Correct the estimate down to what actually went.
                 freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
@@ -4380,8 +4388,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # trimmed, which is exactly the state it ends in.
                 (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
                 if not args.json:
+                    reason = (
+                        "agent session appeared mid-clean"
+                        if isinstance(e, runs.LiveSessionError)
+                        else "engine resumed mid-clean"
+                    )
                     print(
-                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        f"run {run_dir.name}: {reason} — not removed",
                         file=sys.stderr,
                     )
         elif pol.cleanup.trim_artifacts:

@@ -2304,13 +2304,40 @@ def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
 
     stopped = []
-    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    samples = iter(("alive", "dead"))
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: next(samples))
     monkeypatch.setattr(runs, "stop_run", lambda rd: stopped.append(rd) or True)
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
     assert "r1 deleted" in capsys.readouterr().out
     assert stopped == [run_dir]
     assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("command", ["delete", "archive"])
+def test_force_cannot_remove_a_run_that_resumes_after_the_stop(
+    tmp_path, monkeypatch, capsys, command
+):
+    """The outer force stop is not an override for the authoritative in-lock
+    liveness refusal, and its error must not advise retrying with force.
+
+    Ablation: gate the runs-layer probe on ``not force`` and the run disappears.
+    Verified.
+    """
+    samples = iter(("alive", "alive"))
+    stopped: list[Path] = []
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: next(samples))
+    monkeypatch.setattr(runs, "stop_run", lambda rd: stopped.append(rd) or True)
+    run_dir = _make_run_with_state(tmp_path, "r1")
+
+    assert cli.main([command, "--project", str(tmp_path), "r1", "--force"]) == 1
+
+    err = capsys.readouterr().err
+    assert "still live" in err and "refusing to" in err
+    assert "pass --force" not in err
+    assert stopped == [run_dir]
+    assert run_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
 
 
 def test_delete_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
@@ -5155,6 +5182,7 @@ def test_resume_rechecks_liveness_inside_the_state_lock(tmp_path, monkeypatch, c
         yield
 
     monkeypatch.setattr(cli, "state_lock", recording_lock)
+    monkeypatch.setattr(cli.runs, "is_run", lambda _run_dir: True)
 
     def liveness(_run_dir):
         assert entered
@@ -5199,11 +5227,59 @@ def test_resume_liveness_and_publication_share_one_lock_acquisition(tmp_path, mo
         return 1
 
     monkeypatch.setattr(cli, "state_lock", recording_lock)
+    monkeypatch.setattr(cli.runs, "is_run", lambda _run_dir: True)
     monkeypatch.setattr(cli.runs, "engine_liveness", liveness)
     monkeypatch.setattr(cli, "_prepare_resume_locked", prepare)
 
     assert cli._resume_paused_run(tmp_path, tmp_path / "run") == 1
     assert acquisitions == 1
+
+
+@pytest.mark.parametrize("operation", [runs.delete_run, runs.archive_run])
+def test_resume_waiter_refuses_a_run_cleanup_removed_without_recreating_it(
+    tmp_path, monkeypatch, capsys, operation
+):
+    """Cleanup-first ordering: after the waiter enters the lifecycle hold it
+    checks existence before liveness, Journal construction, adapters, or engine
+    drive can recreate anything.
+
+    Ablation: remove or move the existence gate below preparation and the injected
+    preparation failure fires. Verified.
+    """
+    import contextlib
+
+    run_dir = _make_run_with_state(tmp_path, "r1")
+
+    @contextlib.contextmanager
+    def cleanup_won(_run_dir):
+        operation(tmp_path, run_dir)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", cleanup_won)
+
+    def liveness(target):
+        if target.exists():
+            return "dead"
+        pytest.fail("resume read liveness after cleanup removed the run")
+
+    monkeypatch.setattr(
+        cli.runs,
+        "engine_liveness",
+        liveness,
+    )
+    monkeypatch.setattr(
+        cli, "_prepare_resume_locked", lambda *_a: pytest.fail("resume recreated the run")
+    )
+    monkeypatch.setattr(
+        cli.runsetup, "compose_resume", lambda **_k: pytest.fail("resume built an engine")
+    )
+
+    assert cli._resume_paused_run(tmp_path, run_dir) == 1
+
+    assert "no such run: r1" in capsys.readouterr().err
+    assert not run_dir.exists()
+    if operation is runs.archive_run:
+        assert (tmp_path / ".bmad-loop" / "archive" / "r1.tar.gz").is_file()
 
 
 def test_resume_retains_outer_lock_through_pid_publication(project, monkeypatch):
