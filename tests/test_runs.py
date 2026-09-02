@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from conftest import escalated_run, git, refuse_to_resolve
+from conftest import assert_run_state_lock_held, escalated_run, git, refuse_to_resolve
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
@@ -767,6 +767,116 @@ def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
     assert load_state(run_dir).stopped is True
     assert runs.read_stop_request_mode(run_dir) is None
     assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
+
+
+def test_stop_run_takes_state_lock_only_after_signal_and_wait(tmp_path, monkeypatch):
+    """Ablation: move stop_run's state_lock above terminate and this reddens on order;
+    the engine would be unable to save its own stopped state while stop waits."""
+    order: list[str] = []
+    alive = True
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def on_terminate(_pid):
+        nonlocal alive
+        order.append("terminate")
+        alive = False
+
+    host = _FakeHost(alive=lambda: alive, identity=100.0, on_terminate=on_terminate)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: order.append("kill-session"))
+
+    @contextlib.contextmanager
+    def recording_state_lock(_run_dir):
+        order.append("state-lock")
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", recording_state_lock)
+
+    assert runs.stop_run(run_dir) is True
+    assert order == ["terminate", "kill-session", "state-lock"]
+
+
+def test_stop_run_fallback_save_retains_the_outer_state_lock(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    assert runs.stop_run(run_dir) is True
+    assert load_state(run_dir).stopped is True
+
+
+def test_stop_run_does_not_fallback_over_engine_completion(tmp_path, monkeypatch):
+    """The final locked snapshot wins when the engine finishes while stop delivers."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+
+    def finish(_pid):
+        state = load_state(run_dir)
+        state.finished = True
+        save_state(run_dir, state)
+
+    monkeypatch.setattr(
+        runs,
+        "get_process_host",
+        lambda: _FakeHost(alive=False, identity=100.0, on_terminate=finish),
+    )
+
+    assert runs.stop_run(run_dir) is False
+    persisted = load_state(run_dir)
+    assert persisted.finished is True
+    assert persisted.stopped is False
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or '"fallback": true' not in journal.read_text()
+
+
+def test_stop_run_retries_when_resume_publishes_a_new_engine(tmp_path, monkeypatch):
+    """A rival resume that wins during delivery is itself sent the hard stop."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    alive = {4242: True, 5252: True}
+    identities = {4242: 100.0, 5252: 200.0}
+
+    class GenerationalHost(_FakeHost):
+        def __init__(self):
+            super().__init__(alive=False)
+
+        def is_alive(self, pid):
+            return alive.get(pid, False)
+
+        def identity(self, pid):
+            return identities.get(pid)
+
+        def terminate(self, pid):
+            self.terminated.append(pid)
+            alive[pid] = False
+            if pid == 4242:
+                # Resume clears the old gesture, then publishes its new pid and
+                # state atomically under the lock stop will next acquire.
+                with runs.state_lock(run_dir):
+                    runs.clear_graceful_stop(run_dir)
+                    rival = load_state(run_dir)
+                    rival.crashed = True
+                    (run_dir / "engine.pid").write_text("5252 200.0", encoding="utf-8")
+                    save_state(run_dir, rival)
+
+    host = GenerationalHost()
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [4242, 5252]
+    persisted = load_state(run_dir)
+    assert persisted.stopped is True
+    assert persisted.crashed is True
+    assert runs.read_stop_request_mode(run_dir) is None
 
 
 def test_stop_run_engine_confirmed_leaves_nothing_pending(tmp_path, monkeypatch):
@@ -2781,6 +2891,43 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
         assert message is None
 
 
+def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
+    """Ablation: move restamp_code_root's load above state_lock and the rival's
+    ``crashed`` update is overwritten by the stale snapshot."""
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    save_state(run.run_dir, run.state)
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run.run_dir)
+        rival.crashed = True
+        save_state(run.run_dir, rival)
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", rival_first)
+
+    runs.restamp_code_root(run.run_dir, tmp_path / "new-code")
+
+    persisted = load_state(run.run_dir)
+    assert persisted.crashed is True
+    assert persisted.code_root == tmp_path / "new-code"
+
+
+def test_restamp_code_root_retains_outer_lock_through_save(tmp_path, monkeypatch):
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    save_state(run.run_dir, run.state)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.restamp_code_root(run.run_dir, tmp_path / "new-code")
+    assert load_state(run.run_dir).code_root == tmp_path / "new-code"
+
+
 _SPEC_WITH_ARR = (
     "---\ntitle: t\nstatus: blocked\noperator_actions:\n"
     "  - publish the TXT record\n---\n\n## Intent\n\nbody\n"
@@ -2829,6 +2976,63 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert "## Auto Run Result" not in text  # stale attempt authority stripped
     entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
     assert entry["restore"] is False
+
+
+def test_rearm_reloads_state_after_waiting_for_the_run_lock(tmp_path, monkeypatch):
+    """Ablation: load state before rearm_escalation's state_lock and this stale
+    gesture re-arms after the rival has already completed it."""
+    from bmad_loop.model import Phase
+
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    original = spec.read_bytes()
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["1-1-a"].phase = Phase.PENDING
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", rival_first)
+
+    with pytest.raises(runs.RearmError, match="is not escalated"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == original
+
+
+def test_rearm_lock_acquisition_failure_leaves_spec_and_state_unchanged(tmp_path, monkeypatch):
+    from bmad_loop import journal as journal_mod
+
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    spec_before = spec.read_bytes()
+    state_before = (run_dir / journal_mod.STATE_FILE).read_bytes()
+
+    @contextlib.contextmanager
+    def refusing_lock(_path):
+        raise OSError("state lock unavailable")
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", refusing_lock)
+
+    with pytest.raises(OSError, match="state lock unavailable"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == spec_before
+    assert (run_dir / journal_mod.STATE_FILE).read_bytes() == state_before
+
+
+def test_rearm_locked_body_retains_outer_lock_through_state_save(tmp_path, monkeypatch):
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
