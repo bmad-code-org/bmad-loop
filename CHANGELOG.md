@@ -310,6 +310,14 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- Take the re-arm's mount claim and its resume hold from the `rearm-spec-flip-skipped`
+  record instead of inferring both from `reaches_redrive`. The record now carries the live
+  `redrive` mode, so the notice no longer tells an ISOLATED run that it "mounts no worktree" —
+  that arm reaches the re-drive through a spec shared across checkouts, with a worktree very
+  much mounted. A record written before the field drops the mode clause rather than guessing.
+  The same leg now HOLDS the resume (`reaches_redrive` and not `refused`), so its "check the
+  recorded spec path before resuming" imperative stops rendering on the two surfaces that
+  re-arm and resume in one gesture.
 - **`bmad-loop clean` no longer aborts the whole sweep when one run's state lock is
   held.** A busy run used to end the invocation, so later candidates went unprocessed and
   runs already reclaimed vanished from a report only emitted after the loop. `clean` now

@@ -4677,6 +4677,20 @@ def _rearm_escalation_locked(
                         # behaviour on a run that has no worktree. Absent on records
                         # written before this field existed, where the renderer keeps its
                         # previous wording.
+                        # The live re-drive mode, recorded for the same reason
+                        # `refused` is: the renderer reads this OUT OF PROCESS and
+                        # cannot re-derive it. `reaches_redrive` does NOT imply it —
+                        # its isolated arm answers True for a spec in an artifact dir
+                        # configured outside the project tree
+                        # (`_spec_is_shared_with_the_redrive`), which is reachable
+                        # precisely BECAUSE it is shared across checkouts, with a
+                        # worktree very much mounted. Inferring "no worktree" from
+                        # reachability asserted the opposite of the truth on that shape.
+                        # Absent on records written before this field existed, where the
+                        # renderer drops the mount clause rather than guessing: unlike
+                        # the sibling `rearm-spec-write-unreachable`, whose in-place arm
+                        # is newer than the field, this kind was journalled from BOTH
+                        # modes before it, so an absent value here is genuinely unknown.
                         journal.append(
                             "rearm-spec-flip-skipped",
                             story_key=key,
@@ -4684,6 +4698,7 @@ def _rearm_escalation_locked(
                             status=target_status,
                             refused=refused,
                             reaches_redrive=write_reaches_the_redrive,
+                            redrive="isolated" if isolated_redrive else "in-place",
                         )
                         # ...and then ABORT — but only for a spec that IS a readable file
                         # here AND is the copy the re-drive reads. The first half is the same
@@ -5261,15 +5276,30 @@ def rearm_event_notice(
             # The write DID address the copy the re-drive reads; the flip skipped
             # because that path is not a readable file from this process — a spec moved
             # or renamed by the resolve session, or an absolute path this `--project`
-            # invocation cannot see. Nothing is mounted and nothing is discarded, so the
-            # worktree wording below would tell the operator the failed flip is harmless
-            # at precisely the moment it is not.
+            # invocation cannot see. Either way the re-drive reads that same path, so
+            # the worktree wording below would tell the operator the failed flip is
+            # harmless at precisely the moment it is not.
+            #
+            # The MOUNT half is read off the record, never inferred from reachability:
+            # the isolated arm reaches the re-drive through a spec shared across
+            # checkouts, so a worktree is mounted there and "this run mounts no
+            # worktree" was simply false. A record predating the `redrive` field says
+            # nothing about the mode, and this kind was written from both modes before
+            # the field existed — so drop the clause rather than guess. The rest of the
+            # sentence holds in every case.
+            mode = str(entry.get("redrive", "") or "")
+            if mode == "in-place":
+                mount = ", and this run mounts no worktree"
+            elif mode == "isolated":
+                mount = ", and the re-drive reads it from outside the worktree it mounts"
+            else:
+                mount = ""
             return (
                 "warning",
                 f"the recorded spec for this story ({spec}) could not be re-opened to "
-                f"`{status}` — it is not a readable file from here, and this run mounts "
-                "no worktree, so the re-drive reads that same path and will see the "
-                "escalated attempt's status",
+                f"`{status}` — it is not a readable file from here{mount}, so the "
+                "re-drive reads that same path and will see the escalated attempt's "
+                "status",
                 "Check the recorded spec path before resuming",
             )
         # No next_step, and deliberately: on this leg there is nothing to do to THIS
@@ -5390,7 +5420,9 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     tree — so a surface that re-arms and resumes in ONE gesture must stop after the
     re-arm and leave `bmad-loop resume` to the operator.
 
-    TWO kinds qualify, and the discriminator is PROOF, not urgency.
+    THREE records qualify, and the discriminator is PROOF, not urgency. Two of them
+    qualify by KIND; the third qualifies by its FLAGS, because one kind there covers
+    outcomes that answer this question differently.
     `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does NOT carry the status the re-drive routes
     on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
@@ -5421,13 +5453,33 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     LESS than the answer — it proves nothing about whether the re-drive can route, only
     that one advisory could not be computed.
 
+    `rearm-spec-flip-skipped` earns it on ONE of its three arms, which is why this is
+    keyed on the record's flags rather than on the bare kind. Its producer writes
+    `refused = spec_path.is_file() and write_reaches_the_redrive`, so
+    `reaches_redrive and not refused` isolates exactly the leg where the flip addressed
+    the copy the re-drive reads and that path is NOT a readable file here — the
+    re-drive reads the same path and sees the escalated attempt's status. Futile, on
+    the same proof as the two above, and that arm's next_step already says "check the
+    recorded spec path before resuming"; without this it rendered on surfaces that
+    resumed in the same gesture, which is the defect the two kinds above were fixed
+    for. The other two arms must NOT hold: the `refused` arm raises `RearmError` from
+    the producer, so no resume happens at all and holding would be meaningless, and the
+    remaining arm carries no next_step because the imperative on that leg belongs to
+    `rearm-spec-write-unreachable`, which holds the resume itself.
+
     Not folded into `rearm_event_notice`'s tuple, because they are different questions
     asked of the same entry: that table answers "what do I tell the operator", this
     answers "may this gesture still resume". Both surfaces ask both, in one walk.
     """
-    return isinstance(entry, dict) and entry.get("kind") in (
-        "rearm-spec-write-unreachable",
-        "rearm-upstream-write-unreachable",
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get("kind")
+    if kind in ("rearm-spec-write-unreachable", "rearm-upstream-write-unreachable"):
+        return True
+    return (
+        kind == "rearm-spec-flip-skipped"
+        and bool(entry.get("reaches_redrive"))
+        and not entry.get("refused")
     )
 
 
