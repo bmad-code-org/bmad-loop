@@ -3116,7 +3116,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.interactive:
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
-        _ctx_path, withheld = resolve.build_context(
+        _ctx_path, withheld, unreadable = resolve.build_context(
             state, run_dir, story_key, isolation=pol.scm.isolation
         )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
@@ -3140,7 +3140,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        resolution_recorded = bool(produced)
+        # DW-11, second half. `produced` alone is not enough to record coverage,
+        # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
+        # covers every recorded session, INCLUDING the ones whose artifacts this walk
+        # could not read. `_gather_escalations` degrades on those by design (an
+        # observation path must not raise out of an interactive command), but the
+        # watermark turns that transient silence into a durable claim: the next cycle
+        # reads the file fine and withholds it as already answered. So a skipped
+        # artifact withholds COVERAGE instead. The cost is one repeated presentation;
+        # the alternative cost is an escalation nobody ever sees.
+        resolution_recorded = bool(produced) and not unreadable
         # DW-11. Reported to the operator, never into `context.json`: filtering the
         # agent's list silently would trade one misleading surface for another — the
         # human would have no way to tell "nothing else was ever raised" from "the rest
@@ -3158,6 +3167,18 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"{withheld} earlier escalation(s) for {story_key} were not shown to the "
                 "agent: they were presented to an earlier resolve cycle that recorded a "
                 "resolution"
+            )
+        if produced and unreadable:
+            # Only when a resolution WAS produced: with nothing recorded the watermark
+            # would not have advanced anyway, and reporting a withheld coverage the
+            # operator never had is noise. Counts, not paths — the operator's action is
+            # the same for one unreadable artifact as for five, and the run-dir names
+            # are not theirs to chase.
+            print(
+                f"{unreadable} session artifact(s) for {story_key} could not be read, so "
+                "this resolution was NOT recorded as covering the escalations they hold "
+                "— the next resolve will show every escalation for this story again",
+                file=sys.stderr,
             )
         if not produced:
             print(

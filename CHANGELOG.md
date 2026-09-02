@@ -283,7 +283,9 @@ argument` and failed the story; a `ts` key did not raise and instead silently re
   a non-list value on any key-list field now fails closed instead of taking that same path.
 - Stop a second resolve cycle re-presenting escalations the human already answered
   (DW-11). Only a re-arm that accepted a `resolution.json` watermarks the session
-  trail; later cycles show what came after it and print how many were withheld.
+  trail; later cycles show what came after it and print how many were withheld. A
+  cycle whose walk could not read a session artifact records no coverage at all, so
+  a transient read fault no longer buries the escalations it hid.
 - Emit `diagnose --json` v2, replacing journal `patch` / `stashed_to` paths with
   `patch_present` / `stashed_to_present`, and silently degrade Git stale-commit probe
   failures while propagating non-Git faults.

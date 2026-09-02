@@ -79,7 +79,12 @@ def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
 
 
 def _gather_escalations(
-    run_dir: Path, state: RunState, story_key: str, *, start: int = 0
+    run_dir: Path,
+    state: RunState,
+    story_key: str,
+    *,
+    start: int = 0,
+    skipped: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """The CRITICAL escalations recorded by this story's sessions, newest first,
     each DISTINCT escalation exactly once, paired with how many DISTINCT entries
@@ -146,7 +151,27 @@ def _gather_escalations(
     indexed with it, so a watermark past the end of the list yields an empty shown
     list rather than an IndexError. A ``task_id`` repeated across the watermark is
     opened once by ``seen_ids``, at its newest occurrence — the shown side, the
-    conservative direction."""
+    conservative direction.
+
+    ``skipped`` is an OUT-parameter, and it exists because the degrade above is
+    silent in exactly the place silence is unaffordable. An artifact dropped by the
+    ``except`` costs its own escalations — but ``runs.rearm_escalation`` then stamps
+    ``escalations_resolved_upto = len(task.sessions)``, which covers the session that
+    artifact belonged to. A transient read fault (a network mount, a truncated write
+    still in flight) therefore buries every escalation in it FOREVER: the next cycle
+    reads the file fine and withholds it as already answered. The caller refuses to
+    record coverage when this set is non-empty, which is the same
+    observe-and-degrade contract this reader already keeps — it just stops the
+    degrade from being laundered into a durable claim.
+
+    It is an out-parameter rather than a third return value on purpose: the
+    ``(list, int)`` pair is asserted by ~20 tests and read positionally by
+    ``build_context``, and this signal has one consumer. Only skips on the SHOWN
+    side are recorded — ``target is found`` — because those are the records the
+    watermark would NEWLY cover. A skip below ``start`` was already covered by the
+    previous cycle's watermark, so re-covering it buries nothing; it costs only the
+    withheld COUNT, which claims nothing durable. Paths are collected rather than a
+    bare tally so a duplicate artifact cannot inflate the answer."""
     task = state.tasks.get(story_key)
     if task is None:
         return [], 0
@@ -166,12 +191,22 @@ def _gather_escalations(
                 continue
             try:
                 doc = json.loads(fpath.read_text(encoding="utf-8"))
-                if not isinstance(doc, dict) or not isinstance(doc.get("escalations"), list):
+                if not isinstance(doc, dict):
+                    raise ValueError("artifact is not a JSON object")
+                if "escalations" not in doc:
+                    # The ordinary shape of a clean ``result.json``: nothing was
+                    # raised, so there is nothing to show and nothing hidden. NOT a
+                    # skip — counting it as one would withhold coverage from every
+                    # resolve cycle, permanently.
                     continue
+                if not isinstance(doc["escalations"], list):
+                    raise ValueError("'escalations' is not a list")
                 artifact_entries: dict[str, dict[str, Any]] = {}
                 for esc in critical_escalations(doc):
                     artifact_entries.setdefault(json.dumps(esc, sort_keys=True), esc)
             except (OSError, ValueError, RecursionError):
+                if skipped is not None and target is found:
+                    skipped.add(str(fpath))
                 continue
             for key, esc in artifact_entries.items():
                 target.setdefault(key, esc)
@@ -180,15 +215,26 @@ def _gather_escalations(
 
 def build_context(
     state: RunState, run_dir: Path, story_key: str, *, isolation: str
-) -> tuple[Path, int]:
+) -> tuple[Path, int, int]:
     """Write resolve/<story_key>/context.json for the resolve skill to read, and
-    return it beside the number of already-answered escalations withheld from it.
+    return it beside the number of already-answered escalations withheld from it and
+    the number of session artifacts this walk could NOT read.
 
-    The count is for the OPERATOR's terminal (`cli.cmd_resolve` prints it) and is
-    deliberately not a `context.json` field: the skill's contract is singular — resolve
-    the escalation you are shown — and a count of things the agent cannot see is not
-    something it can act on. It comes from the same single walk that produced the shown
-    list, never from a second `_gather_escalations` call subtracting lengths.
+    The withheld count is for the OPERATOR's terminal (`cli.cmd_resolve` prints it) and
+    is deliberately not a `context.json` field: the skill's contract is singular —
+    resolve the escalation you are shown — and a count of things the agent cannot see is
+    not something it can act on. It comes from the same single walk that produced the
+    shown list, never from a second `_gather_escalations` call subtracting lengths.
+
+    The unreadable count rides the SAME walk for the same reason, and it is a third
+    return value rather than a second out-parameter because it has to cross a process's
+    worth of control flow: `cli.cmd_resolve` is the only surface that can advance
+    `escalations_resolved_upto` (the TUI hard-codes `resolution_recorded=False`), and a
+    non-zero count there means this cycle showed the human strictly less than the
+    watermark would claim they answered. The caller withholds coverage on it — see
+    `_gather_escalations`' `skipped` for why the alternative is permanent burial. Zero
+    on every ordinary run, so the coverage path is unchanged whenever the run-dir reads
+    cleanly.
 
     `isolation` is the LIVE policy's `scm.isolation`, and it is required rather than
     defaulted for the reason this surface exists at all: three of the fields below —
@@ -220,8 +266,13 @@ def build_context(
     # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
     # own watermark — 0 for a task never resolved, and for every pre-upgrade
     # `state.json`, which is the unfiltered pre-DW-11 walk.
+    unreadable: set[str] = set()
     escalations, withheld = _gather_escalations(
-        run_dir, state, story_key, start=task.escalations_resolved_upto if task else 0
+        run_dir,
+        state,
+        story_key,
+        start=task.escalations_resolved_upto if task else 0,
+        skipped=unreadable,
     )
     context = {
         "story_key": story_key,
@@ -296,7 +347,7 @@ def build_context(
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2), encoding="utf-8")
-    return path, withheld
+    return path, withheld, len(unreadable)
 
 
 def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
