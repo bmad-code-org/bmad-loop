@@ -43,7 +43,7 @@ from . import bmadconfig
 from . import policy as policy_mod
 from . import runs
 from .checks import Finding
-from .journal import Journal, save_state
+from .journal import Journal, save_state, state_lock
 from .model import RunState
 from .platform_util import atomic_replace, is_wsl_unc_path
 from .runs import RUNS_DIR
@@ -1025,12 +1025,17 @@ def compose_run(
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
         )
-        save_state(run_dir, state)
-        # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
-        # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
-        # cannot be written fails the launch before an observer can see a live run.
-        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-        runs.write_pid(run_dir)
+        # State becoming resumable and the pid making this process live are one
+        # publication.  An explicit-id resume waits for the pid rather than entering
+        # between these writes and double-driving the freshly composed run.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # After the run dir exists (Journal mkdir'd it above) and before the pid
+            # lands: the ordering `reconcile_orphan_state_dirs` reads runs in, and a
+            # stamp that cannot be written fails the launch before an observer can
+            # see a live run.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         adapters = make_adapters(project, run_dir, policy, profiles=profiles)
         journal.append(
             "run-start",
@@ -1158,10 +1163,12 @@ def compose_sweep(
             run_type="sweep",
             trusted_config_digest=trusted_config_digest,
         )
-        save_state(run_dir, state)
-        # Out of the tree, same ordering and same reason as compose_run's stamp.
-        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-        runs.write_pid(run_dir)
+        # Same indivisible state/pid publication as compose_run.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # Out of the tree, same ordering and same reason as compose_run's stamp.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         options = {
             "prompting": prompting,
             "decisions_only": decisions_only,
