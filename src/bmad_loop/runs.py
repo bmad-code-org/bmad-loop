@@ -4022,15 +4022,28 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         moved = bool(state.repo_root)
         state.repo_root = new
         save_state(run_dir, state)
-        if not moved:
-            return None
-        return (
-            f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
-            "this run started — the re-drive works in the tree configured now, while the "
-            "baselines, preserve refs and branches this run already recorded name objects "
-            "in the previous one. Restore the previous `repo_root:` value if you did not "
-            "intend the move."
-        )
+    if not moved:
+        return None
+    # Journalled OUTSIDE the lock, and under resume's own field name. This re-stamp
+    # aligns the mirror that `cli._resume_paused_run` later compares against config,
+    # so by the time `run-resume` computes `code_root_changed` the two necessarily
+    # agree and it records `false` — on the one gesture where the root DID move. The
+    # ephemeral stderr/toast the caller prints from the return value is not a record;
+    # without this line the move leaves no durable trace on the re-arm surfaces while
+    # plain `resume` still writes one. `repo` is dropped by the diagnose registry
+    # (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never reaches a dump.
+    Journal(run_dir).append(
+        "rearm-code-root-restamped",
+        repo=new,
+        code_root_changed=True,
+    )
+    return (
+        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+        "this run started — the re-drive works in the tree configured now, while the "
+        "baselines, preserve refs and branches this run already recorded name objects "
+        "in the previous one. Restore the previous `repo_root:` value if you did not "
+        "intend the move."
+    )
 
 
 @dataclass(frozen=True)
@@ -4571,12 +4584,21 @@ def _rearm_escalation_locked(
                         # ("add a top-level `status:`") for a re-arm that COMPLETED sends
                         # the human to repair a file nothing will read.
                         refused = spec_path.is_file() and write_reaches_the_redrive
+                        # `refused` is False for TWO disjoint reasons and the operator
+                        # surfaces cannot re-derive which: the write would have reached
+                        # the re-drive but the file is gone, or the file is there but the
+                        # re-drive discards that copy. Carrying the second half of the
+                        # conjunction is what lets the renderer stop asserting worktree
+                        # behaviour on a run that has no worktree. Absent on records
+                        # written before this field existed, where the renderer keeps its
+                        # previous wording.
                         journal.append(
                             "rearm-spec-flip-skipped",
                             story_key=key,
                             spec_file=str(spec_path),
                             status=target_status,
                             refused=refused,
+                            reaches_redrive=write_reaches_the_redrive,
                         )
                         # ...and then ABORT — but only for a spec that IS a readable file
                         # here AND is the copy the re-drive reads. The first half is the same
@@ -5000,9 +5022,17 @@ def rearm_event_notice(
     kind = entry.get("kind", "")
     if kind == "stale-restore-excluded":
         files = ", ".join(str(f) for f in _journal_sequence(entry.get("files")))
+        # "this re-arm computed" rather than a bare completed past tense, because
+        # `_stale_restore_residue` journals BEFORE the advance and the re-stamp, and
+        # `save_state` runs once at the very end. Both surfaces echo this from an abort
+        # path on purpose (the residue matters most there), and after an abort nothing
+        # was persisted: the task is still ESCALATED, `restore_patch` is still latched
+        # and `baseline_untracked` is unchanged. The sibling `stale-restore-commits`
+        # needs no such hedge — it reports where commits SIT, which stays true.
         return (
             "note",
-            f"excluded the abandoned restore's new files from the re-drive baseline: {files}",
+            "excluded the abandoned restore's new files from the re-drive baseline this "
+            f"re-arm computed: {files}",
             "",
         )
     if kind == "stale-restore-unparseable":
@@ -5142,11 +5172,28 @@ def rearm_event_notice(
                 "on the status it reads",
                 "Add a top-level `status:` to the spec, then re-run resolve",
             )
+        if entry.get("reaches_redrive"):
+            # The write DID address the copy the re-drive reads; the flip skipped
+            # because that path is not a readable file from this process — a spec moved
+            # or renamed by the resolve session, or an absolute path this `--project`
+            # invocation cannot see. Nothing is mounted and nothing is discarded, so the
+            # worktree wording below would tell the operator the failed flip is harmless
+            # at precisely the moment it is not.
+            return (
+                "warning",
+                f"the recorded spec for this story ({spec}) could not be re-opened to "
+                f"`{status}` — it is not a readable file from here, and this run mounts "
+                "no worktree, so the re-drive reads that same path and will see the "
+                "escalated attempt's status",
+                "Check the recorded spec path before resuming",
+            )
         # No next_step, and deliberately: on this leg there is nothing to do to THIS
         # file. Whether anything is left to do at all is decided by the committed spec,
         # and `rearm-spec-write-unreachable` — journalled from the same block, on
         # exactly the legs where the committed spec is not already at the target —
-        # carries that imperative, and holds the resume behind it.
+        # carries that imperative, and holds the resume behind it. Reached for a
+        # worktree-local copy the re-drive discards, and for a pre-`reaches_redrive`
+        # record, which keeps the wording it was written under.
         return (
             "warning",
             f"the recorded spec for this story ({spec}) could not be re-opened to "
