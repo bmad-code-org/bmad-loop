@@ -152,10 +152,24 @@ case below — omit it entirely for an ordinary resolution.
    especially its `<frozen-after-approval>` block (the intent the dev/review
    sessions treat as authoritative). The escalation is almost always that this
    block is silent on, or contradicts, a case the implementation hit.
-2. **Present the escalation plainly** to the human: what is ambiguous or
-   contradictory, why it blocks safe implementation, and **2–4 concrete
-   resolution options** with a clear recommendation and its trade-offs. Keep it
-   tight — quote the relevant spec lines.
+2. **Present the current pause evidence plainly** to the human:
+   - When the `escalations` array is non-empty, present its recorded entries in
+     their existing newest-first order. Do not replace recorded escalation
+     detail with `paused_reason`.
+   - When the `escalations` array is empty, first require `paused_reason` to be
+     text containing at least one non-whitespace character. If it is missing,
+     `null`, non-text, or blank after trimming, report a malformed resolve
+     context and do not write the resolution marker. Otherwise, present
+     `paused_reason` verbatim as the available evidence for the current pause
+     and disclose that no newer recorded escalation detail is available. Do not
+     read below the watermark, unfilter or recover an older artifact escalation,
+     or synthesize an escalation object from `paused_reason`.
+
+   Using the selected evidence, explain what is ambiguous or contradictory, why
+   it blocks safe implementation, and offer **2–4 concrete resolution options**
+   with a clear recommendation and its trade-offs. Keep it tight — quote the
+   relevant spec lines.
+
 3. **Get the human's decision.** Ask follow-ups if the choice is unclear. Do not
    invent requirements; if the human is unsure, help them reason, don't guess.
 4. **Update the frozen spec** to encode the decision unambiguously: amend the
