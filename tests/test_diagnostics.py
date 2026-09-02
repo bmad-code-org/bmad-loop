@@ -326,6 +326,13 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     assert sanitize.assert_no_leak(js) == []  # general backstop; blind to this shape
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "pins the POSIX half of the gate by faking sys.platform; the faked branch's\n"
+        "imports (fcntl) do not exist on Windows, so the row can only run off win32"
+    ),
+)
 def test_env_win32_on_wsl_path_is_false_off_win32(project, monkeypatch):
     """The *platform* half of the twin gate, pinned. What #332 names is a mismatched
     interpreter, not a path shape: the very distro path a win32 interpreter warns about

@@ -661,9 +661,17 @@ def test_failed_composition_refuses_to_unwind_a_replacement_directory(unwinding,
     """
 
     def replace_then_abort(project, run_dir, policy, *, profiles=None):
+        # Allocate the replacement while the original still holds its own inode,
+        # then rename it into place. `rmtree` followed by `mkdir` is free to reuse
+        # the inode it just released, and on some filesystems it does — leaving
+        # `os.path.samestat` unable to tell the replacement from the directory the
+        # composer exclusively claimed, so the guard correctly stays silent and the
+        # row fails for a reason it is not testing.
+        stand_in = run_dir.parent / f"{run_dir.name}.replacement"
+        stand_in.mkdir()
+        (stand_in / "replacement").write_text("owned elsewhere", encoding="utf-8")
         shutil.rmtree(run_dir)
-        run_dir.mkdir()
-        (run_dir / "replacement").write_text("owned elsewhere", encoding="utf-8")
+        stand_in.rename(run_dir)
         raise SystemExit(BOOM)
 
     with pytest.raises(SystemExit, match="not usable on this host"):
