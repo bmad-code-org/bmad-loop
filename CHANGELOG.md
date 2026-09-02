@@ -290,6 +290,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Take the re-arm's mount claim and its resume hold from the `rearm-spec-flip-skipped`
+  record instead of inferring both from `reaches_redrive`. The record now carries the live
+  `redrive` mode, so the notice no longer tells an ISOLATED run that it "mounts no worktree" —
+  that arm reaches the re-drive through a spec shared across checkouts, with a worktree very
+  much mounted. A record written before the field drops the mode clause rather than guessing.
+  The same leg now HOLDS the resume (`reaches_redrive` and not `refused`), so its "check the
+  recorded spec path before resuming" imperative stops rendering on the two surfaces that
+  re-arm and resume in one gesture.
+
 - **`bmad-loop stop` no longer retries forever on an engine whose identity cannot be
   read.** The rival-engine compare under the state lock used the local pid after every
   declining path had cleared it, so an unchanged pid file with `"unknown"` liveness read
