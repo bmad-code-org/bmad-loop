@@ -50,8 +50,13 @@ breaking changes may land in a minor release.
 
 - **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
   so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
-  instead of re-deriving one. A `state.json` written before the field existed degrades to the
-  project directory, which is the pre-upgrade behavior.
+  instead of re-deriving one. `resume` re-stamps that mirror against the `repo_root` it re-reads
+  from `_bmad/bmm/config.yaml`, so an edit made while the run was paused cannot leave the engine
+  working in one tree while the out-of-process re-arm advances the attempt baseline in the other,
+  with no error on either side; a move is announced rather than silent, since the baselines,
+  preserve refs and branches already recorded name objects in the previous tree. A `state.json`
+  written before the field existed degrades to the project directory — the pre-upgrade behavior —
+  and migrates without being reported as a move.
 
 - **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
   operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
@@ -140,8 +145,12 @@ breaking changes may land in a minor release.
 
 - **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` and
   `overwritten` are aliased, and `repo` is dropped — an absolute host path that correlates nothing.
-  Routing is by field name across every entry rather than by kind, so no existing run's dump changes
-  shape and `SCHEMA_VERSION` is unaffected.
+  All three arrive only on the re-arm kinds, so no run predating them renders differently on their
+  account. By-name routing is the default rather than the whole rule: a narrow kind-scoped table is
+  consulted FIRST, for the fields whose meaning depends on the kind carrying them, and that table
+  DOES change pre-existing dumps — `target` is aliased on `unit-merge-started`, `unit-merged` and
+  `resume-unit-merge` (see `### Security`) while the `board-advance-*` family keeps rendering it
+  verbatim, and `sentinel` is aliased on `sentinel-cleared`. `SCHEMA_VERSION` is unaffected.
 
 - **`bmad-loop diagnose`'s default report shows the split code root and the task generation**
   (#705, #716). Both fields reached `--json` but not the markdown renderer, which samples its fields
@@ -155,12 +164,18 @@ breaking changes may land in a minor release.
   advanced the attempt baseline in the tree the run had left, while the engine that resumed measured
   in the new one, with no error anywhere. Both now re-stamp through one shared writer, after the
   confirm — so a cancelled resolve still leaves the divergence for `resume` to report — and each
-  warns that the run has changed repositories. A config this process cannot read degrades to the
-  root the run recorded, and says so. The #414 isolation refusal is hoisted alongside it, ahead of
+  warns that the run has changed repositories, and journals `rearm-code-root-restamped` so the
+  move leaves a durable record: this re-stamp is what makes resume's own `code_root_changed`
+  read `false` later in the same gesture, and a stderr line or a TUI toast is not a record. A
+  config this process cannot read degrades to the root the run recorded, and says so. The #414 isolation refusal is hoisted alongside it, ahead of
   both writes: under `isolation = "worktree"` beside a `repo_root` override, both surfaces used to
   re-stamp, advance the attempt baseline and report "re-armed" before resume refused the
   configuration — spending an escalation `resolve` could no longer re-run, since the story was no
-  longer escalated.
+  longer escalated. `resolve` refuses it a second time BEFORE the interactive session, ahead of
+  the adapter build: the pair is knowable from config, so the late refusal alone let an operator
+  converse with a full agent and answer the re-arm prompt only to be handed rc 1 for it. The
+  post-confirm refusal stays the authority — it re-reads the config after a conversation of
+  unbounded length, and is the only one `--no-interactive` reaches.
 
 - **Re-arm refuses a story spec it cannot re-open, instead of re-driving onto a status the session
   cannot route** (#640). A spec carrying no top-level `status:` failed the flip silently: the
@@ -196,7 +211,12 @@ breaking changes may land in a minor release.
   HOLDS the resume both surfaces fold in behind
   the re-arm, since its advice is unactionable once the run has resumed, and `--resume` does not
   override the hold — the re-arm stands, and `bmad-loop resume <run-id>` picks the story up once the
-  fix is committed.
+  fix is committed. A spec in an artifact directory configured outside the project is exempt
+  entirely: `ProjectPaths.rebased` leaves such a directory where it is, shared across checkouts
+  rather than rebased onto each worktree, so the flip lands on the one file every re-drive reads and
+  there is nothing to commit — a remedy naming a file outside the repository. Containment is decided
+  on the canonical paths, so a spec spelled out of but resolving back into the worktree still warns,
+  as does one the host cannot canonicalize.
 
 - **The re-arm baseline records reach the TUI operator too** (#640). Each surface carried its own
   copy of the journal-kind → message routing and they had drifted: the TUI printed only
@@ -352,7 +372,10 @@ breaking changes may land in a minor release.
   undoing the spec beneath it mirrors the same defect. An ORDINARY failure of the abort
   record's OWN journal write is suppressed whatever its type, so an observation that cannot
   be made never replaces the fault the operator is being told about — an interrupt still
-  leaves, since by then the rollback has already run and the operator asked to stop.
+  leaves, since by then the rollback has already run and the operator asked to stop. That
+  `finally` is also what makes the residue echo unconditional: the residue is journalled before
+  the re-stamp that can raise, so an abort would otherwise drop the notices for records already
+  on disk — the commits warning among them.
 
 - Stop an LLM-authored preference escalation from aborting the review leg. `_review_and_commit`
   splats a review session's own `result.json` escalation entries into `journal.append`, so a
@@ -494,26 +517,6 @@ argument` and failed the story; a `ts` key did not raise and instead silently re
   `worktree` re-armed treating the main-checkout correction as reachable, emitted no hold,
   then mounted a fresh worktree cut from git that could not see it. A change across the
   session is now reported on stderr.
-
-- **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
-  `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
-  value, so after an edit the engine worked in one tree while the out-of-process re-arm advanced the
-  attempt baseline in the other, with no error on either side. The mirror now follows the paths
-  resume adopts, and a move is announced rather than silent — the baselines, preserve refs and
-  branches already recorded name objects in the previous tree. A `state.json` from before the field
-  existed migrates without being reported as a move.
-
-- **The unreachable-spec-write warning no longer fires on a shared artifact directory** (#640). An
-  artifact directory configured outside the project is left where it is by `ProjectPaths.rebased`,
-  shared across checkouts instead of rebased onto each worktree — so the flip lands on the one file
-  every re-drive reads and there was never anything to commit, yet that layout took the warning on
-  every re-arm with a remedy naming a file outside the repository. Containment is decided on the
-  canonical paths, so a spec spelled out of but resolving back into the worktree still warns, as
-  does one the host cannot canonicalize.
-
-- **`bmad-loop resolve` still reports abandoned-restore residue when the re-arm aborts** (#640).
-  The residue is journalled before the re-stamp that can raise, so an abort discarded records
-  already written — including the commits warning. The echo now runs on both paths.
 
 - **A YAML boolean in a spec's baseline key no longer refuses the attempt** (#716). `no`, `off`,
   `yes` and `on` parse as booleans, and the shared reader stringified them into `"False"`/`"True"` —
@@ -782,6 +785,10 @@ decisions` and the TUI decision modal now also catch the state-root failure that
 ### Security
 
 - **`bmad-loop diagnose` no longer ships a merge record's target branch verbatim** (#640).
+  The leak PRE-DATES the re-arm work this section is otherwise about: all three producers
+  and the by-name routing shipped in earlier releases, so any dump of a run that merged a
+  unit is affected, and the `#640` citation names the work that happened to find it rather
+  than an issue that reported it.
   The journal's `target` field carries a branch on `unit-merge-started`, `unit-merged` and
   `resume-unit-merge` but a sprint status on the `board-advance-*` family, and per-field
   routing is by field NAME — so the field was left unrouted and an identifier-shaped branch
