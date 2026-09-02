@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 import regex
+from conftest import json_recursion_payload
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
@@ -233,8 +234,7 @@ def test_read_result_degrades_a_decoder_recursion_error(tmp_path):
     adapter = make_adapter(tmp_path)
     task_dir = adapter.tasks_dir / "t1"
     task_dir.mkdir(parents=True)
-    depth = sys.getrecursionlimit() * 20
-    nested = '{"value":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+    nested = '{"value":' + json_recursion_payload() + "}"
     with pytest.raises(RecursionError):
         json.loads(nested)
 
