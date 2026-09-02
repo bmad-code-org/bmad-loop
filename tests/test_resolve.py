@@ -95,14 +95,16 @@ def _escalated_run(
 def _context(state, run_dir, story_key, *, isolation):
     """`build_context`'s Path alone, for the ~30 rows that assert on `context.json`.
 
-    `build_context` returns `(path, withheld)` since DW-11, and the withheld count is
-    an OPERATOR-facing number the CLI prints — no row here is about it. Routing every
-    Path-only caller through one unpack pins the arity for all of them at once: grow
-    the tuple a third member and this helper fails, rather than every row silently
+    `build_context` returns `(path, withheld, unreadable)` since DW-11, and both counts
+    are OPERATOR-facing numbers the CLI prints — no row here is about them. Routing
+    every Path-only caller through one unpack pins the arity for all of them at once:
+    grow the tuple a fourth member and this helper fails, rather than every row silently
     binding a longer tuple to `path` (which is what a bare `path, _ = ...` at each
-    site would do). The rows that ARE about the count call `resolve.build_context`
-    directly, so the number is never produced by this helper."""
-    path, _withheld = resolve.build_context(state, run_dir, story_key, isolation=isolation)
+    site would do). The rows that ARE about the counts call `resolve.build_context`
+    directly, so neither number is ever produced by this helper."""
+    path, _withheld, _unreadable = resolve.build_context(
+        state, run_dir, story_key, isolation=isolation
+    )
     return path
 
 
@@ -2969,7 +2971,9 @@ def test_a_second_resolve_cycle_shows_only_what_the_redrive_raised(tmp_path):
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     _redrive_escalates(run_dir, key, "raised by the re-drive")
 
-    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert [e["detail"] for e in ctx["escalations"]] == ["raised by the re-drive"]
     assert withheld == 1
@@ -2999,7 +3003,9 @@ def test_a_third_cycle_stamps_again_over_the_second(tmp_path):
 
     _redrive_escalates(run_dir, key, "raised after cycle 2")
 
-    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 2"]
     assert withheld == 2  # each answered cycle counted once
@@ -3037,7 +3043,9 @@ def test_a_rearm_over_a_surviving_marker_does_not_move_the_watermark(tmp_path):
     task = load_state(run_dir).tasks[key]
     assert task.escalations_resolved_upto == 1  # NOT len(sessions) == 2
     assert task.generation == 2  # positive control: this gesture DID re-arm
-    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 1"]
     assert withheld == 1
@@ -3052,7 +3060,9 @@ def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     _redrive_escalates(run_dir, key, "new one")
 
-    path, withheld = resolve.build_context(load_state(run_dir), run_dir, key, isolation="")
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
     assert withheld == 2  # the count exists...
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert set(ctx) == {
@@ -3067,6 +3077,134 @@ def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
         "spec_reaches_the_redrive",
         "redrive_base_ref",
     }  # ...and reaches no field of the agent contract
+
+
+def _unreadable_artifact(run_dir, task, index):
+    """Corrupt the escalation.json belonging to `task.sessions[index]`.
+
+    Non-UTF-8 bytes rather than bad JSON, so the read fails in
+    `Path.read_text` — the OSError/UnicodeDecodeError arm of the guard, which is the
+    shape a transient fault on a network mount actually takes. Returns the path so a
+    row can assert on the exact member of the sink."""
+    fpath = run_dir / "tasks" / task.sessions[index].task_id / "escalation.json"
+    fpath.write_bytes(b'{"escalations": [\xff\xfe]}')
+    return fpath
+
+
+def test_gather_escalations_records_an_unreadable_shown_side_artifact(tmp_path):
+    """The skip the reader has always performed, now SAID. `build_context` is an
+    observation path and must not raise on a malformed artifact — but the caller then
+    stamps `escalations_resolved_upto = len(task.sessions)`, which covers the session
+    that artifact belongs to. Without this signal a transient read fault buries every
+    escalation in it forever: the next cycle reads the file fine and withholds it as
+    already answered.
+
+    The readable sibling is the positive control — the degrade still costs exactly its
+    own artifact's contents and nothing more.
+
+    Ablation: drop the `skipped.add(...)` from the `except` arm and this reddens on an
+    empty sink while the shown list stays correct."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    corrupt = _unreadable_artifact(run_dir, task, 1)
+
+    skipped: set[str] = set()
+    found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(corrupt)}
+    assert [e["detail"] for e in found] == ["older"]  # the sibling still read
+    assert withheld == 0
+
+
+def test_gather_escalations_ignores_a_skip_below_the_watermark(tmp_path):
+    """A record the PREVIOUS cycle's watermark already covers cannot be newly buried
+    by this one, so an unreadable artifact there is not a skip. Recording it would
+    withhold coverage on every later cycle for a session already answered — a
+    permanent refusal to advance, which is DW-11 back in the other direction.
+
+    The shown-side escalation is the positive control: the walk ran and routed both
+    sides. The withheld count legitimately drops to 0 — that number is an operator
+    advisory and claims nothing durable, which is exactly why the sink is narrower.
+
+    Ablation: drop the `target is found` half of the guard and this reddens on a
+    one-member sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["answered"], ["unanswered"]])
+    corrupt = _unreadable_artifact(run_dir, task, 0)
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, start=1, skipped=skipped)
+
+    assert skipped == set()
+    assert corrupt.is_file()  # MEASURED: the walk really did reach a corrupt file
+    assert [e["detail"] for e in found] == ["unanswered"]
+
+
+def test_gather_escalations_does_not_call_an_escalation_less_artifact_a_skip(tmp_path):
+    """The ordinary shape of a clean `result.json` — no `escalations` key at all — is
+    not a malformed artifact, and calling it one would withhold coverage from EVERY
+    resolve cycle on every run, permanently disabling the watermark. The over-signal
+    is the more dangerous failure of the two, and nothing else grades it: every other
+    row here seeds an artifact that does carry escalations.
+
+    Ablation: treat a missing `escalations` key as malformed (delete the
+    `if "escalations" not in doc: continue` arm) and this reddens with the
+    `result.json` in the sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    (run_dir / "tasks" / task.sessions[0].task_id / "result.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8"
+    )
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]
+
+
+def test_gather_escalations_records_a_non_list_escalations_field(tmp_path):
+    """`{"escalations": null}` is the shape the reader's `list` check exists for, and
+    it is malformed rather than absent: something wrote the key, and what it holds
+    cannot be shown. The sibling row above draws the other side of that line.
+
+    Ablation: fold the non-list arm back into a bare `continue` and this reddens."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    fpath = run_dir / "tasks" / task.sessions[0].task_id / "escalation.json"
+    fpath.write_text(json.dumps({"escalations": None}), encoding="utf-8")
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(fpath)}
+    assert found == []
+
+
+def test_gather_escalations_leaves_the_sink_optional(tmp_path):
+    """~20 rows call this reader with no sink, and the ordinary walk must not need
+    one. The default `None` is what keeps the signal additive rather than a second
+    contract every caller has to satisfy."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    _unreadable_artifact(run_dir, task, 0)
+
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+
+def test_build_context_reports_the_unreadable_artifact_count(tmp_path):
+    """The third return member, from the same single walk. Zero whenever the run-dir
+    reads cleanly, which is why the coverage path is unchanged on an ordinary run.
+
+    Ablation: return a constant 0 instead of `len(unreadable)` and this reddens on the
+    corrupt run while the clean one stays green."""
+    run_dir, _state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+
+    _path, withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert (withheld, unreadable) == (0, 0)  # the clean baseline
+
+    _unreadable_artifact(run_dir, task, 1)
+    _path, _withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert unreadable == 1
 
 
 # ----------------------------------------------------------- run_session
