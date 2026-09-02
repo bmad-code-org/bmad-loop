@@ -216,6 +216,8 @@ RUN_STATE_TRANSACTIONS = {
     ("runs.py", "rearm_escalation"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
+    ("runs.py", "archive_run"),
+    ("runs.py", "delete_run"),
     ("runsetup.py", "compose_run"),
     ("runsetup.py", "compose_sweep"),
     ("tui/app.py", "_do_rearm"),
