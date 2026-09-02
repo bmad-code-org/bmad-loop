@@ -255,6 +255,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Let interactive resolve present `paused_reason` when watermark filtering leaves no newer
+  recorded escalation detail, without recovering or inventing an escalation (DW-91).
+
 - Reject malformed session escalation/result artifacts and non-finite resolve JSON
   (DW-86, DW-89).
 

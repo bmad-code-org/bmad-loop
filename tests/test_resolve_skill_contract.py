@@ -101,6 +101,51 @@ def test_skill_documents_escalation_ordering_and_global_uniqueness(skill_md):
     assert len(contract_lines) == 2
 
 
+def test_skill_presents_paused_reason_when_no_newer_escalation_detail(skill_md):
+    """A watermarked pause can have no new session escalation to present.
+
+    The positive non-empty assertion keeps the empty-path prohibitions from being
+    satisfied by deleting recorded-entry handling altogether.
+    """
+    presentation_step = skill_md.split(
+        "2. **Present the current pause evidence plainly**", maxsplit=1
+    )[1].split("\n3. **Get the human's decision.**", maxsplit=1)[0]
+    normalized = " ".join(presentation_step.split())
+
+    assert "When the `escalations` array is non-empty" in normalized
+    assert "present its recorded entries in their existing newest-first order" in normalized
+    assert "Do not replace recorded escalation detail with `paused_reason`." in normalized
+    assert "When the `escalations` array is empty" in normalized
+    assert (
+        "present `paused_reason` verbatim as the available evidence for the current pause"
+        in normalized
+    )
+    assert "no newer recorded escalation detail is available" in normalized
+    assert "Do not read below the watermark" in normalized
+    assert "unfilter or recover an older artifact escalation" in normalized
+    assert "synthesize an escalation object from `paused_reason`" in normalized
+    assert (
+        "require `paused_reason` to be text containing at least one non-whitespace character"
+        in normalized
+    )
+    assert "missing, `null`, non-text, or blank after trimming" in normalized
+    assert "report a malformed resolve context and do not write the resolution marker" in normalized
+
+    shared_requirement = (
+        "Using the selected evidence, explain what is ambiguous or contradictory, why it "
+        "blocks safe implementation, and offer **2–4 concrete resolution options** with a "
+        "clear recommendation and its trade-offs."
+    )
+    assert shared_requirement in normalized
+    assert normalized.index(shared_requirement) > normalized.index(
+        "When the `escalations` array is empty"
+    )
+    assert (
+        "\n\n   Using the selected evidence, explain what is ambiguous or contradictory"
+        in presentation_step
+    )
+
+
 def test_skill_routes_project_artifacts_and_code_work_to_their_distinct_roots(skill_md):
     """Mentioning both keys is inert unless the skill explains the operational split.
 
