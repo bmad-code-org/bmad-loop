@@ -279,12 +279,13 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     # `collect_env` reaches `get_multiplexer()`, an lru_cache(maxsize=1) that selects
     # on `sys.platform`; without these clears the patched window caches the Windows
     # pick for every later test in the worker.
+    run_dir = _seed_run(project.project)
     get_multiplexer.cache_clear()
     try:
         monkeypatch.setattr(diagnostics.sys, "platform", "win32")
         pseudo = sanitize.Pseudonymizer()
         unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
-        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+        diag = diagnostics.collect([run_dir], pseudo=pseudo, project=unc)
     finally:
         # pytest undoes the patch on its own, but only at teardown — a raise in
         # `collect` would leave the Windows pick cached past this test without this.
@@ -1872,10 +1873,10 @@ def test_events_degrade_to_the_legacy_root_when_the_state_root_is_underivable(
     count this degradation gives up."""
     from bmad_loop import envvars, runs
 
-    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
-    monkeypatch.setattr(runs, "state_root", _raise_no_state_root)
     run_dir = _seed_bare_run(project.project)
     _write_events(run_dir / "events", 2)
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.setattr(runs, "state_root", _raise_no_state_root)
 
     group = _events_group(run_dir, project.project)
     assert group is not None and group.count == 2
