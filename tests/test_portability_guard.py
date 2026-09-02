@@ -185,24 +185,39 @@ TASK_ARTIFACT_LITERAL_ALLOW = {
 SESSION_TASK_ID_CHOKEPOINT = {"engine.py": "_session_task_id"}
 
 # The complete set of ``runs.rearm_escalation`` call sites, as
-# ``(file, enclosing function)``. The re-arm transaction's own commit probe
-# (``runs._rearm_commit_landed``) proves "did MY save_state land?" with nothing but
-# ``(generation, phase)`` over the reloaded task, and that is a sufficient IDENTITY
-# only under a sole-writer model: no engine advancing the task underneath, and one
-# control command at a time. Its docstring argues that model from this enumeration.
-#
-# Prose cannot hold it. A third call site — or either existing gate deleted — leaves
-# every test in the repo green while the probe's premise quietly becomes false, and
-# the failure it opens is DW-79/DW-83's own shape: a spec left re-armed against a task
-# the run still calls ESCALATED. So the enumeration is scanned instead of asserted.
-#
-# Deliberately NOT a lock and not a durable per-re-arm token: the spec's ``Never``
-# forbids both (a lock only ``rearm_escalation`` takes excludes nobody; a token buys a
-# precision ``save_state`` cannot honour). It forbids no guard, and this is the cheap
-# half — it does not make overlapping callers safe, it makes the day someone adds one
-# impossible to miss. Overlapping control commands stay out of the model, as DW-93.
+# ``(file, enclosing function)``. Serialization now comes from the shared run-state
+# lock, not this liveness inventory. The gates remain independently load-bearing: a
+# serialized control command still must not take its turn after an engine known to be
+# live, and a new operator surface must make that policy explicit.
 REARM_ESCALATION_CALLERS = {
     ("cli.py", "cmd_resolve"),
+    ("tui/app.py", "_do_rearm"),
+}
+
+# Every production state publication and every explicit multi-step state transaction.
+# ``save_state`` itself serializes the leaf write, so a new direct publisher is safe
+# from the fixed-temp collision but still appears here for review: if it reads state
+# before deciding what to publish, it also belongs in RUN_STATE_TRANSACTIONS with an
+# outer hold. Exact inventories make a newly added writer fail loudly instead of
+# relying on a reviewer to find it by grep.
+SAVE_STATE_CALLERS = {
+    ("cli.py", "_prepare_resume_locked"),
+    ("engine.py", "_save"),
+    ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "restamp_code_root"),
+    ("runs.py", "_stop_run_once"),
+    ("runsetup.py", "compose_run"),
+    ("runsetup.py", "compose_sweep"),
+}
+RUN_STATE_TRANSACTIONS = {
+    ("cli.py", "_resume_paused_run"),
+    ("cli.py", "cmd_resolve"),
+    ("journal.py", "save_state"),
+    ("runs.py", "rearm_escalation"),
+    ("runs.py", "restamp_code_root"),
+    ("runs.py", "_stop_run_once"),
+    ("runsetup.py", "compose_run"),
+    ("runsetup.py", "compose_sweep"),
     ("tui/app.py", "_do_rearm"),
 }
 
@@ -2222,26 +2237,20 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
     """``runs.rearm_escalation`` is reached from exactly two places, and each consults
     liveness before it.
 
-    ``runs._rearm_commit_landed`` decides whether the re-arm transaction COMMITTED —
-    and therefore whether to roll the spec back — from ``(generation, phase)`` over the
-    reloaded task, nothing more. Those two conjuncts are a sufficient identity only
-    while ``rearm_escalation`` is the sole writer of that run's ``state.json``, and that
-    model is argued from this enumeration: two callers, each behind a liveness
-    consultation, with no engine running. A third caller, or either gate deleted, makes
-    the premise false — and the defect it reopens is DW-79/DW-83's own: a spec left
-    flipped against a task the run still calls ESCALATED.
+    ``runs._rearm_commit_landed`` is protected by the shared run-state transaction
+    lock, so this enumeration no longer supplies its writer-identity premise. It pins
+    the separate safety rule that an operator surface refuses a provably-live engine
+    before entering that serialized mutation turn.
 
     Note what the gate does and does not establish. It proves the engine is not
     PROVABLY alive, not that it is dead: ``"alive"`` is refused outright, while
     ``"unknown"`` proceeds under ``--force`` in ``cmd_resolve`` and counts as blocking
     in the TUI only for a pid-backed run. So this grades the falsifiable half — that
-    an earlier liveness decision BLOCKS fall-through before the call. The rest of the
-    model (one control command at a time) is out of scope here and tracked as DW-93.
+    an earlier liveness decision BLOCKS fall-through before the call.
 
-    ``cli.cmd_resume`` is deliberately absent: it writes this run's ``state.json``
-    through ``_resume_paused_run``, so the sole-writer claim must account for it, but it
-    never re-arms and so is not a call site. Listing it here would make the enumeration
-    unfalsifiable in the direction that matters.
+    ``cli.cmd_resume`` is deliberately absent because it never re-arms. Its state
+    publication is covered separately by the writer/transaction inventory below;
+    listing it here would make this call-site enumeration unfalsifiable.
 
     ⚠️ What this assertion grades, precisely — the two halves differ, and the
     difference is the reason the probe rows below exist:
@@ -2264,10 +2273,9 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
     sites = _rearm_callsite_counts(findings)
     declared = Counter(REARM_ESCALATION_CALLERS)
     assert sites == declared, (
-        "the count of runs.rearm_escalation call sites moved. That enumeration is what "
-        "runs._rearm_commit_landed's (generation, phase) commit probe argues its "
-        "sole-writer premise from — a new caller needs that docstring revisited (and "
-        "DW-93 consulted), not this constant widened:\n"
+        "the count of runs.rearm_escalation call sites moved. A new operator surface "
+        "must retain the liveness refusal as well as the shared run-state transaction; "
+        "do not widen this constant without reviewing both:\n"
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}"
     )
@@ -2277,6 +2285,29 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
         "mutates persisted state for a run it must know is not being driven:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in ungated)
     )
+
+
+def _production_call_sites(name: str) -> set[tuple[str, str | None]]:
+    sites: set[tuple[str, str | None]] = set()
+    for source in SRC.rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        enclosing = _enclosing_function_names(tree)
+        rel = source.relative_to(SRC).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _called_name(node.func) == name:
+                sites.add((rel, enclosing.get(id(node))))
+    return sites
+
+
+def test_run_state_writer_and_transaction_inventory_is_complete():
+    """Every publisher uses save_state, and every known RMW gesture holds state_lock.
+
+    Ablations: add ``save_state(run_dir, state)`` to a new production function, or
+    delete the outer ``state_lock`` from ``runs.restamp_code_root``; the respective
+    exact-set comparison reddens and names the changed site.
+    """
+    assert _production_call_sites("save_state") == SAVE_STATE_CALLERS
+    assert _production_call_sites("state_lock") == RUN_STATE_TRANSACTIONS
 
 
 def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
