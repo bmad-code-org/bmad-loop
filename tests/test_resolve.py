@@ -1477,7 +1477,7 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
 
 
 @pytest.mark.parametrize("isolated", [True, False])
-def test_rearm_records_the_redrive_mode_on_a_skipped_flip(tmp_path, isolated):
+def test_rearm_records_the_redrive_mode_on_a_skipped_flip(project, isolated):
     """The mode rides the record because the renderer cannot re-derive it.
 
     Same argument as `refused` one field above: the operator surfaces read this journal
@@ -1492,8 +1492,7 @@ def test_rearm_records_the_redrive_mode_on_a_skipped_flip(tmp_path, isolated):
     Ablation: drop the `redrive=` kwarg from the producer's `journal.append` and both
     legs redden on `KeyError`; hard-code either literal and one leg reddens.
     """
-    _resolve_repo(tmp_path)
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
+    run_dir, _, _ = _escalated_run(project.project, spec_file="wt/_bmad-output/specs/gone.md")
 
     runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
 
