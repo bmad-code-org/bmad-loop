@@ -2605,6 +2605,7 @@ def delete_run(
     run_dir: Path,
     *,
     force: bool = False,
+    wait_for_lock: bool = True,
     _expected_composer_pid: int | None = None,
     _expected_composer_claim: os.stat_result | None = None,
 ) -> None:
@@ -2627,9 +2628,18 @@ def delete_run(
 
     The containment guard runs first and is NOT under ``force``: an override is
     the operator accepting a leaked session, never a licence to rmtree a path
-    outside the runs dir."""
+    outside the runs dir.
+
+    ``wait_for_lock=False`` refuses instead of waiting when another process holds
+    the run's state lock, raising :class:`platform_util.LockUnavailableError`. It
+    is NOT an override in the sense ``force`` is — it removes nothing extra and
+    weakens no guard; it only declines to queue. A bulk caller passes it because
+    a held lock already means what that caller reports anyway ("in use, left
+    alone"), and because waiting is unbounded on POSIX where ``fcntl.flock`` never
+    times out. The default waits, which is what a single-run operator command
+    wants: there, giving up would turn a brief overlap into a failed command."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
-    with state_lock(run_dir):
+    with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
             try:
                 current_claim = run_dir.stat(follow_symlinks=False)
@@ -2662,7 +2672,9 @@ def delete_run(
         _discard_state_dir(project, run_dir.name)
 
 
-def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
+def archive_run(
+    project: Path, run_dir: Path, *, force: bool = False, wait_for_lock: bool = True
+) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
     place so a partial archive never appears. Engine liveness is re-checked under
@@ -2680,9 +2692,14 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
 
     Containment (see :func:`_refuse_uncontained_run_dir`) is checked ahead of both,
     for the reason the session guard runs early: a refusal must leave no archive
-    directory and no tarball behind."""
+    directory and no tarball behind.
+
+    ``wait_for_lock`` carries the meaning it has on :func:`delete_run`: ``False``
+    declines a contended run with :class:`platform_util.LockUnavailableError`
+    rather than queueing behind its holder, and refuses before the tarball is
+    written, so a decline — like the guards above it — leaves nothing behind."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
-    with state_lock(run_dir):
+    with state_lock(run_dir, blocking=wait_for_lock):
         if engine_liveness(run_dir) == "alive":
             raise LiveEngineError(
                 f"run {run_dir.name} is still live — refusing to archive it; stop it first"

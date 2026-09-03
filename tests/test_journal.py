@@ -22,7 +22,9 @@ def test_save_state_retries_transient_sharing_violation(tmp_path, monkeypatch):
     """On win32, os.replace denied by a concurrent reader is retried, not fatal."""
     monkeypatch.setattr(platform_util.sys, "platform", "win32")
     monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)  # no real backoff
-    monkeypatch.setattr(journal_mod, "file_lock", contextmanager(lambda _path: iter((None,))))
+    monkeypatch.setattr(
+        journal_mod, "file_lock", contextmanager(lambda _path, **_kw: iter((None,)))
+    )
 
     real_replace = os.replace
     calls = {"n": 0}
@@ -55,7 +57,7 @@ def test_state_lock_same_run_nesting_acquires_os_lock_once(tmp_path, monkeypatch
     acquired: list[object] = []
 
     @contextmanager
-    def recording_lock(path):
+    def recording_lock(path, **_kw):
         acquired.append(path)
         yield
 
@@ -84,7 +86,7 @@ def test_state_lock_same_run_symlink_spellings_acquire_os_lock_once(tmp_path, mo
     acquired: list[object] = []
 
     @contextmanager
-    def recording_lock(path):
+    def recording_lock(path, **_kw):
         acquired.append(path)
         yield
 
@@ -133,7 +135,7 @@ def test_state_lock_refuses_different_run_nesting_before_second_acquire(tmp_path
     acquired: list[object] = []
 
     @contextmanager
-    def recording_lock(path):
+    def recording_lock(path, **_kw):
         acquired.append(path)
         yield
 
@@ -151,7 +153,7 @@ def test_state_lock_failure_clears_thread_guard(tmp_path, monkeypatch):
     acquired: list[object] = []
 
     @contextmanager
-    def recording_lock(path):
+    def recording_lock(path, **_kw):
         acquired.append(path)
         yield
 
@@ -170,7 +172,7 @@ def test_save_state_acquisition_error_writes_nothing(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
 
     @contextmanager
-    def refusing_lock(_path):
+    def refusing_lock(_path, **_kw):
         raise OSError("lock unavailable")
         yield
 
@@ -213,10 +215,10 @@ def test_two_concurrent_saves_never_share_the_fixed_temp_file(tmp_path, monkeypa
     replace_threads: list[str] = []
 
     @contextmanager
-    def observed_file_lock(path):
+    def observed_file_lock(path, **_kw):
         if threading.current_thread().name == "second":
             second_attempted.set()
-        with real_file_lock(path):
+        with real_file_lock(path, **_kw):
             yield
 
     def controlled_replace(src, dst):

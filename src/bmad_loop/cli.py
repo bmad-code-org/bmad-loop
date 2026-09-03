@@ -72,7 +72,12 @@ from .documents import (
 from .engine import Engine
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
-from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
+from .platform_util import (
+    MAX_SEGMENT,
+    LockUnavailableError,
+    resolve_or_lexical,
+    walk_files_unlinked,
+)
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -4315,7 +4320,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
     archive/delete runs past the retention window. Only terminal (finished or
     stopped) runs are touched; running, unknown-host, paused and interrupted
-    runs are always left intact."""
+    runs are always left intact.
+
+    Every per-candidate refusal is DATA, never an abort: this is a sweep, so one
+    busy run must not cost the operator the report of the runs already reclaimed
+    around it (they only reach stdout in the post-loop emission). That is why the
+    removals here take the run's state lock with ``wait_for_lock=False`` — a lock
+    someone else holds already means what this command reports anyway, and
+    waiting for it is unbounded on POSIX, where ``fcntl.flock`` never times
+    out."""
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     repo = paths.repo_root
@@ -4395,17 +4408,28 @@ def cmd_clean(args: argparse.Namespace) -> int:
             try:
                 if args.hard or not pol.cleanup.archive_old:
                     if not dry:
-                        runs.delete_run(project, run_dir)
+                        runs.delete_run(project, run_dir, wait_for_lock=False)
                     deleted.append(run_dir.name)
                 else:
                     if not dry:
-                        runs.archive_run(project, run_dir)
+                        runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except (runs.LiveEngineError, runs.LiveSessionError) as e:
+            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
                 # A session or engine appeared between the loop-top sample and the
-                # authoritative removal transaction. Record this run instead of
-                # letting one racer abort the whole invocation, then continue with
-                # its siblings. Correct the estimate down to what actually went.
+                # authoritative removal transaction — or the run's state lock is
+                # held, which says the same thing one layer down and is the only
+                # one of the three that reports it in this window: `resume` takes
+                # the lock FIRST and publishes its pid LAST, so for its whole
+                # preflight (git work bounded by `[limits] git_timeout_s`) the
+                # pid/session guards above still read dead and only the lock
+                # objects. Record this run instead of letting one racer abort the
+                # whole invocation, then continue with its siblings. Correct the
+                # estimate down to what actually went.
+                #
+                # `LockUnavailableError` and NOT a bare `except OSError`: that
+                # would also catch `platform_util.UnconfinedWriteError`, an
+                # OSError subclass raised when a write escapes its root, and file
+                # a containment refusal as a benign "left untouched".
                 freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
@@ -4414,11 +4438,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # trimmed, which is exactly the state it ends in.
                 (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
                 if not args.json:
-                    reason = (
-                        "agent session appeared mid-clean"
-                        if isinstance(e, runs.LiveSessionError)
-                        else "engine resumed mid-clean"
-                    )
+                    if isinstance(e, runs.LiveSessionError):
+                        reason = "agent session appeared mid-clean"
+                    elif isinstance(e, LockUnavailableError):
+                        reason = "run state locked by another process"
+                    else:
+                        reason = "engine resumed mid-clean"
                     print(
                         f"run {run_dir.name}: {reason} — not removed",
                         file=sys.stderr,

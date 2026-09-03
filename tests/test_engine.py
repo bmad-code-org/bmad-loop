@@ -11868,7 +11868,7 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
     monkeypatch.setattr(engine_mod.sys, "platform", "win32")
 
     @contextlib.contextmanager
-    def native_test_lock(_path):
+    def native_test_lock(_path, **_kw):
         # This Linux-hosted test patches the process-wide sys.platform token only to
         # drive Engine's Windows signal branch; msvcrt is intentionally unavailable.
         yield

@@ -224,8 +224,18 @@ class Journal:
 
 
 @contextmanager
-def state_lock(run_dir: Path) -> Iterator[None]:
+def state_lock(run_dir: Path, *, blocking: bool = True) -> Iterator[None]:
     """Serialize one run's state mutations, re-entering only for the same run.
+
+    ``blocking=False`` gives up instead of waiting, raising
+    :class:`platform_util.LockUnavailableError` when another holder has the run.
+    It is for a caller whose own semantics already say "in use ⇒ leave it alone"
+    and which must not stall on one busy run — ``cli.cmd_clean`` sweeping many.
+    The default stays blocking, because every other writer here is mutating one
+    run it means to mutate, and for those giving up is data loss, not politeness.
+    That error propagates out of this function UNCAUGHT and unwrapped: the whole
+    point is that the caller gets to tell contention apart from a real fault, and
+    a translation here would take that back.
 
     The sidecar identity comes from :func:`runs.lock_path_for`, so alternate path
     spellings of one ``state.json`` rendezvous on the same out-of-tree lock.  The
@@ -234,7 +244,9 @@ def state_lock(run_dir: Path) -> Iterator[None]:
     Reentrancy is thread-local and intentionally limited to one run.  An outer
     read-modify-write transaction can call the self-locking :func:`save_state`
     without acquiring the OS lock twice, while nested mutation of another run is
-    refused before a second lock can introduce an ordering cycle.
+    refused before a second lock can introduce an ordering cycle.  A re-entrant
+    acquisition ignores ``blocking`` because it acquires nothing: this thread
+    already holds the run, so there is no one to wait for and nothing to refuse.
     """
     from . import runs
 
@@ -252,7 +264,7 @@ def state_lock(run_dir: Path) -> Iterator[None]:
             _STATE_LOCK_LOCAL.depth -= 1
         return
 
-    with file_lock(lock_path):
+    with file_lock(lock_path, blocking=blocking):
         _STATE_LOCK_LOCAL.path = lock_path
         _STATE_LOCK_LOCAL.depth = 1
         try:

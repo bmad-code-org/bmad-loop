@@ -3168,7 +3168,7 @@ def test_rearm_lock_acquisition_failure_leaves_spec_and_state_unchanged(tmp_path
     state_before = (run_dir / journal_mod.STATE_FILE).read_bytes()
 
     @contextlib.contextmanager
-    def refusing_lock(_path):
+    def refusing_lock(_path, **_kw):
         raise OSError("state lock unavailable")
         yield
 
