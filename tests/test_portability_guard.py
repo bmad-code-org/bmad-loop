@@ -898,6 +898,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-result",
         "triage-decision",
         # worktree_flow.py
+        "isolation-flip-orphan-preserved",
         "merge-preflight-refused",
         "merge-target-cleaned",
         "merge-target-tolerated",
