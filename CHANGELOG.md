@@ -248,6 +248,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`worktree list -z` is gated on git 2.36; the 2.34 support floor keeps the newline
+  parse.** The NUL-delimited listing was issued unconditionally, and Ubuntu 22.04's stock
+  2.34.1 rejects the switch (exit 129), so every isolated-task resume escalated instead of
+  reopening its recorded mount and orphan reconciliation skipped its cleanup. Below 2.36 —
+  or when git will not say what it is — the pre-existing newline parse is used.
+
 - **A looped `*.md` symlink under an artifact dir no longer aborts every unpinned dev
   session on Python 3.11.** `_marker_path_key`'s `resolve()` guard caught only `OSError`,
   but a symlink loop raises `RuntimeError` on the support floor (3.13 resolves it
