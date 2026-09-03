@@ -255,6 +255,13 @@ breaking changes may land in a minor release.
   guard now catches `(OSError, RuntimeError)` like every other `resolve()` in the package,
   and the loop entry reads as one unreadable marker.
 
+- **The defer notice under a recorded mount names the kept branch instead of an
+  in-place merge.** `_defer_recovery_note` selected on live `scm.isolation` alone, so a
+  run flipped `"worktree" -> "none"` while paused advertised
+  `git -C <mount> merge --ff-only <ref>` against the worktree `_integrate_unit` was about
+  to delete, and hid the kept branch when `keep_failed` was on. It now selects on the same
+  live-isolation-or-recorded-mount pair as the defer arm itself.
+
 - **`docs/FEATURES.md` no longer promises a ledger entry the review-budget damping does not
   file.** The bounded-review-loop bullet said a lingering follow-up recommendation is re-filed
   to the deferred-work ledger; `_journal_review_budget_spent` journals the spent budget and

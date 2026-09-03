@@ -6767,8 +6767,15 @@ class Engine:
         half instead of hiding a ref that does exist. The pointer is a name, not a
         promise: `scm.preserve_keep` prunes the oldest refs at a later run's start,
         and nothing here re-validates it (this must stay git-free — `status` reads
-        `state.json` only)."""
-        if self._isolated:
+        `state.json` only).
+
+        Selects on the same pair as `_defer` — live isolation OR a recorded mount —
+        not on live policy alone. A run flipped `"worktree" -> "none"` while paused
+        reaches the defer with the workspace swapped onto its mount, so the in-place
+        arm would advertise `git -C <mount> merge --ff-only` against a directory
+        `_integrate_unit` is about to delete (`keep_failed` off), and hide the kept
+        branch when it is on."""
+        if self._isolated or task.worktree_path:
             note = ""
             if self.policy.scm.keep_failed and task.branch:
                 note = f" — failed work kept on branch `{task.branch}`"
