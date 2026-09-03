@@ -1542,6 +1542,16 @@ class WorktreeFlow:
                 self.state.target_branch,
                 self.policy.scm.branch_per,
                 self.run_dir,
+                # An orphan an isolation flip left standing at this unit's mount
+                # path is reclaimed by the open; its uncommitted state is parked
+                # first and named here so the recovery ref is discoverable from the
+                # journal (`isolation-flip-orphaned-worktree` recorded the orphan).
+                on_orphan_preserved=lambda worktree, ref: self.journal.append(
+                    "isolation-flip-orphan-preserved",
+                    story_key=task.story_key,
+                    worktree=worktree,
+                    ref=ref,
+                ),
             )
         except verify.GitSpawnError as e:
             # a spawn fault is machine-wide, not this unit's: deferring would

@@ -24,7 +24,7 @@ from pathlib import Path
 from . import verify
 from .bmadconfig import ProjectPaths
 from .platform_util import safe_ref_segment, safe_segment
-from .recovery_flow import attempt_preserve_ref_name
+from .recovery_flow import PRESERVE_REF_PROBE_LIMIT, attempt_preserve_ref_name
 
 # Per-unit worktrees live under the run dir (.bmad-loop/runs/<run_id>/worktrees/),
 # which `bmad-loop init` already gitignores — so unit checkouts never show up as
@@ -101,6 +101,89 @@ def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
+def orphan_preserve_ref_name(run_id: str, head: str) -> str:
+    """Canonical snapshot ref for the uncommitted state of an orphaned mount.
+
+    Lives under ``refs/attempt-preserve-dirty/`` — the SAME family
+    :func:`verify.prune_preserve_dirty_refs` bounds with ``scm.preserve_keep`` at
+    every run start — so an orphan snapshot is retained and expired on exactly
+    the terms a rollback snapshot is, and no new unbounded ref family exists. The
+    ``-orphan`` suffix keeps it from ever colliding with a rollback's
+    ``{slug}-{baseline}-{attempt}`` shape, whose last segment is an integer.
+    """
+    return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-orphan"
+
+
+def _preserve_orphan_state(
+    repo_root: Path,
+    wt: Path,
+    run_id: str,
+    unit_key: str,
+    on_orphan_preserved: Callable[[str, str], None] | None,
+) -> None:
+    """Park the uncommitted work an orphaned mount at ``wt`` still holds before the
+    reclaim force-removes it. See the reclaim comment in :func:`open_unit_workspace`
+    for why an orphan can stand at this path at all.
+
+    Three-way guard before any git runs *in* ``wt``: the path exists, it is one of
+    ``repo_root``'s registered linked worktrees, AND git invoked there reports that
+    exact toplevel (:func:`verify.worktree_is_registered`). The run dir lives INSIDE
+    the project checkout, so a leftover plain directory (rmtree fallback residue, an
+    operator's copy) would otherwise make ``git status``/``add`` address the
+    PROJECT's own working tree and park — or worse, report as the orphan's — the
+    user's uncommitted edits. Anything that fails the guard is left to the reclaim
+    exactly as before this gate existed.
+
+    ``baseline_untracked=[]``, not ``None``: a mount is a fresh checkout, so every
+    non-ignored untracked file in it was run-created (seeded skill/config files are
+    shielded as ignored, see ``provision_worktree``) and there is no pre-existing
+    user file to protect — ``None`` would park the tracked edits and silently drop
+    every untracked file, which for a run that writes new modules is most of the
+    work. The snapshot is taken against the orphan's OWN ``HEAD`` (before any story
+    branch reset below moves that ref) so the parked commit is parented at the tree
+    the orphan actually diverged from and holds only what was uncommitted.
+
+    A clean tree is a no-op (no ref, no callback). A capture failure raises
+    :class:`verify.GitError` and so refuses the remount (#340: a capture failure
+    over a tree with something to lose is a gate, not a footnote) — the orphan is
+    left standing for manual recovery, and the caller's ``worktree-open-failed``
+    path defers the unit. ``OSError`` from the snapshot's temp index is folded into
+    that same refusal rather than escaping untyped.
+    """
+    if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
+        return
+    try:
+        head = verify.rev_parse_head(wt)
+        base_ref = orphan_preserve_ref_name(run_id, head)
+        ref = base_ref
+        serial = 2
+        # Same bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a
+        # second orphaning of the same HEAD (flip, flip back, flip again with
+        # nothing committed in between) must not overwrite the first snapshot.
+        while verify.ref_exists(repo_root, ref):
+            if serial > PRESERVE_REF_PROBE_LIMIT:
+                raise verify.PreserveRefExhaustedError(
+                    f"no free snapshot refname for {base_ref}: "
+                    f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
+                    f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
+                    f"scm.preserve_keep to a positive value below that limit)"
+                )
+            ref = f"{base_ref}-r{serial}"
+            serial += 1
+        parked = verify.snapshot_worktree(wt, ref, baseline_untracked=[])
+    except OSError as e:
+        raise verify.GitError(
+            f"cannot snapshot orphaned worktree {wt} for {unit_key} before reclaim: {e}"
+        ) from e
+    except verify.GitError as e:
+        raise verify.GitError(
+            f"cannot snapshot orphaned worktree {wt} for {unit_key} before reclaim "
+            f"(left standing; recover by hand): {e}"
+        ) from e
+    if parked is not None and on_orphan_preserved is not None:
+        on_orphan_preserved(str(wt), parked)
+
+
 def open_unit_workspace(
     repo_root: Path,
     paths: ProjectPaths,
@@ -109,6 +192,8 @@ def open_unit_workspace(
     base: str,
     branch_per: str,
     run_dir: Path,
+    *,
+    on_orphan_preserved: Callable[[str, str], None] | None = None,
 ) -> UnitWorkspace:
     """Mount a fresh worktree for `unit_key` and return its rebased workspace.
 
@@ -118,6 +203,17 @@ def open_unit_workspace(
     remain reachable. Existing story-scoped branches are abandoned-attempt state:
     commits unique to their named tip are parked under ``attempt-preserve/*``, then
     the story branch is compare-and-swap reset to the pinned base before remount.
+
+    Whatever already occupies the deterministic mount path is reclaimed first. If
+    it is a registered worktree of ``repo_root`` (an orphan left standing by an
+    isolation flip, see the reclaim comment) its *uncommitted* state — tracked edits
+    and run-created untracked files — is parked under
+    ``refs/attempt-preserve-dirty/<run>-<head>-orphan`` before the force-remove; a
+    clean orphan parks nothing. ``on_orphan_preserved`` (worktree path, ref) fires
+    once per parked snapshot so a caller with a journal can record it —
+    ``open_unit_workspace`` has none, in the style of ``close_unit_workspace``'s
+    ``on_teardown_degraded``. A snapshot that cannot be written refuses the remount
+    (raises ``GitError``) and leaves the orphan standing.
     """
     branch = unit_branch_name(run_id, unit_key, branch_per)
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
@@ -135,6 +231,10 @@ def open_unit_workspace(
     branch_tip: str | None = None
     if verify.branch_exists(repo_root, branch):
         branch_tip = verify.rev_parse_revision(repo_root, f"refs/heads/{branch}")
+    # Park an orphan's uncommitted state FIRST — before the story reset below moves
+    # the ref the orphan's HEAD points at, so the snapshot is parented at the tree
+    # the orphan actually holds and captures only what was never committed.
+    _preserve_orphan_state(repo_root, wt, run_id, unit_key, on_orphan_preserved)
     if branch_tip is not None and branch_per == "story":
         commits = verify.commits_above(repo_root, pinned_base, branch_tip)
         if commits:
@@ -153,13 +253,20 @@ def open_unit_workspace(
     # re-mount targets the exact path a previous mount used — and `worktree_add`
     # refuses a target that exists or a branch checked out elsewhere, which makes a
     # leftover registration a hard `GitError` rather than a recoverable state.
-    # `engine._finish_inflight` reaches that shape by design: when live policy leaves
-    # isolation it releases the mount's state and clears the task's claim but
-    # deliberately LEAVES the directory standing (the journal names it), so a later
-    # flip back to `worktree` re-derives this same path and used to be unrecoverable
-    # through the normal run flow. Reclaiming here rather than deleting at the flip
-    # keeps that preservation intact for the in-place run and spends the orphan only
-    # when a mount actually needs its path.
+    # `engine._release_orphaned_mount` reaches that shape by design: when live policy
+    # leaves isolation it releases the mount's state and clears the task's claim but
+    # deliberately LEAVES the directory standing (the journal names it, "retained for
+    # recovery"), so a later flip back to `worktree` re-derives this same path and
+    # used to be unrecoverable through the normal run flow. Reclaiming here rather
+    # than deleting at the flip keeps that preservation intact for the in-place run
+    # and spends the orphan only when a mount actually needs its path.
+    #
+    # "Retained for recovery" is only honest if the reclaim does not itself destroy
+    # what was retained: the force-remove below discards the orphan's uncommitted
+    # files irreversibly (even under `keep_failed = true`, which governs teardown
+    # after a session, not this pre-mount reclaim), while the story-branch block
+    # above preserves committed work alone. `_preserve_orphan_state` closes that
+    # gap — a snapshot ref for anything uncommitted, taken before this line.
     #
     # The BRANCH is deliberately not passed: `discard_worktree` would force-delete it.
     # A run-scoped name carries commits earlier units landed; a story-scoped name has
