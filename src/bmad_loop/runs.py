@@ -4005,23 +4005,33 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         if state.repo_root == new:
             return None
         moved = bool(state.repo_root)
+        if moved:
+            # Journalled under resume's own field name, and AHEAD of the state write.
+            # This re-stamp aligns the mirror that `cli._resume_paused_run` later
+            # compares against config, so by the time `run-resume` computes
+            # `code_root_changed` the two necessarily agree and it records `false` —
+            # on the one gesture where the root DID move. The ephemeral stderr/toast
+            # the caller prints from the return value is not a record; without this
+            # line the move leaves no durable trace on the re-arm surfaces while
+            # plain `resume` still writes one.
+            #
+            # Record first, because the early return above keys on the persisted
+            # root: an append that failed AFTER `save_state` had committed the move
+            # left a retry with nothing to do and the record never written. Failing
+            # here leaves the mirror untouched, so the retry redoes both; a save that
+            # fails after a successful append costs one duplicate true record on
+            # the retry — at least once, never never. `repo` is dropped by the
+            # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path
+            # never reaches a dump.
+            Journal(run_dir).append(
+                "rearm-code-root-restamped",
+                repo=new,
+                code_root_changed=True,
+            )
         state.repo_root = new
         save_state(run_dir, state)
     if not moved:
         return None
-    # Journalled OUTSIDE the lock, and under resume's own field name. This re-stamp
-    # aligns the mirror that `cli._resume_paused_run` later compares against config,
-    # so by the time `run-resume` computes `code_root_changed` the two necessarily
-    # agree and it records `false` — on the one gesture where the root DID move. The
-    # ephemeral stderr/toast the caller prints from the return value is not a record;
-    # without this line the move leaves no durable trace on the re-arm surfaces while
-    # plain `resume` still writes one. `repo` is dropped by the diagnose registry
-    # (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never reaches a dump.
-    Journal(run_dir).append(
-        "rearm-code-root-restamped",
-        repo=new,
-        code_root_changed=True,
-    )
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
