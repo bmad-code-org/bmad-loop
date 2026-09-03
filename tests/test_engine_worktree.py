@@ -1153,15 +1153,16 @@ def test_carry_harvest_dedupe_stays_status_agnostic(project):
     assert task.harvest_carry_commit_pending is False  # nothing novel, so no latch
 
 
-def _in_place_policy():
+def _in_place_policy(*, limits: LimitsPolicy | None = None):
     """`wt_policy`'s mirror: the live mode a mid-pause `isolation = "none"` edit
     leaves behind, with everything else identical so the two rows differ in one
-    field only."""
+    field only. ``limits`` mirrors `wt_policy`'s own knob, for the row that has to
+    reach `max_review_cycles` exhaustion instead of the damped force-converge."""
     return Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
         scm=ScmPolicy(isolation="none"),
-        limits=LimitsPolicy(),
+        limits=limits if limits is not None else LimitsPolicy(),
     )
 
 
@@ -1295,6 +1296,110 @@ def test_defer_under_live_isolation_with_no_mount_yet_keeps_the_isolated_arm(pro
 
     assert rolled == []
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+
+def test_review_timeout_salvage_refused_under_a_recorded_mount_after_an_isolation_flip(
+    project,
+):
+    """`_salvage_review_timeout` routes on the tree in hand, not on live policy alone.
+
+    The third member of the pair `_defer` and `_run_story` already select on. An
+    accepted continuation reopens the recorded mount REGARDLESS of live policy —
+    `_finish_inflight` swaps `self.workspace` onto it, and `self._isolated` is a
+    read-only property over LIVE policy with no setter anywhere — so a run whose
+    `scm.isolation` was edited `"worktree" -> "none"` while it was paused reaches this
+    decision mounted with `self._isolated` False. Gated on policy alone, salvage then
+    committed the mounted work for `_integrate_unit` to merge out: a timed-out review
+    landing DONE-and-merged, where the identical work under unchanged policy defers
+    with the unit's worktree and diff kept for review.
+
+    The bytes assertion is the discriminator, not the return value. The `in-review`
+    arm performs REPAIR WRITES the mounted path never performs — `reset_spec_status`
+    to `done` and `strip_auto_run_result` — and they fire before any later verify gate
+    could turn the answer back to False on its own; a return-value-only row would pass
+    for that unrelated reason.
+
+    Ablation: restore `if self._isolated or not task.spec_file:` and this reddens on a
+    spec rewritten to `done` with its terminal marker stripped."""
+    write_sprint(project, {"1-1-a": "done"})
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # `in-review` is the mid-review interrupt the salvage arm repairs forward; the
+    # terminal marker is the second thing it strips.
+    write_spec(sp, "in-review", rev_parse_head(project.project), prose_status="done")
+    before = sp.read_text()
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,  # the phase the review loop calls salvage from
+        spec_file=str(sp),
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+    )
+
+    assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+    assert sp.read_text() == before  # no repair write into a story the mount owns
+
+
+def test_budget_exhausted_rescue_defers_under_a_recorded_mount_after_an_isolation_flip(
+    project,
+):
+    """The budget-exhaustion rescue picks the same arm as the defer it replaces.
+
+    `test_budget_exhausted_finalized_work_commits`'s harness, with one field added: the
+    task carries the attempt's mount while live policy answers "in place" — exactly
+    what `_finish_inflight` leaves after an `isolation` flip across a resume, since it
+    sets only `self.workspace` and `self._isolated` keeps reading live policy. Selected
+    on policy alone, the rescue committed a story that never converged; `_commit` lands
+    in the mount and `_integrate_unit` merges that unit branch out to the target, so
+    the outcome inverts — DONE-and-merged instead of DEFERRED with the unit's worktree
+    and patch preserved.
+
+    The gate is inline in `_review_and_commit`, so a full sandbox run is the lowest
+    layer that reaches it: the loop has to actually exhaust `max_review_cycles` with a
+    finalized, verify-green tree still recommending a follow-up (`max_followup_reviews`
+    pinned high, or the damping converges the story before exhaustion and this row
+    never reaches the branch under test).
+
+    `review_cycle == 3` is the premise control — without it a story that deferred for
+    any earlier reason would satisfy the outcome assertions.
+
+    Ablation: restore `if refileable_followup and not self._isolated:` and this reddens
+    on a DONE task with a fresh commit at HEAD."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"
+    box: list[Engine] = []
+    dev = wt_dev_effect(project, "1-1-a")
+
+    def dev_then_record_the_mount(spec):
+        # The reopened mount, recorded on the task, is all `_finish_inflight` leaves
+        # behind for the review loop to read; recording it after dispatch keeps
+        # `_run_story` out of the row so the gate under test is the only selector.
+        result = dev(spec)
+        box[0].state.tasks["1-1-a"].worktree_path = str(mount)
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [dev_then_record_the_mount]
+        + [wt_review_effect(project, "1-1-a", clean=False) for _ in range(3)],
+        policy=_in_place_policy(limits=LimitsPolicy(max_followup_reviews=99)),
+    )
+    box.append(engine)
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.review_cycle == 3  # MEASURED: the budget really was exhausted
+    assert task.worktree_path == str(mount)  # and the mount really was in hand
+    assert summary.deferred == 1 and summary.done == 0 and not summary.paused
+    assert task.phase == Phase.DEFERRED
+    assert not task.commit_sha
+    assert rev_parse_head(project.project) == head_before  # nothing was committed
+    assert "review-budget-committed" not in journal_kinds(engine)
 
 
 def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):

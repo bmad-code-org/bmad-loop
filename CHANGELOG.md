@@ -251,6 +251,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The review-budget rescue and the timeout salvage route on the tree in hand, not on
+  live policy.** Both selected on `scm.isolation` alone, so an accepted continuation that
+  reopened a recorded mount after a `"worktree" -> "none"` flip took the in-place arm: the
+  commit landed in the mount and `_integrate_unit` merged it out, turning a story that never
+  converged (or a timed-out review) into DONE-and-merged where the same work under unchanged
+  policy defers with the unit's worktree and patch preserved. Salvage additionally performed
+  `in-review` repair writes the mounted path never performs. Both now use the
+  `self._isolated or task.worktree_path` pair `_defer` and `_run_story` already share.
 - **The escalation modal's story manifest follows a moved project onto the mount.**
   `runs.live_stories_root` probed the mount at its RECORDED spelling before rebasing, so
   after a project rename the probe failed, the mount was discarded, and the modal read

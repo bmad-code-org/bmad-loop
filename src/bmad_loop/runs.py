@@ -3394,11 +3394,15 @@ def redrive_base_ref(state: RunState, *, isolated_redrive: bool) -> str:
     `isolated_redrive` is the LIVE policy's isolation mode, injected by the caller, and
     the task drops out of the signature entirely. It used to be inferred from
     `task.worktree_path` — a recorded mount — and that is the retrospective fact, not
-    this one. `engine._run_story` selects the mode from `self._isolated` alone, and an
-    isolation change mid-run is journalled, never refused, so the recorded mount and the
-    next re-drive part company in BOTH directions: a run flipped to `"none"` still
-    carries the escalated attempt's mount and would name the pinned branch for an
-    in-place re-drive that reads `HEAD`, and one flipped to `"worktree"` carries no
+    this one. `engine._run_story` selects on `self._isolated` OR a recorded mount, but a
+    re-drive never reaches it still carrying one: the restart arm releases the mount
+    first — `_discard_unit_for_restart` while policy is still isolated,
+    `_release_orphaned_mount` once it is not — so the mode a re-drive runs in is live
+    policy's. An isolation change mid-run is journalled, never refused, so the recorded
+    mount and the next re-drive part company in BOTH directions: a run flipped to
+    `"none"` still carries the escalated attempt's mount and would name the pinned
+    branch for an in-place re-drive that reads `HEAD`, and one flipped to
+    `"worktree"` carries no
     mount at all and would name `HEAD` for a re-drive that mounts. Both send a
     correction to a tree the run does not read. The same injection is how
     `validate_restore_latch` already learns this fact.

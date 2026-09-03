@@ -2934,11 +2934,21 @@ class Engine:
             # completed pass's own signal) AND _verify_review — the same authoritative
             # gate the converged path uses (frontmatter status==done AND sprint==done
             # AND verify commands pass) — so it can never ship uncompleted work, nor
-            # record a follow-up the last pass did not actually recommend. Only for
-            # the non-isolated path: in worktree isolation a defer already keeps the
-            # unit's worktree + patch (no work is lost), so there is nothing to
-            # rescue and committing into the main repo would be wrong.
-            if refileable_followup and not self._isolated:
+            # record a follow-up the last pass did not actually recommend. Only when
+            # the work does NOT live in a mount — the same
+            # `self._isolated or task.worktree_path` pair `_defer` and `_run_story`
+            # route on, and for the same reason: a recorded mount owns this attempt's
+            # work whether or not live policy still says worktree. `_finish_inflight`
+            # reopens that mount and swaps `self.workspace` onto it, while
+            # `self._isolated` is a read-only property over LIVE policy — so after an
+            # `isolation` flip an accepted continuation arrives here mounted with
+            # `self._isolated` False. Gated on policy alone the rescue commits into
+            # the mount and `_integrate_unit` merges it out to the target: a story
+            # that never converged lands DONE-and-merged, where the identical mounted
+            # work under unchanged policy would be DEFERRED with the unit's worktree
+            # and patch preserved for review. A defer under a mount already keeps
+            # both, so there is nothing to rescue there.
+            if refileable_followup and not (self._isolated or task.worktree_path):
                 rescue = self._verify_review(task)
                 if rescue.ok:
                     self._journal_review_budget_spent(task)
@@ -2995,23 +3005,31 @@ class Engine:
         The cycle the timed-out session charged is deliberately not refunded —
         salvage changes what the *next* cycle costs, not what this one did.
 
-        Applicability, all deterministic: not worktree-isolated (a defer there
-        already keeps the unit's worktree + diff, and committing into the main
-        repo would be wrong — same scoping as the budget-exhaustion rescue); a
-        spec is recorded and its frontmatter reads ``done`` (the review never got
-        far enough to touch it — rare once the adapter's missing-marker fallback
-        (#224) completes those sessions, but a review that never wrote the spec
-        at all still lands here) or ``in-review`` (the mid-review interrupt: the
-        dying pass flipped the transient marker and died — reset it forward,
-        stripping any partial terminal section so the next launch's mtime-floor
-        scan can't misread it). Anything else — ``blocked``, ``in-progress``, a
-        custom token — was set deliberately or means unfinished dev work: never
+        Applicability, all deterministic: the work does not live in a mount —
+        neither live isolation NOR a recorded ``worktree_path``, the same pair
+        ``_defer`` and the budget-exhaustion rescue route on. A mount owns the
+        attempt's work even when live policy no longer says worktree, because
+        `_finish_inflight` reopens it and swaps ``self.workspace`` onto it while
+        ``self._isolated`` still reads live policy; salvaging there would commit
+        into that mount for `_integrate_unit` to merge out, turning a timed-out
+        review into a DONE-and-merged story where the defer would have kept the
+        unit's worktree + diff. The gate also has to precede the ``in-review``
+        repair writes below (`reset_spec_status`, `strip_auto_run_result`), which
+        the mounted path never performs at all. Second: a spec is recorded and its
+        frontmatter reads ``done`` (the review never got far enough to touch it —
+        rare once the adapter's missing-marker fallback (#224) completes those
+        sessions, but a review that never wrote the spec at all still lands here)
+        or ``in-review`` (the mid-review interrupt: the dying pass flipped the
+        transient marker and died — reset it forward, stripping any partial
+        terminal section so the next launch's mtime-floor scan can't misread it).
+        Anything else — ``blocked``, ``in-progress``, a custom token — was set
+        deliberately or means unfinished dev work: never
         salvage over it. The commit is gated on the same authoritative
         ``_verify_review`` as every other converge path, so salvage can never
         ship unverified work; a timeout that produced no review result neither
         re-arms ``followup_review_recommended`` nor spends a damping grant — the
         outstanding recommendation is refiled to deferred work instead."""
-        if self._isolated or not task.spec_file:
+        if self._isolated or task.worktree_path or not task.spec_file:
             return False
         spec_path = Path(task.spec_file)
         fm = self._observed_frontmatter(spec_path, task.story_key, "review-timeout-salvage")
