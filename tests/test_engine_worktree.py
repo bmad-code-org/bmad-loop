@@ -351,6 +351,55 @@ def test_relocated_accepted_spec_disappearance_does_not_bind_fallback(project):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_relocated_accepted_spec_escaping_the_mount_does_not_bind_an_outside_file(
+    project, tmp_path
+):
+    """A probe that leaves the unit is not delivery, however file-shaped it reads.
+
+    The accepted spec's parent is a real directory in the main checkout but a
+    committed OUTWARD symlink in the commit the fresh worktree is cut from, so
+    `_accepted_spec_seed` refuses on its own containment arm and — uniquely among
+    the seed refusals — journals nothing: the rel reaches neither `seed_files` nor
+    `worktree-seed-skipped` nor `worktree-seed-dropped`. The mounted probe is the
+    only remaining guard, and file-ness alone follows the link to an unrelated
+    external artifact and reads as delivered.
+
+    Ablation: drop the containment clause at that probe (or the whole condition)
+    and the unit dispatches, bound to the outside file instead of escalating.
+    """
+    from bmad_loop.engine import RunPaused
+
+    rel_dir = "_bmad-output/accepted-elsewhere"
+    rel = f"{rel_dir}/escape.md"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "escape.md").write_bytes(b"unrelated external bytes\n")
+    link = project.project / rel_dir
+    link.symlink_to(outside, target_is_directory=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The commit keeps the outward symlink, so the fresh worktree materializes the
+    # escape; only the main checkout gets the real directory holding the accepted
+    # artifact, which is what lets the absolute spelling normalize in the first place.
+    link.unlink()
+    link.mkdir()
+    accepted = project.project / rel
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    with pytest.raises(RunPaused, match="accepted spec.*disappeared"):
+        engine._run_isolated(task, lambda _task: drove.append(True))
+
+    assert drove == []
+    assert task.phase == Phase.ESCALATED
+    assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount(project, tmp_path):
     """A shared install outside the repo passes main's through-link resolution but
     cannot be copied into the worktree. The flow pauses before invoking the adapter,

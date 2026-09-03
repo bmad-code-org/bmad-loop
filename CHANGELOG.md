@@ -251,6 +251,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An accepted spec reached through a link out of the unit worktree no longer counts as
+  delivered.** The pre-dispatch check asked only whether a file existed at the mounted path,
+  and that probe follows symlinks, so a spec directory the checkout carries as a link
+  pointing outside the mount let an unrelated external file stand in for the accepted spec
+  and the session ran against the wrong bytes. The check now also requires the resolved path
+  to stay inside the worktree; a link whose target is inside it still passes, and a probe
+  that cannot be resolved escalates rather than binding.
 - **`branch_checkout_path` keeps a registered worktree path's trailing whitespace.** The
   reader went through `_git_out`, which returns `stdout.strip()`, so a foreign checkout
   registered at a unit's own mount path plus a trailing space came back as the bare mount

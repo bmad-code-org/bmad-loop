@@ -1678,12 +1678,34 @@ class WorktreeFlow:
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
 
-        if accepted_spec_relocated and not _is_file(unit.path / str(task.spec_file)):
-            self.escalate_unit(
-                task,
-                f"accepted spec for {task.story_key} disappeared before it could be "
-                "delivered to the replacement worktree",
-            )
+        # The last guard standing over a relocated accepted spec, and the only one
+        # that can see this particular loss at all: `_accepted_spec_seed` refuses on
+        # its own containment arm SILENTLY — the rel reaches neither `seed_files` nor
+        # `skipped_seeds` nor `undelivered_seeds`, so neither journal above names it.
+        # File-ness alone is therefore not enough to call the spec delivered.
+        # `_is_file` follows symlinks and asks only "are there bytes here", so a
+        # parent that is a real directory in the main checkout but a committed
+        # OUTWARD symlink in the commit this mount was cut from lands the probe on an
+        # unrelated external artifact, which answers true and dispatches the unit
+        # reading someone else's bytes under the accepted spec's name. Require
+        # containment as well: resolve the probe and keep it inside the mount. A
+        # legitimate INWARD link whose target is under the mount still passes, and an
+        # unresolvable probe cannot prove delivery, so every filesystem fault
+        # escalates rather than binding.
+        if accepted_spec_relocated:
+            accepted_probe = unit.path / str(task.spec_file)
+            try:
+                accepted_delivered = _is_file(accepted_probe) and accepted_probe.resolve(
+                    strict=False
+                ).is_relative_to(unit.path.resolve())
+            except (OSError, RuntimeError, ValueError):
+                accepted_delivered = False
+            if not accepted_delivered:
+                self.escalate_unit(
+                    task,
+                    f"accepted spec for {task.story_key} disappeared before it could be "
+                    "delivered to the replacement worktree",
+                )
 
         trees = [p.skill_tree for p in profiles]
         # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
