@@ -313,8 +313,11 @@ breaking changes may land in a minor release.
 - **A failed `rearm-code-root-restamped` append no longer loses the move record for
   good.** `restamp_code_root` committed the new root and journalled afterwards, so an
   append that failed once left a retry exiting at "already agrees" with the record never
-  written and the later `run-resume` line reporting `code_root_changed=False`. The record
-  is now written ahead of the state write under the same lock, so the retry redoes both.
+  written and the later `run-resume` line reporting `code_root_changed=False`. The move
+  now lands with an intent marker (`RunState.code_root_restamp_pending`) in one atomic
+  state write, the record follows it, and the marker is cleared only once the record is
+  down — so a retry writes the record the move still owes, and a record can never claim
+  a move the state write did not make.
 
 - **The journal-kind inventory no longer misses a kind passed POSITIONALLY to a declared
   dynamic-kind position.** The scan read `node.keywords` only, so
