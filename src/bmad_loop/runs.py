@@ -4048,7 +4048,10 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # assert a completed move that a failed save then never made. And the
         # marker is cleared only once the append has returned: an append that
         # fails leaves it set, so the retry re-enters here and writes the record
-        # the move still owes. The one residual is a clearing save that fails after
+        # the move still owes — or, when the operator runs plain `resume` instead,
+        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
+        # its own `run-resume` line and clears it on the same write that persists
+        # the resume. The one residual is a clearing save that fails after
         # a successful append, which costs a duplicate — true — record on the
         # retry; a duplicate is recoverable from the journal, a missing record and a
         # false one are not.

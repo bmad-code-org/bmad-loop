@@ -5734,6 +5734,38 @@ def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
     assert "code root" not in capsys.readouterr().err
 
 
+def test_resume_consumes_an_outstanding_code_root_restamp(project, monkeypatch, capsys):
+    """A move `runs.restamp_code_root` persisted whose record never landed reaches
+    resume with the mirror ALREADY agreeing with config — the compare alone reads "no
+    move" on the one gesture that still owes the operator its record and its warning.
+
+    The intent marker exists so a retry writes that record; the retry may arrive
+    through plain `resume` rather than `resolve`, and a run that finished from here
+    would leave the move unrecorded for good — the audit gap the marker closes. So the
+    marker counts as a move for the `run-resume` line and the stderr warning, and is
+    consumed on the same state write that persists the resume.
+
+    Ablation: drop the `or state.code_root_restamp_pending` half of the compare and this
+    reddens on the journal field (`assert False is True`); drop the clearing line
+    instead and it reddens on the persisted marker.
+    """
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        repo_root=str(Path(project.project).resolve()),
+        code_root_restamp_pending=True,
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    assert load_state(run_dir).code_root_restamp_pending is False
+    assert "the code root in _bmad/bmm/config.yaml has changed" in capsys.readouterr().err
+
+
 def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
     """A state.json written before `repo_root` existed reads back "" — a MISSING value,
     not a divergent one. The `bool(state.repo_root)` guard is what keeps it out of the
