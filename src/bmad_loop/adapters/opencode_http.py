@@ -164,6 +164,7 @@ from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
     NUDGE_TEXT,
+    RESULT_FILE_ARTIFACTS,
     STALL_NUDGE_TEXT,
     _DevSynthesisMixin,
     _ResultFileMixin,
@@ -628,9 +629,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        # `messages.json` is this transport's own; the rest are the inherited
+        # `_ResultFileMixin`'s writes, validated here for the same reason
+        # GenericAdapter validates them — see `RESULT_FILE_ARTIFACTS`.
         validate_adapter_artifact_paths(
             task_dir,
-            (task_dir / "messages.json",),
+            (task_dir / "messages.json", *(task_dir / name for name in RESULT_FILE_ARTIFACTS)),
         )
         log_paths = [
             self.logs_dir / f"{spec.task_id}.log",
