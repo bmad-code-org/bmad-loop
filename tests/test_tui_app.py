@@ -4102,6 +4102,59 @@ def test_paused_spec_follows_a_moved_project_to_the_tree_the_rearm_writes(tmp_pa
     assert app._paused_spec_root(state) == live
 
 
+def test_story_context_and_sentinel_follow_a_moved_project_to_the_tree_the_rearm_writes(
+    tmp_path,
+):
+    """The modal's OTHER two readers move with `_paused_spec`. `_story_context` and
+    `_sentinel_kind` located the stories folder from `runs.task_stories_root`, whose
+    no-mount arm is the recorded `state.project`, while `_do_rearm` clears the sentinel
+    under the live tree (`rearm_escalation(..., project_root=self.project)`). After a
+    project move the modal showed the spec from the live tree beside a title,
+    description and sentinel indicator from the old one — omitted once that tree was
+    gone, stale while it lingered.
+
+    The old tree is absent here on purpose: an anchor that did not move finds no
+    manifest and no sentinel, so the row cannot pass on a stale twin.
+
+    Ablations: revert `_story_context` to `runs.task_stories_root(...)` and this
+    reddens on the title (`('', '') == ('Story 1', 'does a thing')`); revert
+    `_sentinel_kind` the same way and it reddens on the kind (`'' == 'unresolved'`)."""
+    import yaml
+
+    from bmad_loop import stories
+
+    recorded = tmp_path / "project-before-rename"
+    live = tmp_path / "project-after-rename"
+    folder = live / "epic-1"
+    (folder / "stories").mkdir(parents=True)
+    (folder / "stories.yaml").write_text(
+        yaml.safe_dump(
+            [{"id": "1", "title": "Story 1", "description": "does a thing"}], sort_keys=False
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    spec = folder / "stories" / "1-unresolved.md"
+    spec.write_text("---\nstatus: escalated\n---\n", encoding="utf-8", newline="\n")
+    assert stories.resolve_story_spec(folder, "1").kind == stories.KIND_SENTINEL
+    assert not recorded.exists()  # the tree the run recorded is gone
+    app = BmadLoopApp(live)
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(recorded),
+        started_at="2026-06-11T10:00:00",
+        source="stories",
+        spec_folder="epic-1",
+        paused_story_key="1",
+    )
+    state.tasks["1"] = StoryTask(
+        story_key="1", epic=0, spec_file=str(recorded / "epic-1" / "stories" / "1-unresolved.md")
+    )
+
+    assert app._story_context(state, "1") == ("Story 1", "does a thing")
+    assert app._sentinel_kind(state, "1") == "unresolved"
+
+
 async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):
     """An absent spec at the ANCHORED path is the signal that the anchoring failed, so
     it must not render as `SpecReviewModal`'s `(empty spec)` — which is also what a
