@@ -696,6 +696,16 @@ class RunState:
     # `project`, which is exactly the pre-upgrade behavior and the correct answer
     # for every run without the override.
     repo_root: str = ""
+    # Intent marker for `runs.restamp_code_root`: True from the atomic state write
+    # that moved `repo_root` until the `rearm-code-root-restamped` journal record
+    # for that move has landed. state.json and the journal are two files with no
+    # transaction across them, so the move and its record cannot be made durable
+    # in one step; this flag rides the state write itself, which is what lets a
+    # retry tell "moved and recorded" from "moved, record still owed" — the one
+    # distinction that keeps the record retryable without ever asserting a move
+    # that was not persisted. Deliberately absent from `documents.py`'s `--json`
+    # projection (schema 1), like `rearmed` / `resolved_redrive`.
+    code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -828,6 +838,7 @@ class RunState:
             "run_id": self.run_id,
             "project": self.project,
             "repo_root": self.repo_root,
+            "code_root_restamp_pending": self.code_root_restamp_pending,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -859,6 +870,7 @@ class RunState:
             run_id=d["run_id"],
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
+            code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
