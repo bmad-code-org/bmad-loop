@@ -98,8 +98,23 @@ def _rearm_outcome(key: str, *entries: dict) -> runs_mod.RearmOutcome:
         for entry in entries
         if (notice := runs_mod.rearm_event_notice(entry)) is not None
     )
+    # Mirrors `runs._RearmJournal.append`, first-wins included: the surface under test
+    # renders the held record's own `next_step`, so a helper that dropped it would let
+    # the hold toast pass on a step no record produced.
+    held = next(
+        (
+            notice
+            for entry in entries
+            if runs_mod.rearm_holds_the_resume(entry)
+            and (notice := runs_mod.rearm_event_notice(entry)) is not None
+        ),
+        None,
+    )
     return runs_mod.RearmOutcome(
-        key, notices, any(runs_mod.rearm_holds_the_resume(entry) for entry in entries)
+        key,
+        notices,
+        any(runs_mod.rearm_holds_the_resume(entry) for entry in entries),
+        held[2] if held is not None else "",
     )
 
 
@@ -5867,13 +5882,15 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
 
     `rearm-spec-write-unreachable` fires only once the re-arm has proven the committed
     spec does not carry the status the re-drive routes on — and this path drops the
-    table's `next_step` precisely because it resumes in the same gesture. That silenced
-    the one record whose remedy MUST land first in BOTH halves: the imperative was
-    dropped as moot, and the resume it was warning against happened anyway, mounting a
-    fresh worktree onto the still-terminal committed spec.
+    table's `next_step` on every ADVISORY toast precisely because it resumes in the same
+    gesture. That silenced the one record whose remedy MUST land first in BOTH halves:
+    the imperative was dropped as moot, and the resume it was warning against happened
+    anyway, mounting a fresh worktree onto the still-terminal committed spec.
 
-    The re-arm itself is kept — the story is armed and persisted — and the toast names
-    what the operator can finish from this screen: commit, then resume. The
+    The re-arm itself is kept — the story is armed and persisted — and the hold toast
+    carries the held record's OWN `next_step` (`RearmOutcome.hold_next_step`), which on
+    this record is the commit. Since the hold is what stops the fold-in, "before
+    resuming" is finally true on this surface when it renders here. The
     `rearm-baseline-restamp-skipped` control keeps this a narrowing rather than
     "warnings stop resumes": it is a warning on the same walk, and the resume still fires.
 
@@ -5930,10 +5947,93 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
 
     assert calls == []  # the resume this gesture folds in did NOT fire
     assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
-    assert any("commit the corrected spec, then resume this run" in n for n in notes)
+    assert any(
+        "not resuming in this gesture. Commit the corrected spec before resuming — the "
+        "run stays paused and resumable from this screen." in n
+        for n in notes
+    )
     # the record that proved it still renders, and its warning sibling did not hold
     assert any("land in a tree it discards" in n for n in notes)
     assert any("is not a readable file from here" in n for n in notes)
+
+
+@pytest.mark.parametrize("redrive", ["in-place", "isolated"])
+async def test_escalation_rearm_hold_names_the_holding_record_s_own_remedy(
+    project, monkeypatch, redrive
+):
+    """The hold toast must carry the HELD record's remedy, not one hardcoded literal.
+
+    Four records hold this surface's fold-in resume and their remedies differ. The
+    newest — `rearm-spec-flip-skipped` on its `reaches_redrive and not refused` arm —
+    is journalled with `refused = spec_path.is_file() and write_reaches_the_redrive`,
+    so the holding arm ENTAILS `spec_path.is_file()` is False: there is no corrected
+    spec at that path to commit, and on the isolated arm the path can be a shared
+    artifact directory outside the project that is not a Git repository at all. The
+    hardcoded "commit the corrected spec" was therefore not merely unhelpful there, it
+    was impossible. Both re-drive modes reach this arm, so both are asserted.
+
+    The negative half is the point and is matched case-insensitively: the fallback
+    literal only differs from the ablated one by its leading capital, and a negative
+    assertion that a capitalization slipped past would pass for the wrong reason.
+
+    Ablation: revert `_do_rearm`'s hold branch to the hardcoded literal and BOTH legs
+    redden — the positive on the missing path remedy, the negative on the commit
+    imperative that cannot be obeyed.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
+        Journal(rd).append(
+            "rearm-spec-flip-skipped",
+            story_key=sk,
+            spec_file="/srv/artifacts/specs/s1.md",
+            status="ready-for-dev",
+            refused=False,
+            reaches_redrive=True,
+            redrive=redrive,
+        )
+        return _journal_rearm_outcome(rd, sk)
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+
+    assert calls == []  # this arm holds, so the folded-in resume did NOT fire
+    assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
+    held = [n for n in notes if "not resuming" in n]
+    assert len(held) == 1
+    assert (
+        "not resuming in this gesture. Check the recorded spec path before resuming — "
+        "the run stays paused and resumable from this screen." == held[0]
+    )
+    # the remedy the record CANNOT have: the holding arm proves the path is not a file
+    assert "commit the corrected spec" not in held[0].lower()
 
 
 async def test_escalation_rearm_holds_without_a_renderable_notice(project, monkeypatch):

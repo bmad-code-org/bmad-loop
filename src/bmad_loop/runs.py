@@ -4172,6 +4172,16 @@ class RearmOutcome:
     story_key: str
     notices: tuple[RearmNotice, ...]
     hold_resume: bool
+    # The `next_step` of the FIRST record that held, so a surface which folds the
+    # resume into the same gesture can say what to actually do. `hold_resume` alone
+    # forced that surface to hardcode ONE remedy for four holding records, and the
+    # hardcoded one ("commit the corrected spec") is impossible on two of them: the
+    # in-place arm of `rearm-spec-write-unreachable` needs an edit in the main
+    # checkout, and `rearm-spec-flip-skipped`'s holding arm fires only when the spec
+    # path is NOT a readable file — there is nothing at that path to commit, and the
+    # path may sit in a shared artifact directory outside any repository. Empty when
+    # the holding record renders no step, which keeps the caller's fallback honest.
+    hold_next_step: str = ""
 
 
 class _RearmJournal(Journal):
@@ -4181,6 +4191,7 @@ class _RearmJournal(Journal):
         super().__init__(run_dir)
         self.notices: list[RearmNotice] = []
         self.hold_resume = False
+        self.hold_next_step = ""
 
     def append(self, kind: str, **fields: Any) -> None:
         # Capture only after the durable append succeeds. The synthetic entry contains
@@ -4188,11 +4199,20 @@ class _RearmJournal(Journal):
         # self-minted timestamp/log fields are not part of either contract.
         super().append(kind, **fields)
         entry = {"kind": kind, **fields}
-        self.hold_resume = rearm_holds_the_resume(entry) or self.hold_resume
+        holds = rearm_holds_the_resume(entry)
         rendered = rearm_event_notice(entry)
         if rendered is not None:
             severity, message, next_step = rendered
             self.notices.append(RearmNotice(severity, message, next_step))
+            # FIRST-WINS, and deliberately: a re-arm can journal more than one holding
+            # record, and the earliest is the cause the operator has to clear first —
+            # the later ones are read from a tree the first remedy changes. Guarded on
+            # `hold_resume` being still-false rather than on the step being empty, so a
+            # holding record that renders no step does not silently hand the surface a
+            # LATER record's imperative for a different file.
+            if holds and not self.hold_resume:
+                self.hold_next_step = next_step
+        self.hold_resume = holds or self.hold_resume
 
 
 def rearm_escalation(
@@ -5071,7 +5091,7 @@ def _rearm_escalation_locked(
         baseline=task.baseline_commit or "",
         restore=bool(restore_patch),
     )
-    return RearmOutcome(key, tuple(journal.notices), journal.hold_resume)
+    return RearmOutcome(key, tuple(journal.notices), journal.hold_resume, journal.hold_next_step)
 
 
 def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:
