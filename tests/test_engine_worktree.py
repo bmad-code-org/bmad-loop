@@ -6697,3 +6697,80 @@ def test_run_branch_serial_units_stay_green_under_every_strategy(project, strate
     src = (project.project / "src.txt").read_text()
     assert "change for 1-1-a" in src and "change for 1-2-b" in src
     assert "worktree-open-failed" not in journal_kinds(engine)
+
+
+# --------------------------------------- remount refuses a branch held elsewhere
+
+
+def test_story_remount_refuses_a_branch_checked_out_at_a_foreign_path(project, tmp_path):
+    """`reset_branch_if_tip` is ``update-ref`` — a ref compare-and-swap that does not
+    care which worktree has the branch checked out. When the story branch is held
+    by a worktree OTHER than this unit's deterministic mount path (here: the
+    operator ``git worktree move``d the retained recovery mount), the reset would
+    move the ref under that checkout — its files and index still at the old tip —
+    and the following ``worktree_add`` would fail on the held branch anyway. The
+    remount refuses BEFORE any mutation: ``GitError`` names the branch and the
+    foreign path, the branch tip is unchanged, the foreign checkout's HEAD still
+    equals it, no preserve ref was written, and nothing was mounted at ``wt``.
+
+    The branch held only by the orphan AT the mount path keeps remounting fine —
+    `test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path` and
+    `test_story_remount_preserves_named_tip_and_restarts_from_pinned_base` grade
+    that arm.
+
+    Ablation: drop the `_refuse_foreign_checkout` call in `open_unit_workspace` and
+    this reddens — `GitError` still arrives (from ``worktree add``), but the branch
+    ref has already been reset to the pinned base and the preserve ref written.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    foreign = tmp_path / "moved-recovery-mount"
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    assert not first.path.exists()
+    (project.project / "advanced.txt").write_text("new base\n")
+    pinned = _commit_project(project, "base advances")
+
+    with pytest.raises(verify.GitError, match=rf"{first.branch}.*checked out at .*moved-recovery"):
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(foreign) == tip
+    assert tip != pinned
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve/") == ""
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+
+
+def test_run_branch_remount_refuses_a_fast_forward_under_a_foreign_checkout(project, tmp_path):
+    """Same hazard on the `branch_per=run` arm: the fast-forward would fire (run tip
+    is an ancestor of the advanced base) but the run branch is checked out at a
+    path other than this unit's mount. The single occupancy check refuses before
+    the ref move: the run branch stays at its tip, the foreign checkout's HEAD
+    still equals it, and nothing was mounted.
+
+    Ablation: drop the `_refuse_foreign_checkout` call and the run branch is
+    fast-forwarded to the advanced base before ``worktree add`` refuses — the
+    ``rev-parse`` assertion reddens.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="run")
+    old_tip = rev_parse_head(first.path)
+    foreign = tmp_path / "moved-recovery-mount"
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    (project.project / "landed-in-place.txt").write_text("story committed on main\n")
+    advanced = _commit_project(project, "story landed in place")
+    assert advanced != old_tip
+
+    with pytest.raises(verify.GitError, match=rf"{first.branch}.*checked out at .*moved-recovery"):
+        open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == old_tip
+    assert rev_parse_head(foreign) == old_tip
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]

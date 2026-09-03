@@ -184,6 +184,42 @@ def _preserve_orphan_state(
         on_orphan_preserved(str(wt), parked)
 
 
+def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:
+    """Raise ``GitError`` when ``branch`` is checked out anywhere but ``wt``.
+
+    `verify.reset_branch_if_tip` is ``git update-ref`` — a compare-and-swap on the
+    ref that does not know or care which worktree has the branch checked out. Moving
+    the ref under a live checkout leaves that checkout's files and index at the old
+    tip while its HEAD now reads the new one: the operator's tree suddenly looks
+    modified. The checkout at ``wt`` — this unit's own deterministic mount path — is
+    exempt: the reclaim force-removes it right after, so nothing observes the skew.
+
+    ``wt`` is already resolved by the caller; git's registered path is resolved the
+    same way so the two compare lexically on canonical spellings. A registered path
+    that cannot be resolved (gone, a permission fault, a symlink loop) is treated as
+    foreign: it is not provably ours, and the failure mode of a wrong "ours" is a
+    silently desynced checkout, so the doubt refuses.
+    """
+    holder = verify.branch_checkout_path(repo_root, branch)
+    if holder is None:
+        return
+    try:
+        resolved = holder.resolve()
+    except (OSError, RuntimeError) as e:
+        raise verify.GitError(
+            f"unit branch {branch} is checked out at {holder}, which cannot be "
+            f"resolved ({e}); refusing to move the branch under a checkout that is "
+            f"not this unit's mount path {wt}"
+        ) from e
+    if resolved != wt:
+        raise verify.GitError(
+            f"unit branch {branch} is checked out at {holder}, not at this unit's "
+            f"mount path {wt}; the remount would move the branch under that checkout. "
+            f"Detach it (git -C {holder} checkout --detach) or remove it "
+            f"(git worktree remove {holder}) before remounting"
+        )
+
+
 def open_unit_workspace(
     repo_root: Path,
     paths: ProjectPaths,
@@ -231,6 +267,12 @@ def open_unit_workspace(
     ``open_unit_workspace`` has none, in the style of ``close_unit_workspace``'s
     ``on_teardown_degraded``. A snapshot that cannot be written refuses the remount
     (raises ``GitError``) and leaves the orphan standing.
+
+    Both ref moves — the story reset and the run fast-forward — are refused up front
+    when the branch is checked out anywhere other than that mount path (an operator
+    moved a retained recovery worktree, or holds the branch in the main checkout):
+    the compare-and-swap would move the ref under a live checkout and the mount
+    would then fail on the held branch anyway. See `_refuse_foreign_checkout`.
     """
     branch = unit_branch_name(run_id, unit_key, branch_per)
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
@@ -249,6 +291,15 @@ def open_unit_workspace(
     branch_tip: str | None = None
     if verify.branch_exists(repo_root, branch):
         branch_tip = verify.rev_parse_revision(repo_root, f"refs/heads/{branch}")
+        # Both ref moves below (the story reset, the run fast-forward) are
+        # `update-ref` compare-and-swaps that do not care which checkout holds the
+        # branch. The orphan AT `wt` is fine — the reclaim removes it right after —
+        # but a checkout anywhere ELSE (an operator `git worktree move`d a retained
+        # recovery mount, or checked the branch out in the main tree) would be left
+        # with its files and index at the old tip under a ref that moved, and the
+        # `worktree_add` that follows fails anyway on the held branch. Refuse
+        # before any mutation instead.
+        _refuse_foreign_checkout(repo_root, branch, wt)
     # Park an orphan's uncommitted state FIRST — before the story reset below moves
     # the ref the orphan's HEAD points at, so the snapshot is parented at the tree
     # the orphan actually holds and captures only what was never committed.
@@ -297,8 +348,10 @@ def open_unit_workspace(
             if verify.is_ancestor(repo_root, branch_tip, pinned_base):
                 # The base strictly advanced past the run tip: fast-forward the run
                 # branch (compare-and-swap on the pinned tip) so the mount comes up
-                # at the base. No mount holds the branch here — the reclaim above
-                # released it — so the ref move cannot desync a checkout.
+                # at the base. No mount holds the branch here — the occupancy
+                # check above refused any checkout other than the one at ``wt``,
+                # and the reclaim released that — so the ref move cannot desync a
+                # checkout.
                 verify.reset_branch_if_tip(repo_root, branch, pinned_base, branch_tip)
             else:
                 catch_up_base = pinned_base  # diverged: merge inside the fresh mount
