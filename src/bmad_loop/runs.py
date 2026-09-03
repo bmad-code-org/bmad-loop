@@ -2203,11 +2203,18 @@ def _stop_run_once(run_dir: Path) -> bool | None:
 
     host = get_process_host()
     pid, identity = read_pid_identity(run_dir)  # identity recorded at run start, not sampled now
+    # The pid-file tuple AS READ, kept for the generation compare under the lock
+    # below. The local `pid` is cleared on every path that declines to signal — a
+    # pid that is gone, reused, or whose identity cannot be read — so comparing the
+    # post-delivery pid file against `(pid, identity)` AFTER that clearing made an
+    # unverifiable engine read as a rival that had published a new pid: the file
+    # was unchanged, its liveness `"unknown"` (not `"dead"`), and `stop_run`'s
+    # retry loop re-entered forever. A rival is a CHANGED pid file, nothing else.
+    recorded_engine = (pid, identity)
     if pid is not None and identity is not None and not host.alive_and_ours(pid, identity):
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
         pid = None
-    addressed_engine = (pid, identity)
     # Whether this call ever proved the engine dead. Only a confirmed death licenses
     # the fallback below to discard the request we lodged: while the engine may still
     # be running, that file is the one channel left that can stop it (on native
@@ -2307,7 +2314,7 @@ def _stop_run_once(run_dir: Path) -> bool | None:
         state = load_state(run_dir)
         current_engine = read_pid_identity(run_dir)
         current_liveness = engine_liveness(run_dir)
-        rival_published_engine = current_liveness != "dead" and current_engine != addressed_engine
+        rival_published_engine = current_liveness != "dead" and current_engine != recorded_engine
         if state.finished:
             # The engine completed while the stop channels were in flight.  Its
             # terminal state is authoritative; do not rewrite it as a fallback stop.
