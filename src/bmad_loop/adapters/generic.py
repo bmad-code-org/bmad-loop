@@ -181,6 +181,21 @@ CONTRACT_NUDGE_TEXT = (
 )
 
 
+# Every task-directory leaf `_ResultFileMixin` writes during a session, beyond the
+# cycle artifacts in `journal.TASK_CYCLE_ARTIFACTS` and the prompt. Both adapters
+# that inherit the mixin hand this tuple to `validate_adapter_artifact_paths`
+# before their first write: a reused task directory carrying a symlink, hardlink,
+# FIFO or device under one of these names would otherwise have the heartbeat
+# overwrite truncate a linked external file, or a breadcrumb append block on or
+# redirect into it. One tuple, so a fourth mixin write cannot reach one adapter's
+# validation and miss the other's.
+RESULT_FILE_ARTIFACTS: tuple[str, ...] = (
+    "heartbeat.json",
+    "resultless-stops.jsonl",
+    "session-lifecycle.jsonl",
+)
+
+
 class _ResultFileMixin:
     """Result-file read-back and verdict finalization: acquire the
     skill-written result dict and fold it into the session's final
@@ -561,14 +576,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
         validate_adapter_artifact_paths(
             task_dir,
-            tuple(
-                task_dir / name
-                for name in (
-                    "heartbeat.json",
-                    "resultless-stops.jsonl",
-                    "session-lifecycle.jsonl",
-                )
-            ),
+            tuple(task_dir / name for name in RESULT_FILE_ARTIFACTS),
         )
         validate_adapter_artifact_paths(
             self.logs_dir,
