@@ -3071,22 +3071,22 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
 
 
 def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_path, monkeypatch):
-    """The record is written AHEAD of the state write, so a failed append leaves the
-    move undone and the retry redoes both. Ordered the other way, `save_state` had
-    already committed the new root when the append failed: `cmd_resolve` returned
-    failure with no durable record, the retry exited at `state.repo_root == new`,
-    and the later `run-resume` line reported `code_root_changed=False` — the exact
-    audit gap this record exists to close, made permanent.
+    """The move and an intent marker land in one atomic state write; the record is
+    appended after it and the marker cleared only once the append returned. So an
+    append that fails leaves the root MOVED and the marker SET, and the retry — which
+    would otherwise exit at "already agrees" with the record never written and the
+    later `run-resume` line reporting `code_root_changed=False` — re-enters, writes
+    the record the move still owes, and clears the marker.
 
-    Ablation: move the `Journal(...).append` back below `save_state` (inside or
-    outside the lock) and the retry reddens on `None`, then on the missing record."""
+    Ablations: drop the `or state.code_root_restamp_pending` half of the early
+    return and the retry reddens on `None`; clear the marker before the append and
+    it reddens the same way; never set it and the first assertion reddens."""
     from bmad_loop.journal import Journal
 
     run = escalated_run(tmp_path, "r1", story_key="s1")
-    was = tmp_path / "was"
     now = tmp_path / "code"
     now.mkdir()
-    run.state.repo_root = str(was)
+    run.state.repo_root = str(tmp_path / "was")
     save_state(run.run_dir, run.state)
     real_append = Journal.append
     failures = iter([OSError(30, "Read-only file system")])
@@ -3101,16 +3101,67 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
 
     with pytest.raises(OSError):
         runs.restamp_code_root(run.run_dir, now)
-    assert load_state(run.run_dir).repo_root == str(was)  # the move did NOT commit
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now  # the move is durable...
+    assert persisted.code_root_restamp_pending is True  # ...and the record still owed
 
     message = runs.restamp_code_root(run.run_dir, now)  # the retry
 
     assert message is not None
-    assert load_state(run.run_dir).code_root == now
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now
+    assert persisted.code_root_restamp_pending is False
     records = [
         e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
     ]
     assert [r["repo"] for r in records] == [str(now)]  # exactly once, on the retry
+
+
+def test_restamp_code_root_records_no_move_the_state_write_did_not_make(tmp_path, monkeypatch):
+    """The other half of the ordering. A record written AHEAD of `save_state` asserted
+    a completed move that a failed save then never made — the journal said the root
+    changed while state.json still named the old tree, permanently, since the retry
+    would write a second such record. With the record after the persisted move, a
+    failed save leaves nothing behind: no move, no marker, no record, and the retry
+    redoes the whole thing exactly once.
+
+    Ablation: move the `Journal(...).append` above the first `save_state` and this
+    reddens on the record count after the failed call."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    was = tmp_path / "was"
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = str(was)
+    save_state(run.run_dir, run.state)
+    real_save = runs.save_state
+    failures = iter([OSError(28, "No space left on device")])
+
+    def save_once_failing(target, state):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", save_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, now)
+    persisted = load_state(run.run_dir)
+    assert persisted.repo_root == str(was)  # the move did NOT commit...
+    assert persisted.code_root_restamp_pending is False
+    records = lambda: [  # noqa: E731
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert records() == []  # ...so nothing may claim it did
+
+    message = runs.restamp_code_root(run.run_dir, now)  # the retry
+
+    assert message is not None
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now and persisted.code_root_restamp_pending is False
+    assert [r["repo"] for r in records()] == [str(now)]
 
 
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
