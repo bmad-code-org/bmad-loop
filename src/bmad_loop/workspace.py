@@ -199,10 +199,27 @@ def open_unit_workspace(
 
     The worktree is mounted under the run dir (see unit_worktrees_dir), not under
     .git/. A new unit branch is cut from a pinned resolution of ``base``. Existing
-    run-scoped branches reattach at their own pinned tip so earlier landed units
-    remain reachable. Existing story-scoped branches are abandoned-attempt state:
-    commits unique to their named tip are parked under ``attempt-preserve/*``, then
-    the story branch is compare-and-swap reset to the pinned base before remount.
+    story-scoped branches are abandoned-attempt state: commits unique to their
+    named tip are parked under ``attempt-preserve/*``, then the story branch is
+    compare-and-swap reset to the pinned base before remount.
+
+    Existing run-scoped branches are cumulative and reattach carrying every unit
+    landed so far — but at a tip *caught up to the pinned base*, not blindly at
+    their own tip. The target can advance while the run branch is unmounted (live
+    policy flips isolation off, a story lands in place on the target, policy flips
+    back), and a remount at the stale tip would develop the next unit without that
+    story: ``merge_strategy = "ff"`` then refuses integration, the other strategies
+    merge stale work. Three shapes, decided on pinned shas: the run tip already
+    contains the base — mount as-is; the run tip is an ancestor of the base — the
+    run branch is compare-and-swap fast-forwarded to the base BEFORE the mount, so
+    the mount comes up at the base; the two diverged — mount at the tip and merge
+    the base into the run branch inside the fresh mount. Divergence is the NORMAL
+    serial-unit shape under ``merge_strategy = "squash"`` (the target receives a
+    squash commit that does not contain the run tip), and identical content on both
+    sides merges clean. A conflicting merge is aborted, the just-created mount is
+    dropped, and :class:`verify.GitError` is raised: the run branch tip is unchanged
+    and an operator must reconcile. The returned ``baseline`` is read AFTER that
+    catch-up, so the attempt baseline is the tree the session actually starts from.
 
     Whatever already occupies the deterministic mount path is reclaimed first. If
     it is a registered worktree of ``repo_root`` (an orphan left standing by an
@@ -226,7 +243,8 @@ def open_unit_workspace(
     # Pin every moving input before the first mutation. A story branch is an
     # attempt-local name: reclaim preserves any commits unique to its old tip,
     # then resets it to the requested base with compare-and-swap semantics. A run
-    # branch is cumulative and deliberately keeps its own tip across remounts.
+    # branch is cumulative and keeps its own history across remounts, catching up
+    # to the pinned base below rather than being reset to it.
     pinned_base = verify.rev_parse_revision(repo_root, base)
     branch_tip: str | None = None
     if verify.branch_exists(repo_root, branch):
@@ -273,7 +291,17 @@ def open_unit_workspace(
     # already been safely reset above. Dropping only the worktree frees the checkout
     # that blocks `worktree_add` without introducing a second ref mutation here.
     discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
+    catch_up_base: str | None = None
     if branch_tip is not None:
+        if branch_per == "run" and not verify.is_ancestor(repo_root, pinned_base, branch_tip):
+            if verify.is_ancestor(repo_root, branch_tip, pinned_base):
+                # The base strictly advanced past the run tip: fast-forward the run
+                # branch (compare-and-swap on the pinned tip) so the mount comes up
+                # at the base. No mount holds the branch here — the reclaim above
+                # released it — so the ref move cannot desync a checkout.
+                verify.reset_branch_if_tip(repo_root, branch, pinned_base, branch_tip)
+            else:
+                catch_up_base = pinned_base  # diverged: merge inside the fresh mount
         verify.worktree_add(repo_root, wt, branch, create=False)
         if branch_per == "story":
             try:
@@ -290,12 +318,33 @@ def open_unit_workspace(
                 # must not be reset or deleted by this failure cleanup.
                 discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
                 raise
+        if catch_up_base is not None:
+            try:
+                verify.merge_branch(
+                    wt,
+                    catch_up_base,
+                    strategy="merge",
+                    message=f"Merge {base} ({catch_up_base[:12]}) into {branch}",
+                )
+            except verify.GitError as e:
+                # `merge_branch` has already aborted a merge that started. Drop only
+                # the mount we just created (the run branch keeps its pinned tip)
+                # and refuse: the run branch and the target have diverged in a way
+                # only an operator can reconcile.
+                discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
+                raise verify.GitError(
+                    f"run branch {branch} at {branch_tip[:12]} diverged from {base} at "
+                    f"{catch_up_base[:12]} and the catch-up merge failed; reconcile the "
+                    f"run branch by hand before remounting: {e}"
+                ) from e
     else:
         verify.worktree_add(repo_root, wt, branch, base=pinned_base, create=True)
     # A story checkout was already verified against the pinned base above.  Do
     # not re-read its symbolic HEAD after that boundary: a rival ref move in this
     # final window would record unverified history as the attempt baseline even
-    # though the mounted index and files still represent ``pinned_base``.
+    # though the mounted index and files still represent ``pinned_base``. A run
+    # checkout is read here, AFTER the fast-forward/merge catch-up above, so the
+    # baseline is the tree the session actually starts from.
     baseline = pinned_base if branch_per == "story" else verify.rev_parse_head(wt)
     return UnitWorkspace(
         workspace=Workspace(root=wt, paths=paths.rebased(wt)),

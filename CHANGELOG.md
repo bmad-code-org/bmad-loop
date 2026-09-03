@@ -258,6 +258,16 @@ breaking changes may land in a minor release.
   plain directory is never read as a worktree (git run there would address the project
   checkout), and a failed capture refuses the remount and leaves the orphan standing.
 
+- **A `branch_per = "run"` remount catches the run branch up to the pinned base.** An
+  existing run branch reattached at its own tip and ignored `pinned_base`, so when the target
+  advanced while the run branch was unmounted (a story landed in place, then isolation flipped
+  back) the next unit developed without that story — `merge_strategy = "ff"` then refused the
+  integration and the other strategies merged stale work. The run branch is now
+  compare-and-swap fast-forwarded before the mount when its tip is an ancestor of the base,
+  and a diverged base (the normal serial shape under `squash`) is merged into the fresh mount;
+  a conflicting catch-up aborts, drops the mount, leaves the run tip unchanged, and raises for
+  an operator to reconcile. The attempt baseline is read after the catch-up.
+
 - **The TUI escalation modal reads the spec, story context and sentinel the re-arm will
   write.** `_paused_spec` / `_paused_spec_root` anchored on the recorded `state.project`
   while `_do_rearm` flips the copy under the live project, so a run opened from a moved
