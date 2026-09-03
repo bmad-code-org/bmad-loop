@@ -2958,6 +2958,76 @@ def test_live_spec_root_still_confines_the_live_spec_path(tmp_path):
     assert spec_path.is_relative_to(spec_root)  # the confined arm stays reachable
 
 
+def test_rearm_rollback_confines_the_undo_to_the_live_root_after_a_rename(tmp_path, monkeypatch):
+    """The undo has to confine against the root its own forward writers confined against.
+
+    `_restore_rearmed_spec` picks between the component-walking confined writer and the
+    plain no-follow one on a LEXICAL `is_relative_to(confine_root)`, and it derived that
+    root from `task_spec_root` — the RECORDED project spelling, which nothing re-stamps.
+    The three writes it undoes (the status flip, the `## Auto Run Result` strip and the
+    baseline re-stamp) all pass `live_spec_root(task, state, live_project)`, and the path
+    itself is `live_spec_path`. Un-renamed those two roots are the same string, which is
+    why every pre-existing `_restore_rearmed_spec` row stayed green either way: they all
+    call `rearm_escalation` WITHOUT `project_root`, so the whole dimension was uncovered.
+    Rename the project and they diverge — the live path is not under the recorded root,
+    the predicate goes False, and the undo takes the UNCONFINED arm on exactly the spec
+    its siblings just wrote through the confined one.
+
+    Nothing downstream can see that: the right file gets the right bytes and the record
+    still says `restored`. What is lost is #593's O_NOFOLLOW walk of the PARENT
+    components — `follow_symlinks=False` covers only the final one — so the invariant is
+    asserted directly, at the seam, the same way
+    `test_live_spec_root_still_confines_the_live_spec_path` grades the forward half.
+
+    The spies go on the `runs` namespace because that is where the call site reads them:
+    `runs` binds both writers with `from .platform_util import ...`, so patching here
+    reaches `_restore_rearmed_spec` and CANNOT reach the forward writers, which hold
+    their own bindings in `verify`, `frontmatter` and `devcontract`. The recorded call
+    list is therefore the undo's alone.
+
+    The byte comparison is the second claim rather than a redundant one: it proves the
+    spy observed a write that actually LANDED, so the writer-identity assertion is not
+    reading a no-op.
+
+    Ablation: revert `confine_root` to `task_spec_root(task, state)` and this reddens on
+    the call list — `[("plain", None)]` instead of the confined arm."""
+    run_dir, _recorded_spec, live_spec, live_project = _renamed_project_pair(tmp_path)
+    before = live_spec.read_bytes()
+    calls: list[tuple[str, Path | None]] = []
+    real_confined = runs.atomic_write_bytes_confined
+    real_plain = runs.atomic_write_bytes
+
+    def spy_confined(path, data, *, confine_root, **kwargs):
+        calls.append(("confined", confine_root))
+        return real_confined(path, data, confine_root=confine_root, **kwargs)
+
+    def spy_plain(path, data, **kwargs):
+        calls.append(("plain", None))
+        return real_plain(path, data, **kwargs)
+
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", spy_confined)
+    monkeypatch.setattr(runs, "atomic_write_bytes", spy_plain)
+
+    def boom(run_dir_, state_):
+        # raised after the flip and the strip have PUBLISHED, so the undo has a real
+        # write to put back and reaches its arm selection
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(
+            run_dir,
+            "1-1-a",
+            isolated_redrive=False,
+            resolution_recorded=False,
+            project_root=live_project,
+        )
+
+    assert calls == [("confined", live_project)]
+    assert live_spec.read_bytes() == before  # the confined write actually landed
+
+
 def test_live_stories_root_follows_the_mount_through_a_project_rename(tmp_path):
     """The READ side's OTHER anchor moves with `live_spec_path`, and the ORDERING is
     what makes it move. `live_stories_root` called `task_stories_root` FIRST, which

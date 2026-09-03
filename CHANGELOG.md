@@ -251,6 +251,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An aborted re-arm's spec rollback confines against the live project root, not the
+  recorded one.** `_restore_rearmed_spec` picked between the confined and plain writers on
+  a lexical `is_relative_to` against `task_spec_root` — the launch-time spelling nothing
+  re-stamps — while the flip, the strip and the baseline re-stamp it undoes all confine
+  against `live_spec_root`. After a project rename the live spec path was not under the
+  recorded root, so the undo silently dropped to the unconfined arm and lost #593's
+  O_NOFOLLOW walk of the parent components (`follow_symlinks=False` guards only the final
+  one) on exactly the specs its siblings had just written through the confined one. The
+  live project root is now threaded through `_rollback_rearm` as a required parameter.
 - **The review-budget rescue and the timeout salvage route on the tree in hand, not on
   live policy.** Both selected on `scm.isolation` alone, so an accepted continuation that
   reopened a recorded mount after a `"worktree" -> "none"` flip took the in-place arm: the

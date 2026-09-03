@@ -3609,7 +3609,11 @@ def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
 
 
 def _restore_rearmed_spec(
-    spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
+    spec_path: Path,
+    original: bytes | None,
+    task: StoryTask,
+    state: RunState,
+    live_project: Path,
 ) -> Literal["restored", "unchanged", "unknown"]:
     """Put back the bytes a re-arm FOUND on the spec, and say what is now on disk.
 
@@ -3655,7 +3659,25 @@ def _restore_rearmed_spec(
     (`frontmatter.set_frontmatter_status` states the rule; `verify.set_frontmatter_field`
     and `devcontract._atomic_write_spec` restate it): under `confine_root`, through the
     component-walking confined helper (#593); outside it, the plain `follow_symlinks=False`
-    write. Calling the confined helper unconditionally looked stricter and was strictly
+    write.
+
+    `confine_root` is the LIVE root — `live_spec_root(task, state, live_project)`, which
+    is `task_spec_root` REBASED onto the tree this gesture is acting in — and `live_project`
+    is a required parameter for that reason rather than an optional one falling back to
+    `task_spec_root`. The three forward writers this undoes all confine against the live
+    root (`rearm_escalation` passes `live_spec_root(task, state, live_project)` to the flip,
+    the strip and the baseline re-stamp), and `spec_path` is itself `live_spec_path`, so
+    reading the RECORDED root here compared the live path against a root it need not sit
+    under. After a project rename the two spellings diverge, the lexical
+    `is_relative_to` goes False, and this undo silently dropped to the plain arm on
+    exactly the specs its own siblings had just written through the CONFINED one — losing
+    #593's O_NOFOLLOW walk of the parent components with no signal, since
+    `follow_symlinks=False` guards only the FINAL component. The observable outcome is
+    otherwise identical (right file, right bytes, `rollback="restored"`), which is why
+    nothing downstream could catch it and why the parity is asserted at this seam. The
+    arm-selection RULE above is unchanged; only the root it compares against is corrected.
+
+    Calling the confined helper unconditionally looked stricter and was strictly
     worse — an artifacts folder configured OUTSIDE both the mount and the project is
     supported configuration (`bmadconfig` resolves one, `verify.spec_within_roots` trusts
     it, `_spec_is_shared_with_the_redrive` treats it as first-class), and there the flip,
@@ -3692,7 +3714,7 @@ def _restore_rearmed_spec(
         # raises `RearmError` if it cannot land, which is the loud outcome the docstring
         # above promises. The cost of being wrong here is one redundant identical write.
         pass
-    confine_root = task_spec_root(task, state)
+    confine_root = live_spec_root(task, state, live_project)
     try:
         if spec_path.is_relative_to(confine_root):
             atomic_write_bytes_confined(
@@ -3720,6 +3742,7 @@ def _rollback_rearm(
     spec_before: bytes | None,
     task: StoryTask,
     state: RunState,
+    live_project: Path,
     error: BaseException,
 ) -> None:
     """Undo an aborted re-arm's spec writes and RECORD that the re-arm aborted.
@@ -3728,6 +3751,12 @@ def _rollback_rearm(
     original fault immediately after, so nothing here may return a verdict or swallow
     one: this function's whole job is to leave the spec's bytes as the re-arm found them
     and put the fact on the run's audit trail.
+
+    `live_project` is threaded straight through to `_restore_rearmed_spec`, which confines
+    against the LIVE (rebased) spec root so the undo validates its write with the same
+    root the forward writers used. The guard's caller already holds it, so this parameter
+    carries the fact rather than re-deriving it — see `_restore_rearmed_spec` for what
+    re-deriving it from `task_spec_root` silently cost after a project rename.
 
     `rollback` goes ON the record, not left to be re-derived, because every reader is
     OUT of process: `rearm_event_notice` renders from a journal line alone, with neither
@@ -3767,7 +3796,7 @@ def _rollback_rearm(
     rollback = "unknown"
     try:
         if spec_path is not None:
-            rollback = _restore_rearmed_spec(spec_path, spec_before, task, state)
+            rollback = _restore_rearmed_spec(spec_path, spec_before, task, state, live_project)
     except BaseException:
         rollback = "failed"
         raise
@@ -4821,7 +4850,7 @@ def rearm_escalation(
         # undoing the spec then would build the mirror image of the defect this guard
         # closes, persisted state re-armed against a spec that is not.
         if not _rearm_commit_landed(run_dir, key, task):
-            _rollback_rearm(journal, key, spec_path, spec_before, task, state, e)
+            _rollback_rearm(journal, key, spec_path, spec_before, task, state, live_project, e)
         raise
     journal.append(
         "story-escalation-resolved",
