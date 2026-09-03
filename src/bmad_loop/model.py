@@ -703,7 +703,9 @@ class RunState:
     # in one step; this flag rides the state write itself, which is what lets a
     # retry tell "moved and recorded" from "moved, record still owed" — the one
     # distinction that keeps the record retryable without ever asserting a move
-    # that was not persisted. Deliberately absent from `documents.py`'s `--json`
+    # that was not persisted. Consumed by whichever surface retries first: a second
+    # `restamp_code_root` writes its own record, and a plain `resume` folds the
+    # move into its `run-resume` line. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)

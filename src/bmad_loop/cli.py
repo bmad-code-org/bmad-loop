@@ -2709,7 +2709,17 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # The `bool(state.repo_root)` guard is what keeps a legacy state.json — written
     # before the field existed, and read back as "" — out of the comparison: it is a
     # missing value, not a divergent one, and the re-stamp migrates it silently.
-    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
+    #
+    # The `code_root_restamp_pending` half is a move `runs.restamp_code_root` already
+    # persisted whose `rearm-code-root-restamped` record never landed: the mirror then
+    # already agrees with config, so the compare alone would read "no move" on the one
+    # gesture that still owes the operator its record and its warning. This resume
+    # CONSUMES that outstanding re-stamp — the retry the marker keeps possible may
+    # arrive through plain `resume` rather than through `resolve`, and a run that
+    # finishes from here would otherwise leave the move unrecorded for good.
+    code_root_changed = (
+        bool(state.repo_root) and state.repo_root != str(paths.repo_root)
+    ) or state.code_root_restamp_pending
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
@@ -2799,6 +2809,10 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
     # migrates a pre-field state.json onto the root it was already using.
     state.repo_root = str(paths.repo_root)
+    # The `run-resume` record above IS the record an outstanding re-stamp owed, so the
+    # marker clears on the same write that persists the resume — never a separate
+    # one, which could land without it and leave the run owing a record it has.
+    state.code_root_restamp_pending = False
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
