@@ -248,6 +248,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A remount parks an orphaned worktree's uncommitted work before reclaiming its path.**
+  `open_unit_workspace` force-removed whatever stood at the deterministic mount path, so the
+  directory an isolation flip had "retained for recovery" lost its tracked edits and
+  run-created files irreversibly (even under `keep_failed = true`) — only commits unique to a
+  story-branch tip were preserved. A registered orphan's dirty state is now snapshotted under
+  `refs/attempt-preserve-dirty/<run>-<head>-orphan` (the family `scm.preserve_keep` already
+  bounds) and journaled as `isolation-flip-orphan-preserved`; a clean orphan parks nothing, a
+  plain directory is never read as a worktree (git run there would address the project
+  checkout), and a failed capture refuses the remount and leaves the orphan standing.
+
 - **The TUI escalation modal reads the spec, story context and sentinel the re-arm will
   write.** `_paused_spec` / `_paused_spec_root` anchored on the recorded `state.project`
   while `_do_rearm` flips the copy under the live project, so a run opened from a moved

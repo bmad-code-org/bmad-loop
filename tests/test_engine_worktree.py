@@ -2986,6 +2986,10 @@ def test_story_remount_does_not_reread_head_after_tip_validation(project, monkey
 
     Ablation: restore ``baseline = rev_parse_head(wt)`` and the injected rival
     move lands between validation and that read, returning the rival as baseline.
+
+    Only reads of the MOUNTED checkout count: the orphan reclaim legitimately reads
+    the first mount's HEAD (at the same path) before ``worktree_add`` to park its
+    uncommitted state, so the spy arms itself on the mount call.
     """
     from bmad_loop.workspace import open_unit_workspace
 
@@ -2996,16 +3000,24 @@ def test_story_remount_does_not_reread_head_after_tip_validation(project, monkey
     old_tip = rev_parse_head(first.path)
     pinned = rev_parse_head(project.project)
     real_head = verify.rev_parse_head
+    real_add = verify.worktree_add
     reads = 0
+    mounted = False
+
+    def arm_on_mount(*a, **k):
+        nonlocal mounted
+        real_add(*a, **k)
+        mounted = True
 
     def move_on_redundant_head_read(repo):
         nonlocal reads
-        if Path(repo).resolve() == first.path.resolve():
+        if mounted and Path(repo).resolve() == first.path.resolve():
             reads += 1
             if reads == 2:
                 git(project.project, "update-ref", f"refs/heads/{first.branch}", old_tip, pinned)
         return real_head(repo)
 
+    monkeypatch.setattr(verify, "worktree_add", arm_on_mount)
     monkeypatch.setattr(verify, "rev_parse_head", move_on_redundant_head_read)
 
     second = open_unit_workspace(*args)
@@ -6379,3 +6391,174 @@ def test_a_replayed_commit_still_records_the_story_close(project, monkeypatch):
     entry = _ledger_entry(project, "DW-1")
     assert entry.status.startswith("done") and not entry.open
     assert "resolution: resolved by story 1-1-a" in entry.body
+
+
+# ------------------------------------------- remount reclaim: orphan preservation
+
+
+def _open_args(project, key="1-1-a", branch_per="story"):
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    return (project.project, project, "test-run", key, "main", branch_per, run_dir)
+
+
+def _dirty_refs(project) -> list[str]:
+    out = git(
+        project.project, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/"
+    )
+    return out.splitlines()
+
+
+def _commit_project(project, message: str) -> str:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", message)
+    return rev_parse_head(project.project)
+
+
+def test_remount_parks_dirty_orphan_before_reclaim(project):
+    """An orphan the isolation flip left standing is force-removed by the remount's
+    reclaim; its UNCOMMITTED state — a tracked edit and a run-created untracked file
+    — is parked under ``refs/attempt-preserve-dirty/<run>-<head>-orphan`` first and
+    the callback names the ref. A second orphaning of the same HEAD probes to
+    ``-r2`` rather than overwriting the first snapshot.
+
+    Ablation: drop the ``_preserve_orphan_state`` call and the remount still
+    succeeds but ``preserved == []`` and no ref holds either file.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    (project.project / "tracked.txt").write_text("v1\n")
+    first, _ = _open_unit(project)  # commits tracked.txt with the sprint board
+    (first.path / "tracked.txt").write_text("edited in the orphan\n")
+    (first.path / "created.txt").write_text("run-created\n")
+    orphan_head = rev_parse_head(first.path)
+
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+
+    assert second.path == first.path and second.path.is_dir()
+    assert (second.path / "tracked.txt").read_text() == "v1\n"  # a fresh checkout
+    assert not (second.path / "created.txt").exists()
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(first.path), ref)]
+    assert verify.ref_exists(project.project, ref)
+    assert git(project.project, "show", f"{ref}:tracked.txt") == "edited in the orphan"
+    assert git(project.project, "show", f"{ref}:created.txt") == "run-created"
+    assert git(project.project, "rev-parse", f"{ref}^") == orphan_head  # parented at HEAD
+    # the family scm.preserve_keep bounds — one ref, keep=1, nothing over budget
+    assert verify.prune_preserve_dirty_refs(project.project, 1) == []
+
+    (second.path / "created.txt").write_text("second orphaning\n")
+    preserved.clear()
+    open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+    assert preserved == [(str(first.path), f"{ref}-r2")]
+    assert git(project.project, "show", f"{ref}:created.txt") == "run-created"  # untouched
+    assert git(project.project, "show", f"{ref}-r2:created.txt") == "second orphaning"
+    assert len(_dirty_refs(project)) == 2  # both in the family preserve_keep bounds
+
+
+def test_remount_over_clean_orphan_parks_nothing(project):
+    """A clean orphan (tree == HEAD) is reclaimed silently: no ref, no callback."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _ = _open_unit(project)
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+    assert second.path == first.path and second.path.is_dir()
+    assert preserved == []
+    assert _dirty_refs(project) == []
+
+
+def test_remount_over_plain_directory_never_snapshots_the_project_tree(project):
+    """The run dir lives INSIDE the project checkout, so a plain (non-worktree)
+    directory at the mount path must not have git run in it: `status`/`add` there
+    would address the PROJECT's own working tree and park the operator's edits as
+    the orphan's. The guard is ``verify.worktree_is_registered``; a failing guard
+    falls through to the reclaim exactly as before.
+
+    Ablation: drop the ``worktree_is_registered`` half of the guard and the dirty
+    project checkout is snapshotted — ``_dirty_refs`` is non-empty and holds
+    ``operator.txt``.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    (project.project / "tracked.txt").write_text("v1\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    plain = run_dir / "worktrees" / "1-1-a"
+    plain.mkdir(parents=True)
+    (plain / "leftover.txt").write_text("rmtree residue\n")
+    # the operator's own uncommitted work in the project checkout
+    (project.project / "tracked.txt").write_text("operator edit\n")
+    (project.project / "operator.txt").write_text("operator untracked\n")
+
+    preserved: list[tuple[str, str]] = []
+    unit = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+
+    assert unit.path == plain.resolve() and unit.path.is_dir()
+    assert not (unit.path / "leftover.txt").exists()  # reclaimed as before
+    assert preserved == []
+    assert _dirty_refs(project) == []
+    # the project tree was neither read as the orphan nor touched
+    assert (project.project / "tracked.txt").read_text() == "operator edit\n"
+    assert (project.project / "operator.txt").read_text() == "operator untracked\n"
+
+
+def test_remount_refuses_when_orphan_snapshot_fails(project, monkeypatch):
+    """A capture failure over a dirty orphan is a gate (#340): the remount raises
+    ``GitError`` and the orphan is left standing, dirty files intact, for manual
+    recovery — never force-removed past work that could not be parked.
+
+    Ablation: swallow the ``snapshot_worktree`` failure in ``_preserve_orphan_state``
+    (``except GitError: return``) and the remount succeeds over the orphan — no
+    ``GitError``, ``created.txt`` gone.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _ = _open_unit(project)
+    (first.path / "created.txt").write_text("run-created\n")
+
+    def boom(*a, **k):
+        raise verify.GitError("commit-tree: disk says no")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", boom)
+
+    with pytest.raises(verify.GitError, match="left standing.*disk says no"):
+        open_unit_workspace(*_open_args(project))
+
+    assert first.path.is_dir()
+    assert (first.path / "created.txt").read_text() == "run-created\n"
+    assert verify.worktree_is_registered(project.project, first.path)
+    assert _dirty_refs(project) == []
+
+
+def test_engine_remount_journals_orphan_preservation(project):
+    """Engine wiring: the orphan snapshot the open parks is journaled as
+    ``isolation-flip-orphan-preserved`` with the worktree and ref, so an operator
+    reading the run's journal can find the recovery ref next to the
+    ``isolation-flip-orphaned-worktree`` record that named the orphan."""
+    orphan, _ = _open_unit(project)
+    (orphan.path / "created.txt").write_text("run-created\n")
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = [
+        e for e in engine.journal.entries() if e["kind"] == "isolation-flip-orphan-preserved"
+    ]
+    assert len(entries) == 1
+    assert entries[0]["story_key"] == "1-1-a"
+    assert entries[0]["worktree"] == str(orphan.path)
+    assert entries[0]["ref"].startswith("refs/attempt-preserve-dirty/test-run-")
+    assert git(project.project, "show", f"{entries[0]['ref']}:created.txt") == "run-created"
