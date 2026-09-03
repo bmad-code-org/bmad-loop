@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 from .adapters.base import SessionSpec
@@ -106,7 +107,7 @@ def _gather_escalations(
     there reaches all three sites at once. Ordering is `reversed(task.sessions)`
     and, within a directory, that constant's own order — result.json before
     escalation.json; a duplicate keeps its FIRST occurrence's position, which is
-    what preserves "newest first". Three guards, each for a defect this reader
+    what preserves "newest first". Four guards, each for a defect this reader
     hit on the way to the operator:
 
     * ``seen_ids`` — ``task.sessions`` is append-only and a re-arm deliberately
@@ -140,8 +141,35 @@ def _gather_escalations(
       own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
       here. The guard belongs in this caller; the shared predicate stays the
       single definition of CRITICAL.
+    * the ``stat`` classification and its ``S_ISREG`` check — deciding ABSENT from
+      UNREADABLE cannot go through ``Path.is_file()``, whose error behavior splits by
+      interpreter. Through 3.13 it re-raises anything outside
+      ``pathlib._IGNORED_ERRNOS`` (ENOENT, ENOTDIR, EBADF, ELOOP), so an artifact under
+      an EACCES directory raised straight out of this observation path and out of
+      ``cmd_resolve`` — the one thing the bullet above promises never happens. On 3.14
+      the body became ``os.path.isfile``, which swallows every error and calls that
+      same artifact ABSENT, so nothing reached ``skipped`` and the caller stamped
+      coverage over escalations it never read. ``stat`` answers with an errno instead:
+      ENOENT and ENOTDIR are genuine absence and stay a bare ``continue`` — the
+      dominant case, since a task dir normally holds only one of these names, and
+      counting it as a skip would withhold coverage from every resolve cycle,
+      permanently. Everything else — EACCES, EIO, ESTALE, EBADF, and now ELOOP — is an
+      artifact that EXISTS and cannot be read, so it joins ``skipped`` under the same
+      shown-side condition. ELOOP changing sides is deliberate, and it is the one
+      reading this switch changes on EVERY interpreter rather than just one: a symlink
+      cycle answered False through 3.13 because ELOOP(40) is IN the ignored tuple, and
+      on 3.14 because ``os.path.isfile`` swallows it too. It is a degrade either way,
+      and this module withholds coverage rather than laundering one into a durable
+      claim. ``Path.stat`` is what makes a single ``except OSError`` enough here:
+      MEASURED as ``OSError`` errno 40 on 3.11, 3.13 and 3.14 alike, unlike
+      ``Path.resolve``, which raises ``RuntimeError`` on a loop under 3.11 and nothing
+      at all under 3.13. ``S_ISREG`` survives the switch because ``is_file()`` answered
+      False for a directory or a FIFO at that path while ``stat`` succeeds on both —
+      without it a directory would reach ``read_text`` as an ``IsADirectoryError``, and
+      a FIFO would BLOCK there forever, wedging the interactive command this reader
+      serves.
 
-    The watermark is a FOURTH concern layered onto that same single walk, not a
+    The watermark is a FIFTH concern layered onto that same single walk, not a
     second pass: ``reversed(task.sessions)`` reaches the unanswered tail first, so
     entries are routed into two content-keyed maps by the record's own index and the
     suppressed count is the answered keys that never appeared in the shown map. Two
@@ -187,7 +215,15 @@ def _gather_escalations(
         task_dir = run_dir / "tasks" / session.task_id
         for fname in TASK_CYCLE_ARTIFACTS:
             fpath = task_dir / fname
-            if not fpath.is_file():
+            try:
+                st = fpath.stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                if skipped is not None and target is found:
+                    skipped.add(str(fpath))
+                continue
+            if not S_ISREG(st.st_mode):
                 continue
             try:
                 doc = json.loads(fpath.read_text(encoding="utf-8"))

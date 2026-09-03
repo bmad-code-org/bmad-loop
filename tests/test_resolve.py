@@ -1,6 +1,7 @@
 """Escalation-resolution: context build, re-arm, spec field writer, session."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from conftest import escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
-from bmad_loop.journal import load_state, save_state
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
@@ -3185,6 +3186,156 @@ def test_gather_escalations_leaves_the_sink_optional(tmp_path):
     _unreadable_artifact(run_dir, task, 0)
 
     assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+
+_POSIX_MODE_BITS = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not deny directory access by mode bits"
+)
+_NOT_ROOT = pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root bypasses mode bits"
+)
+_FIFO = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+@_POSIX_MODE_BITS
+@_NOT_ROOT
+def test_gather_escalations_records_an_artifact_it_cannot_stat(tmp_path):
+    """An artifact that EXISTS and cannot be reached is unreadable, not absent — and
+    which of those the old `Path.is_file()` probe reported depended on the interpreter,
+    so that one line carried two different defects at once. Through 3.13 it re-raises
+    EACCES (not in `pathlib._IGNORED_ERRNOS`), which escaped `build_context` and
+    `cmd_resolve` to `main`'s backstop as `error: [Errno 13] ...`, exit 1 — the exact
+    thing this reader's contract forbids. On 3.14 `is_file()` became `os.path.isfile`,
+    which swallows the error and answers False: the sink stays EMPTY, so the caller
+    reads a clean run, stamps `escalations_resolved_upto = len(task.sessions)`, and the
+    CRITICAL entries under that directory are withheld as already answered FOREVER.
+
+    A real mode-000 parent, never a patched `Path.stat`: on 3.14 `is_file()` reaches
+    `os.stat`, so a mock on the pathlib method is never consulted and the row would
+    pass with the fix ablated — a false green on the one leg the second defect lives on.
+
+    Both names in `TASK_CYCLE_ARTIFACTS` are recorded, which is the honest answer: with
+    the directory unreachable the reader cannot tell which of them was even there.
+
+    The readable sibling is the positive control — the degrade still costs exactly the
+    directory it could not read.
+
+    Ablation: restore `if not fpath.is_file(): continue` outside the `try` and this
+    reddens — on 3.13 with the PermissionError escaping, on 3.14 on an empty sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    task_dir = run_dir / "tasks" / task.sessions[1].task_id
+    task_dir.chmod(0o000)
+    try:
+        skipped: set[str] = set()
+        found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+        assert skipped == {str(task_dir / name) for name in TASK_CYCLE_ARTIFACTS}
+        assert [e["detail"] for e in found] == ["older"]  # the sibling still read
+        assert withheld == 0
+
+        _path, _withheld, unreadable = resolve.build_context(
+            load_state(run_dir), run_dir, key, isolation=""
+        )
+        assert unreadable == len(TASK_CYCLE_ARTIFACTS)  # and it reaches the caller
+    finally:
+        task_dir.chmod(0o755)  # so the sandbox tears down cleanly
+
+
+def test_gather_escalations_treats_a_directory_at_the_artifact_path_as_absent(tmp_path):
+    """`stat` succeeds on a directory where `is_file()` answered False, so the mode
+    check is what keeps the switch behavior-preserving. Without it the directory
+    reaches `read_text`, raises `IsADirectoryError` — an `OSError` — and lands in the
+    sink, which withholds coverage over a path that holds no artifact at all.
+
+    Ablation: drop the `S_ISREG` check and this reddens with the directory in the
+    sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    (run_dir / "tasks" / task.sessions[0].task_id / "result.json").mkdir()
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]  # the real artifact still read
+
+
+@_FIFO
+def test_gather_escalations_does_not_open_a_fifo_at_the_artifact_path(tmp_path):
+    """The dangerous half of the same mode check. `stat` succeeds on a FIFO too, so
+    without `S_ISREG` the walk would `read_text` it — and with no writer that blocks
+    FOREVER, wedging the interactive resolve command rather than failing it. The
+    classification never opens the path, which is why this row asserts through the
+    reader's answer and never reads the FIFO itself.
+
+    Bounded with `SIGALRM`, following `test_diagnostics.py`'s twin: a hang is the
+    failure under test, so it needs a deadline or an ablation wedges the suite instead
+    of reddening it.
+
+    Ablation: drop the `S_ISREG` check and the alarm fires."""
+    import signal
+
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    os.mkfifo(run_dir / "tasks" / task.sessions[0].task_id / "result.json")
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the walk opened the FIFO instead of classifying it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        skipped: set[str] = set()
+        found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_gather_escalations_records_a_symlink_loop_at_the_artifact_path(tmp_path):
+    """The one DELIBERATE behavior change in the switch to `stat`, and the row that
+    grades it. A symlink cycle where an artifact belongs is a degrade — something is
+    there and its contents cannot be reached — but `is_file()` called it ABSENT on
+    every supported interpreter: through 3.13 because ELOOP(40) is IN
+    `pathlib._IGNORED_ERRNOS`, and on 3.14 because `os.path.isfile` swallows it too.
+    Absent costs nothing, so the caller would stamp coverage over a session whose
+    escalations were never read. `stat` raises, and the fault joins the skip sink.
+
+    MEASURED rather than argued, because the analogy nearby is a trap: `Path.resolve()`
+    on a loop raises `RuntimeError` — NOT an `OSError` — on 3.11 and raises nothing at
+    all on 3.13, so an arm catching `OSError` around IT would be inert. `Path.stat()`
+    is a syscall-level error and was probed uniform on 3.11.13, 3.13.14 and 3.14.6:
+    `OSError` errno 40 on all three, which is what makes one `except OSError` arm
+    enough. The premise below is asserted for the same reason.
+
+    The readable sibling is the positive control, and unlike the EACCES row this one
+    reddens identically on every leg — the pre-fix answer was False everywhere.
+
+    Ablation: restore `if not fpath.is_file(): continue` outside the `try` and this
+    reddens on an empty sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    task_dir = run_dir / "tasks" / task.sessions[1].task_id
+    loop = task_dir / "result.json"
+    partner = task_dir / "result.json.cycle"
+    loop.symlink_to(partner)
+    partner.symlink_to(loop)
+    # The premise, MEASURED: the probe this fix replaced reported the cycle as absent,
+    # which is precisely the reading being changed.
+    assert not loop.is_file()
+
+    skipped: set[str] = set()
+    found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(loop)}
+    assert [e["detail"] for e in found] == ["newer", "older"]  # the siblings still read
+    assert withheld == 0
+
+    _path, _withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert unreadable == 1  # and it reaches the caller that decides coverage
 
 
 def test_build_context_reports_the_unreadable_artifact_count(tmp_path):

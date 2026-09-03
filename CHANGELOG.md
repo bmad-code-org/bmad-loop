@@ -232,6 +232,23 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An artifact the escalation walk cannot stat is recorded as unreadable rather than absent**
+  (DW-11). `resolve._gather_escalations` classified each task-cycle artifact with
+  `Path.is_file()` outside its guard, and that probe's answer to EACCES splits by interpreter.
+  Through 3.13 it re-raises anything outside `pathlib._IGNORED_ERRNOS`, so an artifact under an
+  unreadable directory escaped `build_context` and `cmd_resolve` to the top-level backstop as
+  `error: [Errno 13] ...` — a read fault ending the interactive command this reader's contract
+  says it must survive. On 3.14, where the body became `os.path.isfile`, the same fault was
+  swallowed as absence instead: the skip sink stayed empty, so the caller recorded coverage and
+  `escalations_resolved_upto` withheld every CRITICAL entry under that directory permanently.
+  Classification is now `stat`, which answers with an errno — ENOENT and ENOTDIR are genuine
+  absence and still cost nothing, while EACCES, EIO, ESTALE and EBADF join the shown-side skip
+  sink. ELOOP moves with them — the one reading that changes on every interpreter rather than
+  one, since a symlink cycle answered False through 3.13 (ELOOP is in the ignored tuple) and on
+  3.14 (`os.path.isfile` swallows it): a degrade withholds coverage rather than being laundered
+  into a durable claim. The regular-file check stays, because `stat` succeeds where `is_file()`
+  answered False — without it a directory at an artifact path would raise `IsADirectoryError`,
+  and a FIFO would block the read forever, wedging the interactive command.
 - **An aborted re-arm no longer leaves the spec re-armed against an escalated task**
   (DW-79, DW-83, DW-85). `runs.rearm_escalation` published the status flip and stripped the
   stale `## Auto Run Result` about 250 lines before `save_state`, and only two of the aborts
