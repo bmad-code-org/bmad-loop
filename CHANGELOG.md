@@ -255,6 +255,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`bmad-loop stop` no longer retries forever on an engine whose identity cannot be
+  read.** The rival-engine compare under the state lock used the local pid after every
+  declining path had cleared it, so an unchanged pid file with `"unknown"` liveness read
+  as a freshly published rival on every attempt. The compare now uses the pid file as
+  recorded; a rival is a changed file, nothing else.
+
 - Serialize run deletion/archive against resume (DW-94), refusing a newly live
   engine under the per-run lock and preventing a waiting resume from recreating a
   run cleanup already removed.
