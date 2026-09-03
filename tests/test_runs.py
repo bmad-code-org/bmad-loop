@@ -3031,6 +3031,49 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
         assert records[0]["repo"] == str(now)
 
 
+def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_path, monkeypatch):
+    """The record is written AHEAD of the state write, so a failed append leaves the
+    move undone and the retry redoes both. Ordered the other way, `save_state` had
+    already committed the new root when the append failed: `cmd_resolve` returned
+    failure with no durable record, the retry exited at `state.repo_root == new`,
+    and the later `run-resume` line reported `code_root_changed=False` — the exact
+    audit gap this record exists to close, made permanent.
+
+    Ablation: move the `Journal(...).append` back below `save_state` (inside or
+    outside the lock) and the retry reddens on `None`, then on the missing record."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    was = tmp_path / "was"
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = str(was)
+    save_state(run.run_dir, run.state)
+    real_append = Journal.append
+    failures = iter([OSError(30, "Read-only file system")])
+
+    def append_once_failing(self, kind, **fields):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, now)
+    assert load_state(run.run_dir).repo_root == str(was)  # the move did NOT commit
+
+    message = runs.restamp_code_root(run.run_dir, now)  # the retry
+
+    assert message is not None
+    assert load_state(run.run_dir).code_root == now
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert [r["repo"] for r in records] == [str(now)]  # exactly once, on the retry
+
+
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
     """Ablation: move restamp_code_root's load above state_lock and the rival's
     ``crashed`` update is overwritten by the stale snapshot."""
