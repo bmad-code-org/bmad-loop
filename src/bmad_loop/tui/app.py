@@ -1081,7 +1081,14 @@ class BmadLoopApp(App[None]):
         task = self._paused_task(state)
         if task is None or not task.spec_file:
             return None, "", True
-        path = runs.task_spec_path(task, state)
+        # `live_spec_path`, not `task_spec_path`: the anchor is carried onto the
+        # project this dashboard was launched against, the same mapping `_do_rearm`
+        # hands `rearm_escalation`. Anchored on the recorded `state.project` alone, a
+        # run opened from a moved project showed (and validated) the copy under the
+        # old tree — unreadable once that tree is gone, which refused the very re-arm
+        # the live mapping exists for; and when it still exists, the operator reviewed
+        # one spec and re-armed a different, unreviewed one.
+        path = runs.live_spec_path(task, state, self.project)
         try:
             # `errors="replace"` for the same reason `_commit_subject` uses it: a story
             # spec is agent- or human-authored, so an odd byte is a fact about the file,
@@ -1108,18 +1115,23 @@ class BmadLoopApp(App[None]):
         backing both halves: an anchor and a `confine_root` that name different trees do
         not refuse, they silently degrade the write (#593).
 
-        The no-task arm is `Path(state.project)`, NOT `self.project`, so both arms make
-        one claim: the delegate answers from the state the run persisted at launch,
-        while `self.project` is the constructor's `resolve_or_lexical` of the operator's
-        argument, and the two can differ. That arm is currently unreachable from the
-        write path — `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path`
-        before calling `_do_replan`, and `_paused_spec` returns `None` on BOTH of its
-        arms (no task, and a task carrying no `spec_file`) — so this is about not
-        leaving a second claim lying around for a future caller, not a live bug. The
-        no-task arm is the only one reachable here: a task with an empty `spec_file`
-        still answers from `task_spec_root`, which needs no spec to name a tree."""
+        Both arms are carried onto the live project through the one mapping
+        `_paused_spec` uses for the path (`runs.rebase_recorded_project_path`), so the
+        two halves make one claim: the tree the operator opened the dashboard against,
+        spelled by moving the recorded anchor lexically — which for the recorded
+        project itself IS `self.project`. Spelling the no-task arm as `self.project`
+        directly would be the same answer by a second route, and the point of routing
+        both through the mapping is that they cannot drift. That arm is currently
+        unreachable from the write path — `_review_plan_checkpoint`'s `done()`
+        refuses a `None` `spec_path` before calling `_do_replan`, and `_paused_spec`
+        returns `None` on BOTH of its arms (no task, and a task carrying no
+        `spec_file`) — so this is about not leaving a second claim lying around for a
+        future caller, not a live bug. A task with an empty `spec_file` still answers
+        from `task_spec_root`, which needs no spec to name a tree."""
         task = self._paused_task(state)
-        return runs.task_spec_root(task, state) if task else Path(state.project)
+        if task:
+            return runs.live_spec_root(task, state, self.project)
+        return runs.rebase_recorded_project_path(Path(state.project), state, self.project)
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"

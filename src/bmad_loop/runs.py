@@ -3194,11 +3194,14 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
     return mount
 
 
-def _live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
+def live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
     """`task_spec_path` carried onto the tree the caller is acting in.
 
     The pair below is the WRITE side of `rearm_escalation`: the file it flips and
-    re-stamps, and the root every writer confines that edit to. They move together
+    re-stamps, and the root every writer confines that edit to. Public because the
+    TUI's escalation modal is the READ side of that same gesture: it shows and
+    validates the spec `_do_rearm` then flips, so it must anchor on the identical
+    live path or the operator reviews one copy and re-arms another. They move together
     because `task_spec_root` is the confinement claim about the very path
     `task_spec_path` produces — rebasing one alone would hand the writers a path
     outside their own root, and all four of them answer that by silently dropping to
@@ -3207,9 +3210,9 @@ def _live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Pat
     return rebase_recorded_project_path(task_spec_path(task, state), state, project_root)
 
 
-def _live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path:
+def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path:
     """`task_spec_root` carried onto the tree the caller is acting in — the confine
-    root for the path `_live_spec_path` names. See there."""
+    root for the path `live_spec_path` names. See there."""
     return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
@@ -4174,7 +4177,7 @@ def rearm_escalation(
     # proof the tree is untouched.
     try:
         if task.spec_file:
-            spec_path = _live_spec_path(task, state, live_project)
+            spec_path = live_spec_path(task, state, live_project)
             # Stories mode only: a fixed-slug pre-planning-halt sentinel
             # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
             # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -4384,7 +4387,7 @@ def rearm_escalation(
                     flipped = verify.set_frontmatter_status(
                         spec_path,
                         target_status,
-                        confine_root=_live_spec_root(task, state, live_project),
+                        confine_root=live_spec_root(task, state, live_project),
                     )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
@@ -4491,7 +4494,7 @@ def rearm_escalation(
                     # as it found it — a stripped result section on a spec the re-arm then
                     # refused would be the one edit nothing else records.
                     devcontract.strip_auto_run_result(
-                        spec_path, confine_root=_live_spec_root(task, state, live_project)
+                        spec_path, confine_root=live_spec_root(task, state, live_project)
                     )
                 except verify.FrontmatterWriteError as e:
                     # The spec reads fine but carries `status:` in a shape no line
@@ -4659,7 +4662,7 @@ def rearm_escalation(
         # block also returns `False` from both writers. That shape is caught by the flip's
         # `flipped` check above and, here, by `overwritten` staying empty.
         if task.spec_file:
-            spec_path = _live_spec_path(task, state, live_project)
+            spec_path = live_spec_path(task, state, live_project)
             if not spec_path.is_file():
                 # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
                 # made the two #640 legs shadow each other: on a project that is not a
@@ -4694,7 +4697,7 @@ def rearm_escalation(
                         spec_path,
                         "baseline_revision",
                         task.baseline_commit,
-                        confine_root=_live_spec_root(task, state, live_project),
+                        confine_root=live_spec_root(task, state, live_project),
                     )
                 except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                     # FrontmatterWriteError joins the tuple rather than getting its own
