@@ -1020,20 +1020,35 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
 
 def mark_seen_again_many(
     path: Path, dw_ids: Sequence[str], date: str, note: str
-) -> tuple[list[bool], str | None]:
+) -> tuple[list[bool], str | None, list[str]]:
     """Stamp `seen-again: <date> (<note>)` under each entry's status line, in ONE
-    read and ONE atomic write. Returns one applied flag per id, plus the text it
-    published — None when it wrote nothing (every id missing, or already carrying
-    this exact line).
+    read and ONE atomic write. Returns one applied flag per id, the text it
+    published — None when it wrote nothing — and the ids whose match went STALE
+    inside the hold.
 
     The writer half of the format doc's dedupe rule (deferred-work-format.md): a
     finding that matches an existing entry is recorded as a sighting on that
     entry, never as a duplicate entry. Idempotent per (id, date, note): a replay
     stamping the same line is skipped, so a flag reads "this call inserted it",
-    not "the line is there". A missing id is False rather than an error — the
-    caller matched against a snapshot, and a rival may have archived the entry
-    since. A missing ledger applies nothing and takes no lock, like
-    :func:`mark_done_many`'s absent-file arm.
+    not "the line is there".
+
+    ⚠️ The two ways a flag can be False are NOT interchangeable, which is why the
+    stale ids come back separately. A replay whose line is already present has a
+    live sighting on a live entry and must file nothing. An id that is missing or
+    NO LONGER OPEN has no sighting anywhere: the caller matched it against a
+    snapshot read before this lock and a rival closed or archived it in between,
+    so its finding is recorded work again rather than a duplicate and the caller
+    must file it. Stamping a done entry instead — while the caller, having already
+    excluded the finding from its append, files nothing — drops the recurrence in
+    silence, which is the whole reason the recheck happens inside the hold and not
+    against the caller's snapshot.
+
+    ``entry.open``, not ``not entry.done``: a status the format cannot parse is
+    neither, and the only question here is whether this is still the open entry
+    the caller matched — so the predicate has to be the one the caller used.
+
+    A missing ledger applies nothing, takes no lock, and reports every id stale,
+    like :func:`mark_done_many`'s absent-file arm.
 
     ONE locked read->edit->write (#286/#469): each insert lands on the text the
     previous one produced (:func:`_find_entry` re-parses the evolving text, so
@@ -1045,27 +1060,32 @@ def mark_seen_again_many(
     _require_iso_date(date)
     line = f"seen-again: {date} ({_one_line(note)})"
     if not dw_ids:
-        return [], None
+        return [], None, []
     if not path.is_file():
-        return [False for _ in dw_ids], None
+        return [False for _ in dw_ids], None, list(dw_ids)
     with ledger_lock(path):
         if not path.is_file():
-            return [False for _ in dw_ids], None
+            return [False for _ in dw_ids], None, list(dw_ids)
         text = path.read_text(encoding="utf-8")
         applied: list[bool] = []
+        stale: list[str] = []
         for dw_id in dw_ids:
             entry = _find_entry(text, dw_id)
-            if entry is None or line in entry.body:
+            if entry is None or not entry.open:
+                applied.append(False)
+                stale.append(dw_id)
+                continue
+            if line in entry.body:
                 applied.append(False)
                 continue
             text = _insert_after_status(text, entry, line)
             applied.append(True)
         if not any(applied):
-            return applied, None
+            return applied, None, stale
         atomic_write_text(path, text)
         # Returned from INSIDE the hold: this is the published text by
         # construction, not a read-back that a rival could have moved.
-        return applied, text
+        return applied, text, stale
 
 
 _MARK_DONE_TAIL_RE = re.compile(
