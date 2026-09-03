@@ -3164,6 +3164,64 @@ def test_restamp_code_root_records_no_move_the_state_write_did_not_make(tmp_path
     assert [r["repo"] for r in records()] == [str(now)]
 
 
+@pytest.mark.parametrize("retry_root", ["was", "third"])
+def test_restamp_code_root_discharges_the_owed_record_before_moving_again(
+    tmp_path, monkeypatch, retry_root
+):
+    """The owed record names the root the MARKER still describes, not the retry's.
+
+    `code_root_restamp_pending` is a bare bool: the only surviving description of the
+    root an unlanded record was owed for is `state.repo_root` itself. An operator whose
+    record-append failed, and who then re-points the root AGAIN before retrying —
+    restoring the original, or moving to a third tree — would otherwise have the owed
+    root overwritten and its record lost forever, leaving the move with no durable
+    trace on any surface. Both existing failure-path tests retry with the SAME root,
+    where the owed root and the retry's root coincide and the loss cannot show.
+
+    Ablation: drop the `if state.code_root_restamp_pending:` discharge append ahead of
+    `state.repo_root = new` and this reddens on the record list — only the retry's own
+    root is recorded and the owed one is gone."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    was = tmp_path / "was"
+    owed = tmp_path / "owed"
+    owed.mkdir()
+    again = was if retry_root == "was" else tmp_path / "third"
+    run.state.repo_root = str(was)
+    save_state(run.run_dir, run.state)
+    real_append = Journal.append
+    failures = iter([OSError(30, "Read-only file system")])
+
+    def append_once_failing(self, kind, **fields):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, owed)
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == owed  # the move is durable, its record owed
+    assert persisted.code_root_restamp_pending is True
+
+    message = runs.restamp_code_root(run.run_dir, again)  # the root moves AGAIN
+
+    assert message is not None
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == again
+    assert persisted.code_root_restamp_pending is False
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    # The owed root is discharged FIRST, under its own name, and the second move
+    # gets its own row — one record per move, neither of them lost.
+    assert [r["repo"] for r in records] == [str(owed), str(again)]
+    assert all(r["code_root_changed"] is True for r in records)
+
+
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
     """Ablation: move restamp_code_root's load above state_lock and the rival's
     ``crashed`` update is overwritten by the stale snapshot."""

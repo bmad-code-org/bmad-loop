@@ -334,6 +334,14 @@ breaking changes may land in a minor release.
   fire even though the re-stamped mirror already agrees with config, and clears the
   marker on the same write that persists the resume.
 
+- **An owed code-root re-stamp record survives a second move of the root.** The pending
+  marker is a bare flag, so the root a failed record was owed for is described only by
+  the run's own `repo_root`. An operator who re-pointed the root again — restoring the
+  original or moving to a third tree — before retrying had that value overwritten, and
+  the earlier move's record could never be written. The retry now discharges the owed
+  record under the root the marker still names before taking the new one, so every move
+  keeps its own journal row.
+
 - **The journal-kind inventory no longer misses a kind passed POSITIONALLY to a declared
   dynamic-kind position.** The scan read `node.keywords` only, so
   `_close_bundle_ledger_when_spec_status(task, spec, status, "new-kind")` — legal Python,

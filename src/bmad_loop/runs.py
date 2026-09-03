@@ -4105,13 +4105,30 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         if state.repo_root == new and not state.code_root_restamp_pending:
             return None
         if state.repo_root != new:
+            # Discharge an OWED record before the root it names is overwritten.
+            # The marker is a bare bool, so the only surviving description of the
+            # root an unlanded record was owed for is `state.repo_root` itself:
+            # once this call re-points it, a record for the previous tree can
+            # never be written again. An operator who re-points the root a SECOND
+            # time before retrying would otherwise lose that record silently.
+            # Ordering is the same at-least-once bargain the append below keeps:
+            # nothing has been written or cleared yet, so an append that fails
+            # here leaves the root and the marker exactly as the retry needs them.
+            if state.code_root_restamp_pending:
+                Journal(run_dir).append(
+                    "rearm-code-root-restamped",
+                    repo=state.repo_root,
+                    code_root_changed=True,
+                )
             moved = bool(state.repo_root)
             state.repo_root = new
             # The move and its intent marker land in ONE atomic state write: a
             # save that fails here changes nothing on disk, so the retry simply
             # redoes it, and a save that succeeds has durably recorded that a
             # record is now owed. The migration of an empty (pre-field) root is
-            # not a move and owes nothing.
+            # not a move and owes nothing. The marker carries forward rather than
+            # clearing: the discharge above settled the PREVIOUS root's debt, and
+            # this write opens the new one's.
             state.code_root_restamp_pending = moved
             save_state(run_dir, state)
         # Either this call moved the root, or an earlier call moved it and its
