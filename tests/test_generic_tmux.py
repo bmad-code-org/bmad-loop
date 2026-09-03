@@ -4838,6 +4838,57 @@ def test_marker_readback_without_launch_capture_fails_closed(tmp_path, monkeypat
     assert rj is not None and rj["park_asserted"] is False
 
 
+def test_marker_path_key_falls_back_when_resolve_raises_runtime_error(tmp_path):
+    """`Path.resolve()` on a symlink loop raises RuntimeError on the 3.11 support
+    floor — NOT an OSError — and raises nothing at all on 3.13. So a real loop cannot
+    exercise the fallback on the dev interpreter, and a `except OSError:` guard is
+    inert on the floor: the fault is injected here instead, so the row means the same
+    thing on every interpreter CI runs.
+
+    Ablation: narrow the guard back to `except OSError:` and this reddens on both
+    interpreters, on the RuntimeError escaping the key builder."""
+
+    class LoopedPath(type(Path())):
+        def resolve(self, strict=False):
+            raise RuntimeError("Symlink loop from 'a.md'")
+
+    looped = LoopedPath(tmp_path / "impl" / "a.md")
+    assert GenericDevAdapter._marker_path_key(looped) == str(looped.absolute())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs a privilege")
+def test_launch_capture_survives_a_looped_artifact_symlink(tmp_path, monkeypatch):
+    """One looped `*.md` under the artifact dir is one unreadable marker, not an
+    aborted launch. Every unpinned dev session (no `expected_spec`) globs the whole
+    directory here, before the transport starts, so a stray loop used to block the
+    run outright on 3.11. The loop entry is captured as `None` (`read_text` raises
+    ELOOP on every interpreter) and the readable spec beside it is still captured.
+
+    Non-vacuous only on the floor: 3.13 resolves the loop silently, so the abort
+    this guards against cannot be produced there. Its sibling above injects the
+    RuntimeError directly for that reason."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nFinished.\n"
+    )
+    (impl / "a.md").symlink_to("b.md")
+    (impl / "b.md").symlink_to("a.md")
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+
+    adapter.start_session(_dev_spec(tmp_path))  # must not raise
+
+    captured = adapter._launch_auto_run_results["3-1-dev-1"]
+    assert captured is not None  # the directory enumeration itself completed
+    # both loop members are unreadable markers; the real spec beside them survives
+    assert list(captured.values()).count(None) == 2
+    assert [fp for fp in captured.values() if fp is not None] == [
+        devcontract.auto_run_result_fingerprint((impl / "spec-3-1-foo.md").read_text())
+    ]
+
+
 def test_launch_capture_precedes_transport_that_writes_park_marker(tmp_path, monkeypatch):
     """A child that finishes during transport startup still owns its new marker."""
     adapter, impl = make_dev_adapter(tmp_path)
