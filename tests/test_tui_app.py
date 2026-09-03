@@ -5948,8 +5948,9 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     assert calls == []  # the resume this gesture folds in did NOT fire
     assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
     assert any(
-        "not resuming in this gesture. Commit the corrected spec before resuming — the "
-        "run stays paused and resumable from this screen." in n
+        "not resuming in this gesture. Commit the corrected spec with "
+        "`status: ready-for-dev` before resuming — the run stays paused and resumable "
+        "from this screen." in n
         for n in notes
     )
     # the record that proved it still renders, and its warning sibling did not hold
@@ -6029,8 +6030,9 @@ async def test_escalation_rearm_hold_names_the_holding_record_s_own_remedy(
     held = [n for n in notes if "not resuming" in n]
     assert len(held) == 1
     assert (
-        "not resuming in this gesture. Check the recorded spec path before resuming — "
-        "the run stays paused and resumable from this screen." == held[0]
+        "not resuming in this gesture. Restore the recorded spec path with "
+        "`status: ready-for-dev` before resuming — the run stays paused and resumable "
+        "from this screen." == held[0]
     )
     # the remedy the record CANNOT have: the holding arm proves the path is not a file
     assert "commit the corrected spec" not in held[0].lower()

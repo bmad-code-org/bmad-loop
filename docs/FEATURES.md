@@ -118,7 +118,10 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   blocked. They now stop after the re-arm — the story stays armed, `bmad-loop resume <run-id>` picks
   it up once the correction lands, and `--resume` does not override it, since the record is written
   on proof rather than suspicion. Each surface names the HELD record's own remedy rather than one
-  hardcoded literal, because the holding records do not share one: this one asks you to commit, while
+  hardcoded literal, because the holding records do not share one. Each remedy also names the
+  `status:` the re-drive routes on, so a correction that lands byte-correct but still terminal cannot
+  burn the escalation a second time — the sentinel remedy below renders that clause on the same
+  contract, and empty, since its leg has no spec status at all. This one asks you to commit, while
   its in-place arm — isolation edited to `none` while the story was escalated, so the re-arm's writes
   went into the escalated attempt's worktree and the re-drive now reads the main checkout — asks you
   to correct the spec in the MAIN checkout, where committing is not the remedy and naming a branch
@@ -136,11 +139,11 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   keyed on the record's flags rather than on its kind. `rearm-spec-flip-skipped` is journalled with
   `refused = spec_path.is_file() and write_reaches_the_redrive`, so the arm that reaches the re-drive
   without being refused proves the recorded spec path is not a readable file here — the re-drive
-  reads that same path and sees the escalated attempt's status, futile on the same proof as the two
-  above, and it reaches this arm from BOTH re-drive modes. Its remedy is to check the recorded path,
-  never to commit: the arm's own condition means there is no corrected spec at that path to commit,
-  and the path can be a shared artifact directory outside the project that is not a repository at
-  all. The refused arm raises rather than resuming, so there is no gesture left to hold, and the
+  reads that same path and finds no spec there to route on, futile on the same proof as the two
+  above, and it reaches this arm from BOTH re-drive modes. Its remedy is to restore the recorded
+  path carrying the status the re-drive routes on, never to commit: the arm's own condition means
+  there is no corrected spec at that path to commit, and the path can be a shared artifact directory
+  outside the project that is not a repository at all. The refused arm raises rather than resuming, so there is no gesture left to hold, and the
   remaining arm carries no imperative of its own — `rearm-spec-write-unreachable` holds that leg.
   The whole re-arm is one **transaction**, and what it covers is stated narrowly: the SPEC's
   BYTES, from the first spec write to `save_state`. That save is the commit point — until it

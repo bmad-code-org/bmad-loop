@@ -5285,7 +5285,7 @@ def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     established that the committed spec does not carry the status the re-drive routes
     on, so resuming on it is futile rather than risky: step-01 halts blocked on
     `unrecognized status in existing story file` and the escalation is spent. Its
-    next_step already read "commit the corrected spec before resuming" while both
+    next_step already read "commit the corrected spec ... before resuming" while both
     default surfaces resumed in the same breath.
 
     The advisory kinds must NOT hold. `stale-restore-commits` is the record
@@ -5327,8 +5327,8 @@ def test_rearm_holds_the_resume_on_the_flip_no_repair_here_can_reach():
     same way the two kinds above do: `refused = spec_path.is_file() and
     write_reaches_the_redrive`, so reaching-and-not-refused means the flip addressed the
     copy the re-drive reads AND that path is not a readable file here — the re-drive
-    reads the same path and sees the escalated attempt's status. That arm's next_step
-    says "check the recorded spec path BEFORE RESUMING", which was a lie on the two
+    reads the same path and finds no spec there to route on. That arm's next_step says
+    "restore the recorded spec path ... BEFORE RESUMING", which was a lie on the two
     surfaces that re-arm and resume in one gesture.
 
     The other two arms must not hold, and keying on the bare kind would have taken them
@@ -5351,6 +5351,176 @@ def test_rearm_holds_the_resume_on_the_flip_no_repair_here_can_reach():
     )
     # a pre-`reaches_redrive` record proves nothing and must not be re-classified
     assert runs.rearm_holds_the_resume(entry) is False
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {
+                "kind": "rearm-spec-write-unreachable",
+                "spec_file": "wt/specs/s1.md",
+                "status": "ready-for-dev",
+                "redrive": "in-place",
+            },
+            "Correct the spec in the main checkout with `status: ready-for-dev` " "before resuming",
+        ),
+        (
+            {
+                "kind": "rearm-spec-write-unreachable",
+                "spec_file": "wt/specs/s1.md",
+                "status": "in-review",
+                "target_branch": "main",
+                "redrive": "isolated",
+            },
+            "Commit the corrected spec on `main` with `status: in-review` before resuming",
+        ),
+        (
+            {
+                "kind": "rearm-spec-flip-skipped",
+                "spec_file": "/srv/artifacts/specs/s1.md",
+                "status": "ready-for-dev",
+                "refused": False,
+                "reaches_redrive": True,
+                "redrive": "isolated",
+            },
+            "Restore the recorded spec path with `status: ready-for-dev` before resuming",
+        ),
+        (
+            {
+                "kind": "rearm-upstream-write-unreachable",
+                "stories_root": "/proj/docs/stories",
+                "target_branch": "main",
+                "status": "ready-for-dev",
+            },
+            "Commit the corrected SPEC.md / stories.yaml on `main` with "
+            "`status: ready-for-dev` before resuming",
+        ),
+    ],
+    ids=[
+        "write-unreachable-in-place",
+        "write-unreachable-isolated",
+        "flip-skipped-holding",
+        "upstream-write-unreachable",
+    ],
+)
+def test_holding_remedies_name_the_status_the_redrive_routes_on(entry, expected):
+    """Every remedy that HOLDS the resume must name the status it has to leave behind.
+
+    The hold buys the operator one gesture before the re-drive reads the tree, and
+    routing is decided by the spec's frontmatter status alone: a spec with none HALTs
+    the re-driven session on `unrecognized status in existing story file`, and one
+    still carrying the escalated attempt's terminal status routes to "ingest as
+    context, do not resume". So an operator who obeyed a remedy naming only the FILE
+    and the TREE — corrected it in the main checkout, committed it on the pinned
+    branch, put it back at the recorded path — could still spend the escalation on a
+    session that cannot route, having done exactly what they were told. The status is
+    what turns each remedy from necessary into sufficient.
+
+    All FOUR holding arms are graded together, because the gap was identical on each
+    and fixing the cited arm alone would have left it on the rest. The fourth,
+    `rearm-upstream-write-unreachable`, renders the clause on the same idiom as its
+    siblings so the remedies stay one uniform contract; it is graded here on a
+    constructed entry that CARRIES a status, which is what pins the interpolation
+    itself. On the leg its producer actually emits the clause is empty — that record
+    fires only on the sentinel path, where `_clear_sentinel` deletes the spec and the
+    re-dispatch re-plans from PENDING — and the empty rendering is pinned by the
+    sibling test below, so both halves of that arm's behaviour are held.
+
+    The value is read off the record, never recomputed: the producer writes the
+    `target_status` it tried to flip to, which is `in-review` after a restore and
+    `ready-for-dev` otherwise, and both are pinned here so a hardcoded literal cannot
+    pass.
+
+    Ablation: drop the `{to}` / `_redrive_status_clause(entry)` interpolation from any
+    one arm and that row reddens on the remedy it renders.
+    """
+    assert runs.rearm_holds_the_resume(entry) is True  # all three HOLD; that is the point
+    _severity, _message, next_step = runs.rearm_event_notice(entry)
+    assert next_step == expected
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {
+                "kind": "rearm-spec-write-unreachable",
+                "spec_file": "wt/specs/s1.md",
+                "target_branch": "main",
+                "redrive": "isolated",
+            },
+            "Commit the corrected spec on `main` before resuming",
+        ),
+        (
+            {
+                "kind": "rearm-upstream-write-unreachable",
+                "stories_root": "/proj/docs/stories",
+                "target_branch": "main",
+            },
+            "Commit the corrected SPEC.md / stories.yaml on `main` before resuming",
+        ),
+    ],
+    ids=["write-unreachable-legacy", "upstream-write-unreachable-as-produced"],
+)
+def test_holding_remedy_names_no_status_for_a_record_that_carries_none(entry, expected):
+    """A record with no status must drop the clause, not guess at one.
+
+    Two shapes reach this. A `rearm-spec-write-unreachable` predating the field: the
+    renderer runs out of process from a journal line alone and a journal is read back
+    by later versions, so the migration shape is reachable on a plain upgrade. And
+    EVERY `rearm-upstream-write-unreachable` its producer emits today — that append
+    carries no `status`, because the sentinel leg it fires on has none to carry, so
+    the arm renders exactly the remedy it rendered before the clause was added. This
+    row is what proves the uniformity change is inert on the real record rather than
+    quietly putting a placeholder status in front of an operator.
+
+    Same principle the `target_branch` clause already follows: a remedy that names no
+    value beats one that names a guess, and `status: ?` on an operator's terminal is
+    worse than silence.
+
+    Ablation: default `_redrive_status_clause`'s read to the display placeholder `"?"`
+    and both rows redden on a remedy telling the operator to commit `status: ?`.
+    """
+    _severity, _message, next_step = runs.rearm_event_notice(entry)
+
+    assert next_step == expected
+    assert "status" not in next_step.lower()
+
+
+def test_flip_skipped_holding_message_reports_a_missing_spec_not_a_stale_status():
+    """The holding arm ENTAILS the file is absent, so the message may not claim a status.
+
+    The producer writes `refused = spec_path.is_file() and write_reaches_the_redrive`
+    and this arm is `reaches_redrive and not refused`, which forces `is_file()` False:
+    there is nothing at that path to carry a status. Saying the re-drive "will see the
+    escalated attempt's status" described the ONE thing this arm proves cannot happen,
+    and it contradicted the remedy beside it — an operator told the file is there with
+    the wrong status has no reason to restore it.
+
+    Matched case-insensitively on the negative half: the claim being ablated differs
+    from a benign mention only by its leading capital, and an assertion that a
+    capitalization slipped past would pass for the wrong reason.
+
+    Ablation: restore the "will see the escalated attempt's status" tail and both
+    halves redden.
+    """
+    entry = {
+        "kind": "rearm-spec-flip-skipped",
+        "spec_file": "/srv/artifacts/specs/s1.md",
+        "status": "ready-for-dev",
+        "refused": False,
+        "reaches_redrive": True,
+        "redrive": "isolated",
+    }
+
+    _severity, message, next_step = runs.rearm_event_notice(entry)
+
+    assert "finds no spec there to route on" in message
+    assert "escalated attempt's status" not in message.lower()
+    # the remedy has to stay obeyable with the file MISSING: restore it, do not commit it
+    assert next_step.lower().startswith("restore the recorded spec path")
+    assert "commit" not in next_step.lower()
 
 
 def test_rearm_event_notice_ignores_a_non_mapping_entry():

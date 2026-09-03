@@ -1105,7 +1105,7 @@ class BmadLoopApp(App[None]):
             # The step is PROPAGATED from the record that held (`hold_next_step`) rather
             # than hardcoded. Four records hold and their remedies differ — commit the
             # spec, commit `SPEC.md` / `stories.yaml`, correct the spec in the MAIN
-            # checkout, or check the recorded spec PATH — and the one literal this
+            # checkout, or restore the recorded spec PATH — and the one literal this
             # branch used to print was impossible to follow on two of them. The literal
             # survives only as the fallback for a holding record whose render carries no
             # step at all.

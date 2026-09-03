@@ -3340,7 +3340,10 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
 
     `rearm-spec-write-unreachable` fires only once the re-arm has established that the
     committed spec does not carry the status the re-drive routes on, and its own
-    next_step reads "Commit the corrected spec before resuming". This command printed
+    next_step reads "Commit the corrected spec with `status: <target>` before resuming".
+    It names the target status because a spec committed there still carrying the
+    escalated attempt's terminal one re-wedges the re-drive exactly as an uncommitted
+    correction does. This command printed
     that and then resumed two lines later, so the imperative was already unactionable
     when it rendered — and the interactive resolve agent cannot close the gap either,
     since its skill forbids it from committing. The fresh worktree then checked out the
@@ -3394,7 +3397,7 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
         cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
     )
     out, err = capsys.readouterr()
-    assert "Commit the corrected spec before resuming" in err
+    assert "Commit the corrected spec with `status: ready-for-dev` before resuming" in err
     assert "NOT resuming in this gesture" in out
     assert "bmad-loop resume r1" in out  # the escape hatch, reachable once it is committed
     assert resumed == []  # the gesture stopped; the story stays armed and resumable

@@ -310,6 +310,15 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- **Re-arm hold remedies name the status the re-drive routes on.** All four holding
+  remedies — correct the spec in the main checkout, commit it on the pinned branch,
+  restore it at the recorded path, commit the upstream `SPEC.md` / `stories.yaml` — now
+  name the `status:` the corrected file must carry, so a correction that lands
+  byte-correct but still terminal no longer burns the escalation the hold just bought.
+  The restore remedy also stops claiming the re-drive "will see the escalated attempt's
+  status": that arm fires only when the path holds no readable file, so the re-drive
+  finds no spec there at all.
+
 - **The TUI's re-arm hold now names the remedy of the record that actually held.** Its
   hold branch printed one hardcoded "commit the corrected spec" for all four holding
   records, and two of them cannot be obeyed that way: `rearm-spec-write-unreachable`'s

@@ -5161,6 +5161,35 @@ def _journal_sequence(value: Any) -> tuple[Any, ...]:
     return () if value is None else (value,)
 
 
+def _redrive_status_clause(entry: dict[str, Any]) -> str:
+    """The `status:` a holding record's remedy must leave on the spec, as a next_step
+    clause — `""` for a record that carries no status.
+
+    Three of the four holding remedies end in a spec the re-drive has to ROUTE on, and
+    routing is decided by the frontmatter status alone: step-01 halts blocked on
+    `unrecognized status in existing story file`, and a spec still carrying the
+    escalated attempt's terminal status routes to "ingest as context, do not resume".
+    So an operator who restores or commits the file the record names, byte-correct but
+    still terminal, has obeyed the remedy and burned the escalation anyway — the resume
+    the hold bought them is spent on a session that cannot route. Naming the target
+    here is what makes the remedy sufficient rather than merely necessary.
+
+    All FOUR arms call this, so the remedies stay one uniform contract across both
+    operator surfaces. `rearm-upstream-write-unreachable` is the fourth and renders
+    `""` today, since the sentinel leg it fires on has no spec status at all — see the
+    comment at that arm before concluding the call is dead.
+
+    Read off the record rather than recomputed: the producer writes the very value it
+    tried to flip to (`target_status`, `in-review` after a restore and `ready-for-dev`
+    otherwise), and this renderer runs out of process, from a journal line alone. A
+    record predating the field yields `""` and the clause is dropped, on the same
+    principle the `target_branch` clause follows — a remedy that names no value beats
+    one that names a guess.
+    """
+    status = str(entry.get("status", "") or "")
+    return f" with `status: {status}`" if status else ""
+
+
 def rearm_event_notice(
     entry: dict[str, Any],
 ) -> tuple[Literal["note", "warning"], str, str] | None:
@@ -5257,6 +5286,7 @@ def rearm_event_notice(
         # an ISOLATED one: that was the only shape the producer could journal before the
         # in-place arm existed, so the absent field is a known value, not an unknown.
         spec = entry.get("spec_file", "?")
+        to = _redrive_status_clause(entry)
         if str(entry.get("redrive", "isolated") or "isolated") == "in-place":
             # The mirror shape: `isolation` was edited to `"none"` while the escalation
             # was paused, so the writes went into the mount the escalated attempt
@@ -5271,7 +5301,7 @@ def rearm_event_notice(
                 "escalated attempt's worktree while the re-drive now runs in the main "
                 "checkout — re-apply the correction to the main checkout's copy of the "
                 "spec or the story re-wedges on the escalated attempt's status",
-                "Correct the spec in the main checkout before resuming",
+                f"Correct the spec in the main checkout{to} before resuming",
             )
         # The branch is the half an operator cannot infer: the re-drive cuts its fresh
         # worktree from the run's PINNED target branch, so a correction committed on
@@ -5286,7 +5316,7 @@ def rearm_event_notice(
             f"spec writes ({spec}) land in a tree it discards — the re-driven session "
             "reads the COMMITTED spec, so commit the corrected "
             f"spec{where} or the story re-wedges on the escalated attempt's status",
-            f"Commit the corrected spec{where} before resuming",
+            f"Commit the corrected spec{where}{to} before resuming",
         )
     if kind == "rearm-upstream-write-unreachable":
         # The sentinel counterpart, and ONE remedy rather than the two above: the
@@ -5302,6 +5332,24 @@ def rearm_event_notice(
         root = str(entry.get("stories_root", "?"))
         base = str(entry.get("target_branch", "") or "")
         where = f" on `{base}`" if base else ""
+        # The status clause is rendered here for UNIFORMITY with the other three
+        # holding arms, and on the leg the producer actually emits it renders EMPTY.
+        # That is intended, not an oversight, and it is not dead code: the append at
+        # `rearm-upstream-write-unreachable`'s site carries no `status`, because this
+        # arm fires only on the sentinel path — `_clear_sentinel` DELETES the spec and
+        # the re-dispatch re-plans from PENDING, so `target_status` is not even in
+        # scope there, and `stories.yaml` REJECTS a `status` key outright (a story's
+        # status lives in its story spec). `_redrive_status_clause` answers `""` for a
+        # record carrying no status, so every remedy this arm renders today is
+        # byte-identical to the one it rendered before.
+        #
+        # It stays because the four holding remedies are ONE contract an operator
+        # reads across surfaces, and a reader comparing them must not have to work out
+        # which arm was left out; should this record ever come to carry a status, the
+        # remedy names it without a second fix. Do NOT "simplify" it back out, and do
+        # NOT add a `status` field to the producer to make it fire — that would put a
+        # status on a leg that has none.
+        to = _redrive_status_clause(entry)
         return (
             "warning",
             f"the sentinel was cleared, but the re-drive of this story will mount a "
@@ -5309,7 +5357,7 @@ def rearm_event_notice(
             f"correction in {root} (`SPEC.md` / `stories.yaml`) is uncommitted there, "
             f"so the re-plan reads the same intent that wedged and mints the sentinel "
             "again",
-            f"Commit the corrected SPEC.md / stories.yaml{where} before resuming",
+            f"Commit the corrected SPEC.md / stories.yaml{where}{to} before resuming",
         )
     if kind == "rearm-spec-flip-skipped":
         # ONE kind, TWO outcomes, told apart by the flag the producer writes rather
@@ -5360,9 +5408,8 @@ def rearm_event_notice(
                 "warning",
                 f"the recorded spec for this story ({spec}) could not be re-opened to "
                 f"`{status}` — it is not a readable file from here{mount}, so the "
-                "re-drive reads that same path and will see the escalated attempt's "
-                "status",
-                "Check the recorded spec path before resuming",
+                "re-drive reads that same path and finds no spec there to route on",
+                f"Restore the recorded spec path{_redrive_status_clause(entry)} before " "resuming",
             )
         # No next_step, and deliberately: on this leg there is nothing to do to THIS
         # file. Whether anything is left to do at all is decided by the committed spec,
@@ -5491,9 +5538,11 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     risky, it is futile: the re-drive discards the worktree, mounts a fresh one from
     git, and step-01 reads a status it cannot route — `unrecognized status in existing
     story file` halts it blocked, and the escalation is spent. The record's own
-    next_step already said "commit the corrected spec before resuming"; both default
-    surfaces then resumed in the same breath, which made the imperative unactionable at
-    the moment it rendered. The interactive resolve agent cannot close that gap either
+    next_step already said "commit the corrected spec ... before resuming"; both
+    default surfaces then resumed in the same breath, which made the imperative
+    unactionable at the moment it rendered. It names the target `status:` as well as
+    the branch, because a spec committed there still carrying the escalated attempt's
+    terminal status re-wedges exactly as an uncommitted one does. The interactive resolve agent cannot close that gap either
     — its skill forbids it from committing.
 
     `rearm-upstream-write-unreachable` earns it the same way on the sentinel path,
@@ -5519,12 +5568,14 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     keyed on the record's flags rather than on the bare kind. Its producer writes
     `refused = spec_path.is_file() and write_reaches_the_redrive`, so
     `reaches_redrive and not refused` isolates exactly the leg where the flip addressed
-    the copy the re-drive reads and that path is NOT a readable file here — the
-    re-drive reads the same path and sees the escalated attempt's status. Futile, on
-    the same proof as the two above, and that arm's next_step already says "check the
-    recorded spec path before resuming"; without this it rendered on surfaces that
-    resumed in the same gesture, which is the defect the two kinds above were fixed
-    for. The other two arms must NOT hold: the `refused` arm raises `RearmError` from
+    the copy the re-drive reads and that path is NOT a readable file here — so the
+    re-drive reads the same path and finds no spec there to route on. Futile, on the
+    same proof as the two above, and that arm's next_step says "restore the recorded
+    spec path ... before resuming"; without this it rendered on surfaces that resumed
+    in the same gesture, which is the defect the two kinds above were fixed for. The
+    remedy names the target `status:` too: a file put back at that path still carrying
+    the escalated attempt's terminal status is unroutable for the same reason a missing
+    one is. The other two arms must NOT hold: the `refused` arm raises `RearmError` from
     the producer, so no resume happens at all and holding would be meaningless, and the
     remaining arm carries no next_step because the imperative on that leg belongs to
     `rearm-spec-write-unreachable`, which holds the resume itself.
