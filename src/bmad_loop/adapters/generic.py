@@ -1344,9 +1344,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
     @staticmethod
     def _marker_path_key(path: Path) -> str:
+        # `(OSError, RuntimeError)`, like every other `resolve()` guard in this
+        # package: on the 3.11 support floor a symlink LOOP raises RuntimeError,
+        # not an OSError (3.13 resolves it silently), and a bare `except OSError`
+        # let one looped `*.md` under an artifact dir abort the launch capture —
+        # and with it every unpinned dev session — before the transport started.
         try:
             return str(path.resolve())
-        except OSError:
+        except (OSError, RuntimeError):
             return str(path.absolute())
 
     def _capture_launch_auto_run_results(self, spec: SessionSpec) -> None:

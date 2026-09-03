@@ -248,6 +248,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A looped `*.md` symlink under an artifact dir no longer aborts every unpinned dev
+  session on Python 3.11.** `_marker_path_key`'s `resolve()` guard caught only `OSError`,
+  but a symlink loop raises `RuntimeError` on the support floor (3.13 resolves it
+  silently), so the launch-time marker capture died before the transport started. The
+  guard now catches `(OSError, RuntimeError)` like every other `resolve()` in the package,
+  and the loop entry reads as one unreadable marker.
+
 - **`docs/FEATURES.md` no longer promises a ledger entry the review-budget damping does not
   file.** The bounded-review-loop bullet said a lingering follow-up recommendation is re-filed
   to the deferred-work ledger; `_journal_review_budget_spent` journals the spent budget and
