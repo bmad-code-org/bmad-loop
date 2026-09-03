@@ -41,6 +41,20 @@ def test_run_state_stories_fields_default_and_round_trip():
     assert back.spec_folder == "_bmad-output/epic-1"
 
 
+def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
+    """The intent marker `runs.restamp_code_root` sets between the moved root and its
+    journal record survives the state round trip, and a state.json from before the
+    field existed reads back False — a pre-upgrade run owes no record."""
+    state = _state(repo_root="/code")
+    assert state.code_root_restamp_pending is False
+    state.code_root_restamp_pending = True
+    back = RunState.from_dict(state.to_dict())
+    assert back.code_root_restamp_pending is True
+    d = state.to_dict()
+    del d["code_root_restamp_pending"]
+    assert RunState.from_dict(d).code_root_restamp_pending is False
+
+
 def test_run_state_repo_root_round_trips_and_backs_code_root():
     """The git root a run's code work happens in, persisted because
     `runs.rearm_escalation` runs OUT OF PROCESS from the engine and had only

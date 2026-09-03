@@ -4027,36 +4027,48 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     with state_lock(run_dir):
         state = load_state(run_dir)
         new = str(repo_root)
-        if state.repo_root == new:
+        if state.repo_root == new and not state.code_root_restamp_pending:
             return None
-        moved = bool(state.repo_root)
-        if moved:
-            # Journalled under resume's own field name, and AHEAD of the state write.
-            # This re-stamp aligns the mirror that `cli._resume_paused_run` later
-            # compares against config, so by the time `run-resume` computes
-            # `code_root_changed` the two necessarily agree and it records `false` —
-            # on the one gesture where the root DID move. The ephemeral stderr/toast
-            # the caller prints from the return value is not a record; without this
-            # line the move leaves no durable trace on the re-arm surfaces while
-            # plain `resume` still writes one.
-            #
-            # Record first, because the early return above keys on the persisted
-            # root: an append that failed AFTER `save_state` had committed the move
-            # left a retry with nothing to do and the record never written. Failing
-            # here leaves the mirror untouched, so the retry redoes both; a save that
-            # fails after a successful append costs one duplicate true record on
-            # the retry — at least once, never never. `repo` is dropped by the
-            # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path
-            # never reaches a dump.
-            Journal(run_dir).append(
-                "rearm-code-root-restamped",
-                repo=new,
-                code_root_changed=True,
-            )
-        state.repo_root = new
+        if state.repo_root != new:
+            moved = bool(state.repo_root)
+            state.repo_root = new
+            # The move and its intent marker land in ONE atomic state write: a
+            # save that fails here changes nothing on disk, so the retry simply
+            # redoes it, and a save that succeeds has durably recorded that a
+            # record is now owed. The migration of an empty (pre-field) root is
+            # not a move and owes nothing.
+            state.code_root_restamp_pending = moved
+            save_state(run_dir, state)
+        # Either this call moved the root, or an earlier call moved it and its
+        # record never landed — the marker is what tells those apart from the
+        # ordinary "already agrees" return above.
+        if not state.code_root_restamp_pending:
+            return None
+        # Journalled under resume's own field name. This re-stamp aligns the mirror
+        # that `cli._resume_paused_run` later compares against config, so by the
+        # time `run-resume` computes `code_root_changed` the two necessarily agree
+        # and it records `false` — on the one gesture where the root DID move. The
+        # ephemeral stderr/toast the caller prints from the return value is not a
+        # record; without this line the move leaves no durable trace on the re-arm
+        # surfaces while plain `resume` still writes one. `repo` is dropped by the
+        # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
+        # reaches a dump.
+        #
+        # AFTER the persisted move, never before it: a record written first would
+        # assert a completed move that a failed save then never made. And the
+        # marker is cleared only once the append has returned: an append that
+        # fails leaves it set, so the retry re-enters here and writes the record
+        # the move still owes. The one residual is a clearing save that fails after
+        # a successful append, which costs a duplicate — true — record on the
+        # retry; a duplicate is recoverable from the journal, a missing record and a
+        # false one are not.
+        Journal(run_dir).append(
+            "rearm-code-root-restamped",
+            repo=new,
+            code_root_changed=True,
+        )
+        state.code_root_restamp_pending = False
         save_state(run_dir, state)
-    if not moved:
-        return None
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
