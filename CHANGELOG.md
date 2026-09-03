@@ -271,18 +271,10 @@ breaking changes may land in a minor release.
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
 - **`bmad-loop clean` no longer aborts the whole sweep when one run's state lock is
-  held.** The per-run lock DW-94/DW-93 added to `runs.delete_run`/`archive_run` is new in
-  this branch — on `main` neither took a lock — and its acquisition `OSError` escaped
-  `cmd_clean`'s per-candidate handler, so a single busy run cost the operator the entire
-  report: later candidates were never processed, and runs already mutated (worktrees
-  removed, artifacts trimmed) vanished from a document only emitted after the loop. The
-  contended run is now classified like the lifecycle races beside it — `trimmed` if
-  anything reached it, else `protected` — and the sweep continues. `file_lock` raises a
-  typed `LockUnavailableError` for a failed acquisition, and `clean` acquires
-  non-blocking: `fcntl.flock` never times out, so waiting was unbounded on POSIX, and a
-  lock someone else holds already means what `clean` reports anyway. The error is typed
-  rather than a bare `OSError` so a confinement refusal (`UnconfinedWriteError`, also an
-  `OSError`) is never folded into "left untouched".
+  held.** A busy run used to end the invocation, so later candidates went unprocessed and
+  runs already reclaimed vanished from a report only emitted after the loop. `clean` now
+  takes each run's lock without waiting and records the contended run like the lifecycle
+  races beside it — `trimmed` if anything reached it, else `protected` — then continues.
 
 - **`bmad-loop stop` no longer retries forever on an engine whose identity cannot be
   read.** The rival-engine compare under the state lock used the local pid after every
