@@ -2250,25 +2250,38 @@ def worktree_prune(repo: Path) -> None:
         pass
 
 
+# `git worktree list --porcelain -z` arrived in git 2.36; the 2.34 support floor
+# (Ubuntu 22.04's stock git) rejects the switch outright — `error: unknown switch
+# `z'`, exit 129 (measured in an ubuntu:22.04 container, git 2.34.1). The floor is
+# documented as a SUPPORT floor, not a capability one: no command bmad-loop issues
+# may need more than it, so the NUL parse is gated and the newline parse kept
+# beneath it rather than the floor raised.
+_WORKTREE_LIST_NUL_GIT = (2, 36)
+
+
 def worktree_list(repo: Path) -> list[Path]:
     """Paths of every worktree attached to `repo` (the main checkout first).
 
-    Reads stdout alone through NUL-delimited porcelain so paths may contain
-    newlines and the record parse does not depend on no stderr line ever starting
-    with ``"worktree "``. The advisories measured for
-    #442 — an unknown `core.fsyncMethod` value and its family — do NOT start that
-    way, so the `startswith` filter screens them out and this parse was correct by
-    accident rather than by construction; the filter stays as a second, independent
-    screen."""
+    Reads stdout alone, through NUL-delimited porcelain where git offers it
+    (`_WORKTREE_LIST_NUL_GIT`), so paths may contain newlines and the record parse
+    does not depend on no stderr line ever starting with ``"worktree "``. Below that
+    version — and when git will not say what it is — the newline-delimited parse the
+    floor supports is used instead: the one thing it cannot represent is a newline
+    inside a worktree path, which then reads as a truncated record for that entry
+    alone. The advisories measured for #442 — an unknown `core.fsyncMethod` value
+    and its family — do NOT start with ``"worktree "``, so the `startswith` filter
+    screens them out and this parse was correct by accident rather than by
+    construction; the filter stays as a second, independent screen."""
+    nul = git_below_floor(repo, _WORKTREE_LIST_NUL_GIT) is None
     proc = _run_git(
-        ["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain", *(["-z"] if nul else [])],
         repo,
     )
     if proc.returncode != 0:
         detail = (proc.stdout + proc.stderr).strip()
         raise GitError(f"git worktree list failed in {repo}: {detail}")
     paths = []
-    for field in proc.stdout.split("\0"):
+    for field in proc.stdout.split("\0" if nul else "\n"):
         if field.startswith("worktree "):
             paths.append(Path(field[len("worktree ") :]))
     return paths
