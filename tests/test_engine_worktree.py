@@ -6879,3 +6879,102 @@ def test_run_branch_remount_refuses_a_fast_forward_under_a_foreign_checkout(proj
     assert rev_parse_head(foreign) == old_tip
     assert not first.path.exists()
     assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="win32 strips trailing spaces at the API layer, so the shape cannot be registered",
+)
+def test_branch_checkout_path_keeps_a_foreign_checkouts_trailing_space(project):
+    """The occupancy guard exempts the unit's OWN mount, so the reader must not hand it
+    a foreign path that has been trimmed INTO that spelling.
+
+    `branch_checkout_path` read `for-each-ref --format=%(worktreepath)` through
+    `_git_out`, which returns `stdout.strip()`. A worktree registered at the unit's
+    deterministic mount path PLUS a trailing space came back as the bare mount path,
+    compared EQUAL to `wt` in `_refuse_foreign_checkout`, and was exempted as if it were
+    this unit's own orphan. The ref then moved under a live foreign checkout — files and
+    index left at the old tip — its tree went spuriously dirty, and `worktree add` failed
+    on the held branch anyway: precisely the harm the guard was added to prevent, WITH the
+    guard present. The function's own docstring already promised the opposite ("git's
+    registered spelling, un-canonicalized"), so this is the promise being kept.
+
+    The error could only ever go that unsafe way. `safe_segment` rstrips `". "` from every
+    segment we compose, so our own mount path can never end in whitespace and a spurious
+    REFUSE is unreachable; the negative control below pins that half.
+
+    The shape is produced the same way the two sibling rows above produce a foreign
+    checkout — a deliberate operator `git worktree move` — with a destination one space
+    longer than the mount. git registers and reports that spelling verbatim.
+
+    Three claims, because the first two alone cannot show the harm: the returned spelling
+    keeps its space, it is therefore NOT equal to the mount path, and the remount refuses
+    BEFORE any mutation — the branch tip is unchanged and the foreign checkout still
+    holds it. Pre-fix a `GitError` still arrived (from `worktree add`), which is why the
+    `match=` names the guard's own sentence and the tip assertion stands behind it.
+
+    Ablation: revert the read to `_git_out` and this reddens on the returned spelling,
+    with the unchanged-tip assertion reddening behind it (the exempted branch is reset to
+    the pinned base before `worktree add` refuses).
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    # the unit's own deterministic mount path plus ONE trailing space: the whole point is
+    # that `.strip()` collapses this spelling onto the path the guard exempts
+    foreign = Path(f"{first.path} ")
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    assert foreign.is_dir() and not first.path.exists()
+    (project.project / "advanced.txt").write_text("new base\n")
+    pinned = _commit_project(project, "base advances")
+    assert tip != pinned
+
+    holder = verify.branch_checkout_path(project.project, first.branch)
+
+    assert holder is not None
+    assert str(holder) == f"{first.path} "  # git's registered spelling, verbatim
+    assert holder != first.path  # ...so it is not mistaken for this unit's own mount
+
+    with pytest.raises(verify.GitError, match="would move the branch under that checkout"):
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(foreign) == tip
+
+
+def test_branch_checkout_path_answers_an_ordinary_mount_path_exactly(project):
+    """Negative control for the row above: the un-stripped read must not OVER-refuse.
+
+    Only the single `\\n` that `for-each-ref` frames each record with is removed, never
+    arbitrary whitespace — so an ordinary registered path (the overwhelming majority, and
+    the only shape `safe_segment` can compose) still round-trips to exactly the mount path
+    the guard compares against, and the unit's own checkout stays EXEMPT. A reader that
+    trimmed too little would leave the framing newline on, make every path unequal to its
+    own mount, and turn the guard into a refusal on every ordinary remount.
+
+    `_refuse_foreign_checkout` is called directly rather than through a remount because
+    the exemption is the claim: it returns None on the unit's own mount and raises
+    otherwise, so the call itself is the assertion.
+
+    Ablated TWICE, because "does not raise" passes for every reason:
+
+    * Return `Path(out)` un-trimmed (keep the framing `\\n`) and the equality assertion
+      reddens — the spelling gains a newline.
+    * With that equality assertion ALSO removed, the same ablation still reddens, now on
+      `_refuse_foreign_checkout` raising `GitError` over the unit's own mount. So the
+      negative half is not vacuous: it fails when the function over-refuses.
+    """
+    from bmad_loop.workspace import _refuse_foreign_checkout
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+
+    holder = verify.branch_checkout_path(project.project, first.branch)
+
+    assert holder == first.path  # exact round-trip: no framing left on, nothing eaten
+
+    # the exemption still holds — this raises if the guard over-refuses its own mount
+    _refuse_foreign_checkout(project.project, first.branch, first.path)

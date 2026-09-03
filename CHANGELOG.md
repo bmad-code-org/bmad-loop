@@ -251,6 +251,17 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`branch_checkout_path` keeps a registered worktree path's trailing whitespace.** The
+  reader went through `_git_out`, which returns `stdout.strip()`, so a foreign checkout
+  registered at a unit's own mount path plus a trailing space came back as the bare mount
+  path, compared equal to it, and was exempted by the remount's occupancy guard — the ref
+  then moved under a live foreign checkout, its tree went spuriously dirty, and `worktree
+add` failed on the held branch anyway, which is the harm the guard exists to prevent. A
+  new `_git_raw_out` hands back stdout verbatim alongside the merged diagnostic, and only
+  the single framing newline is removed; `_git_out` and its other callers are unchanged.
+  POSIX-only, and a spurious refusal is unreachable because `safe_segment` rstrips `". "`
+  from every segment we compose. A path ending in `\r` stays indistinguishable under
+  `text=True` universal newlines — an accepted bound, documented at the reader.
 - **An aborted re-arm's spec rollback confines against the live project root, not the
   recorded one.** `_restore_rearmed_spec` picked between the confined and plain writers on
   a lexical `is_relative_to` against `task_spec_root` — the launch-time spelling nothing

@@ -416,6 +416,24 @@ def _git_raw(repo: Path, *args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+def _git_raw_out(repo: Path, *args: str) -> tuple[int, str, str]:
+    """`_git_raw`'s value with `_git_out`'s diagnostic —
+    `(returncode, stdout VERBATIM, (stdout + stderr).strip())`.
+
+    The fourth variant, and it exists for the one shape the other three cannot serve
+    together: a caller whose ANSWER is a path whose own trailing whitespace is
+    significant, and which still has to raise with stderr when git fails. `_git_out`
+    strips the value (silently eating that whitespace) and `_git_raw` drops the
+    diagnostic (so the failure message loses stderr).
+
+    stdout is handed back with its line terminator still on. Trimming that is the
+    caller's job precisely because only the caller knows how much of the tail is
+    framing and how much is data — `.strip()` here would rebuild the very hazard this
+    helper exists to avoid."""
+    proc = _run_git(["git", "-C", str(repo), *args], repo)
+    return proc.returncode, proc.stdout, (proc.stdout + proc.stderr).strip()
+
+
 def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Like `_git`, but hands the VALUE and the DIAGNOSTIC back separately —
     `(returncode, stdout.strip(), (stdout + stderr).strip())`.
@@ -436,7 +454,9 @@ def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple
     this whenever the text is the answer; leave `_git` to the rc-only callers.
     `worktree_clean` and `path_tracked` (#441) predate this helper and spell the same
     split inline against `_run_git`; `_git_raw` is the third variant, for `-z` output
-    whose records can begin with a space and which `.strip()` would corrupt.
+    whose records can begin with a space and which `.strip()` would corrupt, and
+    `_git_raw_out` the fourth, for a value whose trailing whitespace is significant but
+    whose failure message still needs stderr (`branch_checkout_path`).
 
     `env` mirrors `_git_env`, for the snapshot path's throwaway `GIT_INDEX_FILE` and
     synthetic-identity calls that also read a sha back."""
@@ -2163,14 +2183,34 @@ def branch_checkout_path(repo: Path, branch: str) -> Path | None:
     not count). A ref that does not exist also prints nothing; callers that need
     the distinction check `branch_exists` first. The path is git's registered
     spelling, un-canonicalized: compare it the way the caller compares its own.
-    Reads stdout alone (`_git_out`): the value is the answer (#442).
+    Reads stdout alone (`_git_raw_out`): the value is the answer (#442).
+
+    That "un-canonicalized" promise is why this reader does NOT go through `_git_out`,
+    which returns `stdout.strip()`. A worktree registered at a path with TRAILING
+    WHITESPACE — `<mount> ` — came back stripped to `<mount>`, which compares EQUAL to
+    a unit's own mount path, so the occupancy guard exempted a foreign checkout as if
+    it were the unit's own. The ref then moved under a live foreign worktree, its tree
+    went spuriously dirty, and `worktree add` failed anyway: exactly the harm the guard
+    exists to prevent, WITH the guard present. The error can only go that unsafe way —
+    `safe_segment` rstrips `". "` from every segment we compose, so our own mount path
+    can never end in whitespace and a spurious REFUSE is unreachable.
+
+    Only the single trailing `\n` that `for-each-ref` frames each record with is
+    removed, never arbitrary whitespace; an empty answer (`""` or a bare `"\n"`) still
+    means "no worktree has it attached" and returns `None`.
+
+    Accepted bound: `_run_git` runs with `text=True` (universal newlines), so a
+    registered path ending in `\r` arrives already translated and stays
+    indistinguishable from one that does not. Closing that needs a bytes read, which is
+    out of scope here.
     """
-    rc, out, detail = _git_out(
+    rc, out, detail = _git_raw_out(
         repo, "for-each-ref", "--format=%(worktreepath)", f"refs/heads/{branch}"
     )
     if rc != 0:
         raise GitError(f"git for-each-ref refs/heads/{branch} failed in {repo}: {detail}")
-    return Path(out) if out else None
+    path = out.removesuffix("\n")
+    return Path(path) if path else None
 
 
 def create_branch(repo: Path, name: str, base: str) -> None:
