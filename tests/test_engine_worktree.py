@@ -1209,6 +1209,36 @@ def test_defer_under_a_recorded_mount_carries_the_harvest_after_an_isolation_fli
     assert task.phase == Phase.DEFERRED
 
 
+def test_defer_recovery_note_under_a_recorded_mount_names_the_branch_not_a_merge(project):
+    """The notice `_record_defer` emits two lines after `_defer` picked its arm must
+    pick the SAME arm. Selected on live policy alone, the flipped-policy defer above
+    printed the in-place `git -C <mount> merge --ff-only <ref>` — a command aimed at
+    a directory `_integrate_unit` deletes on the way out with `keep_failed` off, and
+    with it on, a notice that never names the branch holding the latest failed work.
+    An earlier in-worktree dev-retry rollback parks `preserve_ref` on the shared
+    refs (#333: the ref is not isolation-scoped), so both facts are live at once.
+
+    Ablation: restore the bare `if self._isolated:` gate in `_defer_recovery_note`
+    and this reddens on the merge line, then on the missing branch."""
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    assert engine.policy.scm.keep_failed is True
+    ref = "attempt-preserve/test-run-0badc0de"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+        branch="bmad-loop/1-1-a",
+        preserve_ref=ref,
+    )
+
+    note = engine._defer_recovery_note(task)
+
+    assert "merge --ff-only" not in note
+    assert "failed work kept on branch `bmad-loop/1-1-a`" in note
+    assert f"an earlier rolled-back attempt is parked at `{ref}`" in note
+
+
 def test_defer_with_no_recorded_mount_still_takes_the_in_place_arm(project, monkeypatch):
     """The other half of the widened gate. `or task.worktree_path` must not swallow the
     ordinary in-place defer, whose whole job is the rollback the isolated arm skips —
