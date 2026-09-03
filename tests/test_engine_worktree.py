@@ -6562,3 +6562,138 @@ def test_engine_remount_journals_orphan_preservation(project):
     assert entries[0]["worktree"] == str(orphan.path)
     assert entries[0]["ref"].startswith("refs/attempt-preserve-dirty/test-run-")
     assert git(project.project, "show", f"{entries[0]['ref']}:created.txt") == "run-created"
+
+
+# ------------------------------------------- run-branch remount catches up to base
+
+
+def test_run_branch_remount_fast_forwards_to_an_advanced_base(project):
+    """branch_per=run: a run branch whose tip is an ancestor of the (advanced)
+    pinned base is fast-forwarded to the base before the mount — the isolation-flip
+    shape where a story landed in place on the target while the run branch was
+    unmounted. The mount and the baseline come up at the base.
+
+    Ablation: drop the ``reset_branch_if_tip`` fast-forward arm and the mount comes
+    up at the stale run tip (``HEAD == old_tip``, not the advanced base).
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    old_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)  # flip away
+    (project.project / "landed-in-place.txt").write_text("story committed on main\n")
+    advanced = _commit_project(project, "story landed in place")
+    assert advanced != old_tip
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert rev_parse_head(second.path) == advanced
+    assert git(project.project, "rev-parse", f"refs/heads/{second.branch}") == advanced
+    assert second.baseline == advanced
+    assert (second.path / "landed-in-place.txt").exists()
+
+
+def test_run_branch_remount_merges_a_diverged_base(project):
+    """branch_per=run, diverged: the run branch carries a unit the target lacks
+    AND the target advanced without the run tip. The remount mounts at the tip and
+    merges the base into the run branch inside the fresh mount; HEAD is a merge
+    commit whose parents are exactly the run tip and the base, and the returned
+    baseline is that merge commit (the tree the session starts from).
+
+    Ablation: drop the ``catch_up_base`` merge and HEAD stays at the run tip with
+    a single parent and no ``target.txt``.
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "unit.txt").write_text("landed on the run branch\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "unit on run branch")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    (project.project / "target.txt").write_text("advanced without the run tip\n")
+    base = _commit_project(project, "target advances")
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    head = rev_parse_head(second.path)
+    parents = git(second.path, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+    assert set(parents) == {run_tip, base}
+    assert second.baseline == head
+    assert git(project.project, "rev-parse", f"refs/heads/{second.branch}") == head
+    assert (second.path / "unit.txt").exists() and (second.path / "target.txt").exists()
+    assert worktree_clean(second.path)
+
+
+def test_run_branch_remount_refuses_a_conflicting_base(project):
+    """branch_per=run, diverged with a content conflict: the catch-up merge is
+    aborted, the just-created mount is dropped, the run branch tip is unchanged,
+    and ``GitError`` names the refusal — an operator must reconcile.
+
+    Ablation: swallow the merge failure (``except GitError: pass`` around the
+    catch-up) and the open returns a mounted worktree — no ``GitError``.
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    (project.project / "conflict.txt").write_text("base\n")
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "conflict.txt").write_text("run branch\n")
+    git(first.path, "commit", "-q", "-am", "run side")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    (project.project / "conflict.txt").write_text("target\n")
+    _commit_project(project, "target side")
+
+    with pytest.raises(verify.GitError, match="diverged from main"):
+        open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == run_tip
+
+
+def test_run_branch_remount_after_squash_integration_merges_clean(project):
+    """The diverged arm is the NORMAL serial-unit shape under
+    ``merge_strategy = "squash"``: the target receives a squash commit that does not
+    contain the run tip. Identical content on both sides merges clean, so the next
+    unit mounts on a merge commit holding both histories with no conflict."""
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "unit.txt").write_text("landed on the run branch\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "unit on run branch")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    git(project.project, "merge", "--squash", "-q", run_tip)
+    squashed = _commit_project(project, "squash of the unit")
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    parents = git(second.path, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+    assert set(parents) == {run_tip, squashed}
+    assert worktree_clean(second.path)
+    assert git(second.path, "diff", "--stat", squashed, "HEAD") == ""  # same tree
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_run_branch_serial_units_stay_green_under_every_strategy(project, strategy):
+    """Regression fence for the catch-up: two serial units under ``branch_per=run``
+    integrate under all three strategies and main ends with both changes."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a"),
+            wt_review_effect(project, "1-1-a", clean=True),
+            wt_dev_effect(project, "1-2-b"),
+            wt_review_effect(project, "1-2-b", clean=True),
+        ],
+        policy=wt_policy(branch_per="run", merge_strategy=strategy),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused and not summary.crashed
+    src = (project.project / "src.txt").read_text()
+    assert "change for 1-1-a" in src and "change for 1-2-b" in src
+    assert "worktree-open-failed" not in journal_kinds(engine)
