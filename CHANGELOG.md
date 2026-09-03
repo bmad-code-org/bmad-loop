@@ -248,6 +248,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`docs/FEATURES.md` no longer promises a ledger entry the review-budget damping does not
+  file.** The bounded-review-loop bullet said a lingering follow-up recommendation is re-filed
+  to the deferred-work ledger; `_journal_review_budget_spent` journals the spent budget and
+  deliberately files nothing, on the damping path and on plain budget exhaustion alike (the
+  DW-55/64/90 class showed such rows re-litigate a converged story's review). FEATURES.md is a
+  behavior contract, so the bullet now matches the shipped behavior and names the review
+  _timeout_ salvage as the one path that does still file.
+
 - **A `seen-again:` match that goes stale inside the ledger lock no longer swallows the
   recurrence.** `_harvest_spec_deferrals` decides the cross-spec dedupe against a ledger
   snapshot and excludes the matched finding from its append, then stamps the sighting later
