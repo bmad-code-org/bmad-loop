@@ -879,6 +879,45 @@ def test_stop_run_retries_when_resume_publishes_a_new_engine(tmp_path, monkeypat
     assert runs.read_stop_request_mode(run_dir) is None
 
 
+def test_stop_run_does_not_loop_on_an_engine_whose_identity_cannot_be_read(tmp_path, monkeypatch):
+    """A recorded pid that exists but whose identity cannot be read (win32
+    ERROR_ACCESS_DENIED is the measured shape) is `"unknown"`, not `"dead"`, and
+    `alive_and_ours` declines it — so the local pid is cleared and nothing is
+    signalled. The generation compare under the lock must then read the pid file
+    AS RECORDED: compared against the cleared local pid, the unchanged file looked
+    like a rival that had published a new engine, `_stop_run_once` answered "retry",
+    and `stop_run` — an unbounded loop by design, so a real rival is always sent the
+    stop — never returned.
+
+    `_stop_run_once` is wrapped to turn that livelock into a failure, or the
+    ablation would hang the suite rather than redden it.
+
+    Ablation: compare `current_engine` against the post-clearing `(pid, identity)`
+    again and this reddens on the call count."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    host = _FakeHost(alive=True, identity=None)  # exists, identity unreadable
+    assert host.liveness_of(4242, 100.0) == "unknown"  # MEASURED: the arm under test
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    real_once = runs._stop_run_once
+    calls: list[int] = []
+
+    def bounded_once(run_dir_):
+        calls.append(1)
+        if len(calls) > 3:
+            raise AssertionError("stop_run is retrying an unchanged engine forever")
+        return real_once(run_dir_)
+
+    monkeypatch.setattr(runs, "_stop_run_once", bounded_once)
+
+    assert runs.stop_run(run_dir) is True
+
+    assert len(calls) == 1
+    assert host.terminated == []  # never signals a pid it cannot prove is ours
+    assert load_state(run_dir).stopped is True
+
+
 def test_stop_run_engine_confirmed_leaves_nothing_pending(tmp_path, monkeypatch):
     """When the engine confirms the stop itself the request is consumed too. The
     engine normally clears it on the way out; this is the belt-and-braces half, and
