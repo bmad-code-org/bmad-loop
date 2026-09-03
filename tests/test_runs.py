@@ -3005,6 +3005,56 @@ def test_rearm_leaves_a_spec_outside_the_recorded_project_alone(tmp_path):
     assert verify.status_of(verify.read_frontmatter(spec)) == "ready-for-dev"
 
 
+def test_rearm_leaves_a_spec_that_traverses_out_of_the_recorded_project_alone(tmp_path):
+    """`Path.relative_to` is a PREFIX match: ``<recorded>/../shared/spec.md`` passes it
+    with remainder ``../shared/spec.md``, so a persisted spelling that climbs OUT of
+    the recorded project (into an external artifact root) used to be classified
+    project-owned and, once the project moved to a different parent, rebased to
+    ``<live>/../shared/spec.md`` — a different file. A ``..`` after the recorded
+    prefix names a tree outside it, so `rebase_recorded_project_path` now returns
+    the spelling unchanged and the re-arm flips the file the run actually recorded.
+    (An in-project spelling still rebases:
+    `test_rearm_flips_the_spec_in_the_live_project_after_a_rename`.)
+
+    Both parents hold a `shared/spec.md` deliberately: the decoy under the NEW
+    parent is the file the redirected spelling names, so "unflipped" on the recorded
+    spec cannot be read as a no-op. `resolve.build_context` publishes the same
+    rebased path with no confinement at all, so the agent would be handed the decoy.
+
+    Ablation: drop the ``".." in relative.parts`` arm and the direct assertion
+    reddens on ``<live>/../shared/spec.md``; with that assertion removed too, the
+    re-arm dies in `UnconfinedWriteError` (the redirected spelling climbs out of the
+    rebased confine root) rather than flipping the recorded spec."""
+    old_parent = tmp_path / "old-parent"
+    new_parent = tmp_path / "new-parent"
+    recorded_project = old_parent / "project"
+    live_project = new_parent / "project"
+    for root in (recorded_project, live_project):
+        root.mkdir(parents=True)
+    recorded_spec = old_parent / "shared" / "spec.md"
+    decoy = new_parent / "shared" / "spec.md"
+    for spec in (recorded_spec, decoy):
+        spec.parent.mkdir()
+        spec.write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    traversing = recorded_project / ".." / "shared" / "spec.md"  # the persisted spelling
+    run = escalated_run(
+        recorded_project, "r1", story_key="1-1-a", attempt=2, spec_file=str(traversing)
+    )
+    state = load_state(run.run_dir)
+    assert runs.rebase_recorded_project_path(traversing, state, live_project) == traversing
+
+    runs.rearm_escalation(
+        run.run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(decoy)) != "ready-for-dev"
+
+
 def test_rearm_resets_followup_reviews_spent(tmp_path):
     """A human-resolved re-drive gets a fresh damping budget: rearm_escalation
     zeroes followup_reviews_spent alongside review_cycle, so the clean rebuild
