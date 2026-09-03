@@ -3216,6 +3216,21 @@ def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path
     return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
 
 
+def live_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
+    """`task_stories_root` carried onto the tree the caller is acting in — the root
+    the stories folder is located from by the READ side of the re-arm gesture.
+
+    The escalation modal's title, description and sentinel indicator are read from
+    the stories folder, and `_do_rearm` clears that sentinel at `live_spec_path`. A
+    locator answering the recorded `state.project` after a project move reads the
+    manifest from a tree the re-arm no longer writes: absent once the old tree is
+    gone, stale while it lingers. A mount is a path under the run dir, outside the
+    recorded project, so `rebase_recorded_project_path` passes it through unchanged
+    and the isolated arm keeps its answer; only the project fallback moves.
+    """
+    return rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
+
+
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
     """True when the recorded spec lives outside BOTH checkouts, so the re-arm's status
     flip survives a mount's disposal and the ISOLATED re-drive reads it.

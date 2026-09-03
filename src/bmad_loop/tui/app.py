@@ -1145,15 +1145,16 @@ class BmadLoopApp(App[None]):
         """(title, description) from stories.yaml in stories mode, else ("", "")."""
         if state.source != "stories" or not state.spec_folder:
             return "", ""
-        # `task_stories_root`, not `self.project`, for the reason `_sentinel_kind`
+        # `live_stories_root`, not `self.project` bare, for the reason `_sentinel_kind`
         # states below: BOTH feed one `EscalationModal` — this supplies its title and
         # description, that its sentinel indicator — so a manifest read from the main
         # checkout beside a sentinel read from the mount is the same one-surface-two-trees
-        # defect the anchor exists to close. `self.project` is also the wrong VALUE for
-        # the no-task arm: it is the constructor's `resolve_or_lexical` of the operator's
-        # argument, while every other anchored read here answers from `state.project`,
-        # the path the run persisted at launch.
-        root = runs.task_stories_root(state.tasks.get(key), state)
+        # defect the anchor exists to close. The no-task fallback is still the recorded
+        # `state.project`; what `live_stories_root` adds is the mapping `_do_rearm`
+        # writes through (`project_root=self.project`), so after a project move the
+        # manifest is read from the tree the re-arm clears the sentinel in, not from
+        # the launch-time spelling — absent once that tree is gone, stale while it stays.
+        root = runs.live_stories_root(state.tasks.get(key), state, self.project)
         try:
             folder = stories.resolve_spec_folder(root, state.spec_folder)
             entry = stories.load_stories(folder).get(key)
@@ -1173,12 +1174,16 @@ class BmadLoopApp(App[None]):
         # different trees let a single modal disagree with itself and rendered a
         # pre-planning sentinel wedge as an ordinary escalation.
         #
-        # `task_stories_root`, not `task_spec_root`: the folder is located from the
+        # `live_stories_root`, not `task_spec_root`: the folder is located from the
         # workspace root, and the latter's out-of-mount arm answers a confinement
         # question about `spec_file` that would send this read to the main checkout
         # while `_stories_folder` stayed on the mount. It also takes `None`, so the
-        # no-task fallback is not re-spelled here.
-        root = runs.task_stories_root(state.tasks.get(key), state)
+        # no-task fallback is not re-spelled here. And "live", for the same reason
+        # `_paused_spec` goes through `live_spec_path`: the re-arm clears the sentinel
+        # under `self.project`, so a scan anchored on the recorded `state.project`
+        # misses it after a project move (or keeps showing a cleared twin). A mount
+        # lies outside the recorded project and passes through the mapping unchanged.
+        root = runs.live_stories_root(state.tasks.get(key), state, self.project)
         # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
         # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
         # Degrade to "" rather than let a race-window read crash the render.
