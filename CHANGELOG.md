@@ -317,7 +317,10 @@ breaking changes may land in a minor release.
   now lands with an intent marker (`RunState.code_root_restamp_pending`) in one atomic
   state write, the record follows it, and the marker is cleared only once the record is
   down — so a retry writes the record the move still owes, and a record can never claim
-  a move the state write did not make.
+  a move the state write did not make. A plain `resume` consumes the outstanding record
+  too: it counts the marker as a move, so its `run-resume` line and the code-root warning
+  fire even though the re-stamped mirror already agrees with config, and clears the
+  marker on the same write that persists the resume.
 
 - **The journal-kind inventory no longer misses a kind passed POSITIONALLY to a declared
   dynamic-kind position.** The scan read `node.keywords` only, so
