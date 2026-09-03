@@ -4083,7 +4083,9 @@ def test_paused_spec_follows_a_moved_project_to_the_tree_the_rearm_writes(tmp_pa
     live = tmp_path / "project-after-rename"
     rel = Path("_bmad-output") / "implementation-artifacts" / "spec-1-1-a.md"
     (live / rel).parent.mkdir(parents=True)
-    (live / rel).write_text("---\nstatus: escalated\n---\n\n# Story\n", encoding="utf-8")
+    (live / rel).write_text(
+        "---\nstatus: escalated\n---\n\n# Story\n", encoding="utf-8", newline="\n"
+    )
     assert not recorded.exists()  # the tree the run recorded is gone
     app = BmadLoopApp(live)
     state = RunState(
