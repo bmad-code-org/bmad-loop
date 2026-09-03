@@ -266,7 +266,11 @@ breaking changes may land in a minor release.
   compare-and-swap fast-forwarded before the mount when its tip is an ancestor of the base,
   and a diverged base (the normal serial shape under `squash`) is merged into the fresh mount;
   a conflicting catch-up aborts, drops the mount, leaves the run tip unchanged, and raises for
-  an operator to reconcile. The attempt baseline is read after the catch-up.
+  an operator to reconcile. The attempt baseline is read after the catch-up. Both ref moves —
+  this fast-forward and the story-branch reset — are refused up front (`GitError` naming the
+  branch and the path) when the branch is checked out anywhere other than the unit's own mount
+  path, e.g. a `git worktree move`d recovery mount: the compare-and-swap would move the ref
+  under that live checkout, leaving its files and index at the old tip.
 
 - **The TUI escalation modal reads the spec, story context and sentinel the re-arm will
   write.** `_paused_spec` / `_paused_spec_root` anchored on the recorded `state.project`

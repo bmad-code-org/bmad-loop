@@ -2153,6 +2153,26 @@ def branch_exists(repo: Path, name: str) -> bool:
     return rc == 0
 
 
+def branch_checkout_path(repo: Path, branch: str) -> Path | None:
+    """The worktree that has ``refs/heads/<branch>`` checked out, or ``None``.
+
+    ``git for-each-ref --format=%(worktreepath)`` (git 2.23; the support floor is
+    2.34) prints the registered path of the worktree whose HEAD is attached to the
+    ref — the MAIN checkout's path when the main checkout holds it — and an empty
+    line when no worktree has it attached (a detached HEAD at the same commit does
+    not count). A ref that does not exist also prints nothing; callers that need
+    the distinction check `branch_exists` first. The path is git's registered
+    spelling, un-canonicalized: compare it the way the caller compares its own.
+    Reads stdout alone (`_git_out`): the value is the answer (#442).
+    """
+    rc, out, detail = _git_out(
+        repo, "for-each-ref", "--format=%(worktreepath)", f"refs/heads/{branch}"
+    )
+    if rc != 0:
+        raise GitError(f"git for-each-ref refs/heads/{branch} failed in {repo}: {detail}")
+    return Path(out) if out else None
+
+
 def create_branch(repo: Path, name: str, base: str) -> None:
     """Create branch `name` at `base` without checking it out."""
     rc, out = _git(repo, "branch", name, base)
