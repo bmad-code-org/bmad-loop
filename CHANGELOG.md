@@ -255,35 +255,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Serialize run deletion/archive against resume (DW-94), refusing a newly live
-  engine under the per-run lock and preventing a waiting resume from recreating a
-  run cleanup already removed.
-
-- Serialize every run-state writer and control read-modify-write transaction with one canonical per-run advisory lock (DW-93).
-
-- Let interactive resolve present `paused_reason` when watermark filtering leaves no newer
-  recorded escalation detail, without recovering or inventing an escalation (DW-91).
-
-- Reject malformed session escalation/result artifacts and non-finite resolve JSON
-  (DW-86, DW-89).
-
-- **Confine built-in adapter task directories** (DW-74), refusing unsafe task ids and
-  symlink- or junction-redirected task directories before prompt, artifact, log, or
-  transport side effects.
-
-- **Treat embedded-NUL verify commands and working directories as typed environment
-  faults** (DW-53, DW-54), while documenting that stream retention degrades but
-  journal record writes remain fail-loud.
-
-- Make successful escalation re-arms return authoritative ordered notices and a resume-hold
-  verdict, so a corrupt journal cannot hide a persisted hold from the CLI or TUI gesture.
-
-- **The TUI escalation modal reads the spec the re-arm will write.** `_paused_spec` and
-  `_paused_spec_root` anchored on the recorded `state.project` while `_do_rearm` flips the
-  copy under the live project, so a run opened from a moved project showed the old tree's
-  spec — unreadable once that tree was gone, refusing the re-arm — or let the operator
-  review one copy and re-arm another. Both now use the same live mapping as the re-arm
-  (`runs.live_spec_path` / `live_spec_root`, promoted from private).
+- **`bmad-loop stop` no longer retries forever on an engine whose identity cannot be
+  read.** The rival-engine compare under the state lock used the local pid after every
+  declining path had cleared it, so an unchanged pid file with `"unknown"` liveness read
+  as a freshly published rival on every attempt. The compare now uses the pid file as
+  recorded; a rival is a changed file, nothing else.
 
 - **`worktree list -z` is gated on git 2.36; the 2.34 support floor keeps the newline
   parse.** The NUL-delimited listing was issued unconditionally, and Ubuntu 22.04's stock
