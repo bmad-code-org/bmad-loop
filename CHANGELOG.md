@@ -310,6 +310,17 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- **The journal-kind inventory no longer misses a kind passed POSITIONALLY to a declared
+  dynamic-kind position.** The scan read `node.keywords` only, so
+  `_close_bundle_ledger_when_spec_status(task, spec, status, "new-kind")` — legal Python,
+  since `kind` is positional-or-keyword — reached the journal with no `JOURNAL_KINDS` row
+  anyone had to decide on, while the guard reported itself complete. All three ways a literal
+  reaches such a position (keyword, positional, parameter default) now feed the same emit,
+  with the slot resolved from the declared function's own signature and the bound receiver
+  dropped. A `*args` splat covering the slot yields a kind no row can declare, so an
+  unreadable position reddens the inventory naming its site instead of passing in silence; a
+  declared forwarder is exempt, its kind already read by the journal-write emit.
+
 - Take the re-arm's mount claim and its resume hold from the `rearm-spec-flip-skipped`
   record instead of inferring both from `reaches_redrive`. The record now carries the live
   `redrive` mode, so the notice no longer tells an ISOLATED run that it "mounts no worktree" —
