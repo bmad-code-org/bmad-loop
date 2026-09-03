@@ -4036,22 +4036,23 @@ async def test_sentinel_indicator_reads_the_worktree_under_isolation(project, mo
         assert "pre-planning-halt sentinel" in shown
 
 
-def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
+def test_paused_spec_root_without_a_task_answers_the_live_project(tmp_path):
     """Both arms of `_paused_spec_root` make ONE claim about the project.
 
-    The delegate (`runs.task_spec_root`) answers from `state.project` — the string the
-    run persisted at launch — while `self.project` is the constructor's
-    `resolve_or_lexical` of whatever path the operator opened the dashboard with. The
-    two can differ, so a no-task arm returning `self.project` left a second claim lying
-    around for a future caller to trip on.
+    The delegate (`runs.live_spec_root`) carries the recorded anchor onto the tree
+    the dashboard was opened against — `self.project`, the same mapping `_do_rearm`
+    hands `rearm_escalation` — while `state.project` is the string the run persisted
+    at launch. The two differ after a project move, so a no-task arm answering
+    `state.project` raw was a second claim for a future caller to trip on: a confine
+    root naming the OLD tree for a path `_paused_spec` now anchors on the new one.
 
     Graded directly because the arm is unreachable from the write path today:
     `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path` before calling
     `_do_replan`, and `_paused_spec` returns `None` exactly when there is no task. An
     end-to-end row could not reach it, so this calls the method.
 
-    Ablation: return `self.project` from the no-task arm and this reddens — the two
-    directories are deliberately different here.
+    Ablation: return `Path(state.project)` from the no-task arm and this reddens —
+    the two directories are deliberately different here.
     """
     app = BmadLoopApp(tmp_path / "opened-here")
     state = RunState(
@@ -4060,8 +4061,45 @@ def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
         started_at="2026-06-11T10:00:00",
     )
     assert state.paused_story_key is None  # the no-task arm
-    assert app._paused_spec_root(state) == tmp_path / "persisted-at-launch"
-    assert app._paused_spec_root(state) != app.project
+    assert app._paused_spec_root(state) == app.project
+    assert app._paused_spec_root(state) != tmp_path / "persisted-at-launch"
+
+
+def test_paused_spec_follows_a_moved_project_to_the_tree_the_rearm_writes(tmp_path):
+    """The escalation modal's READ anchor and `_do_rearm`'s WRITE anchor name one
+    file. `_do_rearm` hands `rearm_escalation` `project_root=self.project`, so after a
+    project move the re-arm flips the copy under the live tree; anchored on the
+    recorded `state.project` alone, the modal showed the OLD tree's copy — unreadable
+    once that tree is gone, which disabled the very re-arm the live mapping exists
+    for, and when both exist the operator reviewed one spec and re-armed another.
+
+    The old tree is absent here on purpose: an anchor that did not move reads as
+    "could not be read", so the row cannot pass by finding a stale twin.
+
+    Ablations: revert `_paused_spec` to `runs.task_spec_path` and this reddens on
+    `readable`; revert `_paused_spec_root` to `runs.task_spec_root` and it reddens on
+    the confine root, which must be the live tree the path sits under."""
+    recorded = tmp_path / "project-before-rename"
+    live = tmp_path / "project-after-rename"
+    rel = Path("_bmad-output") / "implementation-artifacts" / "spec-1-1-a.md"
+    (live / rel).parent.mkdir(parents=True)
+    (live / rel).write_text("---\nstatus: escalated\n---\n\n# Story\n", encoding="utf-8")
+    assert not recorded.exists()  # the tree the run recorded is gone
+    app = BmadLoopApp(live)
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(recorded),
+        started_at="2026-06-11T10:00:00",
+        paused_story_key="1-1-a",
+    )
+    state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded / rel))
+
+    spec_path, spec_text, readable = app._paused_spec(state)
+
+    assert readable is True
+    assert spec_path == live / rel
+    assert spec_text.startswith("---\nstatus: escalated")
+    assert app._paused_spec_root(state) == live
 
 
 async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):

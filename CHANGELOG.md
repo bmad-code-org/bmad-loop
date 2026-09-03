@@ -248,6 +248,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The TUI escalation modal reads the spec the re-arm will write.** `_paused_spec` and
+  `_paused_spec_root` anchored on the recorded `state.project` while `_do_rearm` flips the
+  copy under the live project, so a run opened from a moved project showed the old tree's
+  spec — unreadable once that tree was gone, refusing the re-arm — or let the operator
+  review one copy and re-arm another. Both now use the same live mapping as the re-arm
+  (`runs.live_spec_path` / `live_spec_root`, promoted from private).
+
 - **`worktree list -z` is gated on git 2.36; the 2.34 support floor keeps the newline
   parse.** The NUL-delimited listing was issued unconditionally, and Ubuntu 22.04's stock
   2.34.1 rejects the switch (exit 129), so every isolated-task resume escalated instead of

@@ -2904,8 +2904,8 @@ def test_rearm_flips_the_spec_in_the_live_project_after_a_rename(tmp_path):
     Both halves are asserted, because a fix that wrote BOTH files would satisfy the
     first alone.
 
-    Ablation: revert `_live_spec_path` to a bare `task_spec_path` and this reddens on
-    the live spec's unchanged status. `_live_spec_root` is graded by the row below
+    Ablation: revert `live_spec_path` to a bare `task_spec_path` and this reddens on
+    the live spec's unchanged status. `live_spec_root` is graded by the row below
     instead, and deliberately: ablating the ROOT alone is invisible here, because every
     writer answers an out-of-root path by silently dropping to the unconfined arm —
     the write still lands, it just loses #593's O_NOFOLLOW walk. That silent degrade is
@@ -2950,8 +2950,8 @@ def test_live_spec_root_still_confines_the_live_spec_path(tmp_path):
     )
     task = run.state.tasks["1-1-a"]
 
-    spec_path = runs._live_spec_path(task, run.state, live_project)
-    spec_root = runs._live_spec_root(task, run.state, live_project)
+    spec_path = runs.live_spec_path(task, run.state, live_project)
+    spec_root = runs.live_spec_root(task, run.state, live_project)
 
     assert spec_path == live_project / "spec.md"
     assert spec_root == live_project
