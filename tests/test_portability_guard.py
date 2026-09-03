@@ -760,6 +760,7 @@ JOURNAL_KINDS = frozenset(
         "session-rescued-post-kill",
         "session-start",
         "session-synthesized-from-frontmatter",
+        "spec-deferral-sighting-stale",
         "spec-deferrals-harvested",
         "spec-deferrals-malformed",
         "spec-deferrals-skipped-out-of-tree",
@@ -1441,6 +1442,56 @@ def _kind_param_default(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | Non
             if isinstance(default, ast.Constant) and isinstance(default.value, str):
                 return default.value
             return None
+    return None
+
+
+def _kind_param_index(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
+    """Index of ``fn``'s ``kind`` parameter within a CALL's positional argument
+    list, or None when it cannot arrive positionally — keyword-only, or absent.
+
+    A leading ``self``/``cls`` is dropped: every declared dynamic-kind position is a
+    method reached as ``self._log(...)``, where the receiver is bound and never
+    occupies a slot in ``Call.args``. The unbound spelling (``Bus._log(bus, kind)``)
+    would shift by one and is deliberately out of scope — it appears nowhere on this
+    tree, and reading the receiver where a kind was expected yields a non-literal and
+    therefore no finding, which is a miss rather than a false alarm.
+
+    The sibling of :func:`_kind_param_default`, and needed for the same reason: a
+    literal reaches a dynamic-kind position three ways — a caller's keyword, a
+    caller's POSITIONAL argument, and the parameter default — and reading only two of
+    them leaves the third ungraded while the inventory reports itself complete."""
+    positional = fn.args.posonlyargs + fn.args.args
+    if positional and positional[0].arg in ("self", "cls"):
+        positional = positional[1:]
+    for index, arg in enumerate(positional):
+        if arg.arg == "kind":
+            return index
+    return None
+
+
+# A positional `kind` the scan could not resolve, because a `*args` splat covers the
+# parameter's slot. Emitted AS a kind so the inventory arm reddens naming the site:
+# no row can declare it, and an unreadable position must not share its silence with
+# "this call passed no literal".
+UNRESOLVED_DYNAMIC_KIND = "<unresolved-positional-kind>"
+
+
+def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
+    """The string literal a call hands a declared dynamic-kind position
+    POSITIONALLY; :data:`UNRESOLVED_DYNAMIC_KIND` when a ``*args`` splat covers that
+    slot; None when the slot holds no literal — a variable, or nothing at all, the
+    latter being the parameter default that the definition arm reports instead.
+
+    A non-literal in the slot is skipped rather than flagged, matching the keyword
+    arm: whether a position may be dynamic AT ALL is the literalness test's question,
+    and this arm only grades the literals that reach one."""
+    if any(isinstance(arg, ast.Starred) for arg in node.args[: index + 1]):
+        return UNRESOLVED_DYNAMIC_KIND
+    if index >= len(node.args):
+        return None
+    arg = node.args[index]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
     return None
 
 
@@ -2248,6 +2299,15 @@ def _scan_source(src: str, rel: str):
     # pass 2). Same `journalkindliteral` finding, same inventory; keyed `(file,
     # name)` exactly like the position it serves, so a same-named callee in a file
     # that declares no such position stays silent.
+    # Where each declared position keeps its `kind`, so a caller that spells the
+    # kind POSITIONALLY is read too. Keyed by name within this file, exactly like
+    # the allow set it is derived from.
+    kind_positions = {
+        node.name: _kind_param_index(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (rel, node.name) in JOURNAL_DYNAMIC_KIND_ALLOW
+    }
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -2267,6 +2327,21 @@ def _scan_source(src: str, rel: str):
                             line_at(node.lineno),
                             kw.value.value,
                         )
+                    )
+            # A declared FORWARDER (`plugins/bus.py::_log`) is itself a journal
+            # write, so the main emit above already read its positional kind; this
+            # arm exists for the declared positions that are not forwarders, where
+            # nothing else reads the slot.
+            index = kind_positions.get(_called_name(node.func))
+            if (
+                index is not None
+                and not any(kw.arg == "kind" for kw in node.keywords)
+                and not _is_journal_write(node, rel)
+            ):
+                literal = _positional_kind_literal(node, index)
+                if literal is not None:
+                    findings.append(
+                        ("journalkindliteral", rel, node.lineno, line_at(node.lineno), literal)
                     )
         elif (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -5051,6 +5126,99 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
         ("def _skip_review_and_commit(self, task, *, kind=None):\n    return None\n", "engine.py"),
     ):
         assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+
+# The declared position whose `kind` is positional-or-keyword, with NO default, so the
+# definition arm contributes nothing and each row's only finding is the one the
+# positional arm read. `self` is dropped from the parameter list because a bound call
+# never fills its slot — the offset this arm has to get right.
+_POSITIONAL_KIND_DEF = (
+    "def _close_bundle_ledger_when_spec_status(self, task, spec_file, status, kind):\n"
+    "    self.journal.append(kind, story_key=s)\n"
+    "\n"
+)
+
+
+def test_journal_kind_literal_reads_a_positional_dynamic_kind():
+    """A literal handed a declared dynamic-kind position POSITIONALLY is inventoried,
+    not just a `kind=` keyword.
+
+    `sweep._close_bundle_ledger_when_spec_status(task, spec, status, "new-kind")` is
+    legal Python — `kind` is positional-or-keyword — and reached the journal with no
+    `JOURNAL_KINDS` row anyone had to decide on: the arm read `node.keywords` only, so
+    the kind was never graded and the inventory reported itself complete. The three
+    ways a literal reaches such a position (keyword, POSITIONAL, parameter default) now
+    all feed the same emit.
+
+    The unresolvable row is the fail-loud half: a `*args` splat covering the slot yields
+    a kind no row can declare, so the inventory reddens naming the site instead of
+    sharing its silence with "this call passed no literal".
+
+    Ablation: restore the `for kw in node.keywords` loop as the arm's only reader and
+    the first row reddens; delete the `ast.Starred` branch and the second does."""
+    for source, rel, kinds in (
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, "sweep-bundle-closed")\n',
+            "sweep.py",
+            ["sweep-bundle-closed"],
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(*rest, "sweep-bundle-closed")\n',
+            "sweep.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
+    """The complement, in the four directions the positional arm must not invent a kind:
+    a KEYWORD-ONLY `kind` (no positional slot exists, so a string in that argument
+    position is some other parameter's), a non-literal in the slot (the literalness
+    test's territory, as on the keyword arm), the same call in a file declaring no such
+    position, and a declared FORWARDER whose positional kind the journal-write emit
+    already reports — double-reporting one site would make a `found == [kind]` probe
+    redden for a reason that is not a defect.
+
+    Ablation: drop the `_is_journal_write` guard and the forwarder row reddens with two
+    findings; key `kind_positions` by name alone and the wrong-file row reddens."""
+    for source, rel in (
+        (
+            "def _skip_review_and_commit(self, task, *, kind):\n"
+            "    self.journal.append(kind, story_key=s)\n"
+            "\n"
+            "def caller(self):\n"
+            '    self._skip_review_and_commit(task, "review-skipped")\n',
+            "engine.py",
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            "    self._close_bundle_ledger_when_spec_status(task, spec, status, chosen)\n",
+            "sweep.py",
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, "sweep-bundle-closed")\n',
+            "stories_engine.py",
+        ),
+    ):
+        assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+    # The forwarder: exactly one finding, from the journal-write emit, not two.
+    forwarder = (
+        "def _log(self, kind, **fields):\n"
+        "    self._journal.append(kind, **fields)\n"
+        "\n"
+        "def caller(self):\n"
+        '    self._log("plugin-hook", rc=rc)\n'
+    )
+    found = [
+        f[4] for f in _scan_source(forwarder, "plugins/bus.py") if f[0] == "journalkindliteral"
+    ]
+    assert found == ["plugin-hook"], found
 
 
 def test_journal_routing_tables_are_read_from_diagnostics():
