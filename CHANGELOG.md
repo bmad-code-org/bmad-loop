@@ -290,6 +290,18 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The TUI's re-arm hold now names the remedy of the record that actually held.** Its
+  hold branch printed one hardcoded "commit the corrected spec" for all four holding
+  records, and two of them cannot be obeyed that way: `rearm-spec-write-unreachable`'s
+  in-place arm needs the edit made in the MAIN checkout, and `rearm-spec-flip-skipped`'s
+  holding arm fires only where the recorded spec path is not a readable file — nothing to
+  commit, and possibly a shared artifact directory outside any repository.
+  `runs.RearmOutcome` gains `hold_next_step`, captured first-wins from the earliest
+  holding record so the operator is told the cause they must clear first, and the toast
+  composes it as "not resuming in this gesture. `<step>` — the run stays paused and
+  resumable from this screen." The advisory toasts still drop `next_step`; only the hold
+  line carries it.
+
 - **A failed `rearm-code-root-restamped` append no longer loses the move record for
   good.** `restamp_code_root` committed the new root and journalled afterwards, so an
   append that failed once left a retry exiting at "already agrees" with the record never

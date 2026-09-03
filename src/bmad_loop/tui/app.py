@@ -1061,11 +1061,26 @@ class BmadLoopApp(App[None]):
             # The half of the gesture that still worked is kept: the story IS re-armed
             # and persisted. What stops is the resume this surface folds in behind it,
             # because the warning above proved the re-drive would read a spec it cannot
-            # route on and burn the escalation. Worded for a surface that drops
-            # `next_step`, and worded as an instruction the operator can finish here —
-            # the run stays paused and resumable from this same screen.
+            # route on and burn the escalation.
+            #
+            # The step is PROPAGATED from the record that held (`hold_next_step`) rather
+            # than hardcoded. Four records hold and their remedies differ — commit the
+            # spec, commit `SPEC.md` / `stories.yaml`, correct the spec in the MAIN
+            # checkout, or check the recorded spec PATH — and the one literal this
+            # branch used to print was impossible to follow on two of them. The literal
+            # survives only as the fallback for a holding record whose render carries no
+            # step at all.
+            #
+            # Composed rather than concatenated: every `next_step` ends in "before
+            # resuming", which is true here (this hold is what stops the fold-in) but
+            # reads as a contradiction next to an imperative to resume. So the resume's
+            # absence leads, the step follows as the operator's own sentence, and the
+            # tail says the run is still there to resume from this screen once it is
+            # done — instead of ordering a resume in the same breath as a hold.
+            step = outcome.hold_next_step or "Commit the corrected spec before resuming"
             self.notify(
-                "not resuming: commit the corrected spec, then resume this run",
+                f"not resuming in this gesture. {step} — the run stays paused and "
+                "resumable from this screen.",
                 severity="warning",
             )
             return

@@ -113,11 +113,16 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   correction is already committed says nothing, and neither does one whose spec sits in an artifact
   directory configured outside the project: those are shared across checkouts rather than rebased
   onto each worktree, so the flip lands on the one file every re-drive reads. That record also HOLDS
-  the resume: both surfaces re-arm and resume in one gesture, which made its own "commit the
-  corrected spec before resuming" advice unactionable the moment it printed and then burned the
-  escalation on a session that halts blocked. They now stop after the re-arm — the story stays armed,
-  `bmad-loop resume <run-id>` picks it up once the fix is committed, and `--resume` does not override
-  it, since the record is written on proof rather than suspicion. The advisory warnings do not hold.
+  the resume: both surfaces re-arm and resume in one gesture, which made its own "before resuming"
+  advice unactionable the moment it printed and then burned the escalation on a session that halts
+  blocked. They now stop after the re-arm — the story stays armed, `bmad-loop resume <run-id>` picks
+  it up once the correction lands, and `--resume` does not override it, since the record is written
+  on proof rather than suspicion. Each surface names the HELD record's own remedy rather than one
+  hardcoded literal, because the holding records do not share one: this one asks you to commit, while
+  its in-place arm — isolation edited to `none` while the story was escalated, so the re-arm's writes
+  went into the escalated attempt's worktree and the re-drive now reads the main checkout — asks you
+  to correct the spec in the MAIN checkout, where committing is not the remedy and naming a branch
+  would be actively wrong. The advisory warnings do not hold.
   A pre-planning **sentinel** gets the same treatment on its own artifacts. It is cleared by
   deletion rather than a status flip, so there is no spec write to measure — but the correction that
   stops it recurring is upstream (`SPEC.md` / `stories.yaml`, where the resolve skill sends the agent
@@ -127,6 +132,16 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   the re-drive mounts from does not already hold this checkout's copy of those two files, so a
   correction already committed there resumes in one gesture, and an in-place re-drive never records
   at all — it reads the main checkout, which is where the resolve session runs.
+  A **failed status flip** holds too, on exactly one of its three arms, which is why that one is
+  keyed on the record's flags rather than on its kind. `rearm-spec-flip-skipped` is journalled with
+  `refused = spec_path.is_file() and write_reaches_the_redrive`, so the arm that reaches the re-drive
+  without being refused proves the recorded spec path is not a readable file here — the re-drive
+  reads that same path and sees the escalated attempt's status, futile on the same proof as the two
+  above, and it reaches this arm from BOTH re-drive modes. Its remedy is to check the recorded path,
+  never to commit: the arm's own condition means there is no corrected spec at that path to commit,
+  and the path can be a shared artifact directory outside the project that is not a repository at
+  all. The refused arm raises rather than resuming, so there is no gesture left to hold, and the
+  remaining arm carries no imperative of its own — `rearm-spec-write-unreachable` holds that leg.
   The whole re-arm is one **transaction**, and what it covers is stated narrowly: the SPEC's
   BYTES, from the first spec write to `save_state`. That save is the commit point — until it
   returns the run still calls the story escalated, so any fault escaping the window in between
