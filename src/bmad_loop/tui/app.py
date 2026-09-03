@@ -1181,8 +1181,11 @@ class BmadLoopApp(App[None]):
         # no-task fallback is not re-spelled here. And "live", for the same reason
         # `_paused_spec` goes through `live_spec_path`: the re-arm clears the sentinel
         # under `self.project`, so a scan anchored on the recorded `state.project`
-        # misses it after a project move (or keeps showing a cleared twin). A mount
-        # lies outside the recorded project and passes through the mapping unchanged.
+        # misses it after a project move (or keeps showing a cleared twin). A mount is
+        # spelled under the run dir INSIDE the project (`RUNS_DIR` is `.bmad-loop/runs`)
+        # and therefore rebases too — which is why `live_stories_root` probes the moved
+        # mount before falling back; the recorded spelling's own existence probe fails
+        # after the move and would drop this read onto the main checkout's stale twin.
         root = runs.live_stories_root(state.tasks.get(key), state, self.project)
         # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
         # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.

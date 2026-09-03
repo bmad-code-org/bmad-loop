@@ -2958,6 +2958,83 @@ def test_live_spec_root_still_confines_the_live_spec_path(tmp_path):
     assert spec_path.is_relative_to(spec_root)  # the confined arm stays reachable
 
 
+def test_live_stories_root_follows_the_mount_through_a_project_rename(tmp_path):
+    """The READ side's OTHER anchor moves with `live_spec_path`, and the ORDERING is
+    what makes it move. `live_stories_root` called `task_stories_root` FIRST, which
+    decides between the mount and the project on an existence probe against the
+    RECORDED spelling. `RUNS_DIR` is `.bmad-loop/runs`, so a mount lives INSIDE the
+    project; after a rename its recorded spelling is gone, the probe failed, the mount
+    was discarded, and rebasing the project fallback handed back the MAIN CHECKOUT —
+    while `live_spec_path` (no existence probe in `task_spec_root`) followed the rename
+    onto the moved mount. One escalation modal, two trees.
+
+    Two manifests, different titles, and the assertion is on the TITLE: a row that only
+    checked the returned path exists would pass for either tree. The recorded mount is
+    absent on purpose — that absence IS the pre-fix trigger, so the row cannot pass on
+    a stale twin.
+
+    Ablation: revert `live_stories_root` to the bare
+    `rebase_recorded_project_path(task_stories_root(...), ...)` one-liner and this
+    reddens on the title (`'main checkout twin' == 'mounted unit'`)."""
+    import yaml
+
+    from bmad_loop import stories
+
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    mount_rel = Path(".bmad-loop") / "runs" / "r1" / "worktrees" / "1-1-a"
+    recorded_mount = recorded_project / mount_rel
+    live_mount = live_project / mount_rel
+    for root, title in ((live_project, "main checkout twin"), (live_mount, "mounted unit")):
+        (root / "epic-1").mkdir(parents=True)
+        (root / "epic-1" / "stories.yaml").write_text(
+            yaml.safe_dump([{"id": "1-1-a", "title": title, "description": "d"}], sort_keys=False),
+            encoding="utf-8",
+        )
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        source="stories",
+        worktree_path=str(recorded_mount),
+    )
+    assert not recorded_mount.exists()  # the mount the run recorded moved with the project
+
+    root = runs.live_stories_root(run.state.tasks["1-1-a"], run.state, live_project)
+
+    assert root == live_mount
+    entry = stories.load_stories(stories.resolve_spec_folder(root, "epic-1")).get("1-1-a")
+    assert entry is not None and entry.title == "mounted unit"
+
+
+def test_live_stories_root_degrades_to_the_live_project_when_the_mount_is_gone(tmp_path):
+    """The probe-first arm must not become a new way to name a directory that does not
+    exist. A mount removed by teardown (the `done_checkpoint` window, where the engine
+    leaves `worktree_path` set on a task whose worktree its integration already
+    deleted) is absent at BOTH spellings, so the answer falls through
+    `task_stories_root` to the project — rebased, so it is the live tree the re-arm
+    writes and not the launch-time one.
+
+    Ablation: drop the `live_mount.is_dir()` guard (return `live_mount` outright) and
+    this reddens on the root."""
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    recorded_mount = recorded_project / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1-1-a"
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        source="stories",
+        worktree_path=str(recorded_mount),
+    )
+
+    root = runs.live_stories_root(run.state.tasks["1-1-a"], run.state, live_project)
+
+    assert root == live_project
+
+
 def test_rearm_without_a_live_project_writes_the_tree_the_run_recorded(tmp_path):
     """The default is byte-for-byte today's behavior, and that is the whole argument
     for it being optional: `None` does not stand in for a fact only the caller holds

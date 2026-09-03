@@ -3234,10 +3234,35 @@ def live_stories_root(task: StoryTask | None, state: RunState, project_root: Pat
     the stories folder, and `_do_rearm` clears that sentinel at `live_spec_path`. A
     locator answering the recorded `state.project` after a project move reads the
     manifest from a tree the re-arm no longer writes: absent once the old tree is
-    gone, stale while it lingers. A mount is a path under the run dir, outside the
-    recorded project, so `rebase_recorded_project_path` passes it through unchanged
-    and the isolated arm keeps its answer; only the project fallback moves.
+    gone, stale while it lingers.
+
+    The mount is probed on its REBASED spelling FIRST, and that ordering is the whole
+    content of this function. `RUNS_DIR` is ``.bmad-loop/runs``, so a mount is spelled
+    ``<project>/.bmad-loop/runs/<id>/worktrees/<unit>`` — INSIDE the recorded project,
+    and it rebases like every other project-owned path. (Outside-the-project is only
+    the symlinked-`.bmad-loop` layout `_spec_is_shared_with_the_redrive` names.) But
+    `task_stories_root` decides on an existence probe against the RECORDED spelling,
+    which after a project move names a directory that is gone: the probe fails, the
+    mount is discarded for the project fallback, and rebasing that fallback hands back
+    the MAIN CHECKOUT — while `live_spec_path` (whose `task_spec_root` runs no
+    existence probe) follows the rename onto the moved mount. One surface, two trees:
+    exactly the defect the spec anchor exists to close. Asking the live mount first
+    keeps the isolated arm on the moved worktree, and a mount that is genuinely gone
+    still degrades through `task_stories_root` to the project, rebased.
+
+    `is_dir` degrades on OSError rather than raising, for `task_stories_root`'s own
+    reason: this is a READ locator, and a probe that cannot answer falls back to the
+    tree that always exists.
     """
+    if task is not None and task.worktree_path:
+        recorded_mount = Path(task.worktree_path)
+        live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
+        if live_mount != recorded_mount:
+            try:
+                if live_mount.is_dir():
+                    return live_mount
+            except OSError:
+                pass
     return rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
 
 

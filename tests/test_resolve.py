@@ -648,6 +648,49 @@ def test_build_context_rebases_project_owned_artifacts_after_project_rename(tmp_
     assert ctx["stories"]["story"]["title"] == "Live title"
 
 
+def test_build_context_reads_the_manifest_from_the_moved_mount_not_the_checkouts_twin(tmp_path):
+    """The isolated arm of the same rebase. `context.json` and the TUI's escalation
+    modal are the two READ sides of the gesture `rearm_escalation` writes, so
+    `_context_stories_root` delegates to `runs.live_stories_root` — one definition,
+    and this row is what holds the delegation honest from this side.
+
+    The mount is spelled inside the project (`RUNS_DIR` is `.bmad-loop/runs`), so it
+    rebases with the rename; its RECORDED spelling is gone, which is exactly what made
+    `task_stories_root`'s existence probe discard the mount and hand the resolver the
+    main checkout's stale twin. Both manifests exist with different titles and the
+    assertion names the title, so it cannot pass because a path happened to resolve.
+
+    Ablation: revert `runs.live_stories_root` to its one-liner and this reddens on the
+    title (`'main checkout twin' == 'mounted unit'`)."""
+    key = "6-4-cli-list-command"
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    mount_rel = Path(".bmad-loop") / "runs" / "20260613-111429-6a14" / "worktrees" / key
+    recorded_mount = recorded_project / mount_rel
+    live_mount = live_project / mount_rel
+    _stories_manifest(
+        live_project / "epic-1", [{"id": key, "title": "main checkout twin", "description": "d"}]
+    )
+    _stories_manifest(
+        live_mount / "epic-1", [{"id": key, "title": "mounted unit", "description": "d"}]
+    )
+    run_dir, state, _ = _escalated_run(
+        recorded_project,
+        source="stories",
+        spec_folder="epic-1",
+        worktree_path=str(recorded_mount),
+    )
+    assert not recorded_mount.exists()  # the mount the run recorded moved with the project
+
+    path, _withheld, _unreadable = resolve.build_context(
+        state, run_dir, key, isolation="", project_root=live_project, code_root=live_project
+    )
+
+    assert resolve._context_stories_root(state.tasks[key], state, live_project) == live_mount
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["stories"]["story"]["title"] == "mounted unit"
+
+
 def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_path, monkeypatch):
     """`context.json` names the spec in the tree the RUN owns, absolute.
 
@@ -3688,13 +3731,17 @@ def test_build_context_sprint_mode_does_not_resolve_a_stories_root(tmp_path, mon
     """A sprint context has no consumer for stories-root data, so it performs no
     stories-only filesystem lookup.
 
-    Ablation: move `task_stories_root` back above the source gate and this fails at
+    The seam is planted on `live_stories_root`, the module global
+    `_context_stories_root` delegates to, so the row grades the delegation as well as
+    the gate.
+
+    Ablation: move `_context_stories_root` back above the source gate and this fails at
     the planted seam rather than passing from an absent `stories` payload alone.
     """
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")
     monkeypatch.setattr(
         resolve,
-        "task_stories_root",
+        "live_stories_root",
         lambda *_a, **_k: pytest.fail("stories root resolved for sprint context"),
     )
 

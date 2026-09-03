@@ -251,6 +251,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The escalation modal's story manifest follows a moved project onto the mount.**
+  `runs.live_stories_root` probed the mount at its RECORDED spelling before rebasing, so
+  after a project rename the probe failed, the mount was discarded, and the modal read
+  title, description and sentinel from the main checkout's stale twin while `blocking` and
+  the re-arm targeted the moved worktree. It now probes the rebased mount first, and
+  `resolve._context_stories_root` delegates to it so `context.json` and the TUI cannot
+  disagree about which tree the run owns.
+
 - **A remount parks an orphaned worktree's uncommitted work before reclaiming its path.**
   `open_unit_workspace` force-removed whatever stood at the deterministic mount path, so the
   directory an isolation flip had "retained for recovery" lost its tracked edits and

@@ -28,11 +28,11 @@ from .journal import TASK_CYCLE_ARTIFACTS
 from .model import RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
+    live_stories_root,
     rebase_recorded_project_path,
     redrive_base_ref,
     spec_reaches_the_redrive,
     task_spec_path,
-    task_stories_root,
     validate_restore_latch,
 )
 
@@ -48,17 +48,16 @@ def context_path(run_dir: Path, story_key: str) -> Path:
 
 
 def _context_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
-    """Resolve the stories tree against the live project after a project move."""
-    if task is not None and task.worktree_path:
-        recorded_mount = Path(task.worktree_path)
-        live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
-        if live_mount != recorded_mount:
-            try:
-                if live_mount.is_dir():
-                    return live_mount
-            except OSError:
-                pass
-    return rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
+    """Resolve the stories tree against the live project after a project move.
+
+    A delegation, not a second implementation. `context.json` and the TUI's escalation
+    modal are the two READ sides of one gesture whose WRITE side is `rearm_escalation`,
+    so they have to agree on the tree by construction: this module answered the moved
+    mount while `tui.app` answered the main checkout, which is the same
+    one-surface-two-trees split the anchor exists to close, merely relocated to a
+    different pair of surfaces. Kept as a named wrapper because the call site is
+    stories-mode-only (sprint mode must not probe for a stories root at all)."""
+    return live_stories_root(task, state, project_root)
 
 
 def resolution_path(run_dir: Path, story_key: str) -> Path:
@@ -323,8 +322,8 @@ def build_context(
     stories_ctx: dict[str, Any] | None = None
     if state.source == "stories":
         # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
-        # `task_stories_root` rather than by `task_spec_root`. Sprint mode consumes no
-        # stories data, so it must not probe for a stories root at all.
+        # `runs.live_stories_root` rather than by `task_spec_root`. Sprint mode consumes
+        # no stories data, so it must not probe for a stories root at all.
         stories_root = _context_stories_root(task, state, current_project_root)
         stories_ctx = _stories_context(
             state, story_key, stories_root, task, context_spec_path=context_spec_path
@@ -441,8 +440,8 @@ def _stories_context(
     from . import stories
 
     # `root`, not `Path(state.project)`: the caller resolved it with
-    # `task_stories_root`, so this block reads the manifest and sentinel out of the tree
-    # the RUN owns. One `context.json` that names two trees is worse than one that names
+    # `_context_stories_root`, so this block reads the manifest and sentinel out of the
+    # tree the RUN owns. One `context.json` that names two trees is worse than one that names
     # the wrong one — `sentinel.path` and `blocking_condition` would otherwise describe a
     # file the re-arm will never touch, or vanish entirely because the main checkout has
     # no sentinel while the mount does.
