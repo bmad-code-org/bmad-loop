@@ -14,7 +14,10 @@ breaking changes may land in a minor release.
   keeping the session project-rooted and directing code fixes and commits to the code
   root. The re-arm writes the same tree the context published: `runs.rearm_escalation`
   takes the live project root from `resolve` and the TUI, so a moved project no longer
-  has the agent edit one copy of the spec while the re-arm flips another.
+  has the agent edit one copy of the spec while the re-arm flips another. A recorded
+  spelling that traverses out of the project through `..` (an external artifact root
+  named relative to it) is classified external and left unchanged rather than rebased
+  onto a different file under the moved project's new parent.
 
 - **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
   The warn-only probe that lists the commits an abandoned attempt left below the re-drive's

@@ -3019,6 +3019,14 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     edits the live copy while the re-arm writes a path under a directory that no
     longer exists, so the flip silently no-ops and the re-drive wedges on the
     escalated attempt's status.
+
+    `relative_to` is a prefix match, and ``<recorded>/../shared/spec.md`` carries the
+    prefix while naming a tree OUTSIDE it: a ``..`` after the recorded project
+    climbs out, so the remainder is not project-owned. Rebasing it would redirect
+    the spelling to ``<live>/../shared/spec.md`` — a different file once the project
+    moved to another parent. Normalizing the ``..`` away lexically would be wrong
+    across symlinks (and is the canonicalization this function forbids), so a
+    traversing spelling is classified external and left alone like every other.
     """
     recorded_project = Path(state.project)
     if project_root == recorded_project:
@@ -3026,6 +3034,8 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     try:
         relative = path.relative_to(recorded_project)
     except ValueError:
+        return path
+    if ".." in relative.parts:
         return path
     return project_root / relative
 
