@@ -310,6 +310,12 @@ breaking changes may land in a minor release.
   unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
   the preimage they wrote over is still the bytes the run last claimed; the restore skips
   and journals `ledger-restore-skipped-diverged`.
+- **A failed `rearm-code-root-restamped` append no longer loses the move record for
+  good.** `restamp_code_root` committed the new root and journalled afterwards, so an
+  append that failed once left a retry exiting at "already agrees" with the record never
+  written and the later `run-resume` line reporting `code_root_changed=False`. The record
+  is now written ahead of the state write under the same lock, so the retry redoes both.
+
 - **The journal-kind inventory no longer misses a kind passed POSITIONALLY to a declared
   dynamic-kind position.** The scan read `node.keywords` only, so
   `_close_bundle_ledger_when_spec_status(task, spec, status, "new-kind")` — legal Python,
