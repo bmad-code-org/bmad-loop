@@ -1359,6 +1359,43 @@ def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp
     assert adapter._sessions == {}
 
 
+@pytest.mark.parametrize("name", generic.RESULT_FILE_ARTIFACTS)
+def test_start_session_refuses_a_redirected_mixin_artifact_without_side_effects(tmp_path, name):
+    """The inherited `_ResultFileMixin` writes the heartbeat and both breadcrumb
+    files under the task directory, so a reused directory carrying a symlink under
+    one of those names is the same hazard the generic adapter refuses: the heartbeat
+    overwrite truncates the link's target, a breadcrumb append lands outside the run.
+    This adapter validated `messages.json` alone — its own file — and let the three
+    mixin writes through.
+
+    Parametrized over `generic.RESULT_FILE_ARTIFACTS` so a fourth mixin write is a
+    new row here, not a new gap.
+
+    Ablation: validate `(task_dir / "messages.json",)` alone again and every row
+    reddens on the raise."""
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside-target"
+    outside.write_text("theirs", encoding="utf-8")
+    task_id = "reused-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir(parents=True)
+    try:
+        (task_dir / name).symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert (task_dir / name).is_symlink()
+    assert not (task_dir / "prompt.txt").exists()  # refused before the first write
+    assert spawn_calls == []
+
+
 def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_path):
     adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
     spawn_calls = []

@@ -261,6 +261,11 @@ breaking changes may land in a minor release.
   as a freshly published rival on every attempt. The compare now uses the pid file as
   recorded; a rival is a changed file, nothing else.
 
+- **The OpenCode adapter validates every task artifact it will write.** It refused a
+  redirected `messages.json` but not a symlinked, hardlinked or special `heartbeat.json`,
+  `resultless-stops.jsonl` or `session-lifecycle.jsonl`, which the inherited result-file
+  mixin writes; the three names now live in one `RESULT_FILE_ARTIFACTS` tuple both adapters
+  validate.
 - Serialize run deletion/archive against resume (DW-94), refusing a newly live
   engine under the per-run lock and preventing a waiting resume from recreating a
   run cleanup already removed.
