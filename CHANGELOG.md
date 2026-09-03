@@ -248,6 +248,17 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A `seen-again:` match that goes stale inside the ledger lock no longer swallows the
+  recurrence.** `_harvest_spec_deferrals` decides the cross-spec dedupe against a ledger
+  snapshot and excludes the matched finding from its append, then stamps the sighting later
+  under `deferredwork.mark_seen_again_many`'s lock. A rival that closed or archived the entry
+  in that window got the line stamped onto a done entry while no open entry was filed — the
+  finding was then recorded neither as a sighting nor as an entry. The primitive now rechecks
+  `entry.open` inside the hold and returns the ids whose match went stale; the harvest files
+  those findings after all, persists their records ahead of the append so the isolation carry
+  can re-file them, keeps `seen_again` naming only entries that actually took a sighting, and
+  journals `spec-deferral-sighting-stale`.
+
 - **Document spec baseline frontmatter as an optional `verify_dev` attestation**
   (DW-51), with no-claim acceptance and no-work refusal regressions anchored to
   the orchestrator-recorded baseline.

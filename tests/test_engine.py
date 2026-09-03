@@ -14194,6 +14194,57 @@ def test_harvest_files_fresh_when_the_match_is_done(project):
     assert event["dw_ids"] == ["DW-2"] and event["seen_again"] == []
 
 
+def test_harvest_files_the_finding_when_the_seen_again_match_goes_stale(project, monkeypatch):
+    """TOCTOU: the match is decided against a ledger snapshot, the sighting is
+    stamped later under the ledger lock. A rival that closes the entry in between
+    leaves the sighting nowhere to land — and the finding was already excluded from
+    the append on the strength of that match, so without the in-lock recheck the
+    recurrence is lost with no entry and no sighting anywhere.
+
+    The real primitive still runs; only the ledger is mutated ahead of it, which is
+    the race window itself rather than a stub of the code under test."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    real_mark = deferredwork.mark_seen_again_many
+
+    def close_the_match_first(path, dw_ids, date, note):
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-05"),
+            encoding="utf-8",
+        )
+        return real_mark(path, dw_ids, date, note)
+
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", close_the_match_first)
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    # the recurrence is filed fresh, exactly as a match already done at snapshot
+    # time would have been (`_apply_append` dedupes open entries only)
+    assert [e.id for e in entries] == ["DW-1", "DW-2"]
+    assert entries[1].open and entries[1].title == HARVEST_A["summary"]
+    assert "seen-again: " not in entries[0].body  # never stamped on the closed entry
+    (stale_event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "spec-deferral-sighting-stale"
+    ]
+    assert stale_event["items"] == ["DW-1"] and stale_event["refiled"] == 1
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    # `seen_again` names entries that actually took a sighting; a stale id took none
+    assert event["dw_ids"] == ["DW-2"] and event["seen_again"] == []
+    # and the record is persisted, so the isolated carry can re-file it too
+    assert [r["origin"] for r in engine.state.tasks["1-1-a"].harvested_deferrals] == [
+        f"spec-deferred {fp}"
+    ]
+
+
 def test_ledger_digest_collapses_absent_and_empty_only():
     assert _digest_of(None) == _digest_of("")
     assert _digest_of("# Deferred Work\n") != _digest_of(None)

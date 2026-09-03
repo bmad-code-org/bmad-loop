@@ -586,6 +586,26 @@ class _LedgerAnchor(StrEnum):
     NO_RESET_CONTENT = "no-reset-content"
 
 
+def _harvest_row(
+    finding: devcontract.DeferredFinding,
+) -> tuple[str, str, str, str | None, str | None]:
+    """One harvest row — `(origin, title, reason, location, severity)` — for a
+    finding this harvest may file.
+
+    Shared by the snapshot scan and by the stale-sighting recovery below, so a
+    finding whose `seen-again:` match died inside the ledger lock files the
+    byte-identical row it would have filed had the match never existed. Two
+    spellings of this tuple would diverge on exactly the rare path nothing
+    exercises."""
+    return (
+        f"{HARVEST_ORIGIN} {finding.fingerprint}",
+        finding.summary,
+        finding.evidence or finding.summary,
+        finding.location or None,
+        finding.severity or None,
+    )
+
+
 class Engine:
     # The engine that installed the process-wide stop handlers. Signal handling is
     # single-owner per process; only this engine reinstalls/restores them. Run
@@ -3946,6 +3966,53 @@ class Engine:
             return None
         return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
 
+    def _absorb_harvest_records(
+        self,
+        task: StoryTask,
+        rows: Sequence[tuple[str, str, str, str | None, str | None]],
+        spec_name: str,
+    ) -> None:
+        """Fold harvest rows into ``task.harvested_deferrals`` under the stable-union
+        rule, and checkpoint when the union actually grew.
+
+        Persist the full intended set, not only newly-filed rows: a replay can
+        dedupe every append while a later isolation carry still needs the data. The
+        union is stable across a retained retry/review chain — a later pass may
+        replace the frontmatter list, but every earlier accepted finding is still
+        present in an ignored unit ledger and must survive final carry — so the key
+        is ``(origin, source_spec)`` and a repeat is dropped rather than doubled.
+
+        The isolation carry reads only persisted records after a hard loss, so the
+        checkpoint has to precede the ledger write that files these rows. That holds
+        for both callers: the snapshot scan's rows, and the rows recovered when a
+        `seen-again:` match went stale inside the mark's lock — the latter still land
+        ahead of the append, which is the write that files them. Checkpoint every
+        expansion, including later passes where ``harvest_wrote_ledger`` is already
+        latched and its separate pre-write save will be skipped."""
+        known = {
+            (str(item.get("origin", "")), str(item.get("source_spec", "")))
+            for item in task.harvested_deferrals
+        }
+        changed = False
+        for origin, title, reason, location, severity in rows:
+            key = (origin, spec_name)
+            if key in known:
+                continue
+            task.harvested_deferrals.append(
+                {
+                    "origin": origin,
+                    "title": title,
+                    "reason": reason,
+                    "location": location,
+                    "severity": severity,
+                    "source_spec": spec_name,
+                }
+            )
+            known.add(key)
+            changed = True
+        if changed:
+            self._save()
+
     def _harvest_spec_deferrals(
         self, task: StoryTask, result_json: dict | None
     ) -> VerifyOutcome | None:
@@ -3981,7 +4048,15 @@ class Engine:
         fresh, consistent with ``_apply_append``'s open-only scan. A matched
         finding is also excluded from ``harvested_deferrals``, so the isolated
         carry cannot re-file the duplicate.
-        """
+
+        That exclusion is provisional, because the match is decided against a
+        SNAPSHOT and the stamp happens later under the ledger lock. A rival that
+        closes or archives the entry in between leaves the sighting with nowhere to
+        land, and the finding — already dropped from the append on the strength of
+        the match — would vanish entirely. ``mark_seen_again_many`` therefore
+        rechecks ``entry.open`` inside its hold and reports the ids whose match went
+        stale; those findings are folded back into both the append and the records
+        here, and the loss is journaled as ``spec-deferral-sighting-stale``."""
         if not self._generic_dev():
             return
         spec_path = self._harvest_spec_path(task, result_json)
@@ -4091,8 +4166,14 @@ class Engine:
         # entries never match; a recurrence after a close files fresh, exactly
         # as `_apply_append`'s open-only scan treats its own dedupe. Matched
         # findings are also excluded from `harvested_deferrals`, so the
-        # isolated carry cannot re-file the duplicate.
+        # isolated carry cannot re-file the duplicate — provisionally: this
+        # reads a SNAPSHOT, and the stale arm below restores any finding whose
+        # match did not survive to the mark's lock.
         seen_again_ids: list[str] = []
+        # Every finding behind each matched id, so a match that goes stale inside
+        # `mark_seen_again_many`'s lock can still be filed. Dropping the finding
+        # here — as this loop used to — makes that recovery impossible.
+        matched: dict[str, list[devcontract.DeferredFinding]] = {}
         harvestable: list[devcontract.DeferredFinding] = []
         for finding in findings:
             origin = f"{HARVEST_ORIGIN} {finding.fingerprint}"
@@ -4117,21 +4198,16 @@ class Engine:
             )
             if match is None:
                 harvestable.append(finding)
-            elif match.id not in seen_again_ids:
+                continue
+            matched.setdefault(match.id, []).append(finding)
+            if match.id not in seen_again_ids:
                 seen_again_ids.append(match.id)
 
         # (origin, title, reason, location, severity), one row per entry this
         # harvest may file. The malformed loss is aggregated per spec so a bad
         # sibling never suppresses a valid finding and never disappears silently.
         pending: list[tuple[str, str, str, str | None, str | None]] = [
-            (
-                f"{HARVEST_ORIGIN} {finding.fingerprint}",
-                finding.summary,
-                finding.evidence or finding.summary,
-                finding.location or None,
-                finding.severity or None,
-            )
-            for finding in harvestable
+            _harvest_row(finding) for finding in harvestable
         ]
         if malformed:
             self.journal.append(
@@ -4154,39 +4230,7 @@ class Engine:
                 )
             )
 
-        # Persist the full intended set, not only newly-filed rows. A replay can
-        # dedupe every append while a later isolation carry still needs the data.
-        # Keep a stable union across a retained retry/review chain: a later pass
-        # may replace the frontmatter list, but every earlier accepted finding is
-        # still present in an ignored unit ledger and must survive final carry.
-        current_records = [
-            {
-                "origin": origin,
-                "title": title,
-                "reason": reason,
-                "location": location,
-                "severity": severity,
-                "source_spec": spec_name,
-            }
-            for origin, title, reason, location, severity in pending
-        ]
-        known = {
-            (str(item.get("origin", "")), str(item.get("source_spec", "")))
-            for item in task.harvested_deferrals
-        }
-        records_changed = False
-        for record in current_records:
-            key = (str(record["origin"]), str(record["source_spec"]))
-            if key not in known:
-                task.harvested_deferrals.append(record)
-                known.add(key)
-                records_changed = True
-        if records_changed:
-            # The isolation carry reads only persisted records after a hard
-            # loss. Checkpoint every stable-union expansion before a ledger
-            # append, including later passes where harvest_wrote_ledger is
-            # already latched and its separate pre-write save will be skipped.
-            self._save()
+        self._absorb_harvest_records(task, pending, spec_name)
 
         if seen_again_ids:
             # Latch + save BEFORE the write, exactly as the append path does: a
@@ -4197,18 +4241,45 @@ class Engine:
             if not task.harvest_wrote_ledger:
                 task.harvest_wrote_ledger = True
                 self._save()
-            marked_published = deferredwork.mark_seen_again_many(
+            _, marked_published, stale = deferredwork.mark_seen_again_many(
                 ledger,
                 seen_again_ids,
                 self._today(),
                 f"spec-deferral harvest of {spec_name}",
-            )[1]
+            )
             if marked_published is not None:
                 # Re-anchor the pre-harvest restore's CAS on what the mark
                 # published; a following append overwrites this with its own
                 # published text (its locked read includes these marks).
                 task.post_engine_ledger_digest = _digest_of(marked_published)
                 self._save()
+            if stale:
+                # The match was OPEN in the snapshot read above, and gone or
+                # closed by the time the mark took the ledger lock. The sighting
+                # landed nowhere, and the finding was already excluded from
+                # `pending` on the strength of that match — so without this it is
+                # lost in silence, recorded neither as a sighting nor as an entry.
+                # A recurrence after a close files fresh (`_apply_append` dedupes
+                # open entries only), which is exactly what the scan above would
+                # have decided had it run inside the lock.
+                recovered = [
+                    _harvest_row(finding) for dw_id in stale for finding in matched.get(dw_id, ())
+                ]
+                self.journal.append(
+                    "spec-deferral-sighting-stale",
+                    story_key=task.story_key,
+                    spec=spec_name,
+                    items=stale,
+                    refiled=len(recovered),
+                )
+                pending.extend(recovered)
+                # Records before the ledger write that files them, exactly as the
+                # first pass ordered it: the isolation carry reads only what was
+                # persisted, and the append below is still ahead of us.
+                self._absorb_harvest_records(task, recovered, spec_name)
+                # Keep the harvest record honest: `seen_again` below names the
+                # entries that actually took a sighting, and a stale one took none.
+                seen_again_ids = [i for i in seen_again_ids if i not in set(stale)]
 
         specs: list[deferredwork.EntrySpec] = []
         deduped = 0
