@@ -403,8 +403,16 @@ escalation emits before the run stops, on either leg.
 
 `post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
 per-command `CommandResult` records core just executed. Each has `command`,
-`returncode`, the existing merged bounded `output_tail`, and separate `stdout`
-and `stderr` strings. Those two are intended to be the streams essentially whole
+`returncode`, the existing merged bounded `output_tail`, separate `stdout`
+and `stderr` strings, and `spawn_error` — normally `None`, and set when the child
+could not be started at all. The typical cause is the directory it was to run in
+(missing, not a directory, or unsearchable), which the message names, but any
+spawn-time `OSError` lands here — a missing shell, EMFILE, ENOMEM — so read the
+wrapped exception rather than assuming the directory. Such a result carries no
+real exit status (`verify.SPAWN_FAULT_RC`, deliberately outside the range a
+signal-killed child reports and distinct from the timeout leg's `-1`) and
+classifies as an environment fault, which pauses the run. The two stream strings
+are intended to be the streams essentially whole
 — they are not cut to `[verify] stream_capture_kb`, which bounds only what is
 written to disk — but they are not unbounded either: a hard 32 MiB per-stream
 ceiling applies, so a pathologically chatty command cannot grow the orchestrator's
@@ -415,9 +423,13 @@ is always detectable rather than silent. Ordinary suites never reach it. This is
 observation data only: a plugin cannot change the verifier's outcome or the commit
 decision. The run's `journal.jsonl` also records
 one `verify-command-result` entry per command with run/story/attempt/stage and
-verification-sequence correlation, `output_tail`, byte counts, and run-relative `stdout_path` /
+verification-sequence correlation — note that `attempt` is the dev/repair counter, so every review
+cycle of one attempt shares a single value and only `verification_sequence` tells successive review
+passes apart — `output_tail`, `spawn_error`, byte counts, and run-relative `stdout_path` /
 `stderr_path` pointers under the run's `verify/` directory; full streams are not
-embedded in the journal. That store is deliberately separate from `logs/`, which
+embedded in the journal. `spawn_error` rides the record because the record's
+readers are out-of-process and `returncode` alone cannot separate a child that
+never started from one that ran. That store is deliberately separate from `logs/`, which
 holds coding-CLI pane captures named after session task ids and is read as such
 by the TUI.
 
@@ -470,34 +482,44 @@ carries the reason. A plugin reading these pointers must therefore treat both
 file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
-**The dev phase is the whole of this surface.** `[verify] commands` also run at
-the _review_ gate — `verify_review` / `verify_review_stories` /
-`verify_review_bundle` end on the same core classifier — and **none of those runs
-are journalled or published to any hook.** They run in `repo_root`, the same root
+**The dev phase is the whole of this HOOK, not of the journal.** `[verify]
+commands` also run at the _review_ gate — `verify_review` /
+`verify_review_stories` / `verify_review_bundle` end on the same core classifier
+— and those runs **are journalled** (`verification_stage: "review"`, sharing the
+story's one `verification_sequence` counter with the dev and fix passes) but are
+**not published to any hook.** They run in `repo_root`, the same root
 the dev phase uses (#695); only the gates' own artifact reads — the spec, the
 sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
 converged review pass, the review-budget-exhaustion rescue, the review-timeout
 salvage, and both passes inside the skip-review commit path (which runs the gate
-again after a repair). `bmad-loop confirm --reverify` runs the commands too, out
-of band by construction — the run that parked the story is finished, so there is
-no journal to write to and no hook bus to emit on.
+again after a repair). The records do not name which of the five ran — the
+neighbouring `review-result` / `review-skipped*` / `review-timeout-salvage*`
+entries and the sequence ordering say that. `bmad-loop confirm --reverify` runs
+the commands too, out of band by construction — the run that parked the story is
+finished, so there is no journal to write to and no hook bus to emit on.
 
 Two consequences a handler has to be written for:
 
-- **`verify-command-result` entries are not a complete census of a run's verifier
-  invocations.** Every story that reaches a commit ran the commands at least once
-  more than the records show. Never derive "the verifier ran N times" or "the last
-  thing the verifier saw" from the journal — derive only "these are the dev-phase
-  passes", which is what the records claim.
-- **A green commit is not evidence that the last journalled pass was green**, and a
-  red journalled pass is not evidence the commit was blocked: a `fix` pass can fail
-  and the story still commit after a later review-gate run that left no record.
-  Correlate a decision with the `dev-decision` / `fix-decision` / `review-result`
-  entries beside the results, not with the results alone.
+- **`verify-command-result` entries are a complete census of a RUN's verifier
+  command invocations, but not of every gate visit or of a project's.** Every
+  command executed by an in-run dev, fix or review pass lands a record. A pass
+  with no `[verify] commands` configured executes nothing and therefore records
+  nothing; `bmad-loop confirm --reverify` stays outside because it runs after the
+  run that parked the story is over. Count distinct `verification_sequence`
+  values to derive recorded passes, while preserving that zero-command caveat.
+- **One command record is not a pass verdict**, and an earlier red pass is not
+  evidence the commit was blocked: a failed pass can be followed by a green
+  review-gate pass and a commit. Group records by `verification_sequence`, then
+  correlate that group with its surrounding decision event instead of inferring
+  the decision from one command or from an older pass. The dev and fix legs use
+  `dev-decision` / `fix-decision`; review passes use the applicable neighbouring
+  `review-result`, `review-skipped*`, `review-timeout-salvage*`,
+  `review-budget-committed`, or `review-followup-damped` event described above.
 
-The boundary is deliberate, not an oversight — the review leg would need its own
-hook stage rather than a second meaning for one named `post_dev_verify` — and is
-tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656).
+The hook boundary is deliberate, not an oversight — the review leg would need its
+own stage rather than a second meaning for one named `post_dev_verify` — and is
+tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656),
+which now narrows to that stage: the journalling half of it has landed.
 
 ### Review
 
@@ -510,7 +532,8 @@ tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issu
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
 None of these carries the review gate's `[verify] commands` results — that gate
-runs the commands and retains nothing. See the boundary note above `### Review`.
+journals every command it runs, stream captures included, but publishes nothing to
+a hook context. See the boundary note above `### Review`.
 
 ### Commit
 

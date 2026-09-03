@@ -9,11 +9,13 @@ import yaml
 from conftest import escalated_run, git
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
+from bmad_loop.engine import _session_task_id
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
     RunState,
+    SessionRecord,
 )
 from bmad_loop.platform_util import safe_segment
 
@@ -2000,6 +2002,43 @@ def test_rearm_rejects_unescalated_story(tmp_path):
         runs.rearm_escalation(run_dir, isolated_redrive=False)
 
 
+# ------------------------------------------------- _gather_escalations
+
+
+def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
+    """The outermost surface DW-7 names. `_gather_escalations` walks the append-only
+    `task.sessions` — which a re-arm deliberately does NOT clear — and reads
+    `tasks/<record.task_id>/escalation.json` once per record. While the ESCALATED
+    restart re-minted an id byte-equal to the abandoned attempt's, BOTH records
+    addressed the one file, so the abandoned cycle's escalation was returned a second
+    time as the fresh session's. Bumping `generation` gives the fresh record its own
+    id, and the file is read exactly once."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    abandoned = _session_task_id(key, "triage", 1, 0)
+    fresh = _session_task_id(key, "triage", 1, 1)  # post-bump: the -g1 namespace
+    assert abandoned != fresh
+
+    task.sessions.clear()
+    task.sessions.append(SessionRecord(task_id=abandoned, role="dev", status="completed"))
+    task.sessions.append(SessionRecord(task_id=fresh, role="dev", status="completed"))
+    esc_dir = run_dir / "tasks" / abandoned
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    (esc_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "abandoned cycle"}]}),
+        encoding="utf-8",
+    )
+
+    found = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["abandoned cycle"]  # once, not twice
+
+    # the pre-fix shape for contrast: one shared id makes the SAME file answer both
+    # records, and the abandoned escalation is attributed to the fresh session too
+    task.sessions[1] = SessionRecord(task_id=abandoned, role="dev", status="completed")
+    collided = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in collided] == ["abandoned cycle", "abandoned cycle"]
+
+
 # ----------------------------------------------------------- run_session
 
 
@@ -2024,7 +2063,10 @@ def test_run_session_detects_resolution(tmp_path, monkeypatch):
 
     monkeypatch.setattr(resolve.subprocess, "run", fake_subprocess_run)
     adapter = _FakeAdapter(None)
-    assert resolve.run_session(adapter, tmp_path, run_dir, "6-4-cli-list-command") is True
+    assert (
+        resolve.run_session(adapter, tmp_path, run_dir, "6-4-cli-list-command", generation=0)
+        is True
+    )
 
 
 def test_run_session_no_resolution(tmp_path, monkeypatch):
@@ -2032,7 +2074,10 @@ def test_run_session_no_resolution(tmp_path, monkeypatch):
     resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
     monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
     assert (
-        resolve.run_session(_FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command") is False
+        resolve.run_session(
+            _FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command", generation=0
+        )
+        is False
     )
 
 
@@ -2046,9 +2091,85 @@ def test_run_session_clears_stale_marker(tmp_path, monkeypatch):
     stale.write_text('{"from": "last time"}', encoding="utf-8")
     monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)  # agent records nothing
     assert (
-        resolve.run_session(_FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command") is False
+        resolve.run_session(
+            _FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command", generation=0
+        )
+        is False
     )
     assert not stale.exists()  # stale marker was removed, not reused
+
+
+class _SpecCapture(_FakeAdapter):
+    """Records the SessionSpec `run_session` built; its task_id is the whole subject."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.specs: list = []
+
+    def interactive_argv(self, spec):
+        self.specs.append(spec)
+        return super().interactive_argv(spec)
+
+
+def _minted_id(tmp_path, monkeypatch, story_key, generation) -> str:
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
+    adapter = _SpecCapture()
+    resolve.run_session(adapter, tmp_path, tmp_path / "run", story_key, generation=generation)
+    # without this, a run_session that stopped building a spec at all would fail every
+    # id row below with a bare IndexError rather than naming what broke
+    assert adapter.specs, "run_session built no SessionSpec"
+    return adapter.specs[0].task_id
+
+
+def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(
+    tmp_path, monkeypatch
+):
+    """Routing the id through `engine._session_task_id` must not move any run-dir
+    path already on disk: for an ordinary clean key at generation 0 the composition
+    point returns exactly what the hand-mint did."""
+    assert _minted_id(tmp_path, monkeypatch, "6-4-cli-list-command", 0) == (
+        "6-4-cli-list-command-resolve-1"
+    )
+
+
+def test_run_session_id_carries_the_generation_discriminator(tmp_path, monkeypatch):
+    """A resolve spec in generation 1 carries that namespace discriminator.
+
+    Repeated sessions before a successful re-arm may legitimately stay in the same
+    generation; this row tests generation composition, not per-invocation uniqueness.
+    """
+    assert _minted_id(tmp_path, monkeypatch, "6-4-cli-list-command", 1) == (
+        "6-4-cli-list-command-resolve-1-g1"
+    )
+
+
+def test_run_session_id_sanitizes_the_whole_composition(tmp_path, monkeypatch):
+    """The property the hand-mint lost. `safe_segment` caps at MAX_SEGMENT and is
+    identity for a clean name, so sanitizing the KEY alone and concatenating the
+    suffix AFTER returns a segment past the cap for a key already at it — while
+    sanitizing the whole composition returns one legal segment."""
+    key = "a" * platform_util.MAX_SEGMENT
+    minted = _minted_id(tmp_path, monkeypatch, key, 0)
+
+    assert minted == safe_segment(f"{key}-resolve-1")
+    assert len(minted) <= platform_util.MAX_SEGMENT
+    # ...whereas the part-wise mint this replaced overflowed (130 chars)
+    assert len(safe_segment(key) + "-resolve-1") > platform_util.MAX_SEGMENT
+
+
+def test_run_session_id_digest_differs_from_the_part_wise_order(tmp_path, monkeypatch):
+    """The OTHER half of `_session_task_id`'s stated contract. `safe_segment` digests
+    the string it was handed, so for a dirty key the two orders differ in content, not
+    just in length: sanitize-then-append embeds a digest of the bare key, while the
+    chokepoint embeds a digest of the whole composition. The cap row above covers
+    length; nothing covered this."""
+    dirty = "6-4:cli?list"
+    assert safe_segment(dirty) != dirty  # the key really is dirty
+
+    minted = _minted_id(tmp_path, monkeypatch, dirty, 0)
+
+    assert minted == safe_segment(f"{dirty}-resolve-1")
+    assert minted != safe_segment(dirty) + "-resolve-1"
 
 
 # ---------------- item 9: build_context stories-mode enrichment --------------

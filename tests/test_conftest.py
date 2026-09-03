@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 
 import conftest
 import pytest
 from conftest import make_git_noisy
 
-from bmad_loop import verify
+from bmad_loop import bmadconfig, verify
 
 
 def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
@@ -48,6 +49,109 @@ def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     assert list(hooks.glob("*.sample")) == []
     assert hooks.is_dir()
     assert (git_dir / "info" / "exclude").is_file()
+
+
+def test_plant_root_markers_refuses_physical_aliases(tmp_path):
+    """Different spellings of one directory do not make a divergent-roots probe."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_alias = tmp_path / "project-alias"
+    try:
+        project_alias.symlink_to(repo_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(AssertionError, match="DIFFERENT roots"):
+        conftest.plant_root_markers(repo_root=repo_root, project=project_alias)
+
+
+@pytest.mark.parametrize(
+    ("stale_root", "marker"),
+    [
+        ("project", conftest.MARKER_IN_REPO_ROOT),
+        ("repo_root", conftest.MARKER_IN_PROJECT),
+    ],
+)
+def test_plant_root_markers_refuses_opposite_root_residue(tmp_path, stale_root, marker):
+    """A stale opposite-root marker cannot turn the cwd probe into a false green."""
+    repo_root = tmp_path / "repo"
+    project = tmp_path / "project"
+    repo_root.mkdir()
+    project.mkdir()
+    {"repo_root": repo_root, "project": project}[stale_root].joinpath(marker).write_text("stale\n")
+
+    with pytest.raises(AssertionError, match="stale"):
+        conftest.plant_root_markers(repo_root=repo_root, project=project)
+
+
+def test_write_repo_root_override_creates_the_config_tree(project, tmp_path):
+    """The standalone writer does not depend on another fixture running first."""
+    config = project.project / conftest.BMAD_CONFIG_REL
+    assert not config.parent.exists()
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+
+    conftest.write_repo_root_override(project, code_root)
+
+    assert config.is_file()
+    assert bmadconfig.load_paths(project.project).repo_root == code_root.resolve()
+
+
+def test_write_repo_root_override_quotes_yaml_punctuation(project, tmp_path):
+    """YAML punctuation and non-BMP Unicode survive the config round trip."""
+    config = project.project / conftest.BMAD_CONFIG_REL
+    config.parent.mkdir(parents=True)
+    code_root = tmp_path / "code'root-😀"
+    code_root.mkdir()
+
+    conftest.write_repo_root_override(project, code_root)
+
+    assert bmadconfig.load_paths(project.project).repo_root == code_root.resolve()
+
+
+def test_write_repo_root_override_refuses_a_relative_code_root(project):
+    """A relative override cannot acquire process-cwd semantics by accident."""
+    with pytest.raises(AssertionError, match="absolute code_root"):
+        conftest.write_repo_root_override(project, conftest.Path("relative-code-root"))
+
+    assert not (project.project / conftest.BMAD_CONFIG_REL).exists()
+
+
+def test_nested_repo_root_paths_refuses_a_nonempty_index(project):
+    """Its seed commit must never absorb setup another fixture already staged."""
+    staged = project.project / "staged.txt"
+    staged.write_text("belongs to the caller\n", encoding="utf-8")
+    conftest.git(project.project, "add", staged.name)
+
+    with pytest.raises(AssertionError, match="empty index"):
+        conftest.nested_repo_root_paths(project)
+
+    assert not (project.project / conftest.NESTED_SUBDIR).exists()
+
+
+def test_nested_repo_root_paths_refuses_already_divergent_input(project, tmp_path):
+    """The builder owns divergence and leaves pre-diverged input untouched."""
+    paths = replace(project, repo_root=tmp_path / "other-root")
+
+    with pytest.raises(AssertionError, match="already have one"):
+        conftest.nested_repo_root_paths(paths)
+
+    assert not (project.project / conftest.NESTED_SUBDIR).exists()
+
+
+def test_nested_repo_root_paths_refuses_an_existing_nested_project(project):
+    """The builder never overwrites a caller-owned `app/` directory."""
+    nested = project.project / conftest.NESTED_SUBDIR
+    nested.mkdir()
+    sentinel = nested / "caller-owned.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="already exists"):
+        conftest.nested_repo_root_paths(project)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert not (nested / "src.txt").exists()
+    assert not (nested / ".gitignore").exists()
 
 
 def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(project, tmp_path):

@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
     escalated_run,
     fault_read_text,
@@ -25,10 +27,12 @@ from conftest import (
     install_dev_shim,
     machine_json,
     mark_ledger_done,
+    plant_root_markers,
     refuse_to_resolve,
     spec_path,
     write_gated_ledger,
     write_ledger,
+    write_repo_root_override,
     write_script_launcher,
     write_spec,
     write_sprint,
@@ -3143,6 +3147,44 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
 
 
+def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkeypatch):
+    """`cmd_resolve` hands the resolve session the generation it read off the task — a
+    real value, not a constant. The row seeds a NON-zero generation deliberately:
+    `escalated_run` builds tasks at the default 0, so an `assert seen == [0]` cannot
+    tell "read from the task" from "hardcoded 0" — that earlier form passed with
+    `generation=task.generation` ablated to a literal `generation=0`.
+
+    The call precedes `rearm_escalation`, so the value passed is the pre-bump one still
+    on disk. That follows from call ORDER, not from where the read sits: the re-arm
+    reloads state and bumps its own copy, leaving this `task` object untouched either
+    way. Nothing consumes the resulting id, so no collision claim rides on it."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state, save_state
+
+    _escalated_run(tmp_path, "r1")
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
+    state = load_state(run_dir)
+    state.tasks["s1"].generation = 2  # a story already re-armed twice
+    save_state(run_dir, state)
+    seen: list[int] = []
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        seen.append(generation)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    # --no-resume: re-arm only, so the bump this row contrasts against still runs
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == [2]  # the task's own generation, not a constant
+    assert load_state(run_dir).tasks["s1"].generation == 3  # the re-arm bumped past it
+
+
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
     from bmad_loop import resolve
 
@@ -3380,7 +3422,7 @@ def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
     ran: list = []
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the resolve agent records a restore_patch in its output marker
         ran.append(story_key)
         marker = resolve.resolution_path(rd, story_key)
@@ -3565,7 +3607,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     patch.write_text("diff", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the resolve agent records a restore_patch in its output marker
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -3621,7 +3663,7 @@ def test_resolve_rereads_isolation_after_the_agent_session(
     _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
     _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the human and the agent conclude the story needs isolation, and the operator
         # edits policy.toml from another terminal while the session is still open
         if flipped_mid_session:
@@ -3664,7 +3706,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
@@ -3695,7 +3737,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
@@ -5014,7 +5056,7 @@ def test_diagnose_json_emits_pure_document(project, capsys):
 
     _seed_run(project.project)
     doc = machine_json(["diagnose", "--project", str(project.project), "--json"], capsys)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert doc["runs"], "the document carries the run it resolved"
     for canary in CANARIES:
         assert canary not in json.dumps(doc), f"LEAK via CLI: {canary!r}"
@@ -5034,7 +5076,7 @@ def test_diagnose_json_out_writes_document_and_keeps_stdout_empty(project, tmp_p
     assert "written to" in err  # the confirmation moved to stderr
     written = out_file.read_text()
     doc = json.loads(written)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert "```" not in written  # no fences in a file written in JSON mode
     for canary in CANARIES:
         assert canary not in written, f"LEAK via CLI: {canary!r}"
@@ -8009,6 +8051,151 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
+    project, tmp_path, capsys, monkeypatch
+):
+    """A `repo_root` no command can run in refuses the confirmation; it does not
+    raise out of the CLI.
+
+    `_reverify` deliberately does not classify into the engine's vocabulary, but
+    it does reuse `env_fault_reason` — so it inherits the spawn-fault translation
+    with no edit of its own, and this row is what pins that inheritance. Before
+    it, the OSError from `subprocess.run` escaped `cmd_confirm` entirely and the
+    operator saw a traceback in place of "NOT confirmed".
+
+    The park record and the board must be untouched, for the same reason the
+    red-command row beside this one asserts it: a refused `--reverify` has to
+    leave every record exactly where it found it."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-code-root"
+    write_repo_root_override(project, missing)
+    sp = _park_story(project)
+    before = sp.read_text()
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "--reverify failed" in err and "NOT confirmed" in err
+    assert "could not run" in err and str(missing) in err
+    assert sp.read_text() == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def _diverge_repo_root(paths, code_root: Path) -> None:
+    """Compose the two shared conftest halves of the divergent fixture: the
+    `repo_root:` config override, and one cwd marker per root.
+
+    Both load-bearing halves are conftest's, not this module's.
+    `write_repo_root_override` writes the same three keys the two unusable-cwd
+    rows above need, and
+    `plant_root_markers` is the same planter the review-gate row in
+    `test_verify.py` uses — so the four `[verify] commands` callers graded by a
+    two-direction probe cannot end up asking subtly different questions.
+
+    Why this fixture exists at all: `cli._reverify` is handed `paths.repo_root` at
+    both of its call sites, and every pre-existing row here runs a cwd-INSENSITIVE
+    command (`python -c "pass"`) under the collapsed `project` fixture, so nothing
+    observed which root the commands ran in.
+
+    `code_root` is deliberately NOT a git repo, because that is what an operator's
+    `repo_root:` pointing at a non-checkout looks like and `_reverify` runs no git
+    there. Note the limit of that choice: `_land_confirmation` SWALLOWS the
+    `GitError` its `path_ignored`/`commit_paths` calls raise in such a root, so a
+    regression that started shelling out to git here would pass these rows
+    unnoticed. (`test_verify.py::test_verify_review_gates_run_commands_in_repo_root`
+    makes the stronger claim, about a gate that does not swallow it.)
+    """
+    write_repo_root_override(paths, code_root)
+    plant_root_markers(repo_root=code_root, project=paths.project)
+
+
+def _marker_policy(paths, marker_root: str) -> None:
+    """A `[verify] commands` policy holding the RELATIVE probe for one root.
+
+    A dict rather than `X if marker_root == "repo_root" else Y`: under the
+    conditional any value but that exact literal silently selected the project
+    probe, so a typo in the `parametrize` list would have graded BOTH legs in the
+    project direction and left both green — a false-green mechanism inside the
+    rows built to prevent false greens. An unknown key raises `KeyError` here.
+    """
+    command = {"repo_root": REPO_ROOT_MARKER_CMD, "project": PROJECT_MARKER_CMD}[marker_root]
+    _write_policy(paths.project, f"[verify]\ncommands = [{json.dumps(command)}]\n")
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_confirm_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """`cmd_confirm`'s `_reverify` call site, pinned from BOTH directions.
+
+    The marker only `repo_root` holds must let the confirmation through AND the
+    marker only `project` holds must refuse it. The positive leg identifies
+    `repo_root`; the negative leg rules out the tempting `paths.project` regression
+    explicitly. No pre-existing row could see either: they all run cwd-insensitive
+    commands under the `project` fixture, where the two roots are the same object.
+
+    The refusal leg asserts the SPECIFIC failure (`NOT confirmed`) and that all
+    three records are byte-identical to before — a refused `--reverify` has to
+    leave the spec, the board and the park entry exactly where it found them, and
+    `rc == 1` alone is reachable from several other refusals in this command.
+
+    All three are compared as BYTES, which is what "untouched" means and what the
+    claim above says. A parsed read-back (`sprintstatus.story_status`, key
+    membership in `operatoractions.load`) answers a weaker question: a refusal
+    that rewrote the board's other rows, reordered its keys, or rewrote the record
+    in place would satisfy it. The semantic assertions are kept beside the byte
+    ones because they say WHAT the unchanged bytes are.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in `cmd_confirm`
+    and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    sp = _park_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = sp.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "--reverify failed" in captured.err and "NOT confirmed" in captured.err
+        assert sp.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
+
+
 def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, monkeypatch):
     """An empty command list is not a green gate, and must not be reported as one."""
     install_bmad_config(project)
@@ -8427,6 +8614,96 @@ def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, caps
     assert "NOT advanced" in err and "NOT confirmed" not in err
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
+    project, tmp_path, capsys, monkeypatch
+):
+    """The resumable confirmation caller gets the same spawn-fault translation
+    as the initial confirmation and preserves the already-written sign-off."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-resume-code-root"
+    write_repo_root_override(project, missing)
+    spec = _interrupted_story(project)
+    before = spec.read_text(encoding="utf-8")
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert "could not run" in err and str(missing) in err
+    assert spec.read_text(encoding="utf-8") == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """The resumable confirmation's own `_reverify` call site — the second of the
+    two, and a separate line of code from `cmd_confirm`'s.
+
+    Same two-direction probe, and the refusal leg asserts the wording that
+    distinguishes this caller: "NOT advanced" and NOT "NOT confirmed". The
+    confirmation itself already happened here, so telling a human it was not
+    confirmed sends them looking for a sign-off to redo. Asserting the absence
+    matters as much as the presence — one shared message would satisfy a bare
+    "it refused".
+
+    The already-written sign-off must survive either way, which is what makes
+    this leg's "nothing was lost" claim testable at all — and it is compared as
+    BYTES, together with the board and the park record, for the reason the
+    `cmd_confirm` twin gives: a parsed read-back cannot see a record rewritten in
+    place.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in
+    `_resume_confirmation` and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    spec = _interrupted_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = spec.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "NOT advanced" in captured.err and "NOT confirmed" not in captured.err
+        assert spec.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
 
 
 def test_list_marks_an_interrupted_confirmation_as_signed_off_not_refused(project, capsys):

@@ -536,6 +536,33 @@ class DecisionPrompter:
 # ------------------------------------------------------------ sweep engine
 
 
+def _rearm_generation(task: StoryTask) -> None:
+    """Open a new session-id generation for a sweep task restarting from ESCALATED.
+
+    The restart resets ``attempt`` to 0 for a fresh budget, and that reset is exactly
+    what makes the next dispatch re-mint ``attempt == 1`` — an id byte-equal to the
+    abandoned attempt's, since ``engine._session_task_id`` emits its discriminator only
+    above zero. The artifact a shared id corrupts is ``tasks/<id>/escalation.json``: the
+    sweep skill writes it and ``resolve._gather_escalations`` reads it once per RECORDED
+    session, so two records carrying one id return the abandoned cycle's escalation for
+    the fresh session too. ``result.json`` is NOT at risk: both adapters unlink it in
+    ``start_session``.
+
+    Same pattern as ``runs.rearm_escalation``, DIFFERENT reason: #705's harm is
+    ``_resumable_session`` verdict replay, which runs only on the dev/review phases and
+    never reaches ``TRIAGE_RUNNING``/``TRIAGE_VERIFY``. ``cmd_resolve`` *can* reach a
+    sweep task (``_escalate`` raises with ``PAUSE_ESCALATION`` and a story key, which
+    the engine persists), and its own bump there is harmless: the re-arm leaves the task
+    PENDING, so this restart arm does not fire on top of it.
+
+    Call ONLY from the ``Phase.ESCALATED`` arm. A non-escalated restart keeps its
+    attempt counter, so ``attempt += 1`` already yields a fresh id; bumping there would
+    move the namespace for nothing and break the "every id already on disk stays
+    byte-identical" property the suffix rule exists to hold.
+    """
+    task.generation += 1
+
+
 class SweepEngine(Engine):
     """Engine variant whose loop processes the deferred-work ledger instead
     of sprint-status. Bundles reuse the inherited story pipeline through the
@@ -891,6 +918,7 @@ class SweepEngine(Engine):
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                _rearm_generation(task)  # ...and into a fresh session-id namespace
             if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -1172,6 +1200,7 @@ class SweepEngine(Engine):
             self.journal.append("resume-restart", story_key=triage_key, phase=str(task.phase))
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                _rearm_generation(task)  # ...and into a fresh session-id namespace
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
 
         feedback: Path | None = None
@@ -1876,7 +1905,12 @@ class SweepEngine(Engine):
             self._close_bundle_ledger_when_spec_status(
                 task, task.spec_file, "done", kind="sweep-bundle-reclosed"
             )
-        return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
+        return verify.verify_review_bundle(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _operator_park_enabled(self) -> bool:
         # A bundle carries no sprint-status entry, so the pair a park is verified

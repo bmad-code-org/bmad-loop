@@ -202,16 +202,16 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
-    # How many times a human re-arm (`runs.rearm_escalation`) has re-opened this
-    # task. Re-arm resets `attempt` to 0 and the next dispatch bumps it back to 1,
-    # so without a discriminator the re-minted session task_id is byte-equal to a
-    # record the ABANDONED attempt already appended to the append-only `sessions`
-    # list — and `Engine._resumable_session`, which matches on that id, replays the
-    # abandoned attempt's verdict for the fresh one (#705). Feeds
+    # Session-id namespace rollovers performed when an escalated task is reopened
+    # while its attempt budget resets to 0. This happens in `runs.rearm_escalation`
+    # and in the sweep engine's ESCALATED restart arms. The next dispatch bumps the
+    # attempt back to 1, so without a discriminator the re-minted session task_id is
+    # byte-equal to a record the ABANDONED attempt already appended to the
+    # append-only `sessions` list. Feeds
     # `engine._session_task_id`, which emits the suffix only above zero, so every
     # id already on disk stays byte-identical across the upgrade. `task.sessions`
-    # is deliberately NOT cleared at re-arm: the run-dir audit trail it indexes is
-    # read by a second resolve cycle.
+    # is deliberately NOT cleared when a task is reopened: the run-dir audit trail
+    # it indexes is read by a later resolve cycle.
     generation: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
@@ -294,6 +294,20 @@ class StoryTask:
     # owes, and nothing re-derives it once the session that wrote the spec is
     # gone).
     operator_actions: list[str] = field(default_factory=list)
+    # Whether THIS dev phase was in a position to newly elect a park: captured
+    # once, on the fresh entry into `Engine._dev_phase` (`resume_result is None`),
+    # from the same instant and the same condition as `baseline_commit` — so the
+    # expectation and the diff it guards share one anchor. False when the bound
+    # spec was ALREADY at `awaiting-operator` on entry (an earlier attempt's park
+    # is on disk, so a park observed afterwards may be inherited rather than
+    # elected), when parking is disabled, or when the spec could not be read at
+    # all (fail closed). It gates exactly one thing: `verify_dev`'s proof-of-work
+    # skip on the park leg (#335, #676). Every other park gate still selects on the
+    # observed status alone, so an ineligible park with a real diff still passes.
+    # Deliberately per-PHASE, not per-attempt: a fixable repair keeps the previous
+    # session's tree, so re-observing would make every repair of a malformed park
+    # ineligible and fail it on the gate it just re-armed.
+    park_eligible: bool = False
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -442,6 +456,7 @@ class StoryTask:
             ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
+            "park_eligible": self.park_eligible,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -629,6 +644,19 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
+            # `is True`, not `bool(...)`, and this is the one field on this task
+            # where the difference is load-bearing. Every sibling bool above
+            # merely restores bookkeeping; this one AUTHORIZES a gate to be
+            # waived, so its failure direction is not symmetric — a wrong False
+            # costs one retryable proof-of-work refusal, a wrong True re-opens
+            # the inheritance hole the field exists to close (#335, #676). Under
+            # `bool()` every truthy non-boolean grants the waiver, and the
+            # likeliest one is the string "false" (a hand-edited state.json, a
+            # bridge that stringifies JSON scalars): `bool("false")` is True.
+            # Only a real JSON `true` may authorize; anything else — absent,
+            # null, a string, a number — fails closed onto the ordinary gated
+            # path, where an honest park with a real diff still passes.
+            park_eligible=d.get("park_eligible") is True,
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
@@ -868,10 +896,66 @@ class VerifyOutcome:
     # time): no further session can reconcile it, so it routes to a pause with
     # both sides named rather than to another cycle (#334)
     contradiction: bool = False
+    # Whether this PASSING outcome waived the dev gate's proof-of-work check on
+    # the park leg (`verify_dev`'s two-part park selector fired). The fact of the
+    # waiver, not its result: `Engine._verify_dev_artifacts` journals exactly the
+    # attempts this is True for, so a park that got past the dev ARTIFACT gate
+    # without proving work always leaves a trace there (#676).
+    #
+    # Scoped to that gate at both ends, and the bound is worth stating exactly.
+    # This rides only the `passed()` return, so a leg that waived proof-of-work
+    # and then failed a later check INSIDE `verify_dev` — the sprint pair is the
+    # reachable one — records nothing; anything wider would need the flag on the
+    # failing constructors too. It says nothing at all about the stages AFTER that
+    # gate: the configured `[verify]` commands, decision routing, the review loop,
+    # the pre-commit workflows and the commit all run later and may still reject
+    # the attempt, which is then retried or deferred with its record already
+    # written. So a True here means "the artifact gate was cleared with
+    # proof-of-work waived", never "this park committed".
+    park_proof_skipped: bool = False
+    # An OBSERVATION, never a gate: on that same waived leg, what the skipped
+    # proof-of-work gate WOULD have found, measured from the same baseline and
+    # under the same exclusions it would have used. `True` = nothing it counts —
+    # the residue was confined to what proof-of-work already excludes, the #676
+    # shape the waiver exists for. `False` = it would have found changes. `None` =
+    # the probe could not answer.
+    #
+    # `False` is a statement about the TREE, not about a session, and the wording
+    # matters because the tempting shorthand ("the park wrote real code") is a
+    # claim this seam cannot make: the gate it stands in for cannot attribute
+    # residue to a session either — under `isolation = "none"` a commit that
+    # arrived in the shared checkout from outside the session satisfies it — so
+    # the observation inherits exactly that limit rather than improving on it.
+    #
+    # Three things produce `None`, all of them "the probe could not answer": a
+    # `GitError` (it degrades rather than escalating), a git REFUSAL such as an
+    # unresolvable baseline (any rc that is not one of git's two real answers, rc
+    # 128 being the everyday one — `_changes_since` reports it as unknown instead
+    # of letting the gate's fail-open record a confident `False`), and an
+    # attempt with no `baseline_commit` to measure from. Nothing branches on any
+    # of the three.
+    #
+    # The two fields are deliberately separate, and collapsing them is the bug
+    # this pair exists to prevent: one says a gate was waived, the other says what
+    # that gate would have found. Keyed on the observation alone, an unanswerable
+    # probe is indistinguishable from no waiver at all — so a park whose probe
+    # faulted would go unrecorded, re-creating exactly the silence this pair ends.
+    # A waived gate is recorded whatever the probe managed to say; `None` is a
+    # truthful field value, not a reason to withhold the record.
+    park_zero_diff: bool | None = None
 
     @classmethod
-    def passed(cls) -> "VerifyOutcome":
-        return cls(ok=True)
+    def passed(
+        cls,
+        *,
+        park_proof_skipped: bool = False,
+        park_zero_diff: bool | None = None,
+    ) -> "VerifyOutcome":
+        return cls(
+            ok=True,
+            park_proof_skipped=park_proof_skipped,
+            park_zero_diff=park_zero_diff,
+        )
 
     @classmethod
     def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":

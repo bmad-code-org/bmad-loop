@@ -622,9 +622,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         task_dir = self.tasks_dir / spec.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
-        # A re-armed/resumed run reuses task_ids; drop any prior cycle's result
-        # so a session that writes nothing can't be read as a stale completion.
+        # Task ids are supplied by the caller, so defensively reset cycle-scoped
+        # outputs if one is reused. A silent session must not inherit a stale result.
         (task_dir / "result.json").unlink(missing_ok=True)
+        # The sweep skill also writes escalation.json here, and
+        # `resolve._gather_escalations` reads it alongside result.json.
+        (task_dir / "escalation.json").unlink(missing_ok=True)
         # Same hazard, same reason, for the file the #194 tail scan reads (mirrors
         # GenericAdapter.start_session, which unlinks its pane tee here). This one
         # bites hardest on the path the classifier exists to serve: an env fault

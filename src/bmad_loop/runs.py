@@ -4629,8 +4629,8 @@ def _stale_restore_residue(
     human is the classifier. `bmad-loop resolve` echoes these to stderr.
 
     Best-effort throughout: a deleted or unreadable patch, a non-repo project, a
-    bad old baseline — none may wedge a resolve. Every failure degrades to the
-    pre-#90 behavior and says so in the journal.
+    bad old baseline — none may wedge a resolve. A patch parse failure journals
+    its degrade; a commits-probe Git failure deliberately degrades silently.
     """
     if not old_latch:
         return set()
@@ -4661,7 +4661,9 @@ def _stale_restore_residue(
     if old_baseline:
         try:
             shas = verify.commits_above(repo, old_baseline)
-        except Exception:  # nosec B110 - warn-only, must not fail re-arm
+        except verify.GitError:
+            # Follow rearm_escalation's baseline-advance taxonomy boundary;
+            # this warn-only probe remains silent.
             shas = []
         if shas:
             journal.append(

@@ -509,6 +509,9 @@ def test_relay_tolerates_an_unreadable_stdin(tmp_path, monkeypatch, capsys, exc)
     empty."""
     monkeypatch.setenv("BMAD_LOOP_RUN_DIR", str(tmp_path))
     monkeypatch.setenv("BMAD_LOOP_TASK_ID", "t1")
+    # An outer bmad-loop session exports this variable. This row exercises the
+    # legacy RUN_DIR/events fallback, so isolate it just as `_relay` does.
+    monkeypatch.delenv("BMAD_LOOP_EVENTS_DIR", raising=False)
     monkeypatch.setattr(sys, "stdin", _UnreadableStream(exc))
 
     assert cli.main(["relay", "Stop"]) == 0

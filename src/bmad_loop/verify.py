@@ -749,8 +749,60 @@ def has_changes_since(
     "work happened" (a pre-snapshot run must not have its gate silently
     weakened into never seeing new files), while a rollback gate must fail open
     toward "nothing to remove" (never delete a file it cannot prove this attempt
-    created). Keep it that way."""
+    created). Keep it that way.
+
+    Every non-zero `git diff` result reads as "changed" here, INCLUDING a refusal
+    (rc 128 — an unresolvable baseline, a repo git will not read). That is the
+    fail-open above, and it is deliberate for a gate. A caller that needs to tell
+    "git said there are changes" from "git would not answer" calls
+    :func:`_changes_since`, whose tri-state this function collapses; the collapse
+    lives in one place so the gate and any observer share one body."""
+    answer = _changes_since(
+        repo,
+        baseline,
+        exclude,
+        baseline_untracked=baseline_untracked,
+        include_untracked=include_untracked,
+    )
+    # unanswerable -> the stricter reading for a gate: assume work happened
+    return True if answer is None else answer
+
+
+def _changes_since(
+    repo: Path,
+    baseline: str,
+    exclude: tuple[str, ...] = (),
+    *,
+    baseline_untracked: list[str] | None = None,
+    include_untracked: bool = True,
+) -> bool | None:
+    """:func:`has_changes_since` before its fail-open is applied: ``True`` /
+    ``False`` when git answered, and ``None`` when git REFUSED to answer at all.
+
+    `git diff --quiet` reports "no differences" as rc 0 and "differences" as rc 1;
+    anything else is the command failing rather than answering (rc 128 for a
+    baseline it cannot resolve or a directory that is not a repository). The gate
+    above cannot act on that distinction — uncertainty there must keep the
+    stricter path — but a pure OBSERVATION must, because recording an
+    unanswerable probe as a confident ``False`` (`_verify_shared_gates`'
+    ``observe_skipped_proof`` arm) files "the gate would have found changes"
+    about a question git never answered.
+
+    This is the body BOTH proof arms reach, and by only one route: the
+    `proof_of_work_probe` closure in :func:`_verify_shared_gates`, which is what
+    actually makes "the observation measures exactly what the gate would have"
+    structural. The guarantee is the closure's, not this function's — one closure
+    over one `proof_baseline` / `include_untracked_proof` / exclusion set, so the
+    gate arm and the observation arm cannot be given different inputs. All this
+    body decides is what an unanswerable git call looks like; each arm then reads
+    that `None` under its own policy.
+
+    :func:`has_changes_since` is the fail-open COLLAPSE of this tri-state, kept for
+    the gates that want it — it folds `None` into `True` and is what a caller
+    should reach for unless it can act on "git would not answer"."""
     rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
+    if rc not in (0, 1):
+        return None
     if rc != 0:
         return True
     if not include_untracked:
@@ -778,8 +830,9 @@ def path_changed_since(
     counting every ordinary untracked path. Ignored paths are absent from
     :func:`untracked_files` and therefore cannot become proof of work here.
 
-    Any non-zero diff result fails open toward "changed", matching the
-    authoritative :func:`has_changes_since` gate. The literal pathspec is
+    Any non-zero diff result fails open toward "changed", matching what the
+    proof-of-work gate does with :func:`_changes_since`'s unanswerable `None` (and
+    what :func:`has_changes_since` collapses it to). The literal pathspec is
     required for operator-configured ledger paths containing Git wildmatch
     characters.
     """
@@ -1033,14 +1086,15 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     `literal` for the same reason as :func:`_literal_specs` — git reads a positional
     operand as a PATHSPEC, so `[`, `]`, `*` and `?` in an operator-configured dir are
     wildmatch metacharacters — but the harm here runs the other way: an over-matching
-    exclusion HIDES a diff instead of exposing a file. `has_changes_since` and
+    exclusion HIDES a diff instead of exposing a file. `_changes_since` (the
+    proof-of-work probe's body, which `has_changes_since` collapses) and
     `attempt_dirty` both spend these on `diff --quiet . :(exclude)<dir>`, so a dir
     whose name carries a `*` excludes a sibling tree as well and the attempt reads
     CLEAN when it changed — the same false "no changes" that a dev attempt's dirtiness
     check exists to prevent (#423 item 3).
 
     It also realigns this half with :func:`_path_under_any`, the Python `startswith`
-    that filters the untracked half of the very same `has_changes_since` call. The two
+    that filters the untracked half of the very same `_changes_since` call. The two
     disagreed on exactly the shapes that glob (#423 item 4): the tracked half excluded
     a path the untracked half still counted, so one function's two branches answered
     differently about what "under the artifact dir" means. Literal is the reading
@@ -1068,7 +1122,7 @@ def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
 
     The literal reading of "under", and since #423 item 4 the one `_exclude_specs`
     agrees with — the two filter the tracked and untracked halves of a single
-    `has_changes_since` answer and must not disagree."""
+    `_changes_since` answer and must not disagree."""
     return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
 
 
@@ -1123,7 +1177,7 @@ def path_tracked(repo: Path, rel: str) -> bool:
     operator-named `implementation_artifacts` (`bmadconfig._resolve` takes that key
     verbatim, metacharacters and all) outlived the rollback that discarded the code it
     described. Not the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form,
-    which would also disarm the `:(exclude)` magic `worktree_clean`, `has_changes_since`
+    which would also disarm the `:(exclude)` magic `worktree_clean`, `_changes_since`
     and `attempt_dirty` are built on; the per-operand prefix is scoped to this call. It
     costs the callers nothing: that same literal comparison is what matches a DIRECTORY
     prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
@@ -3148,7 +3202,8 @@ def verify_dev_exclude_relpaths(
     root: Path,
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
-    `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
+    its probe (`_changes_since`, via `_verify_shared_gates.proof_of_work_probe`) —
+    file-granularity, unlike `artifact_relpaths`' whole-folder
     exclusion. `artifact_relpaths` has NO production caller left: rollback
     protection builds its own list in `recovery_flow.protected_relpaths` against
     `workspace.root`, and `Engine._protected_relpaths` merely delegates there. Do
@@ -3184,7 +3239,7 @@ def verify_dev_exclude_relpaths(
 
     ``root`` is the tree the resulting pathspecs are relative to, and MUST be the
     same root the caller invokes git against — `paths.repo_root` for the
-    proof-of-work gate, which is where `has_changes_since` runs. REQUIRED, with no
+    proof-of-work gate, which is where the probe runs. REQUIRED, with no
     default: an implicit `paths.project` anchor is #716's own root cause, and the
     two roots collapse in every configuration but the `repo_root` override, so a
     defaulted caller would look correct everywhere it was tested and be wrong only
@@ -3292,6 +3347,34 @@ def _gate_frontmatter(spec_path: Path) -> dict[str, Any] | VerifyOutcome:
         return VerifyOutcome.retry(f"spec unreadable ({e.__class__.__name__}: {e}): {spec_path}")
 
 
+@dataclass(frozen=True)
+class _SharedGateResult:
+    """What :func:`_verify_shared_gates` answers: the failing outcome (``None``
+    when every gate passed and the caller may run its mode-specific tail), plus
+    whatever the gate OBSERVED on the way through that no gate acted on.
+
+    ``skipped_proof_zero_diff`` is the second kind: on a leg that skipped
+    proof-of-work and asked to be told anyway (``observe_skipped_proof``), it is
+    ``True`` when the tree held no changes the gate would have counted, ``False``
+    when it held some, and ``None`` when nothing was observed — no skip, no
+    request, no baseline, or a probe that could not answer (a ``GitError``, or a
+    git refusal such as an unresolvable baseline). Note what ``False`` does and
+    does not say: the gate would have found changes it counts, measured under the
+    gate's own exclusions. It does not say who wrote them — in a shared checkout
+    the gate itself cannot attribute residue to a session, and this observation
+    inherits exactly that limit. It is deliberately a return value and
+    not a gate input: the observation must be made HERE because the baseline it
+    measures from is derived here (the newer-claim branch can re-anchor
+    ``proof_baseline`` and drop untracked evidence), and no caller can reproduce
+    that derivation. A caller re-probing from ``task.baseline_commit`` would count
+    a commit that arrived in a shared ``isolation = "none"`` checkout from outside
+    the session as this attempt's work — the exact false negative the observation
+    exists to expose."""
+
+    outcome: VerifyOutcome | None = None
+    skipped_proof_zero_diff: bool | None = None
+
+
 def _verify_shared_gates(
     spec_path: Path,
     rj: dict[str, Any],
@@ -3300,15 +3383,17 @@ def _verify_shared_gates(
     *,
     expected_status: str,
     extra_exclude: tuple[str, ...] | None,
+    observe_skipped_proof: tuple[str, ...] | None = None,
     allow_ancestor_baseline: bool = False,
     fm: dict[str, Any] | None = None,
-) -> VerifyOutcome | None:
+) -> _SharedGateResult:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
     :func:`verify_dev_stories` — factored out so the sprint-mode and stories-mode
     gates can't silently drift. Reads frontmatter once; a caller that had to read
     it first to *choose* ``expected_status`` passes what it read as ``fm`` so the
-    single-read contract still holds (no caller re-reads it).  Returns a failing
+    single-read contract still holds (no caller re-reads it).  Returns a
+    :class:`_SharedGateResult` whose ``outcome`` is a failing
     :class:`VerifyOutcome`, or ``None`` when every gate passes and the caller may
     run its mode-specific tail.
 
@@ -3325,22 +3410,54 @@ def _verify_shared_gates(
     leg produced only its own spec (structurally spec-only), and a park may
     legitimately have produced no code at all because its remaining work is a
     human's (#676). Both mean "there is no diff to demand here"; neither
-    generalizes to the other's leg, so keep them named separately."""
+    generalizes to the other's leg, so keep them named separately.
+
+    ``observe_skipped_proof`` is the same exclusion tuple the caller WOULD have
+    passed as ``extra_exclude`` had it not skipped the gate. When set on a skipped
+    leg the probe still runs — against the baseline derived above, not the raw
+    ``task.baseline_commit`` — purely to answer whether there was in fact a diff,
+    and the answer rides out on ``_SharedGateResult.skipped_proof_zero_diff``.
+    Nothing branches on it here: a fault degrades to ``None`` rather than
+    escalating, and the leg's outcome is identical either way. It exists so an
+    accepted park's skipped gate stops being silent (#676) — a park the waived
+    gate would have passed and one it would have refused are otherwise
+    indistinguishable after the fact.
+
+    Exactly one of the two skipping legs asks for it, and the asymmetry is
+    deliberate rather than an omission: only sprint mode's PARK passes it.
+    ``verify_dev_stories``' plan halt skips the gate and observes nothing, because
+    it already has an independent cross-check a park has no equivalent for — a
+    clean plan-halt carries ``devcontract``'s ``plan_halt`` marker in its
+    result.json (``rj.get("plan_halt") is not True`` refuses the leg outright), so
+    a died-mid-flight ``ready-for-dev`` cannot reach the skip in the first place. A
+    park's status is self-asserted with no such marker, which is why it is the leg
+    that needs a record of what the waived gate would have found.
+
+    The two parameters are MUTUALLY EXCLUSIVE by construction: ``extra_exclude``
+    gates and ``observe_skipped_proof`` observes, and the arms below are ``if`` /
+    ``elif`` on that order. Passing both is not a richer mode, it is a caller
+    error that silently drops the observation — the gate arm wins and the leg was
+    never skipped, so there was nothing to observe. Pass ``extra_exclude`` OR
+    ``observe_skipped_proof``, never both."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
-        return VerifyOutcome.retry(
-            f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
+        return _SharedGateResult(
+            VerifyOutcome.retry(
+                f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
+            )
         )
 
     if fm is None:
         read = _gate_frontmatter(spec_path)
         if isinstance(read, VerifyOutcome):
-            return read
+            return _SharedGateResult(read)
         fm = read
     status = status_of(fm)
     if status != expected_status:
-        return VerifyOutcome.retry(
-            f"spec status is {status!r}, expected {expected_status!r}: {spec_path}"
+        return _SharedGateResult(
+            VerifyOutcome.retry(
+                f"spec status is {status!r}, expected {expected_status!r}: {spec_path}"
+            )
         )
 
     # The generic bmad-build-auto skill stamps `baseline_revision`, never
@@ -3365,8 +3482,10 @@ def _verify_shared_gates(
     # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
     # IS the code tree, so a `project`-anchored probe judged a tree the session never
     # touched. WHICH probe burned the attempt depends on the layout, and the burn is
-    # not `has_changes_since` in both: it fails OPEN (`rc != 0` -> True), so wherever
-    # `project` is not a checkout the failing git call PASSES that gate. Nested
+    # not the proof-of-work probe in both: `_changes_since` answers `None` when git
+    # will not run, and the gate arm below accepts anything that is not a positive
+    # "nothing changed" (`is False`), so wherever `project` is not a checkout the
+    # failing git call PASSES that gate. Nested
     # (`project` a subdirectory of the code tree) the call succeeds but is scoped to
     # that subdirectory, and the "no changes" forever-burn is real. Disjoint
     # (`project` beside the checkout) git fails and the burn moves to the probes that
@@ -3376,11 +3495,13 @@ def _verify_shared_gates(
         try:
             canonical_claimed = _canonical_commit_oid(paths.repo_root, claimed_baseline)
         except GitError as e:
-            return VerifyOutcome.escalate(str(e))
+            return _SharedGateResult(VerifyOutcome.escalate(str(e)))
         if canonical_claimed is None:
-            return VerifyOutcome.retry(
-                f"spec baseline {claimed_baseline[:12]} does not match "
-                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+            return _SharedGateResult(
+                VerifyOutcome.retry(
+                    f"spec baseline {claimed_baseline[:12]} does not match "
+                    f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+                )
             )
         if canonical_claimed != task.baseline_commit:
             # A deferred-work bundle may legitimately adopt a pre-existing story
@@ -3412,34 +3533,83 @@ def _verify_shared_gates(
             proof_baseline = canonical_claimed if newer_ok else proof_baseline
             include_untracked_proof = not newer_ok
             if not (older_ok or newer_ok):
-                return VerifyOutcome.retry(
-                    f"spec baseline {claimed_baseline[:12]} does not match "
-                    f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+                return _SharedGateResult(
+                    VerifyOutcome.retry(
+                        f"spec baseline {claimed_baseline[:12]} does not match "
+                        f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+                    )
                 )
 
-    if extra_exclude is not None and task.baseline_commit:
-        # The exclude pathspecs are rooted where git is invoked: `repo_root` here
-        # and `repo_root` in every producer that composes into `extra_exclude`
-        # (`Engine._harvest_gate_exclude`, `_stories_relpaths`). A pathspec relative
-        # to a different root is not merely wrong, it is SILENTLY wrong — git
-        # matches nothing and the exclusion evaporates.
-        exclude = (
-            verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch, root=paths.repo_root)
-            + extra_exclude
-        )
-        try:
-            if not has_changes_since(
-                paths.repo_root,
-                proof_baseline,
-                exclude=exclude,
-                baseline_untracked=task.baseline_untracked,
-                include_untracked=include_untracked_proof,
-            ):
-                return VerifyOutcome.retry("no changes in worktree since baseline commit")
-        except GitError as e:
-            return VerifyOutcome.escalate(str(e))
+    def proof_of_work_probe(mode_exclude: tuple[str, ...]) -> bool | None:
+        """The one place proof-of-work is measured, called by BOTH arms below.
 
-    return None
+        The gate arm and the observation arm differ in exactly one input — which
+        mode-supplied tuple composes onto the gate's own exclusions — and in
+        nothing else. They were briefly two spelled-out copies of the same five
+        arguments, and every property the docstrings claim for the observation
+        (that it excludes the mode's paths, that it keeps the newer-claim
+        ``proof_baseline``, that it inherits ``include_untracked_proof``) was
+        silently droppable in the copy while the gate stayed correct and the suite
+        stayed green. A shared body makes the two unable to disagree by
+        construction, which is stronger than any test over the copies: divergence
+        is no longer a thing a reader can express here.
+
+        The exclude pathspecs are rooted where git is invoked: `repo_root` here
+        and `repo_root` in every producer that composes into them
+        (`Engine._harvest_gate_exclude`, `_stories_relpaths`). A pathspec relative
+        to a different root is not merely wrong, it is SILENTLY wrong — git
+        matches nothing and the exclusion evaporates.
+
+        Tri-state on purpose: ``None`` means git REFUSED to answer — any rc outside
+        the two that ARE answers, rc 128 being the everyday one — which the two arms
+        below must read differently. The gate treats it as the
+        stricter "there are changes" — exactly `has_changes_since`'s fail-open,
+        which this function used to call and whose behavior the gate arm keeps
+        byte-for-byte — while the observation arm records it as unknown rather
+        than as a confident answer it never got.
+        """
+        return _changes_since(
+            paths.repo_root,
+            proof_baseline,
+            exclude=verify_dev_exclude_relpaths(
+                paths, spec_path, task.restore_patch, root=paths.repo_root
+            )
+            + mode_exclude,
+            baseline_untracked=task.baseline_untracked,
+            include_untracked=include_untracked_proof,
+        )
+
+    if extra_exclude is not None and task.baseline_commit:
+        try:
+            # `is False` is the gate's fail-open spelled out: only a probe that
+            # positively answered "nothing changed" refuses the attempt, so a git
+            # REFUSAL (`None`) keeps the stricter path exactly as it did when this
+            # arm called `has_changes_since` and let that function collapse it.
+            if proof_of_work_probe(extra_exclude) is False:
+                return _SharedGateResult(
+                    VerifyOutcome.retry("no changes in worktree since baseline commit")
+                )
+        except GitError as e:
+            return _SharedGateResult(VerifyOutcome.escalate(str(e)))
+    elif observe_skipped_proof is not None and task.baseline_commit:
+        # The gate was skipped; run its probe anyway and report, never refuse.
+        #
+        # Unanswerable is recorded as unanswerable, in BOTH of the ways a probe
+        # can fail to answer: a `GitError` (timeout, spawn or decode fault) and a
+        # git REFUSAL (any rc that is not one of the two real answers — rc 128 for
+        # an unresolvable baseline is the everyday one), which the tri-state
+        # probe reports as `None` rather than collapsing into the gate's
+        # fail-open. Collapsing it would file "the gate would have found changes"
+        # about a question git never answered — the one reading a reader cannot
+        # correct, because nothing downstream re-asks. A non-git bug still
+        # surfaces: only `GitError` is caught.
+        try:
+            observed = proof_of_work_probe(observe_skipped_proof)
+        except GitError:
+            observed = None
+        return _SharedGateResult(None, None if observed is None else not observed)
+
+    return _SharedGateResult()
 
 
 # The terminal spec status of a story whose agent-doable work is finished but
@@ -3481,6 +3651,7 @@ def verify_dev(
     review_enabled: bool = True,
     *,
     operator_park: bool = False,
+    park_eligible: bool = False,
     engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
@@ -3502,9 +3673,15 @@ def verify_dev(
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
 
-    On the park leg the proof-of-work gate is skipped, the same way the plan-halt
-    leg of :func:`verify_dev_stories` skips it and by the same ``extra_exclude=None``
-    spelling: a park's whole output can legitimately be its own spec's park
+    The proof-of-work gate is skipped on a park that this attempt was in a
+    position to newly ELECT — ``skip_proof = parked and park_eligible``, a
+    two-part selector. ``parked`` is what the session left behind (the observed
+    spec status, plus the policy flag); ``park_eligible`` is what the orchestrator
+    knew at dispatch (:meth:`Engine._park_eligible_at_dispatch`, captured on the
+    fresh entry into ``Engine._dev_phase`` from the same instant and the same
+    condition as ``task.baseline_commit``): the story's bound spec did NOT already
+    read ``awaiting-operator``. Both halves are load-bearing. The skip exists
+    because a park's whole output can legitimately be its own spec's park
     declaration plus the board sync, both of which proof-of-work already excludes,
     so demanding a diff read a correct park as "no changes since baseline commit"
     and refused it (#676) — costing the attempt, and with it the park declaration:
@@ -3515,27 +3692,89 @@ def verify_dev(
     gate passes — not the session's own work: ``bmad-build-auto`` commits each
     iteration, so a skill commit chain usually already sits above baseline
     (``Engine._finalize_commit_phase``), and a reset discards that too, onto an
-    ``attempt-preserve/*`` ref. Nothing else relaxes — the
-    ``operator_actions`` gate above still refuses a park that enumerates nothing,
-    and the workflow-tag, status, baseline-match and sprint-pair gates all still
-    run. Two of those four are not independent evidence on this leg, and saying so
-    is the point: the status check is tautological here (the same ``fm`` that
-    selected ``parked`` is threaded in as ``fm=fm``, so the shared gate compares it
-    against an ``expected_status`` derived from itself), and the sprint pair was
-    written from that same frontmatter by ``Engine._post_dev_state_sync`` a dozen
-    lines before this gate runs, so it confirms the orchestrator's own write landed
-    rather than anything the session did. What still binds a park to the attempt
-    the orchestrator actually launched is the workflow tag, the baseline match, and
-    a non-empty actions list — and the middle one is weaker on this leg than its
-    name suggests. Baseline-match also accepts a claim NEWER than the recorded
-    baseline whenever it is a HEAD-reachable descendant, and the comment guarding
-    that branch names the compensating control: such a commit "may have arrived in
-    the shared checkout from outside the session", so the check re-anchors
-    proof-of-work onto the claimed commit rather than trusting the match alone.
-    Proof-of-work is precisely what this leg skips, so on a park that re-anchoring
-    is inert and the newer-claim branch tightens nothing. The trade is recorded rather than hidden: the skip
-    covers EVERY park, including one that wrote nothing and listed plausible
-    actions, because the actions gate tests list non-emptiness and never content.
+    ``attempt-preserve/*`` ref.
+
+    What the eligibility half defends is narrow and worth naming exactly. Before
+    it, the relaxation was selected entirely by state a fresh session could
+    INHERIT rather than produce: a spec an earlier attempt left at
+    ``awaiting-operator`` still reads ``awaiting-operator`` to the next session
+    that does nothing at all, so a re-drive over that spec selected the skip and
+    verified green on someone else's declaration, relaxing #676's skip for an
+    attempt that produced nothing. Requiring the
+    orchestrator's own dispatch-time answer means the leg that skips proof-of-work
+    is the leg that actually authored the park. It does NOT defend against a
+    session that elects a park it did not earn — one that writes the frontmatter,
+    lists plausible actions and implements nothing is eligible by construction and
+    still passes, because the actions gate tests list non-emptiness and never
+    content. It is a check on WHICH ATTEMPT owns the park, not on whether the park
+    is honest, and it is captured per PHASE rather than per attempt: a fixable
+    repair deliberately keeps the previous session's tree, so re-observing would
+    make every repair of a malformed park ineligible and fail it on the gate it
+    just re-armed.
+
+    An INELIGIBLE park is not refused — it is merely held to proof-of-work like
+    any other terminal. The park's status pair, ``operator_actions``
+    non-emptiness, workflow tag, baseline match and sprint pair all keep selecting
+    on the observed status alone, so an inherited park carrying a real diff passes
+    exactly as before; only the residue-free one now owes the diff it never
+    produced.
+
+    Nothing else relaxes on the eligible leg either — the ``operator_actions``
+    gate above still refuses a park that enumerates nothing, and the workflow-tag,
+    status, baseline-match and sprint-pair gates all still run. Two of those four
+    are not independent evidence on this leg, and saying so is the point: the
+    status check is tautological here (the same ``fm`` that selected ``parked`` is
+    threaded in as ``fm=fm``, so the shared gate compares it against an
+    ``expected_status`` derived from itself), and the sprint pair was written from
+    that same frontmatter by ``Engine._post_dev_state_sync`` a dozen lines before
+    this gate runs, so it confirms the orchestrator's own write landed rather than
+    anything the session did. What still binds a park to the attempt the
+    orchestrator actually launched is the workflow tag, the baseline match, the
+    non-empty actions list — and now the dispatch-time eligibility, which is the
+    only one of the four the session cannot influence at all. Baseline-match also
+    accepts a claim NEWER than the recorded baseline whenever it is a
+    HEAD-reachable descendant, and the comment guarding that branch names the
+    compensating control: such a commit "may have arrived in the shared checkout
+    from outside the session", so the check re-anchors proof-of-work onto the
+    claimed commit rather than trusting the match alone. Proof-of-work is precisely
+    what this leg skips, so on a park that re-anchoring still gates nothing — but
+    it is no longer inert: the observation below inherits it, so a foreign commit
+    cannot be credited as this attempt's work in the record either.
+
+    The accepted skip is no longer silent, and it is recorded on TWO fields
+    because one cannot carry both facts. ``VerifyOutcome.park_proof_skipped`` is
+    the waiver itself — ``skip_proof``, ``False`` on every other leg. When it
+    fires, the shared gate additionally runs the proof-of-work probe as a pure
+    OBSERVATION (``observe_skipped_proof=engine_written``) and what that probe
+    found rides out on ``VerifyOutcome.park_zero_diff``: ``True`` when the waived
+    gate would have found nothing it counts, ``False`` when it would have found
+    something, ``None`` when the probe could not answer. Read ``False`` as exactly
+    that and no further — the residue the gate counts is not attributed to a
+    session, here or in the gate itself, because under a shared checkout it cannot
+    be (see the newer-claim paragraph above, and `docs/FEATURES.md` on
+    ``isolation``). What separates "unknown" from "no skip happened" is
+    ``park_proof_skipped``, not this field — collapsing the two into
+    ``park_zero_diff is not None`` would make a park whose probe faulted look like
+    a leg that never waived anything, and it would go unrecorded — the silence
+    this record exists to end. ``None`` means "the probe could not answer", and
+    reaches here three ways: a ``GitError`` (timeout, spawn or decode fault), a
+    git REFUSAL such as an unresolvable baseline (any rc that is not one of git's
+    two real answers, rc 128 being the everyday one — the gate arm folds that into
+    its fail-open, the observation arm keeps it as unknown), and an attempt
+    carrying no ``task.baseline_commit`` to measure from (the shared gate runs
+    neither arm without one). Neither field changes an outcome: an unanswerable
+    probe degrades rather than escalating, and an eligible park verifies
+    identically either way. Their consumer is
+    :meth:`Engine._verify_dev_artifacts`, which journals
+    ``park-proof-of-work-skipped`` for a waived gate that this function then
+    PASSED, and carries the observation as that record's ``zero_diff`` field, so a
+    park the waived gate would have passed and one it would have refused stop
+    being indistinguishable afterwards (#676). Both ends of that scope are set here: a
+    waiver refused by a later check in this function (the sprint pair) never
+    reaches the record, and a record that IS written asserts only that this gate
+    was cleared with proof-of-work waived — the configured ``[verify]`` commands,
+    the review loop and the commit all run afterwards and may still reject the
+    attempt, which is then retried or deferred with its record already written.
 
     ``engine_written`` names paths the orchestrator itself wrote above this gate
     during the attempt, relative to ``paths.repo_root`` — the tree the gate invokes
@@ -3543,9 +3782,11 @@ def verify_dev(
     must share (#716). They compose with the mode's normal proof-of-work exclusions
     so engine bookkeeping cannot masquerade as session work; see
     :meth:`Engine._harvest_gate_exclude`, which is their producer and states what a
-    ledger outside the code tree resolves to. On the parked leg they are not passed
-    at all — proof-of-work is skipped there, so there is no exclusion set left for
-    them to compose with.
+    ledger outside the code tree resolves to. On the skipped park leg they are
+    passed as ``observe_skipped_proof`` instead of ``extra_exclude``: no gate
+    consumes them there, but the zero-diff observation must exclude exactly what
+    the gate would have, or the orchestrator's own bookkeeping writes would be
+    counted as residue on the park's record.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -3563,6 +3804,12 @@ def verify_dev(
         actions = _operator_actions_gate(fm, task.story_key)
         if actions is not None:
             return actions
+    # The two-part selector: the session's observed park AND the orchestrator's
+    # dispatch-time answer that this phase could newly elect one. Deliberately a
+    # separate name from `parked` — every other park gate below still keys on
+    # `parked` alone, and collapsing the two would silently widen this expectation
+    # from "may skip proof-of-work" to "may park at all" (#335, #676).
+    skip_proof = parked and park_eligible
 
     # With review disabled, the dev session runs its own internal review and
     # finalizes straight to done; otherwise it hands off at in-review. A park
@@ -3575,16 +3822,20 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        # Proof-of-work is the one gate the parked leg skips (``extra_exclude=None``,
-        # the callee-blessed spelling): a park's whole residue can legitimately be
-        # the spec and the board, both already excluded (#676). The park paragraph
+        # Proof-of-work is the one gate an ELECTED park skips (``extra_exclude=None``,
+        # the callee-blessed spelling): such a park's whole residue can legitimately
+        # be the spec and the board, both already excluded (#676). The park paragraph
         # in this function's docstring carries the reasoning and, more importantly,
-        # what the skip does NOT relax.
-        extra_exclude=None if parked else engine_written,
+        # what the skip does NOT relax. An inherited park (`park_eligible=False`)
+        # takes the ordinary arm and owes a diff like every other terminal.
+        extra_exclude=None if skip_proof else engine_written,
+        # Same tuple, no gate: when the skip fires the probe still runs, purely so
+        # the accepted park's zero-diff answer can be journaled (#676).
+        observe_skipped_proof=engine_written if skip_proof else None,
         fm=fm,
     )
-    if gate is not None:
-        return gate
+    if gate.outcome is not None:
+        return gate.outcome
 
     expected_sprint = AWAITING_OPERATOR if parked else ("review" if review_enabled else "done")
     sprint = story_status(paths.sprint_status, task.story_key)
@@ -3594,7 +3845,15 @@ def verify_dev(
         )
 
     task.spec_file = str(spec_path)
-    return VerifyOutcome.passed()
+    # Two facts, deliberately on two fields: `park_proof_skipped` says this leg
+    # WAIVED proof-of-work (False on every other leg), `park_zero_diff` says what
+    # the waived gate would have found — and `None` there now means only "the
+    # probe could not answer", because the first field already carries the waiver.
+    # Both are carried to the journal; neither is a gate (#676).
+    return VerifyOutcome.passed(
+        park_proof_skipped=skip_proof,
+        park_zero_diff=gate.skipped_proof_zero_diff,
+    )
 
 
 def verify_dev_bundle(
@@ -3633,8 +3892,8 @@ def verify_dev_bundle(
         extra_exclude=engine_written,
         allow_ancestor_baseline=True,
     )
-    if gate is not None:
-        return gate
+    if gate.outcome is not None:
+        return gate.outcome
 
     claimed_ids = {str(i) for i in (rj.get("dw_ids") or [])}
     if claimed_ids and claimed_ids != set(task.dw_ids):
@@ -3752,8 +4011,8 @@ def verify_dev_stories(
             else _stories_relpaths(paths.repo_root, spec_folder) + engine_written
         ),
     )
-    if gate is not None:
-        return gate
+    if gate.outcome is not None:
+        return gate.outcome
 
     task.spec_file = str(spec_path)
     return VerifyOutcome.passed()
@@ -3831,6 +4090,17 @@ class CommandResult:
     cut one. ``None`` means nothing was cut and the stream is the whole of it, so
     the many callers that build a result from three fields stay correct without
     knowing this exists.
+
+    ``spawn_error`` is the discriminator for the one shape that has no return
+    code at all: the child was never started. The typical cause is the ``cwd``
+    it was to run in — missing, not a directory, or unsearchable — and the
+    message names that directory as context, but the fault is caught as any
+    spawn-time ``OSError`` and the set is not closed: a missing shell, EMFILE
+    or ENOMEM reach the same field, and the wrapped exception is what says
+    which. ``None`` on every result that came from a process that actually ran —
+    including a timeout, which ran and hung. It is LAST and defaulted because the
+    construction sites pass three to seven POSITIONAL arguments; a field inserted
+    anywhere else would silently re-bind them.
     """
 
     command: str
@@ -3840,6 +4110,34 @@ class CommandResult:
     stderr: str = ""
     stdout_full_bytes: int | None = None
     stderr_full_bytes: int | None = None
+    spawn_error: str | None = None
+
+
+# The synthetic return code on a result whose child never started.
+#
+# The magnitude is the load-bearing part. On POSIX ``subprocess`` reports ``-N``
+# for a child KILLED BY signal N, so every small negative integer is a real
+# return code some child can produce: ``-2`` is SIGINT, ``-9`` SIGKILL, ``-15``
+# SIGTERM. A sentinel inside that range would be indistinguishable from a
+# verify command the operator (or an OOM killer) had just killed. 1000 is far
+# above the largest real-time signal any platform defines, so this value cannot
+# be minted by a child that ran.
+#
+# Negative because two live arms depend on the sign: the win32 probe's
+# ``returncode < 0`` early-out, and the ordinary ``returncode != 0`` failure arm
+# that must still read it as a failure if anything ever reaches that far. And
+# distinct from the timeout leg's ``-1``, because both are "no exit status
+# exists" sentinels and a reader that conflated them would read a child that
+# never started as one that ran and hung.
+#
+# ``spawn_error`` — not this code — is what the classifiers key on; the code
+# exists so the journal record and the plugin payload carry an rc that no real
+# child could have produced.
+SPAWN_FAULT_RC = -1000
+
+# The sink a caller hands :func:`verify_commands_outcome` to observe the results
+# it is about to classify — the engine journals review-gate results through it.
+CommandSink = Callable[[tuple[CommandResult, ...]], None]
 
 
 # sh launcher convention (verify commands run shell=True): 126 = command found
@@ -3922,8 +4220,12 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     """Windows env-fault evidence, cheapest signal first, or None. Each signal is
     independently sufficient; see the _CMD_* constants for why the rc alone isn't."""
     if result.returncode < 0:
-        # the timeout sentinel: the command ran and hung, so it was found and it
-        # was runnable — none of the signals below can apply to it.
+        # One of the two "no exit status" sentinels, or a signal-killed child.
+        # None of the signals below can apply to any of them, though for opposite
+        # reasons: a timeout (`-1`) and a signal death mean the command WAS found
+        # and WAS runnable, while a spawn fault (`SPAWN_FAULT_RC`) means no child
+        # existed to probe — and that one is already answered by `spawn_error`,
+        # ahead of this function being called at all (see `env_fault_reason`).
         return None
     if result.returncode == _CMD_ENV_FAULT_RC:
         return f"rc={_CMD_ENV_FAULT_RC} — cmd reported the command as not found"
@@ -3973,7 +4275,17 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     """Why this verify command is an environment fault rather than a story
     failure, or None if it is not one. Per-shell: verify commands run through
-    the host shell, and sh and cmd signal a broken environment differently."""
+    the host shell, and sh and cmd signal a broken environment differently.
+
+    ``spawn_error`` is answered FIRST and unconditionally, before any rc reading
+    and before the win32 probe. Not merely an ordering preference: the probe
+    resolves a command's leading token as ``cwd / token`` to decide whether the
+    tool exists, and on this leg no child was started, so that lookup is about a
+    directory nothing ever entered and cannot speak to why. The result also
+    carries no exit status to read (see :data:`SPAWN_FAULT_RC`), which is why
+    the rc arms cannot classify it either."""
+    if result.spawn_error is not None:
+        return result.spawn_error
     if result.returncode in ENV_FAULT_RCS:
         return f"rc={result.returncode}"
     if sys.platform != "win32":
@@ -4026,7 +4338,13 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     ``[-2000:]``), and one undecodable byte must not raise mid-loop and lose
     *every* command's result. Decoding stays on the locale codec (``text=True``)
     precisely because these are host tools — contrast tui/launch.py, which pins
-    ``encoding="utf-8"`` because its child is our own UTF-8 CLI."""
+    ``encoding="utf-8"`` because its child is our own UTF-8 CLI.
+
+    "One apiece" holds across all three legs: a completed child, a timeout, and a
+    child that could never be spawned each append exactly one result and the loop
+    goes on to the next command. The three are told apart on the result itself —
+    an rc for the first, ``rc=-1``/``"timed out"`` for the second,
+    ``spawn_error`` plus :data:`SPAWN_FAULT_RC` for the third."""
     results = []
     for command in policy.verify.commands:
         try:
@@ -4060,6 +4378,42 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
             results.append(
                 CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
             )
+        except OSError as exc:
+            # The child was never started, so no exit status exists to classify:
+            # `subprocess.run` raises out of the fork/exec (or CreateProcess)
+            # itself when `cwd` is unusable — FileNotFoundError (missing),
+            # NotADirectoryError (a regular file, or a path beneath one),
+            # PermissionError (a directory without +x). `except OSError` rather
+            # than the three names because they are the reachable shapes TODAY,
+            # not a closed set: the base class is what the platform actually
+            # guarantees, and one uncaught sibling here crashes the whole run.
+            #
+            # Translated instead of raised, the same doctrine `_run_git` follows
+            # for the faults that land before a return code exists (#343): left
+            # uncaught this escapes every `except` in the engine's verification
+            # path and ends the run as a crash, when the fact it reports — a cwd
+            # no command can run in — is a textbook environment fault, identical
+            # for every story and unfixable by a repair session.
+            #
+            # A result is APPENDED and the loop CONTINUES, honouring this
+            # function's documented "one CommandResult apiece": a caller zipping
+            # results against `policy.verify.commands` must not silently lose the
+            # tail of the list to the first broken spawn.
+            results.append(
+                CommandResult(
+                    command,
+                    SPAWN_FAULT_RC,
+                    f"{type(exc).__name__}: {exc}",
+                    # What was OBSERVED, not a diagnosis. `except OSError` is
+                    # wider than the cwd shapes that motivated it — a missing
+                    # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
+                    # named as context ("cwd was X") rather than blamed, and the
+                    # exception carries whatever the real cause was. No "could
+                    # not run" phrasing: `cli._reverify` prefixes its own
+                    # ("<cmd>' could not run: ..."), and the two stuttered.
+                    spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
+                )
+            )
     return results
 
 
@@ -4078,12 +4432,23 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     for result in results:
         reason = env_fault_reason(result, cwd)
         if reason is not None:
+            # The explanatory clause branches on WHICH fault this is, because the
+            # rc-based one is a claim about the command and the spawn one is not:
+            # a child that never started was never looked for, so "command not
+            # found / not executable" would send the reader hunting for a binary
+            # when the directory is what is broken. Everything after the dash is
+            # shared — the remedy (fix the environment, re-arm) is the same.
+            clause = (
+                "the command could not be started at all"
+                if result.spawn_error is not None
+                else "command not found / not executable"
+            )
+            output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
             return VerifyOutcome.escalate(
                 f"verify environment fault ({reason}): {result.command}\n"
-                "command not found / not executable — this is the run environment, "
+                f"{clause} — this is the run environment, "
                 "not the story; fix the environment, then re-arm the escalation "
-                "(the attempt budget resets on re-arm)\n"
-                f"{result.output_tail}",
+                f"(the attempt budget resets on re-arm){output}",
                 env_fault=True,
             )
     for result in results:
@@ -4096,12 +4461,37 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     return VerifyOutcome.passed()
 
 
-def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
-    """Run the policy's deterministic verify commands and classify the results."""
-    return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
+def verify_commands_outcome(
+    policy: Policy, cwd: Path, *, on_results: CommandSink | None = None
+) -> VerifyOutcome:
+    """Run the policy's deterministic verify commands and classify the results.
+
+    ``on_results`` observes the results BEFORE they are classified, which is the
+    same order ``Engine._verify_commands_with_results`` uses on the dev side:
+    journal first, decide second, so the record exists whatever the classifier
+    then does with it — including an escalation that ends the run. It is called
+    exactly once per invocation, with an empty tuple when no commands are
+    configured, because "the pass ran and executed nothing" and "no pass ran" are
+    different facts and only the second one is signalled by never getting here.
+
+    The contract on the sink is that IT must not raise; this function adds no
+    guard of its own, deliberately. The engine's sink
+    (``_journal_verify_command_results``) degrades on stream-capture faults — an
+    ``OSError`` from a ``verify/`` write becomes a ``capture_error`` field — but
+    the ``Journal.append`` beneath it has no handler, so ENOSPC or a read-only run
+    dir still propagates. That is the same fail-loud boundary the dev leg already
+    stands on, and wrapping the call here would trade it for silence: a lost
+    journal write is a lost audit record, which is exactly the class of failure
+    that must not pass quietly."""
+    results = run_verify_commands(policy, cwd)
+    if on_results is not None:
+        on_results(tuple(results))
+    return verify_command_results_outcome(results, cwd)
 
 
-def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcome:
+def _verify_review_commands(
+    policy: Policy, paths: ProjectPaths, *, on_results: CommandSink | None = None
+) -> VerifyOutcome:
     """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
 
     The two roots split by what is being addressed, and the split is deliberate:
@@ -4133,8 +4523,18 @@ def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcom
     ``paths.repo_root`` is the ONLY member of ``paths`` this reads — it takes the
     whole dataclass to keep the three call sites uniform, not because it consults
     anything else. A future caller must not infer that artifact paths reach here.
+
+    ``on_results`` is forwarded, not consumed: an engine-supplied sink is how
+    review-gate results reach the journal, which the dev side has always had and
+    these gates had not. Optional, so the gates stay callable from core (and from
+    tests) with no engine at all — no sink simply means nothing is recorded,
+    which is what every direct caller got before.
+
+    This is also the ONLY sanctioned caller of ``verify_commands_outcome``; a
+    fourth gate reaching past it would re-open #695. Enforced, not merely stated
+    — see ``tests/test_portability_guard.py``.
     """
-    return verify_commands_outcome(policy, paths.repo_root)
+    return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)
 
 
 def verify_review(
@@ -4144,6 +4544,7 @@ def verify_review(
     *,
     sprint_reached_done: bool = False,
     operator_park: bool = False,
+    on_results: CommandSink | None = None,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -4175,7 +4576,12 @@ def verify_review(
     disagree about whether this run parks. They would: the engine's
     ``_operator_park_enabled`` is an override seam, and a mode that opts out of
     parking while still reaching this gate would otherwise find it accepting a
-    park the engine itself refuses to take."""
+    park the engine itself refuses to take.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4212,7 +4618,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -4231,11 +4637,22 @@ def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy
     return STATUS_ORDER.index(sprint) < STATUS_ORDER.index("done")
 
 
-def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review_stories(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    on_results: CommandSink | None = None,
+) -> VerifyOutcome:
     """verify_review for stories mode: same spec-done + verify-commands gates,
     minus the sprint-status gate (stories mode has no sprint board — the story
     spec's own frontmatter status is authoritative). ``task.spec_file`` is the
-    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4244,16 +4661,27 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
-def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review_bundle(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    on_results: CommandSink | None = None,
+) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
     legacy --dw-bundle skill flips them; on the generic bmad-build-auto path the
     orchestrator flips them after dev and, if review rewrites the ledger diff,
     again immediately before this review gate. Either way this gate is why we
-    can trust it happened."""
+    can trust it happened.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4284,7 +4712,7 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
             fixable=True,
         )
 
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
 def commit_story(repo: Path, message: str) -> str:
@@ -4361,8 +4789,8 @@ def resolve_restore_path(raw: str, root: Path) -> Path:
     `model.StoryTask.restore_patch` documents the field as repo-relative-or-absolute,
     and every consumer must resolve it against the base it actually reads the tree
     from — the engine's live workspace root (the unit worktree under isolation),
-    `paths.repo_root` for the proof-of-work exclude (which is where
-    `has_changes_since` runs, so the latch has to name a path in that tree; #716),
+    `paths.repo_root` for the proof-of-work exclude (which is where the gate's own
+    probe runs, so the latch has to name a path in that tree; #716),
     the CLI's `--project`. Hence the caller-supplied `root` rather than one
     baked-in base.
 

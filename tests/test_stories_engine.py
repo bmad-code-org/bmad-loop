@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
+from conftest import (
+    _OK,
+    attach_profile,
+    git,
+    install_build_auto_skill,
+    write_gated_ledger,
+    write_spec,
+)
 
 from bmad_loop import stories
 from bmad_loop.adapters.base import SessionResult
@@ -40,6 +47,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
 from bmad_loop.stories_engine import StoriesEngine
@@ -244,6 +252,34 @@ def test_two_story_happy_path(project):
         assert status_of(read_frontmatter(story_spec(project, sid))) == "done"
     assert engine.state.tasks["1"].phase == Phase.DONE
     assert engine.state.tasks["2"].phase == Phase.DONE
+
+
+def test_story_review_gate_journals_its_verify_commands(project):
+    """`StoriesEngine._verify_review` threads the base engine's review sink, so a
+    stories-mode review-leg verifier pass lands the same `verify-command-result`
+    records the base engine's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every stories run
+    silently unrecorded while the base engine's tests stayed green — the shape the
+    #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `StoriesEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [], policy=_stories_policy(verify=VerifyPolicy(commands=(_OK,)))
+    )
+    sp = story_spec(project, "1")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    task = StoryTask(story_key="1", epic=1)
+    task.spec_file = str(sp)
+
+    assert engine._verify_review(task).ok
+
+    (record,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert record["verification_stage"] == "review"
+    assert record["command"] == _OK and record["story_key"] == "1"
 
 
 def test_run_state_pins_stories_mode(project):

@@ -3137,6 +3137,33 @@ def test_start_session_resets_reused_task_log(tmp_path):
     assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
 
 
+def test_start_session_drops_a_reused_task_dirs_escalation(tmp_path):
+    """The sweep skill writes `escalation.json` into tasks/<task_id>/ and
+    `resolve._gather_escalations` reads it beside result.json. A re-armed run reuses
+    task_ids, so a prior cycle's escalation left there is handed to whatever session
+    lands on the id next — the same reuse hazard result.json's unlink already covers,
+    against a third reader. An ABSENT file must still start cleanly (missing_ok)."""
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    task_id = _ENV_FAULT_TASK
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    stale = task_dir / "escalation.json"
+    stale.write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+        encoding="utf-8",
+    )
+
+    adapter.start_session(make_spec(tmp_path, task_id=task_id))
+    assert not stale.exists()
+
+    # ...and with the file already gone the unlink is a no-op, not an error. What this
+    # second call asserts is that it RETURNS (the missing_ok path); re-asserting the
+    # file's absence would only restate the line above, since nothing re-created it.
+    assert adapter.start_session(make_spec(tmp_path, task_id=task_id)) is not None
+
+
 def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
     """A pathological operator regex can't hang run() teardown: each match is bounded
     by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it aborts the WHOLE scan and declines
