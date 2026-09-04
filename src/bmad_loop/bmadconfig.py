@@ -199,6 +199,8 @@ def load_paths(project: Path) -> ProjectPaths:
         doc = yaml.safe_load(raw) or {}
     except yaml.YAMLError as e:
         raise BmadConfigError(f"invalid YAML in {config_path}: {e}") from e
+    if not isinstance(doc, dict):
+        raise BmadConfigError(f"{config_path} must contain a top-level mapping")
 
     impl = doc.get("implementation_artifacts")
     plan = doc.get("planning_artifacts")

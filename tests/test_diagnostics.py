@@ -85,6 +85,7 @@ def _seed_run(
     extra_journal=None,
     sweeps_triggered=(),
     sweeps_refused=None,
+    repo_root="",
 ):
     """Build a run dir loaded with canaries in every readable sink.
 
@@ -129,6 +130,7 @@ def _seed_run(
     state = RunState(
         run_id=run_id,
         project=f"{HOME_PATH}",
+        repo_root=repo_root,
         started_at="2026-06-27T12:00:00",
         run_type="story",
         target_branch=BRANCH,
@@ -279,12 +281,13 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     # `collect_env` reaches `get_multiplexer()`, an lru_cache(maxsize=1) that selects
     # on `sys.platform`; without these clears the patched window caches the Windows
     # pick for every later test in the worker.
+    run_dir = _seed_run(project.project)
     get_multiplexer.cache_clear()
     try:
         monkeypatch.setattr(diagnostics.sys, "platform", "win32")
         pseudo = sanitize.Pseudonymizer()
         unc = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
-        diag = diagnostics.collect([_seed_run(project.project)], pseudo=pseudo, project=unc)
+        diag = diagnostics.collect([run_dir], pseudo=pseudo, project=unc)
     finally:
         # pytest undoes the patch on its own, but only at teardown — a raise in
         # `collect` would leave the Windows pick cached past this test without this.
@@ -325,6 +328,13 @@ def test_env_names_the_platform_and_the_win32_on_wsl_path_verdict(project, monke
     assert sanitize.assert_no_leak(js) == []  # general backstop; blind to this shape
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "pins the POSIX half of the gate by faking sys.platform; the faked branch's\n"
+        "imports (fcntl) do not exist on Windows, so the row can only run off win32"
+    ),
+)
 def test_env_win32_on_wsl_path_is_false_off_win32(project, monkeypatch):
     """The *platform* half of the twin gate, pinned. What #332 names is a mismatched
     interpreter, not a path shape: the very distro path a win32 interpreter warns about
@@ -681,9 +691,9 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
     grade: depending on its entropy, the fallback may redact a sha as a secret rather
     than preserving the correlatable alias this table promises.
 
-    `commits` remains deliberately outside this test and outside DW-81's routing
-    change. It is a list on `stale-restore-commits` but an integer count on
-    `rollback-manual-required`; routing it requires a separate, kind-scoped policy.
+    `commits` is now routed by kind because it is a list here but an integer count on
+    `rollback-manual-required`; this row therefore also sees the residue SHA enter
+    the same commit namespace without changing the baseline's alias.
     """
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")
     probe_failed = diagnostics._scrub_entry(
@@ -714,8 +724,9 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
     alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
     # aliased, not dropped — the key stays and only the VALUE is replaced
     assert probe_failed["old_baseline"] == commits["old_baseline"] == alias != SHA
-    # one legend entry for the shared baseline, not one per record spelling
-    assert {orig for ns, orig, _a in pseudo.entries() if ns == "commit"} == {SHA}
+    # one legend entry for the shared baseline, not one per record spelling, plus
+    # the independently aliased residue commit
+    assert {orig for ns, orig, _a in pseudo.entries() if ns == "commit"} == {SHA, "c" * 40}
     # the free-text sibling on the probe record quotes both the sha and a host path
     # back, and is reached by the drop set rather than aliased
     assert "error" not in probe_failed and probe_failed["error_present"] is True
@@ -723,6 +734,199 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
     rendered = json.dumps([probe_failed, commits])
     for canary in (SHA, PROPRIETARY, HOME_PATH, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_remaining_journal_shapes_route_by_kind_and_preserve_safe_structure():
+    """The overloaded names are handled according to the producer shape, not by
+    their generic scalar fallback."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    commit_values = [SHA, "0f" * 20]
+    commits = diagnostics._scrub_entry(
+        {"kind": "stale-restore-commits", "commits": commit_values}, pseudo, {}, None
+    )
+    files = diagnostics._scrub_entry(
+        {
+            "kind": "stale-restore-excluded",
+            "files": ["AcmePayrollExport.py", "AcmeMergerPlan.md"],
+        },
+        pseudo,
+        {},
+        None,
+    )
+    bare_sentinel = diagnostics._scrub_entry(
+        {"kind": "sentinel-cleared", "sentinel": SPEC_NAME}, pseudo, {}, None
+    )
+    qualified_sentinel = diagnostics._scrub_entry(
+        {"kind": "sentinel-cleared", "sentinel": SPEC_ABS}, pseudo, {}, None
+    )
+    manual_count = diagnostics._scrub_entry(
+        {"kind": "rollback-manual-required", "commits": 2}, pseudo, {}, None
+    )
+
+    assert commits["commits"] != commit_values
+    assert len(commits["commits"]) == 2
+    assert all(value.startswith("commit-") for value in commits["commits"])
+    expected_commit_aliases = [
+        next(
+            alias
+            for ns, original, alias in pseudo.entries()
+            if ns == "commit" and original == value
+        )
+        for value in commit_values
+    ]
+    assert commits["commits"] == expected_commit_aliases
+    assert len(set(commits["commits"])) == len(commit_values)
+    assert files == {"kind": "stale-restore-excluded", "files_count": 2}
+    assert bare_sentinel["sentinel"] == qualified_sentinel["sentinel"]
+    assert bare_sentinel["sentinel"].startswith("spec-")
+    assert manual_count["commits"] == 2
+
+    legend = pseudo.legend()
+    assert SPEC_ABS not in legend.values()
+    assert "AcmePayrollExport.py" not in legend.values()
+    assert "AcmeMergerPlan.md" not in legend.values()
+
+
+def test_non_string_sentinel_is_safely_pseudonymized():
+    """A malformed sentinel still takes the explicit alias route.
+
+    Ablation: remove the `sentinel-cleared` kind route and `scrub_json` preserves
+    the identifier-shaped nested value instead of returning one opaque spec alias.
+    """
+    raw = {"customer_spec": "AcmeVaultRotation"}
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "sentinel-cleared", "sentinel": raw}, pseudo, {}, None
+    )
+
+    assert isinstance(scrubbed["sentinel"], str)
+    assert scrubbed["sentinel"].startswith("spec-")
+    assert raw["customer_spec"] not in json.dumps(scrubbed)
+    assert pseudo.entries() == [("spec", str(raw), scrubbed["sentinel"])]
+
+
+def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
+    run_dir = _seed_run(project.project)
+    sentinel_value = chr(0xDC80)
+    commit_values = [chr(0xDC81), chr(0xDC82)]
+    journal = Journal(run_dir)
+    journal.append("sentinel-cleared", sentinel=sentinel_value)
+    journal.append("stale-restore-commits", commits=commit_values)
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    rendered = diagnostics.render_json(diag, pseudo=pseudo)
+    entries = json.loads(rendered)["runs"][0]["journal"]["entries"]
+    sentinel = next(entry for entry in entries if entry["kind"] == "sentinel-cleared")
+    commits = next(entry for entry in entries if entry["kind"] == "stale-restore-commits")
+
+    assert sentinel["sentinel"].startswith("spec-")
+    assert all(value.startswith("commit-") for value in commits["commits"])
+    assert len(set(commits["commits"])) == len(commit_values)
+    assert sentinel_value not in rendered
+    assert all(value not in rendered for value in commit_values)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "value"),
+    [
+        ("stale-restore-commits", "commits", "AcmeCommitResidue"),
+        ("stale-restore-excluded", "files", "AcmePayrollExport.py"),
+    ],
+)
+def test_kind_scoped_container_routes_fail_closed_on_malformed_shapes(kind, field, value):
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, field: value}, sanitize.Pseudonymizer(salt=b"fixed"), {}, None
+    )
+
+    assert field not in scrubbed
+    assert scrubbed[f"{field}_present"] is True
+    assert f"{field}_count" not in scrubbed
+    assert value not in json.dumps(scrubbed)
+
+
+@pytest.mark.parametrize("raw_first", [True, False], ids=["raw-first", "raw-last"])
+def test_derived_files_count_wins_raw_count_collision_in_both_orders(raw_first):
+    fields = [("files_count", 999), ("files", ["one.py", "two.py"])]
+    if not raw_first:
+        fields.reverse()
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "stale-restore-excluded", **dict(fields)},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed["files_count"] == 2
+    assert "files" not in scrubbed
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "malformed"),
+    [
+        ("run-start", "story_keys", "AcmeStoryKey"),
+        ("stale-restore-commits", "commits", "AcmeCommitResidue"),
+        ("stale-restore-excluded", "files", "AcmePayrollExport.py"),
+    ],
+    ids=["global-keylist", "kind-keylist", "kind-countlist"],
+)
+@pytest.mark.parametrize("raw_first", [True, False], ids=["raw-first", "raw-last"])
+def test_derived_malformed_presence_wins_raw_collision_in_both_orders(
+    kind, field, malformed, raw_first
+):
+    presence = f"{field}_present"
+    raw_value = f"AcmeRaw{field.title()}Presence"
+    fields = [(presence, raw_value), (field, malformed)]
+    if not raw_first:
+        fields.reverse()
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, **dict(fields)}, sanitize.Pseudonymizer(salt=b"fixed"), {}, None
+    )
+
+    assert scrubbed[presence] is True
+    assert field not in scrubbed
+    assert raw_value not in json.dumps(scrubbed)
+
+
+def test_declared_schema_reservation_respects_routed_field_precedence():
+    raw_presence = "AcmeRawStoryPresence"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "preference-escalation",
+            "story_key": STORY_KEY,
+            "story_key_present": raw_presence,
+        },
+        pseudo,
+        {},
+        None,
+    )
+
+    assert scrubbed["story_key"].startswith("story-")
+    assert "story_key_present" not in scrubbed
+    assert scrubbed["story_key_present_present"] is True
+    assert raw_presence not in json.dumps(scrubbed)
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_empty_path_becomes_a_false_presence_flag(value):
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "worktree-opened", "path": value},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed == {"kind": "worktree-opened", "path_present": False}
+
+
+def test_unrelated_raw_presence_field_is_not_suppressed():
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "attempt-restored", "patch_present": False},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed["patch_present"] is False
 
 
 def test_sentinel_upstream_record_drops_the_stories_root_it_names():
@@ -889,6 +1093,101 @@ def test_patch_and_stash_paths_are_absent_from_public_diagnostic_renders(project
     legend_values = set(pseudo.legend().values())
     for dropped in (patch_path, Path(patch_path).name, stash_path, Path(stash_path).name):
         assert dropped not in legend_values
+
+
+def test_remaining_journal_sanitization_contract_reaches_both_public_renders(project):
+    """Separator-free canaries grade the explicit routes; the decoded document
+    grades the retained aliases, counts, and authoritative presence booleans."""
+    run_dir = _seed_run(project.project)
+    commit_value = "0f" * 20
+    filename = "AcmePayrollExport.py"
+    sentinel_path = f"{HOME_PATH}/stories/{SPEC_NAME}"
+    sweep_path = "AcmeBundleIntent"
+    worktree_path = f"{HOME_PATH}/worktrees/AcmePrivateTree"
+    patch_value = "AcmePatchLatch"
+    raw_before = "AcmeRawPresenceBefore"
+    raw_after = "AcmeRawPresenceAfter"
+    raw_ts_offset = "AcmePrivateClock"
+    tolerated_filename = "AcmeToleratedScene.unity"
+    cleaned_filename = "AcmeCleanedPrefab.prefab"
+    refused_filename = "AcmeRefusedAsset.asset"
+    journal = Journal(run_dir)
+    journal.append("stale-restore-commits", commits=[commit_value])
+    journal.append("stale-restore-excluded", files=[filename])
+    journal.append("sentinel-cleared", sentinel=sentinel_path)
+    journal.append("sweep-intent-regenerated", path=sweep_path)
+    journal.append("worktree-opened", path=worktree_path, ts_offset=raw_ts_offset)
+    journal.append("merge-target-tolerated", paths=[tolerated_filename])
+    journal.append("merge-target-cleaned", paths=[cleaned_filename])
+    journal.append("merge-preflight-refused", tolerated=[refused_filename])
+    journal.append(
+        "attempt-restored",
+        case="before",
+        **{"patch_present": raw_before, "patch": patch_value},
+    )
+    journal.append(
+        "attempt-restored",
+        case="after",
+        **{"patch": patch_value, "patch_present": raw_after},
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    json_text = diagnostics.render_json(diag, pseudo=pseudo)
+    document = json.loads(json_text)
+    entries = document["runs"][0]["journal"]["entries"]
+
+    commits = next(e for e in entries if e["kind"] == "stale-restore-commits")
+    excluded = next(e for e in entries if e["kind"] == "stale-restore-excluded")
+    sentinel = next(e for e in entries if e["kind"] == "sentinel-cleared")
+    sweep = next(e for e in entries if e["kind"] == "sweep-intent-regenerated")
+    worktree = next(e for e in entries if e["kind"] == "worktree-opened")
+    merge_tolerated = next(e for e in entries if e["kind"] == "merge-target-tolerated")
+    merge_cleaned = next(e for e in entries if e["kind"] == "merge-target-cleaned")
+    merge_refused = next(e for e in entries if e["kind"] == "merge-preflight-refused")
+    collisions = [e for e in entries if e["kind"] == "attempt-restored"]
+
+    assert commits["commits"][0].startswith("commit-")
+    assert excluded["files_count"] == 1 and "files" not in excluded
+    assert sentinel["sentinel"].startswith("spec-")
+    assert sweep["path_present"] is True and "path" not in sweep
+    assert worktree["path_present"] is True and "path" not in worktree
+    assert isinstance(worktree["ts_offset"], (int, float))
+    assert merge_tolerated["paths_count"] == 1 and "paths" not in merge_tolerated
+    assert merge_cleaned["paths_count"] == 1 and "paths" not in merge_cleaned
+    assert merge_refused["tolerated_count"] == 1 and "tolerated" not in merge_refused
+    assert {entry["case"] for entry in collisions} == {"before", "after"}
+    assert all(entry["patch_present"] is True for entry in collisions)
+
+    rendered = markdown + json_text
+    for canary in (
+        commit_value,
+        filename,
+        sentinel_path,
+        sweep_path,
+        worktree_path,
+        patch_value,
+        raw_before,
+        raw_after,
+        raw_ts_offset,
+        tolerated_filename,
+        cleaned_filename,
+        refused_filename,
+    ):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    legend_values = set(pseudo.legend().values())
+    for canary in (
+        filename,
+        sentinel_path,
+        sweep_path,
+        worktree_path,
+        patch_value,
+        tolerated_filename,
+        cleaned_filename,
+        refused_filename,
+    ):
+        assert canary not in legend_values, f"LEAK via legend: {canary!r}"
 
 
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
@@ -1583,10 +1882,10 @@ def test_events_degrade_to_the_legacy_root_when_the_state_root_is_underivable(
     count this degradation gives up."""
     from bmad_loop import envvars, runs
 
-    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
-    monkeypatch.setattr(runs, "state_root", _raise_no_state_root)
     run_dir = _seed_bare_run(project.project)
     _write_events(run_dir / "events", 2)
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    monkeypatch.setattr(runs, "state_root", _raise_no_state_root)
 
     group = _events_group(run_dir, project.project)
     assert group is not None and group.count == 2
@@ -2097,8 +2396,20 @@ def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
 
     Without this the assertion above passes for a hardcoded `True`, and the field
     stops carrying the one bit it exists to carry.
+
+    Seeds `repo_root` EQUAL to `project`, which is what makes this the ordinary
+    layout rather than the legacy one. `repo_root_diverges` is
+    `bool(state.repo_root) and Path(state.repo_root) != Path(state.project)`, so a
+    run with no recorded root short-circuits on the first term and the equality arm
+    is never evaluated — the row would be named for a layout it does not build.
+    `runsetup` writes the field unconditionally on every run, equal to `project`
+    unless a `repo_root:` override exists, so this is the modal shape an operator's
+    dump carries.
+
+    Ablation: drop the `repo_root=` argument and the row still passes, on the legacy
+    guard instead of the comparison.
     """
-    run_dir = _seed_run(project.project)
+    run_dir = _seed_run(project.project, repo_root=f"{HOME_PATH}")
     diag, _pseudo, _combined = _render_all([run_dir])
     (run,) = diag.runs
 
@@ -2171,8 +2482,13 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
 
 
 def test_the_markdown_report_says_no_for_the_ordinary_layout(project):
-    """The rendered line distinguishes; a hardcoded "yes" would pass the test above."""
-    run_dir = _seed_run(project.project)
+    """The rendered line distinguishes; a hardcoded "yes" would pass the test above.
+
+    Seeds `repo_root` equal to `project` for the same reason as its JSON twin: an
+    unset root answers `no` through the legacy guard without ever reaching the
+    comparison.
+    """
+    run_dir = _seed_run(project.project, repo_root=f"{HOME_PATH}")
     pseudo = sanitize.Pseudonymizer()
     diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
     md = diagnostics.render_markdown(diag, pseudo=pseudo)

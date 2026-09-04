@@ -1327,19 +1327,43 @@ def retrying_unlink(path: Path) -> None:
     _retry_on_sharing_violation(path.unlink)
 
 
+class LockUnavailableError(OSError):
+    """:func:`file_lock` could not ACQUIRE the lock: another holder has it, or the
+    acquisition call itself faulted (EINTR, ENOLCK, EBADF).
+
+    An ``OSError`` subclass for the reason :class:`UnconfinedWriteError` is one —
+    every site that already degrades on ``OSError`` from a lock acquisition keeps
+    its behavior unchanged, so this narrows nothing that was previously caught.
+    What the subclass buys is the arm a caller could not write before: telling
+    "something else is using this" apart from every other ``OSError`` WITHOUT the
+    bare ``except OSError`` that would also swallow an ``UnconfinedWriteError``
+    and file a confinement refusal as a benign "busy" — the exact fold-to-benign
+    those two classes exist to keep apart.
+
+    Raised for the ACQUISITION ALONE. A fault raised by the locked body is never
+    wrapped: reporting a body error as contention is the same fold in the other
+    direction. The ``os.open`` that provisions the lock file is deliberately left
+    unwrapped too — failing to create the sidecar is a provisioning fault, not a
+    holder, and a caller that treats it as "someone is using this run" would
+    retry forever against a broken path."""
+
+
 @contextmanager
 def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Exclusive OS advisory lock on ``path`` (created if missing), released on
     exit — and by the kernel when the holder dies, so a crashed process never
     wedges the lock (no stale-lockfile scheme to clean up). ``blocking=False``
-    raises ``OSError`` at once when the lock is already held, giving tests a
-    deterministic exclusion probe instead of a sleep-based negative assertion.
+    raises :class:`LockUnavailableError` at once when the lock is already held,
+    giving tests a deterministic exclusion probe instead of a sleep-based negative
+    assertion — and giving a bulk sweep a way to skip a busy item rather than
+    stall on it (``cli.cmd_clean``).
 
     Lock a dedicated sibling file, never data that is swapped via
     :func:`atomic_replace` — the lock rides the open fd's inode, and a replace
     would swap that inode out from under later acquirers. ``fcntl.flock`` on
     POSIX; ``msvcrt.locking`` on Windows, where the blocking mode's built-in
-    ~10 s retry bounds the wait and surfaces contention as ``OSError``.
+    ~10 s retry bounds the wait and surfaces contention as
+    :class:`LockUnavailableError`.
 
     THE WAIT IS PLATFORM-ASYMMETRIC, and a caller has to decide what that means
     for it: POSIX blocks indefinitely, Windows gives up after ~10 s and raises.
@@ -1349,7 +1373,16 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     multi-step git transaction of roughly seven ``git`` spawns, each bounded by
     ``[limits] git_timeout_s``. So a Windows acquirer can genuinely time out
     under contention rather than only under a deadlock. Hold it for as short a
-    span as correctness allows, and handle the ``OSError`` from acquisition.
+    span as correctness allows, and handle the :class:`LockUnavailableError` from
+    acquisition.
+
+    AND THE ASYMMETRY IS NOT REMOVED BY THE TYPED ERROR, only made catchable: a
+    ``blocking=True`` POSIX acquirer still waits forever, because ``fcntl.flock``
+    does not time out. :class:`LockUnavailableError` therefore reaches a blocking
+    caller only on Windows' ~10 s bound and on genuinely exceptional POSIX errnos.
+    A caller that must not stall — a bulk sweep over many items, where one busy
+    item is data rather than a reason to stop — has to pass ``blocking=False`` and
+    handle the refusal; the typed error alone does not buy it.
 
     OWNER-ONLY, AND DELIBERATELY NOT MADE TO WORK ACROSS OS USERS. A repository
     shared between OS users is not a supported configuration (maintainer
@@ -1375,15 +1408,22 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        if sys.platform == "win32":
-            import msvcrt
+        try:
+            if sys.platform == "win32":
+                import msvcrt
 
-            # Locks 1 byte at the current position — 0 on a fresh fd.
-            msvcrt.locking(fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
+                # Locks 1 byte at the current position — 0 on a fresh fd.
+                msvcrt.locking(fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except OSError as e:
+            # Only this call is wrapped — see LockUnavailableError on why the
+            # `os.open` above and the `yield` below are deliberately outside it.
+            # errno/strerror/filename are carried through so a caller that reads
+            # them, or just prints the exception, sees what the bare OSError said.
+            raise LockUnavailableError(e.errno, e.strerror or str(e), str(path)) from e
         try:
             yield
         finally:

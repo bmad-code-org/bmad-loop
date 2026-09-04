@@ -1018,6 +1018,87 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return bool(mark_done_many(path, [dw_id], date, note))
 
 
+def mark_seen_again_many(
+    path: Path, dw_ids: Sequence[str], date: str, note: str
+) -> tuple[list[bool], str | None, list[str], str | None]:
+    """Stamp `seen-again: <date> (<note>)` under each entry's status line, in ONE
+    read and ONE atomic write. Returns one applied flag per id, the text it
+    published — None when it wrote nothing — the ids whose match went STALE
+    inside the hold, and the PREIMAGE this call read under that hold (None when
+    no locked read happened at all).
+
+    The writer half of the format doc's dedupe rule (deferred-work-format.md): a
+    finding that matches an existing entry is recorded as a sighting on that
+    entry, never as a duplicate entry. Idempotent per (id, date, note): a replay
+    stamping the same line is skipped, so a flag reads "this call inserted it",
+    not "the line is there".
+
+    ⚠️ The two ways a flag can be False are NOT interchangeable, which is why the
+    stale ids come back separately. A replay whose line is already present has a
+    live sighting on a live entry and must file nothing. An id that is missing or
+    NO LONGER OPEN has no sighting anywhere: the caller matched it against a
+    snapshot read before this lock and a rival closed or archived it in between,
+    so its finding is recorded work again rather than a duplicate and the caller
+    must file it. Stamping a done entry instead — while the caller, having already
+    excluded the finding from its append, files nothing — drops the recurrence in
+    silence, which is the whole reason the recheck happens inside the hold and not
+    against the caller's snapshot.
+
+    ``entry.open``, not ``not entry.done``: a status the format cannot parse is
+    neither, and the only question here is whether this is still the open entry
+    the caller matched — so the predicate has to be the one the caller used.
+
+    A missing ledger applies nothing, takes no lock, and reports every id stale,
+    like :func:`mark_done_many`'s absent-file arm.
+
+    ONE locked read->edit->write (#286/#469): each insert lands on the text the
+    previous one produced (:func:`_find_entry` re-parses the evolving text, so
+    spans stay honest), and the published text is handed back from inside the
+    hold for the same ``post_engine_ledger_digest`` reasons as
+    :func:`append_entries_published`. `date` is orchestrator-owned and raises
+    when malformed; `note` is sanitized to one line (#305).
+
+    The PREIMAGE comes back for the other half of that anchor question. The
+    published text says WHAT WAS WRITTEN; only the preimage says WHAT IT WAS
+    WRITTEN OVER, and an anchor may claim the published bytes as the caller's own
+    solely when the preimage is still the bytes the caller last knew the file to
+    hold. A rival that lands between the caller's snapshot and this locked read
+    is folded into the preimage — and therefore re-published — so without that
+    comparison the caller's anchor would authorize retracting the rival's work.
+    """
+    _require_iso_date(date)
+    line = f"seen-again: {date} ({_one_line(note)})"
+    if not dw_ids:
+        return [], None, [], None
+    if not path.is_file():
+        return [False for _ in dw_ids], None, list(dw_ids), None
+    with ledger_lock(path):
+        if not path.is_file():
+            return [False for _ in dw_ids], None, list(dw_ids), None
+        preimage = path.read_text(encoding="utf-8")
+        text = preimage
+        applied: list[bool] = []
+        stale: list[str] = []
+        for dw_id in dw_ids:
+            entry = _find_entry(text, dw_id)
+            if entry is None or not entry.open:
+                applied.append(False)
+                stale.append(dw_id)
+                continue
+            if line in entry.body:
+                applied.append(False)
+                continue
+            text = _insert_after_status(text, entry, line)
+            applied.append(True)
+        if not any(applied):
+            return applied, None, stale, preimage
+        atomic_write_text(path, text)
+        # Both returned from INSIDE the hold: the published text by
+        # construction, and the preimage it replaced — neither a read-back that a
+        # rival could have moved.
+        return applied, text, stale, preimage
+
+
 _MARK_DONE_TAIL_RE = re.compile(
     r"\nresolution:[ \t]*(.*)"
     r"\nresolution-undo:[ \t]*([0-9a-f]{64})[ \t]+"
@@ -1457,10 +1538,11 @@ def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
 
 def append_entries_published(
     path: Path, specs: Sequence[EntrySpec]
-) -> tuple[list[str | None], str | None]:
+) -> tuple[list[str | None], str | None, str | None]:
     """:func:`append_entries`, additionally handing back the text it published —
     or None when it wrote nothing, because every spec deduped or `specs` was
-    empty.
+    empty — and the PREIMAGE it read under the lock, or None when no locked read
+    happened (nothing to write, or the ledger did not exist).
 
     For a caller that has to record WHAT IT WROTE rather than what the file holds
     afterwards. Reading the ledger back after this returns is a different
@@ -1471,6 +1553,14 @@ def append_entries_published(
     ours" — counting a rival's write as ours would have the pre-harvest restore
     retract it, which is the loss this module exists to prevent (#286). Taking
     the text from inside the hold removes the window rather than narrowing it.
+
+    That closes the window AFTER the locked read; the preimage closes the one
+    BEFORE it. A rival that appended between the caller's snapshot and this
+    locked read is already in the text this call re-publishes, so the published
+    bytes carry it and an anchor set from them would still authorize retracting
+    it. Handing the preimage back lets the caller answer the only question that
+    makes the anchor safe — "is what I wrote over still what I last knew this
+    file to be?" — and decline to move the anchor when it is not.
 
     The returned text is what was handed to
     :func:`~bmad_loop.platform_util.atomic_write_text`, so a digest of it equals
@@ -1521,7 +1611,7 @@ def append_entries_published(
             )
     if not specs:
         # Nothing to serialize against, so nothing to take a lock for.
-        return [], None
+        return [], None, None
     try:
         # ADVISORY pre-lock probe (#736): one read — shaped exactly like the
         # locked one, absence included — and the same pure decision the locked
@@ -1532,19 +1622,22 @@ def append_entries_published(
         probe = path.read_text(encoding="utf-8") if path.is_file() else ""
         minted = _apply_appends(probe, specs)[1]
         if all(dw_id is None for dw_id in minted):
-            return minted, None
+            # No lock was taken, so there is no locked read to report a preimage
+            # from — and nothing was written for an anchor to claim either.
+            return minted, None, None
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
         pass
     with ledger_lock(path):
-        text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        text, minted = _apply_appends(text, specs)
+        preimage = path.read_text(encoding="utf-8") if path.is_file() else None
+        text, minted = _apply_appends(preimage or "", specs)
         if all(dw_id is None for dw_id in minted):
-            return minted, None
+            return minted, None, preimage
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, text)
-        # Returned from INSIDE the hold: this is the published text by
-        # construction, not a read-back that a rival could have moved.
-        return minted, text
+        # Both returned from INSIDE the hold: the published text by
+        # construction, and the preimage it replaced — neither a read-back that a
+        # rival could have moved.
+        return minted, text, preimage
 
 
 def append_entry(

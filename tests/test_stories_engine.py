@@ -17,7 +17,7 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import stories
+from bmad_loop import stories, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -987,6 +987,10 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     assert leg1.prompt.endswith("Halt after planning.")
     assert leg1.env["BMAD_LOOP_PLAN_HALT"] == "1"
     assert _kinds(engine.journal, "plan-halt")
+    (waiver,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert waiver["story_key"] == "1"
+    assert waiver["zero_diff"] is True
+    assert "plan_halt" not in waiver  # the result marker remains a separate fact
     assert _kinds(engine.journal, "checkpoint-pause")[-1]["checkpoint"] == "plan"
 
     resumed, radapter = resume_engine(project, engine, [stories_checkpoint_effect()])
@@ -998,6 +1002,115 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+@pytest.mark.parametrize(
+    "result_json",
+    [
+        {"workflow": "auto-dev"},
+        {"workflow": "wrong-workflow", "plan_halt": True},
+    ],
+    ids=["marker-absent", "earlier-gate-fails"],
+)
+def test_refused_plan_halt_does_not_journal_a_proof_waiver(project, result_json):
+    """Only a passing artifact outcome earns the plan-halt waiver record.
+
+    Ablation: move the journal append before `verify_dev_stories`, or key it only
+    on a truthy marker, and the relevant row observes a record for a refused leg.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+
+
+@pytest.mark.parametrize("zero_diff", [False, None], ids=["residue", "unknown"])
+def test_accepted_plan_halt_journals_the_non_clean_proof_observation(
+    project, monkeypatch, zero_diff
+):
+    """The engine carries the verifier's full tri-state into the accepted-halt
+    record; neither residue nor an unanswerable probe may be rewritten as clean.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    if zero_diff is False:
+        (project.repo_root / "src.txt").write_text("planning residue\n", encoding="utf-8")
+    else:
+
+        def boom(_repo):
+            raise verify.GitError("untracked enumeration failed")
+
+        monkeypatch.setattr(verify, "untracked_files", boom)
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is zero_diff
+
+
+def test_accepted_plan_halt_journal_excludes_engine_written(project, monkeypatch):
+    """The journal projects the gate after excluding orchestrator-owned residue.
+
+    Ablation: stop composing ``engine_written`` into the stories observation and
+    this reports ``zero_diff: false`` even though the session itself wrote no code.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    (project.repo_root / "engine-owned.txt").write_text(
+        "orchestrator bookkeeping\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(engine, "_harvest_gate_exclude", lambda _task: ("engine-owned.txt",))
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+
+def test_replayed_plan_halt_does_not_duplicate_proof_waiver(project):
+    """Crash replay preserves the first observation for one session generation.
+
+    The first verification journals a clean waiver. A host death before the
+    accepted-session save can replay the same result after unrelated residue has
+    appeared; that replay must not append a conflicting second audit record.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline, generation=2)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+
+    first = engine._verify_dev_artifacts(task, result_json)
+    (project.repo_root / "late-residue.txt").write_text("later\n", encoding="utf-8")
+    replay = engine._verify_dev_artifacts(task, result_json)
+
+    assert first.ok and first.plan_halt_zero_diff is True
+    assert replay.ok and replay.plan_halt_zero_diff is False
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["generation"] == 2
+    assert record["zero_diff"] is True
 
 
 def test_operator_spec_path_anchors_an_isolated_units_spec(project):
@@ -1069,11 +1182,12 @@ def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
     # this assertion no row in the repo observed ANY `gates.notify` body, so every
     # notification site could be reverted to a bare `task.spec_file` with the suite green.
     #
-    # Ablation: revert `_pause_plan_checkpoint`'s notify to `task.spec_file` and this
-    # reddens — the bare relpath appears and the anchored path does not.
+    # INVERSE ablation: replace only `_pause_plan_checkpoint`'s notification
+    # `_operator_spec_path(task)` call with `task.spec_file`; this focused test
+    # reddens because the bare relpath appears and the anchored path does not.
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert str(wt / rel) in attention
-    assert f"review {rel}," not in attention  # not the un-anchored spelling
+    assert f"review the planned spec {rel}," not in attention
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review

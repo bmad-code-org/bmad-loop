@@ -84,6 +84,87 @@ def test_every_emitted_context_key_is_documented(skill_md):
     )
 
 
+def test_skill_documents_escalation_ordering_and_global_uniqueness(skill_md):
+    """The context consumer can rely on the reader's cross-session guarantees.
+
+    These assertions are deliberately separate so removing either the ordering
+    promise or the global de-duplication promise fails the contract guard.
+    """
+    after_schema = skill_md.split("}\n```\n\n", maxsplit=1)[1]
+    contract_lines = after_schema.split("\n\n", maxsplit=1)[0].splitlines()
+
+    assert "The `escalations` array is ordered newest-first." in contract_lines
+    assert (
+        "Across the entire gathered context, each distinct escalation appears exactly once."
+        in contract_lines
+    )
+    assert len(contract_lines) == 2
+
+
+def test_skill_presents_paused_reason_when_no_newer_escalation_detail(skill_md):
+    """A watermarked pause can have no new session escalation to present.
+
+    The positive non-empty assertion keeps the empty-path prohibitions from being
+    satisfied by deleting recorded-entry handling altogether.
+    """
+    presentation_step = skill_md.split(
+        "2. **Present the current pause evidence plainly**", maxsplit=1
+    )[1].split("\n3. **Get the human's decision.**", maxsplit=1)[0]
+    normalized = " ".join(presentation_step.split())
+
+    assert "When the `escalations` array is non-empty" in normalized
+    assert "present its recorded entries in their existing newest-first order" in normalized
+    assert "Do not replace recorded escalation detail with `paused_reason`." in normalized
+    assert "When the `escalations` array is empty" in normalized
+    assert (
+        "present `paused_reason` verbatim as the available evidence for the current pause"
+        in normalized
+    )
+    assert "no newer recorded escalation detail is available" in normalized
+    assert "Do not read below the watermark" in normalized
+    assert "unfilter or recover an older artifact escalation" in normalized
+    assert "synthesize an escalation object from `paused_reason`" in normalized
+    assert (
+        "require `paused_reason` to be text containing at least one non-whitespace character"
+        in normalized
+    )
+    assert "missing, `null`, non-text, or blank after trimming" in normalized
+    assert "report a malformed resolve context and do not write the resolution marker" in normalized
+
+    shared_requirement = (
+        "Using the selected evidence, explain what is ambiguous or contradictory, why it "
+        "blocks safe implementation, and offer **2–4 concrete resolution options** with a "
+        "clear recommendation and its trade-offs."
+    )
+    assert shared_requirement in normalized
+    assert normalized.index(shared_requirement) > normalized.index(
+        "When the `escalations` array is empty"
+    )
+    assert (
+        "\n\n   Using the selected evidence, explain what is ambiguous or contradictory"
+        in presentation_step
+    )
+
+
+def test_skill_routes_project_artifacts_and_code_work_to_their_distinct_roots(skill_md):
+    """Mentioning both keys is inert unless the skill explains the operational split.
+
+    Each assertion grades a separate instruction the divergent-root resolution needs:
+    where the session starts, where BMAD artifact/spec work stays, and where code/git
+    work belongs. Removing the substantive guidance while leaving the schema keys
+    documented therefore fails this contract rather than passing the key census above.
+    """
+    normalized = " ".join(skill_md.split())
+
+    assert "session's working directory is always `project_root`" in normalized
+    assert (
+        "artifact and spec work remains anchored under `project_root` (or at the explicit "
+        "absolute paths in this context)"
+    ) in normalized
+    assert "When the roots differ" in normalized
+    assert "any code fix or commit the human must make belongs under `code_root`" in normalized
+
+
 def test_skill_branches_on_the_in_place_remedy(skill_md):
     """`spec_reaches_the_redrive: false` has TWO remedies, and the wrong one is lost
     work in the other direction.
@@ -153,3 +234,14 @@ def test_skill_branches_on_spec_reachability(skill_md):
     assert "cut fresh from `redrive_base_ref`" in normalized
     # and the prohibition names whose job the landing is, rather than just refusing it
     assert "is the HUMAN's step" in normalized
+
+
+def test_skill_explains_null_reachability_for_stories_sentinels(skill_md):
+    """A sentinel retains a path but deliberately has no frozen-spec verdict, so
+    the general null definition must not tell the agent that no path was recorded.
+    """
+    normalized = " ".join(skill_md.split())
+
+    assert "no ordinary frozen spec to edit" in normalized
+    assert "stories mode recorded a sentinel path instead" in normalized
+    assert "follow the sentinel guidance below" in normalized

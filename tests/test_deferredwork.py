@@ -29,6 +29,7 @@ from bmad_loop.deferredwork import (
     mark_done_many_reopenable,
     mark_open,
     mark_open_many,
+    mark_seen_again_many,
     next_seq,
     open_ids,
     parse_declaration,
@@ -144,6 +145,131 @@ def test_mark_done_missing_entry(tmp_path):
     path = write_ledger(tmp_path)
     snapshot = path.read_text(encoding="utf-8")
     assert not mark_done(path, "DW-99", "2026-06-11", "n/a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_seen_again_many_inserts_after_status(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, published, stale, preimage = mark_seen_again_many(
+        path, ["DW-1"], "2026-08-31", "spec-deferral harvest of spec-2-2-b.md"
+    )
+    assert applied == [True] and stale == []
+    text = path.read_text(encoding="utf-8")
+    assert published == text
+    # the bytes the write landed on, read under the same hold as the publish
+    assert preimage == LEDGER
+    assert "status: open\nseen-again: 2026-08-31 (spec-deferral harvest of spec-2-2-b.md)" in text
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-1"].open  # the line does not disturb status parsing
+    assert "seen-again: 2026-08-31" not in entries["DW-3"].body  # only the target
+
+
+def test_mark_seen_again_many_is_idempotent_on_replay(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest of x")[0] == [True]
+    snapshot = path.read_text(encoding="utf-8")
+    applied, published, stale, preimage = mark_seen_again_many(
+        path, ["DW-1"], "2026-08-31", "harvest of x"
+    )
+    # the line is already there: a live sighting on a live entry, NOT a stale match
+    assert applied == [False] and published is None and stale == []
+    # a locked read still happened, so the preimage is reported even with no write
+    assert preimage == snapshot
+    assert path.read_text(encoding="utf-8") == snapshot
+    # a different sighting (new date) is a new line, not a dupe to skip
+    assert mark_seen_again_many(path, ["DW-1"], "2026-09-01", "harvest of x")[0] == [True]
+    assert path.read_text(encoding="utf-8").count("seen-again:") == 3  # DW-3 owns one
+
+
+def test_mark_seen_again_many_missing_id_is_false_and_stale(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, published, stale, preimage = mark_seen_again_many(
+        path, ["DW-99", "DW-1"], "2026-08-31", "harvest of x"
+    )
+    assert preimage == LEDGER
+    # an id that is simply gone had nowhere to take the sighting either — the
+    # caller matched it against a snapshot and must file its finding after all
+    assert applied == [False, True] and published is not None and stale == ["DW-99"]
+    assert "seen-again: 2026-08-31 (harvest of x)" in path.read_text(encoding="utf-8")
+    # a missing ledger applies nothing, creates nothing, and reports every id stale
+    missing = tmp_path / "absent" / "deferred-work.md"
+    # no locked read happened on the absent-file arm, so there is no preimage
+    assert mark_seen_again_many(missing, ["DW-1"], "2026-08-31", "x") == (
+        [False],
+        None,
+        ["DW-1"],
+        None,
+    )
+    assert not missing.exists()
+
+
+def test_mark_seen_again_many_reports_a_closed_match_as_stale(tmp_path):
+    """A rival's close between the caller's snapshot and this lock leaves the
+    sighting nowhere to land, and the caller has already excluded the finding from
+    its append on the strength of that match. Stamping the done entry anyway would
+    drop the recurrence in silence, so report the id instead of writing to it."""
+    path = write_ledger(tmp_path)
+    # DW-2 is done in the fixture, standing in for an entry closed since the
+    # caller's snapshot; DW-3 is open and must still take its line in the same call.
+    applied, published, stale, preimage = mark_seen_again_many(
+        path, ["DW-2", "DW-3"], "2026-08-31", "harvest of x"
+    )
+
+    assert applied == [False, True] and stale == ["DW-2"]
+    assert preimage == LEDGER
+    text = path.read_text(encoding="utf-8")
+    assert published == text
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert "seen-again: 2026-08-31" not in entries["DW-2"].body
+    assert "seen-again: 2026-08-31 (harvest of x)" in entries["DW-3"].body
+
+
+def test_mark_seen_again_many_writes_nothing_when_every_match_is_stale(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    assert mark_seen_again_many(path, ["DW-2", "DW-99"], "2026-09-01", "x") == (
+        [False, False],
+        None,
+        ["DW-2", "DW-99"],
+        snapshot,
+    )
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_seen_again_many_treats_an_unparseable_status_as_stale(tmp_path):
+    """``entry.open``, not ``not entry.done``. A status the format cannot read is
+    neither open nor done, and the only question here is whether this is still the
+    open entry the caller matched — so the predicate has to be the caller's."""
+    path = write_ledger(tmp_path, LEDGER.replace("status: open\n\n", "status: opne\n\n", 1))
+    snapshot = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(snapshot)}
+    assert not entries["DW-1"].open and not entries["DW-1"].done  # neither, by design
+
+    assert mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest of x") == (
+        [False],
+        None,
+        ["DW-1"],
+        snapshot,
+    )
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_seen_again_many_sanitizes_the_note_to_one_line(tmp_path):
+    path = write_ledger(tmp_path)
+    applied, _, _, _ = mark_seen_again_many(path, ["DW-1"], "2026-08-31", "harvest\nof spec-x.md")
+    assert applied == [True]
+    text = path.read_text(encoding="utf-8")
+    assert "seen-again: 2026-08-31 (harvest of spec-x.md)" in text
+    # the break never minted a phantom entry or truncated DW-1's span
+    assert [e.id for e in parse_ledger(text)] == ["DW-1", "DW-2", "DW-3"]
+
+
+def test_mark_seen_again_many_raises_on_a_bad_date_without_writing(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError):
+        mark_seen_again_many(path, ["DW-1"], "08/31/2026", "x")
     assert path.read_text(encoding="utf-8") == snapshot
 
 

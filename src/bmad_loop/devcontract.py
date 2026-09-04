@@ -9,13 +9,20 @@ for an LLM deciding how to handle failure). This module is the thin Python shim
 that turns that on-disk spec into the legacy result dict that verify.py /
 escalation.py already consume, so the rest of the pipeline stays unchanged.
 
-DOCTRINE — never trust prose for a gate. The frontmatter `status:` read straight
-off disk is authoritative; the `## Auto Run Result` prose is only used to route
-the blocked→PAUSE decision and to carry a human-readable detail. Where the two
-disagree we surface it (`status_consistent=False`) so the caller can fail safe
-(treat a mismatch as a retry rather than silently proceeding). Every real
-deterministic gate (git baseline, worktree-changed, sprint advancement, dw_id
-match) still runs in verify.py against actual on-disk state.
+DOCTRINE — never let terminal prose override populated frontmatter status. The
+frontmatter `status:` read straight off disk is authoritative whenever it is
+present. A genuine `## Auto Run Result` marker has three narrow roles: its
+status/detail route the blocked→PAUSE decision; its status is a compatibility
+fallback that may populate the synthesized result when frontmatter is blank or
+missing; and proof that the current session authored the marker supplies
+attempt ownership for `park_asserted`. From that compatibility result, `done`
+alone may be reconciled onto disk, `blocked` routes to PAUSE, and
+`awaiting-operator` remains subject to the on-disk frontmatter/status gate.
+Where the marker and populated frontmatter disagree we surface it
+(`status_consistent=False`) so the caller can fail safe (treat a mismatch as a
+retry rather than silently proceeding). Every real deterministic gate (git
+baseline, worktree-changed, sprint advancement, dw_id match) still runs in
+verify.py against actual on-disk state.
 """
 
 from __future__ import annotations
@@ -159,6 +166,24 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     return AutoRunResult(present=True, status=status, detail=body.strip())
 
 
+def auto_run_result_fingerprint(text: str) -> tuple[int, str]:
+    """Identity of the current last real Auto Run Result marker.
+
+    The count distinguishes a newly appended marker even when its text repeats
+    the previous result verbatim; the digest distinguishes an in-place rewrite.
+    Fenced examples remain invisible through the shared heading reader.
+    """
+    matches = _section_headings(text)
+    if not matches:
+        return (0, "")
+    last = matches[-1]
+    section = text[last.start() : _next_heading_start(text, last.end())]
+    return (
+        len(matches),
+        hashlib.sha256(section.encode("utf-8"), usedforsecurity=False).hexdigest(),
+    )
+
+
 # ------------------------------------------------ deferred review findings
 #
 # Since BMAD-METHOD #2640 the dev primitive records findings triaged as `defer`
@@ -198,15 +223,23 @@ def harvest_fingerprint(*parts: str) -> str:
 
 
 def _flatten(value: Any, limit: int) -> str:
-    """Collapse a YAML scalar to one clamped line.
+    """Collapse a YAML scalar to one line clamped at a word boundary.
 
-    Strip after clamping because the cut can land on a join space. Keeping that
-    cleanup here makes the value written to the ledger and the value used in its
-    fingerprint identical.
+    A cut landing mid-word backs up to the last join space so the ledger never
+    records a truncated half-token; a cut ending exactly at a word end keeps the
+    full cut, and a single unbroken token longer than the limit keeps the hard
+    clamp. Fingerprints (``harvest_fingerprint(summary, location)``) therefore
+    drift only for over-limit multi-word values -- accepted.
     """
     if value is None:
         return ""
-    return " ".join(str(value).split())[:limit].strip()
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit]
+    head, sep, _ = text[:limit].rpartition(" ")
+    return head if sep else text[:limit]
 
 
 def _is_yaml_scalar(value: Any) -> bool:
@@ -326,6 +359,7 @@ def synthesize_result(
     story_key: str | None,
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
+    park_marker_session_authored: bool = False,
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -402,6 +436,16 @@ def synthesize_result(
         "baseline_commit": baseline,
         "status": status,
         "escalations": escalations,
+        # Attempt ownership comes only from the current session's terminal marker.
+        # Frontmatter-only fallback is deliberately insufficient, and a marker
+        # written later by the orchestrator's missing-marker repair cannot
+        # retroactively authorize the session that omitted it.
+        "park_asserted": (
+            arr.present
+            and arr.status == AWAITING_OPERATOR
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
@@ -722,6 +766,41 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
     _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    return True
+
+
+def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+    """Reset a spec to ``draft`` and strip its stale result transactionally.
+
+    The TUI exposes those two writes as one operator action. Capture the exact
+    preimage before the status write and restore it through the same confined
+    atomic writer if either stage faults after changing (or removing) the file,
+    so a failed replan never publishes only its first half. A reset that makes no
+    change is a refusal, not permission to strip the result independently.
+
+    Rollback deliberately catches ``BaseException`` so an interrupt between the
+    two writes cannot leave a partial replan. A fault that leaves the preimage
+    untouched does not rewrite it. If the restore itself fails, that failure
+    escapes; otherwise the original stage failure is re-raised.
+    """
+    original = spec_path.read_bytes()
+    try:
+        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        if not reset:
+            if not spec_path.is_file():
+                raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
+            return False
+        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        if not stripped and not spec_path.is_file():
+            raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
+    except BaseException:
+        try:
+            unchanged = spec_path.read_bytes() == original
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+        raise
     return True
 
 

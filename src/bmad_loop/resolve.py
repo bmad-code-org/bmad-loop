@@ -15,6 +15,7 @@ edited frozen spec on disk plus the resolution marker.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -25,17 +26,29 @@ from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
 from .journal import TASK_CYCLE_ARTIFACTS
-from .model import RunState
+from .model import RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
+    live_stories_root,
+    rebase_recorded_project_path,
     redrive_base_ref,
     spec_reaches_the_redrive,
     task_spec_path,
-    task_stories_root,
     validate_restore_latch,
 )
 
 RESOLVE_DIR = "resolve"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON float: {value}")
+    return parsed
 
 
 def _story_dir(run_dir: Path, story_key: str) -> Path:
@@ -44,6 +57,19 @@ def _story_dir(run_dir: Path, story_key: str) -> Path:
 
 def context_path(run_dir: Path, story_key: str) -> Path:
     return _story_dir(run_dir, story_key) / "context.json"
+
+
+def _context_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
+    """Resolve the stories tree against the live project after a project move.
+
+    A delegation, not a second implementation. `context.json` and the TUI's escalation
+    modal are the two READ sides of one gesture whose WRITE side is `rearm_escalation`,
+    so they have to agree on the tree by construction: this module answered the moved
+    mount while `tui.app` answered the main checkout, which is the same
+    one-surface-two-trees split the anchor exists to close, merely relocated to a
+    different pair of surfaces. Kept as a named wrapper because the call site is
+    stories-mode-only (sprint mode must not probe for a stories root at all)."""
+    return live_stories_root(task, state, project_root)
 
 
 def resolution_path(run_dir: Path, story_key: str) -> Path:
@@ -128,7 +154,7 @@ def _gather_escalations(
       global across the pass, not per directory; it removes only exact repeats,
       so a directory holding CRITICAL A in one file and A + B in the other still
       yields both.
-    * the ``except`` tuple and the ``list`` check — ``build_context`` is an
+    * the ``except`` tuple and shared list guard — ``build_context`` is an
       OBSERVATION path: a malformed artifact must cost its own contents and
       nothing more, never raise out to the interactive resolve command.
       ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError`` (the same
@@ -136,11 +162,13 @@ def _gather_escalations(
       also raise a plain ``ValueError`` when an integer exceeds Python's configured
       digit limit. Deeply nested input can raise ``RecursionError`` while either
       parsing the document or canonicalizing an entry, so both operations live
-      under the same artifact-level guard. Meanwhile,
-      ``critical_escalations`` iterates ``escalations`` with no list guard of its
-      own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
-      here. The guard belongs in this caller; the shared predicate stays the
-      single definition of CRITICAL.
+      under the same artifact-level guard. ``critical_escalations`` owns the
+      list-only shape guard shared by every control-loop caller, so malformed
+      ``escalations`` values contribute nothing here just as they do elsewhere.
+      This reader re-checks the shape only AFTER that selector has run, and not
+      to avoid a crash: the recheck decides whether the artifact counts as READ,
+      so a wrong-shaped one reaches ``skipped`` instead of passing for an empty
+      one — see that parameter's note below.
     * the ``stat`` classification and its ``S_ISREG`` check — deciding ABSENT from
       UNREADABLE cannot go through ``Path.is_file()``, whose error behavior splits by
       interpreter. Through 3.13 it re-raises anything outside
@@ -226,7 +254,11 @@ def _gather_escalations(
             if not S_ISREG(st.st_mode):
                 continue
             try:
-                doc = json.loads(fpath.read_text(encoding="utf-8"))
+                doc = json.loads(
+                    fpath.read_text(encoding="utf-8"),
+                    parse_constant=_reject_json_constant,
+                    parse_float=_parse_finite_json_float,
+                )
                 if not isinstance(doc, dict):
                     raise ValueError("artifact is not a JSON object")
                 if "escalations" not in doc:
@@ -235,11 +267,23 @@ def _gather_escalations(
                     # skip — counting it as one would withhold coverage from every
                     # resolve cycle, permanently.
                     continue
-                if not isinstance(doc["escalations"], list):
-                    raise ValueError("'escalations' is not a list")
                 artifact_entries: dict[str, dict[str, Any]] = {}
                 for esc in critical_escalations(doc):
                     artifact_entries.setdefault(json.dumps(esc, sort_keys=True), esc)
+                if not isinstance(doc["escalations"], list):
+                    # Deliberately AFTER the selector, and no longer a crash guard:
+                    # ``escalation._escalation_list`` absorbs a non-list at the shared
+                    # predicate, which is the single definition of what CONTRIBUTES and
+                    # must run for this artifact too, so this reader keeps no private
+                    # shape guard that could drift from the engine and sweep callers.
+                    # What the predicate cannot answer is whether the artifact was
+                    # READ, and that is this walk's own question: an ``escalations`` key
+                    # holding the wrong shape is, from here, indistinguishable from a
+                    # file truncated mid-write. Raise so it reaches ``skipped`` by the
+                    # same ``except`` the other read faults use, and the watermark
+                    # cannot launder it into durable coverage. Nothing is discarded —
+                    # the selector already answered a non-list with no entries.
+                    raise ValueError("'escalations' is not a list")
             except (OSError, ValueError, RecursionError):
                 if skipped is not None and target is found:
                     skipped.add(str(fpath))
@@ -250,7 +294,13 @@ def _gather_escalations(
 
 
 def build_context(
-    state: RunState, run_dir: Path, story_key: str, *, isolation: str
+    state: RunState,
+    run_dir: Path,
+    story_key: str,
+    *,
+    isolation: str,
+    project_root: Path | None = None,
+    code_root: Path | None = None,
 ) -> tuple[Path, int, int]:
     """Write resolve/<story_key>/context.json for the resolve skill to read, and
     return it beside the number of already-answered escalations withheld from it and
@@ -283,6 +333,13 @@ def build_context(
     seam that reports it."""
     task = state.tasks.get(story_key)
     isolated_redrive = isolation == "worktree"
+    current_project_root = project_root if project_root is not None else Path(state.project)
+    current_code_root = code_root if code_root is not None else state.code_root
+    context_spec_path = (
+        rebase_recorded_project_path(task_spec_path(task, state), state, current_project_root)
+        if task and task.spec_file
+        else None
+    )
     # Patch-restore availability (#2564): the shared `validate_restore_latch`
     # verdict, not a local copy of one leg. Any of them — worktree isolation (the
     # re-drive discards and re-mounts the unit's worktree), a spec-less escalation,
@@ -292,13 +349,19 @@ def build_context(
     restore_supported = task is not None and (
         validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
-    # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
-    # `task_stories_root` rather than by `task_spec_root`. The latter answers a
-    # write-confinement question about `spec_file` and falls back to the project for an
-    # out-of-mount spec; borrowing it here pointed the sentinel and the stories block at
-    # the main checkout while `stories_engine._stories_folder` was still the mount, so
-    # one `context.json` could name two trees.
-    stories_root = task_stories_root(task, state)
+    stories_ctx: dict[str, Any] | None = None
+    if state.source == "stories":
+        # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
+        # `runs.live_stories_root` rather than by `task_spec_root`. Sprint mode consumes
+        # no stories data, so it must not probe for a stories root at all.
+        stories_root = _context_stories_root(task, state, current_project_root)
+        stories_ctx = _stories_context(
+            state, story_key, stories_root, task, context_spec_path=context_spec_path
+        )
+    # The persisted detection verdict is authoritative, matching re-arm. A real spec
+    # may legally have a sentinel-shaped basename, while a recorded sentinel remains a
+    # sentinel even when its file is unreadable or has disappeared.
+    sentinel = state.source == "stories" and task is not None and bool(task.sentinel_kind)
     # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
     # own watermark — 0 for a task never resolved, and for every pre-upgrade
     # `state.json`, which is the unfiltered pre-DW-11 walk.
@@ -313,13 +376,20 @@ def build_context(
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
+        # The interactive session deliberately stays rooted at the BMAD project, while
+        # code and git may live in the run's separately configured repository root.
+        # Serialize the caller's live snapshot without another canonicalization step:
+        # these are stable POSIX-form context strings, not a new path-resolution seam.
+        "project_root": current_project_root.as_posix(),
+        "code_root": current_code_root.as_posix(),
         # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
         # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
         # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
         # from the project root, where the main checkout carries the same
-        # `_bmad-output/specs/...` layout — the raw value would name the wrong
-        # tree's copy. `task_spec_path` is the same re-anchor `rearm_escalation`
-        # writes through, so the agent edits the file the re-arm will flip.
+        # implementation-artifacts-relative path — the raw value would name the wrong
+        # tree's copy. `task_spec_path` provides the persisted anchor; when the whole
+        # project moved, `rebase_recorded_project_path` carries that project-owned
+        # spelling onto the live session root without resolving it through the OS.
         # as_posix() for the same reason `resolution_path` below uses it — the
         # context contract is one string on every OS — and because the value this
         # replaces was ALREADY posix under isolation: `_serialized_worktree_path`
@@ -327,7 +397,7 @@ def build_context(
         # NON-isolated absolute case, which was previously emitted verbatim: on Windows
         # that changes `C:\\...\\spec.md` to `C:/.../spec.md`. Deliberate — one
         # spelling for every reader — and consumed by an agent, which accepts '/'.
-        "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
+        "spec_file": context_spec_path.as_posix() if context_spec_path is not None else None,
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
         "escalations": escalations,
@@ -341,13 +411,13 @@ def build_context(
         # every write succeed. `rearm_escalation` already journals
         # `rearm-spec-write-unreachable` on this same verdict; naming it here is what
         # lets the session act on it instead of learning it afterwards.
-        # Guarded on `task.spec_file` exactly as `spec_file` above is: a verdict about
-        # whether an edit SURVIVES is meaningless beside a `"spec_file": null`, and
-        # emitting one invited the session to act on a reachability answer for a file
-        # the same document says does not exist. Both fields are one claim.
+        # Guarded on `task.spec_file` as `spec_file` above is, and additionally on the
+        # stories sentinel the context just discovered: a verdict about whether a
+        # frozen-spec edit SURVIVES is meaningless when the file is absent, and a
+        # sentinel flow explicitly edits upstream intent rather than its sentinel.
         "spec_reaches_the_redrive": (
             spec_reaches_the_redrive(task, state, isolated_redrive=isolated_redrive)
-            if task and task.spec_file
+            if task and task.spec_file and not sentinel
             else None
         ),
         # WHERE a correction has to land to be read. Emitted beside the verdict
@@ -376,27 +446,32 @@ def build_context(
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
     # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
-    if state.source == "stories":
-        stories_ctx = _stories_context(state, story_key, stories_root)
-        if stories_ctx:
-            context["stories"] = stories_ctx
+    if stories_ctx:
+        context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
     return path, withheld, len(unreadable)
 
 
-def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
+def _stories_context(
+    state: RunState,
+    story_key: str,
+    root: Path,
+    task: StoryTask | None,
+    *,
+    context_spec_path: Path | None,
+) -> dict[str, Any]:
     """The stories-mode extension of the resolve context: the spec folder, the
     manifest entry for the story (title/description/checkpoint flags/invoke_dev_with),
-    and — when the escalated spec is a fixed-slug pre-planning-halt sentinel — a
-    sentinel indicator with its kind and recorded blocking condition. Best-effort:
-    an unreadable manifest just yields the folder (resolve still runs)."""
+    and — when the task persisted a pre-planning-halt sentinel verdict — a sentinel
+    indicator using that recorded kind/path plus the best-effort blocking condition.
+    An unreadable manifest or sentinel never changes the recorded mode."""
     from . import stories
 
     # `root`, not `Path(state.project)`: the caller resolved it with
-    # `task_stories_root`, so this block reads the manifest and sentinel out of the tree
-    # the RUN owns. One `context.json` that names two trees is worse than one that names
+    # `_context_stories_root`, so this block reads the manifest and sentinel out of the
+    # tree the RUN owns. One `context.json` that names two trees is worse than one that names
     # the wrong one — `sentinel.path` and `blocking_condition` would otherwise describe a
     # file the re-arm will never touch, or vanish entirely because the main checkout has
     # no sentinel while the mount does.
@@ -415,18 +490,20 @@ def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, A
             "done_checkpoint": entry.done_checkpoint,
             "invoke_dev_with": entry.invoke_dev_with,
         }
-    try:
-        st = stories.resolve_story_spec(folder, story_key)
-    except (OSError, UnicodeDecodeError):
-        st = None
-    if st is not None and st.kind == stories.KIND_SENTINEL and st.path is not None:
+    if task is not None and task.sentinel_kind:
+        sentinel_kind = task.sentinel_kind
+        sentinel_path = context_spec_path
         try:
-            condition = stories.recorded_blocking_condition(st.path.read_text(encoding="utf-8"))
+            condition = (
+                stories.recorded_blocking_condition(sentinel_path.read_text(encoding="utf-8"))
+                if sentinel_path is not None
+                else ""
+            )
         except (OSError, UnicodeDecodeError):
             condition = ""
         ctx["sentinel"] = {
-            "kind": st.sentinel_kind,
-            "path": st.path.as_posix(),
+            "kind": sentinel_kind,
+            "path": sentinel_path.as_posix() if sentinel_path is not None else None,
             "blocking_condition": condition,
         }
     return ctx

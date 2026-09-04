@@ -23,6 +23,7 @@ from conftest import (
     dev_effect,
     needs_strict_codec,
     review_effect,
+    scripted_verify_runner,
     write_sprint,
 )
 
@@ -446,7 +447,11 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
             seen.append((c.verification_stage, c.verification_sequence, c.command_results))
 
     result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "verifyobs")))
     summary = engine.run()

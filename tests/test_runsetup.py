@@ -15,17 +15,21 @@ at the end of the file.
 """
 
 import dataclasses
+import os
 import shutil
+import threading
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from bmad_loop import bmadconfig
+from bmad_loop import journal as journal_mod
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import Journal, load_state, state_lock
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -436,6 +440,96 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.code_root != Path(persisted.project)
 
 
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch, run_type):
+    """A rival explicit-id resume cannot enter after state.json becomes readable
+    but before the fresh composer publishes engine.pid."""
+    run_dir = runs.run_dir_for(tmp_path, RUN_ID)
+    stamp_entered = threading.Event()
+    rival_attempted = threading.Event()
+    release_stamp = threading.Event()
+    rival_observed: list[tuple[bool, bool]] = []
+    errors: list[BaseException] = []
+    real_file_lock = journal_mod.file_lock
+
+    @contextmanager
+    def observed_file_lock(path, *args, **kwargs):
+        if threading.current_thread().name == "rival-resume":
+            rival_attempted.set()
+        with real_file_lock(path, *args, **kwargs):
+            yield
+
+    def paused_stamp(_project, _run_id, _digest):
+        stamp_entered.set()
+        assert release_stamp.wait(2)
+
+    monkeypatch.setattr(journal_mod, "file_lock", observed_file_lock)
+    monkeypatch.setattr(runs, "write_trusted_config_digest", paused_stamp)
+
+    def compose() -> None:
+        try:
+            if run_type == "run":
+                runsetup.compose_run(
+                    project=tmp_path,
+                    paths=_fake_paths(tmp_path),
+                    policy=policy_mod.loads(""),
+                    run_id=RUN_ID,
+                    epic_filter=None,
+                    story_filter=None,
+                    max_stories=None,
+                    stories_on=False,
+                    spec_folder="",
+                    sweep_factory=lambda _trigger, *, started: None,
+                    make_adapters=_accepting_adapters,
+                    engine_cls=_AcceptingEngine,
+                    stories_engine_cls=_AcceptingEngine,
+                    trusted_config_digest="deadbeef",
+                )
+            else:
+                runsetup.compose_sweep(
+                    project=tmp_path,
+                    paths=_fake_paths(tmp_path),
+                    policy=policy_mod.loads(""),
+                    run_id=RUN_ID,
+                    prompting=False,
+                    decisions_only=False,
+                    max_bundles=None,
+                    repeat=None,
+                    max_cycles=None,
+                    trigger="auto",
+                    make_adapters=_accepting_adapters,
+                    sweep_engine_cls=_AcceptingEngine,
+                    trusted_config_digest="deadbeef",
+                )
+        except BaseException as e:
+            errors.append(e)
+
+    def rival_resume() -> None:
+        try:
+            with state_lock(run_dir):
+                rival_observed.append(
+                    ((run_dir / "state.json").is_file(), (run_dir / "engine.pid").is_file())
+                )
+        except BaseException as e:
+            errors.append(e)
+
+    composer = threading.Thread(target=compose, name="composer")
+    rival = threading.Thread(target=rival_resume, name="rival-resume")
+    composer.start()
+    assert stamp_entered.wait(2)
+    assert (run_dir / "state.json").is_file()
+    assert not (run_dir / "engine.pid").exists()
+    rival.start()
+    assert rival_attempted.wait(2)
+    assert rival_observed == []
+    release_stamp.set()
+    composer.join(2)
+    rival.join(2)
+
+    assert errors == []
+    assert rival_observed == [(True, True)]
+
+
 @pytest.fixture
 def unwinding(tmp_path):
     """A project plus a `make_adapters` that fails the way the real one does.
@@ -500,6 +594,93 @@ def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
             trusted_config_digest="deadbeef",
         )
     _assert_unwound(unwinding)
+
+
+def test_failed_composition_identifies_its_narrow_run_ownership(unwinding, monkeypatch):
+    """The composer may unwind its own live pid publication, but must opt into
+    that exception explicitly rather than borrowing operator ``force``."""
+    real_delete = runs.delete_run
+    calls: list[tuple[bool, int | None]] = []
+
+    def checked_delete(
+        project,
+        run_dir,
+        *,
+        force=False,
+        _expected_composer_pid=None,
+        _expected_composer_claim=None,
+    ):
+        assert _expected_composer_claim is not None
+        assert os.path.samestat(_expected_composer_claim, run_dir.stat(follow_symlinks=False))
+        calls.append((force, _expected_composer_pid))
+        return real_delete(
+            project,
+            run_dir,
+            force=force,
+            _expected_composer_pid=_expected_composer_pid,
+            _expected_composer_claim=_expected_composer_claim,
+        )
+
+    monkeypatch.setattr(runs, "delete_run", checked_delete)
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, unwinding.make_adapters)
+
+    assert calls == [(False, os.getpid())]
+    _assert_unwound(unwinding)
+
+
+def test_failed_composition_refuses_to_unwind_a_rival_pid_publication(unwinding, capsys):
+    """A resume that replaces the composer's pid publication owns the run now.
+
+    The launch error remains authoritative, while the refused unwind is reported
+    and leaves both run and control state available to the rival.
+    """
+
+    def rival_then_abort(project, run_dir, policy, *, profiles=None):
+        unwinding.published["run_dir"] = run_dir.is_dir()
+        unwinding.published["state"] = (run_dir / "state.json").is_file()
+        unwinding.published["state_dir"] = runs.state_dir_for(project, RUN_ID).is_dir()
+        (run_dir / runs.PID_FILE).write_text(str(os.getpid() + 1), encoding="utf-8")
+        raise SystemExit(BOOM)
+
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, rival_then_abort)
+
+    warning = capsys.readouterr().err
+    assert "changed engine ownership" in warning
+    assert runs.run_dir_for(unwinding.project, RUN_ID).is_dir()
+    assert runs.state_dir_for(unwinding.project, RUN_ID).is_dir()
+
+
+def test_failed_composition_refuses_to_unwind_a_replacement_directory(unwinding, capsys):
+    """A missing pid does not prove the composer's original directory still exists.
+
+    A cleanup can remove that directory after an unverifiable liveness probe and a
+    later creator can claim the same id before composition unwinds. The directory
+    identity captured by the original exclusive claim keeps the replacement whole.
+    """
+
+    def replace_then_abort(project, run_dir, policy, *, profiles=None):
+        # Allocate the replacement while the original still holds its own inode,
+        # then rename it into place. `rmtree` followed by `mkdir` is free to reuse
+        # the inode it just released, and on some filesystems it does — leaving
+        # `os.path.samestat` unable to tell the replacement from the directory the
+        # composer exclusively claimed, so the guard correctly stays silent and the
+        # row fails for a reason it is not testing.
+        stand_in = run_dir.parent / f"{run_dir.name}.replacement"
+        stand_in.mkdir()
+        (stand_in / "replacement").write_text("owned elsewhere", encoding="utf-8")
+        shutil.rmtree(run_dir)
+        stand_in.rename(run_dir)
+        raise SystemExit(BOOM)
+
+    with pytest.raises(SystemExit, match="not usable on this host"):
+        _run_compose_sweep(unwinding.project, replace_then_abort)
+
+    warning = capsys.readouterr().err
+    assert "changed directory ownership" in warning
+    replacement = runs.run_dir_for(unwinding.project, RUN_ID)
+    assert (replacement / "replacement").read_text(encoding="utf-8") == "owned elsewhere"
 
 
 def test_compose_sweep_unwinds_the_run_when_the_adapters_abort(unwinding):
@@ -798,7 +979,14 @@ def test_a_failed_unwind_is_reported_and_does_not_replace_the_launch_error(
     operator is still `make_adapters`', not the cleanup's. A bare `pytest.raises`
     would pass just as happily for a cleanup failure that replaced it."""
 
-    def boom(project, run_dir, *, force=False):
+    def boom(
+        project,
+        run_dir,
+        *,
+        force=False,
+        _expected_composer_pid=None,
+        _expected_composer_claim=None,
+    ):
         raise OSError(13, "Permission denied")
 
     monkeypatch.setattr(runs, "delete_run", boom)
@@ -830,7 +1018,14 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     suppression around the journal write is load-bearing and gets its own test.
     The stderr report must still land, since it is now the only channel left."""
 
-    def boom(project, run_dir, *, force=False):
+    def boom(
+        project,
+        run_dir,
+        *,
+        force=False,
+        _expected_composer_pid=None,
+        _expected_composer_claim=None,
+    ):
         shutil.rmtree(run_dir)
         raise RuntimeError("state dir removal failed")
 

@@ -40,8 +40,11 @@ def make_task(paths, story_key="1-1-a"):
     return task
 
 
-def dev_result(sp):
-    return {"workflow": "auto-dev", "spec_file": str(sp)}
+def dev_result(sp, *, park_asserted: object = False):
+    result = {"workflow": "auto-dev", "spec_file": str(sp)}
+    if park_asserted is not OMIT:
+        result["park_asserted"] = park_asserted
+    return result
 
 
 def _codec_rejects_bad_byte() -> bool:
@@ -247,6 +250,25 @@ def test_path_changed_since_detects_one_tracked_path(project):
     assert verify.path_changed_since(project.project, baseline, "src.txt") is True
 
 
+def test_path_changed_since_treats_tracked_pathspec_magic_literally(project):
+    """A tracked exact-path probe must not interpret brackets as pathspec magic.
+
+    Ablation: remove the `:(literal)` prefix in `_changes_since` and Git reports
+    the modified bracketed path clean, so both assertions fail.
+    """
+    repo = project.project
+    rel = "tracked[1].txt"
+    (repo / rel).write_text("baseline\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "tracked literal path baseline")
+    baseline = verify.rev_parse_head(repo)
+
+    (repo / rel).write_text("changed\n", encoding="utf-8")
+
+    assert verify._changes_since(repo, baseline, literal_path=rel) is True
+    assert verify.path_changed_since(repo, baseline, rel) is True
+
+
 def test_path_changed_since_respects_the_untracked_baseline(project):
     baseline = verify.rev_parse_head(project.project)
     (project.project / "ledger[1].md").write_text("finding\n", encoding="utf-8")
@@ -263,6 +285,30 @@ def test_path_changed_since_respects_the_untracked_baseline(project):
         "ledger[1].md",
         baseline_untracked=["ledger[1].md"],
     )
+
+
+def test_path_changed_since_routes_the_literal_path_through_the_tri_state(project, monkeypatch):
+    """The literal-path public boundary owns only the fail-open collapse; the
+    centralized tri-state probe owns the quiet diff and its literal pathspec.
+
+    Ablation: restore an inline `_git(..., "diff", "--quiet", ...)` body in
+    `path_changed_since` and this fails because `_changes_since` is never called.
+    """
+    seen = {}
+
+    def probe(repo, baseline, exclude=(), **kwargs):
+        seen.update(repo=repo, baseline=baseline, exclude=exclude, kwargs=kwargs)
+        return None
+
+    monkeypatch.setattr(verify, "_changes_since", probe)
+
+    assert verify.path_changed_since(project.project, "baseline", "ledger[1].md") is True
+    assert seen == {
+        "repo": project.project,
+        "baseline": "baseline",
+        "exclude": (),
+        "kwargs": {"literal_path": "ledger[1].md", "baseline_untracked": None},
+    }
 
 
 def test_attempt_dirty_excludes_untracked_artifact(project):
@@ -853,11 +899,9 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     (awaiting-operator, awaiting-operator) either way — so the flag must not reach
     the outcome, and the `True` leg is what would catch a future edit that let it.
 
-    `park_eligible=True` is the engine-side half of the selector the skip now
-    needs: the orchestrator's answer, recorded at dispatch, that this phase could
-    newly ELECT a park rather than inherit one (DW-1). Without it this row fails
-    on proof-of-work — which is exactly what
-    `test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work` asserts.
+    `park_asserted=True` is the current session's independent marker assertion.
+    Without it this row fails on proof-of-work — exactly what the strict-value
+    sibling asserts.
     `park_zero_diff` is the accepted skip's record: the tree really was residue-free,
     and the outcome says so instead of the skip passing silently (DW-6)."""
     task, sp = _residue_free(
@@ -867,10 +911,9 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=review_enabled,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -878,14 +921,14 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     assert out.park_proof_skipped is True and out.park_zero_diff is True
 
 
-@pytest.mark.parametrize("park_eligible", [False, True])
+@pytest.mark.parametrize("park_asserted", [False, True])
 @pytest.mark.parametrize("operator_park", [False, True])
 @pytest.mark.parametrize(
     "status, sprint, review_enabled",
     [("in-review", "review", True), ("done", "done", False)],
 )
 def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
-    project, status, sprint, review_enabled, operator_park, park_eligible
+    project, status, sprint, review_enabled, operator_park, park_asserted
 ):
     """The control for the row above, and the reason that row proves anything: the
     SAME residue-free tree at an ordinary terminal must still be refused. Without
@@ -906,13 +949,9 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     `test_engine.py` that are about harvest, not about park. A run with parking
     enabled but a session that finished ordinarily must still owe a diff.
 
-    `park_eligible` is parametrized for the identical reason, one selector later:
-    the skip is now `parked and park_eligible`, so the engine-side half is the
-    other input that could widen it past the park. Rewriting it as
-    `None if park_eligible` — the dispatch-time expectation alone, ignoring the
-    observed status — is green everywhere without this dimension, and it would let
-    every ordinary session on a story that had never parked skip proof-of-work
-    entirely. Neither half selects the skip on its own.
+    `park_asserted` is parametrized for the identical reason, one selector later:
+    the assertion alone must not widen the waiver past an observed park. Neither
+    half selects the skip on its own.
 
     Ablation: delete the `if extra_exclude is not None and task.baseline_commit:`
     proof-of-work block in `_verify_shared_gates` and all four rows fail on
@@ -923,10 +962,9 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=park_asserted),
         review_enabled=review_enabled,
         operator_park=operator_park,
-        park_eligible=park_eligible,
     )
 
     assert not out.ok and out.retryable
@@ -935,7 +973,12 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     assert out.park_proof_skipped is False and out.park_zero_diff is None
 
 
-def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
+@pytest.mark.parametrize(
+    "park_asserted",
+    [OMIT, False, None, 0, 1, "true"],
+    ids=["missing", "false", "null", "zero", "one", "truthy-string"],
+)
+def test_verify_dev_unasserted_park_with_no_residue_owes_proof_of_work(project, park_asserted):
     """DW-1, and the reason the row above needs its new argument: the skip used to
     be selected entirely by state a fresh session can INHERIT — the policy flag
     plus the spec's own status. A spec an earlier attempt left at
@@ -943,18 +986,12 @@ def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
     nothing at all, so a re-drive over it selected #676's relaxation and verified
     green on someone else's park declaration.
 
-    `park_eligible=False` is the orchestrator saying "the bound spec was ALREADY
-    parked when I dispatched this". The park is not refused for being inherited —
-    it is merely held to proof-of-work like every other terminal, and this tree has
-    none to show. Note the reason: the ordinary proof-of-work message, not a
-    park-specific refusal, because the eligibility flag gates the SKIP and nothing
-    else.
+    Missing, false, null, numeric, and truthy-string assertions are all held to
+    proof-of-work like every other terminal, and this tree has none to show. The
+    ordinary proof-of-work message proves the assertion gates only the waiver.
 
-    This row and `test_verify_dev_park_with_no_code_residue_passes` differ in
-    exactly one argument over byte-identical state, which is what makes either one
-    evidence. Ablation: rewrite the selector as `skip_proof = parked` (drop the
-    `and park_eligible`) and this fails on `assert not out.ok` while its twin stays
-    green — the pre-DW-1 behavior exactly."""
+    Ablation: rewrite the selector as `skip_proof = parked` and every row fails on
+    `assert not out.ok` while the asserted twin stays green."""
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
@@ -962,10 +999,9 @@ def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=park_asserted),
         review_enabled=False,
         operator_park=True,
-        park_eligible=False,
     )
 
     assert not out.ok and out.retryable
@@ -982,8 +1018,8 @@ def test_verify_dev_ineligible_park_with_a_real_diff_still_passes(project):
     on its own and passes — status pair, actions list, workflow tag, baseline match
     and sprint pair all still select on the OBSERVED status exactly as before.
 
-    This is the row that would catch the over-correction: making `park_eligible`
-    select the park's status pair as well (rather than only the skip) turns a
+    This is the row that catches making `park_asserted` select the park's status
+    pair as well (rather than only the skip), which turns a
     legitimate repair-then-park into a status mismatch, and refuses work that was
     actually done. `park_zero_diff` stays None because no skip fired — a passing
     park is not automatically a recorded one."""
@@ -995,7 +1031,6 @@ def test_verify_dev_ineligible_park_with_a_real_diff_still_passes(project):
         dev_result(sp),
         review_enabled=False,
         operator_park=True,
-        park_eligible=False,
     )
 
     assert out.ok
@@ -1018,10 +1053,9 @@ def test_verify_dev_elected_park_with_code_residue_records_a_non_zero_diff(proje
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1064,10 +1098,9 @@ def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monk
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1115,10 +1148,9 @@ def test_verify_dev_park_zero_diff_is_unknown_when_git_refuses_the_probe(project
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1142,6 +1174,27 @@ def test_verify_dev_proof_of_work_gate_still_fails_open_on_a_refused_probe(proje
     spellings apart."""
     task, sp = _residue_free(project, status="done", sprint="done", baseline=OMIT)
     task.baseline_commit = "0" * 40
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert out.ok
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_proof_gate_fails_open_on_untracked_enumeration_fault(project, monkeypatch):
+    """A clean tracked diff followed by a failed untracked enumeration is an
+    unanswerable proof, not an escalation. The ordinary gate keeps its established
+    fail-open policy and accepts the attempt.
+
+    Ablation: delete `_changes_since`'s `except GitError: return None` and this
+    changes from a passing outcome to a raised/escalated Git fault.
+    """
+    task, sp = _residue_free(project, status="done", sprint="done")
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
 
     out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
 
@@ -1181,10 +1234,9 @@ def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(projec
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert out.ok
@@ -1218,10 +1270,9 @@ def test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes(project
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
         engine_written=("ledger.md",),
     )
 
@@ -1248,13 +1299,11 @@ def test_verify_dev_park_still_faces_the_workflow_tag_gate(project):
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
-    rj = {"workflow": "quick-dev", "spec_file": str(sp)}
+    rj = {"workflow": "quick-dev", "spec_file": str(sp), "park_asserted": True}
 
-    # park_eligible=True so the skip really is in place: without it proof-of-work
+    # park_asserted=True so the skip really is in place: without it proof-of-work
     # would also refuse this tree and the row would pass for a compound reason.
-    out = verify.verify_dev(
-        task, project, rj, review_enabled=False, operator_park=True, park_eligible=True
-    )
+    out = verify.verify_dev(task, project, rj, review_enabled=False, operator_park=True)
 
     assert not out.ok and out.retryable
     assert "auto-dev" in out.reason
@@ -1281,16 +1330,15 @@ def test_verify_dev_park_still_faces_the_baseline_match_gate(project):
         baseline="deadbeef" * 5,
     )
 
-    # Same reason as the workflow-tag row above: with park_eligible left False the
+    # Same reason as the workflow-tag row above: with park_asserted left False the
     # tree would also owe proof-of-work, and baseline-match would stop being the
     # only thing that could refuse here.
     out = verify.verify_dev(
         task,
         project,
-        dev_result(sp),
+        dev_result(sp, park_asserted=True),
         review_enabled=False,
         operator_park=True,
-        park_eligible=True,
     )
 
     assert not out.ok and out.retryable
@@ -2181,6 +2229,58 @@ def test_unusable_cwd_yields_one_result_per_command(tmp_path):
     assert "second-check" not in outcome.reason and "third-check" not in outcome.reason
 
 
+def test_embedded_nul_command_is_an_environment_fault_and_later_command_runs(tmp_path):
+    """A pre-spawn ValueError is typed without shortening the result list.
+
+    The valid second command proves the loop continues after rejecting only the
+    first command. Ablation: remove ``ValueError`` from the spawn handler and the
+    raw exception escapes before the second command runs.
+    """
+    invalid = f"{_OK}\x00ignored"
+    policy = Policy(verify=VerifyPolicy(commands=(invalid, _OK)))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    assert [result.command for result in results] == [invalid, _OK]
+    rejected, completed = results
+    assert rejected.returncode == verify.SPAWN_FAULT_RC
+    assert rejected.spawn_error is not None and "ValueError" in rejected.spawn_error
+    assert "ValueError" in rejected.output_tail
+    assert completed.returncode == 0 and completed.spawn_error is None
+    outcome = verify.verify_command_results_outcome(results, tmp_path)
+    assert not outcome.ok and outcome.env_fault
+    assert not outcome.retryable and not outcome.fixable
+
+
+def test_embedded_nul_cwd_yields_one_spawn_fault_per_command(tmp_path):
+    """An invalid cwd rejects every spawn but still yields one typed result each."""
+    cwd = Path(f"{tmp_path}\x00invalid")
+    commands = (_OK, _OK)
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, cwd)
+
+    assert [result.command for result in results] == list(commands)
+    assert all(result.returncode == verify.SPAWN_FAULT_RC for result in results)
+    assert all(result.spawn_error and "ValueError" in result.spawn_error for result in results)
+    outcome = verify.verify_command_results_outcome(results, cwd)
+    assert not outcome.ok and outcome.env_fault
+    assert not outcome.retryable and not outcome.fixable
+
+
+def test_value_error_after_process_creation_remains_fail_loud(tmp_path, monkeypatch):
+    """Only subprocess creation ValueErrors belong to the spawn-fault taxonomy."""
+
+    def broken_result_processing(_text, _max_bytes):
+        raise ValueError("result processing defect")
+
+    monkeypatch.setattr(verify, "byte_tail", broken_result_processing)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    with pytest.raises(ValueError, match="result processing defect"):
+        verify.run_verify_commands(policy, tmp_path)
+
+
 def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch):
     """The handler is `except OSError`, not three named cwd classes — and the
     record must not describe every one of them as a directory problem.
@@ -3066,10 +3166,10 @@ def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
     """T3 regression: a stories-mode story whose entire authorized diff is
     ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)
     must pass proof-of-work, not false-negative "no changes". Guards the file-granular
-    exclude port off #79 — the old whole-folder `artifact_relpaths` exclusion
-    swallowed the ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-
-    changes.md in stories mode (verify_dev_exclude_relpaths excludes only the
-    session's own spec + sprint-status, so sibling ledger content counts)."""
+    exclude port off #79 — the old whole-folder artifact exclusion swallowed the
+    ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-changes.md in stories
+    mode (verify_dev_exclude_relpaths excludes only the session's own spec +
+    sprint-status, so sibling ledger content counts)."""
     spec_folder = project.planning_artifacts / "epic-a"
     task = make_stories_task(project, "1")
     sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
@@ -3118,9 +3218,41 @@ def test_stories_relpaths_is_empty_when_resolution_is_uncertain(project, monkeyp
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
     # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
     # is NO code change — proof-of-work is skipped and the plan spec is recorded.
+    # Post-baseline stories bookkeeping is excluded from the observation too.
     spec_folder = project.planning_artifacts / "epic-a"
     task = make_stories_task(project, "1")
     sp = write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    (spec_folder / "stories.yaml").write_text("stories: []\n", encoding="utf-8")
+    write_story(spec_folder, "2", "sibling", "ready-for-dev", task.baseline_commit)
+    (project.repo_root / "engine-owned.txt").write_text(
+        "orchestrator bookkeeping\n", encoding="utf-8"
+    )
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+        engine_written=("engine-owned.txt",),
+    )
+    assert out.ok  # no code change required for a plan
+    assert task.spec_file == str(sp)
+    assert out.plan_halt_zero_diff is True
+
+
+def test_verify_dev_stories_plan_halt_observes_a_non_zero_diff(project):
+    """The skipped gate is observed even when it would have passed: the marker
+    still authorizes the halt, while the independent observation reports residue.
+
+    Ablation: replace the skipped-proof observation with a constant clean answer
+    and this fails without changing plan-halt acceptance.
+    """
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    (project.repo_root / "src.txt").write_text("changed during planning\n", encoding="utf-8")
+
     out = verify.verify_dev_stories(
         task,
         project,
@@ -3129,8 +3261,39 @@ def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
         review_enabled=False,
         plan_halt=True,
     )
-    assert out.ok  # no code change required for a plan
-    assert task.spec_file == str(sp)
+
+    assert out.ok
+    assert out.plan_halt_zero_diff is False
+
+
+def test_verify_dev_stories_plan_halt_untracked_fault_is_unknown(project, monkeypatch):
+    """A bookkeeping probe fault cannot reject an otherwise valid plan halt; the
+    returned observation is unknown so the engine can journal JSON null.
+
+    Ablation: delete `_changes_since`'s untracked `GitError` normalization and
+    this still passes only if the outer skipped-proof observer catches it; remove
+    that catch as well and the fault escapes. The helper-level sibling pins the
+    normalization itself.
+    """
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+
+    assert out.ok
+    assert out.plan_halt_zero_diff is None
 
 
 def test_verify_dev_stories_plan_halt_rejects_non_plan_status(project):
@@ -3164,6 +3327,7 @@ def test_verify_dev_stories_plan_halt_requires_marker(project):
         plan_halt=True,
     )
     assert not out.ok and "no plan_halt marker" in out.reason
+    assert out.plan_halt_zero_diff is None
 
 
 def test_plan_halt_status_matches_devcontract():
@@ -6136,6 +6300,32 @@ def test_verify_dev_exclude_relpaths_separates_the_two_roots_in_a_monorepo(proje
     assert (paths.repo_root / from_project[0]) != paths.sprint_status
 
 
+def test_verify_dev_exclude_relpaths_roots_restore_patch_on_the_outer_repo(project):
+    """A relative restore latch selects the code-root file, not a nested decoy.
+
+    Both candidates exist so the assertion grades root selection by value; an
+    absence-only assertion would pass if setup simply forgot to create the decoy.
+
+    Ablation: resolve `restore_patch` against `paths.project` instead of `root`
+    and the final equality selects `app/restore.patch`, reddening this row.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project.parent == paths.repo_root
+    outer = paths.repo_root / "restore.patch"
+    decoy = paths.project / "restore.patch"
+    outer.write_text("outer\n", encoding="utf-8")
+    decoy.write_text("nested decoy\n", encoding="utf-8")
+    assert outer.is_file() and decoy.is_file() and outer.resolve() != decoy.resolve()
+    sp = paths.implementation_artifacts / "spec-1-1-a.md"
+
+    relpaths = verify.verify_dev_exclude_relpaths(paths, sp, "restore.patch", root=paths.repo_root)
+
+    restore_rel = relpaths[-1]
+    assert restore_rel == "restore.patch"
+    assert (paths.repo_root / restore_rel).resolve() == outer.resolve()
+    assert (paths.repo_root / restore_rel).resolve() != decoy.resolve()
+
+
 def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
     """Same rule, same shape, for the stories-mode exclude.
 
@@ -6296,48 +6486,6 @@ def test_verify_dev_stories_refuses_bookkeeping_only_changes_under_the_monorepo_
     ).ok
 
 
-def test_artifact_relpaths_returns_in_repo_folders(project):
-    """The orchestrator-owned artifact folders, repo-relative posix."""
-    rels = verify.artifact_relpaths(project)
-    assert "_bmad-output/implementation-artifacts" in rels
-    assert "_bmad-output/planning-artifacts" in rels
-    assert all(r and r != "." for r in rels)
-
-
-def test_artifact_relpaths_drops_dot_when_folder_is_project_root(project):
-    """A folder configured == project root yields "."; it must be dropped so it
-    can't become a whole-tree exclude that disables the proof-of-work gate."""
-    paths = dataclasses.replace(project, output_folder=project.project)
-    rels = verify.artifact_relpaths(paths)
-    assert "." not in rels and "" not in rels
-    # the real sub-dirs are still excluded; only the root-collapsing "." is dropped
-    assert "_bmad-output/implementation-artifacts" in rels
-
-
-def test_has_changes_since_excludes_artifact_only_edit(project):
-    """A change confined to the artifact folders is not proof of dev work."""
-    baseline = verify.rev_parse_head(project.project)
-    # root-level _bmad-output edit (bundle/ledger) + nested impl-artifact edit:
-    # both must be excluded, proving artifact_relpaths covers output_folder too.
-    (project.output_folder / "ledger.json").write_text("bookkeeping\n")
-    (project.implementation_artifacts / "spec-x.md").write_text("bookkeeping\n")
-    assert verify.has_changes_since(project.project, baseline) is True  # unscoped
-    assert (
-        verify.has_changes_since(
-            project.project, baseline, exclude=verify.artifact_relpaths(project)
-        )
-        is False
-    )
-    # a real source edit still counts
-    (project.project / "src.txt").write_text("real\n")
-    assert (
-        verify.has_changes_since(
-            project.project, baseline, exclude=verify.artifact_relpaths(project)
-        )
-        is True
-    )
-
-
 def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(project):
     """The two-function split, at its own layer: `_changes_since` answers the
     tri-state and `has_changes_since` is its fail-open collapse.
@@ -6368,6 +6516,31 @@ def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(
     head = verify.rev_parse_head(project.project)
     assert verify._changes_since(project.project, head) is False
     assert verify.has_changes_since(project.project, head) is False
+
+
+@pytest.mark.parametrize("literal_path", [None, "src.txt"], ids=["whole-tree", "literal-path"])
+def test_changes_since_reports_untracked_enumeration_fault_as_unknown(
+    project, monkeypatch, literal_path
+):
+    """Tracked diff and untracked enumeration are halves of one tri-state answer.
+    Once the clean tracked half succeeds, a `GitError` from the untracked half is
+    unknown too; both public boolean boundaries then fail open to changed.
+
+    Ablation: delete `_changes_since`'s `except GitError: return None` and both
+    rows raise instead of reaching either fail-open boundary.
+    """
+    baseline = verify.rev_parse_head(project.project)
+
+    def boom(_repo):
+        raise verify.GitError("untracked enumeration failed")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
+
+    assert verify._changes_since(project.project, baseline, literal_path=literal_path) is None
+    if literal_path is None:
+        assert verify.has_changes_since(project.project, baseline) is True
+    else:
+        assert verify.path_changed_since(project.project, baseline, literal_path) is True
 
 
 def test_has_changes_since_subtracts_baseline_untracked(project):
@@ -6403,10 +6576,9 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
 
 
 def test_verify_dev_exclude_relpaths_is_file_granular(project):
-    """Unlike artifact_relpaths (whole-folder), this excludes only the
-    sprint-status ledger and the session's own claimed spec file — sibling
-    artifact-folder content (deferred-work.md, other stories' specs) is left
-    un-excluded so it can register as real work."""
+    """Excludes only the sprint-status ledger and the session's own claimed spec
+    file — sibling artifact-folder content (deferred-work.md, other stories' specs)
+    is left un-excluded so it can register as real work."""
     sp = spec_path(project, "1-1-a")
     rels = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
     assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
@@ -6570,6 +6742,25 @@ def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project
     # matching baseline + real work → the gate passes
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("real work\n")
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_accepts_an_optional_baseline_claim_but_still_requires_work(project):
+    """A missing baseline claim is valid, but it does not disable proof-of-work:
+    the orchestrator-owned task baseline remains the measurement authority."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", OMIT)
+    body = sp.read_text()
+    assert "baseline_revision:" not in body and "baseline_commit:" not in body
+
+    no_work = verify.verify_dev(task, project, dev_result(sp))
+    assert not no_work.ok and "no changes in worktree since baseline commit" in no_work.reason
+
+    (project.project / "src.txt").write_text("real work\n")
+    git(project.project, "add", "src.txt")
+    git(project.project, "commit", "-q", "-m", "real work after task baseline")
     assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
@@ -6806,6 +6997,77 @@ def test_commits_above_lists_attempt_commits_newest_first(project):
     head = verify.rev_parse_head(repo)
     commits = verify.commits_above(repo, baseline)
     assert commits == [head]
+
+
+def test_pinned_revision_preservation_does_not_follow_checkout_head(project):
+    """A named story tip, not whichever branch the caller has checked out, is parked."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "story-tip")
+    (repo / "story.txt").write_text("story\n", encoding="utf-8")
+    git(repo, "add", "story.txt")
+    git(repo, "commit", "-q", "-m", "story work")
+    story_tip = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "main")
+    (repo / "main.txt").write_text("main\n", encoding="utf-8")
+    git(repo, "add", "main.txt")
+    git(repo, "commit", "-q", "-m", "main moved")
+    main_tip = verify.rev_parse_head(repo)
+
+    commits = verify.commits_above(repo, baseline, story_tip)
+    ref = verify.preserve_commits(
+        repo,
+        baseline,
+        "attempt-preserve/run-story",
+        commits=commits,
+        revision=story_tip,
+    )
+
+    assert ref == "attempt-preserve/run-story"
+    assert git(repo, "rev-parse", ref) == story_tip
+    assert git(repo, "rev-parse", ref) != main_tip
+
+
+def test_reset_branch_if_tip_refuses_a_concurrent_move(project):
+    """CAS failure leaves the rival tip intact.
+
+    INVERSE ablation: replace ``update-ref <new> <old>`` with an unconditional
+    branch force-update and this test loses ``rival_tip``.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    git(repo, "branch", "story", baseline)
+    git(repo, "checkout", "-q", "story")
+    git(repo, "commit", "--allow-empty", "-q", "-m", "old story tip")
+    old_tip = verify.rev_parse_head(repo)
+    git(repo, "commit", "--allow-empty", "-q", "-m", "rival advances")
+    rival_tip = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "main")
+
+    with pytest.raises(verify.GitError):
+        verify.reset_branch_if_tip(repo, "story", baseline, old_tip)
+
+    assert git(repo, "rev-parse", "story") == rival_tip
+
+
+def test_reset_branch_if_tip_does_not_follow_symbolic_story_ref(project):
+    """A story ref must never redirect its reset onto the branch it names.
+
+    Ablation: remove ``--no-deref`` and update-ref resets ``main`` through the
+    symbolic story ref instead of replacing the named ref itself.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    (repo / "advance-symbolic-main.txt").write_text("main stays here\n", encoding="utf-8")
+    git(repo, "add", "advance-symbolic-main.txt")
+    git(repo, "commit", "-q", "-m", "advance main before symbolic reset")
+    main_tip = verify.rev_parse_head(repo)
+    git(repo, "symbolic-ref", "refs/heads/story", "refs/heads/main")
+
+    verify.reset_branch_if_tip(repo, "story", baseline, main_tip)
+
+    assert verify.rev_parse_head(repo) == main_tip
+    assert git(repo, "rev-parse", "refs/heads/story") == baseline
 
 
 def test_preserve_commits_survives_reset_and_gc(project):
@@ -7348,13 +7610,7 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         parameter = inspect.signature(fn).parameters["engine_written"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert "operator_park" in inspect.signature(verify.verify_dev).parameters
-    # The park skip's second selector (DW-1). Keyword-only for the same reason
-    # `engine_written` is: `verify_dev`'s positional tail is `review_enabled`, and
-    # a positional eligibility flag would be one transposed argument away from
-    # silently authorizing the skip on every leg.
-    park_eligible = inspect.signature(verify.verify_dev).parameters["park_eligible"]
-    assert park_eligible.kind is inspect.Parameter.KEYWORD_ONLY
-    assert park_eligible.default is False
+    assert "park_eligible" not in inspect.signature(verify.verify_dev).parameters
 
 
 # --------------------------------------------------- the git support floor (GIT_FLOOR)

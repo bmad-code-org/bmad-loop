@@ -70,9 +70,14 @@ from .documents import (
     validate_document,
 )
 from .engine import Engine
-from .journal import Journal, load_state, save_state
+from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
-from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
+from .platform_util import (
+    MAX_SEGMENT,
+    LockUnavailableError,
+    resolve_or_lexical,
+    walk_files_unlinked,
+)
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -277,15 +282,22 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
     1 to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the three :class:`~engine.Engine` construction sites that return an
-    rc to a human: `cmd_run`, `cmd_sweep`, and `_resume_paused_run` — the shared
-    helper behind both `resume` and `resolve`'s re-arm. The fourth such site, the
-    auto-triggered child sweep in `_sweep_factory`, shares the refusal but not this
-    disposition: it has no rc channel, so it raises (see the comment there).
-    Keyed on Engine construction rather than on "loads policy.toml", which is a
-    wider set that does not all provision — `_configure_mux` reads the file on
-    every command and builds nothing; `cmd_validate` and `cmd_clean` load it and
-    never mount a worktree.
+    Called from the four sites that return an rc to a human: `cmd_run`, `cmd_sweep`,
+    `_resume_paused_run` — the shared helper behind both `resume` and `resolve`'s
+    re-arm — and `cmd_resolve`, which calls it TWICE: once before the interactive
+    session and once after the config re-read that authorises the re-arm. A fifth
+    site, the auto-triggered child sweep in `_sweep_factory`, shares the refusal but
+    not this disposition: it has no rc channel, so it raises (see the comment there).
+
+    Keyed on provisioning-or-arming a run against the config, NOT on Engine
+    construction: `cmd_resolve` constructs no Engine and delegates to
+    `_resume_paused_run` for that, but `runs.rearm_escalation` mutates persisted run
+    state — advancing the attempt baseline and re-stamping the spec — against the
+    same `repo_root` this refuses, and it does so BEFORE the delegate is reached. A
+    refusal keyed on Engine construction alone therefore arrives after the damage.
+    Both keyings exclude the same wider "loads policy.toml" set, which does not all
+    provision — `_configure_mux` reads the file on every command and builds nothing;
+    `cmd_validate` and `cmd_clean` load it and never mount a worktree.
 
     `validate` deliberately does not call this — it reports rather than aborts, so
     it renders the same message as a Finding and keeps running its other gates."""
@@ -300,8 +312,8 @@ def _reject_under_floor_git(project: Path) -> int | None:
     """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
     `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the same four Engine-construction sites as
-    `_reject_isolation_conflict`, with the same split of dispositions: an rc to a
+    Called from the four Engine-construction sites, with the same split of
+    dispositions as `_reject_isolation_conflict`: an rc to a
     human from `cmd_run`, `cmd_sweep` and `_resume_paused_run`, and a raise from the
     auto-triggered child sweep in `_sweep_factory`, which has no rc channel.
 
@@ -2554,9 +2566,8 @@ def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
     return 0
 
 
-def _resume_paused_run(project: Path, run_dir: Path) -> int:
-    """Resume the engine for a paused/interrupted run. Shared by `resume` and
-    the re-arm step of `resolve`."""
+def _prepare_resume_locked(project: Path, run_dir: Path):
+    """Publish resume state while the caller holds this run's state lock."""
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -2703,7 +2714,17 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # The `bool(state.repo_root)` guard is what keeps a legacy state.json — written
     # before the field existed, and read back as "" — out of the comparison: it is a
     # missing value, not a divergent one, and the re-stamp migrates it silently.
-    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
+    #
+    # The `code_root_restamp_pending` half is a move `runs.restamp_code_root` already
+    # persisted whose `rearm-code-root-restamped` record never landed: the mirror then
+    # already agrees with config, so the compare alone would read "no move" on the one
+    # gesture that still owes the operator its record and its warning. This resume
+    # CONSUMES that outstanding re-stamp — the retry the marker keeps possible may
+    # arrive through plain `resume` rather than through `resolve`, and a run that
+    # finishes from here would otherwise leave the move unrecorded for good.
+    code_root_changed = (
+        bool(state.repo_root) and state.repo_root != str(paths.repo_root)
+    ) or state.code_root_restamp_pending
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
@@ -2793,6 +2814,10 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
     # migrates a pre-field state.json onto the root it was already using.
     state.repo_root = str(paths.repo_root)
+    # The `run-resume` record above IS the record an outstanding re-stamp owed, so the
+    # marker clears on the same write that persists the resume — never a separate
+    # one, which could land without it and leave the run owing a record it has.
+    state.code_root_restamp_pending = False
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -2806,6 +2831,36 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
+    return paths, state, pol, journal, new_digest, profiles
+
+
+def _resume_paused_run(project: Path, run_dir: Path) -> int:
+    """Resume a paused/interrupted run without holding its lock across execution."""
+    with state_lock(run_dir):
+        # Cleanup removes the run under this same hold. A resume that resolved the
+        # path before cleanup won must not let Journal/save_state recreate it after
+        # its wait ends.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
+        # Repeat the command's liveness decision after exclusion.  A concurrent
+        # resume publishes its pid under this same hold, so the waiter refuses
+        # instead of reloading the predecessor's old paused state and double-driving.
+        if runs.engine_liveness(run_dir) == "alive":
+            print(
+                f"run {run_dir.name} is still live — resuming would double-drive it; "
+                "stop it first",
+                file=sys.stderr,
+            )
+            return 1
+        prepared = _prepare_resume_locked(project, run_dir)
+    if isinstance(prepared, int):
+        return prepared
+    paths, state, pol, journal, new_digest, profiles = prepared
+
+    # Adapter construction and the engine lifetime are deliberately outside the
+    # state hold.  The pid/state publication above makes a rival control command
+    # observe this process as live while these unbounded operations proceed.
     composed = runsetup.compose_resume(
         project=project,
         paths=paths,
@@ -2964,7 +3019,7 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
+def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> None:
     """Surface the events a just-completed re-arm journaled: the residue of the restore
     attempt it abandoned — the `stale-restore-*` records AND `rearm-commits-probe-failed`,
     all written by `runs._stale_restore_residue` — and the `rearm-*` records the status
@@ -2993,33 +3048,30 @@ def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bo
     the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
     relocate.
 
-    Returns True when one of those records HOLDS the resume
-    (`runs.rearm_holds_the_resume`): the caller re-arms and resumes in a single gesture,
-    and a record proving the re-drive cannot route has to break that gesture, or its own
-    "before resuming" imperative is already unactionable the moment it prints. The
-    question is asked here because this is the one walk over the entries the re-arm
-    added, and the answer has to survive the `finally` it is computed in."""
+    This is abort-only diagnostic recovery: a raised call has no authoritative outcome,
+    so the journal is the only place to recover records that were appended before the
+    abort. It deliberately does not infer a resume hold for a call that did not succeed."""
     after = runs.journal_entries_or_none(run_dir)
     if before is None or after is None:
         # Either end of the diff is unreadable, so there is no trustworthy "new since
         # the re-arm" window. Skip rather than guess: this runs from a `finally`, and a
         # raise here would replace the `RearmError` the operator needs, while treating a
         # failed read as "no entries seen" would replay the whole journal as new. The
-        # hold degrades with the echo, for the same reason: an unproven hold is a guess,
-        # and this is what the gesture did before either existed.
-        return False
-    holds = False
+        return
     for entry in after[len(before) :]:
-        # asked of every entry, BEFORE the routing table can drop it — a `None` notice
-        # means "nothing to print here", never "nothing to decide here"
-        holds = runs.rearm_holds_the_resume(entry) or holds
         notice = runs.rearm_event_notice(entry)
         if notice is None:
             continue
         severity, message, next_step = notice
         tail = f"; {next_step}" if next_step else ""
         print(f"{severity}: {message}{tail}", file=sys.stderr)
-    return holds
+
+
+def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
+    """Render a successful re-arm's authoritative notices in append order."""
+    for notice in notices:
+        tail = f"; {notice.next_step}" if notice.next_step else ""
+        print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -3114,11 +3166,58 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # gesture.
     resolution_recorded = False
     if args.interactive:
+        # The interactive session uses the CURRENT CLI project as cwd. Its code root
+        # must come from the CURRENT config too: both can have moved since state.json
+        # was written. This is best-effort observation only; the mandatory config
+        # re-read after the human conversation remains the authority for re-arm.
+        #
+        # Read BEFORE `_make_adapters` so the refusal below can precede it. Ordering
+        # only, no new failure mode: `load_paths` is a read, and the arm that cannot
+        # read degrades exactly as it did when it sat lower.
+        try:
+            pre_session_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pre_session_code_root = state.code_root
+        else:
+            pre_session_code_root = pre_session_paths.repo_root
+            # Refuse the unsupported config BEFORE the interactive session, not only
+            # after it. Both inputs are already in hand here — `pol` was loaded at the
+            # top of this function and is being read for `isolation` two calls below —
+            # so the late refusal alone let an operator build adapters, converse with a
+            # full agent session and answer the re-arm prompt, only to be handed rc 1
+            # for a configuration knowable before any of it. `cmd_run` and `cmd_sweep`
+            # refuse the same config before provisioning anything; this restores the
+            # parity, and honours the rule the restore latch states one screen down
+            # ("validate before the interactive resolve session, not after a whole
+            # agent conversation the abort would throw away"). Ahead of the adapter
+            # build for the same reason `cmd_run` puts it ahead of the queue and
+            # worktree-clean gates: this one says the configuration cannot run at all,
+            # so an adapter fault reported first would send the operator at the wrong
+            # problem — and would be refused again anyway.
+            #
+            # It does NOT replace the refusal after the confirm: that one re-reads the
+            # config, which is the authority for the re-arm and is the only check the
+            # `--no-interactive` path reaches. This is a strictly earlier exit on the
+            # same predicate, so an operator who declines still gets no config lecture.
+            if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
+                return rc
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
         _ctx_path, withheld, unreadable = resolve.build_context(
-            state, run_dir, story_key, isolation=pol.scm.isolation
+            state,
+            run_dir,
+            story_key,
+            isolation=pol.scm.isolation,
+            project_root=project,
+            code_root=pre_session_code_root,
         )
+        if pre_session_code_root != project:
+            print(
+                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                "code fixes and commits belong in the run's code root at "
+                f"{pre_session_code_root.as_posix()!r}",
+                file=sys.stderr,
+            )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -3236,6 +3335,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     try:
         paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError) as e:
+        paths = None
         # An observation, so it degrades: without the config this process cannot NAME
         # the tree, and re-pointing the mirror at a guess is the one outcome worse than
         # leaving it alone. The re-arm then reads the root the run recorded — precisely
@@ -3248,6 +3348,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
+        if args.interactive and paths.repo_root != pre_session_code_root:
+            print(
+                "error: the code root changed during the resolve session from "
+                f"{pre_session_code_root.as_posix()!r} to {paths.repo_root.as_posix()!r}; "
+                "the agent's guidance no longer names the tree the re-drive would use. "
+                "No re-arm was performed; reconcile the code change, then run resolve again.",
+                file=sys.stderr,
+            )
+            return 1
         # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
         # below — because aiming the mirror at the tree config.yaml names is only
         # correct for a configuration the orchestrator will actually run, and this is
@@ -3274,18 +3383,59 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
             return rc
-        if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
-            print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
-    hold_resume = False
+    outcome: runs.RearmOutcome | None = None
     try:
-        runs.rearm_escalation(
-            run_dir,
-            story_key,
-            restore_patch=restore_patch,
-            isolated_redrive=pol.scm.isolation == "worktree",
-            resolution_recorded=resolution_recorded,
-        )
+        with state_lock(run_dir):
+            # The pre-session checks intentionally stay lock-free; this is the
+            # mutation boundary, so repeat every state/liveness precondition from
+            # the snapshot left by the preceding writer before restamping anything.
+            fresh_state = load_state(run_dir)
+            if fresh_state.paused_stage != PAUSE_ESCALATION:
+                print(
+                    f"run {args.run_id} is not paused at an escalation "
+                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-arm. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
+            if paths is not None:
+                if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                    print(f"warning: {moved}", file=sys.stderr)
+            outcome = runs.rearm_escalation(
+                run_dir,
+                story_key,
+                restore_patch=restore_patch,
+                isolated_redrive=pol.scm.isolation == "worktree",
+                resolution_recorded=resolution_recorded,
+                # The tree this invocation is acting in, which is also the tree
+                # `build_context` published a `spec_file` from. `state.project` is where the
+                # run was LAUNCHED and nothing re-stamps it, so a moved project would have
+                # the agent edit one file and the re-arm flip another.
+                project_root=project,
+            )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -3297,7 +3447,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # `rearm-commits-probe-failed` when it could not), whose whole point is that
         # nothing else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
-        hold_resume = _echo_rearm_events(run_dir, before_entries)
+        if outcome is None:
+            _echo_rearm_events(run_dir, before_entries)
+    assert outcome is not None
+    _echo_rearm_notices(outcome.notices)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")
@@ -3305,7 +3458,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
-    if hold_resume:
+    if outcome.hold_resume:
         # The re-arm SUCCEEDED — the task is armed and persisted — so this is a 0, and it
         # stops the GESTURE, not the run. `--resume` does not override it: that flag
         # skips the confirmation prompt, while the hold is not a question but a proof
@@ -4003,6 +4156,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -4023,6 +4179,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         return rc
     try:
         dest = runs.archive_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -4207,7 +4366,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
     archive/delete runs past the retention window. Only terminal (finished or
     stopped) runs are touched; running, unknown-host, paused and interrupted
-    runs are always left intact."""
+    runs are always left intact.
+
+    Every per-candidate refusal is DATA, never an abort: this is a sweep, so one
+    busy run must not cost the operator the report of the runs already reclaimed
+    around it (they only reach stdout in the post-loop emission). That is why the
+    removals here take the run's state lock with ``wait_for_lock=False`` — a lock
+    someone else holds already means what this command reports anyway, and
+    waiting for it is unbounded on POSIX, where ``fcntl.flock`` never times
+    out."""
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     repo = paths.repo_root
@@ -4287,21 +4454,28 @@ def cmd_clean(args: argparse.Namespace) -> int:
             try:
                 if args.hard or not pol.cleanup.archive_old:
                     if not dry:
-                        runs.delete_run(project, run_dir)
+                        runs.delete_run(project, run_dir, wait_for_lock=False)
                     deleted.append(run_dir.name)
                 else:
                     if not dry:
-                        runs.archive_run(project, run_dir)
+                        runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except runs.LiveSessionError:
-                # A session appeared between the loop-top guard and here — a resume
-                # of a stopped run, racing this clean. The chokepoint refused the
-                # removal; record the run instead of letting one racing run abort
-                # the whole invocation. Correct the estimate down to what actually
-                # went. The wider race — every mutation in this loop against a
-                # concurrent resume — is older than this guard (`reclaimable` is
-                # sampled in the loop above and never re-read) and is tracked in
-                # issue #533.
+            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
+                # A session or engine appeared between the loop-top sample and the
+                # authoritative removal transaction — or the run's state lock is
+                # held, which says the same thing one layer down and is the only
+                # one of the three that reports it in this window: `resume` takes
+                # the lock FIRST and publishes its pid LAST, so for its whole
+                # preflight (git work bounded by `[limits] git_timeout_s`) the
+                # pid/session guards above still read dead and only the lock
+                # objects. Record this run instead of letting one racer abort the
+                # whole invocation, then continue with its siblings. Correct the
+                # estimate down to what actually went.
+                #
+                # `LockUnavailableError` and NOT a bare `except OSError`: that
+                # would also catch `platform_util.UnconfinedWriteError`, an
+                # OSError subclass raised when a write escapes its root, and file
+                # a containment refusal as a benign "left untouched".
                 freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
@@ -4310,8 +4484,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # trimmed, which is exactly the state it ends in.
                 (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
                 if not args.json:
+                    if isinstance(e, runs.LiveSessionError):
+                        reason = "agent session appeared mid-clean"
+                    elif isinstance(e, LockUnavailableError):
+                        reason = "run state locked by another process"
+                    else:
+                        reason = "engine resumed mid-clean"
                     print(
-                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        f"run {run_dir.name}: {reason} — not removed",
                         file=sys.stderr,
                     )
         elif pol.cleanup.trim_artifacts:

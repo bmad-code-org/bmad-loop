@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    assert_run_state_lock_held,
     git,
     install_bmad_config,
     make_validate_document,
@@ -41,6 +42,7 @@ from textual.widgets import (
 
 from bmad_loop import bmadconfig, documents
 from bmad_loop import policy as policy_mod
+from bmad_loop import runs as runs_mod
 from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.journal import Journal, save_state
@@ -88,6 +90,36 @@ from bmad_loop.tui.widgets import (
     story_checkpoint_cell,
     story_state_cell,
 )
+
+
+def _rearm_outcome(key: str, *entries: dict) -> runs_mod.RearmOutcome:
+    notices = tuple(
+        runs_mod.RearmNotice(*notice)
+        for entry in entries
+        if (notice := runs_mod.rearm_event_notice(entry)) is not None
+    )
+    # Mirrors `runs._RearmJournal.append`, first-wins included: the surface under test
+    # renders the held record's own `next_step`, so a helper that dropped it would let
+    # the hold toast pass on a step no record produced.
+    held = next(
+        (
+            notice
+            for entry in entries
+            if runs_mod.rearm_holds_the_resume(entry)
+            and (notice := runs_mod.rearm_event_notice(entry)) is not None
+        ),
+        None,
+    )
+    return runs_mod.RearmOutcome(
+        key,
+        notices,
+        any(runs_mod.rearm_holds_the_resume(entry) for entry in entries),
+        held[2] if held is not None else "",
+    )
+
+
+def _journal_rearm_outcome(run_dir: Path, key: str) -> runs_mod.RearmOutcome:
+    return _rearm_outcome(key, *Journal(run_dir).entries())
 
 
 def make_run(
@@ -3480,7 +3512,11 @@ def _stories_paused_run(
     if blocked_result:
         body += f"\n## Auto Run Result\n\n- Status: blocked\n\n{blocked_result}\n"
     spec.write_text(body, encoding="utf-8")
-    task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
+    task = StoryTask(
+        story_key=story_key,
+        epic=0,
+        phase=Phase.ESCALATED if stage == "escalation" else Phase.DEV_VERIFY,
+    )
     task.spec_file = str(spec)
     if worktree_path:
         task.worktree_path = worktree_path
@@ -3561,6 +3597,131 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
         assert strips == [(spec, project.project)]
 
 
+async def test_plan_checkpoint_replan_restores_preimage_when_result_strip_fails(
+    project, monkeypatch
+):
+    """The reset and result strip are one TUI transaction, including confinement.
+
+    The real status reset commits first; the injected second-stage fault then forces
+    the helper to restore the byte-for-byte preimage. Using an isolated worktree also
+    pins that both the forward status write and rollback carry the caller's owning
+    root into the confined atomic writer.
+
+    Ablation: delete the rollback write in ``reset_spec_for_replan`` and this reddens
+    on byte identity because the spec remains at ``status: draft``.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_atomic_write = devcontract._atomic_write_spec
+
+    writes = 0
+
+    def fail_second_atomic_write(p, text, **kw):
+        nonlocal writes
+        writes += 1
+        roots.append(kw["confine_root"])
+        if writes == 2:
+            raise OSError("injected result-strip write failure")
+        return real_atomic_write(p, text, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "_atomic_write_spec", fail_second_atomic_write)
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
+    )
+    original = (
+        b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n# worktree plan for 1\r\n"
+        b"\r\n## Auto Run Result\r\n\r\n- Status: blocked\r\n\r\nstale terminal result\r\n"
+    )
+    spec.write_bytes(original)
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("injected result-strip write failure" in m for m in notifications(app)),
+        )
+        assert app.is_running
+    assert spec.read_bytes() == original
+    assert calls == []
+    assert roots == [wt, wt, wt]
+
+
+async def test_plan_checkpoint_replan_does_not_strip_when_reset_refuses(project, monkeypatch):
+    """An unchanged reset must not independently commit the result-strip half."""
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        spec_status="draft",
+        blocked_result="stale terminal result",
+    )
+    original = spec.read_bytes()
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("could not reset" in m for m in notifications(app)))
+    assert spec.read_bytes() == original
+    assert calls == []
+
+
+async def test_plan_checkpoint_replan_rollback_failure_stays_loud(project, monkeypatch):
+    """A failed undo escapes to the TUI error path and still cannot resume."""
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    writes = 0
+    real_atomic_write = devcontract._atomic_write_spec
+
+    def fail_rollback(p, text, **kw):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("injected rollback failure")
+        return real_atomic_write(p, text, **kw)
+
+    def fail_strip(p, **kw):
+        raise OSError("injected result-strip failure")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "_atomic_write_spec", fail_rollback)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", fail_strip)
+    _run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        blocked_result="stale terminal result",
+    )
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("injected rollback failure" in m for m in notifications(app)),
+        )
+        assert app.is_running
+    assert calls == []
+
+
 def _unit_worktree(root: Path, run_id: str = "20260611-100000-aaaa", unit: str = "1") -> Path:
     """The UNRESOLVED spelling of where `workspace.open_unit_workspace` mounts a unit.
 
@@ -3625,7 +3786,10 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
     wt = _unit_worktree(project.project)
     _run_dir, spec = _stories_paused_run(
-        project.project, stage="plan-checkpoint", worktree_path=str(wt)
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(wt),
+        blocked_result="stale terminal result",
     )
     twin = project.project / spec.relative_to(wt)
     untouched = twin.read_bytes()
@@ -3637,6 +3801,7 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
     assert verify.read_frontmatter(spec)["status"] == "draft"
+    assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     assert twin.read_bytes() == untouched
     assert roots == [wt, wt]
 
@@ -3907,22 +4072,23 @@ async def test_sentinel_indicator_reads_the_worktree_under_isolation(project, mo
         assert "pre-planning-halt sentinel" in shown
 
 
-def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
+def test_paused_spec_root_without_a_task_answers_the_live_project(tmp_path):
     """Both arms of `_paused_spec_root` make ONE claim about the project.
 
-    The delegate (`runs.task_spec_root`) answers from `state.project` — the string the
-    run persisted at launch — while `self.project` is the constructor's
-    `resolve_or_lexical` of whatever path the operator opened the dashboard with. The
-    two can differ, so a no-task arm returning `self.project` left a second claim lying
-    around for a future caller to trip on.
+    The delegate (`runs.live_spec_root`) carries the recorded anchor onto the tree
+    the dashboard was opened against — `self.project`, the same mapping `_do_rearm`
+    hands `rearm_escalation` — while `state.project` is the string the run persisted
+    at launch. The two differ after a project move, so a no-task arm answering
+    `state.project` raw was a second claim for a future caller to trip on: a confine
+    root naming the OLD tree for a path `_paused_spec` now anchors on the new one.
 
     Graded directly because the arm is unreachable from the write path today:
     `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path` before calling
     `_do_replan`, and `_paused_spec` returns `None` exactly when there is no task. An
     end-to-end row could not reach it, so this calls the method.
 
-    Ablation: return `self.project` from the no-task arm and this reddens — the two
-    directories are deliberately different here.
+    Ablation: return `Path(state.project)` from the no-task arm and this reddens —
+    the two directories are deliberately different here.
     """
     app = BmadLoopApp(tmp_path / "opened-here")
     state = RunState(
@@ -3931,8 +4097,100 @@ def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
         started_at="2026-06-11T10:00:00",
     )
     assert state.paused_story_key is None  # the no-task arm
-    assert app._paused_spec_root(state) == tmp_path / "persisted-at-launch"
-    assert app._paused_spec_root(state) != app.project
+    assert app._paused_spec_root(state) == app.project
+    assert app._paused_spec_root(state) != tmp_path / "persisted-at-launch"
+
+
+def test_paused_spec_follows_a_moved_project_to_the_tree_the_rearm_writes(tmp_path):
+    """The escalation modal's READ anchor and `_do_rearm`'s WRITE anchor name one
+    file. `_do_rearm` hands `rearm_escalation` `project_root=self.project`, so after a
+    project move the re-arm flips the copy under the live tree; anchored on the
+    recorded `state.project` alone, the modal showed the OLD tree's copy — unreadable
+    once that tree is gone, which disabled the very re-arm the live mapping exists
+    for, and when both exist the operator reviewed one spec and re-armed another.
+
+    The old tree is absent here on purpose: an anchor that did not move reads as
+    "could not be read", so the row cannot pass by finding a stale twin.
+
+    Ablations: revert `_paused_spec` to `runs.task_spec_path` and this reddens on
+    `readable`; revert `_paused_spec_root` to `runs.task_spec_root` and it reddens on
+    the confine root, which must be the live tree the path sits under."""
+    recorded = tmp_path / "project-before-rename"
+    live = tmp_path / "project-after-rename"
+    rel = Path("_bmad-output") / "implementation-artifacts" / "spec-1-1-a.md"
+    (live / rel).parent.mkdir(parents=True)
+    (live / rel).write_text(
+        "---\nstatus: escalated\n---\n\n# Story\n", encoding="utf-8", newline="\n"
+    )
+    assert not recorded.exists()  # the tree the run recorded is gone
+    app = BmadLoopApp(live)
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(recorded),
+        started_at="2026-06-11T10:00:00",
+        paused_story_key="1-1-a",
+    )
+    state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded / rel))
+
+    spec_path, spec_text, readable = app._paused_spec(state)
+
+    assert readable is True
+    assert spec_path == live / rel
+    assert spec_text.startswith("---\nstatus: escalated")
+    assert app._paused_spec_root(state) == live
+
+
+def test_story_context_and_sentinel_follow_a_moved_project_to_the_tree_the_rearm_writes(
+    tmp_path,
+):
+    """The modal's OTHER two readers move with `_paused_spec`. `_story_context` and
+    `_sentinel_kind` located the stories folder from `runs.task_stories_root`, whose
+    no-mount arm is the recorded `state.project`, while `_do_rearm` clears the sentinel
+    under the live tree (`rearm_escalation(..., project_root=self.project)`). After a
+    project move the modal showed the spec from the live tree beside a title,
+    description and sentinel indicator from the old one — omitted once that tree was
+    gone, stale while it lingered.
+
+    The old tree is absent here on purpose: an anchor that did not move finds no
+    manifest and no sentinel, so the row cannot pass on a stale twin.
+
+    Ablations: revert `_story_context` to `runs.task_stories_root(...)` and this
+    reddens on the title (`('', '') == ('Story 1', 'does a thing')`); revert
+    `_sentinel_kind` the same way and it reddens on the kind (`'' == 'unresolved'`)."""
+    import yaml
+
+    from bmad_loop import stories
+
+    recorded = tmp_path / "project-before-rename"
+    live = tmp_path / "project-after-rename"
+    folder = live / "epic-1"
+    (folder / "stories").mkdir(parents=True)
+    (folder / "stories.yaml").write_text(
+        yaml.safe_dump(
+            [{"id": "1", "title": "Story 1", "description": "does a thing"}], sort_keys=False
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    spec = folder / "stories" / "1-unresolved.md"
+    spec.write_text("---\nstatus: escalated\n---\n", encoding="utf-8", newline="\n")
+    assert stories.resolve_story_spec(folder, "1").kind == stories.KIND_SENTINEL
+    assert not recorded.exists()  # the tree the run recorded is gone
+    app = BmadLoopApp(live)
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(recorded),
+        started_at="2026-06-11T10:00:00",
+        source="stories",
+        spec_folder="epic-1",
+        paused_story_key="1",
+    )
+    state.tasks["1"] = StoryTask(
+        story_key="1", epic=0, spec_file=str(recorded / "epic-1" / "stories" / "1-unresolved.md")
+    )
+
+    assert app._story_context(state, "1") == ("Story 1", "does a thing")
+    assert app._sentinel_kind(state, "1") == "unresolved"
 
 
 async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):
@@ -4207,6 +4465,54 @@ async def test_archive_live_run_refused_without_calling(project, monkeypatch):
         await until(pilot, lambda: any("is live — stop it first" in m for m in notifications(app)))
         assert archived == []
         assert not isinstance(app.screen, ConfirmModal)
+
+
+@pytest.mark.parametrize(
+    "key, helper, failure, expected",
+    [
+        ("D", "delete_run", runs_mod.LiveEngineError("engine resumed"), "delete failed"),
+        (
+            "D",
+            "delete_run",
+            runs_mod.StateRootError("no usable state root"),
+            "delete failed",
+        ),
+        ("A", "archive_run", runs_mod.LiveEngineError("engine resumed"), "archive failed"),
+        (
+            "A",
+            "archive_run",
+            runs_mod.StateRootError("no usable state root"),
+            "archive failed",
+        ),
+    ],
+)
+async def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
+    project, monkeypatch, key, helper, failure, expected
+):
+    """The modal's liveness sample is advisory. A later lifecycle or state-lock
+    refusal is toasted from the worker, and the dashboard forget happens only on
+    success.
+
+    Ablation: omit either new exception type from the worker catch and the worker
+    dies without the expected notification. Verified.
+    """
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "dead")
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(runs_mod, helper, fail)
+    run_dir = make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press(key)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(expected in note for note in notifications(app)))
+        assert dashboard(app).selected_run_id == run_dir.name
+
+    assert run_dir.is_dir()
 
 
 # ------------------------------------------------------------ graceful stop (S)
@@ -4556,7 +4862,7 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
     monkeypatch.setattr(
         runs,
         "rearm_escalation",
-        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -4649,9 +4955,15 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project,
     recorded `task.worktree_path` describes only the attempt that already ran. This
     gesture re-arms BEFORE it resumes, so nothing downstream can supply the value later.
 
+    The LIVE PROJECT rides the same argument list and for the same reason: nothing
+    re-stamps `state.project`, so a re-arm left to the recorded value writes the spec
+    into the tree this dashboard is no longer looking at. `self.project` rather than
+    `paths.project`, because the `load_paths` arm above may degrade without binding
+    `paths` at all.
+
     Ablation: pass a literal `isolated_redrive=False` at the call site and this reddens
     — the modes stop tracking policy.toml and every isolated run gets the in-place
-    answers.
+    answers. Drop `project_root=self.project` and it reddens on the second list.
     """
     from bmad_loop import resolve, runs
 
@@ -4659,15 +4971,17 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project,
     bmad.mkdir(parents=True, exist_ok=True)
     (bmad / "policy.toml").write_text('[scm]\nisolation = "worktree"\n', encoding="utf-8")
     seen: list[bool] = []
+    roots: list[object] = []
+
+    def fake_rearm(rd, sk, *, isolated_redrive, resolution_recorded, project_root=None):
+        seen.append(isolated_redrive)
+        roots.append(project_root)
+        return _rearm_outcome(sk)
+
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
-    monkeypatch.setattr(
-        runs,
-        "rearm_escalation",
-        lambda rd, sk, *, isolated_redrive, resolution_recorded: seen.append(isolated_redrive)
-        or "ready-for-dev",
-    )
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     run_dir, _spec = _stories_paused_run(
         project.project,
         stage="escalation",
@@ -4683,6 +4997,7 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project,
         await _open_review(app, pilot, EscalationModal)
         await pilot.click(await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: seen == [True])
+    assert roots == [project.project]  # the live tree, not the recorded one
 
     # ...and the other mode is not a constant: the same gesture on `none` says so
     (bmad / "policy.toml").write_text('[scm]\nisolation = "none"\n', encoding="utf-8")
@@ -4725,7 +5040,7 @@ async def test_escalation_rearm_refuses_when_the_policy_cannot_be_read(project, 
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev"
+        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk)
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -4786,7 +5101,7 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     monkeypatch.setattr(
         runs,
         "rearm_escalation",
-        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -4836,7 +5151,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         Journal(rd).append(
             "rearm-baseline-advance-failed",
             story_key=sk,
@@ -4844,7 +5159,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
             baseline="a" * 40,
             error="GitError: not a git repository",
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -4896,9 +5211,9 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     seen: list = []
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         seen.append(load_state(rd).code_root)
-        return "ready-for-dev"
+        return _rearm_outcome(sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -4935,6 +5250,403 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
 
     assert seen == [moved.resolve()]
     assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+
+
+def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypatch):
+    """Ablation: delete _do_rearm's second liveness check and the TUI re-arms after
+    a rival resume published its pid while this gesture waited for the state lock."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260611-100000-aaaa"
+    checks: list[str] = []
+
+    def liveness_gate(_self, _run_id, _run_dir):
+        checks.append("checked")
+        return len(checks) == 2
+
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", liveness_gate)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("double re-armed"))
+
+    BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+
+    assert checks == ["checked", "checked"]
+
+
+def test_escalation_rearm_declines_a_run_whose_state_lock_is_held(project, monkeypatch):
+    """A contended run is REFUSED with a toast, not queued behind its holder.
+
+    `_do_rearm` runs ON Textual's message loop: it carries no `@work`, and its only
+    caller is the synchronous `push_screen` dismiss callback, so the acquisition
+    happens inline and the whole dashboard freezes for however long the holder keeps
+    the lock — unbounded on POSIX, where `fcntl.flock` never times out. The realistic
+    holder is a rival `resume`, which takes the lock FIRST and publishes its pid LAST,
+    so the modal's `_engine_possibly_live` gate reads dead for that entire window (the
+    same window `cmd_clean` documents) and does not head the freeze off.
+
+    The contention is real — the run's own canonical sidecar — and taken through
+    `platform_util.file_lock` rather than `journal.state_lock` for the reason
+    test_cleanup states: `state_lock`'s reentrancy guard is thread-local, so acquiring
+    it here would let `_do_rearm` RE-ENTER the lock and pass for the wrong reason. The
+    holder sits on a background thread with a BOUNDED hold so that a regression to a
+    blocking acquire reddens on `elapsed` instead of hanging the suite.
+
+    Ablations, both of which must redden this: (1) MOVE the `except
+    LockUnavailableError` arm below the existing `except (RearmError, OSError,
+    runs.StateRootError)` — the subclass makes the moved arm dead and contention is
+    filed as "re-arm failed"; (2) drop `blocking=False` and the gesture queues for the
+    holder's full hold.
+    """
+    import threading
+    import time
+
+    from bmad_loop import platform_util
+    from bmad_loop.journal import STATE_FILE
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: a rival process holds the run state.",
+    )
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **kwargs: notes.append(
+            (str(message), str(kwargs.get("severity", "information")))
+        ),
+    )
+    monkeypatch.setattr(
+        runs_mod, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed a locked run")
+    )
+
+    lock_path = runs_mod.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    hold_s = 3.0
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with platform_util.file_lock(lock_path):
+            held.set()
+            release.wait(hold_s)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(30), "the rival never acquired the run's state lock"
+        started = time.monotonic()
+        BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(timeout=30)
+
+    assert elapsed < hold_s / 2  # refused at once, not queued behind the holder
+    # One toast, and it is the contention one: equality over the list covers both
+    # negatives at once — no "re-arm failed" fault report, and no residue echo
+    # crediting this gesture with journal records only the HOLDER can have written.
+    assert [severity for _message, severity in notes] == ["warning"]
+    assert "run state locked by another process" in notes[0][0]
+    assert "re-arm failed" not in notes[0][0]
+
+
+def test_rearm_contention_arm_precedes_the_generic_oserror_arm():
+    """`LockUnavailableError` SUBCLASSES `OSError`, so `_do_rearm`'s contention arm is
+    correct only in that ORDER: below the existing `except (RearmError, OSError,
+    runs.StateRootError)` it is unreachable and every contention is reported as a
+    fault, leaving the non-blocking acquire buying nothing.
+
+    The behavioral test above reddens on the same swap; this one names the property, so
+    the failure says what the invariant is instead of leaving the subclass relation to
+    be rediscovered from a toast.
+
+    Ablation: move the `except LockUnavailableError` arm after the OSError arm.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from bmad_loop import platform_util
+    from bmad_loop.tui import app as app_mod
+
+    assert issubclass(platform_util.LockUnavailableError, OSError)  # the whole hazard
+
+    def caught(handler: ast.ExceptHandler) -> set[str]:
+        if handler.type is None:
+            return {"BaseException"}
+        names: set[str] = set()
+        for node in ast.walk(handler.type):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+        return names
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(app_mod.BmadLoopApp._do_rearm)))
+    paired = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        arms = [caught(h) for h in node.handlers]
+        narrow = [i for i, names in enumerate(arms) if "LockUnavailableError" in names]
+        wide = [
+            i
+            for i, names in enumerate(arms)
+            if "LockUnavailableError" not in names and names & {"OSError", "BaseException"}
+        ]
+        if not narrow or not wide:
+            continue
+        paired += 1
+        assert max(narrow) < min(wide), (
+            "_do_rearm catches LockUnavailableError after a wider OSError arm — the "
+            "subclass makes the later arm unreachable, so contention is misreported"
+        )
+    assert paired == 1, "_do_rearm no longer pairs a LockUnavailableError arm with an OSError arm"
+
+
+def test_escalation_rearm_contention_does_not_echo_the_holders_journal_records(
+    project, monkeypatch
+):
+    """A refused acquisition claims none of the HOLDER's journal records.
+
+    `_do_rearm`'s `finally` recovers the re-arm records a raised call had already
+    written — abort-only diagnostic recovery, as its docstring says. A refused
+    acquisition is not that abort: it ran nothing, so every record appended between
+    the pre-lock read and the refusal was written by the process that HOLDS the lock,
+    and echoing it credits this gesture with a rival's re-arm.
+
+    The rival's append is injected through `journal_entries_or_none` rather than raced
+    on a real thread because the window is the microseconds between the pre-lock read
+    and a non-blocking refusal — a real race would be a coin flip, and a negative
+    assertion that only sometimes has anything to be negative about proves nothing.
+    The exclusion itself is still the real sidecar lock, so the refusal is genuine.
+
+    Ablation: drop `and not contended` from the `finally` and the holder's record is
+    toasted here as this gesture's own residue.
+    """
+    import threading
+
+    from bmad_loop import platform_util
+    from bmad_loop.journal import STATE_FILE
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: a rival process holds the run state.",
+    )
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp, "notify", lambda _self, message, **_kwargs: notes.append(str(message))
+    )
+
+    reads = 0
+
+    def racing_entries(_run_dir):
+        # First read is the pre-lock watermark; any later one would be the `finally`,
+        # by when the holder has appended a re-arm record of its own.
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        return [{"ts": 0.0, "kind": "stale-restore-excluded", "files": ["rival.py"]}]
+
+    monkeypatch.setattr(runs_mod, "journal_entries_or_none", racing_entries)
+
+    lock_path = runs_mod.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with platform_util.file_lock(lock_path):
+            held.set()
+            release.wait(3.0)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(30), "the rival never acquired the run's state lock"
+        BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+    finally:
+        release.set()
+        holder.join(timeout=30)
+
+    assert not any("excluded the abandoned restore" in note for note in notes)
+    assert [note for note in notes if "run state locked by another process" in note]
+    assert reads == 1  # the `finally` never took the second read at all
+
+
+def test_escalation_rearm_reloads_state_before_restamping(project, monkeypatch):
+    """Ablation: delete _do_rearm's fresh state check and the TUI restamps a run
+    whose escalation a rival already consumed while this gesture waited for the lock."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: rival resolved this escalation.",
+    )
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **_kwargs: notes.append(str(message)),
+    )
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir, **_kwargs):
+        rival = load_state(run_dir)
+        rival.tasks["1"].phase = Phase.PENDING
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", rival_first)
+    monkeypatch.setattr(runs, "restamp_code_root", lambda *_a: pytest.fail("stale restamp"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("double re-armed"))
+
+    BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+
+    assert any("no longer paused at escalation" in note for note in notes)
+
+
+def test_escalation_rearm_refuses_a_newer_generation_from_an_open_review(project, monkeypatch):
+    """An old modal must not consume a later escalation for the same story.
+
+    Ablation: delete ``_do_rearm``'s generation comparison and the rival's newer
+    escalation reaches ``rearm_escalation`` even though the modal never displayed it.
+    """
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: the original escalation.",
+    )
+    expected_generation = load_state(run_dir).tasks["1"].generation
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **_kwargs: notes.append(str(message)),
+    )
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir, **_kwargs):
+        rival = load_state(run_dir)
+        rival.tasks["1"].generation = expected_generation + 1
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", rival_first)
+    monkeypatch.setattr(runs, "restamp_code_root", lambda *_a: pytest.fail("stale restamp"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("stale rearm"))
+
+    BmadLoopApp(project.project)._do_rearm(
+        run_dir.name,
+        run_dir,
+        "1",
+        expected_generation=expected_generation,
+    )
+
+    assert any("changed while its review was open" in note for note in notes)
+
+
+def test_escalation_rearm_retains_outer_lock_through_rearm_call(project, monkeypatch):
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    rearms: list[Path] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+
+    def checked_rearm(rd, key, **_kwargs):
+        assert_run_state_lock_held(rd)
+        rearms.append(rd)
+        return _rearm_outcome(key)
+
+    monkeypatch.setattr(runs, "rearm_escalation", checked_rearm)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "notify", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert rearms == [run_dir]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("lock file could not be created"), runs_mod.StateRootError("no usable state root")],
+)
+def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, failure):
+    """The other half of the contention split: an acquisition fault that is NOT a
+    holder still reports "re-arm failed". Neither parameter may be a
+    `LockUnavailableError` — that subclass is contention, routed to its own arm — and
+    a plain `OSError` is exactly what `platform_util.file_lock` raises when the
+    sidecar cannot be PROVISIONED, which its docstring keeps deliberately unwrapped
+    because a broken path is not "someone is using this run"."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.tui import app as app_mod
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    notes: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("wrote unlocked"))
+
+    @contextlib.contextmanager
+    def refusing_lock(_run_dir, **_kwargs):
+        raise failure
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", refusing_lock)
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda message, **kwargs: notes.append((str(message), kwargs.get("severity"))),
+    )
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert notes == [(f"re-arm failed: {failure}", "error")]
 
 
 async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
@@ -5043,7 +5755,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         journal = Journal(rd)
         journal.append(
             "stale-restore-commits",
@@ -5090,7 +5802,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             error="OSError: [Errno 28] No space left on device",
             rollback="failed",
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5150,6 +5862,19 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     # the CLI's trailing imperative is omitted here: the resume is already queued
     assert not any("before resuming" in n[0] for n in notes), notes
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
+    ordered_messages = (
+        "2 commit(s) sit below the re-drive's new baseline",
+        "excluded the abandoned restore's new files",
+        "could not list the commits above the abandoned attempt's baseline",
+        "is not a readable file from here",
+        "could not be re-opened to `ready-for-dev`",
+        "may be left part-written",
+    )
+    positions = [
+        next(i for i, note in enumerate(notes) if message in note[0])
+        for message in ordered_messages
+    ]
+    assert positions == sorted(positions)
 
 
 async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatch):
@@ -5157,13 +5882,15 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
 
     `rearm-spec-write-unreachable` fires only once the re-arm has proven the committed
     spec does not carry the status the re-drive routes on — and this path drops the
-    table's `next_step` precisely because it resumes in the same gesture. That silenced
-    the one record whose remedy MUST land first in BOTH halves: the imperative was
-    dropped as moot, and the resume it was warning against happened anyway, mounting a
-    fresh worktree onto the still-terminal committed spec.
+    table's `next_step` on every ADVISORY toast precisely because it resumes in the same
+    gesture. That silenced the one record whose remedy MUST land first in BOTH halves:
+    the imperative was dropped as moot, and the resume it was warning against happened
+    anyway, mounting a fresh worktree onto the still-terminal committed spec.
 
-    The re-arm itself is kept — the story is armed and persisted — and the toast names
-    what the operator can finish from this screen: commit, then resume. The
+    The re-arm itself is kept — the story is armed and persisted — and the hold toast
+    carries the held record's OWN `next_step` (`RearmOutcome.hold_next_step`), which on
+    this record is the commit. Since the hold is what stops the fold-in, "before
+    resuming" is finally true on this surface when it renders here. The
     `rearm-baseline-restamp-skipped` control keeps this a narrowing rather than
     "warnings stop resumes": it is a warning on the same walk, and the resume still fires.
 
@@ -5180,7 +5907,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         Journal(rd).append(
             "rearm-spec-write-unreachable",
             story_key=sk,
@@ -5193,7 +5920,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
             spec_file="wt/specs/s1.md",
             baseline="c" * 40,
         )
-        return "ready-for-dev"
+        return _journal_rearm_outcome(rd, sk)
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5220,10 +5947,135 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
 
     assert calls == []  # the resume this gesture folds in did NOT fire
     assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
-    assert any("commit the corrected spec, then resume this run" in n for n in notes)
+    assert any(
+        "not resuming in this gesture. Commit the corrected spec with "
+        "`status: ready-for-dev` before resuming — the run stays paused and resumable "
+        "from this screen." in n
+        for n in notes
+    )
     # the record that proved it still renders, and its warning sibling did not hold
     assert any("land in a tree it discards" in n for n in notes)
     assert any("is not a readable file from here" in n for n in notes)
+
+
+@pytest.mark.parametrize("redrive", ["in-place", "isolated"])
+async def test_escalation_rearm_hold_names_the_holding_record_s_own_remedy(
+    project, monkeypatch, redrive
+):
+    """The hold toast must carry the HELD record's remedy, not one hardcoded literal.
+
+    Four records hold this surface's fold-in resume and their remedies differ. The
+    newest — `rearm-spec-flip-skipped` on its `reaches_redrive and not refused` arm —
+    is journalled with `refused = spec_path.is_file() and write_reaches_the_redrive`,
+    so the holding arm ENTAILS `spec_path.is_file()` is False: there is no corrected
+    spec at that path to commit, and on the isolated arm the path can be a shared
+    artifact directory outside the project that is not a Git repository at all. The
+    hardcoded "commit the corrected spec" was therefore not merely unhelpful there, it
+    was impossible. Both re-drive modes reach this arm, so both are asserted.
+
+    The negative half is the point and is matched case-insensitively: the fallback
+    literal only differs from the ablated one by its leading capital, and a negative
+    assertion that a capitalization slipped past would pass for the wrong reason.
+
+    Ablation: revert `_do_rearm`'s hold branch to the hardcoded literal and BOTH legs
+    redden — the positive on the missing path remedy, the negative on the commit
+    imperative that cannot be obeyed.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
+        Journal(rd).append(
+            "rearm-spec-flip-skipped",
+            story_key=sk,
+            spec_file="/srv/artifacts/specs/s1.md",
+            status="ready-for-dev",
+            refused=False,
+            reaches_redrive=True,
+            redrive=redrive,
+        )
+        return _journal_rearm_outcome(rd, sk)
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+
+    assert calls == []  # this arm holds, so the folded-in resume did NOT fire
+    assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
+    held = [n for n in notes if "not resuming" in n]
+    assert len(held) == 1
+    assert (
+        "not resuming in this gesture. Restore the recorded spec path with "
+        "`status: ready-for-dev` before resuming — the run stays paused and resumable "
+        "from this screen." == held[0]
+    )
+    # the remedy the record CANNOT have: the holding arm proves the path is not a file
+    assert "commit the corrected spec" not in held[0].lower()
+
+
+async def test_escalation_rearm_holds_without_a_renderable_notice(project, monkeypatch):
+    """The authoritative hold is independent of whether there is a toast to render."""
+    from bmad_loop import resolve, runs
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **kwargs: runs.RearmOutcome(sk, (), True),
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in note for note in notes))
+
+    assert calls == []
+    assert any("re-armed 1" in note for note in notes)
 
 
 async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
@@ -5252,7 +6104,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
         # exactly the real ordering: residue journalled, THEN the abort
         Journal(rd).append(
             "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
@@ -5288,7 +6140,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
 
 
 async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch):
-    """An undecodable byte in journal.jsonl costs the echo, never the gesture.
+    """An undecodable journal cannot suppress a successful authoritative hold.
 
     `_do_rearm` reads the journal twice to diff what the re-arm appended, and before
     that echo existed it read it not at all — so `Journal.entries()`' strict UTF-8
@@ -5305,7 +6157,7 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     `re-armed 1` notice ever fires.
     """
     from bmad_loop import resolve, runs
-    from bmad_loop.journal import JOURNAL_FILE, Journal
+    from bmad_loop.journal import JOURNAL_FILE
 
     calls: list[str] = []
     notes: list[str] = []
@@ -5313,11 +6165,16 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
-        Journal(rd).append(
-            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False, project_root=None):
+        return runs.RearmOutcome(
+            sk,
+            (
+                runs.RearmNotice(
+                    "warning", "authoritative hold from the successful re-arm", "ignored"
+                ),
+            ),
+            True,
         )
-        return "ready-for-dev"
 
     monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
     orig_notify = BmadLoopApp.notify
@@ -5344,11 +6201,12 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, EscalationModal)
         await pilot.click(await ready(pilot, "#act-rearm"))
-        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-    # the re-arm ran and the run resumed: the corruption cost only the echo
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+    # the re-arm ran, its outcome rendered, and the authoritative hold stopped resume
     assert any("re-armed 1" in n for n in notes)
     assert not any("re-arm failed" in n for n in notes), notes
-    assert not any("commit(s) sit below" in n for n in notes), notes
+    assert any("authoritative hold from the successful re-arm" in n for n in notes), notes
+    assert calls == []
 
 
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):

@@ -10,6 +10,7 @@ import pytest
 from conftest import (
     _OK,
     _file_exists_cmd,
+    _spec_baseline,
     attach_profile,
     bundle_dev_effect,
     bundle_dev_escalates,
@@ -1205,6 +1206,30 @@ def wt_bundle_dev(project, name="fix", dw_ids=("DW-1",), deferred=None):
     return effect
 
 
+def wt_bundle_review(project, name="fix"):
+    """Follow-up review effect that resolves the accepted spec from ``spec.cwd``."""
+
+    def effect(spec):
+        wt = project.rebased(spec.cwd)
+        sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
 def bundle_plan(dw_ids=("DW-1",), name="fix"):
     return triage_result(
         list(dw_ids),
@@ -1766,6 +1791,64 @@ def test_resume_dev_verify_bundle_replays_accepted_sync_before_review(project, m
     accepted = saved.accepted_dev_session_index
     assert accepted is not None and saved.sessions[accepted].role == "dev"
     assert saved.pre_harvest_ledger_captured is False
+
+
+def test_isolation_flip_resumes_accepted_bundle_in_mount_and_integrates(project, monkeypatch):
+    """A sweep receipt owns its recorded tree until sync, review, commit, and merge.
+
+    Ablation: gate accepted DEV_VERIFY reopening on live isolation and review sees
+    main's still-open ledger instead of the accepted close in the mounted workspace.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    plan = bundle_plan()
+    isolated = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="worktree", rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), wt_bundle_dev(project)],
+        policy=isolated,
+    )
+
+    def crash_before_accepted_sync(task, result_json):
+        raise RuntimeError("host died before accepted sync")
+
+    monkeypatch.setattr(engine, "_post_dev_accepted_sync", crash_before_accepted_sync)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    mount = Path(crashed.worktree_path)
+    assert crashed.phase == Phase.DEV_VERIFY and mount.is_dir()
+
+    engine.policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
+    seen: list[tuple[Path, str]] = []
+    review = wt_bundle_review(project)
+
+    def review_mounted_close(spec):
+        wt = project.rebased(spec.cwd)
+        seen.append((spec.cwd, ledger_entries(wt)["DW-1"].status))
+        return review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_mounted_close])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == ["review"]
+    assert seen and seen[0][0] == mount and seen[0][1].startswith("done")
+    assert "change for dw-fix" in (project.project / "src.txt").read_text(encoding="utf-8")
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "unit-merged" in journal_kinds(resumed)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(resumed)
+    assert not mount.exists()
 
 
 def test_resume_dev_verify_bundle_after_repair_preserves_acceptance(project, monkeypatch):
@@ -4489,11 +4572,11 @@ def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(projec
 # ------------------------------------------ review-budget commit-instead-of-rollback
 
 
-def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
+def test_sweep_bundle_budget_exhausted_commits_and_journals(project):
     """A bundle whose review keeps recommending a follow-up but is finalized
     (spec done, owned dw ids closed, verify green) is COMMITTED when the review
-    budget is exhausted — not rolled back. The lingering follow-up is re-filed as
-    a fresh open deferred-work entry."""
+    budget is exhausted — not rolled back. The spent budget is journaled; no
+    deferred-work entry is filed."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4519,15 +4602,16 @@ def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-budget-committed" in kinds and "story-deferred" not in kinds
 
 
 def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     """Re-review cap: when a bundle itself closes a `review-budget-followup` entry
-    and still won't converge, the work is committed but NOT re-filed again — a
-    second non-convergence should reach a human, not loop across sweeps."""
+    (legacy and hand-filed rows still exist) and still won't converge, the work is
+    committed and the journal flags the repeat — a second non-convergence should
+    reach a human, not loop across sweeps."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
@@ -4568,11 +4652,11 @@ def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     assert len(capped) == 1 and capped[0]["re_review_capped"] is True
 
 
-def test_sweep_bundle_followup_damped_commits_and_refiles(project):
+def test_sweep_bundle_followup_damped_commits_and_journals(project):
     """Default damping cap (1): a bundle whose review keeps recommending a follow-up
     converges after ONE honored round instead of burning the whole review budget.
-    The lingering follow-up is re-filed once, the work is committed, and — the
-    steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
+    The spent budget is journaled (no ledger entry), the work is committed, and —
+    the steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4593,7 +4677,7 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-followup-damped" in kinds
     assert "review-budget-committed" not in kinds and "story-deferred" not in kinds
@@ -4603,9 +4687,10 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
 
 def test_sweep_bundle_damped_re_review_capped_notifies_not_refiles(project):
     """Re-review cap survives damping: when a bundle itself closes a
-    `review-budget-followup` entry and still won't converge, the damped force-
-    converge commits but does NOT re-file again — and, unlike an ordinary quiet
-    damped converge, it raises an ATTENTION notice so a human sees the repeat."""
+    `review-budget-followup` entry (legacy and hand-filed rows still exist) and
+    still won't converge, the damped force-converge commits — and, unlike an
+    ordinary quiet damped converge, it raises an ATTENTION notice so a human sees
+    the repeat."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
@@ -4841,13 +4926,21 @@ def test_resume_committing_bundle_finishes_commit(project):
     plan = triage_result(
         ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
     )
+    isolated = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="worktree", rollback_on_failure=True),
+    )
     engine, _ = make_sweep(
         project,
         [
             triage_effect(plan),
-            bundle_dev_effect(project, "fix", ["DW-1"]),
-            bundle_review_effect(project, "fix"),
+            wt_bundle_dev(project),
+            wt_bundle_review(project),
         ],
+        policy=isolated,
     )
 
     def crashing_emit(stage, *args, **kwargs):
@@ -4861,7 +4954,16 @@ def test_resume_committing_bundle_finishes_commit(project):
     crashed = load_state(engine.run_dir).tasks["dw-fix"]
     assert crashed.phase == Phase.COMMITTING
     assert not crashed.commit_sha  # stamped only by the DONE save that never ran
+    mount = Path(crashed.worktree_path)
+    assert mount.is_dir()
 
+    engine.policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
     resumed, adapter = resume_sweep(project, engine, [])
     summary = resumed.run()
 
@@ -4873,6 +4975,88 @@ def test_resume_committing_bundle_finishes_commit(project):
     assert "resume-commit" in journal
     assert "resume-restart" not in journal
     assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "change for dw-fix" in (project.project / "src.txt").read_text(encoding="utf-8")
+    assert "unit-merged" in journal_kinds(resumed)
+    assert not mount.exists()
+
+
+def test_sweep_isolation_flip_restart_releases_mount_state_without_main_rollback(
+    project, monkeypatch
+):
+    """Rejected/incomplete work restarts in main without carrying mount operands.
+
+    Ablation: omit the mounted restart release and the rollback spy receives the
+    unit baseline while the mount claim remains attached.
+    """
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [], policy=in_place)
+    mount = engine.run_dir / "worktrees" / "dw-fix"
+    mount.mkdir(parents=True)
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.DEV_RUNNING,
+        worktree_path=str(mount),
+        branch="bmad-loop/sweep-run/dw-fix",
+        baseline_commit=verify.rev_parse_head(project.project),
+        baseline_untracked=[],
+        spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        dispatched_spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        dispatched_spec_snapshot=b"bound",
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda _task, cause: rolled.append(cause))
+
+    assert engine._recover_inflight_bundle(task) is False
+
+    assert rolled == []
+    assert task.phase == Phase.PENDING
+    assert task.worktree_path == "" and task.branch == ""
+    assert task.baseline_commit is None and task.baseline_untracked is None
+    assert task.dispatched_spec_file is None and task.dispatched_spec_snapshot is None
+    assert task.spec_file == "_bmad-output/implementation-artifacts/spec-dw-fix.md"
+    assert mount.is_dir()  # released and journaled, not destroyed
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+
+
+def test_sweep_missing_recorded_mount_escalates_without_finalizing_in_main(project, monkeypatch):
+    """A mounted COMMITTING receipt has no in-place fallback when its tree is gone.
+
+    Ablation: gate the reopen on live isolation and the finalizer spy runs against
+    main rather than the bundle escalating.
+    """
+    from bmad_loop.engine import RunPaused
+
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_sweep(project, [], policy=in_place)
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.COMMITTING,
+        worktree_path=str(engine.run_dir / "worktrees" / "gone"),
+        branch="bmad-loop/sweep-run/dw-fix",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="is gone"):
+        engine._recover_inflight_bundle(task)
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
 
 
 def test_regenerated_intent_when_bundle_file_missing(project):

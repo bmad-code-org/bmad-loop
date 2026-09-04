@@ -14,8 +14,8 @@ plugin-owned env-var families stay with their plugin" — see
 calls go through the ``_run_git`` chokepoint in ``verify.py``" — see
 ``test_no_git_invocation_outside_verify``.
 
-Three later invariants ride the same machinery, each one previously held by
-docstring prose alone:
+Later invariants ride the same machinery, each one previously held by docstring
+prose alone (or by nothing):
 
 * the task-directory artifact names are ``journal.TASK_CYCLE_ARTIFACTS`` and not a
   literal repeated per reader/writer — ``test_task_cycle_artifacts_named_only_through_the_constant``
@@ -29,6 +29,12 @@ docstring prose alone:
   the two names ``Journal.append`` mints itself, which no call site spells.
 * ``runs.rearm_escalation`` is called from exactly two places, each of which consults
   liveness first — ``test_rearm_escalation_called_only_behind_a_liveness_gate``.
+* every literal journal KIND is a declared ``JOURNAL_KINDS`` row —
+  ``test_journal_kind_inventory_is_complete``.
+* every ``_refuse_*``/``_reject_*`` helper definition and every #414-family
+  isolation-refusal call site is enumerated —
+  ``test_refusal_helper_inventory_is_complete`` and
+  ``test_isolation_conflict_refusal_sites_are_enumerated``.
 
 If this test flags something unexpected, fix the source (route it through the
 seam / a platform helper) rather than widening an allowlist.
@@ -131,7 +137,7 @@ VERIFY_CLASSIFY_CHOKEPOINT = {
 # Everywhere else the field arrives from `load_state`, and
 # `_serialized_worktree_path` persists an isolated unit's spec RELATIVE to the mount.
 # A bare `Path(...)` there resolves against the READER's cwd — the main checkout,
-# which carries the same `_bmad-output/specs/...` layout and answers with the wrong
+# which carries the same implementation-artifacts-relative path and answers with the wrong
 # tree's copy. That defect shipped in `tui/app.py::_paused_spec`, where it reached a
 # destructive write, and was then re-found one surface at a time in `resolve.py`,
 # `sweep.py`, `stories_engine.py` and `worktree_flow.py` across four review rounds.
@@ -185,25 +191,88 @@ TASK_ARTIFACT_LITERAL_ALLOW = {
 SESSION_TASK_ID_CHOKEPOINT = {"engine.py": "_session_task_id"}
 
 # The complete set of ``runs.rearm_escalation`` call sites, as
-# ``(file, enclosing function)``. The re-arm transaction's own commit probe
-# (``runs._rearm_commit_landed``) proves "did MY save_state land?" with nothing but
-# ``(generation, phase)`` over the reloaded task, and that is a sufficient IDENTITY
-# only under a sole-writer model: no engine advancing the task underneath, and one
-# control command at a time. Its docstring argues that model from this enumeration.
-#
-# Prose cannot hold it. A third call site — or either existing gate deleted — leaves
-# every test in the repo green while the probe's premise quietly becomes false, and
-# the failure it opens is DW-79/DW-83's own shape: a spec left re-armed against a task
-# the run still calls ESCALATED. So the enumeration is scanned instead of asserted.
-#
-# Deliberately NOT a lock and not a durable per-re-arm token: the spec's ``Never``
-# forbids both (a lock only ``rearm_escalation`` takes excludes nobody; a token buys a
-# precision ``save_state`` cannot honour). It forbids no guard, and this is the cheap
-# half — it does not make overlapping callers safe, it makes the day someone adds one
-# impossible to miss. Overlapping control commands stay out of the model, as DW-93.
+# ``(file, enclosing function)``. Serialization now comes from the shared run-state
+# lock, not this liveness inventory. The gates remain independently load-bearing: a
+# serialized control command still must not take its turn after an engine known to be
+# live, and a new operator surface must make that policy explicit.
 REARM_ESCALATION_CALLERS = {
     ("cli.py", "cmd_resolve"),
     ("tui/app.py", "_do_rearm"),
+}
+
+# Every production state publication and every explicit multi-step state transaction.
+# ``save_state`` itself serializes the leaf write, so a new direct publisher is safe
+# from the fixed-temp collision but still appears here for review: if it reads state
+# before deciding what to publish, it also belongs in RUN_STATE_TRANSACTIONS with an
+# outer hold. Exact inventories make a newly added writer fail loudly instead of
+# relying on a reviewer to find it by grep.
+SAVE_STATE_CALLERS = {
+    ("cli.py", "_prepare_resume_locked"),
+    ("engine.py", "_save"),
+    ("runs.py", "_rearm_escalation_locked"),
+    ("runs.py", "restamp_code_root"),
+    ("runs.py", "_stop_run_once"),
+    ("runsetup.py", "compose_run"),
+    ("runsetup.py", "compose_sweep"),
+}
+RUN_STATE_TRANSACTIONS = {
+    ("cli.py", "_resume_paused_run"),
+    ("cli.py", "cmd_resolve"),
+    ("journal.py", "save_state"),
+    ("runs.py", "rearm_escalation"),
+    ("runs.py", "restamp_code_root"),
+    ("runs.py", "_stop_run_once"),
+    ("runs.py", "archive_run"),
+    ("runs.py", "delete_run"),
+    ("runsetup.py", "compose_run"),
+    ("runsetup.py", "compose_sweep"),
+    ("tui/app.py", "_do_rearm"),
+}
+
+# The two refusal surfaces review iteration 6 kept re-finding by hand, enumerated so
+# a NEW one reddens CI until its row lands — the row being the PR-time decision
+# whose failure message demands the covering test land beside it (the journal-kind
+# inventory below is the third surface of that shape).
+#
+# Every `_refuse_*` / `_reject_*` helper DEFINITION in the tree, as
+# `(file, def name)`. The prefix pair is the tree's whole refusal-helper naming
+# convention today; a helper named outside it is invisible here — a stated bound,
+# not coverage. The guard forces the decision only on names that claim to be
+# refusals, and deliberately adds no runtime abstraction (no RefusalError, no
+# registry): the inventory is the test file's, not the product's.
+REFUSAL_HELPER_DEFS = {
+    ("cli.py", "_reject_bad_run_id"),
+    ("cli.py", "_reject_isolation_conflict"),
+    ("cli.py", "_reject_under_floor_git"),
+    ("engine.py", "_refuse_gated_story"),
+    ("platform_util.py", "_refuse_unwritable_target"),
+    ("platform_util.py", "_refuse_unwritable_target_at"),
+    ("resolve.py", "_reject_json_constant"),
+    ("runs.py", "_refuse_live_session"),
+    ("runs.py", "_refuse_uncontained_run_dir"),
+    ("workspace.py", "_refuse_foreign_checkout"),
+}
+
+# Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole
+# producer of the isolation-under-repo-root refusal text, plus its rc-returning CLI
+# wrapper `_reject_isolation_conflict` — as `(file, enclosing function) -> count`.
+# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because `cmd_resolve`
+# legitimately calls the wrapper twice: post-confirm is the authority, and the
+# pre-session arm spares the operator a full interactive session on a pair knowable
+# from config — the `96aa09a9` fix, which landed with no structural gate naming it.
+# Accepted cost (human decision 2026-09-02): every future caller of the predicate
+# touches a row here in the same PR.
+ISOLATION_CONFLICT_CALLERS = {
+    ("cli.py", "_reject_isolation_conflict"): 1,  # the wrapper's own predicate call
+    ("cli.py", "cmd_run"): 1,
+    ("cli.py", "cmd_sweep"): 1,
+    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm re-read
+    ("cli.py", "cmd_validate"): 1,  # reports a Finding rather than aborting
+    ("cli.py", "_prepare_resume_locked"): 1,  # behind both `resume` and the re-arm
+    ("cli.py", "_warn_preflight_would_abort"): 1,  # the dry-run honesty banner
+    ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises — no rc channel
+    ("tui/app.py", "_guarded"): 1,  # the pre-launch toast guard
+    ("tui/app.py", "_do_rearm"): 1,
 }
 
 # What counts as consulting liveness, matched as a substring of the callee's name
@@ -242,14 +311,22 @@ JOURNAL_ROUTED_FIELDS = (
 )
 
 # ``kind -> the field names routed on THAT kind only``, read off the same module so
-# the guard still cannot drift from it. A name here is routed on its own kinds and
-# unrouted everywhere else, which is the distinction the flattened union destroyed.
-JOURNAL_KIND_ROUTED_FIELDS = {
-    kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
-}
+# the guard still cannot drift from it. Alias, identifier-list, and count-list rules
+# share this inventory because all three claim the same `(kind, field)` boundary.
+JOURNAL_KIND_ROUTING_TABLES = (
+    diagnostics._JOURNAL_KIND_ALIAS_FIELDS,
+    diagnostics._JOURNAL_KIND_KEYLIST_FIELDS,
+    diagnostics._JOURNAL_KIND_COUNTLIST_FIELDS,
+)
+JOURNAL_KIND_ROUTED_FIELDS: dict[str, frozenset[str]] = {}
+for _routing_table in JOURNAL_KIND_ROUTING_TABLES:
+    for _kind, _row in _routing_table.items():
+        JOURNAL_KIND_ROUTED_FIELDS[_kind] = JOURNAL_KIND_ROUTED_FIELDS.get(
+            _kind, frozenset()
+        ) | frozenset(_row)
 
 # ``kind -> field names declared benign on that kind alone`` — the kind-scoped twin of
-# ``JOURNAL_BENIGN_FIELDS``, and it exists for the same field the routing table does.
+# ``JOURNAL_BENIGN_FIELDS`` for overloaded names whose other shapes are routed.
 # ``engine``'s board-advance carry paths journal ``target`` carrying a sprint STATUS
 # ("done"), not a branch; ``diagnostics``' ``_JOURNAL_KIND_ALIAS_FIELDS`` comment is
 # explicit that aliasing those would destroy the field a maintainer reads the record
@@ -261,6 +338,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
     "board-advance-carry-uncommitted": frozenset({"target"}),
+    # The stale-restore record carries SHA strings under this name and is routed;
+    # this recovery notice carries only the already-derived integer count.
+    "rollback-manual-required": frozenset({"commits"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -306,7 +386,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "checkpoint",
         "code_root_changed",
         "command_index",
-        "commits",
         "condition",
         "contradiction",
         "converted",
@@ -327,14 +406,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "errors",
         "expired_clock",
         "failed",
+        "fallback",
         "field",
-        "files",
         "finished",
         "fired_at",
         "flat_remainder",
         "followup_damped",
         "followup_review_recommended",
         "frm",
+        "generation",
         "graceful",
         "harvest_attempt",
         "head",
@@ -368,9 +448,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "open_now",
         "original",
         "owed_after_implement",
-        "path",
-        "paths",
         "phase",
+        "pid",
         "platform",
         "plugin",
         "plugins",
@@ -384,6 +463,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # turned out to be wrong.
         "rc",
         "re_review_capped",
+        "reaches_redrive",
         "rearmed",
         "record",
         "redrive",
@@ -406,7 +486,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "run_id",
         "run_type",
         "security_config_changed",
-        "sentinel",
+        "seen_again",
         "sentinel_kind",
         "session_status",
         "session_vanished",
@@ -429,7 +509,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "to",
         "tokens",
         "tokens_weighted",
-        "tolerated",
         "total",
         "trigger",
         "verification_sequence",
@@ -585,16 +664,282 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
     ("plugins/bus.py", "_log"),
 }
 
-# The receivers a ``.append(...)`` call must hang off to be a journal write. Matched
-# on the trailing name so `self.journal`, a bare `journal` parameter and
-# `self._journal` (the plugin bus's optional handle) all resolve — the three
-# spellings in the tree.
+# Every literal journal KIND written today: a declared inventory, not a per-kind
+# audit — `JOURNAL_BENIGN_FIELDS`' claim, made for the kind axis. Kind #205 cannot
+# appear without someone deciding, in the same PR, what covers the record it
+# introduces: a routing row in `diagnostics` if any field carries an identifier, a
+# path or free text, and a test row asserting the record at the layer that reads it
+# — the decision review iteration 6 kept discovering had been skipped.
+#
+# Generated from the scan, hand-reviewed, grouped by producer module; a kind two
+# modules write sits under a shared heading. A deleted or renamed kind reddens the
+# staleness direction too — PROVIDED no other producer still writes it: the
+# staleness arm sees the union of producers, so removing ONE writer of a shared
+# kind (the shared headings below, `run-stop` included) reddens nothing by itself.
+#
+# A declared dynamic-kind position (`JOURNAL_DYNAMIC_KIND_ALLOW`) writes a
+# parameter, not a literal, so its kinds enter here through the literals that reach
+# it from outside: the `kind="..."` a caller hands `engine._skip_review_and_commit`
+# or `sweep._close_bundle_ledger_when_spec_status`, and each one's parameter
+# default (`review-skipped`, `sweep-bundle-closed`) — a second `journalkindliteral`
+# arm reads both, keyed by the same `(file, name)` as the position.
+#
+# ⚠️ STATED BOUNDS. Truly dynamic kinds — the f-string family in
+# `recovery_flow.prune_preserve_refs` — are NOT rows here: the position is declared
+# and governed by the literalness test, and the kinds it mints (e.g.
+# `attempt-preserve-pruned`) never enter this inventory. And every receiver shape
+# the journal scan cannot see is a hole in this emit too (`JOURNAL_RECEIVERS`'
+# bound): a locally aliased handle, a `Journal` SUBCLASS constructed inline
+# (`_RearmJournal(run_dir).append(...)`), the `super().append(...)` inside such a
+# subclass's override, and a constructor reached through an import alias. On
+# today's tree the only subclass instance is bound to the `journal` name and its
+# override forwards its parameter kind, so no literal is missed — but the bound is
+# the scan's, not the tree's.
+JOURNAL_KINDS = frozenset(
+    {
+        # cli.py
+        "run-resume",
+        # engine.py
+        "board-advance-carried",
+        "board-advance-carry-failed",
+        "board-advance-carry-foreign-dirt",
+        "board-advance-carry-uncommitted",
+        "console-ctrl-ignored",
+        "defer-ledger-restore-diverged",
+        "deferred-artifacts-stashed",
+        "deferred-close-duplicate-id",
+        "deferred-close-external-ledger",
+        "deferred-close-ledger-unavailable",
+        "deferred-close-malformed",
+        "deferred-close-reopen-unmatched",
+        "deferred-close-rollback-failed",
+        "deferred-close-rolled-back",
+        "deferred-close-skipped-out-of-tree",
+        "deferred-close-unmatched",
+        "dev-decision",
+        "epic-boundary",
+        "fix-decision",
+        "fix-harvest-failed",
+        "harvest-carried",
+        "harvest-carry-uncommitted",
+        "isolation-flip-orphaned-worktree",
+        "ledger-baseline-probe-failed",
+        "ledger-restore-failed",
+        "ledger-restore-skipped-diverged",
+        "ledger-scope-probe-failed",
+        "ledger-snapshot-missing",
+        "ledger-tracked-probe-failed",
+        "legacy-ledger-attribution-failed",
+        "max-stories-reached",
+        "notify-desktop-unavailable",
+        "operator-index-failed",
+        "park-proof-of-work-skipped",
+        "park-record-rollback-failed",
+        "plugin-veto",
+        "plugins-active",
+        "preference-escalation",
+        "resume-defer",
+        "resume-ledger-carry",
+        "resume-review",
+        "resume-unit-merge",
+        "resume-verify",
+        "review-budget-committed",
+        "review-followup-damped",
+        "review-not-recommended",
+        "review-result",
+        "review-retry",
+        "review-skipped",
+        "review-skipped-awaiting-operator",
+        "review-timeout-salvage",
+        "review-timeout-salvage-failed",
+        "review-verify-failed",
+        "run-complete",
+        "run-crash",
+        "run-paused",
+        "run-stop-finalize-error",
+        "session-end",
+        "session-rescued-post-kill",
+        "session-start",
+        "session-synthesized-from-frontmatter",
+        "spec-deferral-sighting-stale",
+        "spec-deferrals-harvested",
+        "spec-deferrals-malformed",
+        "spec-deferrals-skipped-out-of-tree",
+        "spec-marker-repair-failed",
+        "spec-marker-repair-skipped",
+        "spec-marker-repaired",
+        "spec-read-failed",
+        "spec-reconcile-skipped-out-of-tree",
+        "spec-status-reconciled",
+        "sprint-status-unknown-keys",
+        "stop-request-discarded",
+        "story-awaiting-operator",
+        "story-deferred",
+        "story-deferred-close-carried",
+        "story-deferred-close-carry-uncommitted",
+        "story-deferred-closed",
+        "story-done",
+        "story-gate-unreadable",
+        "story-gated",
+        "story-skipped",
+        "story-start",
+        "sweep-auto-failed",
+        "sweep-auto-finished",
+        "sweep-auto-not-started",
+        "sweep-auto-skipped-dirty",
+        "sweep-auto-suppressed",
+        "sweep-auto-trigger",
+        "token-budget-exceeded",
+        "verify-command-result",
+        "workflow-end",
+        "workflow-start",
+        # engine.py + runs.py (runs.py's writer is the constructor-inline spelling)
+        "run-stop",
+        # engine.py + sweep.py
+        "resume-commit",
+        "resume-restart",
+        # engine.py + worktree_flow.py
+        "story-escalated",
+        # plugins/bus.py
+        "plugin-hook",
+        "plugin-hook-error",
+        # plugins/bus.py + plugins/registry.py
+        "plugin-error",
+        # plugins/loader.py
+        "plugin-skipped",
+        # plugins/registry.py
+        "plugin-loaded",
+        "plugin-untrusted",
+        # recovery_flow.py
+        "attempt-commits-preserved",
+        "attempt-preserve-enumerate-failed",
+        "attempt-preserve-failed",
+        "attempt-restore-failed",
+        "attempt-restored",
+        "attempt-worktree-preserve-failed",
+        "attempt-worktree-preserved",
+        "rollback-auto",
+        "rollback-dirty-check-failed",
+        "rollback-manual-required",
+        "rollback-owned-spec-baseline-read-failed",
+        "rollback-owned-spec-baseline-status-failed",
+        "rollback-owned-spec-manual-required",
+        "rollback-owned-spec-normalized",
+        "rollback-owned-spec-restored",
+        "rollback-owned-spec-snapshot-missing",
+        "rollback-owned-spec-unavailable",
+        "rollback-owned-spec-unpreservable",
+        "rollback-owned-spec-unreadable",
+        "rollback-reset-failed",
+        "rollback-skipped-clean",
+        # runs.py
+        "rearm-aborted",
+        "rearm-baseline-advance-failed",
+        "rearm-baseline-restamp-skipped",
+        "rearm-baseline-restamped",
+        "rearm-code-root-restamped",
+        "rearm-commits-probe-failed",
+        "rearm-spec-flip-skipped",
+        "rearm-spec-write-unreachable",
+        "rearm-upstream-write-unreachable",
+        "run-stop-undelivered",
+        "sentinel-cleared",
+        "stale-restore-commits",
+        "stale-restore-excluded",
+        "stale-restore-unparseable",
+        "story-escalation-resolved",
+        # runsetup.py
+        "composition-unwind-failed",
+        "run-start",
+        # stories_engine.py
+        "checkpoint-pause",
+        "checkpoint-resume",
+        "checkpoint-skip-last",
+        "deferred-close-declaration-unreadable",
+        "plan-halt",
+        "plan-halt-proof-of-work-skipped",
+        "sentinel-detected",
+        "stories-escalation-unresolved",
+        "stories-manifest-unreadable",
+        "stories-selector-unknown",
+        "stories-validated",
+        "stories-wedged",
+        # sweep.py
+        "bundle-start",
+        "decision-answered",
+        "decision-pending",
+        "decision-preanswered",
+        "decision-preanswers-pruned",
+        "decision-skipped-unattended",
+        "migrate-decision",
+        "migrate-duplicate-ids",
+        "sweep-bundle-close-carried",
+        "sweep-bundle-close-carry-uncommitted",
+        "sweep-bundle-closed",
+        "sweep-bundle-name-discarded",
+        "sweep-bundle-name-normalized",
+        "sweep-bundle-reclosed",
+        "sweep-bundle-reopened",
+        "sweep-bundle-skipped",
+        "sweep-bundles-truncated",
+        "sweep-cycle",
+        "sweep-decisions-only",
+        "sweep-inflight-redrive",
+        "sweep-inflight-stranded",
+        "sweep-intent-regenerated",
+        "sweep-ledger-commit",
+        "sweep-migrated",
+        "sweep-migration-restore-diverged",
+        "sweep-nothing-open",
+        "sweep-repeat-done",
+        "sweep-resolved-closed",
+        "sweep-return-no-client",
+        "sweep-returned-after-decisions",
+        "sweep-triage-reload-failed",
+        "sweep-triage-result",
+        "triage-decision",
+        # worktree_flow.py
+        "isolation-flip-orphan-preserved",
+        "merge-preflight-refused",
+        "merge-target-cleaned",
+        "merge-target-tolerated",
+        "scm-failed-diff-unlimited",
+        "target-branch",
+        "target-branch-checkout",
+        "target-branch-created",
+        "unit-closed",
+        "unit-merge-started",
+        "unit-merged",
+        "worktree-exclude-degraded",
+        "worktree-kept",
+        "worktree-module-skills-dropped",
+        "worktree-open-failed",
+        "worktree-opened",
+        "worktree-seed-dropped",
+        "worktree-seed-skipped",
+        "worktree-teardown-degraded",
+    }
+)
+
+# The NAMED-HANDLE receivers a ``.append(...)`` call must hang off to be a journal
+# write. Matched on the trailing name so `self.journal`, a bare `journal` parameter
+# and `self._journal` (the plugin bus's optional handle) all resolve. The tree's
+# fourth spelling — the constructor-inline `Journal(run_dir).append(...)` that
+# runs.py's stop/restamp records use — is a Call receiver, not a name, and is
+# matched structurally in `_is_journal_write` rather than through this set.
 #
 # ⚠️ STATED BOUND: a LOCALLY ALIASED handle is invisible. `j = self.journal` followed
 # by `j.append(kind, customer_email=x)` produces no finding (verified by running it
-# through `_scan_source`). No such site exists in the tree today, and resolving the
-# binding would be `_call_aliases`' shape rather than a new idea — but the
-# guard does not do it, and a reader must not assume it does.
+# through `_scan_source`), and a handle bound from the constructor —
+# `j = Journal(run_dir)` then `j.append(...)` — is the same shape. So is anything
+# the constructor arm's bare-name anchor does not spell: a SUBCLASS constructed
+# inline (`_RearmJournal(run_dir).append(...)` — `runs._RearmJournal(Journal)`
+# exists), the `super().append(kind, **fields)` inside that subclass's override
+# (runs.py's fifth receiver spelling, a `super` Call), and `Journal` reached
+# through an import alias. None of these carries a literal the tree misses today
+# (the subclass's one instance is bound to `journal`; its override forwards a
+# parameter kind), and resolving them would be `_call_aliases`' shape rather than a
+# new idea — but the guard does not do it, and a reader must not assume it does.
 JOURNAL_RECEIVERS = {"journal", "_journal"}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
@@ -1084,10 +1429,96 @@ def _mint_candidates(node: ast.expr, depth: int = 0):
             yield from _mint_candidates(arg, depth + 1)
 
 
+def _kind_param_default(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The string-literal default of ``fn``'s ``kind`` parameter — positional-or-
+    keyword or keyword-only — or None when there is no such parameter or its default
+    is not a string literal. The declared dynamic-kind positions mint their fallback
+    kind here (``review-skipped``, ``sweep-bundle-closed``), and nothing else in
+    the scan reads a parameter default."""
+    args = fn.args
+    positional = args.posonlyargs + args.args
+    padded: list[ast.expr | None] = [None] * (len(positional) - len(args.defaults))
+    padded.extend(args.defaults)
+    for arg, default in [*zip(positional, padded), *zip(args.kwonlyargs, args.kw_defaults)]:
+        if arg.arg == "kind":
+            if isinstance(default, ast.Constant) and isinstance(default.value, str):
+                return default.value
+            return None
+    return None
+
+
+def _kind_param_index(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
+    """Index of ``fn``'s ``kind`` parameter within a CALL's positional argument
+    list, or None when it cannot arrive positionally — keyword-only, or absent.
+
+    A leading ``self``/``cls`` is dropped: every declared dynamic-kind position is a
+    method reached as ``self._log(...)``, where the receiver is bound and never
+    occupies a slot in ``Call.args``. The unbound spelling (``Bus._log(bus, kind)``)
+    would shift by one and is deliberately out of scope — it appears nowhere on this
+    tree, and reading the receiver where a kind was expected yields a non-literal and
+    therefore no finding, which is a miss rather than a false alarm.
+
+    The sibling of :func:`_kind_param_default`, and needed for the same reason: a
+    literal reaches a dynamic-kind position three ways — a caller's keyword, a
+    caller's POSITIONAL argument, and the parameter default — and reading only two of
+    them leaves the third ungraded while the inventory reports itself complete."""
+    positional = fn.args.posonlyargs + fn.args.args
+    if positional and positional[0].arg in ("self", "cls"):
+        positional = positional[1:]
+    for index, arg in enumerate(positional):
+        if arg.arg == "kind":
+            return index
+    return None
+
+
+# A `kind` argument at a declared dynamic-kind position that the scan could not
+# resolve: a `*args` splat covering the parameter's slot, or a non-literal expression
+# in that slot or in a `kind=` keyword. Emitted AS a kind so the inventory arm reddens
+# naming the site: no row can declare it, and an unreadable argument must not share
+# its silence with "this call passed no literal".
+UNRESOLVED_DYNAMIC_KIND = "<unresolved-positional-kind>"
+
+
+def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
+    """The string literal a call hands a declared dynamic-kind position
+    POSITIONALLY; :data:`UNRESOLVED_DYNAMIC_KIND` when that slot is OCCUPIED by
+    something the scan cannot read — a ``*args`` splat covering it, or a non-literal
+    expression in it; None only when the slot is EMPTY, which is the parameter default
+    the definition arm reports instead.
+
+    Empty and occupied-but-unreadable are different answers and must not share one
+    return value. ``sweep.py``'s own ``_close_bundle_ledger_when_spec_status(task,
+    str(spec_file), success_status)`` omits ``kind`` and relies on the default, so
+    folding the empty slot into the sentinel reddens the clean tree.
+
+    A non-literal in an occupied slot is FLAGGED, not skipped. Deferring it to the
+    literalness test — the rationale this arm used to carry, and the keyword arm with
+    it — holds only at the declared FORWARDER (``plugins/bus.py::_log``), whose
+    enclosing function at the CALL is not in ``JOURNAL_DYNAMIC_KIND_ALLOW``, so a
+    variable there reddens
+    ``test_journal_kinds_are_literal_or_the_position_is_declared`` anyway. At the two
+    non-forwarder positions (``engine._skip_review_and_commit``,
+    ``sweep._close_bundle_ledger_when_spec_status``) the allow set waives exactly that
+    test for the write INSIDE the position, so nothing else grades the slot: a caller
+    handing it a variable would reach the journal with a kind no row declares while
+    every arm stayed green."""
+    if any(isinstance(arg, ast.Starred) for arg in node.args[: index + 1]):
+        return UNRESOLVED_DYNAMIC_KIND
+    if index >= len(node.args):
+        return None
+    arg = node.args[index]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return UNRESOLVED_DYNAMIC_KIND
+
+
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
     """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
-    each of the three receiver spellings the tree uses (see ``JOURNAL_RECEIVERS``),
-    or a call to one of this file's declared ``JOURNAL_FORWARDERS``.
+    each of the four receiver spellings the scan reads: the three named handles (see
+    ``JOURNAL_RECEIVERS``) and the constructor-inline ``Journal(run_dir).append(...)``
+    — or a call to one of this file's declared ``JOURNAL_FORWARDERS``. The tree's
+    fifth spelling, ``super().append(...)`` inside ``runs._RearmJournal``'s override,
+    is a stated bound (``JOURNAL_RECEIVERS``), not a receiver.
 
     The forwarder half is not a convenience. ``plugins/bus.py::_log`` takes its own
     ``**fields`` and hands them to ``self._journal.append``, so its four call sites
@@ -1105,11 +1536,18 @@ def _is_journal_write(node: ast.AST, rel: str) -> bool:
         return False
     if (rel, name) in JOURNAL_FORWARDERS:
         return True
-    return (
-        isinstance(node.func, ast.Attribute)
-        and name == "append"
-        and _called_name(node.func.value) in JOURNAL_RECEIVERS
-    )
+    if not (isinstance(node.func, ast.Attribute) and name == "append"):
+        return False
+    receiver = node.func.value
+    if _called_name(receiver) in JOURNAL_RECEIVERS:
+        return True
+    # The constructor-inline spelling: `Journal(run_dir).append(...)`. The receiver
+    # is an ast.Call, so the named-handle match above can never see it — runs.py's
+    # stop/restamp records (and their kinds and fields) went unscanned exactly this
+    # way. Name-anchored on `Journal` like the handle arm, so a lookalike
+    # constructor stays silent — and so, by the same anchor, does a subclass
+    # constructor or an import alias (the stated bound on `JOURNAL_RECEIVERS`).
+    return isinstance(receiver, ast.Call) and _called_name(receiver.func) == "Journal"
 
 
 def _dict_literal_keys(value: ast.expr) -> set[str] | None:
@@ -1243,6 +1681,23 @@ def _names_rearm_escalation(func: ast.expr, aliases: frozenset[str] = frozenset(
     return _names_guarded_verify_call(func, "rearm_escalation", aliases)
 
 
+def _names_isolation_refusal(
+    func: ast.expr,
+    predicate_aliases: frozenset[str] = frozenset(),
+    wrapper_aliases: frozenset[str] = frozenset(),
+) -> bool:
+    """True when ``func`` spells a #414-family refusal entry point: the
+    ``bmadconfig.worktree_isolation_conflict`` predicate or its rc-returning CLI
+    wrapper ``_reject_isolation_conflict``. Both names are guarded because a new
+    surface can reach the refusal through either — the ``96aa09a9`` site did so
+    through the wrapper — and each resolves its own alias set. Same reach and
+    computed-name bound as the sibling detectors, and the same trade: an unrelated
+    ``x.worktree_isolation_conflict(...)`` is a review prompt, not a miss."""
+    return _names_guarded_verify_call(
+        func, "worktree_isolation_conflict", predicate_aliases
+    ) or _names_guarded_verify_call(func, "_reject_isolation_conflict", wrapper_aliases)
+
+
 def _block_exits(body: list[ast.stmt]) -> bool:
     """Whether this simple guard body cannot fall through to the re-arm below it."""
     return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
@@ -1338,6 +1793,8 @@ def _scan_source(src: str, rel: str):
     verify_command_aliases = _call_aliases(tree, "verify_commands_outcome")
     verify_classifier_aliases = _call_aliases(tree, "verify_command_results_outcome")
     rearm_aliases = _call_aliases(tree, "rearm_escalation")
+    isolation_aliases = _call_aliases(tree, "worktree_isolation_conflict")
+    isolation_wrapper_aliases = _call_aliases(tree, "_reject_isolation_conflict")
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -1589,6 +2046,14 @@ def _scan_source(src: str, rel: str):
             )
             if kind is None:
                 findings.append(("journalkind", rel, node.lineno, line_at(node.lineno), fn_name))
+            else:
+                # The literal-kind twin, and the KIND inventory's only feed. NOT
+                # derivable from the `journalfield` rows below, although each of
+                # those carries the kind: a kind-only write (`run-complete` and
+                # three siblings) has no keyword row to ride on.
+                findings.append(
+                    ("journalkindliteral", rel, node.lineno, line_at(node.lineno), kind)
+                )
             for kw in node.keywords:
                 if kw.arg is not None:
                     findings.append(
@@ -1841,6 +2306,100 @@ def _scan_source(src: str, rel: str):
                 )
             )
 
+    # The literal kinds that reach a declared dynamic-kind POSITION from outside it:
+    # a `kind="..."` keyword at a call to one of this file's
+    # `JOURNAL_DYNAMIC_KIND_ALLOW` functions, and that function's own `kind`
+    # parameter default. The write inside such a position spells a parameter, so
+    # the journal-write arm above reports it as `journalkind` and nothing more —
+    # which is how `review-skipped-awaiting-operator` and its three siblings
+    # reached the journal with no inventory row anyone had to decide on (review
+    # pass 2). Same `journalkindliteral` finding, same inventory; keyed `(file,
+    # name)` exactly like the position it serves, so a same-named callee in a file
+    # that declares no such position stays silent.
+    # Where each declared position keeps its `kind`, so a caller that spells the
+    # kind POSITIONALLY is read too. Keyed by name within this file, exactly like
+    # the allow set it is derived from.
+    kind_positions = {
+        node.name: _kind_param_index(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (rel, node.name) in JOURNAL_DYNAMIC_KIND_ALLOW
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and (rel, _called_name(node.func)) in JOURNAL_DYNAMIC_KIND_ALLOW
+        ):
+            for kw in node.keywords:
+                if kw.arg != "kind":
+                    continue
+                # A spelled-but-unreadable `kind=` is unresolvable, not absent, for
+                # the reason `_positional_kind_literal` states: the write inside a
+                # declared position spells a parameter and the literalness test is
+                # waived there, so skipping it lets an undeclared kind reach the
+                # journal with nothing red.
+                findings.append(
+                    (
+                        "journalkindliteral",
+                        rel,
+                        node.lineno,
+                        line_at(node.lineno),
+                        (
+                            kw.value.value
+                            if isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, str)
+                            else UNRESOLVED_DYNAMIC_KIND
+                        ),
+                    )
+                )
+            # A declared FORWARDER (`plugins/bus.py::_log`) is itself a journal
+            # write, so the main emit above already read its positional kind; this
+            # arm exists for the declared positions that are not forwarders, where
+            # nothing else reads the slot.
+            index = kind_positions.get(_called_name(node.func))
+            if (
+                index is not None
+                and not any(kw.arg == "kind" for kw in node.keywords)
+                and not _is_journal_write(node, rel)
+            ):
+                literal = _positional_kind_literal(node, index)
+                if literal is not None:
+                    findings.append(
+                        ("journalkindliteral", rel, node.lineno, line_at(node.lineno), literal)
+                    )
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (rel, node.name) in JOURNAL_DYNAMIC_KIND_ALLOW
+        ):
+            default = _kind_param_default(node)
+            if default is not None:
+                findings.append(
+                    ("journalkindliteral", rel, node.lineno, line_at(node.lineno), default)
+                )
+
+    # Every refusal-helper DEFINITION (`_refuse_*` / `_reject_*`) and every
+    # #414-family isolation-refusal CALL — the two surfaces `REFUSAL_HELPER_DEFS`
+    # and `ISOLATION_CONFLICT_CALLERS` enumerate. The def side needs no alias
+    # resolution (a definition IS its name); the call side resolves both guarded
+    # names through `_call_aliases`, exactly like the re-arm detector above.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+            ("_refuse_", "_reject_")
+        ):
+            findings.append(("refusaldef", rel, node.lineno, line_at(node.lineno), node.name))
+        if isinstance(node, ast.Call) and _names_isolation_refusal(
+            node.func, isolation_aliases, isolation_wrapper_aliases
+        ):
+            findings.append(
+                (
+                    "isolationcall",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    enclosing_names.get(id(node)),
+                )
+            )
+
     return findings
 
 
@@ -1886,6 +2445,62 @@ def test_no_git_invocation_outside_verify():
         "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_proof_quiet_diff_is_owned_by_the_central_tri_state_probe():
+    """Production has one proof-of-work quiet-diff body across the source tree.
+    Whole-tree and literal public callers route through `_changes_since`;
+    `attempt_dirty` retains the one separate quiet diff whose contract is rollback
+    ownership, not proof of work.
+
+    Ablation: restore `path_changed_since`'s inline `_git(..., "diff",
+    "--quiet", ...)` body and this fails twice — the unexpected owner appears and
+    the literal caller no longer calls the tri-state probe.
+    """
+    quiet_diff_owners: list[tuple[str, str]] = []
+    tri_state_callers: Counter[tuple[str, str]] = Counter()
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, rel: str) -> None:
+            self.rel = rel
+            self.functions: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            owner = self.functions[-1] if self.functions else "<module>"
+            callee = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute) else None
+            )
+            if callee == "_changes_since":
+                tri_state_callers[(self.rel, owner)] += 1
+            if (
+                callee == "_git"
+                and len(node.args) >= 3
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "diff"
+                and isinstance(node.args[2], ast.Constant)
+                and node.args[2].value == "--quiet"
+            ):
+                quiet_diff_owners.append((self.rel, owner))
+            self.generic_visit(node)
+
+    for source in SRC.rglob("*.py"):
+        rel = source.relative_to(SRC).as_posix()
+        Visitor(rel).visit(ast.parse(source.read_text(encoding="utf-8")))
+
+    assert Counter(quiet_diff_owners) == Counter(
+        {("verify.py", "_changes_since"): 1, ("verify.py", "attempt_dirty"): 1}
+    )
+    assert tri_state_callers[("verify.py", "has_changes_since")] == 1
+    assert tri_state_callers[("verify.py", "path_changed_since")] == 1
 
 
 def _verify_command_offenders(findings) -> list[tuple[str, int, str]]:
@@ -1973,8 +2588,8 @@ def test_spec_path_resolved_only_through_the_anchor():
     loads state from disk must say WHICH tree the value is relative to. The four
     allowlisted files run inside that tree already; everything else — the TUI, the
     resolve-context builder, the sweep and stories engines, the read-model
-    projections — does not, and the main checkout carries an identical
-    ``_bmad-output/specs/...`` layout that answers a bare ``Path(...)`` with the wrong
+    projections — does not, and the main checkout carries the same
+    implementation-artifacts-relative path that answers a bare ``Path(...)`` with the wrong
     copy. That is not a hypothetical: it shipped in ``tui/app.py::_paused_spec``,
     where ``_do_replan`` then WROTE to the main checkout's file and the operator's
     replan silently did not happen.
@@ -2080,6 +2695,33 @@ def test_task_cycle_artifacts_named_only_through_the_constant():
     )
 
 
+def test_task_cycle_artifact_docs_track_the_canonical_tuple():
+    """The run inventory and extension boundary keep pace with the shared list."""
+    project_root = Path(__file__).resolve().parents[1]
+    features = (project_root / "docs/FEATURES.md").read_text(encoding="utf-8")
+    inventory = features.split("- All run state in", 1)[1].split("\n- ", 1)[0]
+    guide = (project_root / "docs/adapter-authoring-guide.md").read_text(encoding="utf-8")
+    start_session_contract = guide.split("- `start_session", 1)[1].split(
+        "- `wait_for_completion", 1
+    )[0]
+
+    def shared_artifacts(contract: str) -> set[str]:
+        listing = contract.split("shared artifacts: [", 1)[1].split("]", 1)[0]
+        return set(listing.split("`")[1::2])
+
+    canonical = set(TASK_CYCLE_ARTIFACTS)
+    assert shared_artifacts(inventory) == canonical
+    assert shared_artifacts(start_session_contract) == canonical
+
+    assert "`journal.TASK_CYCLE_ARTIFACTS`" in start_session_contract
+    assert (
+        "after creating the task directory and before\n  launching the session"
+        in start_session_contract
+    )
+    assert "a missing artifact is a normal no-op" in start_session_contract
+    assert "Adapter-private breadcrumbs" in start_session_contract
+
+
 def _session_task_id_offenders(findings) -> list[tuple[str, int, str]]:
     """The chokepoint invariant as a filter: a composed task id is sanctioned only
     in a ``SESSION_TASK_ID_CHOKEPOINT`` file AND only inside that file's one listed
@@ -2132,26 +2774,20 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
     """``runs.rearm_escalation`` is reached from exactly two places, and each consults
     liveness before it.
 
-    ``runs._rearm_commit_landed`` decides whether the re-arm transaction COMMITTED —
-    and therefore whether to roll the spec back — from ``(generation, phase)`` over the
-    reloaded task, nothing more. Those two conjuncts are a sufficient identity only
-    while ``rearm_escalation`` is the sole writer of that run's ``state.json``, and that
-    model is argued from this enumeration: two callers, each behind a liveness
-    consultation, with no engine running. A third caller, or either gate deleted, makes
-    the premise false — and the defect it reopens is DW-79/DW-83's own: a spec left
-    flipped against a task the run still calls ESCALATED.
+    ``runs._rearm_commit_landed`` is protected by the shared run-state transaction
+    lock, so this enumeration no longer supplies its writer-identity premise. It pins
+    the separate safety rule that an operator surface refuses a provably-live engine
+    before entering that serialized mutation turn.
 
     Note what the gate does and does not establish. It proves the engine is not
     PROVABLY alive, not that it is dead: ``"alive"`` is refused outright, while
     ``"unknown"`` proceeds under ``--force`` in ``cmd_resolve`` and counts as blocking
     in the TUI only for a pid-backed run. So this grades the falsifiable half — that
-    an earlier liveness decision BLOCKS fall-through before the call. The rest of the
-    model (one control command at a time) is out of scope here and tracked as DW-93.
+    an earlier liveness decision BLOCKS fall-through before the call.
 
-    ``cli.cmd_resume`` is deliberately absent: it writes this run's ``state.json``
-    through ``_resume_paused_run``, so the sole-writer claim must account for it, but it
-    never re-arms and so is not a call site. Listing it here would make the enumeration
-    unfalsifiable in the direction that matters.
+    ``cli.cmd_resume`` is deliberately absent because it never re-arms. Its state
+    publication is covered separately by the writer/transaction inventory below;
+    listing it here would make this call-site enumeration unfalsifiable.
 
     ⚠️ What this assertion grades, precisely — the two halves differ, and the
     difference is the reason the probe rows below exist:
@@ -2174,10 +2810,9 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
     sites = _rearm_callsite_counts(findings)
     declared = Counter(REARM_ESCALATION_CALLERS)
     assert sites == declared, (
-        "the count of runs.rearm_escalation call sites moved. That enumeration is what "
-        "runs._rearm_commit_landed's (generation, phase) commit probe argues its "
-        "sole-writer premise from — a new caller needs that docstring revisited (and "
-        "DW-93 consulted), not this constant widened:\n"
+        "the count of runs.rearm_escalation call sites moved. A new operator surface "
+        "must retain the liveness refusal as well as the shared run-state transaction; "
+        "do not widen this constant without reviewing both:\n"
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}"
     )
@@ -2189,6 +2824,108 @@ def test_rearm_escalation_called_only_behind_a_liveness_gate():
     )
 
 
+def _production_call_sites(name: str) -> set[tuple[str, str | None]]:
+    sites: set[tuple[str, str | None]] = set()
+    for source in SRC.rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        enclosing = _enclosing_function_names(tree)
+        rel = source.relative_to(SRC).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _called_name(node.func) == name:
+                sites.add((rel, enclosing.get(id(node))))
+    return sites
+
+
+def test_run_state_writer_and_transaction_inventory_is_complete():
+    """Every publisher uses save_state, and every known RMW gesture holds state_lock.
+
+    Ablations: add ``save_state(run_dir, state)`` to a new production function, or
+    delete the outer ``state_lock`` from ``runs.restamp_code_root``; the respective
+    exact-set comparison reddens and names the changed site.
+    """
+    assert _production_call_sites("save_state") == SAVE_STATE_CALLERS
+    assert _production_call_sites("state_lock") == RUN_STATE_TRANSACTIONS
+
+
+def test_refusal_helper_inventory_is_complete():
+    """Every `_refuse_*`/`_reject_*` helper definition in the tree has a declared
+    row, in both directions. Review iteration 6 (and four bot rounds after it) kept
+    finding one shape by hand — a refusal landed with no test row, caught only by a
+    later review pass — and the journal-FIELD inventory beside this one is the gate
+    that caught `reaches_redrive`; this is the same gate for the refusal surface. A
+    row here is the PR-time decision, not the test itself: the helper's refusal
+    behavior still needs its own test landed with the row.
+
+    Anti-vacuity is structural, the exact-inventory property the rearm Counter
+    relies on: the declared side is non-empty, so a scan that stops finding
+    definitions reddens the staleness direction instead of passing green.
+
+    Graded as a Counter WITH multiplicity, not a set of names —
+    `ISOLATION_CONFLICT_CALLERS`' rationale, applied to definitions: a SECOND def
+    of a declared name in the same file (a platform-conditional twin, say) is a new
+    refusal body the emit reports twice, and a set comparison absorbed it silently
+    (measured). Every declared row's count is 1 today, which `Counter` over the set
+    encodes.
+
+    Ablation: delete the `refusaldef` emit and this reddens with all nine declared
+    rows stale; add `def _refuse_nothing()` to `runs.py` and this reddens naming
+    it; add a platform-conditional TWIN def of `_refuse_live_session` to `runs.py`
+    and the count comparison reddens with the set of names unchanged."""
+    findings = _of("refusaldef")
+    scanned = Counter((rel, name) for _, rel, _, _, name in findings)
+    declared = Counter(REFUSAL_HELPER_DEFS)
+    changed = {key for key in set(scanned) | set(declared) if scanned[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: {name} — {txt.strip()}"
+        for _, rel, ln, txt, name in findings
+        if (rel, name) in changed
+    ]
+    assert scanned == declared, (
+        "the `_refuse_*`/`_reject_*` helper definitions moved. A NEW helper — a "
+        "second same-named def in one file included — lands WITH its (file, name) "
+        "row and the test asserting what it refuses in the same PR; a helper no "
+        "module defines any more loses its row, which otherwise stands as a "
+        "pre-approval for the next helper that reuses the name:\n"
+        f"  scanned:  {sorted(scanned.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
+def test_isolation_conflict_refusal_sites_are_enumerated():
+    """The #414 refusal is reached from exactly the declared call sites, counted
+    WITH multiplicity — both the `bmadconfig.worktree_isolation_conflict` predicate
+    and its CLI wrapper `_reject_isolation_conflict`, so a new surface reaching the
+    pair through either spelling reddens this row. That is the `96aa09a9` shape:
+    `cmd_resolve`'s pre-session refusal landed as a wrapper call with no test row,
+    and nothing structural named the omission until a review pass did.
+
+    Multiplicity is load-bearing on today's tree — `cmd_resolve` legitimately calls
+    the wrapper twice, so a set of keys would absorb a third call there silently
+    (`test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function`
+    pins the counting itself).
+
+    Ablation: delete the `isolationcall` emit and this reddens (eleven declared,
+    zero scanned); add a third `_reject_isolation_conflict` call inside
+    `cmd_resolve` and the count comparison reddens naming the site."""
+    findings = _of("isolationcall")
+    sites = _isolation_callsite_counts(findings)
+    declared = Counter(ISOLATION_CONFLICT_CALLERS)
+    changed = {key for key in set(sites) | set(declared) if sites[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: in {fn or '<module>'} — {txt.strip()}"
+        for _, rel, ln, txt, fn in findings
+        if (rel, fn) in changed
+    ]
+    assert sites == declared, (
+        "the #414-family refusal call sites moved (worktree_isolation_conflict / "
+        "_reject_isolation_conflict). A new surface refusing the pair lands WITH "
+        "its own refusal test in the same PR; a removed one deletes its row — "
+        "update ISOLATION_CONFLICT_CALLERS only alongside that decision:\n"
+        f"  scanned:  {sorted(sites.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
 def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     """The routing invariant as a filter, in the two directions a finding can fail:
     a field name that neither ``diagnostics`` nor the benign inventory accounts for,
@@ -2196,11 +2933,10 @@ def _journal_field_offenders(findings) -> list[tuple[str, int, str, str]]:
     declared itself a hole.
 
     Routing is checked BY NAME first and then BY KIND, mirroring ``_scrub_entry``'s
-    own order rather than a flattened union of the two. A kind-scoped name — today
-    only ``target`` — is routed on its own kinds, declared benign on the
-    ``board-advance-*`` family that carries a sprint status under the same name, and
-    an offender everywhere else, INCLUDING at a call whose kind the scan could not
-    resolve. That is the case a by-name union got wrong in the dangerous direction:
+    own order rather than a flattened union of the two. A kind-scoped name is routed
+    only on its declared shapes and is an offender everywhere else unless that other
+    shape is explicitly benign. That includes a call whose kind the scan could not
+    resolve. `target` is the dangerous example: flattening it made
     ``journal.append("unit-merge-failed", target=branch)`` read as routed."""
     offenders: list[tuple[str, int, str, str]] = []
     for _, rel, ln, txt, (field, fn, kind) in findings:
@@ -2311,6 +3047,101 @@ def test_journal_kinds_are_literal_or_the_position_is_declared():
         "JOURNAL_DYNAMIC_KIND_ALLOW with what it journals:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_journal_kind_inventory_is_complete():
+    """Every literal journal kind a producer writes is a declared `JOURNAL_KINDS`
+    row, in both directions — the enumerate-vs-declare gate for the kind axis. The
+    ~196 literal kinds had no inventory at all: a new record kind could land, with
+    or without a test row, and only a later review pass would ask what covers it.
+    Now the question is asked by CI, at PR time, on the diff that introduces the
+    kind.
+
+    Both directions matter. A NEW kind fails the undeclared arm naming its file,
+    line and kind; a RENAME fails both arms at once — the new spelling undeclared,
+    the old row stale — so the old row cannot survive as a pre-approval for the
+    next kind that reuses it. The staleness arm's bound is stated on
+    `JOURNAL_KINDS`: it sees the union of producers, so one writer of a SHARED
+    kind can drop it without reddening anything while another still writes it.
+
+    A declared dynamic-kind position writes a parameter, so its kinds are read
+    where a literal reaches it — a caller's `kind="..."` keyword, or the parameter
+    default — by the emit's second arm (`JOURNAL_KINDS`' header); only the f-string
+    family is absent, by `JOURNAL_KINDS`' stated bound, and the sibling literalness
+    test above governs whether a POSITION may be dynamic at all. Consumer-side kind
+    parity — readers matching kinds by literal — stays DW-82's, out of scope here.
+
+    Anti-vacuity is structural: the declared set is non-empty, so deleting the
+    `journalkindliteral` emit reddens the staleness arm with the entire inventory
+    rather than passing green.
+
+    Both arms are graded from ONE scan in ONE assertion
+    (`_journal_kind_inventory_drift`): as two sequential asserts a rename reported
+    only the undeclared spelling, and the stale row surfaced a run later, after the
+    new row had landed (review pass 2).
+
+    Ablation: delete the `journalkindliteral` emit and this reddens with all 204
+    rows stale; duplicate engine.py's epic-boundary write under the kind
+    `"guard-ablation-probe"` and ONLY this test reddens, naming the kind and site;
+    add `self._skip_review_and_commit(task, kind="guard-ablation-probe")` to
+    engine.py and ONLY this test reddens, naming the call; rename engine.py's
+    `epic-boundary` write and the ONE failure names both the new spelling and the
+    stale row."""
+    undeclared, stale = _journal_kind_inventory_drift(_of("journalkindliteral"))
+    assert (undeclared, stale) == ([], set()), (
+        "the literal journal kinds and JOURNAL_KINDS disagree. A kind a producer "
+        "writes but no row declares — add its row IN THE SAME PR as what covers its "
+        "record: a diagnostics routing row if any field carries an identifier, a "
+        "path or free text, and the test asserting the record at the layer that "
+        "reads it; or drop the write. A row no producer writes any more — delete it "
+        "and retire its routing/test rows deliberately, because a stale row "
+        "pre-approves the next record that reuses the name:\n"
+        + "\n".join(
+            f"  undeclared {rel}:{ln}: {kind!r} — {txt.strip()}"
+            for rel, ln, txt, kind in undeclared
+        )
+        + ("\n" if undeclared and stale else "")
+        + "\n".join(f"  stale row: {kind!r}" for kind in sorted(stale))
+    )
+
+
+def _journal_kind_inventory_drift(
+    findings,
+) -> tuple[list[tuple[str, int, str, str]], set[str]]:
+    """Both arms of the kind inventory from one set of `journalkindliteral`
+    findings: the literal kinds written but undeclared (with their sites), and the
+    declared rows nothing writes any more. Returned together so the inventory test
+    can grade them in one assertion — a rename is one defect with two faces."""
+    scanned = {kind for _, _, _, _, kind in findings}
+    undeclared = [
+        (rel, ln, txt, kind) for _, rel, ln, txt, kind in findings if kind not in JOURNAL_KINDS
+    ]
+    return undeclared, JOURNAL_KINDS - scanned
+
+
+def test_journal_kind_inventory_drift_reports_a_rename_on_both_arms():
+    """A rename is one undeclared spelling AND one stale row, from the same findings.
+
+    Ablation: make `_journal_kind_inventory_drift` return the stale arm only when
+    the undeclared arm is empty (the sequential-assert shape) and this reddens."""
+    synthetic = [
+        ("journalkindliteral", "engine.py", 1, f'journal.append("{kind}")', kind)
+        for kind in sorted(JOURNAL_KINDS)
+        if kind != "epic-boundary"
+    ] + [
+        (
+            "journalkindliteral",
+            "engine.py",
+            7728,
+            'self.journal.append("epic-boundary-renamed", epic=e)',
+            "epic-boundary-renamed",
+        )
+    ]
+    undeclared, stale = _journal_kind_inventory_drift(synthetic)
+    assert [(rel, ln, kind) for rel, ln, _, kind in undeclared] == [
+        ("engine.py", 7728, "epic-boundary-renamed")
+    ]
+    assert stale == {"epic-boundary"}
 
 
 def test_journal_field_guard_actually_saw_the_producers():
@@ -3761,15 +4592,196 @@ def test_rearm_call_detector_stays_silent_on_non_calls(label, source):
     assert not found, f"the {label!r} shape produced a `rearmcall` finding:\n{source}"
 
 
+# The refusal-helper detector's matrix: `(label, source, expected def names)`. The
+# surface is DEFINITIONS — a new `_refuse_*`/`_reject_*` helper is a new refusal
+# behavior that must land with an inventory row and its own test — so calls,
+# lookalike prefixes and prose must all stay silent or the inventory fills with
+# noise it cannot force a decision about.
+REFUSAL_DEF_PROBES = [
+    (
+        "plain-def",
+        "def _refuse_live_session(project, run_id, verb):\n    return None\n",
+        {"_refuse_live_session"},
+    ),
+    (
+        "reject-spelling",
+        "def _reject_bad_run_id(run_id):\n    return None\n",
+        {"_reject_bad_run_id"},
+    ),
+    (
+        "async-def",
+        "async def _refuse_slow_probe(target):\n    return None\n",
+        {"_refuse_slow_probe"},
+    ),
+    # A method is a definition too — `engine.Engine._refuse_gated_story` is one of
+    # the nine rows the real tree declares.
+    (
+        "method-def",
+        "class Engine:\n    def _refuse_gated_story(self, story_key):\n        return None\n",
+        {"_refuse_gated_story"},
+    ),
+]
+REFUSAL_DEF_NON_PROBES = [
+    # A CALL is not a definition: call sites belong to each helper's own tests, and
+    # flagging them would report every use as a new refusal behavior.
+    ("call-not-a-def", 'def f():\n    _refuse_live_session(project, run_id, "stop")\n'),
+    # The prefix is `_refuse_`/`_reject_` WITH the trailing underscore: a name that
+    # merely starts `_refus` is not claiming to be a refusal helper.
+    ("similar-prefix", "def _refusal_note(story_key):\n    return None\n"),
+    # …and a public spelling makes no `_refuse_*` claim either.
+    ("public-spelling", "def refuse_everything():\n    return None\n"),
+    # Prose naming a helper is a Constant, not a def.
+    ("prose", 'def f():\n    """Calls _refuse_live_session first."""\n    return 1\n'),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "expected"), REFUSAL_DEF_PROBES, ids=[p[0] for p in REFUSAL_DEF_PROBES]
+)
+def test_refusal_def_detector_flags_every_definition_shape(label, source, expected):
+    """Each definition shape is found and reported by name. `runs.py` is passed
+    because nothing in this detector is file-scoped — the enumeration lives in the
+    tree-wide inventory test, not here.
+
+    Ablation: delete the `refusaldef` emit and every row here reddens."""
+    found = {f[4] for f in _scan_source(source, "runs.py") if f[0] == "refusaldef"}
+    assert found == expected, f"the {label!r} shape resolved to {sorted(found)}:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), REFUSAL_DEF_NON_PROBES, ids=[p[0] for p in REFUSAL_DEF_NON_PROBES]
+)
+def test_refusal_def_detector_stays_silent_on_lookalikes(label, source):
+    """A call, a lookalike prefix, a public spelling and prose are not refusal-helper
+    definitions. The inventory is an equality assertion, so a false positive fails as
+    loudly as a miss.
+
+    Ablation: widen the emit's prefix match to `_refus` and the similar-prefix row
+    reddens."""
+    found = [f for f in _scan_source(source, "runs.py") if f[0] == "refusaldef"]
+    assert not found, f"the {label!r} shape produced a `refusaldef` finding:\n{source}"
+
+
+# The #414-family call detector's matrix: `(label, source, expected enclosing
+# function)`. Both spellings of the refusal are probed — the `bmadconfig` predicate
+# and the rc-returning CLI wrapper — because a new surface can reach the pair
+# through either, and the `96aa09a9` site (cmd_resolve's pre-session arm) arrived
+# through the wrapper.
+ISOLATION_CALL_PROBES = [
+    (
+        "qualified-predicate-call",
+        "def cmd_validate(args):\n"
+        "    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)\n",
+        "cmd_validate",
+    ),
+    (
+        "bare-wrapper-call",
+        "def cmd_run(args):\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n",
+        "cmd_run",
+    ),
+    # A rename-on-import and an assignment alias are just as callable — the
+    # `_call_aliases` shapes, one per guarded name.
+    (
+        "renamed-predicate-import",
+        "from .bmadconfig import worktree_isolation_conflict as conflict_for\n"
+        "def f(args):\n"
+        "    conflict_for(paths, isolation)\n",
+        "f",
+    ),
+    (
+        "assigned-wrapper-alias",
+        "check = _reject_isolation_conflict\ndef f(args):\n    check(paths, pol)\n",
+        "f",
+    ),
+]
+ISOLATION_CALL_NON_PROBES = [
+    # The definitions are not calls. The wrapper's own predicate call is a real
+    # finding on today's tree — `("cli.py", "_reject_isolation_conflict")` is a row
+    # of the declared Counter — so the bodies here are stubs on purpose.
+    (
+        "predicate-definition",
+        "def worktree_isolation_conflict(paths, isolation):\n    return None\n",
+    ),
+    ("wrapper-definition", "def _reject_isolation_conflict(paths, pol):\n    return None\n"),
+    # A different function whose name merely embeds the guarded one.
+    ("similar-name", "def f():\n    worktree_isolation_conflicts(paths)\n"),
+    ("reference-not-a-call", "def f():\n    handler = bmadconfig.worktree_isolation_conflict\n"),
+    (
+        "prose",
+        'def f():\n    """bmadconfig.worktree_isolation_conflict(paths, mode) decides."""\n'
+        "    return 1\n",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "fn"), ISOLATION_CALL_PROBES, ids=[p[0] for p in ISOLATION_CALL_PROBES]
+)
+def test_isolation_call_detector_reports_the_site(label, source, fn):
+    """Each call shape is found and attributed to its enclosing function — the key
+    the declared Counter is built on. `cli.py` is passed because nothing in this
+    detector is file-scoped.
+
+    Ablation: delete the `isolationcall` emit and every row here reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert len(found) == 1, f"the {label!r} shape produced {len(found)} findings:\n{source}"
+    assert found[0][4] == fn, f"the {label!r} shape attributed to {found[0][4]!r}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), ISOLATION_CALL_NON_PROBES, ids=[p[0] for p in ISOLATION_CALL_NON_PROBES]
+)
+def test_isolation_call_detector_stays_silent_on_non_calls(label, source):
+    """Definitions, a similarly-named neighbour, a bare reference and prose are not
+    call sites. The tree-wide assertion is a Counter equality, so a false positive
+    fails as loudly as a miss.
+
+    Ablation: relax `_names_guarded_verify_call`'s name equality to a substring
+    match and the similar-name row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert not found, f"the {label!r} shape produced an `isolationcall` finding:\n{source}"
+
+
+def _isolation_callsite_counts(findings) -> Counter:
+    """Call-site multiplicity, not just distinct enclosing functions — the
+    `_rearm_callsite_counts` idiom, and load-bearing on the real tree:
+    `cli.cmd_resolve` legitimately calls the wrapper twice."""
+    return Counter((rel, fn) for _, rel, _, _, fn in findings)
+
+
+def test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function():
+    """Ablation: collapse `_isolation_callsite_counts` to a set of keys and this
+    reddens — `cmd_resolve` would then absorb a third call silently."""
+    source = (
+        "def cmd_resolve(args):\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n"
+        "    if (rc := _reject_isolation_conflict(paths, pol)) is not None:\n"
+        "        return rc\n"
+    )
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "isolationcall"]
+    assert _isolation_callsite_counts(found) == Counter({("cli.py", "cmd_resolve"): 2})
+
+
 # The journal detector's probe matrix, as `(label, source, expected)` where
 # `expected` is the exact set of field names the scan must extract — `None` standing
 # for an unresolvable splat. Asserting the SET rather than "something was found" is
 # what makes a partial splat resolution fail here instead of quietly under-reporting.
 JOURNAL_FIELD_PROBES = [
-    # The three receiver spellings in the tree.
+    # The four receiver spellings in the tree.
     ("self-journal", 'self.journal.append("k", story_key=s, patch=p)\n', {"story_key", "patch"}),
     ("bare-journal", 'journal.append("k", branch=b)\n', {"branch"}),
     ("private-journal", "self._journal.append(kind, plugin=name)\n", {"plugin"}),
+    # The constructor-inline spelling `Journal(run_dir).append(...)` — three live
+    # sites in runs.py use it, and the receiver is an ast.Call, so the named-handle
+    # match alone left them (and their kinds and fields) entirely unscanned.
+    (
+        "constructor-inline-receiver",
+        'def f(run_dir):\n    Journal(run_dir).append("k", pid=1)\n',
+        {"pid"},
+    ),
     # A splat resolved through the literal stores that build it, in both store
     # shapes and across the conditional-dict form `engine._run_inner` uses.
     (
@@ -3894,6 +4906,10 @@ JOURNAL_FIELD_NON_PROBES = [
     # the most common in the language, so anchoring on the receiver is load-bearing.
     ("list-append", "results.append(SessionResult(status=s, stop_seen=True))\n"),
     ("attribute-list-append", "self.entries.append(dict(kind=k, story_key=s))\n"),
+    # A constructor that merely ends in a `.append` is not a journal write unless
+    # the constructed thing IS a Journal — the constructor arm is name-anchored
+    # exactly like the handle arm.
+    ("constructor-lookalike", 'NotAJournal(run_dir).append("k", pid=1)\n'),
     # A journal write with no fields at all produces nothing to route.
     ("kind-only", 'self.journal.append("run-start")\n'),
     # Prose naming the call is a Constant, not a Call.
@@ -4051,6 +5067,225 @@ def test_journal_kind_probes_flag_a_non_literal_kind():
         assert not [f for f in _scan_source(source, "sweep.py") if f[0] == "journalkind"], source
 
 
+def test_journal_kind_literal_probes_extract_the_kind():
+    """The kind inventory's detector half: a journal write whose kind IS a string
+    literal emits that kind — including a kind-only write (`run-complete` and three
+    siblings), which the FIELD detector never reports because there is no keyword
+    to carry it, and a declared forwarder's call site, whose kind would otherwise
+    stop at `plugins/bus.py::_log`'s wall.
+
+    Ablation: delete the `journalkindliteral` emit and every row here reddens."""
+    for source, rel, kind in (
+        (
+            'def f(self):\n    self.journal.append("run-start", story_key=s)\n',
+            "sweep.py",
+            "run-start",
+        ),
+        # The kind-only shape: no keywords, so no `journalfield` finding exists to
+        # derive the kind from — this emit is the only reader.
+        ('def f(self):\n    journal.append("run-complete")\n', "engine.py", "run-complete"),
+        (
+            'def f(self):\n    self._journal.append("plugin-loaded", plugin=name)\n',
+            "plugins/registry.py",
+            "plugin-loaded",
+        ),
+        ('def f(self):\n    self._log("plugin-hook", rc=rc)\n', "plugins/bus.py", "plugin-hook"),
+        # The kinds a declared dynamic-kind POSITION receives from outside it: the
+        # literal `kind=` a caller hands it, and the position's own parameter
+        # default — keyword-only (`engine._skip_review_and_commit`) or
+        # positional-or-keyword (`sweep._close_bundle_ledger_when_spec_status`).
+        # The write inside spells a parameter, so nothing else reads these.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, kind="review-skipped-awaiting-operator")\n',
+            "engine.py",
+            "review-skipped-awaiting-operator",
+        ),
+        (
+            'def _skip_review_and_commit(self, task, *, kind="review-skipped"):\n'
+            "    self.journal.append(kind, story_key=s)\n",
+            "engine.py",
+            "review-skipped",
+        ),
+        (
+            "def _close_bundle_ledger_when_spec_status(self, task, spec_file, status, "
+            'kind="sweep-bundle-closed"):\n    return None\n',
+            "sweep.py",
+            "sweep-bundle-closed",
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == [kind], f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
+    """The complement: a non-literal kind (the literalness test's territory), an
+    `.append` on a non-journal receiver, a forwarder NAME outside its declared
+    file, and prose are all silent — the inventory must not fill itself with
+    strings that never reach `Journal.append`.
+
+    Ablation: drop `_is_journal_write`'s receiver anchor (accept any `.append`) and
+    the list-append row reddens."""
+    for source, rel in (
+        ("def f(self):\n    self.journal.append(kind, story_key=s)\n", "sweep.py"),
+        (
+            'def f(self):\n    self.journal.append(f"{family}-pruned", count=n)\n',
+            "recovery_flow.py",
+        ),
+        ('def f(self):\n    results.append("done")\n', "sweep.py"),
+        ('def f(self):\n    self._log("plugin-hook", rc=rc)\n', "stories_engine.py"),
+        (
+            'def f():\n    """journal.append("prose-kind") is described here."""\n    return 1\n',
+            "sweep.py",
+        ),
+        # The forwarder-kind arm is keyed `(file, name)` like the position it
+        # serves: the same call in a file that declares no such position, a
+        # `kind=` keyword on an undeclared callee, and a non-string default on its
+        # def are all silent.
+        (
+            'def f(self):\n    self._skip_review_and_commit(task, kind="review-skipped")\n',
+            "sweep.py",
+        ),
+        ('def f(self):\n    self.emit(kind="review-skipped")\n', "engine.py"),
+        ("def _skip_review_and_commit(self, task, *, kind=None):\n    return None\n", "engine.py"),
+    ):
+        assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+    # The one shape here that is NOT silent, and used to be. A non-literal `kind=` AT
+    # a declared position is unresolvable rather than absent: `JOURNAL_DYNAMIC_KIND_ALLOW`
+    # waives the literalness test for the write inside, so the inventory is the only
+    # arm left that can fail loud on it.
+    #
+    # Ablation: return None instead of the sentinel for a non-literal `kind=` and this
+    # reddens.
+    unresolvable = [
+        f[4]
+        for f in _scan_source(
+            "def f(self):\n    self._skip_review_and_commit(task, kind=chosen)\n", "engine.py"
+        )
+        if f[0] == "journalkindliteral"
+    ]
+    assert unresolvable == [UNRESOLVED_DYNAMIC_KIND], unresolvable
+
+
+# The declared position whose `kind` is positional-or-keyword, with NO default, so the
+# definition arm contributes nothing and each row's only finding is the one the
+# positional arm read. `self` is dropped from the parameter list because a bound call
+# never fills its slot — the offset this arm has to get right.
+_POSITIONAL_KIND_DEF = (
+    "def _close_bundle_ledger_when_spec_status(self, task, spec_file, status, kind):\n"
+    "    self.journal.append(kind, story_key=s)\n"
+    "\n"
+)
+
+
+def test_journal_kind_literal_reads_a_positional_dynamic_kind():
+    """A literal handed a declared dynamic-kind position POSITIONALLY is inventoried,
+    not just a `kind=` keyword.
+
+    `sweep._close_bundle_ledger_when_spec_status(task, spec, status, "new-kind")` is
+    legal Python — `kind` is positional-or-keyword — and reached the journal with no
+    `JOURNAL_KINDS` row anyone had to decide on: the arm read `node.keywords` only, so
+    the kind was never graded and the inventory reported itself complete. The three
+    ways a literal reaches such a position (keyword, POSITIONAL, parameter default) now
+    all feed the same emit.
+
+    The unresolvable row is the fail-loud half: a `*args` splat covering the slot yields
+    a kind no row can declare, so the inventory reddens naming the site instead of
+    sharing its silence with "this call passed no literal".
+
+    Ablation: restore the `for kw in node.keywords` loop as the arm's only reader and
+    the first row reddens; delete the `ast.Starred` branch and the second does."""
+    for source, rel, kinds in (
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, "sweep-bundle-closed")\n',
+            "sweep.py",
+            ["sweep-bundle-closed"],
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(*rest, "sweep-bundle-closed")\n',
+            "sweep.py",
+            [UNRESOLVED_DYNAMIC_KIND],
+        ),
+    ):
+        found = [f[4] for f in _scan_source(source, rel) if f[0] == "journalkindliteral"]
+        assert found == kinds, f"extracted {found} from:\n{source}"
+
+
+def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
+    """The complement, in the four directions the positional arm must not invent a kind:
+    a KEYWORD-ONLY `kind` (no positional slot exists, so a string in that argument
+    position is some other parameter's), an EMPTY slot (the parameter default, which the
+    definition arm reports instead — `sweep.py`'s own
+    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)` call
+    relies on it, so flagging an omitted `kind` would redden the clean tree), the same
+    call in a file declaring no such position, and a declared FORWARDER whose positional
+    kind the journal-write emit already reports — double-reporting one site would make a
+    `found == [kind]` probe redden for a reason that is not a defect.
+
+    A slot OCCUPIED by a non-literal is the direction that is deliberately not here: it
+    is asserted RED below, because the literalness test that would otherwise catch it is
+    waived at a declared position.
+
+    Ablation: drop the `_is_journal_write` guard and the forwarder row reddens with two
+    findings; key `kind_positions` by name alone and the wrong-file row reddens; fold the
+    empty slot into `UNRESOLVED_DYNAMIC_KIND` and the omitted-`kind` row reddens."""
+    for source, rel in (
+        (
+            "def _skip_review_and_commit(self, task, *, kind):\n"
+            "    self.journal.append(kind, story_key=s)\n"
+            "\n"
+            "def caller(self):\n"
+            '    self._skip_review_and_commit(task, "review-skipped")\n',
+            "engine.py",
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            "    self._close_bundle_ledger_when_spec_status(task, spec, status)\n",
+            "sweep.py",
+        ),
+        (
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            '    self._close_bundle_ledger_when_spec_status(task, spec, status, "sweep-bundle-closed")\n',
+            "stories_engine.py",
+        ),
+    ):
+        assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+    # The slot this arm used to share with "no literal passed": OCCUPIED by a
+    # non-literal. `JOURNAL_DYNAMIC_KIND_ALLOW` waives the literalness test for the
+    # write inside the position, so the inventory is the only arm that can fail loud —
+    # and it stayed green while a variable carrying an undeclared kind reached the
+    # journal.
+    #
+    # Ablation: return None instead of the sentinel for a non-literal slot and this
+    # reddens.
+    unresolvable = [
+        f[4]
+        for f in _scan_source(
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            "    self._close_bundle_ledger_when_spec_status(task, spec, status, chosen)\n",
+            "sweep.py",
+        )
+        if f[0] == "journalkindliteral"
+    ]
+    assert unresolvable == [UNRESOLVED_DYNAMIC_KIND], unresolvable
+
+    # The forwarder: exactly one finding, from the journal-write emit, not two.
+    forwarder = (
+        "def _log(self, kind, **fields):\n"
+        "    self._journal.append(kind, **fields)\n"
+        "\n"
+        "def caller(self):\n"
+        '    self._log("plugin-hook", rc=rc)\n'
+    )
+    found = [
+        f[4] for f in _scan_source(forwarder, "plugins/bus.py") if f[0] == "journalkindliteral"
+    ]
+    assert found == ["plugin-hook"], found
+
+
 def test_journal_routing_tables_are_read_from_diagnostics():
     """`JOURNAL_ROUTED_FIELDS` and `JOURNAL_KIND_ROUTED_FIELDS` are built from the
     live `diagnostics` tables, not copied, so the guard cannot drift from the module
@@ -4063,19 +5298,25 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         diagnostics._JOURNAL_KEYLIST_FIELDS,
     ):
         assert set(table) <= JOURNAL_ROUTED_FIELDS
-    assert JOURNAL_KIND_ROUTED_FIELDS == {
-        kind: frozenset(row) for kind, row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.items()
-    }
+    expected_kind_routing: dict[str, frozenset[str]] = {}
+    for table in JOURNAL_KIND_ROUTING_TABLES:
+        for kind, row in table.items():
+            expected_kind_routing[kind] = expected_kind_routing.get(kind, frozenset()) | frozenset(
+                row
+            )
+    assert JOURNAL_KIND_ROUTED_FIELDS == expected_kind_routing
     # …and the kind-scoped names are deliberately NOT in the by-name union. This is
     # the assertion that would have caught the flattening: `target` routed by name
     # says the board-advance family is covered when `_scrub_entry` does not cover it.
-    for row in diagnostics._JOURNAL_KIND_ALIAS_FIELDS.values():
-        assert not set(row) & JOURNAL_ROUTED_FIELDS, (
-            "a kind-scoped field name leaked into the by-name routed union; "
-            "`_scrub_entry` consults `_JOURNAL_KIND_ALIAS_FIELDS` per kind, so a "
-            "by-name claim about it is false on every other kind"
-        )
-    # `_JOURNAL_KIND_SCHEMAS` is the FOURTH table `_scrub_entry` consults, and it was
+    for table in JOURNAL_KIND_ROUTING_TABLES:
+        for row in table.values():
+            assert not set(row) & JOURNAL_ROUTED_FIELDS, (
+                "a kind-scoped field name leaked into the by-name routed union; "
+                "`_scrub_entry` consults its kind tables per kind, so a by-name "
+                "claim about it is false on every other kind"
+            )
+    # `_JOURNAL_KIND_SCHEMAS` is the fail-closed schema table `_scrub_entry` consults,
+    # and it was
     # coupled to this guard by prose alone: deleting its `preference-escalation` row
     # left every assertion here green while the fail-closed arm stopped running and
     # `customer="AcmeVault"` went back to shipping verbatim (measured). Read it here

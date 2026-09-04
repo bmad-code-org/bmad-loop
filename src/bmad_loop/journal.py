@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,7 @@ from .platform_util import (
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
+    file_lock,
     is_link_like,
     open_dir_confined,
 )
@@ -76,6 +80,8 @@ TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ("result.json", "escalation.json")
 # them to keep its static call-site scan from calling them dead. Both import this
 # name; neither restates the pair.
 SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
+
+_STATE_LOCK_LOCAL = threading.local()
 
 
 class Journal:
@@ -217,12 +223,64 @@ class Journal:
         return out
 
 
+@contextmanager
+def state_lock(run_dir: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Serialize one run's state mutations, re-entering only for the same run.
+
+    ``blocking=False`` gives up instead of waiting, raising
+    :class:`platform_util.LockUnavailableError` when another holder has the run.
+    It is for a caller whose own semantics already say "in use ⇒ leave it alone"
+    and which must not stall on one busy run — ``cli.cmd_clean`` sweeping many.
+    The default stays blocking, because every other writer here is mutating one
+    run it means to mutate, and for those giving up is data loss, not politeness.
+    That error propagates out of this function UNCAUGHT and unwrapped: the whole
+    point is that the caller gets to tell contention apart from a real fault, and
+    a translation here would take that back.
+
+    The sidecar identity comes from :func:`runs.lock_path_for`, so alternate path
+    spellings of one ``state.json`` rendezvous on the same out-of-tree lock.  The
+    import is deliberately lazy: ``runs`` imports this module's persistence helpers.
+
+    Reentrancy is thread-local and intentionally limited to one run.  An outer
+    read-modify-write transaction can call the self-locking :func:`save_state`
+    without acquiring the OS lock twice, while nested mutation of another run is
+    refused before a second lock can introduce an ordering cycle.  A re-entrant
+    acquisition ignores ``blocking`` because it acquires nothing: this thread
+    already holds the run, so there is no one to wait for and nothing to refuse.
+    """
+    from . import runs
+
+    lock_path = runs.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    held_path = getattr(_STATE_LOCK_LOCAL, "path", None)
+    if held_path is not None:
+        if held_path != lock_path:
+            raise RuntimeError(
+                f"cannot nest run-state locks for different runs: {held_path} then {lock_path}"
+            )
+        _STATE_LOCK_LOCAL.depth += 1
+        try:
+            yield
+        finally:
+            _STATE_LOCK_LOCAL.depth -= 1
+        return
+
+    with file_lock(lock_path, blocking=blocking):
+        _STATE_LOCK_LOCAL.path = lock_path
+        _STATE_LOCK_LOCAL.depth = 1
+        try:
+            yield
+        finally:
+            del _STATE_LOCK_LOCAL.depth
+            del _STATE_LOCK_LOCAL.path
+
+
 def save_state(run_dir: Path, state: RunState) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    target = run_dir / STATE_FILE
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-    atomic_replace(tmp, target)
+    with state_lock(run_dir):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        target = run_dir / STATE_FILE
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+        atomic_replace(tmp, target)
 
 
 def load_state(run_dir: Path) -> RunState:

@@ -6,6 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import subprocess
+import sys
 
 import pytest
 from conftest import git, make_git_noisy, refuse_to_resolve
@@ -115,6 +116,50 @@ def test_worktree_list_reads_stdout_alone(project, monkeypatch):
     monkeypatch.setattr(verify.subprocess, "run", noisy_run)
 
     assert [p.resolve() for p in verify.worktree_list(repo)] == [repo.resolve()]
+
+
+@pytest.mark.parametrize("answer", ["git version 2.34.1", "no version reported"])
+def test_worktree_list_keeps_the_newline_parse_below_git_2_36(
+    project, tmp_path, monkeypatch, answer
+):
+    """`worktree list --porcelain -z` is a git 2.36 switch; the 2.34 support floor
+    rejects it (`error: unknown switch `z'`, exit 129 — measured on Ubuntu 22.04's
+    stock 2.34.1). Gated the other way every isolated-task resume reached
+    `worktree_is_registered`, got a `GitError`, and escalated instead of reopening
+    its recorded mount, and orphan reconciliation silently skipped its cleanup.
+    An unreadable version answer takes the same arm: the generous failure here is
+    the parse that works everywhere, not the one that needs the newer git.
+
+    Ablation: make the `nul` gate unconditionally True and the argv assertion
+    reddens; split on `\\0` regardless of the gate and the listing reddens."""
+    repo = project.project
+    wt = tmp_path / "plain"
+    verify.worktree_add(repo, wt, "plain-path", "main")
+    monkeypatch.setattr(verify, "git_below_floor", lambda _repo, _floor: answer)
+    real = verify._run_git
+    seen: list[list[str]] = []
+
+    def spy(args, cwd, **kw):
+        seen.append(list(args))
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+
+    listed = [path.resolve() for path in verify.worktree_list(repo)]
+
+    assert seen and "-z" not in seen[-1] and "--porcelain" in seen[-1]
+    assert listed == [repo.resolve(), wt.resolve()]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Win32 forbids newlines in filenames")
+def test_worktree_list_preserves_newlines_in_paths(project, tmp_path):
+    """NUL-delimited porcelain keeps a valid newline inside one path record."""
+    repo = project.project
+    wt = tmp_path / "wt\nline"
+    verify.worktree_add(repo, wt, "newline-path", "main")
+
+    assert wt.resolve() in [path.resolve() for path in verify.worktree_list(repo)]
+    assert verify.worktree_is_registered(repo, wt)
 
 
 def test_worktree_add_create_defaults_to_head(project, tmp_path):

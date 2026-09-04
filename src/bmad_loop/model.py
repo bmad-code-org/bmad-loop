@@ -256,9 +256,6 @@ class StoryTask:
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
-    # `append_entry` kwargs for review-budget follow-ups this task filed into the
-    # ACTIVE workspace's ledger, which under isolation is the unit worktree's.
-    refiled_followups: list[dict[str, Any]] = field(default_factory=list)
     # Deferred-work ids a story DECLARED it closes (`closes_deferred:`), recorded at
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
@@ -307,20 +304,6 @@ class StoryTask:
     # owes, and nothing re-derives it once the session that wrote the spec is
     # gone).
     operator_actions: list[str] = field(default_factory=list)
-    # Whether THIS dev phase was in a position to newly elect a park: captured
-    # once, on the fresh entry into `Engine._dev_phase` (`resume_result is None`),
-    # from the same instant and the same condition as `baseline_commit` — so the
-    # expectation and the diff it guards share one anchor. False when the bound
-    # spec was ALREADY at `awaiting-operator` on entry (an earlier attempt's park
-    # is on disk, so a park observed afterwards may be inherited rather than
-    # elected), when parking is disabled, or when the spec could not be read at
-    # all (fail closed). It gates exactly one thing: `verify_dev`'s proof-of-work
-    # skip on the park leg (#335, #676). Every other park gate still selects on the
-    # observed status alone, so an ineligible park with a real diff still passes.
-    # Deliberately per-PHASE, not per-attempt: a fixable repair keeps the previous
-    # session's tree, so re-observing would make every repair of a malformed park
-    # ineligible and fail it on the gate it just re-armed.
-    park_eligible: bool = False
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -455,7 +438,6 @@ class StoryTask:
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
-            "refiled_followups": self.refiled_followups,
             "story_closes_intended": self.story_closes_intended,
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
@@ -470,7 +452,6 @@ class StoryTask:
             ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
-            "park_eligible": self.park_eligible,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -591,6 +572,30 @@ class StoryTask:
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
 
+    def relativize_project_local_accepted_spec(self, project: Path) -> None:
+        """Make a canonical project-local accepted spec portable to a worktree.
+
+        Only the accepted ``spec_file`` is normalized. Prior-attempt dispatch path
+        and snapshot fields remain byte-for-byte untouched until fresh attempt
+        binding replaces them after the mount opens. Relative values already carry
+        the intended authority, while external, missing, unresolvable, and
+        symlink-external absolute values keep their original spelling. Resolving
+        both sides before containment prevents a lexical in-project path through an
+        outward symlink from being redirected into a replacement checkout.
+        """
+        raw = self.spec_file
+        if not raw or not Path(raw).is_absolute():
+            return
+        try:
+            project_root = project.resolve(strict=True)
+            target = Path(raw).resolve(strict=True)
+            relative = target.relative_to(project_root)
+        except (OSError, RuntimeError, ValueError):
+            return
+        if not target.is_file():
+            return
+        self.spec_file = relative.as_posix()
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
         dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")
@@ -640,7 +645,6 @@ class StoryTask:
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
-            refiled_followups=[deepcopy(dict(item)) for item in d.get("refiled_followups", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
             board_advance_intended=(
                 str(d["board_advance_intended"])
@@ -659,19 +663,6 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
-            # `is True`, not `bool(...)`, and this is the one field on this task
-            # where the difference is load-bearing. Every sibling bool above
-            # merely restores bookkeeping; this one AUTHORIZES a gate to be
-            # waived, so its failure direction is not symmetric — a wrong False
-            # costs one retryable proof-of-work refusal, a wrong True re-opens
-            # the inheritance hole the field exists to close (#335, #676). Under
-            # `bool()` every truthy non-boolean grants the waiver, and the
-            # likeliest one is the string "false" (a hand-edited state.json, a
-            # bridge that stringifies JSON scalars): `bool("false")` is True.
-            # Only a real JSON `true` may authorize; anything else — absent,
-            # null, a string, a number — fails closed onto the ordinary gated
-            # path, where an honest park with a real diff still passes.
-            park_eligible=d.get("park_eligible") is True,
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
@@ -705,6 +696,18 @@ class RunState:
     # `project`, which is exactly the pre-upgrade behavior and the correct answer
     # for every run without the override.
     repo_root: str = ""
+    # Intent marker for `runs.restamp_code_root`: True from the atomic state write
+    # that moved `repo_root` until the `rearm-code-root-restamped` journal record
+    # for that move has landed. state.json and the journal are two files with no
+    # transaction across them, so the move and its record cannot be made durable
+    # in one step; this flag rides the state write itself, which is what lets a
+    # retry tell "moved and recorded" from "moved, record still owed" — the one
+    # distinction that keeps the record retryable without ever asserting a move
+    # that was not persisted. Consumed by whichever surface retries first: a second
+    # `restamp_code_root` writes its own record, and a plain `resume` folds the
+    # move into its `run-resume` line. Deliberately absent from `documents.py`'s `--json`
+    # projection (schema 1), like `rearmed` / `resolved_redrive`.
+    code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -837,6 +840,7 @@ class RunState:
             "run_id": self.run_id,
             "project": self.project,
             "repo_root": self.repo_root,
+            "code_root_restamp_pending": self.code_root_restamp_pending,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -868,6 +872,7 @@ class RunState:
             run_id=d["run_id"],
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
+            code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
@@ -958,6 +963,13 @@ class VerifyOutcome:
     # A waived gate is recorded whatever the probe managed to say; `None` is a
     # truthful field value, not a reason to withhold the record.
     park_zero_diff: bool | None = None
+    # Stories plan halts waive the same proof-of-work gate for a different
+    # reason: the accepted output is the plan spec itself. Keep their observation
+    # independent of the park-only pair above — the result.json `plan_halt`
+    # marker remains the authority for which leg ran, while this field reports
+    # only what the waived gate would have found. `True` / `False` / `None` have
+    # the same no-diff / diff / unknown meanings as `park_zero_diff`.
+    plan_halt_zero_diff: bool | None = None
 
     @classmethod
     def passed(
@@ -965,11 +977,13 @@ class VerifyOutcome:
         *,
         park_proof_skipped: bool = False,
         park_zero_diff: bool | None = None,
+        plan_halt_zero_diff: bool | None = None,
     ) -> "VerifyOutcome":
         return cls(
             ok=True,
             park_proof_skipped=park_proof_skipped,
             park_zero_diff=park_zero_diff,
+            plan_halt_zero_diff=plan_halt_zero_diff,
         )
 
     @classmethod

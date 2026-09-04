@@ -7,8 +7,8 @@ import os
 import pytest
 from conftest import install_bmad_config, machine_json
 
-from bmad_loop import cli, runs, verify
-from bmad_loop.journal import VERIFY_DIR, save_state
+from bmad_loop import cli, platform_util, runs, verify
+from bmad_loop.journal import STATE_FILE, VERIFY_DIR, save_state
 from bmad_loop.model import RunState
 
 
@@ -454,6 +454,177 @@ def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, mo
     assert doc["trimmed"] == ["20260101-000000-aaaa"]
     assert doc["protected"] == []
     assert doc["archived"] == [] and doc["deleted"] == []
+
+
+@pytest.mark.parametrize(
+    "hard, helper_name, result_key, other_key",
+    [
+        (False, "archive_run", "archived", "deleted"),
+        (True, "delete_run", "deleted", "archived"),
+    ],
+)
+def test_cmd_clean_json_records_a_resumed_engine_and_continues_siblings(
+    project, monkeypatch, capsys, hard, helper_name, result_key, other_key
+):
+    """A runs-layer lifecycle refusal is per-run data, never a partial JSON
+    document or an abort that prevents later candidates from being reclaimed."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    sibling = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
+    for run_dir in (racer, sibling):
+        save_state(
+            run_dir,
+            RunState(run_id=run_dir.name, project=str(repo), started_at="x", finished=True),
+        )
+    real_cleanup = getattr(runs, helper_name)
+
+    def racing_cleanup(project_path, run_dir, **kw):
+        if run_dir == racer:
+            raise runs.LiveEngineError("engine resumed")
+        return real_cleanup(project_path, run_dir, **kw)
+
+    monkeypatch.setattr(runs, helper_name, racing_cleanup)
+
+    extra = ("--hard",) if hard else ()
+    doc = _clean_json(repo, capsys, "--retain", "0", *extra)
+
+    assert doc["protected"] == [racer.name]
+    assert doc[result_key] == [sibling.name]
+    assert doc[other_key] == []
+    assert racer.is_dir() and not sibling.exists()
+
+
+def test_cmd_clean_text_identifies_a_resumed_engine(project, monkeypatch, capsys):
+    """Text mode distinguishes an engine resume from an agent-session race."""
+    install_bmad_config(project)
+    repo = project.project
+    racer = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(
+        racer,
+        RunState(run_id=racer.name, project=str(repo), started_at="x", finished=True),
+    )
+
+    def racing_archive(_project, _run_dir, **_kw):
+        raise runs.LiveEngineError("engine resumed")
+
+    monkeypatch.setattr(runs, "archive_run", racing_archive)
+
+    assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
+
+    _out, err = capsys.readouterr()
+    assert f"run {racer.name}: engine resumed mid-clean — not removed" in err
+    assert "agent session appeared mid-clean" not in err
+
+
+def _terminal_runs(repo, *names):
+    """Terminal (finished) run dirs, created in the order given."""
+    made = []
+    for name in names:
+        run_dir = repo / ".bmad-loop" / "runs" / name
+        save_state(
+            run_dir,
+            RunState(run_id=run_dir.name, project=str(repo), started_at="x", finished=True),
+        )
+        made.append(run_dir)
+    return made
+
+
+@pytest.mark.parametrize(
+    "hard, result_key, other_key",
+    [(True, "deleted", "archived"), (False, "archived", "deleted")],
+)
+def test_cmd_clean_json_records_a_lock_held_run_and_still_sweeps_its_siblings(
+    project, capsys, hard, result_key, other_key
+):
+    """A run whose state lock someone else holds is per-run data, exactly as the
+    lifecycle refusals above it are — the sweep must not abort on it.
+
+    THIS is the assertion that characterises the defect, not the single-run one:
+    every list `clean` reports reaches the operator only in the post-loop
+    emission, so an acquisition error escaping the per-candidate handler costs
+    the report of the whole invocation, including siblings it had ALREADY
+    deleted. The contended run therefore sits BETWEEN two siblings
+    (`list_run_dirs` is sorted oldest-first), so a passing run proves the sweep
+    continued past it rather than merely started before it.
+
+    The contention is real — the run's own canonical sidecar, held across the
+    whole invocation — and carries no timing dependence: `cmd_clean` acquires
+    with `wait_for_lock=False`, so the rival attempt is refused at once instead
+    of waiting. It is taken through `platform_util.file_lock` rather than
+    `journal.state_lock` deliberately: `state_lock`'s reentrancy guard is
+    thread-local, so acquiring it here would make `cmd_clean` RE-ENTER the lock
+    it already holds and reclaim the run, passing for the wrong reason.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    early, held, late = _terminal_runs(
+        repo,
+        "20260101-000000-aaaa",
+        "20260101-000001-bbbb",
+        "20260101-000002-cccc",
+    )
+    lock_path = runs.lock_path_for(held / STATE_FILE, follow_final_symlink=False)
+    extra = ("--hard",) if hard else ()
+
+    with platform_util.file_lock(lock_path):
+        doc = _clean_json(repo, capsys, "--retain", "0", *extra)
+
+    # `_clean_json` is the document assertion: rc 0, stdout parses whole, stderr empty
+    assert doc["protected"] == [held.name]
+    assert doc[result_key] == [early.name, late.name]  # the run AFTER it too
+    assert doc[other_key] == []
+    assert held.is_dir() and not early.exists() and not late.exists()
+
+
+def test_cmd_clean_text_names_a_lock_held_run_and_keeps_its_siblings(project, capsys):
+    """Text mode tells a held lock apart from the two races it is classified
+    with, and still reports the siblings it reclaimed around it."""
+    install_bmad_config(project)
+    repo = project.project
+    early, held, late = _terminal_runs(
+        repo,
+        "20260101-000000-aaaa",
+        "20260101-000001-bbbb",
+        "20260101-000002-cccc",
+    )
+    lock_path = runs.lock_path_for(held / STATE_FILE, follow_final_symlink=False)
+
+    with platform_util.file_lock(lock_path):
+        rc = cli.cmd_clean(_clean_args(repo, retain=0, hard=True))
+
+    assert rc == 0  # not an aborted clean
+    out, err = capsys.readouterr()
+    assert f"run {held.name}: run state locked by another process — not removed" in err
+    assert "engine resumed mid-clean" not in err
+    assert "agent session appeared mid-clean" not in err
+    assert held.is_dir() and not early.exists() and not late.exists()
+    assert "2 deleted" in out
+
+
+def test_cmd_clean_never_files_a_confinement_refusal_as_protected(project, monkeypatch, capsys):
+    """The typed arm's whole reason for existing, and the ablation that grades it.
+
+    `platform_util.UnconfinedWriteError` is an `OSError` SUBCLASS, so the bare
+    `except OSError` that would also have stopped the abort would swallow a
+    containment refusal — "this write escaped its root" — and file it as a benign
+    `protected`/"left untouched". A refusal that security-relevant must keep
+    escaping the per-candidate handler, so widening the arm reddens here.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    (run_dir,) = _terminal_runs(repo, "20260101-000000-aaaa")
+
+    def unconfined(_project, _run_dir, **_kw):
+        raise platform_util.UnconfinedWriteError("run dir escaped the runs root")
+
+    monkeypatch.setattr(runs, "delete_run", unconfined)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        cli.cmd_clean(_clean_args(repo, retain=0, hard=True))
+
+    assert run_dir.is_dir()  # nothing removed, and nothing reported as reclaimed
+    capsys.readouterr()
 
 
 def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(

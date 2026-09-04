@@ -182,6 +182,7 @@ def test_synth_success_maps_baseline_revision(tmp_path):
     assert rj["spec_file"] == str(sp)
     assert rj["baseline_commit"] == "abc123def456abc123def456abc123def456abcd"
     assert rj["escalations"] == []
+    assert rj["park_asserted"] is False
     assert "dw_ids" not in rj
 
 
@@ -362,12 +363,17 @@ def test_synth_awaiting_operator_is_terminal_and_folds_actions(tmp_path):
         auto_run="awaiting-operator",
         actions="['buy example.com', 'publish the TXT record']",
     )
-    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+    out = devcontract.synthesize_result(
+        sp,
+        story_key="1-1-a",
+        park_marker_session_authored=True,
+    )
 
     assert out.status_consistent
     rj = out.result_json
     assert rj is not None and rj["status"] == "awaiting-operator"
     assert rj["operator_actions"] == ["buy example.com", "publish the TXT record"]
+    assert rj["park_asserted"] is True
 
 
 def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
@@ -381,6 +387,73 @@ def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
 
     assert out.result_json["escalations"] == []
     assert "followup_review_recommended" not in out.result_json
+    assert out.result_json["park_asserted"] is False
+
+
+def test_synth_park_assertion_uses_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine park cannot authorize a later result."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run=None,
+        actions="['do it']",
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: awaiting-operator\n```\n"
+            "\n## Auto Run Result\n\nStatus: awaiting-operator\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    assert (
+        devcontract.synthesize_result(sp, story_key="1-1-a").result_json["park_asserted"] is False
+    )
+
+
+def test_synth_repaired_park_marker_cannot_assert_session_ownership(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run=None,
+        actions="['do it']",
+        body_extra=(
+            "\n## Auto Run Result\n\nStatus: awaiting-operator\n\n"
+            f"{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n"
+        ),
+    )
+
+    assert (
+        devcontract.synthesize_result(sp, story_key="1-1-a").result_json["park_asserted"] is False
+    )
+
+
+def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_provenance(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run="awaiting-operator",
+        actions="['do it']",
+    )
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj["park_asserted"] is False
+
+
+def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
+    marker = "## Auto Run Result\n\nStatus: awaiting-operator\n"
+
+    assert devcontract.auto_run_result_fingerprint(marker) != (
+        devcontract.auto_run_result_fingerprint(marker + "\n" + marker)
+    )
+
+
+def test_auto_run_result_fingerprint_detects_an_in_place_marker_rewrite():
+    before = "## Auto Run Result\n\nStatus: done\n"
+    after = "## Auto Run Result\n\nStatus: awaiting-operator\n"
+
+    assert devcontract.auto_run_result_fingerprint(before) != (
+        devcontract.auto_run_result_fingerprint(after)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1060,6 +1133,104 @@ def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
     text = sp.read_text()
     assert "Auto Run Result" not in text and "trailing stale prose" not in text
     assert "## Intent\n\nbody\n" in text
+
+
+# --------------------------------------------------------- reset_spec_for_replan
+
+
+def test_reset_spec_for_replan_does_not_rewrite_unchanged_reset_refusal(tmp_path, monkeypatch):
+    """A pre-write frontmatter refusal propagates without an unnecessary undo."""
+    sp = tmp_path / "spec.md"
+    original = b"---\nstatus: |\n  ready-for-dev\n---\n\nbody\n"
+    sp.write_bytes(original)
+    writes: list[tuple] = []
+    monkeypatch.setattr(
+        devcontract,
+        "_atomic_write_spec",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
+    assert writes == []
+
+
+def test_reset_spec_for_replan_restores_when_reset_commits_then_interrupts(tmp_path, monkeypatch):
+    """An interrupt after reset's atomic replace still rolls the transaction back."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+    real_reset = devcontract.reset_spec_status
+    interrupt = KeyboardInterrupt("interrupt after reset commit")
+
+    def reset_then_interrupt(*args, **kwargs):
+        assert real_reset(*args, **kwargs) is True
+        raise interrupt
+
+    monkeypatch.setattr(devcontract, "reset_spec_status", reset_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert caught.value is interrupt
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_when_reset_finds_spec_missing(tmp_path, monkeypatch):
+    """A vanished spec during reset is restored rather than treated as a refusal."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+
+    def vanish_during_reset(*args, **kwargs):
+        sp.unlink()
+        return False
+
+    monkeypatch.setattr(devcontract, "reset_spec_status", vanish_during_reset)
+
+    with pytest.raises(FileNotFoundError, match="vanished during status reset"):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_on_baseexception_from_strip(tmp_path, monkeypatch):
+    """The strip-stage guard is intentionally broader than ``Exception``."""
+
+    class StripAbort(BaseException):
+        pass
+
+    sp = tmp_path / "spec.md"
+    original = b"---\nstatus: ready-for-dev\n---\n\n## Auto Run Result\n"
+    sp.write_bytes(original)
+    abort = StripAbort("abort result strip")
+
+    def abort_strip(*args, **kwargs):
+        raise abort
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", abort_strip)
+
+    with pytest.raises(StripAbort) as caught:
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert caught.value is abort
+    assert sp.read_bytes() == original
+
+
+def test_reset_spec_for_replan_restores_when_strip_finds_spec_missing(tmp_path, monkeypatch):
+    """A vanished spec is a failed transaction, not a successful no-section strip."""
+    sp = tmp_path / "spec.md"
+    original = b"---\r\nstatus: ready-for-dev\r\n---\r\n\r\n## Auto Run Result\r\n"
+    sp.write_bytes(original)
+    real_strip = devcontract.strip_auto_run_result
+
+    def vanish_then_strip(*args, **kwargs):
+        sp.unlink()
+        return real_strip(*args, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", vanish_then_strip)
+
+    with pytest.raises(FileNotFoundError, match="vanished during result strip"):
+        devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
+    assert sp.read_bytes() == original
 
 
 def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
@@ -1932,6 +2103,18 @@ def test_flatten_strips_a_join_space_at_the_clamp_boundary(tmp_path):
     finding = findings[0]
     assert not finding.location.endswith(" ")
     assert finding.fingerprint == devcontract.harvest_fingerprint("s", finding.location)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("alpha betas gamma", "alpha", id="mid-word cut backs up to the boundary"),
+        pytest.param("alpha beta gamma", "alpha beta", id="cut at a word end keeps the full cut"),
+        pytest.param("a" * 30, "a" * 10, id="single unbroken token keeps the hard clamp"),
+    ],
+)
+def test_flatten_clamps_at_a_word_boundary(raw, expected):
+    assert devcontract._flatten(raw, 10) == expected
 
 
 def test_deferred_fingerprint_ignores_evidence_but_tracks_location(tmp_path):

@@ -34,6 +34,7 @@ from conftest import (
     plant_root_markers,
     refuse_to_resolve,
     review_effect,
+    scripted_verify_runner,
     set_sprint,
     spec_path,
     write_gated_ledger,
@@ -184,7 +185,11 @@ def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch)
     capture = _PostDevVerifyCaptureBus()
     engine._bus = capture
     result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     summary = engine.run()
 
@@ -238,7 +243,11 @@ def test_review_gate_verify_commands_are_journalled_under_the_review_stage(proje
         ),
     )
     result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     summary = engine.run()
 
@@ -499,6 +508,27 @@ def test_verify_stream_capture_disabled_writes_no_files_and_still_journals(proje
     assert entry["output_tail"] == "tail"
 
 
+def test_verify_result_journal_append_failure_propagates(project, monkeypatch):
+    """The durable record is fail-loud even though stream retention can degrade.
+
+    Ablation: remove the append or catch its OSError and the expected exception
+    is not raised.
+    """
+    engine = _capture_engine(project, 0)
+
+    def failing_append(*_args, **_kwargs):
+        raise OSError("journal.jsonl is not writable")
+
+    monkeypatch.setattr(engine.journal, "append", failing_append)
+
+    with pytest.raises(OSError, match="journal.jsonl is not writable"):
+        engine._journal_verify_command_results(
+            StoryTask(story_key="1-1-a", epic=1),
+            "dev",
+            (verify.CommandResult("pytest -q", 0, "tail"),),
+        )
+
+
 def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(project, monkeypatch):
     """A failed retain is an observation loss, never a lost run (AGENTS.md).
 
@@ -523,7 +553,10 @@ def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(proje
     monkeypatch.setattr(
         verify,
         "run_verify_commands",
-        lambda policy, cwd: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+        scripted_verify_runner(
+            project.repo_root,
+            lambda: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+        ),
     )
 
     def _enospc(*_args, **_kwargs):
@@ -752,7 +785,11 @@ def _dev_then_fix_run(project, monkeypatch, capture):
             [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
         ]
     )
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
     return engine, engine.run()
 
 
@@ -860,7 +897,11 @@ def test_a_critical_session_emits_post_dev_verify_on_both_legs(project, monkeypa
             [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
         ]
     )
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
 
     summary = engine.run()
 
@@ -1521,14 +1562,6 @@ def test_transient_initial_binding_fault_does_not_promote_after_bare_prompt(proj
         return real_resolve(bound_task)
 
     monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", transient_first_fault)
-    # The phase-entry park-eligibility read is a SECOND, unrelated consumer of the
-    # same resolver (`_park_eligible_at_dispatch`, DW-1) and would otherwise absorb
-    # the injected fault, handing the binder a clean second observation and
-    # inverting exactly what this row measures. Pin it out so `observations` counts
-    # the binder alone — this test is about prompt construction and recovery
-    # ownership, not about whether the story could newly elect a park.
-    monkeypatch.setattr(engine, "_park_eligible_at_dispatch", lambda _task: False)
-
     assert engine._dev_phase(task)
 
     assert observations == 1
@@ -1888,6 +1921,7 @@ def _dev_verify_crash_state(project, engine, spec_status: str) -> tuple[str, Pat
                 "baseline_commit": baseline,
                 "escalations": [],
                 "followup_review_recommended": False,
+                "park_asserted": False,
             },
         )
     )
@@ -2424,7 +2458,10 @@ def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
     monkeypatch.setattr(
         verify,
         "run_verify_commands",
-        lambda policy, cwd: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+        scripted_verify_runner(
+            project.repo_root,
+            lambda: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+        ),
     )
 
     assert engine.run().done == 1
@@ -2539,11 +2576,11 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
 #
 # `Engine._verify_commands_with_results` runs the commands in `self.workspace.root`
 # — which `Workspace.default` sets to `paths.repo_root`, the CODE tree. Both of its
-# stages (`dev` and `fix`) were unpinned: every other engine row mocks
-# `verify.run_verify_commands` with a `lambda policy, cwd:` that DISCARDS the cwd,
-# so moving the root back to `paths.project` left the whole suite green. These two
-# rows therefore run the real commands, and use `conftest.nested_repo_root_paths`
-# so the two roots are genuinely different directories.
+# stages (`dev` and `fix`) once had only cwd-discarding scripted doubles, so moving
+# the root back to `paths.project` left the whole suite green. The shared scripted
+# helper now pins the default-root scenarios too; these two rows still run real
+# commands under `conftest.nested_repo_root_paths` to grade the divergent behavior
+# an operator sees.
 
 
 @pytest.mark.parametrize("marker_root", ["repo_root", "project"])
@@ -3138,59 +3175,10 @@ def test_park_without_usable_actions_is_repaired_not_committed(project):
     assert "story-awaiting-operator" not in kinds and "story-done" in kinds
 
 
-def test_dispatch_over_an_already_parked_spec_is_not_park_eligible(project):
-    """DW-1's engine half: the proof-of-work skip is authorized by an expectation
-    the orchestrator records at dispatch, and a story whose bound spec ALREADY
-    reads `awaiting-operator` cannot newly elect a park — whatever the session
-    that runs next leaves behind, the declaration on disk when it launched was
-    someone else's.
-
-    The answer is captured on the fresh entry into `_dev_phase`, on the same
-    `resume_result is None` condition as `baseline_commit`, and persisted, so a
-    crash-replayed attempt reads back the same expectation rather than
-    re-deriving one from the tree the replayed session already wrote.
-
-    Ablation (measured): drop the `!= AWAITING_OPERATOR` test and this fails —
-    the re-drive becomes eligible and #676's relaxation applies to a session that
-    inherited its park. Note what this row does NOT detect: moving the capture out
-    of the `resume_result is None` block leaves it green, because the parked spec
-    is on disk before the phase starts and attempt 1 therefore observes the same
-    status either way. The anchor is pinned one row down, by
-    `test_park_eligibility_is_captured_once_per_phase_not_per_attempt`, which is
-    the row that reddens on that mutation."""
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")], policy=_park_policy())
-    recorded = spec_path(project, "1-1-a")
-    write_spec(
-        recorded, "awaiting-operator", rev_parse_head(project.project), operator_actions=ACTIONS
-    )
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
-    engine.state.tasks[task.story_key] = task
-
-    engine._dev_phase(task)
-
-    assert task.park_eligible is False
-    assert load_state(engine.run_dir).tasks["1-1-a"].park_eligible is False
-
-
 def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
-    """The JOIN, which both halves being pinned separately does not cover: that
-    `_verify_dev_artifacts` actually forwards `task.park_eligible` into
-    `verify_dev`. Its sibling row stops at the flag, and every refusal row in
-    `test_verify.py` hand-passes `park_eligible=False` straight into the gate — so
-    the one wiring point between them was untested, and the whole fix could be
-    reverted there with the suite green.
-
-    Driven through the engine's own binding lifecycle: the story's spec_file is
-    bound to a spec ALREADY at `awaiting-operator`, so eligibility is reached via
-    the bound branch (every other `engine.run()`-level park row reaches it
-    unbound, and therefore eligible). The re-driven session writes no code and
-    re-declares the same park — the inherited-park shape — and must NOT verify
-    green.
-
-    Ablation: replace `park_eligible=task.park_eligible` with the literal `True`
-    in `_verify_dev_artifacts` and this row fails; without it that mutation passes
-    the entire suite."""
+    """A markerless/inherited result must reach the strict selector through the
+    engine and owe ordinary proof-of-work. Setting its synthesized assertion true
+    makes the residue-free park verify, so the negative gate discriminates."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "awaiting-operator"})
     engine, _ = make_engine(
         project,
@@ -3201,6 +3189,7 @@ def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
                 final_status="awaiting-operator",
                 operator_actions=ACTIONS,
                 write_src=False,
+                park_asserted=False,
             )
         ]
         * 3,
@@ -3221,93 +3210,16 @@ def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
     with pytest.raises(RunPaused):
         engine._dev_phase(task)
 
-    assert task.park_eligible is False
     reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert reasons and all(r == "no changes in worktree since baseline commit" for r in reasons)
     # the waiver never fired, so nothing was journaled as a skipped gate
     assert "park-proof-of-work-skipped" not in [e["kind"] for e in engine.journal.entries()]
 
 
-def test_dispatch_with_no_bound_spec_is_park_eligible(project):
-    """The ordinary case, not a fallback: a story's first attempt has no
-    `spec_file` yet, so there is no earlier declaration for it to inherit and the
-    #676 relaxation must remain available. Fail-CLOSED applies to uncertainty
-    about a spec that exists, not to the absence of one."""
-    engine, _ = make_engine(project, [], policy=_park_policy())
-
-    assert engine._park_eligible_at_dispatch(StoryTask(story_key="1-1-a", epic=1)) is True
-
-
-def test_park_eligibility_fails_closed_on_an_unresolvable_binding(project):
-    """The OTHER fail-closed arm, and a genuinely separate one: this is the
-    `bound is None` refusal from `_dispatched_spec_for_attempt` (a symlinked
-    binding, the shape it exists to refuse), not the later `fm is None` OSError
-    arm its sibling row covers. A spec_file that will not resolve to a trusted
-    regular file is a spec whose status the orchestrator does not know, and an
-    unknown status must not authorize waiving proof-of-work.
-
-    Ablation: invert this arm to `return True` and this row fails while the whole
-    rest of the suite stays green — nothing else reaches it, which is why it
-    needed its own row rather than sharing the unreadable-spec one."""
-    engine, _ = make_engine(project, [], policy=_park_policy())
-    real = spec_path(project, "1-1-a")
-    write_spec(real, "ready-for-dev", rev_parse_head(project.project))
-    link = real.parent / "spec-1-1-a-symlink.md"
-    link.symlink_to(real)
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(link))
-
-    # the binding resolves to nothing usable, even though the TARGET is a
-    # perfectly readable non-parked spec — it is the binding that is untrusted
-    assert engine._dispatched_spec_for_attempt(task) is None
-    assert engine._park_eligible_at_dispatch(task) is False
-
-
-def test_park_eligibility_fails_closed_on_an_unreadable_spec(project):
-    """Observation degrades, and here degrading means denying the relaxation: a
-    bound spec the orchestrator cannot read is a spec whose status it does not
-    know, and an unknown status must not authorize skipping proof-of-work. The
-    skip is what would be lost, not the park — an honest park with a real diff
-    still passes the ordinary gate.
-
-    Silent it is not: the read goes through `_observed_frontmatter`, so the skip
-    lands a `spec-read-failed` entry naming this site."""
-    engine, _ = make_engine(project, [], policy=_park_policy())
-    recorded = spec_path(project, "1-1-a")
-    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
-
-    def boom(_path):
-        raise OSError("spec vanished mid-read")
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(verify, "read_frontmatter", boom)
-        assert engine._park_eligible_at_dispatch(task) is False
-
-    failures = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
-    assert [e["site"] for e in failures] == ["park-eligibility"]
-
-
-def test_park_eligibility_is_captured_once_per_phase_not_per_attempt(project):
-    """A fixable repair deliberately keeps the previous session's tree, so the
-    malformed park it is repairing is on disk when it launches. Re-observing
-    eligibility per ATTEMPT would therefore make every such repair ineligible,
-    and its fix — one frontmatter block, which proof-of-work already excludes —
-    would fail the gate it just re-armed. The expectation is anchored to the
-    phase, on the same `resume_result is None` condition as `baseline_commit`,
-    precisely so the expectation and the diff it guards cannot disagree.
-
-    Both sessions run with `write_src=False`, which is what makes this row
-    evidence: the tree never holds any code residue, so the ONLY thing that can
-    carry the repair past proof-of-work is the retained eligibility.
-
-    Ablation (measured, not assumed): move `task.park_eligible = ...` out of the
-    `resume_result is None` block and into `_dev_phase`'s per-attempt branch, and
-    attempt 2 re-observes the parked spec attempt 1 left behind, turns ineligible,
-    and its `dev-decision` reads exactly `no changes in worktree since baseline
-    commit` -> DEFER. Note what the row then fails ON: the defer's spec-restore
-    finds the binding unusable and raises `RunPaused`, so the visible surface is a
-    pause, not the assertion below. The refusal is the cause and the journal
-    records it; the pause is its consequence."""
+def test_fixable_retry_uses_the_repair_sessions_park_assertion(project):
+    """A fixable retry keeps the prior tree but authorizes only from the repair
+    session's own result. Its genuine assertion carries a residue-free corrected
+    park through without re-observing retained frontmatter."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(
         project,
@@ -3338,7 +3250,6 @@ def test_park_eligibility_is_captured_once_per_phase_not_per_attempt(project):
 
     assert engine._dev_phase(task) is True
 
-    assert task.park_eligible is True
     assert len(adapter.sessions) == 2  # the malformed park, then its repair
     # the repair's park was ACCEPTED with the gate waived, on a tree that holds no
     # code at all — the whole point of retaining the phase's answer
@@ -3346,27 +3257,9 @@ def test_park_eligibility_is_captured_once_per_phase_not_per_attempt(project):
     assert [(e["attempt"], e["zero_diff"]) for e in records] == [(2, True)]
 
 
-def test_replayed_attempt_reuses_the_persisted_park_eligibility(project):
-    """Crash replay: the host died after the dev session finished and before its
-    result was consumed, so `_finish_inflight` resets the task to PENDING and
-    re-enters `_dev_phase` with the recorded result instead of a session
-    (`engine.py`'s `resumable` arm). The fresh-entry block is skipped wholesale on
-    that path, which is exactly why eligibility is captured there — a replayed
-    attempt must read back the answer the DEAD phase recorded, never derive a new
-    one from the tree the session it is replaying already wrote.
-
-    The setup makes the two answers differ: the spec on disk is ALREADY parked
-    (the replayed session's own work), so a re-observation at this point returns
-    False and the residue-free tree would then owe proof-of-work it cannot show.
-    The persisted `True` is the only thing that carries the park through.
-
-    Ablation: move `task.park_eligible = self._park_eligible_at_dispatch(task)`
-    out of `_dev_phase`'s `if resume_result is None:` block and this fails — the
-    replay re-observes its own parked spec, turns ineligible, and the park is
-    refused for "no changes in worktree since baseline commit". This is the row
-    the sibling capture-once test explicitly does NOT cover: that one measures a
-    second ATTEMPT inside a live phase, this one a replayed phase with no
-    attempt of its own."""
+def test_replayed_attempt_reuses_the_persisted_park_assertion(project):
+    """Crash replay consumes the persisted synthesized result without launching
+    or re-deriving authority from the parked spec now on disk."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(project, [], policy=_park_policy())
     baseline = rev_parse_head(project.project)
@@ -3379,8 +3272,6 @@ def test_replayed_attempt_reuses_the_persisted_park_eligibility(project):
     task.spec_file = str(sp)
     task.baseline_commit = baseline
     task.baseline_untracked = untracked
-    # what the dead phase recorded at ITS dispatch, when the spec was unparked
-    task.park_eligible = True
     engine.state.tasks[task.story_key] = task
     result_json = {
         "workflow": "auto-dev",
@@ -3389,6 +3280,7 @@ def test_replayed_attempt_reuses_the_persisted_park_eligibility(project):
         "baseline_commit": baseline,
         "escalations": [],
         "followup_review_recommended": False,
+        "park_asserted": True,
     }
     # the persisted record the resume arm replays FROM — `_accept_current_dev_session`
     # latches it as the accepted tree owner, so its task_id has to be the one the
@@ -3408,7 +3300,6 @@ def test_replayed_attempt_reuses_the_persisted_park_eligibility(project):
     # the recorded result replaced the session: nothing was dispatched, so the
     # only observation available was the persisted one
     assert adapter.sessions == []
-    assert task.park_eligible is True
     records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
     assert [(e["attempt"], e["zero_diff"]) for e in records] == [(1, True)]
 
@@ -3448,9 +3339,10 @@ def test_no_waiver_record_when_a_later_check_inside_the_gate_rejects_the_park(pr
     task.spec_file = str(sp)
     task.baseline_commit = baseline
     task.baseline_untracked = sorted(verify.untracked_files(project.project))
-    task.park_eligible = True
-
-    outcome = engine._verify_dev_artifacts(task, {"workflow": "auto-dev", "spec_file": str(sp)})
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "spec_file": str(sp), "park_asserted": True},
+    )
 
     # refused for the sprint pair, NOT for proof-of-work: the waiver did fire
     assert not outcome.ok and outcome.retryable
@@ -3505,55 +3397,15 @@ def test_the_waiver_record_stands_when_a_later_stage_rejects_the_park(project):
     assert len(adapter.sessions) == 2
 
 
-def test_eligible_phase_waives_on_a_different_spec_than_it_was_authorized_over(project):
-    """CHARACTERIZATION of behavior this change deliberately LEAVES OPEN — not a
-    guarantee, and not a gate. It is the shipped answer to the intent's I/O row
-    "Eligible phase, attempt resolves a DIFFERENT spec", and it is folded into the
-    first `deferred` entry on this change's spec ("the same authorization is also
-    never re-validated against spec IDENTITY"). A later change that closes that
-    deferral is EXPECTED to rewrite this row rather than be blocked by it.
-
-    What it pins: `park_eligible` is a PHASE-level authorization answering one
-    question about ONE observation — was `task.spec_file` already parked at the
-    instant the phase was dispatched? Here it was not (the binding is a
-    `ready-for-dev` spec), so the phase is eligible. The session then returns a
-    result naming a DIFFERENT spec that was already at `awaiting-operator` before
-    the phase began, and writes no code at all. The authorization is not
-    re-validated against that identity, so the waiver is spent on an inherited
-    park declaration the phase was never authorized over, the residue-free tree is
-    accepted, and the attempt is journaled as a waived gate.
-
-    ENGINE layer, and the choice is forced rather than preferred: `verify_dev`
-    takes `park_eligible` as a bare argument and has no notion of the phase
-    binding at all, so at that layer "the authorization was computed about another
-    spec" is not expressible — a caller can only assert the value it just passed
-    in. Only `_dev_phase` holds both halves: it computes eligibility from
-    `task.spec_file` at fresh entry and later hands the session's own
-    `result_json["spec_file"]` to the gate. Nothing between the two compares them,
-    which is precisely the finding. (No binding or roots gate refuses the
-    construction: the foreign spec sits inside `implementation_artifacts`, so
-    `spec_within_roots` admits it, and no verify gate reads `result.json`'s
-    `story_key`.)
-
-    Ablation, measured rather than predicted: bind eligibility to the returned
-    spec identity in `verify_dev` with
-    `skip_proof = parked and park_eligible and
-    (not task.spec_file or str(spec_path) == task.spec_file)` — and this row fails
-    with `ScriptExhausted: no scripted result for session 1-1-a-dev-2`. Note the
-    surface it fails on, because it is a consequence and not the assertion below:
-    the waiver no longer fires, the residue-free tree owes a diff it never
-    produced, `verify_dev` refuses it with "no changes in worktree since baseline
-    commit", and the engine asks for the retry the one-entry script cannot supply.
-    The refusal is the cause and the `dev-decision` journal entry records it; the
-    exhausted script is only how the retry becomes visible. That failure is the
-    expected shape of CLOSING the deferral, which is why this row is
-    characterization rather than warranty — close it and rewrite this row."""
+def test_asserted_result_selects_the_spec_named_by_that_result(project):
+    """The assertion belongs to the synthesized result, while the parked half is
+    independently observed from the result's claimed spec path."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     baseline = rev_parse_head(project.project)
-    # the phase's binding: NOT parked, so the dispatch-time answer is "eligible"
+    # the phase's prior binding is intentionally a different spec
     bound = spec_path(project, "1-1-a")
     write_spec(bound, "ready-for-dev", baseline)
-    # somebody else's park, on disk before this phase ever starts
+    # the result names this separately parked spec
     inherited = spec_path(project, "1-2-b")
     write_spec(inherited, "awaiting-operator", baseline, operator_actions=ACTIONS)
 
@@ -3569,12 +3421,11 @@ def test_eligible_phase_waives_on_a_different_spec_than_it_was_authorized_over(p
                 "baseline_commit": baseline,
                 "escalations": [],
                 "followup_review_recommended": False,
+                "park_asserted": True,
             },
         )
 
-    # exactly ONE scripted session: the shipped behavior accepts on the first
-    # attempt, and under the ablation below the engine's request for a second is
-    # the whole signal
+    # exactly one result owns the assertion and claims the parked spec
     engine, adapter = make_engine(project, [resolves_the_other_spec], policy=_park_policy())
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(bound))
     engine.state.tasks[task.story_key] = task
@@ -3582,10 +3433,9 @@ def test_eligible_phase_waives_on_a_different_spec_than_it_was_authorized_over(p
     assert engine._dev_phase(task) is True
 
     assert len(adapter.sessions) == 1  # accepted on the first attempt, never retried
-    # authorized over the bound spec...
-    assert task.park_eligible is True
+    # the bound spec remains unchanged...
     assert read_frontmatter(bound)["status"] == "ready-for-dev"
-    # ...and spent on the other one, which the gate then rebound the task to
+    # ...and the result's spec becomes the accepted task binding
     assert task.spec_file == str(inherited)
     records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
     assert [(e["attempt"], e["zero_diff"]) for e in records] == [(1, True)]
@@ -6260,6 +6110,9 @@ LEDGER_SENTENCE = (
 )
 PARK_HEAD = "If this story's acceptance criteria include actions only a HUMAN"
 PARK_NEVER_BLOCKED = "Never use the blocked status"
+PARK_RESULT_ASSERTION = (
+    "final Auto Run Result must also report the matching status: awaiting-operator"
+)
 PARK_TAIL = "blocked halts the whole run, and this story is finished as far as you can take it."
 LEDGER_BOARD_JOIN = "their status and resolution. sprint-status.yaml is owned by the orchestrator"
 BOARD_REDIRECT_JOIN = "not proof that the work is verified. If the story cannot be finished"
@@ -6448,6 +6301,7 @@ def test_board_clause_rides_every_dev_leg_ahead_of_the_park_clause(project, tmp_
     for prompt in (bare, explicit, restore, repair):
         assert BOARD_OWNED in prompt
         assert PARK_HEAD in prompt
+        assert PARK_RESULT_ASSERTION in prompt
         assert prompt.index(BOARD_OWNED) < prompt.index(PARK_HEAD)
         assert BOARD_PARK_JOIN in prompt  # the board→park separator itself
         assert prompt.endswith(PARK_TAIL)  # nothing may be appended after the park
@@ -7002,8 +6856,9 @@ def test_review_strips_stale_auto_run_result_before_each_launch(project):
 def test_budget_exhausted_finalized_work_commits(project):
     """A finalized story (status: done, sprint done, verify green) whose review
     pass keeps recommending an independent follow-up is COMMITTED when the review
-    budget is exhausted — not rolled back. The lingering recommendation is
-    re-filed as a fresh open deferred-work entry, and the run records the event."""
+    budget is exhausted — not rolled back. The spent budget is journaled and the
+    run notifies; no deferred-work entry is filed (the process-exhaust ticket
+    class is retired)."""
     from bmad_loop import deferredwork
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -7030,12 +6885,16 @@ def test_budget_exhausted_finalized_work_commits(project):
     # the finalized work is committed, not reverted
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "review-budget-committed" in kinds and "story-deferred" not in kinds
-    # the lingering follow-up is preserved as a new open deferred-work entry
-    open_entries = [
-        e for e in deferredwork.parse_ledger(project.deferred_work.read_text()) if e.open
-    ]
-    assert any("origin: review-budget-followup" in e.body for e in open_entries)
+    assert "story-deferred" not in kinds
+    committed = [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    assert len(committed) == 1 and committed[0]["re_review_capped"] is False
+    assert "refiled" not in committed[0]
+    # the process-exhaust ticket class is retired: no ledger entry is filed
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
 
 
 def test_budget_exhausted_unfinalized_defers(project):
@@ -7491,7 +7350,7 @@ def test_followup_damping_converges_at_cap(project):
     """Default damping cap (1): a finalized story whose review keeps recommending
     an independent follow-up converges after honoring exactly ONE self-recommended
     follow-up. Round 1 spends the grant; round 2 (still recommending) is damped →
-    verify, refile, commit. The 3rd scripted review never runs, and — being the
+    verify, journal, commit. The 3rd scripted review never runs, and — being the
     expected steady state — the damped converge stays quiet (no ATTENTION)."""
     from bmad_loop import deferredwork
 
@@ -7514,13 +7373,15 @@ def test_followup_damping_converges_at_cap(project):
     assert "review-followup-damped" in kinds
     assert "review-budget-committed" not in kinds  # not the exhaustion path
     assert "story-deferred" not in kinds
-    # the lingering follow-up is preserved as exactly one open DW entry
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1
+    # the process-exhaust ticket class is retired: no ledger entry is filed
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
+    damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
+    assert len(damped) == 1 and damped[0]["re_review_capped"] is False
+    assert "refiled" not in damped[0]
     # damped convergence is the steady state — no review-budget ATTENTION notice
     # (the always-on run-finished notice is the only thing in the file).
     attention = engine.run_dir / "ATTENTION"
@@ -7532,7 +7393,7 @@ def test_followup_damping_converges_at_cap(project):
 def test_followup_damping_cap_zero_converges_immediately(project):
     """Cap 0: the orchestrator never honors a pass's own follow-up. The first
     finalized round that still recommends one is damped immediately — verify,
-    refile, commit — after a single review round, with nothing spent."""
+    journal, commit — after a single review round, with nothing spent."""
     from bmad_loop import deferredwork
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -7550,12 +7411,11 @@ def test_followup_damping_cap_zero_converges_immediately(project):
     assert task.followup_reviews_spent == 0  # cap 0 grants nothing to spend
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "review-followup-damped" in kinds
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
 
 
 def test_nonterminal_rounds_do_not_spend_damping_cap(project):
@@ -7628,8 +7488,8 @@ def test_followup_damping_resume_replay_does_not_double_count(project):
     """A host death in the post-session window of the grant-spending review round
     must not double-count the damping spend on resume. The recorded round-1 result
     replays (re-deriving the spend), then round 2 damps and converges: the story
-    reaches DONE with followup_reviews_spent == 1 (not 2) and exactly one refiled
-    entry — append_entry's open-dedupe keeps a replayed refile from duplicating.
+    reaches DONE with followup_reviews_spent == 1 (not 2) and no ledger entry —
+    the spent budget is journal-only.
     Modeled on test_resume_final_review_cycle_replays_clean_result."""
     from bmad_loop import deferredwork
 
@@ -7680,12 +7540,11 @@ def test_followup_damping_resume_replay_does_not_double_count(project):
     assert final.review_cycle == 2
     assert final.followup_reviews_spent == 1  # re-derived once, never double-counted
     assert len(adapter.sessions) == 1  # only round 2 re-ran; round 1 was replayed
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text())
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1  # exactly one, even across the crash/replay
+    ledger = project.deferred_work.read_text() if project.deferred_work.exists() else ""
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )  # journal-only, even across the crash/replay
 
 
 def _tail_death_review_effect(paths, story_key, *, followup: bool):
@@ -11988,6 +11847,7 @@ def test_journal_log_position_covers_post_session_entries(project):
 )
 def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_name, fallback_signum):
     import bmad_loop.engine as engine_mod
+    from bmad_loop import journal as journal_mod
 
     signum = getattr(signal, signal_name, fallback_signum)
     if signal_name == "SIGBREAK":
@@ -12006,6 +11866,14 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
         return previous[sig]
 
     monkeypatch.setattr(engine_mod.sys, "platform", "win32")
+
+    @contextlib.contextmanager
+    def native_test_lock(_path, **_kw):
+        # This Linux-hosted test patches the process-wide sys.platform token only to
+        # drive Engine's Windows signal branch; msvcrt is intentionally unavailable.
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", native_test_lock)
     monkeypatch.setattr(signal, "signal", fake_signal)
     monkeypatch.setattr(engine_mod, "kill_session", lambda rid: None)
 
@@ -12023,6 +11891,13 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
     assert Engine._stop_signals_owner is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "pins the POSIX half of the gate by faking sys.platform; the faked branch's\n"
+        "imports (fcntl) do not exist on Windows, so the row can only run off win32"
+    ),
+)
 def test_non_windows_sigint_still_stops_run(project, monkeypatch):
     import bmad_loop.engine as engine_mod
 
@@ -14108,7 +13983,7 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
     rival_filed: list[bool] = []
 
     def append_then_a_rival_writes(*args, **kwargs):
-        minted, text = real_append(*args, **kwargs)
+        minted, text, preimage = real_append(*args, **kwargs)
         if not rival_filed:
             # Latched BEFORE the nested call, not after: the rival goes through
             # the ordinary public appender, which delegates down to this very
@@ -14124,7 +13999,7 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
                 source_spec="other.md",
                 reason="a rival writer got here first.",
             )
-        return minted, text
+        return minted, text, preimage
 
     monkeypatch.setattr(deferredwork, "append_entries_published", append_then_a_rival_writes)
 
@@ -14134,6 +14009,185 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
     assert "filed by another process" in on_disk  # the rival really did land
     assert published and task.post_engine_ledger_digest == _digest_of(published[0])
     assert task.post_engine_ledger_digest != _digest_of(on_disk)
+
+
+def _arm_ledger_snapshot(task, ledger):
+    """Arm the pre-harvest restore exactly as ``_run_story`` does, and hand back
+    the snapshot text so a test can assert the anchor never left it."""
+    snapshot = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+    task.pre_harvest_ledger = snapshot
+    task.pre_harvest_ledger_captured = True
+    task.post_engine_ledger_digest = _digest_of(snapshot)
+    return snapshot
+
+
+def test_harvest_append_declines_the_anchor_over_a_rival_that_beat_it_to_the_lock(
+    project, monkeypatch
+):
+    """A rival that lands BEFORE the writer's locked read must not be adopted.
+
+    The published text handed back from inside the hold is the WHOLE post-edit
+    file, so a rival entry appended between this task's pre-harvest snapshot and
+    the append's locked read is in the preimage, is re-published, and would land
+    in ``post_engine_ledger_digest``. A later rejected attempt then reads ``ours``
+    as True and whole-file-overwrites with the old snapshot, deleting the rival's
+    entry in silence — the default ledger is gitignored, so the digest is the sole
+    write authorization and git never republishes it.
+
+    The anchor therefore moves only when the bytes written over are still the
+    bytes this engine last claimed; here they are not, so it stays on the
+    snapshot, the restore declines and journals instead.
+
+    Ablation: drop the `_may_move_ledger_anchor` guard from the append site and
+    the anchor row reds, then the rival's entry vanishes from disk."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    real_append = deferredwork.append_entries_published
+    rival_filed: list[bool] = []
+
+    def a_rival_writes_then_append(*args, **kwargs):
+        if not rival_filed:
+            # Latched BEFORE the nested call: the rival goes through the ordinary
+            # public appender, which delegates down to this very symbol.
+            rival_filed.append(True)
+            deferredwork.append_entry(
+                ledger,
+                title="filed by another process",
+                origin="sweep, 2026-06-11",
+                source_spec="other.md",
+                reason="a rival writer got here first.",
+            )
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", a_rival_writes_then_append)
+    engine._harvest_spec_deferrals(task, result_json)
+    monkeypatch.setattr(deferredwork, "append_entries_published", real_append)
+
+    published = ledger.read_text(encoding="utf-8")
+    assert rival_filed and "filed by another process" in published  # the rival really did land
+    assert [e.title for e in _harvest_entries(project)][-1] == HARVEST_A["summary"]  # ours too
+    # The anchor never left the snapshot: what this append wrote over was not what
+    # the task last claimed, so the published bytes are not provably ours.
+    assert task.post_engine_ledger_digest == _digest_of(snapshot)
+    assert task.post_engine_ledger_digest != _digest_of(published)
+
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == published  # nothing retracted
+    assert "filed by another process" in ledger.read_text(encoding="utf-8")
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a" and event["ledger"] == str(ledger)
+
+
+def test_harvest_mark_declines_the_anchor_over_a_rival_that_beat_it_to_the_lock(
+    project, monkeypatch
+):
+    """The identical loss through the `seen-again:` leg, which files no entry.
+
+    `mark_seen_again_many` hands back the whole post-edit file too, so fixing only
+    the append site leaves this path re-publishing — and then retracting — a
+    rival's entry. Shaped so the harvest's append leg is inert: the one finding
+    matches an already-open entry from another spec, so nothing is filed and the
+    mark is the only ledger write this harvest makes.
+
+    Ablation: drop the `_may_move_ledger_anchor` guard from the mark site and the
+    anchor row reds, then the rival's entry vanishes from disk."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    real_mark = deferredwork.mark_seen_again_many
+
+    def a_rival_writes_then_mark(path, dw_ids, date, note):
+        deferredwork.append_entry(
+            path,
+            title="filed by another process",
+            origin="sweep, 2026-06-11",
+            source_spec="other.md",
+            reason="a rival writer got here first.",
+        )
+        return real_mark(path, dw_ids, date, note)
+
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", a_rival_writes_then_mark)
+    engine._harvest_spec_deferrals(task, result_json)
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", real_mark)
+
+    published = ledger.read_text(encoding="utf-8")
+    assert "filed by another process" in published  # the rival really did land
+    assert "seen-again: " in published  # and the mark really did write
+    # The append leg is inert here, so the mark's own decision is the only one
+    # that could have moved the anchor.
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert task.post_engine_ledger_digest == _digest_of(snapshot)
+    assert task.post_engine_ledger_digest != _digest_of(published)
+
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == published  # nothing retracted
+    assert "filed by another process" in ledger.read_text(encoding="utf-8")
+    assert "ledger-restore-skipped-diverged" in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_harvest_anchor_still_moves_for_an_uncontended_mark_then_append(project):
+    """The control the conditional must not cost: with no rival, both legs anchor.
+
+    The append's locked read sees the text the mark published, not the raw
+    pre-harvest snapshot, so the guard compares against the anchor rather than the
+    snapshot. One finding matches an open entry (the mark) and a second does not
+    (the append), which is the only ordering where both legs write in one harvest."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
+    ledger = project.deferred_work
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    published = ledger.read_text(encoding="utf-8")
+    assert "seen-again: " in published  # the mark leg wrote
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["seen_again"] == ["DW-1"] and event["dw_ids"] == ["DW-2"]  # and the append leg
+    assert task.post_engine_ledger_digest == _digest_of(published)
+    assert task.post_engine_ledger_digest != _digest_of(snapshot)
+
+    # And the restore still owns those bytes: an accepted-then-rejected attempt
+    # retracts this engine's own harvest exactly as it did before the guard.
+    engine._restore_persisted_ledger(task, replayed=False)
+    assert ledger.read_text(encoding="utf-8") == snapshot
 
 
 def test_spec_deferrals_dedup_sees_already_done_entries(project):
@@ -14251,6 +14305,183 @@ def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert [e["dw_ids"] for e in events] == [["DW-1"], ["DW-2"]]
     assert events[-1]["deduped"] == 1
+
+
+def _seeded_ledger(project, *, origin: str, source_spec: str, status: str = "open") -> None:
+    """One hand-written open entry, shaped like a harvest from ANOTHER spec."""
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### DW-1: {HARVEST_A['summary']}\n\n"
+        f"origin: {origin}\n"
+        f"location: {HARVEST_A['location']}\n"
+        f"source_spec: `{source_spec}`\n"
+        "severity: medium\n"
+        f"reason: {HARVEST_A['evidence']}\n"
+        f"status: {status}\n",
+        encoding="utf-8",
+    )
+
+
+def test_harvest_marks_a_cross_spec_duplicate_seen_again(project):
+    """DW-88 vs DW-65: an identical finding (same fingerprint) already harvested
+    from ANOTHER spec is a sighting, not new work — no entry is filed, the open
+    match gains a `seen-again:` line, the journal names it, and the finding never
+    enters `harvested_deferrals` (so the isolated carry cannot re-file it)."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1"]  # no new entry
+    assert "seen-again: " in entries[0].body
+    assert "(spec-deferral harvest of spec-1-1-a.md)" in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert event["deduped"] == 0
+    assert engine.state.tasks["1-1-a"].harvested_deferrals == []
+
+
+def test_harvest_marks_a_dw_prefixed_summary_seen_again(project):
+    """The DW-88 shape itself: a finding whose summary begins with an open
+    entry's own `DW-<n>:` id is that entry re-reported, whatever its
+    fingerprint or origin says."""
+    _seeded_ledger(
+        project,
+        origin="code review of spec-9-9-z.md, 2026-06-01",
+        source_spec="spec-9-9-z.md",
+    )
+    finding = {
+        "summary": "DW-1: the retry ceiling is still missing",
+        "evidence": "re-reported by a later review",
+        "location": "src/retry.py:90",
+    }
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[finding])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1"]
+    assert "seen-again: " in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert engine.state.tasks["1-1-a"].harvested_deferrals == []
+
+
+def test_harvest_seen_again_replay_adds_one_line_only(project):
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    assert engine.run().done == 1
+
+    task = engine.state.tasks["1-1-a"]
+    engine._harvest_spec_deferrals(task, {"spec_file": str(spec_path(project, "1-1-a"))})
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert text.count("seen-again: ") == 1  # the replay skipped its identical line
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [e["seen_again"] for e in events] == [["DW-1"], ["DW-1"]]
+    assert [e["dw_ids"] for e in events] == [[], []]
+
+
+def test_harvest_files_fresh_when_the_match_is_done(project):
+    """A closed entry never absorbs a sighting: recurrence after a close files a
+    fresh entry, consistent with `_apply_append`'s open-only dedupe scan."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(
+        project,
+        origin=f"spec-deferred {fp}",
+        source_spec="spec-9-9-z.md",
+        status="done 2026-06-05",
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert [e.id for e in entries] == ["DW-1", "DW-2"]
+    assert entries[1].open and entries[1].title == HARVEST_A["summary"]
+    assert "seen-again: " not in entries[0].body
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == ["DW-2"] and event["seen_again"] == []
+
+
+def test_harvest_files_the_finding_when_the_seen_again_match_goes_stale(project, monkeypatch):
+    """TOCTOU: the match is decided against a ledger snapshot, the sighting is
+    stamped later under the ledger lock. A rival that closes the entry in between
+    leaves the sighting nowhere to land — and the finding was already excluded from
+    the append on the strength of that match, so without the in-lock recheck the
+    recurrence is lost with no entry and no sighting anywhere.
+
+    The real primitive still runs; only the ledger is mutated ahead of it, which is
+    the race window itself rather than a stub of the code under test."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    real_mark = deferredwork.mark_seen_again_many
+
+    def close_the_match_first(path, dw_ids, date, note):
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-05"),
+            encoding="utf-8",
+        )
+        return real_mark(path, dw_ids, date, note)
+
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", close_the_match_first)
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    # the recurrence is filed fresh, exactly as a match already done at snapshot
+    # time would have been (`_apply_append` dedupes open entries only)
+    assert [e.id for e in entries] == ["DW-1", "DW-2"]
+    assert entries[1].open and entries[1].title == HARVEST_A["summary"]
+    assert "seen-again: " not in entries[0].body  # never stamped on the closed entry
+    (stale_event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "spec-deferral-sighting-stale"
+    ]
+    assert stale_event["items"] == ["DW-1"] and stale_event["refiled"] == 1
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    # `seen_again` names entries that actually took a sighting; a stale id took none
+    assert event["dw_ids"] == ["DW-2"] and event["seen_again"] == []
+    # and the record is persisted, so the isolated carry can re-file it too
+    assert [r["origin"] for r in engine.state.tasks["1-1-a"].harvested_deferrals] == [
+        f"spec-deferred {fp}"
+    ]
 
 
 def test_ledger_digest_collapses_absent_and_empty_only():
@@ -16399,7 +16630,10 @@ def test_legacy_replay_derives_session_ledger_attribution_before_harvest(project
     ]
 
 
-def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
+@pytest.mark.parametrize("untracked_fault", [False, True], ids=["answered", "unknown"])
+def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(
+    project, monkeypatch, untracked_fault
+):
     """Missing attribution must not let the upgrade's own append satisfy proof."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -16428,6 +16662,18 @@ def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
     _downgrade_harvest_state_to_legacy(engine)
 
     resumed, adapter = resume_engine(project, engine, [])
+    untracked_calls = 0
+    real_untracked_files = verify.untracked_files
+
+    def fault_once(repo):
+        nonlocal untracked_calls
+        untracked_calls += 1
+        if untracked_calls == 1:
+            raise verify.GitError("untracked enumeration failed")
+        return real_untracked_files(repo)
+
+    if untracked_fault:
+        monkeypatch.setattr(verify, "untracked_files", fault_once)
     summary = resumed.run()
 
     assert summary.deferred == 1 and not summary.done and not summary.crashed
@@ -16437,6 +16683,12 @@ def test_legacy_replay_does_not_credit_its_new_harvest_as_session_work(project):
     decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
     assert [decision["action"] for decision in decisions] == ["defer"]
     assert "no changes in worktree" in decisions[0]["reason"]
+    if untracked_fault:
+        assert untracked_calls >= 2  # attribution faulted; the later proof gate re-probed
+        failed = [
+            e for e in resumed.journal.entries() if e["kind"] == "legacy-ledger-attribution-failed"
+        ]
+        assert failed and "could not determine" in failed[-1]["error"]
 
 
 def test_retry_replay_recovers_session_ledger_attribution_after_prior_harvest(project):

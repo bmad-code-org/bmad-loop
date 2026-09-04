@@ -62,6 +62,20 @@ def test_load_paths_non_utf8_config_raises_bmad_config_error(project) -> None:
         bmadconfig.load_paths(project.project)
 
 
+def test_load_paths_non_mapping_config_raises_bmad_config_error(project) -> None:
+    """A syntactically valid YAML sequence is still an invalid BMAD config.
+
+    The typed boundary matters to best-effort observers such as interactive resolve:
+    they catch ``BmadConfigError`` and can fall back to the run's recorded roots.
+    """
+    install_bmad_config(project)
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="top-level mapping"):
+        bmadconfig.load_paths(project.project)
+
+
 def test_rebased_reroots_project_and_artifacts(tmp_path: Path) -> None:
     src = tmp_path / "main"
     paths = ProjectPaths(

@@ -121,7 +121,9 @@ def _make_flow(
         raise _Pause(reason, story_key)
 
     flow = WorktreeFlow(
-        paths=paths if paths is not None else SimpleNamespace(repo_root=tmp_path),
+        paths=(
+            paths if paths is not None else SimpleNamespace(repo_root=tmp_path, project=tmp_path)
+        ),
         policy=policy if policy is not None else _policy(),
         state=(
             state
@@ -426,6 +428,41 @@ def test_ensure_target_branch_detached_head_pauses(project):
 
 
 # --------------------------------------------------------------- run / escalate
+
+
+def test_run_isolated_relativizes_local_accepted_spec_before_open(tmp_path):
+    """Mount creation observes the portable spelling, never the main absolute path.
+
+    Ablation: move normalization below ``_open_unit_workspace`` and the spy sees the
+    main-checkout absolute value.
+    """
+    project = tmp_path / "project"
+    artifacts = project / "_bmad-output" / "implementation-artifacts"
+    artifacts.mkdir(parents=True)
+    spec = artifacts / "spec-1-1.md"
+    spec.write_text("spec\n", encoding="utf-8")
+    paths = ProjectPaths(
+        project=project,
+        implementation_artifacts=artifacts,
+        planning_artifacts=project / "_bmad-output" / "planning-artifacts",
+    )
+    task = StoryTask(story_key="1-1", epic=1, spec_file=str(spec))
+    observed: list[str | None] = []
+
+    def stop_after_observation(*_args, **_kwargs):
+        observed.append(task.spec_file)
+        raise verify.GitError("stop after observing pre-open state")
+
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=SimpleNamespace(target_branch="main", run_id="run-1", tasks={}),
+        open_unit_workspace=stop_after_observation,
+    )
+
+    flow.run_isolated(task, lambda _task: pytest.fail("drive must not run"))
+
+    assert observed == ["_bmad-output/implementation-artifacts/spec-1-1.md"]
 
 
 def test_run_isolated_defers_on_open_failure(tmp_path):

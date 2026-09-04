@@ -1482,11 +1482,57 @@ class WorktreeFlow:
             return ()
         return (rel,)
 
+    def _accepted_spec_seed(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> tuple[str, ...]:
+        """Copy an accepted project-local spec a tracked checkout did not deliver.
+
+        The isolation-flip normalizer gives a main-checkout absolute spec a
+        project-relative spelling before this point. If the accepted file is
+        ignored or untracked, ``git worktree add`` cannot carry it, so binding the
+        new attempt would silently fall back to the bare story key. Seed only a
+        canonical regular file inside the project, only when the mounted checkout
+        lacks its corresponding path. Absolute/external spellings pass through;
+        prior-attempt binding fields remain authoritative until fresh binding
+        replaces them after the mount is provisioned.
+        """
+        raw = task.spec_file
+        if not raw or Path(raw).is_absolute():
+            return ()
+        try:
+            project = self.paths.project.resolve(strict=True)
+            source = (
+                self.paths.project / raw
+                if project_relative_only
+                else verify.resolve_spec_path(raw, self.paths)
+            ).resolve(strict=True)
+            relative = source.relative_to(project)
+            destination = (worktree / relative).resolve(strict=False)
+            mounted_root = worktree.resolve(strict=True)
+            destination.relative_to(mounted_root)
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        if not source.is_file() or destination.is_file():
+            return ()
+        return (relative.as_posix(),)
+
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
         it back into the target branch. `drive` either returns (DONE/DEFERRED →
         integrate) or raises RunPaused (spec-approval gate / escalation → leave
         the worktree mounted for resume/inspection, integration skipped)."""
+        # A sprint run can accept an absolute spec in the main checkout before
+        # isolation is enabled. Convert only that canonical project-local accepted
+        # artifact to the portable spelling the new mount can own. This must happen
+        # before worktree creation and must not disturb an existing attempt binding,
+        # whose path/snapshot authority belongs to its prior workspace.
+        accepted_spec_before = task.spec_file
+        task.relativize_project_local_accepted_spec(self.paths.project)
+        accepted_spec_relocated = task.spec_file != accepted_spec_before
         try:
             unit = self._open_unit_workspace(
                 self.paths.repo_root,
@@ -1496,6 +1542,23 @@ class WorktreeFlow:
                 self.state.target_branch,
                 self.policy.scm.branch_per,
                 self.run_dir,
+                # The accepted spec the reclaim must not destroy. `_accepted_spec_seed`
+                # lays a gitignored spec into the mount and the shield then ignores it
+                # there, so the orphan holds the only copy; the isolation flip kept
+                # `spec_file` at its mount-relative spelling for exactly this reason
+                # (`release_spec_paths_from_mount`), which is the spelling the reclaim's
+                # snapshot resolves against the mount.
+                spec_file=task.spec_file,
+                # An orphan an isolation flip left standing at this unit's mount
+                # path is reclaimed by the open; its uncommitted state is parked
+                # first and named here so the recovery ref is discoverable from the
+                # journal (`isolation-flip-orphaned-worktree` recorded the orphan).
+                on_orphan_preserved=lambda worktree, ref: self.journal.append(
+                    "isolation-flip-orphan-preserved",
+                    story_key=task.story_key,
+                    worktree=worktree,
+                    ref=ref,
+                ),
             )
         except verify.GitSpawnError as e:
             # a spawn fault is machine-wide, not this unit's: deferring would
@@ -1565,6 +1628,13 @@ class WorktreeFlow:
         # behind — each decides its own exclusions; see the methods.
         seeds.extend(self._ledger_seed(unit.path))
         seeds.extend(self._board_seed(unit.path))
+        seeds.extend(
+            self._accepted_spec_seed(
+                task,
+                unit.path,
+                project_relative_only=accepted_spec_relocated,
+            )
+        )
         # plugins (e.g. the Unity engine) may prime an isolated checkout with
         # gitignored paths they need — e.g. an MCP-generated skill tree + client
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
@@ -1614,6 +1684,35 @@ class WorktreeFlow:
             self.journal.append(
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
+
+        # The last guard standing over a relocated accepted spec, and the only one
+        # that can see this particular loss at all: `_accepted_spec_seed` refuses on
+        # its own containment arm SILENTLY — the rel reaches neither `seed_files` nor
+        # `skipped_seeds` nor `undelivered_seeds`, so neither journal above names it.
+        # File-ness alone is therefore not enough to call the spec delivered.
+        # `_is_file` follows symlinks and asks only "are there bytes here", so a
+        # parent that is a real directory in the main checkout but a committed
+        # OUTWARD symlink in the commit this mount was cut from lands the probe on an
+        # unrelated external artifact, which answers true and dispatches the unit
+        # reading someone else's bytes under the accepted spec's name. Require
+        # containment as well: resolve the probe and keep it inside the mount. A
+        # legitimate INWARD link whose target is under the mount still passes, and an
+        # unresolvable probe cannot prove delivery, so every filesystem fault
+        # escalates rather than binding.
+        if accepted_spec_relocated:
+            accepted_probe = unit.path / str(task.spec_file)
+            try:
+                accepted_delivered = _is_file(accepted_probe) and accepted_probe.resolve(
+                    strict=False
+                ).is_relative_to(unit.path.resolve())
+            except (OSError, RuntimeError, ValueError):
+                accepted_delivered = False
+            if not accepted_delivered:
+                self.escalate_unit(
+                    task,
+                    f"accepted spec for {task.story_key} disappeared before it could be "
+                    "delivered to the replacement worktree",
+                )
 
         trees = [p.skill_tree for p in profiles]
         # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
@@ -1783,10 +1882,10 @@ class WorktreeFlow:
         ``clean_incoming_collisions``' ``protected`` operand (#618).
 
         The sprint board and the deferred-work ledger, because those are the two
-        files the four post-merge carries name: ``_carry_harvested_deferrals``,
-        ``_carry_review_budget_followups`` and ``_carry_story_deferred_closes`` pass
-        ``paths.deferred_work`` and ``_carry_board_advance`` passes
-        ``paths.sprint_status``, all four to ``verify.commit_paths`` against this same
+        files the three post-merge carries name: ``_carry_harvested_deferrals``
+        and ``_carry_story_deferred_closes`` pass ``paths.deferred_work`` and
+        ``_carry_board_advance`` passes
+        ``paths.sprint_status``, all three to ``verify.commit_paths`` against this same
         ``repo``. That call stages by PATHSPEC — `git add -- :(literal)<path>` — so
         whatever the working tree holds at that path is committed no matter who wrote
         it, and a merge that walked past an operator's edit there hands the run its
@@ -2280,10 +2379,31 @@ class WorktreeFlow:
         be mounted — if it was pruned out from under us we cannot safely reuse it,
         so escalate rather than run a session in a missing directory."""
         wt = Path(task.worktree_path)
-        if not wt.is_dir():
+        try:
+            mounted = wt.is_dir() and verify.worktree_is_registered(self.paths.repo_root, wt)
+        except verify.GitError as exc:
             self.escalate_unit(
                 task,
-                f"worktree for {task.story_key} is gone ({wt}); cannot resume in place",
+                f"cannot verify recorded worktree for {task.story_key} ({wt}): {exc}",
+            )
+        if not mounted:
+            self.escalate_unit(
+                task,
+                f"worktree for {task.story_key} is gone or unopenable ({wt}); "
+                "cannot resume in place",
+            )
+        try:
+            mounted_branch = verify.current_branch(wt)
+        except verify.GitError as exc:
+            self.escalate_unit(
+                task,
+                f"cannot verify recorded worktree branch for {task.story_key} ({wt}): {exc}",
+            )
+        if mounted_branch != task.branch:
+            self.escalate_unit(
+                task,
+                f"worktree for {task.story_key} is on {mounted_branch!r}, not recorded "
+                f"branch {task.branch!r}; cannot resume in place",
             )
         # Spec paths are persisted relative to the worktree (model.to_dict) so
         # state stays portable; re-absolutize both accepted/result ownership and

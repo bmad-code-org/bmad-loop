@@ -4,8 +4,10 @@ resolved-escalation guard that re-escalates instead of silently deferring."""
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.escalation import (
     Action,
+    critical_escalations,
     decide_dev,
     decide_review_session,
+    preference_escalations,
     review_retry_or_exhaust,
 )
 from bmad_loop.model import StoryTask
@@ -18,6 +20,27 @@ POLICY = Policy(
 )
 COMPLETED = SessionResult(status="completed", result_json={"escalations": []})
 FAILING = VerifyOutcome.retry("spec status is 'in-progress', expected 'done'")
+
+
+def test_escalation_selectors_preserve_valid_list_semantics():
+    critical = {"severity": "critical", "detail": "stop"}
+    preferences = [
+        {},
+        {"severity": "PREFERENCE", "detail": "explicit"},
+        {"detail": "implicit"},
+        {"severity": 1, "detail": "non-critical"},
+    ]
+    result = {"escalations": [None, "junk", critical, *preferences]}
+
+    assert critical_escalations(result) == [critical]
+    assert preference_escalations(result) == preferences
+
+
+def test_escalation_selectors_reject_every_non_list_shape():
+    for value in (None, 1, "escalation", {"severity": "CRITICAL"}, ("tuple",)):
+        result = {"escalations": value}
+        assert critical_escalations(result) == []
+        assert preference_escalations(result) == []
 
 
 def _task(**kw) -> StoryTask:

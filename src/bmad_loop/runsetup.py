@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from contextlib import suppress
@@ -43,7 +44,7 @@ from . import bmadconfig
 from . import policy as policy_mod
 from . import runs
 from .checks import Finding
-from .journal import Journal, save_state
+from .journal import Journal, save_state, state_lock
 from .model import RunState
 from .platform_util import atomic_replace, is_wsl_unc_path
 from .runs import RUNS_DIR
@@ -830,7 +831,7 @@ class ComposedRun:
     journal: Journal
 
 
-def _claim_run_dir(run_dir: Path) -> None:
+def _claim_run_dir(run_dir: Path) -> os.stat_result:
     """Take exclusive ownership of a fresh run directory, refusing an id that
     already names a run.
 
@@ -869,9 +870,23 @@ def _claim_run_dir(run_dir: Path) -> None:
             f"error: run {run_dir.name} already exists — refusing to compose over it. "
             "`--run-id` must name a run that does not exist yet."
         ) from e
+    try:
+        return run_dir.stat(follow_symlinks=False)
+    except BaseException:
+        # The directory is still empty and exclusively ours. If its identity
+        # cannot be captured, take the just-published claim back here because the
+        # outer composition unwind cannot safely identify it without the token.
+        with suppress(OSError):
+            run_dir.rmdir()
+        raise
 
 
-def _unwind_composition(project: Path, run_dir: Path, journal: Journal | None) -> None:
+def _unwind_composition(
+    project: Path,
+    run_dir: Path,
+    journal: Journal | None,
+    composer_claim: os.stat_result,
+) -> None:
     """Remove the run a failed ``compose_*`` had already published, so a launch
     that aborts partway leaves nothing behind.
 
@@ -929,7 +944,12 @@ def _unwind_composition(project: Path, run_dir: Path, journal: Journal | None) -
     effect: the operator reads the launch error, and nothing anywhere says the
     cleanup after it did not happen."""
     try:
-        runs.delete_run(project, run_dir)
+        runs.delete_run(
+            project,
+            run_dir,
+            _expected_composer_pid=os.getpid(),
+            _expected_composer_claim=composer_claim,
+        )
     except Exception as e:
         detail = f"{type(e).__name__}: {e}"
         print(
@@ -999,7 +1019,7 @@ def compose_run(
     run_dir = project / RUNS_DIR / run_id
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
-    _claim_run_dir(run_dir)
+    composer_claim = _claim_run_dir(run_dir)
     # Composition is atomic from the first published artifact onward: everything
     # below either lands whole or is unwound (see :func:`_unwind_composition`,
     # which also states why the arm is `BaseException` and not `Exception`).
@@ -1025,12 +1045,17 @@ def compose_run(
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
         )
-        save_state(run_dir, state)
-        # After the run dir exists (Journal mkdir'd it above) and before the pid lands:
-        # the ordering `reconcile_orphan_state_dirs` reads runs in, and a stamp that
-        # cannot be written fails the launch before an observer can see a live run.
-        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-        runs.write_pid(run_dir)
+        # State becoming resumable and the pid making this process live are one
+        # publication.  An explicit-id resume waits for the pid rather than entering
+        # between these writes and double-driving the freshly composed run.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # After the run dir exists (Journal mkdir'd it above) and before the pid
+            # lands: the ordering `reconcile_orphan_state_dirs` reads runs in, and a
+            # stamp that cannot be written fails the launch before an observer can
+            # see a live run.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         adapters = make_adapters(project, run_dir, policy, profiles=profiles)
         journal.append(
             "run-start",
@@ -1059,7 +1084,7 @@ def compose_run(
             else engine_cls(**common)  # pyright: ignore[reportArgumentType]
         )
     except BaseException:
-        _unwind_composition(project, run_dir, journal)
+        _unwind_composition(project, run_dir, journal, composer_claim)
         raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
@@ -1142,7 +1167,7 @@ def compose_sweep(
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Same claim, same reason, same placement outside the try as in `compose_run`.
-    _claim_run_dir(run_dir)
+    composer_claim = _claim_run_dir(run_dir)
     # Atomic from the first published artifact onward, exactly as in `compose_run`
     # — same reason, same opening on the statement after the claim, and one more
     # artifact to unwind (`sweep.json`).
@@ -1158,10 +1183,12 @@ def compose_sweep(
             run_type="sweep",
             trusted_config_digest=trusted_config_digest,
         )
-        save_state(run_dir, state)
-        # Out of the tree, same ordering and same reason as compose_run's stamp.
-        runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-        runs.write_pid(run_dir)
+        # Same indivisible state/pid publication as compose_run.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # Out of the tree, same ordering and same reason as compose_run's stamp.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         options = {
             "prompting": prompting,
             "decisions_only": decisions_only,
@@ -1197,7 +1224,7 @@ def compose_sweep(
         if on_started is not None:
             on_started()
     except BaseException:
-        _unwind_composition(project, run_dir, journal)
+        _unwind_composition(project, run_dir, journal, composer_claim)
         raise
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 

@@ -7,6 +7,7 @@ exactly what each CLI's hook registration produces), exercising spawn / env
 propagation / hook-signal waiting / kill end-to-end for any profile.
 """
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -21,10 +22,18 @@ from pathlib import Path
 
 import pytest
 import regex
+from conftest import json_recursion_payload
 
 from bmad_loop import devcontract, runs
+from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
+from bmad_loop.adapters.base import (
+    AdapterTaskDirectoryError,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    SpecSnapshot,
+)
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
@@ -33,6 +42,14 @@ from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
+
+# A bump the filesystem can actually record. NTFS stores ~100ns ticks (FAT, 2s),
+# so a 1ns increment rounds away on Windows and the rewritten marker never reads
+# as newer than the launch capture — the readback then fails closed and
+# `_result_json` returns None. ext4 keeps the nanosecond, which is why a 1ns bump
+# only ever reddened the Windows legs. A whole second clears every granularity
+# these tests can meet, and matches the bump already used elsewhere in this file.
+_MTIME_TICK_NS = 10**9
 
 HAVE_TMUX = sys.platform != "win32" and shutil.which("tmux") is not None
 
@@ -183,6 +200,90 @@ def test_read_result_variants(tmp_path):
     assert adapter._read_result("t1") is None  # malformed
     (task_dir / "result.json").write_text('["not a dict"]')
     assert adapter._read_result("t1") is None  # wrong shape
+    (task_dir / "result.json").write_bytes(_BAD_UTF8)
+    assert adapter._read_result("t1") is None  # invalid UTF-8
+    (task_dir / "result.json").write_text('{"clean": true}')
+    assert adapter._read_result("t1") == {"clean": True}  # valid rewrite
+
+
+def test_read_result_degrades_a_plain_decoder_value_error(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    marker = '{"value":"decoder-value-error"}'
+    (task_dir / "result.json").write_text(marker)
+    real_loads = json.loads
+
+    def loads_with_value_error(data, *args, **kwargs):
+        if data == marker:
+            raise ValueError("synthetic decoder value error")
+        return real_loads(data, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(generic.json, "loads", loads_with_value_error)
+        assert adapter._read_result("t1") is None
+
+    valid_unicode = {"escalations": [{"severity": "PREFERENCE", "detail": "café 🚀"}]}
+    (task_dir / "result.json").write_text(
+        json.dumps(valid_unicode, ensure_ascii=False), encoding="utf-8"
+    )
+    assert adapter._read_result("t1") == valid_unicode
+
+
+def test_read_result_degrades_a_decoder_recursion_error(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    nested = '{"value":' + json_recursion_payload() + "}"
+    with pytest.raises(RecursionError):
+        json.loads(nested)
+
+    (task_dir / "result.json").write_text(nested)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_degrades_an_unreadable_existence_probe(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    path = adapter._result_path("t1")
+    real_is_file = Path.is_file
+
+    def is_file_with_permission_error(candidate):
+        if candidate == path:
+            raise PermissionError("task directory is not searchable")
+        return real_is_file(candidate)
+
+    monkeypatch.setattr(Path, "is_file", is_file_with_permission_error)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_rejects_data_that_plugin_deepcopy_cannot_handle(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    depth = sys.getrecursionlimit() // 2
+    nested = '{"value":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+    parsed = json.loads(nested)
+    with pytest.raises(RecursionError):
+        copy.deepcopy(parsed)
+    (task_dir / "result.json").write_text(nested)
+
+    assert adapter._read_result("t1") is None
+
+
+def test_read_result_rejects_lone_surrogates_and_recovers_after_rewrite(tmp_path):
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    escaped_surrogate = '{"escalations":[{"severity":"CRITICAL","detail":"\\ud800"}]}'
+    parsed = json.loads(escaped_surrogate)
+    with pytest.raises(UnicodeEncodeError):
+        json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+    (task_dir / "result.json").write_text(escaped_surrogate)
+
+    assert adapter._read_result("t1") is None
+
     (task_dir / "result.json").write_text('{"clean": true}')
     assert adapter._read_result("t1") == {"clean": True}
 
@@ -3094,8 +3195,10 @@ class _StartSessionMux:
 
     def __init__(self):
         self.piped: list[tuple[str, Path]] = []
+        self.windows: list[tuple[str, str, Path]] = []
 
     def new_window(self, session_name, window_name, cwd, env, cmd):
+        self.windows.append((session_name, window_name, Path(cwd)))
         return "@1"
 
     def pipe_pane(self, window_id, log_file):
@@ -3105,6 +3208,283 @@ class _StartSessionMux:
         # The crash-path diagnosis probe (#489) asks this; these tests are about a
         # window that died under a session that is still very much there.
         return True
+
+
+@pytest.mark.parametrize(
+    "task_id_kind", ["absolute", "parent-traversal", "empty", "windows-reserved"]
+)
+def test_start_session_refuses_unconfined_task_id_without_side_effects(tmp_path, task_id_kind):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_ids = {
+        "absolute": str(outside),
+        "parent-traversal": str(Path("..") / ".." / "outside"),
+        "empty": "",
+        "windows-reserved": "CON",
+    }
+    task_id = task_ids[task_id_kind]
+    escaped_log = adapter.logs_dir / f"{task_id}.log"
+
+    with pytest.raises(AdapterTaskDirectoryError, match="expected one clean path segment"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert not escaped_log.exists()
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    try:
+        task_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert task_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.txt").write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    adapter.tasks_dir.rmdir()
+    try:
+        adapter.tasks_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert adapter.tasks_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path, monkeypatch):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == adapter.tasks_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        prompt_path.symlink_to(outside_prompt)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert not prompt_path.is_symlink()
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+    assert len(mux.windows) == 1
+    assert len(mux.piped) == 1
+
+
+def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        os.link(outside_prompt, prompt_path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert prompt_path.stat().st_ino != outside_prompt.stat().st_ino
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+
+
+def test_start_session_preserves_existing_regular_prompt_inode(tmp_path):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    prompt_path = task_dir / "prompt.txt"
+    prompt_path.write_text("old", encoding="utf-8")
+    inode = prompt_path.stat().st_ino
+    spec = make_spec(tmp_path, task_id=task_id)
+
+    adapter.start_session(spec)
+
+    assert prompt_path.stat().st_ino == inode
+    assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["heartbeat.json", "resultless-stops.jsonl", "session-lifecycle.jsonl"],
+)
+def test_start_session_refuses_redirected_task_artifact_before_mutation(tmp_path, artifact_name):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    task_dir = adapter.tasks_dir / "clean-task"
+    task_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (task_dir / artifact_name).symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (task_dir / "prompt.txt").exists()
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+@pytest.mark.parametrize("redirect_kind", ["root", "junction-like-root", "log-file"])
+def test_start_session_refuses_redirected_log_path_before_mutation(
+    tmp_path, redirect_kind, monkeypatch
+):
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "theirs.log"
+    outside_file.write_text("theirs", encoding="utf-8")
+    try:
+        if redirect_kind == "root":
+            adapter.logs_dir.rmdir()
+            adapter.logs_dir.symlink_to(outside, target_is_directory=True)
+        elif redirect_kind == "junction-like-root":
+            monkeypatch.setattr(
+                adapter_base,
+                "is_link_like",
+                lambda path: Path(path) == adapter.logs_dir,
+            )
+        else:
+            (adapter.logs_dir / "clean-task.log").symlink_to(outside_file)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact (directory )?is a symlink"):
+        adapter.start_session(make_spec(tmp_path, task_id="clean-task"))
+
+    assert outside_file.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_start_session_refuses_junction_like_task_directory_before_mutation(tmp_path, monkeypatch):
+    """The adapter consumes the shared predicate's Windows-junction verdict.
+
+    platform_util's reparse-tag tests own junction detection itself; an ordinary
+    directory standing in here makes this composition arm run on every platform.
+    """
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    ensure_calls = []
+    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    (task_dir / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (task_dir / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in task_dir.iterdir()}
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(make_spec(tmp_path, task_id=task_id))
+
+    assert {path.name: path.read_bytes() for path in task_dir.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert ensure_calls == []
+    assert mux.windows == []
+    assert mux.piped == []
+
+
+def test_validated_task_directory_refuses_direct_junction_verdict(tmp_path, monkeypatch):
+    tasks_dir = tmp_path / "tasks"
+    task_dir = tasks_dir / "clean-task"
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="task directory is a symlink"):
+        adapter_base.validated_task_directory(tasks_dir, "clean-task")
 
 
 def test_start_session_resets_reused_task_log(tmp_path):
@@ -3924,8 +4304,26 @@ def test_frontmatter_fallback_synthesizes_on_second_stable_stop(tmp_path, monkey
     assert rj["baseline_commit"] == "abc123"
     assert rj["synthesized_from_frontmatter"] is True
     assert rj["escalations"] == []
+    assert rj["park_asserted"] is False
     # the harvest pass writes no breadcrumb
     assert len(_breadcrumbs(adapter)) == 1
+
+
+def test_frontmatter_fallback_park_cannot_assert_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    markerless_park = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n"
+    )
+    (impl / "spec-3-1-foo.md").write_text(markerless_park)
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+
+    assert rj["status"] == "awaiting-operator"
+    assert rj["park_asserted"] is False
+    assert rj["synthesized_from_frontmatter"] is True
 
 
 def test_frontmatter_fallback_stamps_story_key_and_dw_ids(tmp_path, monkeypatch):
@@ -4733,6 +5131,290 @@ def test_expected_spec_synthesizes_its_own_marker_spec(tmp_path, monkeypatch):
     assert rj is not None and rj["status"] == "done"
     assert rj["story_key"] == "3-1"
     assert rj["spec_file"] == str(ours)
+
+
+@pytest.mark.parametrize("known_spec", [False, True], ids=["scan", "known-spec"])
+def test_prelaunch_park_marker_survives_unrelated_touch_without_asserting_ownership(
+    tmp_path, monkeypatch, known_spec
+):
+    """A whole-file mtime bump cannot lend a retained park marker to this session."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    parked = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    ours.write_text(parked)
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    if known_spec:
+        spec = dataclasses.replace(spec, expected_spec=str(ours))
+
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    # Rewrite only the body before the retained marker, then lift whole-file mtime
+    # past launch. The old implementation treated that mtime as marker provenance.
+    ours.write_text(parked.replace("# Story", "# Story\n\nUnrelated post-launch touch."))
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["status"] == "awaiting-operator"
+    assert rj["park_asserted"] is False
+
+
+def test_new_session_marker_asserts_park_after_launch_capture(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_marker_readback_without_launch_capture_fails_closed(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    rj = adapter._result_json(_dev_handle(), spec, wait=False)
+
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_marker_path_key_falls_back_when_resolve_raises_runtime_error(tmp_path):
+    """`Path.resolve()` on a symlink loop raises RuntimeError on the 3.11 support
+    floor — NOT an OSError — and raises nothing at all on 3.13. So a real loop cannot
+    exercise the fallback on the dev interpreter, and a `except OSError:` guard is
+    inert on the floor: the fault is injected here instead, so the row means the same
+    thing on every interpreter CI runs.
+
+    Ablation: narrow the guard back to `except OSError:` and this reddens on both
+    interpreters, on the RuntimeError escaping the key builder."""
+
+    class LoopedPath(type(Path())):
+        def resolve(self, strict=False):
+            raise RuntimeError("Symlink loop from 'a.md'")
+
+    looped = LoopedPath(tmp_path / "impl" / "a.md")
+    assert GenericDevAdapter._marker_path_key(looped) == str(looped.absolute())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs a privilege")
+def test_launch_capture_survives_a_looped_artifact_symlink(tmp_path, monkeypatch):
+    """One looped `*.md` under the artifact dir is one unreadable marker, not an
+    aborted launch. Every unpinned dev session (no `expected_spec`) globs the whole
+    directory here, before the transport starts, so a stray loop used to block the
+    run outright on 3.11. The loop entry is captured as `None` (`read_text` raises
+    ELOOP on every interpreter) and the readable spec beside it is still captured.
+
+    Non-vacuous only on the floor: 3.13 resolves the loop silently, so the abort
+    this guards against cannot be produced there. Its sibling above injects the
+    RuntimeError directly for that reason."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nFinished.\n"
+    )
+    (impl / "a.md").symlink_to("b.md")
+    (impl / "b.md").symlink_to("a.md")
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+
+    adapter.start_session(_dev_spec(tmp_path))  # must not raise
+
+    captured = adapter._launch_auto_run_results["3-1-dev-1"]
+    assert captured is not None  # the directory enumeration itself completed
+    # both loop members are unreadable markers; the real spec beside them survives
+    assert list(captured.values()).count(None) == 2
+    assert [fp for fp in captured.values() if fp is not None] == [
+        devcontract.auto_run_result_fingerprint((impl / "spec-3-1-foo.md").read_text())
+    ]
+
+
+def test_launch_capture_precedes_transport_that_writes_park_marker(tmp_path, monkeypatch):
+    """A child that finishes during transport startup still owns its new marker."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    def launch(_adapter, _spec):
+        ours.write_text(
+            "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+            "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+            "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+        )
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+        return _dev_handle(launched_ns=launch_floor)
+
+    monkeypatch.setattr(generic.GenericAdapter, "start_session", launch)
+
+    handle = adapter.start_session(spec)
+    rj = adapter._result_json(handle, spec, wait=False)
+
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_in_place_marker_rewrite_asserts_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: done\nFinished.\n"
+    )
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_deleting_older_marker_does_not_assert_retained_last_marker(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    final_marker = "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    prefix = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+    )
+    ours.write_text(prefix + "## Auto Run Result\n\nStatus: done\nOld.\n\n" + final_marker)
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(prefix + final_marker)
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_moved_launch_marker_does_not_assert_session_ownership(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    old = impl / "spec-old.md"
+    ours = impl / "spec-3-1-foo.md"
+    old.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    launch_floor = old.stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    old.rename(ours)
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
+
+
+def test_unrelated_unreadable_markdown_does_not_poison_new_spec_capture(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "notes.md").write_bytes(b"\xff")
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = (impl / "notes.md").stat().st_mtime_ns + 1
+    spec = _dev_spec(tmp_path)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is True
+
+
+def test_unreadable_launch_spec_fails_closed_after_becoming_readable(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_bytes(b"\xff")
+    launch_floor = ours.stat().st_mtime_ns + 1
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    handle = adapter.start_session(spec)
+
+    ours.write_text(
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+
+    rj = adapter._result_json(handle, spec, wait=False)
+    assert rj is not None and rj["park_asserted"] is False
 
 
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):

@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from conftest import escalated_run, git, refuse_to_resolve
+from conftest import assert_run_state_lock_held, escalated_run, git, refuse_to_resolve
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
@@ -767,6 +767,155 @@ def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
     assert load_state(run_dir).stopped is True
     assert runs.read_stop_request_mode(run_dir) is None
     assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
+
+
+def test_stop_run_takes_state_lock_only_after_signal_and_wait(tmp_path, monkeypatch):
+    """Ablation: move stop_run's state_lock above terminate and this reddens on order;
+    the engine would be unable to save its own stopped state while stop waits."""
+    order: list[str] = []
+    alive = True
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def on_terminate(_pid):
+        nonlocal alive
+        order.append("terminate")
+        alive = False
+
+    host = _FakeHost(alive=lambda: alive, identity=100.0, on_terminate=on_terminate)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: order.append("kill-session"))
+
+    @contextlib.contextmanager
+    def recording_state_lock(_run_dir):
+        order.append("state-lock")
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", recording_state_lock)
+
+    assert runs.stop_run(run_dir) is True
+    assert order == ["terminate", "kill-session", "state-lock"]
+
+
+def test_stop_run_fallback_save_retains_the_outer_state_lock(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    assert runs.stop_run(run_dir) is True
+    assert load_state(run_dir).stopped is True
+
+
+def test_stop_run_does_not_fallback_over_engine_completion(tmp_path, monkeypatch):
+    """The final locked snapshot wins when the engine finishes while stop delivers."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+
+    def finish(_pid):
+        state = load_state(run_dir)
+        state.finished = True
+        save_state(run_dir, state)
+
+    monkeypatch.setattr(
+        runs,
+        "get_process_host",
+        lambda: _FakeHost(alive=False, identity=100.0, on_terminate=finish),
+    )
+
+    assert runs.stop_run(run_dir) is False
+    persisted = load_state(run_dir)
+    assert persisted.finished is True
+    assert persisted.stopped is False
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or '"fallback": true' not in journal.read_text()
+
+
+def test_stop_run_retries_when_resume_publishes_a_new_engine(tmp_path, monkeypatch):
+    """A rival resume that wins during delivery is itself sent the hard stop."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    alive = {4242: True, 5252: True}
+    identities = {4242: 100.0, 5252: 200.0}
+
+    class GenerationalHost(_FakeHost):
+        def __init__(self):
+            super().__init__(alive=False)
+
+        def is_alive(self, pid):
+            return alive.get(pid, False)
+
+        def identity(self, pid):
+            return identities.get(pid)
+
+        def terminate(self, pid):
+            self.terminated.append(pid)
+            alive[pid] = False
+            if pid == 4242:
+                # Resume clears the old gesture, then publishes its new pid and
+                # state atomically under the lock stop will next acquire.
+                with runs.state_lock(run_dir):
+                    runs.clear_graceful_stop(run_dir)
+                    rival = load_state(run_dir)
+                    rival.crashed = True
+                    (run_dir / "engine.pid").write_text("5252 200.0", encoding="utf-8")
+                    save_state(run_dir, rival)
+
+    host = GenerationalHost()
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [4242, 5252]
+    persisted = load_state(run_dir)
+    assert persisted.stopped is True
+    assert persisted.crashed is True
+    assert runs.read_stop_request_mode(run_dir) is None
+
+
+def test_stop_run_does_not_loop_on_an_engine_whose_identity_cannot_be_read(tmp_path, monkeypatch):
+    """A recorded pid that exists but whose identity cannot be read (win32
+    ERROR_ACCESS_DENIED is the measured shape) is `"unknown"`, not `"dead"`, and
+    `alive_and_ours` declines it — so the local pid is cleared and nothing is
+    signalled. The generation compare under the lock must then read the pid file
+    AS RECORDED: compared against the cleared local pid, the unchanged file looked
+    like a rival that had published a new engine, `_stop_run_once` answered "retry",
+    and `stop_run` — an unbounded loop by design, so a real rival is always sent the
+    stop — never returned.
+
+    `_stop_run_once` is wrapped to turn that livelock into a failure, or the
+    ablation would hang the suite rather than redden it.
+
+    Ablation: compare `current_engine` against the post-clearing `(pid, identity)`
+    again and this reddens on the call count."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0", encoding="utf-8")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    host = _FakeHost(alive=True, identity=None)  # exists, identity unreadable
+    assert host.liveness_of(4242, 100.0) == "unknown"  # MEASURED: the arm under test
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    real_once = runs._stop_run_once
+    calls: list[int] = []
+
+    def bounded_once(run_dir_):
+        calls.append(1)
+        if len(calls) > 3:
+            raise AssertionError("stop_run is retrying an unchanged engine forever")
+        return real_once(run_dir_)
+
+    monkeypatch.setattr(runs, "_stop_run_once", bounded_once)
+
+    assert runs.stop_run(run_dir) is True
+
+    assert len(calls) == 1
+    assert host.terminated == []  # never signals a pid it cannot prove is ours
+    assert load_state(run_dir).stopped is True
 
 
 def test_stop_run_engine_confirmed_leaves_nothing_pending(tmp_path, monkeypatch):
@@ -2412,6 +2561,127 @@ def test_delete_run(tmp_path):
     assert not run_dir.exists()
 
 
+def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, monkeypatch):
+    """Resume-first ordering: the decisive probe runs after lock acquisition and
+    leaves both the run and its control plane untouched.
+
+    Ablation: remove the in-lock ``engine_liveness`` gate and the run disappears;
+    move it above ``state_lock`` and the lock assertion fails. Verified.
+    """
+    run_dir = _make_state_run(tmp_path, "r1")
+    state_dir = _seed_state_dir(tmp_path, "r1")
+
+    def live(target):
+        assert_run_state_lock_held(target)
+        return "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", live)
+    monkeypatch.setattr(
+        runs,
+        "_refuse_live_session",
+        lambda *_args: pytest.fail("session guard ran before authoritative engine probe"),
+    )
+    with pytest.raises(runs.LiveEngineError, match="refusing to delete"):
+        runs.delete_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert state_dir.is_dir()
+
+
+def test_delete_run_holds_lifecycle_lock_through_removal_and_state_discard(tmp_path, monkeypatch):
+    """The authoritative probe, directory removal, and control-plane tail are one
+    uninterrupted transaction. Moving either mutation outside the hold reddens.
+    """
+    run_dir = _make_state_run(tmp_path, "r1")
+    removed: list[str] = []
+    real_rmtree = runs.shutil.rmtree
+
+    def dead(target):
+        assert_run_state_lock_held(target)
+        return "dead"
+
+    def checked_rmtree(target, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        removed.append("run")
+        return real_rmtree(target, *args, **kwargs)
+
+    def checked_discard(_project, _run_id):
+        assert_run_state_lock_held(run_dir)
+        removed.append("state")
+
+    monkeypatch.setattr(runs, "engine_liveness", dead)
+    monkeypatch.setattr(runs.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(runs, "_discard_state_dir", checked_discard)
+
+    runs.delete_run(tmp_path, run_dir)
+
+    assert removed == ["run", "state"]
+
+
+def test_failed_composition_pid_bypasses_only_its_own_live_engine(tmp_path, monkeypatch):
+    """The narrow composer token keeps the independent session guard active."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    composer_claim = run_dir.stat(follow_symlinks=False)
+    runs.write_pid(run_dir)
+    checked: list[str] = []
+
+    def session_guard(_project, run_id, _action):
+        checked.append(run_id)
+
+    monkeypatch.setattr(runs, "_refuse_live_session", session_guard)
+    runs.delete_run(
+        tmp_path,
+        run_dir,
+        _expected_composer_pid=os.getpid(),
+        _expected_composer_claim=composer_claim,
+    )
+
+    assert checked == ["r1"]
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("operation", [runs.delete_run, runs.archive_run])
+def test_lifecycle_containment_is_checked_before_lock_acquisition(tmp_path, monkeypatch, operation):
+    """A hostile path is refused without deriving or taking any state lock."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "state.json").write_text("{}", encoding="utf-8")
+
+    def unexpected_lock(_run_dir):
+        pytest.fail("containment must run before state-lock acquisition")
+
+    monkeypatch.setattr(runs, "state_lock", unexpected_lock)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        operation(project, outside)
+
+    assert outside.is_dir()
+
+
+def test_delete_run_refuses_before_removal_when_state_lock_cannot_be_named(tmp_path, monkeypatch):
+    """The lifecycle lock is mandatory: without a state root cleanup cannot
+    rendezvous with resume, so failure leaves the run intact and surfaces."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+
+    with pytest.raises(runs.StateRootError, match="no root"):
+        runs.delete_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+
+
+def test_archive_run_refuses_before_staging_when_state_lock_cannot_be_named(tmp_path, monkeypatch):
+    """Archive cannot stage or remove anything when its mandatory lock fails."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+
+    with pytest.raises(runs.StateRootError, match="no root"):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
 def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
     """#494 moved the events channel out of the project tree, so removing the run
     dir stopped removing everything the run owns. Without this tail every delete
@@ -2429,19 +2699,18 @@ def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
 @pytest.mark.parametrize(
     "attr, exc",
     [
-        ("state_root", runs.StateRootError("no root")),
         ("project_tag", OSError("cannot canonicalize")),
         ("project_tag", RuntimeError("Symlink loop from '/p'")),
     ],
-    ids=["no-derivable-state-root", "unresolvable-project", "symlink-loop-project"],
+    ids=["unresolvable-project", "symlink-loop-project"],
 )
 def test_delete_run_survives_a_counterpart_it_cannot_name(tmp_path, monkeypatch, attr, exc):
     """The counterpart removal is a never-raise tail (#139 teardown doctrine).
 
-    Every row is the counterpart being *unnameable*, which is the only failure
-    that can escape: an environment with no derivable state root, and a project
-    the OS refuses to canonicalize (#552). Removal failures are absorbed
-    separately, by `ignore_errors`.
+    Every row is a project the OS refuses to canonicalize (#552) only after the
+    mandatory lifecycle lock was named. Removal failures are absorbed separately,
+    by `ignore_errors`. A missing state root now refuses before removal because
+    cleanup cannot safely rendezvous with resume without that lock.
 
     The `RuntimeError` row is not a hypothetical type: `project_tag` resolves
     before digesting, and below 3.13 `Path.resolve` reports a symlink loop as
@@ -2747,11 +3016,20 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
       MISSING value, not a divergent one: it migrates silently, and calling it a move
       would fire the warning once on every pre-upgrade run.
 
+    The journal line is graded on the same three rows, because it is the DURABLE half
+    and the return value is not: the caller prints that string to stderr or a TUI toast
+    and it is gone. Worse, this re-stamp is what makes `cli._resume_paused_run`'s own
+    `code_root_changed` record read `false` later in the same gesture — both sides read
+    `bmadconfig.load_paths` on one project, so once the mirror is aimed the compare
+    NECESSARILY agrees. Without this line the one gesture where the root actually moved
+    is the one that leaves no trace, while plain `resume` still writes one.
+
     Ablation: drop the `if not moved: return None` arm and `legacy` reddens on the
     message; return the message without the `save_state` and `moved` reddens on the
-    persisted root while the other two rows still pass.
+    persisted root while the other two rows still pass; delete the `journal.append` and
+    `moved` reddens on the record alone, with every message assertion still green.
     """
-    from bmad_loop.journal import STATE_FILE
+    from bmad_loop.journal import STATE_FILE, Journal
 
     run = escalated_run(tmp_path, "r1", story_key="s1")
     now = tmp_path / "code"
@@ -2780,9 +3058,210 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
     else:
         assert message is None
 
+    # ...and the move is RECORDED, on exactly the row that moved
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert len(records) == (1 if recorded == "moved" else 0)
+    if records:
+        # `code_root_changed` is resume's own field name, so a reader correlates the two
+        # surfaces without knowing which one wrote the line
+        assert records[0]["code_root_changed"] is True
+        assert records[0]["repo"] == str(now)
+
+
+def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_path, monkeypatch):
+    """The move and an intent marker land in one atomic state write; the record is
+    appended after it and the marker cleared only once the append returned. So an
+    append that fails leaves the root MOVED and the marker SET, and the retry — which
+    would otherwise exit at "already agrees" with the record never written and the
+    later `run-resume` line reporting `code_root_changed=False` — re-enters, writes
+    the record the move still owes, and clears the marker.
+
+    Ablations: drop the `or state.code_root_restamp_pending` half of the early
+    return and the retry reddens on `None`; clear the marker before the append and
+    it reddens the same way; never set it and the first assertion reddens."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = str(tmp_path / "was")
+    save_state(run.run_dir, run.state)
+    real_append = Journal.append
+    failures = iter([OSError(30, "Read-only file system")])
+
+    def append_once_failing(self, kind, **fields):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, now)
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now  # the move is durable...
+    assert persisted.code_root_restamp_pending is True  # ...and the record still owed
+
+    message = runs.restamp_code_root(run.run_dir, now)  # the retry
+
+    assert message is not None
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now
+    assert persisted.code_root_restamp_pending is False
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert [r["repo"] for r in records] == [str(now)]  # exactly once, on the retry
+
+
+def test_restamp_code_root_records_no_move_the_state_write_did_not_make(tmp_path, monkeypatch):
+    """The other half of the ordering. A record written AHEAD of `save_state` asserted
+    a completed move that a failed save then never made — the journal said the root
+    changed while state.json still named the old tree, permanently, since the retry
+    would write a second such record. With the record after the persisted move, a
+    failed save leaves nothing behind: no move, no marker, no record, and the retry
+    redoes the whole thing exactly once.
+
+    Ablation: move the `Journal(...).append` above the first `save_state` and this
+    reddens on the record count after the failed call."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    was = tmp_path / "was"
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = str(was)
+    save_state(run.run_dir, run.state)
+    real_save = runs.save_state
+    failures = iter([OSError(28, "No space left on device")])
+
+    def save_once_failing(target, state):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", save_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, now)
+    persisted = load_state(run.run_dir)
+    assert persisted.repo_root == str(was)  # the move did NOT commit...
+    assert persisted.code_root_restamp_pending is False
+    records = lambda: [  # noqa: E731
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    assert records() == []  # ...so nothing may claim it did
+
+    message = runs.restamp_code_root(run.run_dir, now)  # the retry
+
+    assert message is not None
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now and persisted.code_root_restamp_pending is False
+    assert [r["repo"] for r in records()] == [str(now)]
+
+
+@pytest.mark.parametrize("retry_root", ["was", "third"])
+def test_restamp_code_root_discharges_the_owed_record_before_moving_again(
+    tmp_path, monkeypatch, retry_root
+):
+    """The owed record names the root the MARKER still describes, not the retry's.
+
+    `code_root_restamp_pending` is a bare bool: the only surviving description of the
+    root an unlanded record was owed for is `state.repo_root` itself. An operator whose
+    record-append failed, and who then re-points the root AGAIN before retrying —
+    restoring the original, or moving to a third tree — would otherwise have the owed
+    root overwritten and its record lost forever, leaving the move with no durable
+    trace on any surface. Both existing failure-path tests retry with the SAME root,
+    where the owed root and the retry's root coincide and the loss cannot show.
+
+    Ablation: drop the `if state.code_root_restamp_pending:` discharge append ahead of
+    `state.repo_root = new` and this reddens on the record list — only the retry's own
+    root is recorded and the owed one is gone."""
+    from bmad_loop.journal import Journal
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    was = tmp_path / "was"
+    owed = tmp_path / "owed"
+    owed.mkdir()
+    again = was if retry_root == "was" else tmp_path / "third"
+    run.state.repo_root = str(was)
+    save_state(run.run_dir, run.state)
+    real_append = Journal.append
+    failures = iter([OSError(30, "Read-only file system")])
+
+    def append_once_failing(self, kind, **fields):
+        fault = next(failures, None)
+        if fault is not None:
+            raise fault
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_once_failing)
+
+    with pytest.raises(OSError):
+        runs.restamp_code_root(run.run_dir, owed)
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == owed  # the move is durable, its record owed
+    assert persisted.code_root_restamp_pending is True
+
+    message = runs.restamp_code_root(run.run_dir, again)  # the root moves AGAIN
+
+    assert message is not None
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == again
+    assert persisted.code_root_restamp_pending is False
+    records = [
+        e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+    ]
+    # The owed root is discharged FIRST, under its own name, and the second move
+    # gets its own row — one record per move, neither of them lost.
+    assert [r["repo"] for r in records] == [str(owed), str(again)]
+    assert all(r["code_root_changed"] is True for r in records)
+
+
+def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):
+    """Ablation: move restamp_code_root's load above state_lock and the rival's
+    ``crashed`` update is overwritten by the stale snapshot."""
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    save_state(run.run_dir, run.state)
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run.run_dir)
+        rival.crashed = True
+        save_state(run.run_dir, rival)
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", rival_first)
+
+    runs.restamp_code_root(run.run_dir, tmp_path / "new-code")
+
+    persisted = load_state(run.run_dir)
+    assert persisted.crashed is True
+    assert persisted.code_root == tmp_path / "new-code"
+
+
+def test_restamp_code_root_retains_outer_lock_through_save(tmp_path, monkeypatch):
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    save_state(run.run_dir, run.state)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.restamp_code_root(run.run_dir, tmp_path / "new-code")
+    assert load_state(run.run_dir).code_root == tmp_path / "new-code"
+
 
 _SPEC_WITH_ARR = (
-    "---\ntitle: t\nstatus: blocked\n---\n\n## Intent\n\nbody\n"
+    "---\ntitle: t\nstatus: blocked\noperator_actions:\n"
+    "  - publish the TXT record\n---\n\n## Intent\n\nbody\n"
     "\n## Auto Run Result\n\n- Status: blocked\n\nboom\n"
 )
 
@@ -2822,9 +3301,69 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
     assert task.restore_patch is None  # stale latch cleared
-    assert "status: ready-for-dev" in spec.read_text()
+    text = spec.read_text()
+    assert "status: ready-for-dev" in text
+    assert verify.operator_actions_of(verify.read_frontmatter(spec)) == ("publish the TXT record",)
+    assert "## Auto Run Result" not in text  # stale attempt authority stripped
     entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
     assert entry["restore"] is False
+
+
+def test_rearm_reloads_state_after_waiting_for_the_run_lock(tmp_path, monkeypatch):
+    """Ablation: load state before rearm_escalation's state_lock and this stale
+    gesture re-arms after the rival has already completed it."""
+    from bmad_loop.model import Phase
+
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    original = spec.read_bytes()
+
+    @contextlib.contextmanager
+    def rival_first(_run_dir):
+        rival = load_state(run_dir)
+        rival.tasks["1-1-a"].phase = Phase.PENDING
+        save_state(run_dir, rival)
+        yield
+
+    monkeypatch.setattr(runs, "state_lock", rival_first)
+
+    with pytest.raises(runs.RearmError, match="is not escalated"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == original
+
+
+def test_rearm_lock_acquisition_failure_leaves_spec_and_state_unchanged(tmp_path, monkeypatch):
+    from bmad_loop import journal as journal_mod
+
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    spec_before = spec.read_bytes()
+    state_before = (run_dir / journal_mod.STATE_FILE).read_bytes()
+
+    @contextlib.contextmanager
+    def refusing_lock(_path, **_kw):
+        raise OSError("state lock unavailable")
+        yield
+
+    monkeypatch.setattr(journal_mod, "file_lock", refusing_lock)
+
+    with pytest.raises(OSError, match="state lock unavailable"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == spec_before
+    assert (run_dir / journal_mod.STATE_FILE).read_bytes() == state_before
+
+
+def test_rearm_locked_body_retains_outer_lock_through_state_save(tmp_path, monkeypatch):
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
@@ -2858,6 +3397,344 @@ def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED and task.attempt == 2  # nothing persisted
     assert task.restore_patch is None  # the latch never landed either
+
+
+def _renamed_project_pair(tmp_path):
+    """A run whose `state.project` names the tree it LAUNCHED in, plus a live tree
+    holding the same spec at the same relative position — the shape a project move
+    leaves behind.
+
+    Both copies exist deliberately, and that is what makes the rows below falsifiable:
+    a real rename deletes the old tree, so a re-arm aimed at it would merely no-op and
+    "the live spec is unflipped" could not tell a wrong target from no write at all.
+    With both present, exactly one file changes and the assertion names which.
+    """
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    for root in (recorded_project, live_project):
+        root.mkdir()
+        (root / "spec.md").write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    recorded_spec = recorded_project / "spec.md"
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        attempt=2,
+        spec_file=str(recorded_spec),
+    )
+    return run.run_dir, recorded_spec, live_project / "spec.md", live_project
+
+
+def test_rearm_flips_the_spec_in_the_live_project_after_a_rename(tmp_path):
+    """`resolve.build_context` publishes a `spec_file` REBASED onto the live CLI
+    project, because `state.project` is the launch-time spelling and nothing re-stamps
+    it — `restamp_code_root` moves the CODE root, and there is no project counterpart.
+    The re-arm resolved the same task through `task_spec_path` against that recorded
+    project, so after a rename the agent edited one file and the re-arm flipped
+    another. In the real shape the recorded tree is gone, so the flip silently no-ops
+    (every writer answers an absent path with `False`), the baseline re-stamp is
+    skipped, and the re-drive wedges on the escalated attempt's status with the
+    escalation spent.
+
+    Both halves are asserted, because a fix that wrote BOTH files would satisfy the
+    first alone.
+
+    Ablation: revert `live_spec_path` to a bare `task_spec_path` and this reddens on
+    the live spec's unchanged status. `live_spec_root` is graded by the row below
+    instead, and deliberately: ablating the ROOT alone is invisible here, because every
+    writer answers an out-of-root path by silently dropping to the unconfined arm —
+    the write still lands, it just loses #593's O_NOFOLLOW walk. That silent degrade is
+    the hazard `task_spec_root`'s own docstring names, so the invariant has to be
+    asserted directly rather than inferred from an outcome that cannot see it."""
+    run_dir, recorded_spec, live_spec, live_project = _renamed_project_pair(tmp_path)
+
+    runs.rearm_escalation(
+        run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(live_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) != "ready-for-dev"
+    assert "## Auto Run Result" not in live_spec.read_text(encoding="utf-8")
+    assert "## Auto Run Result" in recorded_spec.read_text(encoding="utf-8")
+
+
+def test_live_spec_root_still_confines_the_live_spec_path(tmp_path):
+    """The pair moves together or not at all. `task_spec_root` is the confinement claim
+    about the very path `task_spec_path` produces, so rebasing one alone hands the four
+    writers of these bytes a path outside their own root — which none of them refuses.
+    They drop to the plain write and #593's O_NOFOLLOW walk of the parent components is
+    gone, with no signal anywhere. Nothing downstream can observe that, so the
+    containment is asserted here, at the seam that has to preserve it.
+
+    Ablation: revert either helper to its un-rebased original and this reddens — the
+    root one on containment, the path one on the root's own identity."""
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    for root in (recorded_project, live_project):
+        root.mkdir()
+        (root / "spec.md").write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        spec_file=str(recorded_project / "spec.md"),
+    )
+    task = run.state.tasks["1-1-a"]
+
+    spec_path = runs.live_spec_path(task, run.state, live_project)
+    spec_root = runs.live_spec_root(task, run.state, live_project)
+
+    assert spec_path == live_project / "spec.md"
+    assert spec_root == live_project
+    assert spec_path.is_relative_to(spec_root)  # the confined arm stays reachable
+
+
+def test_rearm_rollback_confines_the_undo_to_the_live_root_after_a_rename(tmp_path, monkeypatch):
+    """The undo has to confine against the root its own forward writers confined against.
+
+    `_restore_rearmed_spec` picks between the component-walking confined writer and the
+    plain no-follow one on a LEXICAL `is_relative_to(confine_root)`, and it derived that
+    root from `task_spec_root` — the RECORDED project spelling, which nothing re-stamps.
+    The three writes it undoes (the status flip, the `## Auto Run Result` strip and the
+    baseline re-stamp) all pass `live_spec_root(task, state, live_project)`, and the path
+    itself is `live_spec_path`. Un-renamed those two roots are the same string, which is
+    why every pre-existing `_restore_rearmed_spec` row stayed green either way: they all
+    call `rearm_escalation` WITHOUT `project_root`, so the whole dimension was uncovered.
+    Rename the project and they diverge — the live path is not under the recorded root,
+    the predicate goes False, and the undo takes the UNCONFINED arm on exactly the spec
+    its siblings just wrote through the confined one.
+
+    Nothing downstream can see that: the right file gets the right bytes and the record
+    still says `restored`. What is lost is #593's O_NOFOLLOW walk of the PARENT
+    components — `follow_symlinks=False` covers only the final one — so the invariant is
+    asserted directly, at the seam, the same way
+    `test_live_spec_root_still_confines_the_live_spec_path` grades the forward half.
+
+    The spies go on the `runs` namespace because that is where the call site reads them:
+    `runs` binds both writers with `from .platform_util import ...`, so patching here
+    reaches `_restore_rearmed_spec` and CANNOT reach the forward writers, which hold
+    their own bindings in `verify`, `frontmatter` and `devcontract`. The recorded call
+    list is therefore the undo's alone.
+
+    The byte comparison is the second claim rather than a redundant one: it proves the
+    spy observed a write that actually LANDED, so the writer-identity assertion is not
+    reading a no-op.
+
+    Ablation: revert `confine_root` to `task_spec_root(task, state)` and this reddens on
+    the call list — `[("plain", None)]` instead of the confined arm."""
+    run_dir, _recorded_spec, live_spec, live_project = _renamed_project_pair(tmp_path)
+    before = live_spec.read_bytes()
+    calls: list[tuple[str, Path | None]] = []
+    real_confined = runs.atomic_write_bytes_confined
+    real_plain = runs.atomic_write_bytes
+
+    def spy_confined(path, data, *, confine_root, **kwargs):
+        calls.append(("confined", confine_root))
+        return real_confined(path, data, confine_root=confine_root, **kwargs)
+
+    def spy_plain(path, data, **kwargs):
+        calls.append(("plain", None))
+        return real_plain(path, data, **kwargs)
+
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", spy_confined)
+    monkeypatch.setattr(runs, "atomic_write_bytes", spy_plain)
+
+    def boom(run_dir_, state_):
+        # raised after the flip and the strip have PUBLISHED, so the undo has a real
+        # write to put back and reaches its arm selection
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(
+            run_dir,
+            "1-1-a",
+            isolated_redrive=False,
+            resolution_recorded=False,
+            project_root=live_project,
+        )
+
+    assert calls == [("confined", live_project)]
+    assert live_spec.read_bytes() == before  # the confined write actually landed
+
+
+def test_live_stories_root_follows_the_mount_through_a_project_rename(tmp_path):
+    """The READ side's OTHER anchor moves with `live_spec_path`, and the ORDERING is
+    what makes it move. `live_stories_root` called `task_stories_root` FIRST, which
+    decides between the mount and the project on an existence probe against the
+    RECORDED spelling. `RUNS_DIR` is `.bmad-loop/runs`, so a mount lives INSIDE the
+    project; after a rename its recorded spelling is gone, the probe failed, the mount
+    was discarded, and rebasing the project fallback handed back the MAIN CHECKOUT —
+    while `live_spec_path` (no existence probe in `task_spec_root`) followed the rename
+    onto the moved mount. One escalation modal, two trees.
+
+    Two manifests, different titles, and the assertion is on the TITLE: a row that only
+    checked the returned path exists would pass for either tree. The recorded mount is
+    absent on purpose — that absence IS the pre-fix trigger, so the row cannot pass on
+    a stale twin.
+
+    Ablation: revert `live_stories_root` to the bare
+    `rebase_recorded_project_path(task_stories_root(...), ...)` one-liner and this
+    reddens on the title (`'main checkout twin' == 'mounted unit'`)."""
+    import yaml
+
+    from bmad_loop import stories
+
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    mount_rel = Path(".bmad-loop") / "runs" / "r1" / "worktrees" / "1-1-a"
+    recorded_mount = recorded_project / mount_rel
+    live_mount = live_project / mount_rel
+    for root, title in ((live_project, "main checkout twin"), (live_mount, "mounted unit")):
+        (root / "epic-1").mkdir(parents=True)
+        (root / "epic-1" / "stories.yaml").write_text(
+            yaml.safe_dump([{"id": "1-1-a", "title": title, "description": "d"}], sort_keys=False),
+            encoding="utf-8",
+        )
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        source="stories",
+        worktree_path=str(recorded_mount),
+    )
+    assert not recorded_mount.exists()  # the mount the run recorded moved with the project
+
+    root = runs.live_stories_root(run.state.tasks["1-1-a"], run.state, live_project)
+
+    assert root == live_mount
+    entry = stories.load_stories(stories.resolve_spec_folder(root, "epic-1")).get("1-1-a")
+    assert entry is not None and entry.title == "mounted unit"
+
+
+def test_live_stories_root_degrades_to_the_live_project_when_the_mount_is_gone(tmp_path):
+    """The probe-first arm must not become a new way to name a directory that does not
+    exist. A mount removed by teardown (the `done_checkpoint` window, where the engine
+    leaves `worktree_path` set on a task whose worktree its integration already
+    deleted) is absent at BOTH spellings, so the answer falls through
+    `task_stories_root` to the project — rebased, so it is the live tree the re-arm
+    writes and not the launch-time one.
+
+    Ablation: drop the `live_mount.is_dir()` guard (return `live_mount` outright) and
+    this reddens on the root."""
+    recorded_project = tmp_path / "project-before-rename"
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    recorded_mount = recorded_project / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1-1-a"
+    run = escalated_run(
+        recorded_project,
+        "r1",
+        story_key="1-1-a",
+        source="stories",
+        worktree_path=str(recorded_mount),
+    )
+
+    root = runs.live_stories_root(run.state.tasks["1-1-a"], run.state, live_project)
+
+    assert root == live_project
+
+
+def test_rearm_without_a_live_project_writes_the_tree_the_run_recorded(tmp_path):
+    """The default is byte-for-byte today's behavior, and that is the whole argument
+    for it being optional: `None` does not stand in for a fact only the caller holds
+    (the way a defaulted `isolated_redrive` would), it names the same tree the caller
+    would have passed on every run whose project has not moved.
+
+    Ablation: make the parameter required, or default it to anything but
+    `state.project`, and this reddens."""
+    run_dir, recorded_spec, live_spec, _live_project = _renamed_project_pair(tmp_path)
+
+    runs.rearm_escalation(run_dir, "1-1-a", isolated_redrive=False, resolution_recorded=False)
+
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(live_spec)) != "ready-for-dev"
+
+
+def test_rearm_leaves_a_spec_outside_the_recorded_project_alone(tmp_path):
+    """`rebase_recorded_project_path` is spelling arithmetic over the recorded project
+    PREFIX, so an artifact dir configured outside the project tree — the shared
+    external layout `[stories] source` allows, and the one shape
+    `_spec_is_shared_with_the_redrive` treats as reachable under isolation — is not
+    project-owned and must pass through untouched. Rebasing it would relocate a file
+    every checkout already shares onto a tree that does not contain it.
+
+    Ablation: drop the `relative_to` guard's `except ValueError: return path` arm and
+    this reddens on an unflipped external spec."""
+    external = tmp_path / "shared-artifacts"
+    external.mkdir()
+    spec = external / "spec.md"
+    spec.write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    recorded_project = tmp_path / "project-before-rename"
+    recorded_project.mkdir()
+    live_project = tmp_path / "project-after-rename"
+    live_project.mkdir()
+    run = escalated_run(recorded_project, "r1", story_key="1-1-a", attempt=2, spec_file=str(spec))
+
+    runs.rearm_escalation(
+        run.run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(spec)) == "ready-for-dev"
+
+
+def test_rearm_leaves_a_spec_that_traverses_out_of_the_recorded_project_alone(tmp_path):
+    """`Path.relative_to` is a PREFIX match: ``<recorded>/../shared/spec.md`` passes it
+    with remainder ``../shared/spec.md``, so a persisted spelling that climbs OUT of
+    the recorded project (into an external artifact root) used to be classified
+    project-owned and, once the project moved to a different parent, rebased to
+    ``<live>/../shared/spec.md`` — a different file. A ``..`` after the recorded
+    prefix names a tree outside it, so `rebase_recorded_project_path` now returns
+    the spelling unchanged and the re-arm flips the file the run actually recorded.
+    (An in-project spelling still rebases:
+    `test_rearm_flips_the_spec_in_the_live_project_after_a_rename`.)
+
+    Both parents hold a `shared/spec.md` deliberately: the decoy under the NEW
+    parent is the file the redirected spelling names, so "unflipped" on the recorded
+    spec cannot be read as a no-op. `resolve.build_context` publishes the same
+    rebased path with no confinement at all, so the agent would be handed the decoy.
+
+    Ablation: drop the ``".." in relative.parts`` arm and the direct assertion
+    reddens on ``<live>/../shared/spec.md``; with that assertion removed too, the
+    re-arm dies in `UnconfinedWriteError` (the redirected spelling climbs out of the
+    rebased confine root) rather than flipping the recorded spec."""
+    old_parent = tmp_path / "old-parent"
+    new_parent = tmp_path / "new-parent"
+    recorded_project = old_parent / "project"
+    live_project = new_parent / "project"
+    for root in (recorded_project, live_project):
+        root.mkdir(parents=True)
+    recorded_spec = old_parent / "shared" / "spec.md"
+    decoy = new_parent / "shared" / "spec.md"
+    for spec in (recorded_spec, decoy):
+        spec.parent.mkdir()
+        spec.write_text(_SPEC_WITH_ARR, encoding="utf-8")
+    traversing = recorded_project / ".." / "shared" / "spec.md"  # the persisted spelling
+    run = escalated_run(
+        recorded_project, "r1", story_key="1-1-a", attempt=2, spec_file=str(traversing)
+    )
+    state = load_state(run.run_dir)
+    assert runs.rebase_recorded_project_path(traversing, state, live_project) == traversing
+
+    runs.rearm_escalation(
+        run.run_dir,
+        "1-1-a",
+        isolated_redrive=False,
+        resolution_recorded=False,
+        project_root=live_project,
+    )
+
+    assert verify.status_of(verify.read_frontmatter(recorded_spec)) == "ready-for-dev"
+    assert verify.status_of(verify.read_frontmatter(decoy)) != "ready-for-dev"
 
 
 def test_rearm_resets_followup_reviews_spent(tmp_path):
@@ -2910,6 +3787,12 @@ def _kinds(run_dir, prefix="stale-restore-"):
     return [e for e in Journal(run_dir).entries() if e["kind"].startswith(prefix)]
 
 
+def _rendered_rearm_notice(entry):
+    rendered = runs.rearm_event_notice(entry)
+    assert rendered is not None
+    return runs.RearmNotice(*rendered)
+
+
 def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     """The abandoned attempt's applied new files must NOT be blessed as
     pre-existing, or finalize_commit's `add -A` sweeps them into the corrected
@@ -2927,7 +3810,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     """
     run_dir, _spec, patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(
+    outcome = runs.rearm_escalation(
         run_dir, isolated_redrive=False, resolution_recorded=True
     )  # from-scratch re-arm replaces the latch
 
@@ -2939,6 +3822,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
     assert excluded[0]["patch"] == str(patch)
+    assert outcome.notices == (_rendered_rearm_notice(excluded[0]),)
     # the probe ran and answered "none" — neither commit record may appear
     assert not _kinds(run_dir, "stale-restore-commits")
     assert not _kinds(run_dir, "rearm-commits-probe-failed")
@@ -2972,7 +3856,7 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     git(tmp_path, "add", "committed.txt")
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
 
-    runs.rearm_escalation(
+    outcome = runs.rearm_escalation(
         run_dir, isolated_redrive=False, resolution_recorded=True
     )  # must not raise RearmError
 
@@ -2983,7 +3867,11 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     assert "FileNotFoundError" in unparseable[0]["error"]
     assert not _kinds(run_dir, "stale-restore-excluded")
     # the unreadable patch must not also cost the human the commits warning
-    assert _kinds(run_dir, "stale-restore-commits")
+    (commits,) = _kinds(run_dir, "stale-restore-commits")
+    assert outcome.notices == (
+        _rendered_rearm_notice(unparseable[0]),
+        _rendered_rearm_notice(commits),
+    )
 
 
 def test_rearm_without_a_stale_latch_journals_no_stale_restore_events(tmp_path):
@@ -3011,7 +3899,7 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
     old_baseline = load_state(run_dir).tasks["1-1-a"].baseline_commit
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.baseline_commit != old_baseline  # baseline advanced past the commit
@@ -3019,6 +3907,11 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     assert len(warned) == 1
     assert warned[0]["old_baseline"] == old_baseline
     assert warned[0]["commits"] == [git(tmp_path, "rev-parse", "HEAD")]
+    (excluded,) = _kinds(run_dir, "stale-restore-excluded")
+    assert outcome.notices == (
+        _rendered_rearm_notice(excluded),
+        _rendered_rearm_notice(warned[0]),
+    )
 
 
 def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_path):
@@ -3046,7 +3939,7 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     task.baseline_commit = "0" * 39 + "1"  # sha-shaped, but names no object
     save_state(run_dir, state)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -3066,6 +3959,10 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     excluded = _kinds(run_dir, "stale-restore-excluded")
     assert len(excluded) == 1
     assert excluded[0]["files"] == ["newfile.txt"]
+    assert outcome.notices == (
+        _rendered_rearm_notice(excluded[0]),
+        _rendered_rearm_notice(probe[0]),
+    )
 
 
 def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
@@ -3895,6 +4792,80 @@ def test_archive_run(tmp_path):
     assert "20260611-100000-aaaa/journal.jsonl" in names
 
 
+def test_archive_run_refuses_a_live_engine_before_staging(tmp_path, monkeypatch):
+    """Resume-first ordering leaves source, destination, and control state whole."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    state_dir = _seed_state_dir(tmp_path, run_dir.name)
+
+    def live(target):
+        assert_run_state_lock_held(target)
+        return "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", live)
+    monkeypatch.setattr(
+        runs,
+        "_refuse_live_session",
+        lambda *_args: pytest.fail("session guard ran before authoritative engine probe"),
+    )
+    with pytest.raises(runs.LiveEngineError, match="refusing to archive"):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert run_dir.is_dir()
+    assert state_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
+def test_archive_run_holds_one_lock_through_snapshot_publish_and_removal(tmp_path, monkeypatch):
+    """Snapshot, durable publication, source removal, and control cleanup all
+    remain inside the same lifecycle hold.
+
+    Ablation: moving the liveness gate, tar add, replace, rmtree, or discard outside
+    the hold fails at that seam. Verified.
+    """
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "payload").write_text("data", encoding="utf-8")
+    order: list[str] = []
+    real_add = runs.tarfile.TarFile.add
+    real_replace = runs.atomic_replace
+    real_rmtree = runs.shutil.rmtree
+
+    def dead(target):
+        assert_run_state_lock_held(target)
+        order.append("probe")
+        return "dead"
+
+    def checked_add(self, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        order.append("snapshot")
+        return real_add(self, *args, **kwargs)
+
+    def checked_replace(src, dest):
+        assert_run_state_lock_held(run_dir)
+        order.append("publish")
+        return real_replace(src, dest)
+
+    def checked_rmtree(target, *args, **kwargs):
+        assert_run_state_lock_held(run_dir)
+        order.append("remove")
+        return real_rmtree(target, *args, **kwargs)
+
+    def checked_discard(_project, _run_id):
+        assert_run_state_lock_held(run_dir)
+        order.append("discard")
+
+    monkeypatch.setattr(runs, "engine_liveness", dead)
+    monkeypatch.setattr(runs.tarfile.TarFile, "add", checked_add)
+    monkeypatch.setattr(runs, "atomic_replace", checked_replace)
+    monkeypatch.setattr(runs.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(runs, "_discard_state_dir", checked_discard)
+
+    runs.archive_run(tmp_path, run_dir)
+
+    assert order[0] == "probe"
+    assert order[-3:] == ["publish", "remove", "discard"]
+    assert order[1:-3] and set(order[1:-3]) == {"snapshot"}
+
+
 def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch):
     """#363's filename half, and it needs its own test because NOTHING else grades
     it: on the happy path `atomic_replace` consumes the temp under either spelling,
@@ -3963,6 +4934,9 @@ def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
 
     assert (run_dir / "state.json").is_file()  # the run survives a failed archive
     assert list((tmp_path / ".bmad-loop" / "archive").iterdir()) == []  # no temp left
+    sidecar = runs.lock_path_for(run_dir / "state.json", follow_final_symlink=False)
+    with platform_util.file_lock(sidecar, blocking=False):
+        pass  # the original archive error released lifecycle exclusion
 
 
 def test_archive_run_temp_is_created_exclusively_at_0600(tmp_path, monkeypatch):

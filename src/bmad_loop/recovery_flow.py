@@ -41,6 +41,11 @@ if TYPE_CHECKING:
 PRESERVE_REF_PROBE_LIMIT = 100
 
 
+def attempt_preserve_ref_name(run_id: str, tip: str) -> str:
+    """Canonical commits-only recovery branch for one run and pinned tip."""
+    return f"attempt-preserve/{safe_ref_segment(run_id)}-{tip[:8]}"
+
+
 class _OwnedSpecAuthorityError(RuntimeError):
     """A previously canonical owned-spec name became unsafe to restore."""
 
@@ -114,7 +119,16 @@ class RecoveryFlow:
         return tuple(out)
 
     def _attempt_owned_spec(self, task: StoryTask) -> tuple[Path, str | None] | None:
-        """Resolve this attempt's bound spec and its exact Git exclusion.
+        """Bind recovery restoration to this attempt's spec and exact Git exclusion.
+
+        This is the restore authority for the dispatched attempt, not an ordinary
+        path lookup. Operations on the tree recorded by a task use
+        ``runs.task_spec_path``, which anchors a bare basename directly on that tree.
+        Binding a reported or persisted spelling inside the current active
+        ``ProjectPaths`` uses ``verify.resolve_spec_path``, which chooses an existing
+        project candidate or falls back under implementation artifacts. Here a bare
+        basename probes both locations and is accepted only when exactly one trusted
+        regular-file candidate exists.
 
         Relative persisted paths may name either a project-relative file or a
         basename under the configured implementation-artifacts directory. The
@@ -1185,14 +1199,14 @@ class RecoveryFlow:
         # blind). These two calls carried no guard at all, so until #343 a plain
         # git *timeout* — which `_run_git` does translate, and which every sibling
         # here already treats as routine — crashed the rollback outright; OSError
-        # joins it because the translation stops at timeouts. The `not commits`
-        # return sits inside the try to keep the original call order: HEAD is still
-        # only read once there is something to park.
+        # joins it because the translation stops at timeouts. Pin HEAD before
+        # enumerating so the range and the recovery ref describe the same observed
+        # tip even if the checkout moves between those operations.
         try:
-            commits = verify.commits_above(workspace.root, baseline)
+            head = verify.rev_parse_head(workspace.root)
+            commits = verify.commits_above(workspace.root, baseline, head)
             if not commits:
                 return
-            head = verify.rev_parse_head(workspace.root)  # the tip the ref parks at
         except (verify.GitError, OSError) as exc:
             self.journal.append(
                 "attempt-preserve-enumerate-failed", story_key=task.story_key, error=str(exc)
@@ -1207,13 +1221,13 @@ class RecoveryFlow:
         # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
         # drop the recovery ref (which on a re-drive would then reset past the work
         # anyway).
-        slug = safe_ref_segment(self.state.run_id)
         try:
             ref = verify.preserve_commits(
                 workspace.root,
                 baseline,
-                f"attempt-preserve/{slug}-{head[:8]}",
+                attempt_preserve_ref_name(self.state.run_id, head),
                 commits=commits,
+                revision=head,
             )
         except (verify.GitError, OSError):
             ref = None  # branch creation failed — treat as a preservation failure

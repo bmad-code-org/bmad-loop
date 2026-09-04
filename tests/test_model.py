@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
     SWEEP_REFUSED_DIRTY,
@@ -38,6 +39,20 @@ def test_run_state_stories_fields_default_and_round_trip():
     back = RunState.from_dict(stories.to_dict())
     assert back.source == "stories"
     assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
+    """The intent marker `runs.restamp_code_root` sets between the moved root and its
+    journal record survives the state round trip, and a state.json from before the
+    field existed reads back False — a pre-upgrade run owes no record."""
+    state = _state(repo_root="/code")
+    assert state.code_root_restamp_pending is False
+    state.code_root_restamp_pending = True
+    back = RunState.from_dict(state.to_dict())
+    assert back.code_root_restamp_pending is True
+    d = state.to_dict()
+    del d["code_root_restamp_pending"]
+    assert RunState.from_dict(d).code_root_restamp_pending is False
 
 
 def test_run_state_repo_root_round_trips_and_backs_code_root():
@@ -188,57 +203,15 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).followup_review_recommended is False
 
 
-def test_park_eligible_round_trips():
-    """The dispatch-time expectation gating the park's proof-of-work skip is
-    captured once per dev phase, so it has to survive the crash/resume boundary —
-    a replayed attempt that re-derived it would answer about the spec the session
-    it is replaying already parked."""
-    task = StoryTask(story_key="1-1-a", epic=1, park_eligible=True)
-    assert StoryTask.from_dict(task.to_dict()).park_eligible is True
-
-
-def test_park_eligible_defaults_false_for_legacy_state():
-    """And it defaults to the FAIL-CLOSED value, which is the load-bearing half: a
-    run resumed from a state.json written before the field existed has no recorded
-    answer, and the absent one must deny the skip rather than grant it. Defaulting
-    True would make every legacy resume the exact DW-1 hole this field closes."""
+def test_legacy_park_eligible_state_loads_but_is_not_persisted():
+    """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["park_eligible"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).park_eligible is False
+    doc["park_eligible"] = True
 
+    loaded = StoryTask.from_dict(doc)
 
-@pytest.mark.parametrize(
-    "stored",
-    ["false", "true", "", 0, 1, None, [], ["x"], {}],
-    ids=["str-false", "str-true", "str-empty", "int-0", "int-1", "null", "list", "list-x", "dict"],
-)
-def test_park_eligible_only_a_real_boolean_true_authorizes_the_waiver(stored):
-    """`from_dict` reads this one field STRICTLY, and the asymmetry is the reason.
-    Every sibling bool on the task restores bookkeeping; this one authorizes the
-    dev gate's proof-of-work check to be WAIVED, so a wrong `False` costs one
-    retryable refusal while a wrong `True` re-opens the inheritance hole the field
-    exists to close.
-
-    Under the ordinary `bool(...)` spelling every truthy non-boolean grants that
-    waiver, and the likeliest one is the string `"false"` — a hand-edited
-    state.json, or any bridge that stringifies JSON scalars — for which
-    `bool("false")` is True. The `"true"`/`1` rows are here for the same reason
-    from the other side: reading them as authorization would be GUESSING that a
-    non-boolean meant yes, and fail-closed does not guess.
-
-    Ablation: restore `bool(d.get("park_eligible", False))` and the `str-false`,
-    `str-true`, `int-1` and `list-x` rows all fail."""
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    doc["park_eligible"] = stored
-    assert StoryTask.from_dict(doc).park_eligible is False
-
-
-def test_park_eligible_round_trips_the_authorized_value():
-    """The other direction, so strictness is not mistaken for "always False": a
-    real JSON `true` — the only value `to_dict` ever writes — survives."""
-    doc = StoryTask(story_key="1-1-a", epic=1, park_eligible=True).to_dict()
-    assert doc["park_eligible"] is True
-    assert StoryTask.from_dict(doc).park_eligible is True
+    assert not hasattr(loaded, "park_eligible")
+    assert "park_eligible" not in loaded.to_dict()
 
 
 def test_verify_outcome_park_fields_are_absent_by_default():
@@ -334,7 +307,7 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
-def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
+def test_rebase_spec_paths_on_reanchors_both_ownership_fields(tmp_path):
     """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
 
     `to_dict` relativizes `spec_file` and `dispatched_spec_file` together, so a
@@ -342,7 +315,7 @@ def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
     values are already anchored (a spec outside the mount persists verbatim) and
     must pass through, which is also what makes the call idempotent.
     """
-    mount = Path("/repo/.bmad-loop/runs/r1/worktrees/1-1-a")
+    mount = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1-1-a"
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
@@ -361,7 +334,7 @@ def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
     assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
 
 
-def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
+def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched(tmp_path):
     """An out-of-mount spec and an unbound field are both already correct.
 
     `_serialized_worktree_path` keeps a path verbatim exactly when
@@ -371,13 +344,131 @@ def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
     becoming the mount root: `Path("")` is `.`, so a bare join would answer the
     tree root, which is a write target, not a spec.
     """
-    outside = str(Path("/elsewhere/spec.md"))
+    outside = str(tmp_path / "outside" / "spec.md")
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=outside)
 
-    task.rebase_spec_paths_on(Path("/repo/wt"))
+    task.rebase_spec_paths_on(tmp_path / "alternate-root" / "wt")
 
     assert task.spec_file == outside
     assert task.dispatched_spec_file is None
+
+
+def test_project_local_absolute_accepted_spec_becomes_canonical_relative(tmp_path):
+    project = tmp_path / "project"
+    spec = project / "artifacts" / "spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("spec\n", encoding="utf-8")
+    (project / "hop").mkdir()
+    raw = str(project / "hop" / ".." / "artifacts" / "spec.md")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == "artifacts/spec.md"
+
+
+def test_prior_attempt_binding_survives_accepted_spec_relocation(tmp_path):
+    """Only accepted-spec portability changes before fresh attempt binding."""
+    project = tmp_path / "project"
+    spec = project / "spec.md"
+    project.mkdir()
+    spec.write_text("spec\n", encoding="utf-8")
+    old_dispatch = str(tmp_path / "old-worktree" / "spec.md")
+    old_snapshot = b"prior attempt bytes\x00"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(spec),
+        dispatched_spec_file=old_dispatch,
+        dispatched_spec_snapshot=old_snapshot,
+    )
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == "spec.md"
+    assert task.dispatched_spec_file == old_dispatch
+    assert task.dispatched_spec_snapshot == old_snapshot
+
+
+def test_external_and_symlink_external_accepted_specs_keep_their_spelling(tmp_path):
+    project = tmp_path / "project"
+    external = tmp_path / "external"
+    project.mkdir()
+    external.mkdir()
+    spec = external / "spec.md"
+    spec.write_text("spec\n", encoding="utf-8")
+    link = project / "linked"
+    link.symlink_to(external, target_is_directory=True)
+
+    for raw in (str(spec), str(link / "spec.md")):
+        task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+        task.relativize_project_local_accepted_spec(project)
+        assert task.spec_file == raw
+
+
+def test_relative_accepted_spec_keeps_its_exact_spelling():
+    """A relative value already carries the intended dispatch authority.
+
+    Ablation: delete the absolute-path guard and ``./pyproject.toml`` is normalized
+    to ``pyproject.toml``.
+    """
+    raw = "./pyproject.toml"
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(Path.cwd())
+
+    assert task.spec_file == raw
+
+
+def test_missing_absolute_accepted_spec_is_unchanged(tmp_path):
+    """A missing target has no canonical containment fact to transfer.
+
+    INVERSE ablation: resolve the target non-strictly; the missing in-project
+    spelling is rewritten despite having no accepted artifact.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    raw = str(project / "missing.md")
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
+
+
+def test_non_file_absolute_accepted_spec_is_unchanged(tmp_path):
+    """A contained directory cannot gain relative fallback authority.
+
+    Ablation: remove the regular-file guard and the accepted directory is
+    rewritten to a relative spelling that can probe an unrelated artifact root.
+    """
+    project = tmp_path / "project"
+    directory = project / "artifacts" / "spec.md"
+    directory.mkdir(parents=True)
+    raw = str(directory)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
+
+
+def test_resolution_fault_accepted_spec_is_unchanged(tmp_path, monkeypatch):
+    """Uncertain canonical containment fails safe with the exact original spelling.
+
+    INVERSE ablation: fall back to lexical containment after the resolution error;
+    the faulted in-project absolute value is rewritten.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    faulted = project / "faulted.md"
+    refuse_to_resolve(monkeypatch, faulted)
+    raw = str(faulted)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    assert task.spec_file == raw
 
 
 def test_dispatched_spec_snapshot_round_trips_byte_exactly():
@@ -474,7 +565,6 @@ _DEFERRED_STATE_KEYS = (
     "ledger_changed_before_harvest",
     "harvested_deferrals",
     "bundle_closes_intended",
-    "refiled_followups",
     "story_closes_intended",
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
@@ -483,7 +573,7 @@ _DEFERRED_STATE_KEYS = (
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All twelve fields are hand-enumerated in both serializers. Non-default
+    """All eleven fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -496,7 +586,6 @@ def test_deferred_work_state_fields_round_trip_through_json():
         ledger_changed_before_harvest=True,
         harvested_deferrals=[{"origin": "spec-deferred abc", "title": "finding"}],
         bundle_closes_intended=["DW-3", "DW-7"],
-        refiled_followups=[{"origin": "review-budget-followup", "title": "follow-up"}],
         story_closes_intended=["DW-4"],
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
@@ -512,9 +601,6 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.ledger_changed_before_harvest is True
     assert restored.harvested_deferrals == [{"origin": "spec-deferred abc", "title": "finding"}]
     assert restored.bundle_closes_intended == ["DW-3", "DW-7"]
-    assert restored.refiled_followups == [
-        {"origin": "review-budget-followup", "title": "follow-up"}
-    ]
     assert restored.story_closes_intended == ["DW-4"]
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
@@ -522,7 +608,7 @@ def test_deferred_work_state_fields_round_trip_through_json():
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the twelve keys.
+    """A state.json written before this package has none of the eleven keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -537,7 +623,6 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.ledger_changed_before_harvest is False
     assert restored.harvested_deferrals == []
     assert restored.bundle_closes_intended == []
-    assert restored.refiled_followups == []
     assert restored.story_closes_intended == []
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
@@ -563,21 +648,15 @@ def test_deferred_work_state_containers_do_not_alias_the_persisted_doc():
             {"title": "original", "metadata": {"labels": ["review"]}},
         ],
         bundle_closes_intended=["DW-1"],
-        refiled_followups=[{"title": "followup", "metadata": {"labels": ["review"]}}],
     ).to_dict()
     restored = StoryTask.from_dict(doc)
     restored.harvested_deferrals[0]["title"] = "mutated"
     restored.harvested_deferrals[0]["metadata"]["labels"].append("follow-up")
     restored.bundle_closes_intended.append("DW-2")
-    restored.refiled_followups[0]["title"] = "mutated"
-    restored.refiled_followups[0]["metadata"]["labels"].append("follow-up")
     assert doc["harvested_deferrals"] == [
         {"title": "original", "metadata": {"labels": ["review"]}},
     ]
     assert doc["bundle_closes_intended"] == ["DW-1"]
-    assert doc["refiled_followups"] == [
-        {"title": "followup", "metadata": {"labels": ["review"]}},
-    ]
 
 
 def test_deferred_work_state_container_defaults_are_not_shared():
@@ -585,10 +664,8 @@ def test_deferred_work_state_container_defaults_are_not_shared():
     other = StoryTask(story_key="1-2-b", epic=1)
     one.harvested_deferrals.append({"title": "one"})
     one.bundle_closes_intended.append("DW-1")
-    one.refiled_followups.append({"title": "one"})
     assert other.harvested_deferrals == []
     assert other.bundle_closes_intended == []
-    assert other.refiled_followups == []
 
 
 def test_restore_patch_round_trips():

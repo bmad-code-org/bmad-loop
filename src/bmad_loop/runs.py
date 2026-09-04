@@ -1,4 +1,16 @@
-"""Run-directory discovery and helpers shared by the CLI and the TUI."""
+"""Run-directory discovery and helpers shared by the CLI and the TUI.
+
+The public story-spec ownership and confinement seam consists of four helpers:
+
+* :func:`task_spec_path` anchors a persisted ``StoryTask.spec_file`` on the tree
+  that owned the task when it was recorded.
+* :func:`task_spec_root` names the matching root used to confine writes to that
+  anchored spec.
+* :func:`task_stories_root` locates the workspace tree from which the run reads
+  its stories folder; it is a read locator, not a spec-write confinement root.
+* :func:`spec_reaches_the_redrive` reports whether an edit at the persisted-task
+  anchor will survive to the workspace used by the next attempt.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +40,7 @@ from .adapters.multiplexer import (
     mux_usable,
 )
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
-from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
+from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
@@ -108,6 +120,16 @@ class LiveSessionError(Exception):
     """A run directory was not removed because the run's agent session is still
     live (see :func:`live_session_may_be_ours`). ``str()`` is the operator-facing
     message the CLI/TUI surface verbatim."""
+
+
+class LiveEngineError(Exception):
+    """A destructive run-lifecycle transaction found a provably live engine.
+
+    Unlike :class:`LiveSessionError`, this refusal is authoritative even when the
+    operator requested ``force``: force may stop the engine before entering the
+    transaction, but it never licenses removing a run a rival resume claimed in
+    the meantime. ``str()`` is the operator-facing message surfaces report.
+    """
 
 
 # How long stop_run waits for a signalled engine to exit before falling back to
@@ -1358,7 +1380,7 @@ def accepted_tags(project: Path) -> frozenset[str]:
     return frozenset({project_tag(project), str(project.resolve())})
 
 
-def lock_path_for(data_path: Path) -> Path:
+def lock_path_for(data_path: Path, *, follow_final_symlink: bool = True) -> Path:
     """The advisory-lock sidecar for a mutable data file:
     ``<state root>/locks/<sha256(resolved path)[:16]>-<basename>.lock``.
 
@@ -1387,7 +1409,15 @@ def lock_path_for(data_path: Path) -> Path:
     usable state root (see :func:`state_root`); the caller fails rather than
     silently locking somewhere else.
     """
-    resolved = data_path.resolve()
+    # Run-state publication atomically replaces ``state.json``.  Its transaction
+    # lock therefore needs the identity of that *logical directory entry*, not the
+    # current referent of a planted final-component symlink: following that link
+    # would change the sidecar halfway through an outer transaction when
+    # ``save_state`` replaces it.  Other mutable artifacts retain the historical
+    # referent-based behavior by default (notably shared external ledgers).
+    resolved = (
+        data_path.resolve() if follow_final_symlink else data_path.parent.resolve() / data_path.name
+    )
     digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
     return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
 
@@ -2088,6 +2118,14 @@ def request_graceful_stop(run_dir: Path) -> str:
 
 
 def stop_run(run_dir: Path) -> bool:
+    """Stop the engine generation current at completion of the gesture."""
+    while True:
+        result = _stop_run_once(run_dir)
+        if result is not None:
+            return result
+
+
+def _stop_run_once(run_dir: Path) -> bool | None:
     """Stop a live run. Returns False if it was already finished.
 
     The request is delivered two ways at once, and the engine wins whichever race
@@ -2165,6 +2203,14 @@ def stop_run(run_dir: Path) -> bool:
 
     host = get_process_host()
     pid, identity = read_pid_identity(run_dir)  # identity recorded at run start, not sampled now
+    # The pid-file tuple AS READ, kept for the generation compare under the lock
+    # below. The local `pid` is cleared on every path that declines to signal — a
+    # pid that is gone, reused, or whose identity cannot be read — so comparing the
+    # post-delivery pid file against `(pid, identity)` AFTER that clearing made an
+    # unverifiable engine read as a rival that had published a new pid: the file
+    # was unchanged, its liveness `"unknown"` (not `"dead"`), and `stop_run`'s
+    # retry loop re-entered forever. A rival is a CHANGED pid file, nothing else.
+    recorded_engine = (pid, identity)
     if pid is not None and identity is not None and not host.alive_and_ours(pid, identity):
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
@@ -2256,8 +2302,53 @@ def stop_run(run_dir: Path) -> bool:
     # addresses the registry this process exported, and `cleanup`'s legacy pass is
     # what reaches a session left in an older one.
     kill_session(run_dir.name)
-    state = load_state(run_dir)
-    if state.stopped:
+
+    already_stopped = False
+    finished_during_stop = False
+    retry_new_engine = False
+    clear_request = False
+    with state_lock(run_dir):
+        # Authoritative post-delivery snapshot.  A rival writer that completed while
+        # stop was signalling is observed here, after exclusion, rather than being
+        # overwritten by the stale state loaded at entry.
+        state = load_state(run_dir)
+        current_engine = read_pid_identity(run_dir)
+        current_liveness = engine_liveness(run_dir)
+        rival_published_engine = current_liveness != "dead" and current_engine != recorded_engine
+        if state.finished:
+            # The engine completed while the stop channels were in flight.  Its
+            # terminal state is authoritative; do not rewrite it as a fallback stop.
+            finished_during_stop = True
+            clear_request = current_liveness == "dead"
+        elif rival_published_engine:
+            # Resume publishes pid + state under this same lock.  If that happened
+            # while this attempt was signalling an older generation, release before
+            # delivering to the new process and retry from its fresh identity.
+            retry_new_engine = True
+        elif state.stopped:
+            already_stopped = True
+            clear_request = True
+        elif engine_may_live and not lodged:
+            Journal(run_dir).append("run-stop-undelivered", pid=pid)
+            raise StopRunError(
+                f"run {run_dir.name}: the stop request could not be written to the run "
+                "directory and the engine could not be proved dead, so no stop is pending. "
+                "Its agent session was killed as a backstop. Free space in the run directory "
+                "and retry, or stop the process yourself"
+            )
+        else:
+            state.stopped = True
+            save_state(run_dir, state)
+            clear_request = not engine_may_live
+
+    if clear_request:
+        clear_graceful_stop(run_dir)
+    if finished_during_stop:
+        return False
+    if retry_new_engine:
+        return None
+
+    if already_stopped:
         # The engine honored the stop and is gone, and its own `run-stop` already
         # stands in the journal. Stamping `fallback=True` on top would describe an
         # engine that did its own teardown as one that had to be stopped from
@@ -2274,47 +2365,11 @@ def stop_run(run_dir: Path) -> bool:
         # re-stop at its first item. Safe on the `engine_may_live` paths too: a
         # written `stopped` *is* the engine reporting it honored the request, so
         # there is no live consumer left to strand.
-        clear_graceful_stop(run_dir)
         return True
 
-    # Neither channel was delivered: nothing is lodged, and we never proved the engine
-    # dead. This is the one outcome `stop` must not report as success — the operator is
-    # left believing a request is in flight that was never written, while an engine we
-    # could not signal keeps mutating the project. The pid-reuse guard above already
-    # refuses for its own path; these are its siblings, and the only reason they stayed
-    # quiet is that they clear `pid` and skip that block. Not a regression — on the
-    # merge-base this was the state of *every* refused signal, because `stop_run` cleared
-    # the request as its first statement — but the earlier decision to report success
-    # rested on the request being retained, which is exactly what did not happen here.
-    #
-    # Placement is load-bearing, twice over. It sits *after* the session backstop
-    # because refusing to report a stop is no reason to leak the window, and *after* the
-    # `state.stopped` return because a run the engine already honored must not be
-    # reported as a failure. Journal the attempt before raising: the `run-stop` append
-    # below is skipped, and an unrecorded stop attempt is its own trap.
-    if engine_may_live and not lodged:
-        Journal(run_dir).append("run-stop-undelivered", pid=pid)
-        raise StopRunError(
-            f"run {run_dir.name}: the stop request could not be written to the run "
-            "directory and the engine could not be proved dead, so no stop is pending. "
-            "Its agent session was killed as a backstop. Free space in the run directory "
-            "and retry, or stop the process yourself"
-        )
-
-    # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
-    # the request first — nothing is left alive to consume it, and a file outliving
-    # the run it asked to stop is a trap for the next resume.
-    #
-    # Unless we never actually proved that. Where the engine may still be running,
-    # the request stays lodged and the stop is genuinely still in flight: the engine
-    # honors the file at its next poll and writes `stopped` itself. Discarding it here
-    # would leave a live engine with no channel left while we report the run stopped —
-    # the stale-request trap above is the lesser of the two, and it only bites a run
-    # that is later resumed, which this one cannot be until that engine exits.
-    if not engine_may_live:
-        clear_graceful_stop(run_dir)
-    state.stopped = True
-    save_state(run_dir, state)
+    # The locked branch above performed the external fallback's final
+    # read-modify-write.  The journal remains outside the state transaction: it is
+    # append-only observation, not part of state publication.
     Journal(run_dir).append("run-stop", pid=pid, fallback=True)
     return True
 
@@ -2545,10 +2600,25 @@ def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> No
         node = parent
 
 
-def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
-    """Permanently remove a run directory. Callers enforce the engine-liveness
-    guard; the session guard is enforced here (see :func:`_refuse_live_session`),
-    which raises :class:`LiveSessionError` instead of removing.
+def delete_run(
+    project: Path,
+    run_dir: Path,
+    *,
+    force: bool = False,
+    wait_for_lock: bool = True,
+    _expected_composer_pid: int | None = None,
+    _expected_composer_claim: os.stat_result | None = None,
+) -> None:
+    """Permanently remove a run directory under one lifecycle transaction.
+
+    Engine liveness is re-checked after acquiring the canonical per-run state
+    lock and a provably live engine raises :class:`LiveEngineError`. The private
+    ``_expected_composer_pid`` and ``_expected_composer_claim`` escape exists only
+    for ``runsetup``'s failed launch unwind: that composer may remove its own live
+    pid publication only while the freshly read pid and the directory it
+    exclusively created still match. It does not bypass the independent
+    live-session guard, and a rival pid publication or replacement directory
+    refuses the unwind.
 
     ``force`` is the operator's explicit override and skips that guard, accepting
     the leak on their own say-so. It deliberately does not kill the session
@@ -2558,23 +2628,61 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
 
     The containment guard runs first and is NOT under ``force``: an override is
     the operator accepting a leaked session, never a licence to rmtree a path
-    outside the runs dir."""
+    outside the runs dir.
+
+    ``wait_for_lock=False`` refuses instead of waiting when another process holds
+    the run's state lock, raising :class:`platform_util.LockUnavailableError`. It
+    is NOT an override in the sense ``force`` is — it removes nothing extra and
+    weakens no guard; it only declines to queue. A bulk caller passes it because
+    a held lock already means what that caller reports anyway ("in use, left
+    alone"), and because waiting is unbounded on POSIX where ``fcntl.flock`` never
+    times out. The default waits, which is what a single-run operator command
+    wants: there, giving up would turn a brief overlap into a failed command."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
-    if not force:
-        _refuse_live_session(project, run_dir.name, "delete")
-    shutil.rmtree(run_dir)
-    # after the run dir, never before: a raise above leaves the run whole, and a
-    # whole run keeps its control plane (see _discard_state_dir).
-    _discard_state_dir(project, run_dir.name)
+    with state_lock(run_dir, blocking=wait_for_lock):
+        if _expected_composer_claim is not None:
+            try:
+                current_claim = run_dir.stat(follow_symlinks=False)
+            except OSError as e:
+                raise LiveEngineError(
+                    f"run {run_dir.name} changed directory ownership — refusing to delete it"
+                ) from e
+            if not os.path.samestat(_expected_composer_claim, current_claim):
+                raise LiveEngineError(
+                    f"run {run_dir.name} changed directory ownership — refusing to delete it"
+                )
+        published_pid = read_pid(run_dir)
+        if (
+            _expected_composer_pid is not None
+            and published_pid is not None
+            and published_pid != _expected_composer_pid
+        ):
+            raise LiveEngineError(
+                f"run {run_dir.name} changed engine ownership — refusing to delete it"
+            )
+        if _expected_composer_pid is None and engine_liveness(run_dir) == "alive":
+            raise LiveEngineError(
+                f"run {run_dir.name} is still live — refusing to delete it; stop it first"
+            )
+        if not force:
+            _refuse_live_session(project, run_dir.name, "delete")
+        shutil.rmtree(run_dir)
+        # after the run dir, never before: a raise above leaves the run whole, and a
+        # whole run keeps its control plane (see _discard_state_dir).
+        _discard_state_dir(project, run_dir.name)
 
 
-def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
+def archive_run(
+    project: Path, run_dir: Path, *, force: bool = False, wait_for_lock: bool = True
+) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
     original. The tarball is written to a temp path then atomically replaced into
-    place so a partial archive never appears. Callers enforce the engine-liveness
-    guard; the session guard is enforced here (see :func:`_refuse_live_session`,
-    and :func:`delete_run` for ``force``) and runs before the tarball is written,
-    so a refusal leaves nothing behind.
+    place so a partial archive never appears. Engine liveness is re-checked under
+    the canonical per-run state lock; that exclusion remains held through archive
+    publication, source removal, and control-state discard. The session guard is
+    enforced here too (see :func:`_refuse_live_session` and :func:`delete_run` for
+    ``force``), before any archive path is created, so a refusal leaves nothing
+    behind.
 
     The tarball holds the run dir only, so since #494 an archive no longer carries
     the run's ``events/``: the channel moved out of the tree, and its files are
@@ -2584,10 +2692,25 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
 
     Containment (see :func:`_refuse_uncontained_run_dir`) is checked ahead of both,
     for the reason the session guard runs early: a refusal must leave no archive
-    directory and no tarball behind."""
+    directory and no tarball behind.
+
+    ``wait_for_lock`` carries the meaning it has on :func:`delete_run`: ``False``
+    declines a contended run with :class:`platform_util.LockUnavailableError`
+    rather than queueing behind its holder, and refuses before the tarball is
+    written, so a decline — like the guards above it — leaves nothing behind."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
-    if not force:
-        _refuse_live_session(project, run_dir.name, "archive")
+    with state_lock(run_dir, blocking=wait_for_lock):
+        if engine_liveness(run_dir) == "alive":
+            raise LiveEngineError(
+                f"run {run_dir.name} is still live — refusing to archive it; stop it first"
+            )
+        if not force:
+            _refuse_live_session(project, run_dir.name, "archive")
+        return _archive_run_locked(project, run_dir)
+
+
+def _archive_run_locked(project: Path, run_dir: Path) -> Path:
+    """Archive ``run_dir`` while its caller owns :func:`state_lock`."""
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
@@ -2989,15 +3112,64 @@ def validate_restore_latch(
     return None
 
 
+def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path) -> Path:
+    """Move a project-owned persisted path with a renamed project, lexically.
+
+    Run state intentionally keeps the LAUNCH-TIME project string — nothing re-stamps
+    `state.project` the way `restamp_code_root` re-stamps the code root — while both
+    surfaces that resolve an escalation run from the LIVE CLI project. Paths outside
+    the recorded project are shared/external and remain untouched. This is spelling
+    arithmetic only: do not introduce filesystem canonicalization here, at either
+    caller's boundary.
+
+    Lives in `runs` rather than in `resolve` because BOTH sides of one gesture need
+    the identical answer, and `resolve` already imports this module (the reverse is a
+    cycle). `resolve.build_context` hands the agent a `spec_file` to edit;
+    `rearm_escalation` flips the status of the file it then re-drives from. Rebasing
+    one and not the other is not a cosmetic split — after a project move the agent
+    edits the live copy while the re-arm writes a path under a directory that no
+    longer exists, so the flip silently no-ops and the re-drive wedges on the
+    escalated attempt's status.
+
+    `relative_to` is a prefix match, and ``<recorded>/../shared/spec.md`` carries the
+    prefix while naming a tree OUTSIDE it: a ``..`` after the recorded project
+    climbs out, so the remainder is not project-owned. Rebasing it would redirect
+    the spelling to ``<live>/../shared/spec.md`` — a different file once the project
+    moved to another parent. Normalizing the ``..`` away lexically would be wrong
+    across symlinks (and is the canonicalization this function forbids), so a
+    traversing spelling is classified external and left alone like every other.
+    """
+    recorded_project = Path(state.project)
+    if project_root == recorded_project:
+        return path
+    try:
+        relative = path.relative_to(recorded_project)
+    except ValueError:
+        return path
+    if ".." in relative.parts:
+        return path
+    return project_root / relative
+
+
 def task_spec_path(task: StoryTask, state: RunState) -> Path:
-    """The recorded spec path, re-anchored on the tree it was persisted relative to.
+    """The persisted-task spec anchor, re-based on the tree it was recorded relative to.
+
+    Use this when an operation must address the tree recorded by the task. A bare
+    basename is joined directly to :func:`task_spec_root`; it is NOT probed against the
+    project and has no implementation-artifacts fallback. To bind either a
+    session-reported path or a persisted spelling inside the current active
+    ``ProjectPaths``, use :func:`verify.resolve_spec_path`, which probes project-first
+    and then falls back under the implementation-artifacts directory. Recovery uses
+    ``recovery_flow.RecoveryFlow._attempt_owned_spec`` instead: for a bare basename it
+    probes both locations and accepts the binding only when exactly one trusted regular
+    file exists.
 
     `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
     RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
     that against the process cwd is not merely unreachable — it is actively wrong:
     `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
-    same `_bmad-output/specs/...` layout, so a bare `Path(task.spec_file)` names the main
-    checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
+    same implementation-artifacts-relative path, so a bare `Path(task.spec_file)` names
+    the main checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
     accepts it (it genuinely is under `project`), and the status flip and the baseline
     re-stamp both land on a file the run never used while the worktree's real spec is
     left on the escalated attempt's sha.
@@ -3143,6 +3315,68 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
     return mount
 
 
+def live_spec_path(task: StoryTask, state: RunState, project_root: Path) -> Path:
+    """`task_spec_path` carried onto the tree the caller is acting in.
+
+    The pair below is the WRITE side of `rearm_escalation`: the file it flips and
+    re-stamps, and the root every writer confines that edit to. Public because the
+    TUI's escalation modal is the READ side of that same gesture: it shows and
+    validates the spec `_do_rearm` then flips, so it must anchor on the identical
+    live path or the operator reviews one copy and re-arms another. They move together
+    because `task_spec_root` is the confinement claim about the very path
+    `task_spec_path` produces — rebasing one alone would hand the writers a path
+    outside their own root, and all four of them answer that by silently dropping to
+    the unconfined arm (see `task_spec_root` for why that matters).
+    """
+    return rebase_recorded_project_path(task_spec_path(task, state), state, project_root)
+
+
+def live_spec_root(task: StoryTask, state: RunState, project_root: Path) -> Path:
+    """`task_spec_root` carried onto the tree the caller is acting in — the confine
+    root for the path `live_spec_path` names. See there."""
+    return rebase_recorded_project_path(task_spec_root(task, state), state, project_root)
+
+
+def live_stories_root(task: StoryTask | None, state: RunState, project_root: Path) -> Path:
+    """`task_stories_root` carried onto the tree the caller is acting in — the root
+    the stories folder is located from by the READ side of the re-arm gesture.
+
+    The escalation modal's title, description and sentinel indicator are read from
+    the stories folder, and `_do_rearm` clears that sentinel at `live_spec_path`. A
+    locator answering the recorded `state.project` after a project move reads the
+    manifest from a tree the re-arm no longer writes: absent once the old tree is
+    gone, stale while it lingers.
+
+    The mount is probed on its REBASED spelling FIRST, and that ordering is the whole
+    content of this function. `RUNS_DIR` is ``.bmad-loop/runs``, so a mount is spelled
+    ``<project>/.bmad-loop/runs/<id>/worktrees/<unit>`` — INSIDE the recorded project,
+    and it rebases like every other project-owned path. (Outside-the-project is only
+    the symlinked-`.bmad-loop` layout `_spec_is_shared_with_the_redrive` names.) But
+    `task_stories_root` decides on an existence probe against the RECORDED spelling,
+    which after a project move names a directory that is gone: the probe fails, the
+    mount is discarded for the project fallback, and rebasing that fallback hands back
+    the MAIN CHECKOUT — while `live_spec_path` (whose `task_spec_root` runs no
+    existence probe) follows the rename onto the moved mount. One surface, two trees:
+    exactly the defect the spec anchor exists to close. Asking the live mount first
+    keeps the isolated arm on the moved worktree, and a mount that is genuinely gone
+    still degrades through `task_stories_root` to the project, rebased.
+
+    `is_dir` degrades on OSError rather than raising, for `task_stories_root`'s own
+    reason: this is a READ locator, and a probe that cannot answer falls back to the
+    tree that always exists.
+    """
+    if task is not None and task.worktree_path:
+        recorded_mount = Path(task.worktree_path)
+        live_mount = rebase_recorded_project_path(recorded_mount, state, project_root)
+        if live_mount != recorded_mount:
+            try:
+                if live_mount.is_dir():
+                    return live_mount
+            except OSError:
+                pass
+    return rebase_recorded_project_path(task_stories_root(task, state), state, project_root)
+
+
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
     """True when the recorded spec lives outside BOTH checkouts, so the re-arm's status
     flip survives a mount's disposal and the ISOLATED re-drive reads it.
@@ -3271,11 +3505,15 @@ def redrive_base_ref(state: RunState, *, isolated_redrive: bool) -> str:
     `isolated_redrive` is the LIVE policy's isolation mode, injected by the caller, and
     the task drops out of the signature entirely. It used to be inferred from
     `task.worktree_path` — a recorded mount — and that is the retrospective fact, not
-    this one. `engine._run_story` selects the mode from `self._isolated` alone, and an
-    isolation change mid-run is journalled, never refused, so the recorded mount and the
-    next re-drive part company in BOTH directions: a run flipped to `"none"` still
-    carries the escalated attempt's mount and would name the pinned branch for an
-    in-place re-drive that reads `HEAD`, and one flipped to `"worktree"` carries no
+    this one. `engine._run_story` selects on `self._isolated` OR a recorded mount, but a
+    re-drive never reaches it still carrying one: the restart arm releases the mount
+    first — `_discard_unit_for_restart` while policy is still isolated,
+    `_release_orphaned_mount` once it is not — so the mode a re-drive runs in is live
+    policy's. An isolation change mid-run is journalled, never refused, so the recorded
+    mount and the next re-drive part company in BOTH directions: a run flipped to
+    `"none"` still carries the escalated attempt's mount and would name the pinned
+    branch for an in-place re-drive that reads `HEAD`, and one flipped to
+    `"worktree"` carries no
     mount at all and would name `HEAD` for a re-drive that mounts. Both send a
     correction to a tree the run does not read. The same injection is how
     `validate_restore_latch` already learns this fact.
@@ -3482,7 +3720,11 @@ def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
 
 
 def _restore_rearmed_spec(
-    spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
+    spec_path: Path,
+    original: bytes | None,
+    task: StoryTask,
+    state: RunState,
+    live_project: Path,
 ) -> Literal["restored", "unchanged", "unknown"]:
     """Put back the bytes a re-arm FOUND on the spec, and say what is now on disk.
 
@@ -3528,7 +3770,25 @@ def _restore_rearmed_spec(
     (`frontmatter.set_frontmatter_status` states the rule; `verify.set_frontmatter_field`
     and `devcontract._atomic_write_spec` restate it): under `confine_root`, through the
     component-walking confined helper (#593); outside it, the plain `follow_symlinks=False`
-    write. Calling the confined helper unconditionally looked stricter and was strictly
+    write.
+
+    `confine_root` is the LIVE root — `live_spec_root(task, state, live_project)`, which
+    is `task_spec_root` REBASED onto the tree this gesture is acting in — and `live_project`
+    is a required parameter for that reason rather than an optional one falling back to
+    `task_spec_root`. The three forward writers this undoes all confine against the live
+    root (`rearm_escalation` passes `live_spec_root(task, state, live_project)` to the flip,
+    the strip and the baseline re-stamp), and `spec_path` is itself `live_spec_path`, so
+    reading the RECORDED root here compared the live path against a root it need not sit
+    under. After a project rename the two spellings diverge, the lexical
+    `is_relative_to` goes False, and this undo silently dropped to the plain arm on
+    exactly the specs its own siblings had just written through the CONFINED one — losing
+    #593's O_NOFOLLOW walk of the parent components with no signal, since
+    `follow_symlinks=False` guards only the FINAL component. The observable outcome is
+    otherwise identical (right file, right bytes, `rollback="restored"`), which is why
+    nothing downstream could catch it and why the parity is asserted at this seam. The
+    arm-selection RULE above is unchanged; only the root it compares against is corrected.
+
+    Calling the confined helper unconditionally looked stricter and was strictly
     worse — an artifacts folder configured OUTSIDE both the mount and the project is
     supported configuration (`bmadconfig` resolves one, `verify.spec_within_roots` trusts
     it, `_spec_is_shared_with_the_redrive` treats it as first-class), and there the flip,
@@ -3565,7 +3825,7 @@ def _restore_rearmed_spec(
         # raises `RearmError` if it cannot land, which is the loud outcome the docstring
         # above promises. The cost of being wrong here is one redundant identical write.
         pass
-    confine_root = task_spec_root(task, state)
+    confine_root = live_spec_root(task, state, live_project)
     try:
         if spec_path.is_relative_to(confine_root):
             atomic_write_bytes_confined(
@@ -3593,6 +3853,7 @@ def _rollback_rearm(
     spec_before: bytes | None,
     task: StoryTask,
     state: RunState,
+    live_project: Path,
     error: BaseException,
 ) -> None:
     """Undo an aborted re-arm's spec writes and RECORD that the re-arm aborted.
@@ -3601,6 +3862,12 @@ def _rollback_rearm(
     original fault immediately after, so nothing here may return a verdict or swallow
     one: this function's whole job is to leave the spec's bytes as the re-arm found them
     and put the fact on the run's audit trail.
+
+    `live_project` is threaded straight through to `_restore_rearmed_spec`, which confines
+    against the LIVE (rebased) spec root so the undo validates its write with the same
+    root the forward writers used. The guard's caller already holds it, so this parameter
+    carries the fact rather than re-deriving it — see `_restore_rearmed_spec` for what
+    re-deriving it from `task_spec_root` silently cost after a project rename.
 
     `rollback` goes ON the record, not left to be re-derived, because every reader is
     OUT of process: `rearm_event_notice` renders from a journal line alone, with neither
@@ -3640,7 +3907,7 @@ def _rollback_rearm(
     rollback = "unknown"
     try:
         if spec_path is not None:
-            rollback = _restore_rearmed_spec(spec_path, spec_before, task, state)
+            rollback = _restore_rearmed_spec(spec_path, spec_before, task, state, live_project)
     except BaseException:
         rollback = "failed"
         raise
@@ -3682,41 +3949,18 @@ def _rearm_commit_landed(run_dir: Path, story_key: str, task: StoryTask) -> bool
     only if some other writer had minted the same bump, and `phase` alone moves for
     reasons a re-arm does not own.
 
-    Those two conjuncts are a sufficient identity ONLY because `rearm_escalation` runs as
-    the SOLE writer of this run's `state.json`, and that model is the probe's premise
-    rather than an assumption left implicit. Exactly TWO call sites reach this
-    transaction — `cli.cmd_resolve` and `tui.TuiApp._do_rearm` — and each consults
-    liveness before any side effect: :func:`engine_liveness` in the CLI, its pid-file
-    sibling :func:`liveness` in the TUI (`probe_liveness` is the shared body). A third
-    control command, `cli.cmd_resume`, never re-arms but DOES write this run's
-    `state.json` (through `_resume_paused_run`), which is why the sole-writer claim has
-    to account for it as well as for the two callers.
-    `tests/test_portability_guard.py::test_rearm_escalation_called_only_behind_a_liveness_gate`
-    holds that enumeration, which is otherwise prose a third call site could falsify
-    silently.
+    Those two conjuncts are a sufficient identity because the entire re-arm — including
+    this error-path probe — runs inside :func:`journal.state_lock`. Every state writer
+    participates through the self-locking :func:`journal.save_state`, and every external
+    read-modify-write gesture holds the same canonical run sidecar from its deciding read
+    through publication. Therefore no rival can supply the observed generation/phase
+    while this transaction is in flight: a waiter reloads only after this hold exits.
 
-    Those gates establish that no engine is PROVABLY ALIVE — not that one is proven
-    dead — and the premise rests on the difference, so it is stated rather than rounded
-    off. `"alive"` is refused outright at all three. `"unknown"` is not: `cmd_resolve`
-    proceeds on it under `--force`, `cmd_resume` warns and proceeds by design (it is the
-    recovery path that rewrites engine.pid), and the TUI counts it as blocking only for a
-    pid-backed run. So the model this probe leans on is the engine stopped AND the
-    operator driving one control command at a time. Under it only THIS caller can have
-    moved either field, which is exactly what the exact-phase predicate reports — the
-    predicate is correct for the reason it is narrow.
-
-    Two overlapping control commands are OUTSIDE that model rather than handled by it,
-    and deliberately so. `journal.save_state` stages through a FIXED `state.json.tmp`
-    sibling before its `atomic_replace` — the collision `_write_stop_request` documents
-    under #379, which names the stop-request file as the ONE control file with genuinely
-    *concurrent* writers — so two overlapping re-arms lose a `save_state` to
-    `FileNotFoundError` long before this probe's identity could matter. Answering them
-    here was weighed and declined: a lock taken by only `rearm_escalation` excludes
-    nobody (the honest fix is a run-level one shared with `_resume_paused_run` and the
-    engine's own `save_state`), and a durable per-re-arm token stamped on `StoryTask`
-    would buy this probe a precision the `save_state` writer beneath it cannot honour, at
-    the cost of a new persisted model field. Tracked as DW-93; the probe stays two
-    conjuncts over the reloaded task.
+    The two operator call sites still repeat liveness under their outer transaction
+    holds. That is a separate safety rule: serialization prevents stale publication,
+    while liveness prevents deliberately taking a turn after an engine known to be live.
+    The portability guard keeps both the writer/transaction inventory and the two re-arm
+    surface gates executable rather than relying on this prose.
 
     Degrades to `False` — roll back, the pre-existing behavior — on ANY failure to read
     or parse the state file. This is observation feeding a repair decision, and the safe
@@ -3855,15 +4099,71 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     run has changed repositories, and the paths are the half that would put an
     attacker-controlled string on their terminal.
     """
-    state = load_state(run_dir)
-    new = str(repo_root)
-    if state.repo_root == new:
-        return None
-    moved = bool(state.repo_root)
-    state.repo_root = new
-    save_state(run_dir, state)
-    if not moved:
-        return None
+    with state_lock(run_dir):
+        state = load_state(run_dir)
+        new = str(repo_root)
+        if state.repo_root == new and not state.code_root_restamp_pending:
+            return None
+        if state.repo_root != new:
+            # Discharge an OWED record before the root it names is overwritten.
+            # The marker is a bare bool, so the only surviving description of the
+            # root an unlanded record was owed for is `state.repo_root` itself:
+            # once this call re-points it, a record for the previous tree can
+            # never be written again. An operator who re-points the root a SECOND
+            # time before retrying would otherwise lose that record silently.
+            # Ordering is the same at-least-once bargain the append below keeps:
+            # nothing has been written or cleared yet, so an append that fails
+            # here leaves the root and the marker exactly as the retry needs them.
+            if state.code_root_restamp_pending:
+                Journal(run_dir).append(
+                    "rearm-code-root-restamped",
+                    repo=state.repo_root,
+                    code_root_changed=True,
+                )
+            moved = bool(state.repo_root)
+            state.repo_root = new
+            # The move and its intent marker land in ONE atomic state write: a
+            # save that fails here changes nothing on disk, so the retry simply
+            # redoes it, and a save that succeeds has durably recorded that a
+            # record is now owed. The migration of an empty (pre-field) root is
+            # not a move and owes nothing. The marker carries forward rather than
+            # clearing: the discharge above settled the PREVIOUS root's debt, and
+            # this write opens the new one's.
+            state.code_root_restamp_pending = moved
+            save_state(run_dir, state)
+        # Either this call moved the root, or an earlier call moved it and its
+        # record never landed — the marker is what tells those apart from the
+        # ordinary "already agrees" return above.
+        if not state.code_root_restamp_pending:
+            return None
+        # Journalled under resume's own field name. This re-stamp aligns the mirror
+        # that `cli._resume_paused_run` later compares against config, so by the
+        # time `run-resume` computes `code_root_changed` the two necessarily agree
+        # and it records `false` — on the one gesture where the root DID move. The
+        # ephemeral stderr/toast the caller prints from the return value is not a
+        # record; without this line the move leaves no durable trace on the re-arm
+        # surfaces while plain `resume` still writes one. `repo` is dropped by the
+        # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
+        # reaches a dump.
+        #
+        # AFTER the persisted move, never before it: a record written first would
+        # assert a completed move that a failed save then never made. And the
+        # marker is cleared only once the append has returned: an append that
+        # fails leaves it set, so the retry re-enters here and writes the record
+        # the move still owes — or, when the operator runs plain `resume` instead,
+        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
+        # its own `run-resume` line and clears it on the same write that persists
+        # the resume. The one residual is a clearing save that fails after
+        # a successful append, which costs a duplicate — true — record on the
+        # retry; a duplicate is recoverable from the journal, a missing record and a
+        # false one are not.
+        Journal(run_dir).append(
+            "rearm-code-root-restamped",
+            repo=new,
+            code_root_changed=True,
+        )
+        state.code_root_restamp_pending = False
+        save_state(run_dir, state)
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
@@ -3873,6 +4173,65 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     )
 
 
+@dataclass(frozen=True)
+class RearmNotice:
+    """One operator-facing notice produced by a successful re-arm."""
+
+    severity: Literal["note", "warning"]
+    message: str
+    next_step: str
+
+
+@dataclass(frozen=True)
+class RearmOutcome:
+    """Authoritative result of a successfully persisted escalation re-arm."""
+
+    story_key: str
+    notices: tuple[RearmNotice, ...]
+    hold_resume: bool
+    # The `next_step` of the FIRST record that held, so a surface which folds the
+    # resume into the same gesture can say what to actually do. `hold_resume` alone
+    # forced that surface to hardcode ONE remedy for four holding records, and the
+    # hardcoded one ("commit the corrected spec") is impossible on two of them: the
+    # in-place arm of `rearm-spec-write-unreachable` needs an edit in the main
+    # checkout, and `rearm-spec-flip-skipped`'s holding arm fires only when the spec
+    # path is NOT a readable file — there is nothing at that path to commit, and the
+    # path may sit in a shared artifact directory outside any repository. Empty when
+    # the holding record renders no step, which keeps the caller's fallback honest.
+    hold_next_step: str = ""
+
+
+class _RearmJournal(Journal):
+    """Journal writer that captures successful re-arm notices at append time."""
+
+    def __init__(self, run_dir: Path):
+        super().__init__(run_dir)
+        self.notices: list[RearmNotice] = []
+        self.hold_resume = False
+        self.hold_next_step = ""
+
+    def append(self, kind: str, **fields: Any) -> None:
+        # Capture only after the durable append succeeds. The synthetic entry contains
+        # every producer-supplied field the shared classifiers consume; Journal's
+        # self-minted timestamp/log fields are not part of either contract.
+        super().append(kind, **fields)
+        entry = {"kind": kind, **fields}
+        holds = rearm_holds_the_resume(entry)
+        rendered = rearm_event_notice(entry)
+        if rendered is not None:
+            severity, message, next_step = rendered
+            self.notices.append(RearmNotice(severity, message, next_step))
+            # FIRST-WINS, and deliberately: a re-arm can journal more than one holding
+            # record, and the earliest is the cause the operator has to clear first —
+            # the later ones are read from a tree the first remedy changes. Guarded on
+            # `hold_resume` being still-false rather than on the step being empty, so a
+            # holding record that renders no step does not silently hand the surface a
+            # LATER record's imperative for a different file.
+            if holds and not self.hold_resume:
+                self.hold_next_step = next_step
+        self.hold_resume = holds or self.hold_resume
+
+
 def rearm_escalation(
     run_dir: Path,
     story_key: str | None = None,
@@ -3880,7 +4239,29 @@ def rearm_escalation(
     restore_patch: str | None = None,
     isolated_redrive: bool,
     resolution_recorded: bool,
-) -> str:
+    project_root: Path | None = None,
+) -> RearmOutcome:
+    """Run the complete spec/git/state re-arm transaction under the run lock."""
+    with state_lock(run_dir):
+        return _rearm_escalation_locked(
+            run_dir,
+            story_key,
+            restore_patch=restore_patch,
+            isolated_redrive=isolated_redrive,
+            resolution_recorded=resolution_recorded,
+            project_root=project_root,
+        )
+
+
+def _rearm_escalation_locked(
+    run_dir: Path,
+    story_key: str | None = None,
+    *,
+    restore_patch: str | None = None,
+    isolated_redrive: bool,
+    resolution_recorded: bool,
+    project_root: Path | None = None,
+) -> RearmOutcome:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
     Flips the escalated task out of its terminal ESCALATED phase back to
@@ -3965,10 +4346,37 @@ def rearm_escalation(
     and both non-interactive callers know by construction that no session ran. Do not
     unlink the marker here either — the TUI's Re-arm button is gated on its presence.
 
+    `project_root` is the LIVE CLI project, and it exists so this function writes the
+    file `resolve.build_context` told the agent to edit. `state.project` is the
+    LAUNCH-TIME project and nothing re-stamps it (unlike `state.code_root`, which
+    `restamp_code_root` re-points just before both callers reach here), so after a
+    project move `task_spec_path` resolves under a directory that no longer exists:
+    the status flip and the baseline re-stamp both silently no-op — every writer
+    answers an absent path with `False` rather than an exception — while the agent's
+    correction sits in the live tree the re-drive actually reads. The re-drive then
+    wedges on the escalated attempt's status and the escalation is spent.
+    `build_context` already rebases the `spec_file` it publishes, through the very
+    helper used here, so the two sides now name one file.
+
+    `None` means "the project this run recorded", which is byte-for-byte today's
+    behavior and the correct answer for every run whose project has not moved — the
+    default is safe in a way `isolated_redrive`'s would not be, because it does not
+    stand in for a fact only the caller holds; it names the same tree the caller
+    would pass. It is optional for that reason and to match `build_context`'s own
+    signature, which takes the live roots the same way.
+
+    Scope is the WRITE TARGET and its confinement root, not the reachability verdicts
+    beside them. Those read `task.spec_file`, which is relative for every run that
+    records one under the project, and answer without consulting `state.project` at
+    all; the two that can consult it degrade toward WARNING on an unresolvable path,
+    which is the safe direction and already their documented contract.
+
     The generation bump stays UNCONDITIONAL beside the gated stamp: it answers session-id
     reuse (#705), which an abandoned attempt needs exactly as much as a resolved one.
 
-    Returns the re-armed story key. Raises RearmError when the run is not paused at
+    Returns the authoritative re-arm outcome: the story key, the ordered notices
+    whose journal appends succeeded during this call, and whether one of the appended
+    records holds the combined re-arm/resume gesture. Raises RearmError when the run is not paused at
     the escalation stage, the target story is not escalated, or a supplied
     `restore_patch` fails `validate_restore_latch` (the shared precondition set —
     sentinel wedge, spec-less escalation, worktree isolation).
@@ -3997,7 +4405,12 @@ def rearm_escalation(
         if err is not None:
             raise RearmError(err)
 
-    journal = Journal(run_dir)
+    # The tree this gesture is ACTING IN, for the paths below that WRITE. `state.project`
+    # is where the run was launched and nothing re-stamps it, so after a project move it
+    # names a directory that is no longer there. See the `project_root` note above.
+    live_project = project_root if project_root is not None else Path(state.project)
+
+    journal = _RearmJournal(run_dir)
     # Read before the unconditional overwrite below: they describe the restore
     # attempt this re-arm is abandoning, and the residue block needs both.
     old_latch = task.restore_patch
@@ -4073,7 +4486,7 @@ def rearm_escalation(
     # proof the tree is untouched.
     try:
         if task.spec_file:
-            spec_path = task_spec_path(task, state)
+            spec_path = live_spec_path(task, state, live_project)
             # Stories mode only: a fixed-slug pre-planning-halt sentinel
             # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
             # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -4281,7 +4694,9 @@ def rearm_escalation(
                     spec_before = None
                 try:
                     flipped = verify.set_frontmatter_status(
-                        spec_path, target_status, confine_root=task_spec_root(task, state)
+                        spec_path,
+                        target_status,
+                        confine_root=live_spec_root(task, state, live_project),
                     )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
@@ -4316,12 +4731,36 @@ def rearm_escalation(
                         # ("add a top-level `status:`") for a re-arm that COMPLETED sends
                         # the human to repair a file nothing will read.
                         refused = spec_path.is_file() and write_reaches_the_redrive
+                        # `refused` is False for TWO disjoint reasons and the operator
+                        # surfaces cannot re-derive which: the write would have reached
+                        # the re-drive but the file is gone, or the file is there but the
+                        # re-drive discards that copy. Carrying the second half of the
+                        # conjunction is what lets the renderer stop asserting worktree
+                        # behaviour on a run that has no worktree. Absent on records
+                        # written before this field existed, where the renderer keeps its
+                        # previous wording.
+                        # The live re-drive mode, recorded for the same reason
+                        # `refused` is: the renderer reads this OUT OF PROCESS and
+                        # cannot re-derive it. `reaches_redrive` does NOT imply it —
+                        # its isolated arm answers True for a spec in an artifact dir
+                        # configured outside the project tree
+                        # (`_spec_is_shared_with_the_redrive`), which is reachable
+                        # precisely BECAUSE it is shared across checkouts, with a
+                        # worktree very much mounted. Inferring "no worktree" from
+                        # reachability asserted the opposite of the truth on that shape.
+                        # Absent on records written before this field existed, where the
+                        # renderer drops the mount clause rather than guessing: unlike
+                        # the sibling `rearm-spec-write-unreachable`, whose in-place arm
+                        # is newer than the field, this kind was journalled from BOTH
+                        # modes before it, so an absent value here is genuinely unknown.
                         journal.append(
                             "rearm-spec-flip-skipped",
                             story_key=key,
                             spec_file=str(spec_path),
                             status=target_status,
                             refused=refused,
+                            reaches_redrive=write_reaches_the_redrive,
+                            redrive="isolated" if isolated_redrive else "in-place",
                         )
                         # ...and then ABORT — but only for a spec that IS a readable file
                         # here AND is the copy the re-drive reads. The first half is the same
@@ -4388,7 +4827,7 @@ def rearm_escalation(
                     # as it found it — a stripped result section on a spec the re-arm then
                     # refused would be the one edit nothing else records.
                     devcontract.strip_auto_run_result(
-                        spec_path, confine_root=task_spec_root(task, state)
+                        spec_path, confine_root=live_spec_root(task, state, live_project)
                     )
                 except verify.FrontmatterWriteError as e:
                     # The spec reads fine but carries `status:` in a shape no line
@@ -4556,7 +4995,7 @@ def rearm_escalation(
         # block also returns `False` from both writers. That shape is caught by the flip's
         # `flipped` check above and, here, by `overwritten` staying empty.
         if task.spec_file:
-            spec_path = task_spec_path(task, state)
+            spec_path = live_spec_path(task, state, live_project)
             if not spec_path.is_file():
                 # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
                 # made the two #640 legs shadow each other: on a project that is not a
@@ -4591,7 +5030,7 @@ def rearm_escalation(
                         spec_path,
                         "baseline_revision",
                         task.baseline_commit,
-                        confine_root=task_spec_root(task, state),
+                        confine_root=live_spec_root(task, state, live_project),
                     )
                 except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                     # FrontmatterWriteError joins the tuple rather than getting its own
@@ -4661,7 +5100,7 @@ def rearm_escalation(
         # undoing the spec then would build the mirror image of the defect this guard
         # closes, persisted state re-armed against a spec that is not.
         if not _rearm_commit_landed(run_dir, key, task):
-            _rollback_rearm(journal, key, spec_path, spec_before, task, state, e)
+            _rollback_rearm(journal, key, spec_path, spec_before, task, state, live_project, e)
         raise
     journal.append(
         "story-escalation-resolved",
@@ -4669,7 +5108,7 @@ def rearm_escalation(
         baseline=task.baseline_commit or "",
         restore=bool(restore_patch),
     )
-    return key
+    return RearmOutcome(key, tuple(journal.notices), journal.hold_resume, journal.hold_next_step)
 
 
 def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:
@@ -4722,6 +5161,35 @@ def _journal_sequence(value: Any) -> tuple[Any, ...]:
     return () if value is None else (value,)
 
 
+def _redrive_status_clause(entry: dict[str, Any]) -> str:
+    """The `status:` a holding record's remedy must leave on the spec, as a next_step
+    clause — `""` for a record that carries no status.
+
+    Three of the four holding remedies end in a spec the re-drive has to ROUTE on, and
+    routing is decided by the frontmatter status alone: step-01 halts blocked on
+    `unrecognized status in existing story file`, and a spec still carrying the
+    escalated attempt's terminal status routes to "ingest as context, do not resume".
+    So an operator who restores or commits the file the record names, byte-correct but
+    still terminal, has obeyed the remedy and burned the escalation anyway — the resume
+    the hold bought them is spent on a session that cannot route. Naming the target
+    here is what makes the remedy sufficient rather than merely necessary.
+
+    All FOUR arms call this, so the remedies stay one uniform contract across both
+    operator surfaces. `rearm-upstream-write-unreachable` is the fourth and renders
+    `""` today, since the sentinel leg it fires on has no spec status at all — see the
+    comment at that arm before concluding the call is dead.
+
+    Read off the record rather than recomputed: the producer writes the very value it
+    tried to flip to (`target_status`, `in-review` after a restore and `ready-for-dev`
+    otherwise), and this renderer runs out of process, from a journal line alone. A
+    record predating the field yields `""` and the clause is dropped, on the same
+    principle the `target_branch` clause follows — a remedy that names no value beats
+    one that names a guess.
+    """
+    status = str(entry.get("status", "") or "")
+    return f" with `status: {status}`" if status else ""
+
+
 def rearm_event_notice(
     entry: dict[str, Any],
 ) -> tuple[Literal["note", "warning"], str, str] | None:
@@ -4745,9 +5213,17 @@ def rearm_event_notice(
     kind = entry.get("kind", "")
     if kind == "stale-restore-excluded":
         files = ", ".join(str(f) for f in _journal_sequence(entry.get("files")))
+        # "this re-arm computed" rather than a bare completed past tense, because
+        # `_stale_restore_residue` journals BEFORE the advance and the re-stamp, and
+        # `save_state` runs once at the very end. Both surfaces echo this from an abort
+        # path on purpose (the residue matters most there), and after an abort nothing
+        # was persisted: the task is still ESCALATED, `restore_patch` is still latched
+        # and `baseline_untracked` is unchanged. The sibling `stale-restore-commits`
+        # needs no such hedge — it reports where commits SIT, which stays true.
         return (
             "note",
-            f"excluded the abandoned restore's new files from the re-drive baseline: {files}",
+            "excluded the abandoned restore's new files from the re-drive baseline this "
+            f"re-arm computed: {files}",
             "",
         )
     if kind == "stale-restore-unparseable":
@@ -4810,6 +5286,7 @@ def rearm_event_notice(
         # an ISOLATED one: that was the only shape the producer could journal before the
         # in-place arm existed, so the absent field is a known value, not an unknown.
         spec = entry.get("spec_file", "?")
+        to = _redrive_status_clause(entry)
         if str(entry.get("redrive", "isolated") or "isolated") == "in-place":
             # The mirror shape: `isolation` was edited to `"none"` while the escalation
             # was paused, so the writes went into the mount the escalated attempt
@@ -4824,7 +5301,7 @@ def rearm_event_notice(
                 "escalated attempt's worktree while the re-drive now runs in the main "
                 "checkout — re-apply the correction to the main checkout's copy of the "
                 "spec or the story re-wedges on the escalated attempt's status",
-                "Correct the spec in the main checkout before resuming",
+                f"Correct the spec in the main checkout{to} before resuming",
             )
         # The branch is the half an operator cannot infer: the re-drive cuts its fresh
         # worktree from the run's PINNED target branch, so a correction committed on
@@ -4839,7 +5316,7 @@ def rearm_event_notice(
             f"spec writes ({spec}) land in a tree it discards — the re-driven session "
             "reads the COMMITTED spec, so commit the corrected "
             f"spec{where} or the story re-wedges on the escalated attempt's status",
-            f"Commit the corrected spec{where} before resuming",
+            f"Commit the corrected spec{where}{to} before resuming",
         )
     if kind == "rearm-upstream-write-unreachable":
         # The sentinel counterpart, and ONE remedy rather than the two above: the
@@ -4855,6 +5332,24 @@ def rearm_event_notice(
         root = str(entry.get("stories_root", "?"))
         base = str(entry.get("target_branch", "") or "")
         where = f" on `{base}`" if base else ""
+        # The status clause is rendered here for UNIFORMITY with the other three
+        # holding arms, and on the leg the producer actually emits it renders EMPTY.
+        # That is intended, not an oversight, and it is not dead code: the append at
+        # `rearm-upstream-write-unreachable`'s site carries no `status`, because this
+        # arm fires only on the sentinel path — `_clear_sentinel` DELETES the spec and
+        # the re-dispatch re-plans from PENDING, so `target_status` is not even in
+        # scope there, and `stories.yaml` REJECTS a `status` key outright (a story's
+        # status lives in its story spec). `_redrive_status_clause` answers `""` for a
+        # record carrying no status, so every remedy this arm renders today is
+        # byte-identical to the one it rendered before.
+        #
+        # It stays because the four holding remedies are ONE contract an operator
+        # reads across surfaces, and a reader comparing them must not have to work out
+        # which arm was left out; should this record ever come to carry a status, the
+        # remedy names it without a second fix. Do NOT "simplify" it back out, and do
+        # NOT add a `status` field to the producer to make it fire — that would put a
+        # status on a leg that has none.
+        to = _redrive_status_clause(entry)
         return (
             "warning",
             f"the sentinel was cleared, but the re-drive of this story will mount a "
@@ -4862,7 +5357,7 @@ def rearm_event_notice(
             f"correction in {root} (`SPEC.md` / `stories.yaml`) is uncommitted there, "
             f"so the re-plan reads the same intent that wedged and mints the sentinel "
             "again",
-            f"Commit the corrected SPEC.md / stories.yaml{where} before resuming",
+            f"Commit the corrected SPEC.md / stories.yaml{where}{to} before resuming",
         )
     if kind == "rearm-spec-flip-skipped":
         # ONE kind, TWO outcomes, told apart by the flag the producer writes rather
@@ -4887,11 +5382,42 @@ def rearm_event_notice(
                 "on the status it reads",
                 "Add a top-level `status:` to the spec, then re-run resolve",
             )
+        if entry.get("reaches_redrive"):
+            # The write DID address the copy the re-drive reads; the flip skipped
+            # because that path is not a readable file from this process — a spec moved
+            # or renamed by the resolve session, or an absolute path this `--project`
+            # invocation cannot see. Either way the re-drive reads that same path, so
+            # the worktree wording below would tell the operator the failed flip is
+            # harmless at precisely the moment it is not.
+            #
+            # The MOUNT half is read off the record, never inferred from reachability:
+            # the isolated arm reaches the re-drive through a spec shared across
+            # checkouts, so a worktree is mounted there and "this run mounts no
+            # worktree" was simply false. A record predating the `redrive` field says
+            # nothing about the mode, and this kind was written from both modes before
+            # the field existed — so drop the clause rather than guess. The rest of the
+            # sentence holds in every case.
+            mode = str(entry.get("redrive", "") or "")
+            if mode == "in-place":
+                mount = ", and this run mounts no worktree"
+            elif mode == "isolated":
+                mount = ", and the re-drive reads it from outside the worktree it mounts"
+            else:
+                mount = ""
+            return (
+                "warning",
+                f"the recorded spec for this story ({spec}) could not be re-opened to "
+                f"`{status}` — it is not a readable file from here{mount}, so the "
+                "re-drive reads that same path and finds no spec there to route on",
+                f"Restore the recorded spec path{_redrive_status_clause(entry)} before " "resuming",
+            )
         # No next_step, and deliberately: on this leg there is nothing to do to THIS
         # file. Whether anything is left to do at all is decided by the committed spec,
         # and `rearm-spec-write-unreachable` — journalled from the same block, on
         # exactly the legs where the committed spec is not already at the target —
-        # carries that imperative, and holds the resume behind it.
+        # carries that imperative, and holds the resume behind it. Reached for a
+        # worktree-local copy the re-drive discards, and for a pre-`reaches_redrive`
+        # record, which keeps the wording it was written under.
         return (
             "warning",
             f"the recorded spec for this story ({spec}) could not be re-opened to "
@@ -5003,16 +5529,20 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     tree — so a surface that re-arms and resumes in ONE gesture must stop after the
     re-arm and leave `bmad-loop resume` to the operator.
 
-    TWO kinds qualify, and the discriminator is PROOF, not urgency.
+    THREE records qualify, and the discriminator is PROOF, not urgency. Two of them
+    qualify by KIND; the third qualifies by its FLAGS, because one kind there covers
+    outcomes that answer this question differently.
     `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does NOT carry the status the re-drive routes
     on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
     risky, it is futile: the re-drive discards the worktree, mounts a fresh one from
     git, and step-01 reads a status it cannot route — `unrecognized status in existing
     story file` halts it blocked, and the escalation is spent. The record's own
-    next_step already said "commit the corrected spec before resuming"; both default
-    surfaces then resumed in the same breath, which made the imperative unactionable at
-    the moment it rendered. The interactive resolve agent cannot close that gap either
+    next_step already said "commit the corrected spec ... before resuming"; both
+    default surfaces then resumed in the same breath, which made the imperative
+    unactionable at the moment it rendered. It names the target `status:` as well as
+    the branch, because a spec committed there still carrying the escalated attempt's
+    terminal status re-wedges exactly as an uncommitted one does. The interactive resolve agent cannot close that gap either
     — its skill forbids it from committing.
 
     `rearm-upstream-write-unreachable` earns it the same way on the sentinel path,
@@ -5034,13 +5564,35 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     LESS than the answer — it proves nothing about whether the re-drive can route, only
     that one advisory could not be computed.
 
+    `rearm-spec-flip-skipped` earns it on ONE of its three arms, which is why this is
+    keyed on the record's flags rather than on the bare kind. Its producer writes
+    `refused = spec_path.is_file() and write_reaches_the_redrive`, so
+    `reaches_redrive and not refused` isolates exactly the leg where the flip addressed
+    the copy the re-drive reads and that path is NOT a readable file here — so the
+    re-drive reads the same path and finds no spec there to route on. Futile, on the
+    same proof as the two above, and that arm's next_step says "restore the recorded
+    spec path ... before resuming"; without this it rendered on surfaces that resumed
+    in the same gesture, which is the defect the two kinds above were fixed for. The
+    remedy names the target `status:` too: a file put back at that path still carrying
+    the escalated attempt's terminal status is unroutable for the same reason a missing
+    one is. The other two arms must NOT hold: the `refused` arm raises `RearmError` from
+    the producer, so no resume happens at all and holding would be meaningless, and the
+    remaining arm carries no next_step because the imperative on that leg belongs to
+    `rearm-spec-write-unreachable`, which holds the resume itself.
+
     Not folded into `rearm_event_notice`'s tuple, because they are different questions
     asked of the same entry: that table answers "what do I tell the operator", this
     answers "may this gesture still resume". Both surfaces ask both, in one walk.
     """
-    return isinstance(entry, dict) and entry.get("kind") in (
-        "rearm-spec-write-unreachable",
-        "rearm-upstream-write-unreachable",
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get("kind")
+    if kind in ("rearm-spec-write-unreachable", "rearm-upstream-write-unreachable"):
+        return True
+    return (
+        kind == "rearm-spec-flip-skipped"
+        and bool(entry.get("reaches_redrive"))
+        and not entry.get("refused")
     )
 
 

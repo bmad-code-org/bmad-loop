@@ -31,6 +31,8 @@ These environment variables are set:
 {
   "story_key": "6-4-cli-list-command",
   "run_id": "20260613-111429-6a14",
+  "project_root": "/abs/path/to/bmad-project",
+  "code_root": "/abs/path/to/code-repository",
   "spec_file": "/abs/path/to/_bmad-output/implementation-artifacts/spec-<story>.md",
   "spec_reaches_the_redrive": true,
   "redrive_base_ref": "<branch the re-drive reads, or HEAD>",
@@ -47,13 +49,26 @@ These environment variables are set:
 }
 ```
 
+The `escalations` array is ordered newest-first.
+Across the entire gathered context, each distinct escalation appears exactly once.
+
+The interactive session's working directory is always `project_root`. That tree holds
+the BMAD artifacts and specs you inspect or clarify. `code_root` is the tree where the
+run's code and git work belong; it may be different. When the roots differ, do not
+mistake the session cwd for the code checkout: any code fix or commit the human must
+make belongs under `code_root`, while artifact and spec work remains anchored under
+`project_root` (or at the explicit absolute paths in this context). You still do not
+implement or commit during this resolution session; name the correct tree when guiding
+the human.
+
 **`spec_reaches_the_redrive` says whether your edit has a future.** The re-drive
 reads one tree; `spec_file` may name another. Under worktree isolation the run's mount
 is discarded before the re-drive reads anything, so a spec inside that mount is
 destroyed with it. When this field is `false`, every write to `spec_file` still
 SUCCEEDS and is then thrown away — worse than not editing at all, because the session
-looks resolved. `null` means the task has no spec on record: there is nothing to edit
-and step 4 does not apply.
+looks resolved. `null` means there is no ordinary frozen spec to edit: either the task
+has no spec on record, or stories mode recorded a sentinel path instead. In both cases
+step 4 does not apply; follow the sentinel guidance below when that block is present.
 
 **`redrive_base_ref` tells you which of the two remedies applies.** Read it before you
 tell the human anything: a branch name and `HEAD` mean opposite things.
@@ -137,10 +152,24 @@ case below — omit it entirely for an ordinary resolution.
    especially its `<frozen-after-approval>` block (the intent the dev/review
    sessions treat as authoritative). The escalation is almost always that this
    block is silent on, or contradicts, a case the implementation hit.
-2. **Present the escalation plainly** to the human: what is ambiguous or
-   contradictory, why it blocks safe implementation, and **2–4 concrete
-   resolution options** with a clear recommendation and its trade-offs. Keep it
-   tight — quote the relevant spec lines.
+2. **Present the current pause evidence plainly** to the human:
+   - When the `escalations` array is non-empty, present its recorded entries in
+     their existing newest-first order. Do not replace recorded escalation
+     detail with `paused_reason`.
+   - When the `escalations` array is empty, first require `paused_reason` to be
+     text containing at least one non-whitespace character. If it is missing,
+     `null`, non-text, or blank after trimming, report a malformed resolve
+     context and do not write the resolution marker. Otherwise, present
+     `paused_reason` verbatim as the available evidence for the current pause
+     and disclose that no newer recorded escalation detail is available. Do not
+     read below the watermark, unfilter or recover an older artifact escalation,
+     or synthesize an escalation object from `paused_reason`.
+
+   Using the selected evidence, explain what is ambiguous or contradictory, why
+   it blocks safe implementation, and offer **2–4 concrete resolution options**
+   with a clear recommendation and its trade-offs. Keep it tight — quote the
+   relevant spec lines.
+
 3. **Get the human's decision.** Ask follow-ups if the choice is unclear. Do not
    invent requirements; if the human is unsure, help them reason, don't guess.
 4. **Update the frozen spec** to encode the decision unambiguously: amend the
