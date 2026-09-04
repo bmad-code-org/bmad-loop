@@ -1614,7 +1614,7 @@ def test_sweep_happy_path(project):
     dev_spec = adapter.sessions[1]
     assert "Implement the deferred-work bundle" in dev_spec.prompt
     intent_path = re.findall(r"`([^`]*)`", dev_spec.prompt)[0]
-    intent = open(intent_path).read()
+    intent = Path(intent_path).read_text(encoding="utf-8")
     assert "fix both" in intent and "DW-2" in intent and "### DW-3" in intent
 
 
@@ -2409,7 +2409,7 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "not triaged: DW-1" in open(feedback_path).read()
+    assert "not triaged: DW-1" in Path(feedback_path).read_text(encoding="utf-8")
 
 
 def test_overlong_bundle_name_is_normalized_without_triage_retry(project):
@@ -4031,7 +4031,7 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
     # the migration session was prompted with the manifest path
     assert "--migrate" in adapter.sessions[0].prompt
     manifest_path = adapter.sessions[0].prompt.split("--migrate ", 1)[1].split()[0]
-    written = json.loads(open(manifest_path).read())
+    written = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     assert [m["key"] for m in written] == [m["key"] for m in manifest]
     # triage ran against the post-migration open set, strict check intact
     assert "--migrate" not in adapter.sessions[1].prompt
@@ -4060,7 +4060,7 @@ def test_migration_validation_failure_restores_ledger_then_escalates(project):
     prompts = [s.prompt for s in adapter.sessions]
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
-    feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
+    feedback = Path(prompts[1].split("--feedback ", 1)[1]).read_text(encoding="utf-8")
     assert "still parse as legacy" in feedback and "not mapped" in feedback
 
 
