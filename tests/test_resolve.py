@@ -1,16 +1,17 @@
 """Escalation-resolution: context build, re-arm, spec field writer, session."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from conftest import escalated_run, git
+from conftest import escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
-from bmad_loop.journal import load_state, save_state
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
@@ -90,6 +91,22 @@ def _escalated_run(
             run.state.spec_folder = spec_folder
         save_state(run.run_dir, run.state)
     return run.run_dir, run.state, run.task
+
+
+def _context(state, run_dir, story_key, *, isolation):
+    """`build_context`'s Path alone, for the ~30 rows that assert on `context.json`.
+
+    `build_context` returns `(path, withheld, unreadable)` since DW-11, and both counts
+    are OPERATOR-facing numbers the CLI prints — no row here is about them. Routing
+    every Path-only caller through one unpack pins the arity for all of them at once:
+    grow the tuple a fourth member and this helper fails, rather than every row silently
+    binding a longer tuple to `path` (which is what a bare `path, _ = ...` at each
+    site would do). The rows that ARE about the counts call `resolve.build_context`
+    directly, so neither number is ever produced by this helper."""
+    path, _withheld, _unreadable = resolve.build_context(
+        state, run_dir, story_key, isolation=isolation
+    )
+    return path
 
 
 # ------------------------------------------------------------ set_frontmatter_field
@@ -531,7 +548,7 @@ def test_build_context_gathers_critical_escalations(tmp_path):
         ),
         encoding="utf-8",
     )
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == "6-4-cli-list-command"
     assert ctx["spec_file"] == spec.as_posix()
@@ -589,7 +606,7 @@ def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)  # what the resolve session actually runs from
 
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert Path(ctx["spec_file"]).is_absolute()
     # the worktree's copy, not the main checkout's twin — compared as posix, which is
@@ -611,24 +628,25 @@ def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=None, worktree_path=str(wt))
 
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_file"] is None  # task present, spec-less escalation
 
     assert "no-such-story" not in state.tasks
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "no-such-story", isolation="worktree").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "no-such-story", isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] is None  # no task at all
+    # ... and the escalation gather degrades on the same absence rather than
+    # dereferencing the missing task (`_gather_escalations` returns [] up front).
+    assert ctx["escalations"] == []
 
 
 def test_build_context_no_session_files(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, with_session=False)
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["escalations"] == []
     assert ctx["paused_reason"].startswith("CRITICAL")
@@ -643,25 +661,25 @@ def test_build_context_restore_supported_signal(tmp_path):
     run_dir, state, task = _escalated_run(tmp_path, spec_file="/abs/spec.md", with_session=False)
     key = "6-4-cli-list-command"
 
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is True
 
-    path = resolve.build_context(state, run_dir, key, isolation="worktree")
+    path = _context(state, run_dir, key, isolation="worktree")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = str(tmp_path / "wt")  # recorded worktree execution
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = ""
     task.spec_file = None  # spec-less escalation: a restored patch has no review to resume
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.spec_file = "/abs/spec.md"
     state.source = "stories"
     task.sentinel_kind = "missing-prd"  # pre-planning wedge: nothing attempted to restore
-    path = resolve.build_context(state, run_dir, key, isolation="")
+    path = _context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
 
@@ -672,7 +690,7 @@ def test_build_context_sanitizes_dirty_story_key(tmp_path):
     dirty = "6-4:cli?list"
     seg = safe_segment(dirty)
     assert seg != dirty
-    path = resolve.build_context(state, run_dir, dirty, isolation="")
+    path = _context(state, run_dir, dirty, isolation="")
     assert path.parent.name == seg
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == dirty
@@ -686,7 +704,7 @@ def test_rearm_flips_phase_and_spec_status(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    key = runs.rearm_escalation(run_dir, isolated_redrive=False)
+    key = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert key == "6-4-cli-list-command"
     state = load_state(run_dir)
     task = state.tasks[key]
@@ -710,7 +728,7 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
         encoding="utf-8",
     )
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     text = spec.read_text(encoding="utf-8")
     assert "Auto Run Result" not in text and "names not unique" not in text
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
@@ -753,7 +771,7 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
         tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["story_key"] == "6-4-cli-list-command"
@@ -767,6 +785,55 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
     assert next_step
 
 
+def test_rearm_completes_on_an_unreachable_spec_it_could_not_capture(tmp_path, monkeypatch):
+    """The preimage refusal is gated on the SAME pair as the flip's refusal, so a spec the
+    re-drive does not read keeps warn-and-continue.
+
+    This is the isolated shape the row above builds: `task_spec_path` anchors the writes on
+    the mount, and a re-armed task's mount is discarded before the re-drive reads anything,
+    so the readable file is the copy that is destroyed. `rearm-spec-write-unreachable` has
+    already recorded that fact by the time the preimage is captured.
+
+    Add one transient `EIO` on the first `read_bytes` of that spec and, gated on
+    `is_file()` ALONE, the re-arm aborted — demanding that the operator repair a file the
+    re-drive never opens, over a remedy that cannot change what it reads, at the cost of
+    the interactive resolve session. The unreadable preimage is an OBSERVATION on this
+    shape, and observations degrade: `spec_before` stays `None` and the re-arm completes.
+
+    Its sibling `tests/test_runs.py::test_rearm_refuses_a_spec_whose_bytes_it_could_not_capture`
+    holds the other half — on a REACHABLE spec the same fault still refuses, because there
+    the write it is about to publish is the one the re-drive will read.
+
+    Ablation: drop the `write_reaches_the_redrive` conjunct and this reddens with the
+    `RearmError` the reachable row expects, while that row stays green.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
+    )
+    real_read_bytes = Path.read_bytes
+    failed_once = []
+
+    def flaky(self):
+        if self == spec and not failed_once:
+            failed_once.append(1)
+            raise OSError(5, "Input/output error")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+
+    assert failed_once  # the fault really did land on the capture
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
+    # ...and the record that DOES describe this shape is still the one written
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert rec["spec_file"] == str(spec)
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"] == []
+
+
 def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_path):
     """The control for the row above: the in-place case is where those writes DO land,
     so a record there would fire on every ordinary re-arm."""
@@ -775,7 +842,7 @@ def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_pat
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -843,9 +910,9 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
     if shape == "no-frontmatter":
         with pytest.raises(runs.RearmError, match="no frontmatter `status:`"):
-            runs.rearm_escalation(run_dir, isolated_redrive=False)
+            runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     else:
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
     if shape == "already-at-target":
@@ -876,7 +943,7 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
 def test_rearm_journals_event(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     journal = (run_dir / "journal.jsonl").read_text(encoding="utf-8")
     assert "story-escalation-resolved" in journal
 
@@ -895,7 +962,7 @@ def test_rearm_advances_baseline_to_resolved_head(project):
     # a file the resolve session (or the user) left untracked must enter the
     # snapshot, so the redrive reset treats it as pre-existing, not run-created
     (root / "leftover.txt").write_text("keep me\n", encoding="utf-8")
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(root, "rev-parse", "HEAD")
     assert task.baseline_commit != old_head
@@ -914,7 +981,7 @@ def test_rearm_baseline_all_or_nothing_on_partial_git_failure(monkeypatch, proje
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
     assert task.baseline_untracked is None
@@ -924,7 +991,7 @@ def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
     # best-effort contract: a project dir that is not a git repo (or a broken
     # one) must not make re-arm fail — the old baseline simply stands
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
 
@@ -944,7 +1011,7 @@ def test_rearm_journals_a_failed_baseline_advance(tmp_path):
     """
     run_dir, _, _ = _escalated_run(tmp_path)  # tmp_path is not a git repo
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"]
     assert entry["story_key"] == "6-4-cli-list-command"
@@ -972,7 +1039,7 @@ def test_rearm_does_not_swallow_a_non_git_fault_from_the_advance(monkeypatch, tm
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
     with pytest.raises(MemoryError):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 @pytest.mark.parametrize("restore", [None, "artifacts/attempt.patch"])
@@ -996,7 +1063,9 @@ def test_rearm_does_not_restamp_a_baseline_the_advance_did_not_move(monkeypatch,
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir, restore_patch=restore, isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir, restore_patch=restore, isolated_redrive=False, resolution_recorded=True
+    )
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == old_head  # NOT re-stamped with the stale sha
@@ -1021,7 +1090,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     before = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert before.generation == 0 and len(before.sessions) == 1
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.generation == 1
@@ -1029,7 +1098,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     assert len(task.sessions) == 1  # the audit trail survives the re-arm
 
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].generation == 2
 
 
@@ -1054,7 +1123,7 @@ def test_rearm_advances_the_baseline_in_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     (code / "leftover.txt").write_text("keep me\n")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(code, "rev-parse", "HEAD") != head
@@ -1112,7 +1181,9 @@ def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     new_head = git(code, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)  # from scratch: the latch is dropped
+    runs.rearm_escalation(
+        run_dir, isolated_redrive=False, resolution_recorded=True
+    )  # from scratch: the latch is dropped
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == new_head
@@ -1153,7 +1224,7 @@ def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
 
     assert load_state(run_dir).repo_root == ""
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
 
 
@@ -1200,7 +1271,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)  # what `bmad-loop resolve` actually runs from
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     fm = verify.read_frontmatter(wt / rel)
     assert fm["status"] == "ready-for-dev"  # the flip landed in the WORKTREE
@@ -1237,7 +1308,7 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=False
+        run_dir, isolated_redrive=False, resolution_recorded=True
     )  # must not raise: the flip's no-op is not a refusal
 
     kinds = _kinds(run_dir)
@@ -1277,7 +1348,7 @@ def test_rearm_records_an_unreachable_spec_even_when_the_advance_failed(tmp_path
         _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
@@ -1305,7 +1376,7 @@ def test_rearm_restamps_normally_when_the_spec_resolves(tmp_path):
     spec.write_text("---\nstatus: 'escalated'\nbaseline_revision: 'old'\n---\n\nbody\n")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"] == []
@@ -1334,7 +1405,7 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    returned = runs.rearm_escalation(run_dir, isolated_redrive=False)
+    returned = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert returned == key
 
     # sentinel deleted from disk, a copy preserved under the run dir
@@ -1374,7 +1445,7 @@ def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
     # detected as a sentinel) → status-flip, not delete.
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # not deleted
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1394,7 +1465,7 @@ def test_rearm_sentinel_named_spec_never_detected_is_not_deleted(tmp_path):
     # stories mode, but sentinel_kind unset — the run never classified it as a sentinel
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1411,7 +1482,7 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nreal work\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))  # sprint-status source
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"  # flipped like any spec
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1438,7 +1509,10 @@ def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
 
     with pytest.raises(runs.RearmError, match="sentinel"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=False,
+            resolution_recorded=True,
         )
 
     assert sentinel.is_file()  # nothing deleted, copy NOT preserved — no clear happened
@@ -1460,7 +1534,10 @@ def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
 
     with pytest.raises(runs.RearmError, match="no recorded spec file"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=False,
+            resolution_recorded=True,
         )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
@@ -1469,7 +1546,7 @@ def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
     assert not (run_dir / "journal.jsonl").exists()  # nothing journaled
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=False
+        run_dir, isolated_redrive=False, resolution_recorded=True
     )  # a from-scratch re-arm remains available
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
@@ -1487,14 +1564,20 @@ def test_rearm_rejects_restore_patch_for_a_worktree_executed_task(tmp_path):
 
     with pytest.raises(runs.RearmError, match="worktree-isolation"):
         runs.rearm_escalation(
-            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=True
+            run_dir,
+            restore_patch="artifacts/attempt.patch",
+            isolated_redrive=True,
+            resolution_recorded=True,
         )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.phase == Phase.ESCALATED  # nothing mutated; still armed for a re-resolve
     assert task.restore_patch is None
     # a from-scratch re-arm of the same task is unaffected — the guard is latch-only
-    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == "6-4-cli-list-command"
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
+        == "6-4-cli-list-command"
+    )
 
 
 def test_validate_restore_latch_passes_a_clean_in_place_escalation(tmp_path):
@@ -1521,7 +1604,12 @@ def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir,
+        restore_patch="artifacts/attempt.patch",
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
     task = load_state(run_dir).tasks[key]
     assert task.phase == Phase.PENDING
     assert task.restore_patch == "artifacts/attempt.patch"
@@ -1561,7 +1649,12 @@ def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
     new_head = git(tmp_path, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
+    runs.rearm_escalation(
+        run_dir,
+        restore_patch="artifacts/attempt.patch",
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head  # step-04 diffs from the ADVANCED baseline
@@ -1611,7 +1704,7 @@ def test_rearm_restamps_spec_baseline_on_the_from_scratch_leg_too(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)  # no restore
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)  # no restore
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head
@@ -1639,10 +1732,15 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     to `ready-for-dev` and stripped of the `## Auto Run Result` section the next resolve
     session reads as its context — the one edit nothing else records.
 
-    Ablation: drop the `_restore_rearmed_spec(...)` call from the re-stamp's except arm
-    and this reddens on the byte comparison (the status flip and the strip both stand),
-    while the `RearmError` and the ESCALATED phase keep passing — which is exactly why
-    those two alone do not grade this.
+    The undo is no longer written into the re-stamp's own `except` arm: the whole window
+    from the first spec write to `save_state` is one transaction, and its guard rolls the
+    spec back for every fault that escapes — this one included. What the arm still owns is
+    the `RearmError` and its remedy.
+
+    Ablation: delete the `except BaseException` arm from `rearm_escalation` and this
+    reddens on the byte comparison (the status flip and the strip both stand), while the
+    `RearmError` and the ESCALATED phase keep passing — which is exactly why those two
+    alone do not grade this.
     """
     old_head = _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
@@ -1662,7 +1760,7 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
 
     with pytest.raises(runs.RearmError, match="baseline_revision"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # flip AND strip both undone
     # nothing was persisted either, so the escalation is still armed for a corrected spec
@@ -1690,9 +1788,11 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     reddens the flip first and leaves nothing to restore. The injection stands in for the
     faults above, which are real and are exactly what the atomic writers exist for.
 
-    Ablation: drop the `_restore_rearmed_spec(...)` call from that arm and this reddens on
-    the byte comparison alone — the `RearmError` and the ESCALATED phase both still pass,
-    since the flip landing is precisely what neither observes. Both of those assertions
+    Ablation: delete the `except BaseException` arm from `rearm_escalation` — the
+    transaction guard that now performs this undo, in place of the per-arm call this test
+    used to grade — and it reddens on the byte comparison alone. The `RearmError` and the
+    ESCALATED phase both still pass, since the flip landing is precisely what neither
+    observes. Both of those assertions
     are load-bearing for that claim, so both stay in THIS test: an isolated sibling row
     was once inserted between them and silently adopted the phase check, leaving this
     docstring citing an assertion the test no longer made.
@@ -1713,7 +1813,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
 
     with pytest.raises(runs.RearmError, match="No space left on device"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # the published flip is rolled back
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
@@ -1727,20 +1827,21 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     An absolute `spec_file` beside a set `worktree_path` means the spec is lexically
     OUTSIDE the mount (`model._serialized_worktree_path` keeps a path verbatim exactly
     when `relative_to(worktree_path)` raises) — the shape a shared artifact directory
-    produces. `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY, so
-    a `confine_root` naming the worktree does not merely degrade the write the way the
-    three `_atomic_write_spec` writers do: it raises `UnconfinedWriteError`, which the
-    arm re-raises as "cannot restore ...". The operator was then left with the exact
-    state the undo exists to prevent — a spec carrying this re-arm's status flip and
-    stripped of its `## Auto Run Result`, on a story the run still calls ESCALATED —
-    plus a second error masking the first.
+    produces. `task_spec_root` answers the PROJECT there rather than the mount, which CAN
+    confine this spec, so the undo takes its confined arm and lands, and the original
+    fault is the one that surfaces — instead of an `UnconfinedWriteError` re-raised as
+    "cannot restore ..." over a spec left carrying this re-arm's status flip and stripped
+    of its `## Auto Run Result`, on a story the run still calls ESCALATED.
 
-    `task_spec_root` now answers the project for that shape, which CAN confine the
-    spec, so the restore lands and the original fault is the one that surfaces.
-
-    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
-    and this reddens twice — the `match=` fails on "cannot restore ... UnconfinedWrite
-    Error", and the byte comparison fails behind it.
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)` AND
+    make `_restore_rearmed_spec` take `atomic_write_bytes_confined` unconditionally; this
+    then reddens twice, on the `match=` and on the byte comparison behind it. Both halves
+    are needed because either one alone now rescues the write, and that redundancy is
+    deliberate — the root moved for this shape (graded directly by
+    `test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_spec`)
+    and the undo later gained the same lexical arm its three sibling writers have, which
+    is what carries a spec outside BOTH roots
+    (`test_rearm_restores_a_spec_outside_every_root_it_could_be_confined_to`).
     """
     _resolve_repo(tmp_path)
     wt = tmp_path / ".bmad-loop" / "runs" / "wt-mount"  # the mount, which holds no spec
@@ -1759,10 +1860,211 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
 
     with pytest.raises(runs.RearmError, match="No space left on device"):
-        runs.rearm_escalation(run_dir, isolated_redrive=True)
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert spec.read_bytes() == before  # the undo reached a spec outside the mount
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
+def test_rearm_restores_a_spec_outside_every_root_it_could_be_confined_to(tmp_path, monkeypatch):
+    """The undo has to reach the spec wherever its three sibling writers reached it.
+
+    An artifacts folder configured OUTSIDE the checkout is supported configuration —
+    `bmadconfig` resolves one, `verify.spec_within_roots` trusts it, and
+    `_spec_is_shared_with_the_redrive` treats a spec that lands there as first-class and
+    reachable by the re-drive. On that shape neither candidate root can confine the path:
+    the mount cannot, and neither can the project, so `task_spec_root`'s fallback names a
+    root the spec is lexically outside of.
+
+    `frontmatter.set_frontmatter_status`, `verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` all select their writer on that same lexical test and
+    simply take the plain no-follow arm, so the flip, the strip and the re-stamp LAND.
+    `_restore_rearmed_spec` called `atomic_write_bytes_confined` unconditionally, so the
+    undo alone raised `UnconfinedWriteError` — the transaction's write set going
+    unhonoured on exactly the specs it was still able to break, and the operator left with
+    a flipped, stripped spec on a story the run still called ESCALATED plus a second error
+    masking the first. A writer that refuses where its siblings write is not extra safety.
+
+    The project deliberately sits UNDER `tmp_path` here so the spec can be a sibling of
+    it: that is the only way to build a path outside both roots without leaving the
+    fixture's tree.
+
+    The fault is raised from `save_state` rather than from a git probe because it must be
+    reached unconditionally: `_stale_restore_residue` returns before touching git when the
+    task carries no restore latch, so a `commits_above` injection would never fire here.
+
+    Ablation: make `_restore_rearmed_spec` call `atomic_write_bytes_confined`
+    unconditionally again and this reddens on the `match=` — the raise becomes
+    "cannot restore ... UnconfinedWriteError" instead of the fault the re-arm aborted on
+    — with the byte comparison reddening behind it.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    # the flip and the strip both LAND on this path (their writers degrade to the plain
+    # arm), so there is a real published write for the undo to put back
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert spec.read_bytes() == before
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
+
+
+def test_rearm_reports_a_failed_rollback_through_the_plain_arm(tmp_path, monkeypatch):
+    """The undo's `failed` outcome has to be reachable through BOTH of its writers.
+
+    `tests/test_runs.py::test_rearm_reports_a_rollback_that_itself_failed_and_keeps_the_original_fault`
+    injects at `runs.atomic_write_bytes_confined`, and its fixture always puts the spec
+    under the project, so it only ever grades the CONFINED arm. The plain
+    `atomic_write_bytes` arm added for the out-of-every-root shape had no `failed`
+    coverage at all — the sibling row above grades that arm's `"restored"` outcome only,
+    so a plain arm that raised the wrong type, or swallowed instead of raising, was
+    invisible.
+
+    Same three claims as the confined row, on the other writer: the `RearmError` names the
+    spec, the record says `failed`, and the ORIGINAL fault rides in the exception chain
+    because the restore raises WHILE that fault is being handled.
+
+    Ablation: make `_restore_rearmed_spec` take `atomic_write_bytes_confined`
+    unconditionally and this reddens on the INJECTED-fault assertion. That ablation is
+    the one that matters and the one the three claims above cannot catch on their own:
+    the confined writer refuses this out-of-root path with `UnconfinedWriteError`, which
+    IS an `OSError`, so it produces the same `RearmError`, the same `failed` record and
+    the same chained `MemoryError` — every claim stays true while the plain arm this row
+    exists for is never reached. Naming the injected error is what tells the two apart.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        raise MemoryError("nothing to do with the spec")
+
+    def no_space(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    # ONLY the undo's out-of-root writer: the flip and the strip reach this path through
+    # `verify` and `devcontract`, so this cannot pre-empt the writes it is meant to fail
+    # to undo
+    monkeypatch.setattr(runs, "atomic_write_bytes", no_space)
+
+    with pytest.raises(runs.RearmError, match="cannot restore") as excinfo:
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert str(spec) in str(excinfo.value)
+    # the fault the operator is shown is the one the PLAIN arm raised. Without this the
+    # row cannot tell its own writer apart from the confined one refusing the same path
+    assert "No space left on device" in str(excinfo.value)
+    chain = []
+    exc: BaseException | None = excinfo.value
+    while exc is not None:
+        chain.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    assert any(isinstance(e, MemoryError) for e in chain)  # the original fault survives
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "failed"
+    assert "MemoryError" in aborted["error"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_rearm_rollback_replaces_a_link_planted_at_the_spec_rather_than_writing_through_it(
+    tmp_path, monkeypatch
+):
+    """The out-of-root undo replaces the NAME, so a link planted at it cannot aim the
+    captured bytes into whatever it points at — on the shape this row drives, where that
+    file's bytes DIFFER from the preimage.
+
+    That scope is the short-circuit's, not a hedge. `_restore_rearmed_spec` answers
+    `"unchanged"` and writes NOTHING when `spec_path.read_bytes()` already equals the
+    preimage, and that read follows the link — so a link aimed at a byte-equal file is
+    never replaced and there is nothing left for `follow_symlinks` to decide. Reaching
+    that shape needs a second actor mutating the spec's name mid-window, which this
+    story's triage log has repeatedly found unreachable while the run is paused and the
+    resolve session that wrote the spec has terminated. It is therefore left ungraded
+    rather than pinned by a row built on an actor that does not exist.
+
+    `_restore_rearmed_spec`'s plain arm passes `follow_symlinks=False`, matching the
+    three writers it undoes (`frontmatter.set_frontmatter_status` states the rule).
+    That argument was the one thing on this path with no caller-level coverage: the
+    sibling rows above drive the arm over a plain regular file, where following or not
+    following resolves to the same inode, so dropping the argument left them green while
+    the undo silently gained the default's `path.resolve()` — and with it a window in
+    which the last thing that touches the spec's name decides which file this re-arm's
+    preimage lands in.
+
+    The window is the widened transaction's own: the flip and the strip publish to the
+    real file, then the guard's whole residue/advance/`save_state` tail runs before the
+    undo looks at the name again. This row plants the link at the last moment inside that
+    tail — from the injected `save_state`, so the redirection is in place before the
+    rollback and after every write it exists to put back.
+
+    The `restored` record is the third claim rather than a redundant one: the undo has to
+    read the link (seeing the OTHER file's bytes, which do not match the preimage), take
+    its writer, and land — the same three steps a silent write-through also takes, which
+    is why the byte assertions and not the record are what tell the two apart.
+
+    Ablation: drop `follow_symlinks=False` from `_restore_rearmed_spec`'s plain
+    `atomic_write_bytes` call and this reddens on the FIRST assertion — the preimage
+    lands in the unrelated file — with `not spec.is_symlink()` reddening behind it. The
+    final byte comparison stays green through that ablation (it reads THROUGH the link),
+    so it cannot carry this row on its own.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _resolve_repo(project)
+    spec = tmp_path / "artifacts" / "spec.md"  # outside the project, and outside any mount
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    bystander = tmp_path / "artifacts" / "someone-elses-notes.md"
+    bystander.write_bytes(b"not this re-arm's file\n")
+    bystander_before = bystander.read_bytes()
+    run_dir, _, _ = _escalated_run(project, spec_file=str(spec))
+
+    def boom(run_dir_, state_):
+        # the flip and the strip have already LANDED on the real file; the name is
+        # redirected here, inside the window, before the undo looks at it again
+        spec.unlink()
+        spec.symlink_to(bystander)
+        raise MemoryError("nothing to do with the spec")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+
+    with pytest.raises(MemoryError, match="nothing to do with the spec"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert bystander.read_bytes() == bystander_before  # the preimage did NOT go through
+    assert not spec.is_symlink()  # the name was replaced, whatever it pointed at
+    assert spec.read_bytes() == before
+    (aborted,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
 
 
 def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
@@ -1778,7 +2080,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, _spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head
@@ -1787,7 +2089,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
 
     # a second re-arm has nothing left to overwrite: no duplicate record
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert len([e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]) == 1
 
 
@@ -1813,7 +2115,7 @@ def test_rearm_does_not_report_a_divergence_the_run_never_had(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head, recorded=old_head)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     # the re-stamp itself ran: this row is about what was REPORTED, not what was skipped
     assert verify.read_frontmatter(spec)["baseline_revision"] == new_head
@@ -1849,7 +2151,7 @@ def test_rearm_reports_a_claim_the_advanced_head_would_have_masked(tmp_path):
         encoding="utf-8",
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == new_head  # the claim, carried verbatim
@@ -1866,7 +2168,7 @@ def test_rearm_prefers_the_fresh_revision_when_the_spec_carries_both_keys(tmp_pa
         tmp_path, old_head, extra=f"baseline_commit: {'a' * 40}\n"
     )
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head  # NOT the stale baseline_commit
@@ -1902,7 +2204,7 @@ def test_build_context_tolerates_non_utf8_present_spec(tmp_path):
     (stories_dir / f"{key}-slug.md").write_bytes(_BAD_UTF8)  # a real spec, undecodable
     run_dir, state, _ = _escalated_run(tmp_path, source="stories")
 
-    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
+    path = _context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["spec_folder"] == ""  # best-effort context still produced
     assert "sentinel" not in ctx["stories"]  # the undecodable spec yields no sentinel
@@ -1917,7 +2219,7 @@ def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
     (stories_dir / f"{key}-unresolved.md").write_bytes(_BAD_UTF8)  # undecodable sentinel
     run_dir, state, _ = _escalated_run(tmp_path, source="stories", sentinel_kind="unresolved")
 
-    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
+    path = _context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["sentinel"]["kind"] == "unresolved"
     assert ctx["stories"]["sentinel"]["blocking_condition"] == ""  # unreadable → empty
@@ -1938,7 +2240,7 @@ def test_rearm_non_utf8_present_spec_fails_clean_and_stays_armed(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
     with pytest.raises(runs.RearmError) as exc:
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
     assert "UTF-8" in str(exc.value) and "resolve" in str(exc.value)
     assert spec.read_bytes() == _BAD_UTF8  # spec untouched
     task = load_state(run_dir).tasks[key]
@@ -1958,7 +2260,9 @@ def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    assert runs.rearm_escalation(run_dir, isolated_redrive=False) == key  # must not raise
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True) == key
+    )  # must not raise
     assert not sentinel.exists()  # cleared by deletion
     assert (run_dir / "sentinels" / f"{key}-unresolved.md").is_file()  # copy preserved
     assert load_state(run_dir).tasks[key].spec_file is None  # cleared → PENDING re-dispatch
@@ -1991,7 +2295,7 @@ def test_rearm_rejects_non_escalation_stage(tmp_path):
         ),
     )
     with pytest.raises(runs.RearmError, match="not paused at an escalation"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 def test_rearm_rejects_unescalated_story(tmp_path):
@@ -1999,7 +2303,7 @@ def test_rearm_rejects_unescalated_story(tmp_path):
     task.phase = Phase.DONE  # terminal but not escalated
     save_state(run_dir, state)
     with pytest.raises(runs.RearmError, match="not escalated"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
 # ------------------------------------------------- _gather_escalations
@@ -2007,12 +2311,12 @@ def test_rearm_rejects_unescalated_story(tmp_path):
 
 def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
     """The outermost surface DW-7 names. `_gather_escalations` walks the append-only
-    `task.sessions` — which a re-arm deliberately does NOT clear — and reads
-    `tasks/<record.task_id>/escalation.json` once per record. While the ESCALATED
-    restart re-minted an id byte-equal to the abandoned attempt's, BOTH records
-    addressed the one file, so the abandoned cycle's escalation was returned a second
-    time as the fresh session's. Bumping `generation` gives the fresh record its own
-    id, and the file is read exactly once."""
+    `task.sessions` — which a re-arm deliberately does NOT clear — and now opens each
+    distinct `tasks/<record.task_id>` directory once. Before that reader guard, an
+    ESCALATED restart that re-minted the abandoned attempt's id made BOTH records
+    address one file and returned its escalation twice. Bumping `generation` gives the
+    fresh record its own artifact namespace; the reader also degrades safely on older
+    persisted state where the collision already exists."""
     run_dir, state, task = _escalated_run(tmp_path)
     key = "6-4-cli-list-command"
     abandoned = _session_task_id(key, "triage", 1, 0)
@@ -2029,14 +2333,1029 @@ def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
         encoding="utf-8",
     )
 
-    found = resolve._gather_escalations(run_dir, state, key)
+    found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["abandoned cycle"]  # once, not twice
 
-    # the pre-fix shape for contrast: one shared id makes the SAME file answer both
-    # records, and the abandoned escalation is attributed to the fresh session too
+    # DW-71: the id bump only protects records minted AFTER it. State persisted
+    # before the bump still carries two records under ONE id, both addressing that
+    # directory's single mutable escalation.json — the reader itself has to return
+    # the escalation once rather than attribute it to the fresh session too.
     task.sessions[1] = SessionRecord(task_id=abandoned, role="dev", status="completed")
-    collided = resolve._gather_escalations(run_dir, state, key)
-    assert [e["detail"] for e in collided] == ["abandoned cycle", "abandoned cycle"]
+    collided, _ = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in collided] == ["abandoned cycle"]
+
+
+def test_gather_escalations_opens_a_repeated_task_id_once(tmp_path, monkeypatch):
+    """DW-71's own leg, watched at the I/O rather than the return value.
+
+    Content de-duplication would hide a re-read behind the identical entry it
+    yields, so "returned once" alone cannot tell the `seen_ids` guard from the
+    content map. Two records under one `task_id` must OPEN that directory's
+    artifacts exactly once — which is also what stops a directory rewritten
+    mid-pass from answering two records differently."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    shared = _session_task_id(key, "triage", 1, 0)
+    task.sessions.clear()
+    for _ in range(2):
+        task.sessions.append(SessionRecord(task_id=shared, role="dev", status="completed"))
+    esc_dir = run_dir / "tasks" / shared
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    result_file = esc_dir / "result.json"
+    result_file.write_text(json.dumps({"escalations": []}), encoding="utf-8")
+    esc_file = esc_dir / "escalation.json"
+    esc_file.write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "shared id"}]}),
+        encoding="utf-8",
+    )
+
+    reads: list[str] = []
+    real_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        reads.append(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    # `monkeypatch.context()`, NOT a bare `setattr` + `undo()`: the autouse
+    # `_isolate_state_root` / `_isolate_mux_registry` fixtures record onto the SAME
+    # function-scoped monkeypatch instance this test receives (conftest says so in
+    # `_isolate_state_root`'s own docstring), so an explicit `undo()` here would roll
+    # back the suite's `BMAD_LOOP_STATE_DIR` isolation too, mid-test.
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "read_text", counting_read_text)
+        found, _ = resolve._gather_escalations(run_dir, state, key)
+
+    assert reads.count(str(result_file)) == 1  # each artifact once, not once per record
+    assert reads.count(str(esc_file)) == 1
+    assert [e["detail"] for e in found] == ["shared id"]
+
+
+def _two_session_dirs(tmp_path):
+    """A task carrying TWO records with DISTINCT `task_id`s, plus both task
+    directories. `task.sessions` is append-only and chronological, so `sessions[1]`
+    is the NEWER attempt and `reversed(...)` must reach its directory first.
+
+    This shape exists because no single-directory row can see either of this
+    reader's cross-session contracts: rescope the content map per directory, or
+    drop `reversed`, and every one-directory row below stays green."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    older = _session_task_id(key, "triage", 1, 0)
+    newer = _session_task_id(key, "triage", 1, 1)  # post-bump: the -g1 namespace
+    assert older != newer
+    task.sessions.clear()
+    dirs: list[Path] = []
+    for task_id in (older, newer):
+        task.sessions.append(SessionRecord(task_id=task_id, role="dev", status="completed"))
+        d = run_dir / "tasks" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        dirs.append(d)
+    return run_dir, state, key, dirs[0], dirs[1]
+
+
+def test_gather_escalations_dedupes_one_entry_across_two_sessions(tmp_path):
+    """De-duplication is GLOBAL across the pass, not scoped to one directory.
+
+    An escalation a retry does not resolve is re-raised by the next attempt, so two
+    DIFFERENT `tasks/<id>/` directories carry the byte-identical entry and the
+    operator learns nothing from the repeat. This is the only row that can tell a
+    global content map from a per-directory one."""
+    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
+    entry = {"type": "spec-gap", "severity": "CRITICAL", "detail": "unresolved across attempts"}
+    for d in (older_dir, newer_dir):
+        (d / "escalation.json").write_text(json.dumps({"escalations": [entry]}), encoding="utf-8")
+
+    found, _ = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["unresolved across attempts"]
+
+
+def test_gather_escalations_orders_distinct_sessions_newest_first(tmp_path):
+    """The documented "newest first" order is a CROSS-SESSION property: nothing
+    inside one directory can pin it, because `reversed(task.sessions)` is what
+    reaches the newer record's directory before the older one's. Drop `reversed`
+    and only this row notices."""
+    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
+    for d, detail in ((older_dir, "older"), (newer_dir, "newer")):
+        (d / "escalation.json").write_text(
+            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
+            encoding="utf-8",
+        )
+
+    found, _ = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["newer", "older"]
+
+
+def _task_dir(run_dir, task):
+    """Where `_gather_escalations` looks for result.json / escalation.json, DERIVED
+    from the session record the fixture actually appended — never a literal.
+
+    A hardcoded directory name is a false green waiting on a fixture change: it can
+    drift off the record the reader walks, and a row asserting an EMPTY result would
+    then pass because nothing was read rather than because the filter worked."""
+    d = run_dir / "tasks" / task.sessions[-1].task_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_gather_escalations_returns_a_mirrored_entry_once(tmp_path):
+    """DW-68/72. The sweep skill's contract (bmad-loop-sweep/automation-mode.md)
+    tells a producer to write escalation.json and then mirror the same entries into
+    result.json `escalations` — so every COMPLIANT escalation reached the operator
+    twice. The mirroring stays; the reader absorbs it. Asserted through
+    `build_context` because `context.json` is the surface the human reads."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    entry = {"type": "spec-gap", "severity": "CRITICAL", "detail": "mirrored once"}
+    # Same JSON object, deliberately authored in a different member order. Raw
+    # `json.dumps(esc)` keys would treat these as distinct; `sort_keys=True` must
+    # make the de-duplication key semantic rather than source-order-sensitive.
+    reordered = {"detail": "mirrored once", "severity": "CRITICAL", "type": "spec-gap"}
+    task_dir = _task_dir(run_dir, task)
+    for fname, value in (("result.json", entry), ("escalation.json", reordered)):
+        (task_dir / fname).write_text(json.dumps({"escalations": [value]}), encoding="utf-8")
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert ctx["escalations"] == [entry]
+
+
+def test_gather_escalations_keeps_distinct_entries_from_both_files(tmp_path):
+    """De-duplication removes only the exact repeat. A directory whose result.json
+    carries A and whose escalation.json carries A + B still yields both, in
+    newest-first order (result.json before escalation.json) — the guard must not
+    collapse a partially-mirrored pair into one."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    a = {"type": "spec-gap", "severity": "CRITICAL", "detail": "A"}
+    b = {"type": "spec-gap", "severity": "CRITICAL", "detail": "B"}
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [a]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(json.dumps({"escalations": [a, b]}), encoding="utf-8")
+
+    found, _ = resolve._gather_escalations(run_dir, state, "6-4-cli-list-command")
+    assert [e["detail"] for e in found] == ["A", "B"]
+
+
+def test_gather_escalations_keeps_full_objects_that_share_a_detail(tmp_path):
+    """Exact content, not one convenient field, defines a duplicate. Two
+    escalations may explain the same symptom while identifying different gaps;
+    both complete dictionaries must reach the resolver."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {
+        "type": "spec-gap",
+        "severity": "CRITICAL",
+        "detail": "same operator-facing explanation",
+        "location": "SPEC.md",
+    }
+    second = {
+        "type": "environment-gap",
+        "severity": "CRITICAL",
+        "detail": "same operator-facing explanation",
+        "location": "policy.toml",
+    }
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [first, second]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
+
+
+def test_gather_escalations_preserves_result_before_escalation_file_order(tmp_path):
+    """Within one session directory, result.json precedes escalation.json."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {"severity": "CRITICAL", "detail": "from result"}
+    second = {"severity": "CRITICAL", "detail": "from escalation"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [first]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [second]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
+
+
+def test_gather_escalations_keeps_a_duplicates_first_position(tmp_path):
+    """A later copy must not move an entry behind intervening distinct content."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {"severity": "CRITICAL", "detail": "first"}
+    second = {"severity": "CRITICAL", "detail": "second"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [first]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [second, first]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == (
+        [first, second],
+        0,
+    )
+
+
+def test_gather_escalations_dedupes_repeats_inside_one_list(tmp_path):
+    """The content map spans the whole pass, including one producer's list."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    entry = {"severity": "CRITICAL", "detail": "listed twice"}
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [entry, entry]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == ([entry], 0)
+
+
+def test_gather_escalations_keeps_mixed_case_critical_and_drops_non_dicts(tmp_path):
+    """Delegating the filter preserves its case-insensitive and shape semantics."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    critical = {"severity": "critical", "detail": "case folded"}
+    preference = {"severity": "PREFERENCE", "detail": "not critical"}
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [None, "junk", preference, critical]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == ([critical], 0)
+
+
+def test_gather_escalations_skips_a_non_utf8_artifact(tmp_path):
+    """DW-70/73. `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so the
+    old `except (OSError, json.JSONDecodeError)` let a non-UTF-8 artifact crash
+    `build_context` — the interactive resolve path, an OBSERVATION surface that must
+    degrade. The bad file costs its own contents and nothing more."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_bytes(_BAD_UTF8)
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "still readable"}]}),
+        encoding="utf-8",
+    )
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert [e["detail"] for e in ctx["escalations"]] == ["still readable"]
+
+
+def test_gather_escalations_skips_a_plain_json_value_error(tmp_path, monkeypatch):
+    """`json.loads` raises plain ValueError, not JSONDecodeError, when an integer
+    exceeds Python's configured digit limit. That malformed file costs only its
+    contents; its valid sibling still reaches context.json."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    marker = '"detail":' + ("9" * 5000)
+    (task_dir / "result.json").write_text(
+        '{"escalations":[{"severity":"CRITICAL",' + marker + "}]}", encoding="utf-8"
+    )
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    real_loads = json.loads
+
+    def loads_with_digit_limit(data, *args, **kwargs):
+        if marker in data:
+            raise ValueError("integer exceeds configured digit limit")
+        return real_loads(data, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve.json, "loads", loads_with_digit_limit)
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_skips_a_json_recursion_error(tmp_path):
+    """A deeply nested artifact can exceed the decoder's recursion guard.
+
+    Confirm the real decoder failure first so this stays a regression test for
+    ``RecursionError`` rather than another synthetic exception row. The bad file
+    still costs only its own contents; its valid sibling reaches context.json.
+    """
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    nested = json_recursion_payload()
+    malformed = '{"escalations":[{"severity":"CRITICAL","detail":' + nested + "}]}"
+    with pytest.raises(RecursionError):
+        json.loads(malformed)
+    (task_dir / "result.json").write_text(malformed, encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_skips_a_canonicalization_recursion_error(tmp_path, monkeypatch):
+    """Canonical-key construction is part of the guarded artifact read too."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    bad = {"severity": "CRITICAL", "detail": "canonicalization recurses"}
+    sibling = {"severity": "CRITICAL", "detail": "sibling survives"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [bad]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [sibling]}), encoding="utf-8"
+    )
+    real_dumps = json.dumps
+
+    def dumps_with_recursion_error(value, *args, **kwargs):
+        if value == bad:
+            raise RecursionError("canonicalization depth exceeded")
+        return real_dumps(value, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve.json, "dumps", dumps_with_recursion_error)
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["escalations"] == [sibling]
+
+
+@pytest.mark.parametrize("bad", [None, 1, "x", {}])
+def test_gather_escalations_skips_a_non_list_escalations_field(tmp_path, monkeypatch, bad):
+    """DW-70/73's other half. `escalation.critical_escalations` iterates
+    `escalations` with no list guard of its own, so `{"escalations": null}` raised
+    `TypeError` straight out of `build_context`. The guard sits in this caller; the
+    shared predicate stays the single definition of CRITICAL.
+
+    Every parameter must fail when the list guard is ablated. ``None`` and ``1``
+    raise without it; the call trace below distinguishes the iterable ``"x"`` and
+    ``{}`` shapes, which the shared filter would otherwise accept as empty."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_text(json.dumps({"escalations": bad}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    filtered: list[dict] = []
+    real_critical_escalations = resolve.critical_escalations
+
+    def recording_critical_escalations(doc):
+        filtered.append(doc)
+        return real_critical_escalations(doc)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve, "critical_escalations", recording_critical_escalations)
+        path = _context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert filtered == [
+        {
+            "escalations": [
+                {"severity": "CRITICAL", "detail": "sibling survives"},
+            ]
+        }
+    ]
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_preference_only_yields_nothing(tmp_path):
+    """The CRITICAL-only filter is unchanged by the de-duplication rewrite: a
+    directory carrying only non-CRITICAL entries contributes nothing, and mirroring
+    a PREFERENCE across both files still contributes nothing.
+
+    The second half is the POSITIVE CONTROL, and it is what makes the first half
+    mean anything. `== []` passes just as well when the directory was never read, so
+    the same files are re-written with a CRITICAL alongside the PREFERENCE and that
+    entry must come back. Absence then evidences the severity filter rather than an
+    unread path."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    pref = {"type": "nit", "severity": "PREFERENCE", "detail": "ignore me"}
+    task_dir = _task_dir(run_dir, task)
+    for fname in ("result.json", "escalation.json"):
+        (task_dir / fname).write_text(json.dumps({"escalations": [pref]}), encoding="utf-8")
+
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+    crit = {"type": "spec-gap", "severity": "CRITICAL", "detail": "kept"}
+    for fname in ("result.json", "escalation.json"):
+        (task_dir / fname).write_text(json.dumps({"escalations": [pref, crit]}), encoding="utf-8")
+    found, _ = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["kept"]  # this directory IS read
+
+
+# -------------------------------------- DW-11: the escalation watermark
+
+
+def _watermarked_trail(tmp_path, per_session):
+    """A task whose append-only `sessions` list carries ONE record per element of
+    `per_session`, each with its own `tasks/<id>/escalation.json` holding that
+    record's CRITICAL details. Returns `(run_dir, state, task, key)` with the state
+    already saved, so a row can re-arm it without re-saving by hand.
+
+    The ids are minted through `engine._session_task_id`, varying the SEQ inside
+    generation 0 — the trail one pre-re-arm cycle leaves behind. Distinctness is
+    asserted rather than assumed: a shared id collapses into the reader's `seen_ids`
+    guard, leaving one directory and one side to route to, and every row below would
+    then pass with the filter ablated. Varying the seq (not the generation) also
+    keeps the whole namespace clear of the ids a LATER re-arm mints, so a re-drive
+    record cannot silently overwrite a trail artifact.
+    """
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    task.sessions.clear()
+    for seq, details in enumerate(per_session, start=1):
+        task_id = _session_task_id(key, "review", seq, 0)
+        assert task_id not in {r.task_id for r in task.sessions}
+        task.sessions.append(SessionRecord(task_id=task_id, role="dev", status="completed"))
+        d = run_dir / "tasks" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "escalation.json").write_text(
+            json.dumps(
+                {
+                    "escalations": [
+                        {"type": "spec-gap", "severity": "CRITICAL", "detail": detail}
+                        for detail in details
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    save_state(run_dir, state)
+    return run_dir, state, task, key
+
+
+def _redrive_escalates(run_dir, key, detail, *, escalated=False):
+    """Append the record + artifact a re-driven session that escalated again leaves
+    behind — through `record_session`, the SOLE mutation of `task.sessions` in
+    `src/`, which is what makes a length watermark meaningful. The id carries the
+    re-arm's own generation, exactly as `engine._session_task_id` would mint it."""
+    state = load_state(run_dir)
+    task = state.tasks[key]
+    assert task.generation > 0  # a re-arm ran, so this id is in a fresh namespace
+    task_id = _session_task_id(key, "review", 1, task.generation)
+    assert task_id not in {r.task_id for r in task.sessions}
+    task.record_session(SessionRecord(task_id=task_id, role="dev", status="completed"))
+    d = run_dir / "tasks" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "escalation.json").write_text(
+        json.dumps(
+            {"escalations": [{"type": "spec-gap", "severity": "CRITICAL", "detail": detail}]}
+        ),
+        encoding="utf-8",
+    )
+    if escalated:
+        task.phase = Phase.ESCALATED
+    save_state(run_dir, state)
+
+
+def test_gather_escalations_shows_the_whole_trail_at_watermark_zero(tmp_path):
+    """The default is the PRE-DW-11 walk, byte-for-byte. 0 is what a task that was
+    never resolved carries and what a pre-upgrade `state.json` deserializes to, so
+    this row is also the legacy-state contract at the reader."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    assert task.escalations_resolved_upto == 0
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["newer", "older"]
+    assert withheld == 0
+
+
+def test_gather_escalations_hides_sessions_below_the_watermark(tmp_path):
+    """The defect DW-11 names. `task.sessions` is append-only and a re-arm
+    deliberately does not clear it, so a second resolve cycle re-presented every
+    escalation the story ever raised — interleaved with the new ones and with
+    nothing marking which was which, against a skill contract that is singular
+    ("present THE escalation").
+
+    Ablation: ignore `start` in `_gather_escalations` (route everything to `found`)
+    and this row fails by showing the answered entry again."""
+    run_dir, state, _task, key = _watermarked_trail(
+        tmp_path, [["answered last cycle"], ["raised since"]]
+    )
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["raised since"]
+    assert withheld == 1
+
+
+def test_gather_escalations_counts_the_entries_it_withheld(tmp_path):
+    """The number the operator is shown is the count of DISTINCT withheld entries,
+    not of sessions or of directories — and it comes from the same single walk that
+    produced the shown list, never a second call subtracting lengths."""
+    run_dir, state, _task, key = _watermarked_trail(tmp_path, [["a", "b", "c"], ["new"]])
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["new"]
+    assert withheld == 3
+
+
+def test_gather_escalations_does_not_count_an_entry_it_still_shows(tmp_path):
+    """ "Not shown" is the claim the number makes, so it must never count something
+    the operator can see. An escalation the re-drive re-raised appears on BOTH sides
+    of the watermark: it is shown once (the newest-first content map) and contributes
+    0 to the count, while its answered-only sibling contributes 1.
+
+    The sibling is the in-row positive control: an `assert withheld == 0` alone would
+    pass just as well if the answered directory were never read at all.
+
+    Ablation: drop the `key not in found` clause from the count and this reddens at
+    2 != 1."""
+    run_dir, state, _task, key = _watermarked_trail(
+        tmp_path,
+        [["re-raised by the re-drive", "answered and gone"], ["re-raised by the re-drive"]],
+    )
+
+    found, withheld = resolve._gather_escalations(run_dir, state, key, start=1)
+    assert [e["detail"] for e in found] == ["re-raised by the re-drive"]  # once, not twice
+    assert withheld == 1  # "answered and gone" only
+
+
+def test_gather_escalations_attributes_a_task_id_spanning_the_watermark_to_the_shown_side(
+    tmp_path,
+):
+    """One `task_id` on an answered record AND an unanswered one — the shape the
+    pre-`generation` id namespace produced, which persisted state still carries. The
+    `seen_ids` guard opens that directory ONCE, at its newest occurrence, which is
+    the unanswered side: the entry is SHOWN. Over-showing is the conservative
+    direction; the alternative buries an escalation on an ambiguity.
+
+    Ablation: walk the trail FORWARD — `for index, session in enumerate(task.sessions)`
+    with `target = found if index >= start else answered`, a rewrite that still reads
+    correct and leaves every other row in this block green except the ordering sibling
+    — and this reddens at `([], 1)`. The shared directory is then opened at its
+    ANSWERED occurrence, so the escalation is buried AND counted as already answered:
+    the second member is what catches that, which is why the assertion is a tuple and
+    not the shown list alone. MEASURED, and the recipe is specific for a reason:
+    deleting the `seen_ids` guard does NOT redden this row (the directory is read
+    twice, but the key lands in `found` first and the count's `key not in found`
+    clause absorbs the duplicate), so `seen_ids` is graded by its own siblings above,
+    not here."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["spans the watermark"]])
+    shared = task.sessions[0].task_id
+    task.sessions.append(SessionRecord(task_id=shared, role="dev", status="completed"))
+    save_state(run_dir, state)
+
+    assert resolve._gather_escalations(run_dir, state, key, start=1) == (
+        [{"type": "spec-gap", "severity": "CRITICAL", "detail": "spans the watermark"}],
+        0,
+    )
+
+
+def test_gather_escalations_with_no_sessions_is_empty_and_reports_nothing(tmp_path):
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [])
+    assert task.sessions == []
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+
+def test_gather_escalations_past_the_end_of_the_trail_never_raises(tmp_path):
+    """A watermark beyond the list — hand-edited state, or a trail that shrank —
+    must yield an empty shown list, not an IndexError. `start` only SELECTS a map;
+    nothing is indexed with it, which is what makes that true structurally.
+
+    The `2` is load-bearing: `== ([], 2)` proves both directories were READ and
+    filtered. An `== []` alone would pass equally if the walk had found nothing."""
+    run_dir, state, _task, key = _watermarked_trail(tmp_path, [["first"], ["second"]])
+
+    assert resolve._gather_escalations(run_dir, state, key, start=9) == ([], 2)
+
+
+def test_rearm_stamps_the_watermark_when_a_resolution_was_recorded(tmp_path):
+    """The stamp records how much of the audit trail the accepted resolution covered
+    — a LENGTH of `task.sessions`, taken before the re-drive appends anything.
+
+    Ablation: drop the stamp from `rearm_escalation` and this reddens at 0 != 1,
+    taking the second-cycle rows below with it."""
+    run_dir, _, _ = _escalated_run(tmp_path)
+    before = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert before.escalations_resolved_upto == 0 and len(before.sessions) == 1
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.escalations_resolved_upto == 1
+    assert len(task.sessions) == 1  # the trail the watermark indexes still stands
+    assert task.generation == 1  # positive control: the bump ran on this gesture too
+
+
+def test_rearm_leaves_the_watermark_where_it_was_when_nothing_was_recorded(tmp_path):
+    """`cmd_resolve` prints "no resolution recorded" and FALLS THROUGH to re-arm, and
+    both non-interactive re-arm gestures run no session at all. None of them accepted
+    anything, so none may advance the watermark: escalations no human answered would
+    otherwise become invisible to every later cycle and be reported as already
+    answered — the inverse of the defect.
+
+    The generation assertion is the positive control and the discriminator: the bump
+    is UNCONDITIONAL (it answers session-id reuse, #705, which an abandoned attempt
+    needs just as much), so this row cannot pass by the re-arm having done nothing.
+
+    Ablation: remove the `if resolution_recorded:` gate and this reddens at 1 != 0."""
+    run_dir, _, _ = _escalated_run(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=False)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.escalations_resolved_upto == 0
+    assert task.generation == 1
+
+
+def test_a_second_resolve_cycle_shows_only_what_the_redrive_raised(tmp_path):
+    """The whole chain with no seam hand-set: escalate, re-arm on a recorded
+    resolution, let the re-drive append its own session record and artifact, then
+    build the context a second time. `build_context` reads the watermark off the task
+    it loaded — nothing in this row passes `start`."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["the first cycle answered this"]])
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    _redrive_escalates(run_dir, key, "raised by the re-drive")
+
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised by the re-drive"]
+    assert withheld == 1
+
+
+def test_a_third_cycle_stamps_again_over_the_second(tmp_path):
+    """TWO accepted cycles in sequence. Every other multi-cycle row stops after one
+    accepted cycle (`..._shows_only_what_the_redrive_raised`) or pairs an accepted one
+    with a declining one (`..._over_a_surviving_marker_...`), so nothing pinned that the
+    watermark keeps ADVANCING. A stamp that fires once and then sticks passes both of
+    those rows and re-presents cycle 2's answered escalation to every later cycle —
+    DW-11 itself, surviving one cycle further along.
+
+    Ablation: make the stamp `max(task.escalations_resolved_upto, 1)` and this row
+    reddens on the third cycle's shown list and its count, while both existing
+    multi-cycle rows stay green."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered in cycle 1"]])
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(run_dir).tasks[key].escalations_resolved_upto == 1
+    _redrive_escalates(run_dir, key, "answered in cycle 2", escalated=True)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    task = load_state(run_dir).tasks[key]
+    assert task.escalations_resolved_upto == 2  # ADVANCED again, over cycle 2's record
+    assert task.generation == 2  # positive control: both gestures re-armed
+
+    _redrive_escalates(run_dir, key, "raised after cycle 2")
+
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 2"]
+    assert withheld == 2  # each answered cycle counted once
+
+
+def test_a_rearm_over_a_surviving_marker_does_not_move_the_watermark(tmp_path):
+    """`resolution.json` SURVIVES the re-arm that consumed it: the only unlink in
+    `src/` is in `resolve.run_session`, which two of the three re-arm callers never
+    reach, and nothing deletes it at or after a re-arm. So a marker-presence gate
+    reads the PREVIOUS cycle's marker as this gesture's own, and a second re-arm
+    running no session would stamp over an escalation nobody has seen — hiding it
+    forever and reporting it as already answered.
+
+    The marker is deliberately left on disk here and never removed, which is the
+    state a real second gesture opens on.
+
+    Ablation: replace the `resolution_recorded` parameter with a
+    `resolution_path(run_dir, key).is_file()` read inside `rearm_escalation` and this
+    row reddens twice — the watermark advances to 2, and the context comes back
+    empty with the new escalation counted as withheld."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered in cycle 1"]])
+
+    marker = resolve.resolution_path(run_dir, key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(run_dir).tasks[key].escalations_resolved_upto == 1
+    assert marker.is_file()  # MEASURED: nothing deletes it at re-arm
+
+    _redrive_escalates(run_dir, key, "raised after cycle 1", escalated=True)
+
+    # the `--no-interactive` / TUI gesture: no session ran, so nothing was accepted
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=False)
+
+    task = load_state(run_dir).tasks[key]
+    assert task.escalations_resolved_upto == 1  # NOT len(sessions) == 2
+    assert task.generation == 2  # positive control: this gesture DID re-arm
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised after cycle 1"]
+    assert withheld == 1
+
+
+def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
+    """The count is the OPERATOR's, not the agent's: `bmad-loop-resolve/SKILL.md`
+    documents `escalations` as the list to resolve, and a number for entries the
+    session cannot see is nothing it can act on. Any spelling of a leak reddens this,
+    because the key set is compared whole rather than probed for one name."""
+    run_dir, _state, _task, key = _watermarked_trail(tmp_path, [["answered"], ["new"]])
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    _redrive_escalates(run_dir, key, "new one")
+
+    path, withheld, _unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert withheld == 2  # the count exists...
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert set(ctx) == {
+        "story_key",
+        "run_id",
+        "spec_file",
+        "baseline_commit",
+        "paused_reason",
+        "escalations",
+        "resolution_path",
+        "restore_supported",
+        "spec_reaches_the_redrive",
+        "redrive_base_ref",
+    }  # ...and reaches no field of the agent contract
+
+
+def _unreadable_artifact(run_dir, task, index):
+    """Corrupt the escalation.json belonging to `task.sessions[index]`.
+
+    Non-UTF-8 bytes rather than bad JSON, so the read fails in
+    `Path.read_text` — the OSError/UnicodeDecodeError arm of the guard, which is the
+    shape a transient fault on a network mount actually takes. Returns the path so a
+    row can assert on the exact member of the sink."""
+    fpath = run_dir / "tasks" / task.sessions[index].task_id / "escalation.json"
+    fpath.write_bytes(b'{"escalations": [\xff\xfe]}')
+    return fpath
+
+
+def test_gather_escalations_records_an_unreadable_shown_side_artifact(tmp_path):
+    """The skip the reader has always performed, now SAID. `build_context` is an
+    observation path and must not raise on a malformed artifact — but the caller then
+    stamps `escalations_resolved_upto = len(task.sessions)`, which covers the session
+    that artifact belongs to. Without this signal a transient read fault buries every
+    escalation in it forever: the next cycle reads the file fine and withholds it as
+    already answered.
+
+    The readable sibling is the positive control — the degrade still costs exactly its
+    own artifact's contents and nothing more.
+
+    Ablation: drop the `skipped.add(...)` from the `except` arm and this reddens on an
+    empty sink while the shown list stays correct."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    corrupt = _unreadable_artifact(run_dir, task, 1)
+
+    skipped: set[str] = set()
+    found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(corrupt)}
+    assert [e["detail"] for e in found] == ["older"]  # the sibling still read
+    assert withheld == 0
+
+
+def test_gather_escalations_ignores_a_skip_below_the_watermark(tmp_path):
+    """A record the PREVIOUS cycle's watermark already covers cannot be newly buried
+    by this one, so an unreadable artifact there is not a skip. Recording it would
+    withhold coverage on every later cycle for a session already answered — a
+    permanent refusal to advance, which is DW-11 back in the other direction.
+
+    The shown-side escalation is the positive control: the walk ran and routed both
+    sides. The withheld count legitimately drops to 0 — that number is an operator
+    advisory and claims nothing durable, which is exactly why the sink is narrower.
+
+    Ablation: drop the `target is found` half of the guard and this reddens on a
+    one-member sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["answered"], ["unanswered"]])
+    corrupt = _unreadable_artifact(run_dir, task, 0)
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, start=1, skipped=skipped)
+
+    assert skipped == set()
+    assert corrupt.is_file()  # MEASURED: the walk really did reach a corrupt file
+    assert [e["detail"] for e in found] == ["unanswered"]
+
+
+def test_gather_escalations_does_not_call_an_escalation_less_artifact_a_skip(tmp_path):
+    """The ordinary shape of a clean `result.json` — no `escalations` key at all — is
+    not a malformed artifact, and calling it one would withhold coverage from EVERY
+    resolve cycle on every run, permanently disabling the watermark. The over-signal
+    is the more dangerous failure of the two, and nothing else grades it: every other
+    row here seeds an artifact that does carry escalations.
+
+    Ablation: treat a missing `escalations` key as malformed (delete the
+    `if "escalations" not in doc: continue` arm) and this reddens with the
+    `result.json` in the sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    (run_dir / "tasks" / task.sessions[0].task_id / "result.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8"
+    )
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]
+
+
+def test_gather_escalations_records_a_non_list_escalations_field(tmp_path):
+    """`{"escalations": null}` is the shape the reader's `list` check exists for, and
+    it is malformed rather than absent: something wrote the key, and what it holds
+    cannot be shown. The sibling row above draws the other side of that line.
+
+    Ablation: fold the non-list arm back into a bare `continue` and this reddens."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    fpath = run_dir / "tasks" / task.sessions[0].task_id / "escalation.json"
+    fpath.write_text(json.dumps({"escalations": None}), encoding="utf-8")
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(fpath)}
+    assert found == []
+
+
+def test_gather_escalations_leaves_the_sink_optional(tmp_path):
+    """~20 rows call this reader with no sink, and the ordinary walk must not need
+    one. The default `None` is what keeps the signal additive rather than a second
+    contract every caller has to satisfy."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    _unreadable_artifact(run_dir, task, 0)
+
+    assert resolve._gather_escalations(run_dir, state, key) == ([], 0)
+
+
+_POSIX_MODE_BITS = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not deny directory access by mode bits"
+)
+_NOT_ROOT = pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root bypasses mode bits"
+)
+_FIFO = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+@_POSIX_MODE_BITS
+@_NOT_ROOT
+def test_gather_escalations_records_an_artifact_it_cannot_stat(tmp_path):
+    """An artifact that EXISTS and cannot be reached is unreadable, not absent — and
+    which of those the old `Path.is_file()` probe reported depended on the interpreter,
+    so that one line carried two different defects at once. Through 3.13 it re-raises
+    EACCES (not in `pathlib._IGNORED_ERRNOS`), which escaped `build_context` and
+    `cmd_resolve` to `main`'s backstop as `error: [Errno 13] ...`, exit 1 — the exact
+    thing this reader's contract forbids. On 3.14 `is_file()` became `os.path.isfile`,
+    which swallows the error and answers False: the sink stays EMPTY, so the caller
+    reads a clean run, stamps `escalations_resolved_upto = len(task.sessions)`, and the
+    CRITICAL entries under that directory are withheld as already answered FOREVER.
+
+    A real mode-000 parent, never a patched `Path.stat`: on 3.14 `is_file()` reaches
+    `os.stat`, so a mock on the pathlib method is never consulted and the row would
+    pass with the fix ablated — a false green on the one leg the second defect lives on.
+
+    Both names in `TASK_CYCLE_ARTIFACTS` are recorded, which is the honest answer: with
+    the directory unreachable the reader cannot tell which of them was even there.
+
+    The readable sibling is the positive control — the degrade still costs exactly the
+    directory it could not read.
+
+    Ablation: restore `if not fpath.is_file(): continue` outside the `try` and this
+    reddens — on 3.13 with the PermissionError escaping, on 3.14 on an empty sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    task_dir = run_dir / "tasks" / task.sessions[1].task_id
+    task_dir.chmod(0o000)
+    try:
+        skipped: set[str] = set()
+        found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+        assert skipped == {str(task_dir / name) for name in TASK_CYCLE_ARTIFACTS}
+        assert [e["detail"] for e in found] == ["older"]  # the sibling still read
+        assert withheld == 0
+
+        _path, _withheld, unreadable = resolve.build_context(
+            load_state(run_dir), run_dir, key, isolation=""
+        )
+        assert unreadable == len(TASK_CYCLE_ARTIFACTS)  # and it reaches the caller
+    finally:
+        task_dir.chmod(0o755)  # so the sandbox tears down cleanly
+
+
+def test_gather_escalations_treats_a_directory_at_the_artifact_path_as_absent(tmp_path):
+    """`stat` succeeds on a directory where `is_file()` answered False, so the mode
+    check is what keeps the switch behavior-preserving. Without it the directory
+    reaches `read_text`, raises `IsADirectoryError` — an `OSError` — and lands in the
+    sink, which withholds coverage over a path that holds no artifact at all.
+
+    Ablation: drop the `S_ISREG` check and this reddens with the directory in the
+    sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    (run_dir / "tasks" / task.sessions[0].task_id / "result.json").mkdir()
+
+    skipped: set[str] = set()
+    found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]  # the real artifact still read
+
+
+@_FIFO
+def test_gather_escalations_does_not_open_a_fifo_at_the_artifact_path(tmp_path):
+    """The dangerous half of the same mode check. `stat` succeeds on a FIFO too, so
+    without `S_ISREG` the walk would `read_text` it — and with no writer that blocks
+    FOREVER, wedging the interactive resolve command rather than failing it. The
+    classification never opens the path, which is why this row asserts through the
+    reader's answer and never reads the FIFO itself.
+
+    Bounded with `SIGALRM`, following `test_diagnostics.py`'s twin: a hang is the
+    failure under test, so it needs a deadline or an ablation wedges the suite instead
+    of reddening it.
+
+    Ablation: drop the `S_ISREG` check and the alarm fires."""
+    import signal
+
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["raised"]])
+    os.mkfifo(run_dir / "tasks" / task.sessions[0].task_id / "result.json")
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the walk opened the FIFO instead of classifying it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        skipped: set[str] = set()
+        found, _withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert skipped == set()
+    assert [e["detail"] for e in found] == ["raised"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_gather_escalations_records_a_symlink_loop_at_the_artifact_path(tmp_path):
+    """The one DELIBERATE behavior change in the switch to `stat`, and the row that
+    grades it. A symlink cycle where an artifact belongs is a degrade — something is
+    there and its contents cannot be reached — but `is_file()` called it ABSENT on
+    every supported interpreter: through 3.13 because ELOOP(40) is IN
+    `pathlib._IGNORED_ERRNOS`, and on 3.14 because `os.path.isfile` swallows it too.
+    Absent costs nothing, so the caller would stamp coverage over a session whose
+    escalations were never read. `stat` raises, and the fault joins the skip sink.
+
+    MEASURED rather than argued, because the analogy nearby is a trap: `Path.resolve()`
+    on a loop raises `RuntimeError` — NOT an `OSError` — on 3.11 and raises nothing at
+    all on 3.13, so an arm catching `OSError` around IT would be inert. `Path.stat()`
+    is a syscall-level error and was probed uniform on 3.11.13, 3.13.14 and 3.14.6:
+    `OSError` errno 40 on all three, which is what makes one `except OSError` arm
+    enough. The premise below is asserted for the same reason.
+
+    The readable sibling is the positive control, and unlike the EACCES row this one
+    reddens identically on every leg — the pre-fix answer was False everywhere.
+
+    Ablation: restore `if not fpath.is_file(): continue` outside the `try` and this
+    reddens on an empty sink."""
+    run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+    task_dir = run_dir / "tasks" / task.sessions[1].task_id
+    loop = task_dir / "result.json"
+    partner = task_dir / "result.json.cycle"
+    loop.symlink_to(partner)
+    partner.symlink_to(loop)
+    # The premise, MEASURED: the probe this fix replaced reported the cycle as absent,
+    # which is precisely the reading being changed.
+    assert not loop.is_file()
+
+    skipped: set[str] = set()
+    found, withheld = resolve._gather_escalations(run_dir, state, key, skipped=skipped)
+
+    assert skipped == {str(loop)}
+    assert [e["detail"] for e in found] == ["newer", "older"]  # the siblings still read
+    assert withheld == 0
+
+    _path, _withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert unreadable == 1  # and it reaches the caller that decides coverage
+
+
+def test_build_context_reports_the_unreadable_artifact_count(tmp_path):
+    """The third return member, from the same single walk. Zero whenever the run-dir
+    reads cleanly, which is why the coverage path is unchanged on an ordinary run.
+
+    Ablation: return a constant 0 instead of `len(unreadable)` and this reddens on the
+    corrupt run while the clean one stays green."""
+    run_dir, _state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
+
+    _path, withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert (withheld, unreadable) == (0, 0)  # the clean baseline
+
+    _unreadable_artifact(run_dir, task, 1)
+    _path, _withheld, unreadable = resolve.build_context(
+        load_state(run_dir), run_dir, key, isolation=""
+    )
+    assert unreadable == 1
 
 
 # ----------------------------------------------------------- run_session
@@ -2055,7 +3374,7 @@ class _FakeAdapter:
 
 def test_run_session_detects_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     def fake_subprocess_run(argv, cwd, env):
         # simulate the agent writing the resolution marker
@@ -2071,7 +3390,7 @@ def test_run_session_detects_resolution(tmp_path, monkeypatch):
 
 def test_run_session_no_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
     monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
     assert (
         resolve.run_session(
@@ -2085,7 +3404,7 @@ def test_run_session_clears_stale_marker(tmp_path, monkeypatch):
     """A marker left by a previous resolve of this story must not be read as
     this session's output (the agent that says 'already resolved' writes none)."""
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+    _context(state, run_dir, "6-4-cli-list-command", isolation="")
     stale = resolve.resolution_path(run_dir, "6-4-cli-list-command")
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text('{"from": "last time"}', encoding="utf-8")
@@ -2199,9 +3518,7 @@ def test_build_context_stories_carries_manifest_entry(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md", source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
-    )
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
     st = ctx["stories"]
     assert st["spec_folder"] == "epic-1"
     assert st["story"]["title"] == "List command"
@@ -2225,9 +3542,7 @@ def test_build_context_stories_sentinel_indicator(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
-    )
+    ctx = json.loads(_context(state, run_dir, key, isolation="").read_text(encoding="utf-8"))
     sent = ctx["stories"]["sentinel"]
     assert sent["kind"] == "unresolved"
     assert "intent too vague" in sent["blocking_condition"]
@@ -2237,9 +3552,7 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
     """Sprint mode leaves the context contract unchanged — no stories block."""
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
     )
     assert "stories" not in ctx
 
@@ -2261,9 +3574,9 @@ def test_build_context_leaves_an_out_of_mount_spec_unchanged(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
 
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_file"] == spec.as_posix()
 
@@ -2304,7 +3617,7 @@ def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
     state.spec_folder = "epic-1"
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+        _context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] == (wt / rel).as_posix()
     sent = ctx["stories"]["sentinel"]
@@ -2353,7 +3666,7 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
     state.spec_folder = "epic-1"
 
     ctx = json.loads(
-        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+        _context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
     )
     assert ctx["spec_file"] == outside.as_posix()  # unchanged: absolute passes through
     sent = ctx["stories"]["sentinel"]
@@ -2375,9 +3688,9 @@ def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
     wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     assert ctx["spec_reaches_the_redrive"] is False
 
@@ -2385,9 +3698,9 @@ def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
         tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
     )
     plain = json.loads(
-        resolve.build_context(
-            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
-        ).read_text(encoding="utf-8")
+        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
     )
     assert plain["spec_reaches_the_redrive"] is True
 
@@ -2410,9 +3723,9 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
     state.target_branch = "feat/the-pinned-one"
     ctx = json.loads(
-        resolve.build_context(
-            state, run_dir, "6-4-cli-list-command", isolation="worktree"
-        ).read_text(encoding="utf-8")
+        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
     )
     # the paired claim: the edit has no future, and THIS is the tree that does
     assert ctx["spec_reaches_the_redrive"] is False
@@ -2424,9 +3737,9 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
     )
     plain_state.target_branch = "feat/the-pinned-one"  # set, but no mount to make it apply
     plain = json.loads(
-        resolve.build_context(
-            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
-        ).read_text(encoding="utf-8")
+        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
     )
     assert plain["redrive_base_ref"] == "HEAD"
 
@@ -2473,7 +3786,7 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -2545,7 +3858,7 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -2604,7 +3917,7 @@ def _sentinel_run(
 
     sentinel = folder / f"{key}-unresolved.md"
     sentinel.write_text(
-        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\n" "Status: blocked\nintent too vague\n",
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
         encoding="utf-8",
     )
     mount = tmp_path / "wt"
@@ -2668,7 +3981,7 @@ def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redriv
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=isolated)
+    runs.rearm_escalation(run_dir, isolated_redrive=isolated, resolution_recorded=True)
 
     assert not sentinel.exists()  # the sentinel really was cleared on every row
     records = _upstream_records(run_dir)
@@ -2757,7 +4070,7 @@ def test_rearm_reads_the_upstream_artifacts_at_the_redrive_base_not_the_current_
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     records = _upstream_records(run_dir)
     assert bool(records) is warns
@@ -2792,7 +4105,7 @@ def test_rearm_exempts_a_stories_folder_configured_outside_the_project(
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert bool(_upstream_records(run_dir)) is not external
 
@@ -2834,7 +4147,9 @@ def test_rearm_of_a_sentinel_survives_a_project_that_is_not_a_repository(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == key  # no GitError
+    assert (
+        runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True) == key
+    )  # no GitError
 
     assert not sentinel.exists()  # the destructive half still completed
     (rec,) = _upstream_records(run_dir)
@@ -2886,7 +4201,7 @@ def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_pat
     monkeypatch.chdir(tmp_path)
 
     # the flip: policy now says `none`, while the recorded mount still says otherwise
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["redrive"] == "in-place"
@@ -2943,7 +4258,7 @@ def test_rearm_in_place_proof_reads_the_working_tree_not_the_commit(tmp_path, mo
             root, spec_file=rel, worktree_path=str(mount), target_branch="main"
         )
         monkeypatch.chdir(root)
-        runs.rearm_escalation(run_dir, isolated_redrive=False)
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
         fired = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
         assert bool(fired) is warns, f"corrected={corrected}"
@@ -3004,7 +4319,7 @@ def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_pat
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -3057,7 +4372,7 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
     monkeypatch.chdir(tmp_path)
 
     runs.rearm_escalation(
-        run_dir, isolated_redrive=True
+        run_dir, isolated_redrive=True, resolution_recorded=True
     )  # must not raise: this flip cannot reach the re-drive
 
     kinds = _kinds(run_dir)
@@ -3090,7 +4405,7 @@ def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkey
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     kinds = _kinds(run_dir)
     (unreachable,) = [e for e in kinds if e["kind"] == "rearm-spec-write-unreachable"]
@@ -3132,7 +4447,7 @@ def test_rearm_does_not_warn_when_the_spec_dir_is_shared_with_the_redrive(tmp_pa
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
     # and the flip really landed on the shared file the re-drive will read
@@ -3176,7 +4491,7 @@ def test_rearm_still_warns_for_a_spec_spelled_out_of_but_resolving_into_the_work
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spelled), worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
@@ -3215,7 +4530,7 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
@@ -3253,7 +4568,7 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel)  # worktree_path="" -> the fallback
     monkeypatch.chdir(tmp_path / "elsewhere")
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False)
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     fm = verify.read_frontmatter(spec)
     assert fm["status"] == "ready-for-dev"  # the project-rooted copy was flipped
@@ -3324,6 +4639,126 @@ def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
     assert step == ""
 
 
+def test_rearm_event_notice_splits_the_abort_three_ways_on_the_rollback():
+    """One kind, THREE renderings, and the split is by what the surface may CLAIM about
+    the file — not by how the re-arm failed.
+
+    Nothing else grades this. The CLI's abort-echo test asserts "the re-arm ABORTED",
+    "nothing was persisted", "still escalated" and the spec path, and every one of those
+    is true of the `failed` message too — so replacing the discriminator with `if False:`
+    was SILENT across the whole suite while an operator holding a part-written spec was
+    told it had been "left exactly as the re-arm found it". A row that reads the table
+    directly is the only place the three can be compared.
+
+    The unrecognized-value leg is the load-bearing one. `unknown` is a real producer
+    answer (the sentinel-clear leg, and a spec the undo could not read), an absent field
+    is what a record from an older or future producer looks like, and neither may inherit
+    the reassuring branch by falling through to it. So the default is the branch that
+    claims nothing, and the assertions below say that in the strongest available form:
+    the "left exactly as the re-arm found it" sentence appears on `restored`/`unchanged`
+    and NOWHERE else.
+
+    next_step is graded beside the message for `rearm-spec-flip-skipped`'s reason above —
+    it is the half that costs an operator time — and for one this kind adds: the TUI
+    drops next_step entirely, so `failed`'s restore-from-git remedy has to survive in the
+    MESSAGE as well. That is asserted on the message, not just on the step.
+
+    Ablations, each run: replace the `rollback == "failed"` test with `if False:` and the
+    `failed` assertions redden; replace the `rollback in ("restored", "unchanged")` test
+    with `if True:` and the `unknown`/absent assertions redden; drop "restore it from git"
+    from the `failed` MESSAGE (keeping next_step) and the TUI-reachability assertion
+    reddens alone.
+    """
+    entry = {
+        "kind": "rearm-aborted",
+        "spec_file": "/p/specs/s1.md",
+        "error": "OSError: [Errno 28] No space left on device",
+    }
+    left_as_found = "left exactly as the re-arm found it"
+
+    _, failed_msg, failed_step = runs.rearm_event_notice({**entry, "rollback": "failed"})
+    _, restored_msg, restored_step = runs.rearm_event_notice({**entry, "rollback": "restored"})
+    _, unchanged_msg, _ = runs.rearm_event_notice({**entry, "rollback": "unchanged"})
+    _, unknown_msg, unknown_step = runs.rearm_event_notice({**entry, "rollback": "unknown"})
+    _, absent_msg, absent_step = runs.rearm_event_notice(entry)
+    _, future_msg, _ = runs.rearm_event_notice({**entry, "rollback": "something-new"})
+
+    # every rendering states the two facts that are true whatever happened
+    for msg in (failed_msg, restored_msg, unchanged_msg, unknown_msg, absent_msg, future_msg):
+        assert "the re-arm ABORTED" in msg
+        assert "nothing was persisted" in msg
+        assert "still escalated" in msg
+
+    # ...and ONLY the two outcomes that proved it say the file is intact
+    assert left_as_found in restored_msg and left_as_found in unchanged_msg
+    assert left_as_found not in failed_msg
+    assert left_as_found not in unknown_msg
+    assert left_as_found not in absent_msg
+    assert left_as_found not in future_msg  # an unrecognized value defaults to NOT reassuring
+
+    # `failed` is the only one that can leave a part-written spec, and its remedy has to
+    # reach a TUI operator, which never sees next_step
+    assert "may be left part-written" in failed_msg
+    assert "restore it from git" in failed_msg
+    # ...and it names a SECOND source, because the bytes the undo failed to write are gone
+    # with the process and an untracked or out-of-checkout spec has no committed copy
+    assert "or from your own copy" in failed_msg
+    assert failed_step == "Restore the spec from git or your own copy, then re-run resolve"
+    # ...and it does NOT enumerate which writes landed: a fault inside
+    # `strip_auto_run_result` reaches the guard with the flip published and the section
+    # still present, so an enumeration would describe a state this record cannot know
+    assert "## Auto Run Result" not in failed_msg
+
+    # the three next_steps are distinct remedies, not one sentence reused
+    assert len({failed_step, restored_step, unknown_step}) == 3
+    assert absent_step == unknown_step  # an absent field IS the unknown outcome
+
+
+def test_rearm_event_notice_renders_the_commits_probe_failure():
+    """The row that stops a FAILED commits probe reading as a clean one (DW-81).
+
+    `stale-restore-commits` is written only when the probe answered, so its absence
+    used to carry two opposite meanings — "nothing from the abandoned attempt" and
+    "nobody could tell" — and neither operator surface could separate them. This row
+    is the separation, so it is graded on all three returned fields:
+
+    * the truncated baseline, because that is the ref the operator has to diff from
+      and the record is read out of process from the journal line alone;
+    * the typed error, because a bad baseline and a non-repo code tree are different
+      things to go fix;
+    * the range, in the MESSAGE as well as the next_step — the TUI drops `next_step`
+      and resumes in the same gesture, so a message that only said "something went
+      wrong" would leave that surface's operator with no action at all.
+
+    Ablation: return None for this kind and every assertion here reddens; drop the
+    `git log` range from the message while keeping it in the next_step and only the
+    message assertion does — which is the half the TUI would have lost.
+    """
+    baseline = "abc123def456" + "0" * 28
+    rec = {
+        "kind": "rearm-commits-probe-failed",
+        "story_key": "1-1-a",
+        "old_baseline": baseline,
+        "error": f"GitError: git rev-list {baseline}..HEAD failed in /code:\n"
+        + "fatal "
+        + "x" * 5000,
+    }
+    severity, message, next_step = runs.rearm_event_notice(rec)
+    assert severity == "warning"
+    assert "abc123def456.." in message  # truncated to 12, as the sibling row does
+    assert "0" * 28 not in message  # ...and NOT the whole sha
+    assert "GitError" in message and "rev-list" in message  # the typed cause
+    assert "\n" not in message and len(message) < 4500  # terminal-safe and bounded
+    assert "proves nothing" in message  # the silence is not evidence of "clean"
+    assert "fix the Git failure" in message  # do not blindly repeat the failed probe
+    assert "git log abc123def456..HEAD" in message  # actionable on the TUI alone
+    assert next_step == (
+        "Fix the Git failure, then check `git log abc123def456..HEAD` before resuming"
+    )
+    # the imperative lives ONLY in next_step: the TUI drops it and resumes here
+    assert "before resuming" not in message
+
+
 def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     """The hold is PROOF, not urgency — and it is asked of every kind the table knows.
 
@@ -3349,6 +4784,9 @@ def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
         "stale-restore-commits",
         "stale-restore-unparseable",
         "stale-restore-excluded",
+        # the probe that could NOT answer proves strictly less than the answer, so if
+        # `stale-restore-commits` does not hold, neither can this
+        "rearm-commits-probe-failed",
         "rearm-baseline-advance-failed",
         "rearm-baseline-restamp-skipped",
         "rearm-baseline-restamped",

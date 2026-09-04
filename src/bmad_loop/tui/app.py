@@ -969,7 +969,19 @@ class BmadLoopApp(App[None]):
         before_entries = runs.journal_entries_or_none(run_dir)
         hold_resume = False
         try:
-            runs.rearm_escalation(run_dir, story_key, isolated_redrive=isolation == "worktree")
+            runs.rearm_escalation(
+                run_dir,
+                story_key,
+                isolated_redrive=isolation == "worktree",
+                # DW-11. This gesture runs no resolve session, so it accepted nothing:
+                # the escalation watermark must not advance. A `resolution.json` on
+                # disk is NOT evidence to the contrary here — `_restore_recorded`
+                # already records the governing fact for this surface, that a stale
+                # marker is indistinguishable from a fresh one, which is why this path
+                # declines the restore latch too. Stamping on its presence would bury
+                # escalations raised since the marker was written.
+                resolution_recorded=False,
+            )
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
@@ -977,7 +989,8 @@ class BmadLoopApp(App[None]):
             # In the `finally`, matching `cli.cmd_resolve`. `_stale_restore_residue`
             # journals BEFORE the re-stamp block that raises `RearmError`, so on that
             # path the records were already written and returning early threw them
-            # away — including `stale-restore-commits`, the one record whose whole
+            # away — including the commits PAIR (`stale-restore-commits` when the probe
+            # answered, `rearm-commits-probe-failed` when it could not), whose whole
             # point is that nothing else will tell the human. This surface used to
             # `return` there while the CLI echoed, so the two DID drift on the abort
             # path even after they were unified on routing — and an abort is when the

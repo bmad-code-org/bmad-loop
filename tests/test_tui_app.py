@@ -4517,6 +4517,34 @@ async def test_story_checkpoint_card_surfaces_real_review_cycles(project, monkey
         assert "verification passed" not in line
 
 
+def test_tui_rearm_refuses_an_alive_run_before_any_mutation(project, monkeypatch):
+    """The liveness helper's result must control the re-arm, not merely be observed."""
+    from bmad_loop import runs
+
+    notes: list[str] = []
+    rearms: list[str] = []
+    run_id = "20260611-100000-aaaa"
+    run_dir = project.project / RUNS_DIR / run_id
+    app = BmadLoopApp(project.project)
+
+    def fail_if_rearm_continues(_path):
+        raise AssertionError("continued past liveness gate")
+
+    monkeypatch.setattr(data, "liveness", lambda _run_dir: "alive")
+    monkeypatch.setattr(app, "notify", lambda message, **_kwargs: notes.append(message))
+    monkeypatch.setattr(policy_mod, "load", fail_if_rearm_continues)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda _run_dir, story_key, **_kwargs: rearms.append(story_key),
+    )
+
+    app._do_rearm(run_id, run_dir, "1")
+
+    assert rearms == []
+    assert notes == [f"run {run_id} may still be live — stop it first"]
+
+
 async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypatch):
     from bmad_loop import resolve, runs
 
@@ -4550,6 +4578,67 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
 
 
+async def test_tui_rearm_does_not_move_the_escalation_watermark(project, monkeypatch):
+    """DW-11, on the one re-arm surface a stale `resolution.json` actively invites.
+
+    Every other TUI row here monkeypatches `runs.rearm_escalation` away, so none can
+    observe what it stamps — this one lets the REAL function run. The marker on disk is
+    the shape that matters: `resolve.run_session` is the only thing in `src/` that
+    unlinks it and this gesture never calls it, so the marker survived the CLI cycle
+    that consumed it, and `resolution_ready` (the sole enabler of this button) still
+    reads True. `_do_rearm` therefore has to declare `resolution_recorded=False` from
+    what it KNOWS — it ran no session — rather than from what is on disk, which is
+    exactly the verdict `_restore_recorded` already records for this surface.
+
+    The watermark is seeded to 1 over a two-record trail so "did not move" is
+    distinguishable from "was never set"; `generation` is the positive control that the
+    re-arm really ran.
+
+    Ablation: pass `resolution_recorded=True` from `_do_rearm` (or gate the stamp on
+    `resolution_path(...).is_file()` inside `rearm_escalation`) and this reddens at
+    2 != 1."""
+    from bmad_loop import resolve
+    from bmad_loop.engine import _session_task_id
+    from bmad_loop.journal import load_state
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    state = load_state(run_dir)
+    task = state.tasks["1"]
+    task.phase = Phase.ESCALATED
+    task.sessions.clear()
+    for seq in (1, 2):
+        task.record_session(
+            SessionRecord(
+                task_id=_session_task_id("1", "review", seq, 0), role="dev", status="completed"
+            )
+        )
+    task.escalations_resolved_upto = 1  # an earlier CLI cycle answered the first record
+    save_state(run_dir, state)
+    # the marker that cycle's agent wrote — nothing deleted it at its re-arm
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "1")
+        await pilot.pause()
+
+    rearmed = load_state(run_dir).tasks["1"]
+    assert rearmed.escalations_resolved_upto == 1  # NOT len(sessions) == 2
+    assert rearmed.generation == 1  # positive control: the re-arm ran
+
+
 async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project, monkeypatch):
     """The mode `runs.rearm_escalation` needs comes from policy.toml, read HERE.
 
@@ -4576,7 +4665,8 @@ async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project,
     monkeypatch.setattr(
         runs,
         "rearm_escalation",
-        lambda rd, sk, *, isolated_redrive: seen.append(isolated_redrive) or "ready-for-dev",
+        lambda rd, sk, *, isolated_redrive, resolution_recorded: seen.append(isolated_redrive)
+        or "ready-for-dev",
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -4746,7 +4836,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         Journal(rd).append(
             "rearm-baseline-advance-failed",
             story_key=sk,
@@ -4806,7 +4896,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     seen: list = []
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         seen.append(load_state(rd).code_root)
         return "ready-for-dev"
 
@@ -4920,7 +5010,9 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     TUI's own copy of the chain happened to handle.
 
     That copy carried `rearm-baseline-*` only and silently dropped the whole
-    `stale-restore-*` family, including `stale-restore-commits` — the record
+    `stale-restore-*` family (and would have dropped `rearm-commits-probe-failed`,
+    the record that says the commits probe could not answer at all), including
+    `stale-restore-commits` — the record
     `cli._echo_rearm_events`' docstring calls the one a human must act on, and the
     one whose whole point is that nothing else will tell them. All of it is
     warn-only by contract, so a toast is the only place this path can ever show it,
@@ -4936,7 +5028,11 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     already queued behind this toast.
 
     Ablation: make `runs.rearm_event_notice` return None for any one of these kinds
-    and this reddens on that kind's message alone.
+    and this reddens on that kind's message alone. Drop the remedy
+    ("restore it from git or from your own copy") from the `rearm-aborted` `failed`
+    MESSAGE while keeping it in that arm's `next_step` and only the remedy assertion
+    reddens — which is the point of grading it here rather than on the CLI, where the
+    dropped half is still printed.
     """
     from bmad_loop import resolve, runs
     from bmad_loop.journal import Journal
@@ -4947,7 +5043,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         journal = Journal(rd)
         journal.append(
             "stale-restore-commits",
@@ -4956,6 +5052,16 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             commits=["c1", "c2"],
         )
         journal.append("stale-restore-excluded", story_key=sk, patch="a.patch", files=["new.txt"])
+        # The commits record's TWIN: the probe that could not answer at all. It rides
+        # this walk because the pair is the whole point — the record above is written
+        # only when the probe answered, so without this one its absence reads as
+        # "clean" on the surface that resumes in the same gesture (DW-81).
+        journal.append(
+            "rearm-commits-probe-failed",
+            story_key=sk,
+            old_baseline="e" * 40,
+            error=f"GitError: git rev-list {'e' * 40}..HEAD failed in /code: fatal",
+        )
         journal.append(
             "rearm-baseline-restamp-skipped",
             story_key=sk,
@@ -4967,6 +5073,22 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
             story_key=sk,
             spec_file="wt/specs/s1.md",
             status="ready-for-dev",
+        )
+        # `rearm-aborted` is journalled by `runs._rollback_rearm` from the transaction
+        # guard's error path. It rides this walk for its ROUTING, which is what this test
+        # grades — the rendering path is real on this surface either way, since a genuine
+        # abort reaches `_do_rearm`'s `finally` (and so this echo) BEFORE its
+        # `except RearmError` arm returns. The `failed` outcome is the one chosen on
+        # purpose: it is the single re-arm kind whose imperative is NOT moot here, because
+        # this path does not go on to resume, and this surface drops `next_step` — so the
+        # restore-from-git remedy has to survive in the MESSAGE or a TUI operator never
+        # gets it at all.
+        journal.append(
+            "rearm-aborted",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            error="OSError: [Errno 28] No space left on device",
+            rollback="failed",
         )
         return "ready-for-dev"
 
@@ -5005,10 +5127,26 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     assert severity_of("2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)") == (
         "warning"
     )
+    # ...and its twin, the probe that could not answer — advisory, so a toast is the
+    # only place this surface can ever show it
+    assert severity_of("could not list the commits above the abandoned attempt's baseline") == (
+        "warning"
+    )
+    # the range is carried in the MESSAGE, because this surface drops `next_step`
+    assert any("git log eeeeeeeeeeee..HEAD" in n[0] for n in notes), notes
+    assert not any("e" * 40 in n[0] for n in notes), notes
     assert severity_of("is not a readable file from here") == "warning"
     assert severity_of("could not be re-opened to `ready-for-dev`") == "warning"
     # `note` maps onto Textual's own channel name, not through unchanged
     assert severity_of("excluded the abandoned restore's new files") == "information"
+    # the abort record, and specifically the half that only the MESSAGE can carry on a
+    # surface with no `next_step`: without it a TUI operator is told the spec may be
+    # part-written and given no remedy for it
+    assert severity_of("may be left part-written") == "warning"
+    # the WHOLE remedy, not its first three words: the message names a second source
+    # because an untracked or out-of-checkout spec has no committed copy, and asserting
+    # only the "from git" prefix passes for a message that never gained the rest
+    assert any("restore it from git or from your own copy" in n[0] for n in notes), notes
     # the CLI's trailing imperative is omitted here: the resume is already queued
     assert not any("before resuming" in n[0] for n in notes), notes
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
@@ -5042,7 +5180,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         Journal(rd).append(
             "rearm-spec-write-unreachable",
             story_key=sk,
@@ -5114,7 +5252,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         # exactly the real ordering: residue journalled, THEN the abort
         Journal(rd).append(
             "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
@@ -5175,7 +5313,7 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk, *, isolated_redrive=False):
+    def fake_rearm(rd, sk, *, isolated_redrive=False, resolution_recorded=False):
         Journal(rd).append(
             "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
         )

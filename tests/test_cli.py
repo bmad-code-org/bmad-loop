@@ -2624,7 +2624,9 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
     run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
     seen: list = []
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         seen.append(load_state(rd).code_root)
         return key
 
@@ -2748,7 +2750,9 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     run_dir = _escalated_run(tmp_path, "r1")
     Journal(run_dir).append("stale-restore-excluded", story_key="s1", files=["FROM-LAST-TIME.txt"])
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         journal = Journal(rd)
         journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
         journal.append("stale-restore-unparseable", story_key=key, patch="b.patch", error="OSErr")
@@ -2788,7 +2792,9 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         journal = Journal(rd)
         journal.append(
             "rearm-baseline-advance-failed",
@@ -2839,7 +2845,9 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
     from bmad_loop.journal import Journal
 
     def rearm_with(restore: bool):
-        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        def fake_rearm(
+            rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        ):
             Journal(rd).append(
                 "rearm-baseline-restamped",
                 story_key=key,
@@ -2893,7 +2901,9 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
     from bmad_loop import runs
     from bmad_loop.journal import JOURNAL_FILE
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         if outcome == "rearm-error":
             raise runs.RearmError("cannot re-open story spec /x/spec.md")
         return key
@@ -2929,7 +2939,9 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         Journal(rd).append(
             "rearm-baseline-restamp-skipped",
             story_key=key,
@@ -2950,19 +2962,36 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
 
 
 def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeypatch, capsys):
-    """An abort is when the residue matters MOST, so the echo lives in a `finally`.
+    """An abort is when the residue matters MOST, so the echo lives in a `finally` — and
+    since the whole re-arm window became one transaction, the echo has to say the re-arm
+    ABORTED as well as what it left behind (DW-85).
 
-    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
-    `RearmError`, so on that path the records are already on disk when the abort
-    happens — and an echo placed after an early `return 1` threw away records the
-    re-arm had genuinely written. The one it threw away is the one that cannot be
-    recovered from anywhere else: `stale-restore-commits` names commits now sitting
-    below a baseline the operator is looking at in a half-run re-arm, and nothing
-    but this line will tell them. The failure and the residue are both true, and the
-    operator needs both to decide what to do with the tree.
+    `runs._stale_restore_residue` journals BEFORE anything that can raise past it, so on
+    an abort those records are already on disk when the fault happens — and an echo
+    placed after an early `return 1` threw away records the re-arm had genuinely written.
+    The one it threw away is the one that cannot be recovered from anywhere else:
+    `stale-restore-commits` names commits now sitting below a baseline the operator is
+    looking at, and nothing but this line will tell them.
+
+    But that line alone MISDESCRIBES the tree once the rollback exists. It says files
+    were "excluded from the re-drive baseline" and commits "sit below the re-drive's new
+    baseline" — a baseline `save_state` never persisted, because the transaction rolled
+    the whole window back. The residue records are true observations of what the re-arm
+    LOOKED at and false as a description of what it LEFT, so `rearm-aborted` is journalled
+    from the rollback and echoed beside them: the operator needs both, and needs to know
+    which one describes the disk.
+
+    The fake journals the two records in the order the real path writes them (the residue
+    pass, then the abort record from `_rollback_rearm`'s `finally`) and then raises, which
+    is what makes the echo's one walk over the new entries the thing under test.
 
     Ablation (residue echo): move `_echo_rearm_events` out of the `finally` back under
     the `try` and the commits assertion reddens while the `error:` line still prints.
+
+    Ablation (abort line): drop the `rearm-aborted` arm from `runs.rearm_event_notice`
+    and the "still escalated" assertion reddens while the commits line still prints —
+    which is exactly the DW-85 state, a true residue notice with nothing saying it
+    describes a baseline that was never saved.
 
     Ablation (success output): deleting the gate outright does NOT grade the last
     assertion. Drop `return 1` from `cmd_resolve`'s `except runs.RearmError` arm and the
@@ -2977,10 +3006,20 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         # journalled first, exactly as the real residue pass is ordered
         Journal(rd).append(
             "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
+        )
+        # ...and then the rollback's own record, from `_rollback_rearm`'s `finally`
+        Journal(rd).append(
+            "rearm-aborted",
+            story_key=key,
+            spec_file="/p/specs/s1.md",
+            error="OSError: [Errno 28] No space left on device",
+            rollback="restored",
         )
         raise runs.RearmError("could not re-stamp the spec baseline")
 
@@ -2993,6 +3032,11 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
     out, err = capsys.readouterr()
     assert "error: could not re-stamp the spec baseline" in err  # the abort still reports
     assert "2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    # ...and the line that says the baseline those commits sit below was never persisted
+    assert "the re-arm ABORTED" in err
+    assert "nothing was persisted" in err
+    assert "still escalated" in err
+    assert "/p/specs/s1.md" in err
     assert "re-armed" not in out  # ...and the failure is not dressed up as a success
 
 
@@ -3032,7 +3076,9 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     from bmad_loop.journal import Journal
 
     def rearm_journalling(kind, **fields):
-        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        def fake_rearm(
+            rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+        ):
             Journal(rd).append(kind, story_key=key, **fields)
             return key
 
@@ -3099,7 +3145,9 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         journal = Journal(rd)
         journal.append(  # table row with a next_step
             "rearm-baseline-advance-failed",
@@ -3127,6 +3175,55 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
     assert commits.endswith("revert them now")
 
 
+def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys):
+    """The failed commits probe reaches stderr, imperative and all (DW-81).
+
+    Before it had a record, a probe that FAILED and a probe that found nothing were
+    byte-identical here: neither journalled, so neither printed, and the operator was
+    never told that the abandoned attempt's commits might be sitting under the
+    re-drive's new baseline unreverted. Graded on this surface specifically because
+    it is the one that appends `next_step` — the TUI drops it — and because the
+    record is warn-only by contract, so an echo is the only place it can ever appear.
+
+    Ablation: delete the `rearm-commits-probe-failed` row from
+    `runs.rearm_event_notice` and the line is not printed at all, so `next(...)`
+    raises `StopIteration`; drop `tail` from `_echo_rearm_events`' f-string and only
+    the `endswith` reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+    baseline = "b" * 40
+
+    def fake_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
+        Journal(rd).append(
+            "rearm-commits-probe-failed",
+            story_key=key,
+            old_baseline=baseline,
+            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: "
+            "not a git repository",
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    probe = next(ln for ln in lines if "could not list the commits above" in ln)
+    assert probe.startswith("warning: ")  # advisory severity, rendered as the prefix
+    assert "bbbbbbbbbbbb.." in probe and "b" * 40 not in probe  # truncated, not raw
+    assert "not a git repository" in probe  # the typed cause survives the echo
+    assert probe.endswith(
+        "; Fix the Git failure, then check `git log bbbbbbbbbbbb..HEAD` before resuming"
+    )
+
+
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state
@@ -3135,7 +3232,9 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     _escalated_run(tmp_path, "r1")
     calls = {}
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: calls.setdefault("ctx", True))
+    monkeypatch.setattr(
+        resolve, "build_context", lambda *a, **k: (calls.setdefault("ctx", True), 0, 0)
+    )
     monkeypatch.setattr(
         resolve, "run_session", lambda *a, **k: calls.setdefault("session", True) or True
     )
@@ -3176,7 +3275,7 @@ def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkey
         return True
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     # --no-resume: re-arm only, so the bump this row contrasts against still runs
     assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
@@ -3190,7 +3289,14 @@ def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
 
     _escalated_run(tmp_path, "r1")
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    # DW-11: a NON-ZERO withheld count, deliberately. This command is about to fail,
+    # and an operator must not be told escalations were withheld from an agent that
+    # never launched — which is why the count is printed AFTER the adapter has proved
+    # it supports an interactive session, not beside the context build.
+    #
+    # Ablation: move the withheld print above the `try:` and this row reddens on the
+    # stdout assertion below.
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 3, 0))
 
     def boom(*a, **k):
         raise NotImplementedError
@@ -3198,7 +3304,388 @@ def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(resolve, "run_session", boom)
     rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
     assert rc == 1
-    assert "no interactive session mode" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "no interactive session mode" in captured.err
+    assert "were not shown" not in captured.out
+
+
+def _withheld_line(out: str) -> str:
+    (line,) = [ln for ln in out.splitlines() if "were not shown" in ln]
+    return line
+
+
+def test_resolve_reports_the_escalations_it_withheld(tmp_path, monkeypatch, capsys):
+    """The number an operator reads is `build_context`'s OWN second member, not a
+    constant and not a re-derivation. Seeded to 3 so a hardcoded 1 (or a length of
+    something else) cannot pass, and worded for what the code can prove: these entries
+    were PRESENTED to an earlier cycle that recorded a resolution.
+
+    Ablation: delete the `if withheld:` print from `cmd_resolve` and this reddens."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 3, 0))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: True)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    line = _withheld_line(capsys.readouterr().out)
+    assert line.startswith("3 earlier escalation(s) for s1 were not shown")
+    assert "recorded a resolution" in line
+
+
+def test_resolve_says_nothing_when_it_withheld_nothing(tmp_path, monkeypatch, capsys):
+    """A first cycle, and every pre-upgrade `state.json`, withholds nothing — and must
+    print nothing, or the line becomes noise on the surface it exists to inform.
+
+    `launching resolve agent` is the positive control: an absence assertion passes for
+    every reason stdout could be empty, including a command that returned before it
+    ever reached the print.
+
+    Ablation: make the print unconditional (drop `if withheld:`) and this reddens."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: True)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    out = capsys.readouterr().out
+    assert "launching resolve agent for s1" in out  # the path WAS taken
+    assert "were not shown" not in out
+
+
+def test_resolve_no_interactive_builds_no_context_and_reports_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """`--no-interactive` runs no agent, so there is no context to filter and no
+    audience for the count. It also accepted nothing IN THIS GESTURE, so the watermark
+    must stand — the human may have fixed the spec by hand, but nothing recorded which
+    escalations that answered. The generation bump is the positive control that the
+    re-arm really ran.
+
+    The run carries a session record deliberately: on a task with an EMPTY `sessions`
+    list an unconditional stamp writes `len([]) == 0`, so `escalations_resolved_upto ==
+    0` would hold with the gate ablated and the assertion would grade nothing."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, "r1", details=("never answered",))
+    built: list[int] = []
+    monkeypatch.setattr(
+        resolve, "build_context", lambda *a, **k: (built.append(1), (None, 5, 0))[1]
+    )
+
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--no-resume"])
+        == 0
+    )
+
+    assert built == []
+    assert "were not shown" not in capsys.readouterr().out
+    task = load_state(run_dir).tasks["s1"]
+    assert len(task.sessions) == 1  # a stamp here would be a VISIBLE 1
+    assert task.escalations_resolved_upto == 0
+    assert task.generation == 1  # positive control: the re-arm ran
+
+
+def _escalated_trail_run(tmp_path, run_id="r1", *, details=("first cycle",)):
+    """An escalated run whose task carries one completed session record per entry in
+    `details`, each with the `tasks/<id>/escalation.json` the engine wrote when it
+    paused. Nothing about the escalation walk is stubbed by the rows that use it."""
+    import json as _json
+
+    from bmad_loop.engine import _session_task_id
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import SessionRecord
+
+    run_dir = _escalated_run(tmp_path, run_id)
+    state = load_state(run_dir)
+    task = state.tasks["s1"]
+    task.sessions.clear()
+    for seq, detail in enumerate(details, start=1):
+        task_id = _session_task_id("s1", "review", seq, 0)
+        task.record_session(SessionRecord(task_id=task_id, role="dev", status="completed"))
+        d = run_dir / "tasks" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "escalation.json").write_text(
+            _json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
+            encoding="utf-8",
+        )
+    save_state(run_dir, state)
+    return run_dir
+
+
+def _redrive_escalates(run_dir, detail):
+    """What a re-driven session that escalated again leaves behind, re-escalated so a
+    second `bmad-loop resolve` is legal on it."""
+    import json as _json
+
+    from bmad_loop.engine import _session_task_id
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, SessionRecord
+
+    state = load_state(run_dir)
+    task = state.tasks["s1"]
+    task_id = _session_task_id("s1", "review", 1, task.generation)
+    assert task_id not in {r.task_id for r in task.sessions}
+    task.record_session(SessionRecord(task_id=task_id, role="dev", status="completed"))
+    d = run_dir / "tasks" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "escalation.json").write_text(
+        _json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
+        encoding="utf-8",
+    )
+    task.phase = Phase.ESCALATED
+    save_state(run_dir, state)
+
+
+def _marker_writing_session(run_dir_marker=True):
+    from bmad_loop import resolve
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if run_dir_marker:
+            marker.write_text("{}", encoding="utf-8")
+        return run_dir_marker
+
+    return fake_session
+
+
+def test_resolve_prints_the_number_the_real_walk_produced(tmp_path, monkeypatch, capsys):
+    """Every other CLI row here stubs `build_context` to a literal, so the number an
+    operator actually sees is otherwise never produced by the real walk. This row runs
+    two whole cycles with only `_make_adapters` and `run_session` stubbed: the first
+    shows both escalations and withholds nothing, the re-arm stamps the watermark, the
+    re-drive escalates again, and the second cycle prints the count `_gather_escalations`
+    computed — against a `context.json` that carries only the new entry.
+
+    Ablation: revert `_gather_escalations` to the unsliced walk and the second cycle
+    prints nothing while `context.json` carries all three."""
+    import json as _json
+
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("older A", "older B"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session())
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-resume"]
+    assert cli.main(argv) == 0
+    first = capsys.readouterr().out
+    assert "launching resolve agent for s1" in first
+    assert "were not shown" not in first  # a first cycle withholds nothing
+    assert load_state(run_dir).tasks["s1"].escalations_resolved_upto == 2
+
+    _redrive_escalates(run_dir, "raised by the re-drive")
+
+    assert cli.main(argv) == 0
+    assert _withheld_line(capsys.readouterr().out).startswith(
+        "2 earlier escalation(s) for s1 were not shown"
+    )
+    ctx = _json.loads(resolve.context_path(run_dir, "s1").read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised by the re-drive"]
+
+
+def test_resolve_withholds_coverage_when_a_session_artifact_could_not_be_read(
+    tmp_path, monkeypatch, capsys
+):
+    """The whole F1 channel, unstubbed past `_make_adapters` and `run_session`: the
+    walk skips an unreadable artifact, `build_context` reports the skip, and
+    `cmd_resolve` refuses to record coverage over it.
+
+    Without the refusal the watermark would stamp `len(task.sessions)` — covering the
+    session whose escalations this cycle never showed anyone — and the NEXT cycle,
+    reading the same file cleanly, would withhold them as already answered. The
+    escalation is then invisible for the rest of the run.
+
+    The second cycle is the proof and the reason a one-cycle assertion is not enough:
+    it repairs the artifact and re-runs, and the escalation that was skipped comes back
+    SHOWN rather than counted as withheld.
+
+    `re-armed s1` is the positive control on both cycles — the refusal withholds
+    coverage, never the re-arm itself.
+
+    Ablation: restore `resolution_recorded = bool(produced)` and this reddens at the
+    first cycle's watermark (1 != 0), and again on the second cycle's shown list."""
+    import json as _json
+
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("raised then unreadable",))
+    task_id = load_state(run_dir).tasks["s1"].sessions[0].task_id
+    artifact = run_dir / "tasks" / task_id / "escalation.json"
+    good = artifact.read_bytes()
+    artifact.write_bytes(b'{"escalations": [\xff\xfe]}')
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session())
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-resume"]
+
+    assert cli.main(argv) == 0
+    first = capsys.readouterr()
+    assert "re-armed s1" in first.out  # the re-arm itself was NOT withheld
+    assert "could not be read" in first.err
+    assert "NOT recorded as covering" in first.err
+    task = load_state(run_dir).tasks["s1"]
+    assert task.escalations_resolved_upto == 0  # nothing claimed
+    assert task.generation == 1  # positive control: the gesture really re-armed
+
+    # the transient fault clears; the escalation is still there to be answered
+    artifact.write_bytes(good)
+    _redrive_escalates(run_dir, "raised by the re-drive")
+    assert cli.main(argv) == 0
+    second = capsys.readouterr()
+    assert "re-armed s1" in second.out
+    assert "were not shown" not in second.out  # nothing was ever covered, so nothing hides
+    ctx = _json.loads(resolve.context_path(run_dir, "s1").read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == [
+        "raised by the re-drive",
+        "raised then unreadable",  # the one the first cycle could not show
+    ]
+    assert load_state(run_dir).tasks["s1"].escalations_resolved_upto == 2  # now covered
+
+
+def test_resolve_says_nothing_about_unreadable_artifacts_when_none_were_skipped(
+    tmp_path, monkeypatch, capsys
+):
+    """The ordinary run: a clean run-dir prints no coverage warning and records
+    coverage exactly as before. Without this row the refusal could fire on every
+    resolve and every existing count row would still pass.
+
+    Ablation: drop the `if produced and unreadable:` guard (print unconditionally) and
+    this reddens; invert `resolution_recorded` to `bool(produced) and unreadable` and it
+    reddens on the watermark."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("first cycle",))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session())
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    captured = capsys.readouterr()
+    assert "launching resolve agent for s1" in captured.out  # the path WAS taken
+    assert "could not be read" not in captured.err
+    assert load_state(run_dir).tasks["s1"].escalations_resolved_upto == 1
+
+
+def test_resolve_records_no_coverage_for_a_skip_when_the_agent_wrote_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """The warning is gated on `produced` as well as on the skip: with no resolution
+    recorded the watermark would not have advanced anyway, so telling the operator a
+    coverage was withheld describes a loss they never had. The `no resolution recorded`
+    line is the positive control that this IS the abandoned-session path.
+
+    Ablation: drop the `produced and` half of the print guard and this reddens."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("raised",))
+    task_id = load_state(run_dir).tasks["s1"].sessions[0].task_id
+    (run_dir / "tasks" / task_id / "escalation.json").write_bytes(b'{"escalations": [\xff]}')
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session(run_dir_marker=False))
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    err = capsys.readouterr().err
+    assert "no resolution recorded for s1" in err  # the abandoned-session path
+    assert "could not be read" not in err
+    assert load_state(run_dir).tasks["s1"].escalations_resolved_upto == 0
+
+
+def test_resolve_reports_the_withheld_count_when_this_cycle_records_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """A watermark already standing filters whatever THIS gesture accepts. The two
+    halves are independent — `withheld` comes from the walk over what an EARLIER cycle
+    answered, the stamp from what this one did — but no row paired them: the rows that
+    assert a number run a marker-writing resolver, and the abandoned-session row asserts
+    the line's ABSENCE at watermark 0. So a print gated on `resolution_recorded`, or a
+    count recomputed after the stamp, went ungraded.
+
+    Ablation: gate the withheld print on `resolution_recorded` in `cmd_resolve` and this
+    row reddens on the missing line while every existing count row stays green."""
+    import json as _json
+
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("older A", "older B"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session())
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-resume"]
+    assert cli.main(argv) == 0  # cycle 1 accepts, stamping the watermark at 2
+    capsys.readouterr()
+    _redrive_escalates(run_dir, "raised by the re-drive")
+
+    # cycle 2 walks away without writing `resolution.json`. The marker cycle 1 wrote is
+    # still on disk — nothing unlinks it at re-arm — which is the state this path opens
+    # on for real, and the stub does not clear it either.
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session(run_dir_marker=False))
+    assert cli.main(argv) == 0
+    out = capsys.readouterr()
+    assert _withheld_line(out.out).startswith("2 earlier escalation(s) for s1 were not shown")
+    assert "no resolution recorded for s1" in out.err
+
+    task = load_state(run_dir).tasks["s1"]
+    assert task.escalations_resolved_upto == 2  # UNCHANGED by a gesture that accepted none
+    assert task.generation == 2  # positive control: it still re-armed
+    ctx = _json.loads(resolve.context_path(run_dir, "s1").read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["raised by the re-drive"]
+
+
+def test_resolve_leaves_the_watermark_when_the_agent_wrote_no_resolution(
+    tmp_path, monkeypatch, capsys
+):
+    """`cmd_resolve` prints "no resolution recorded" and FALLS THROUGH — no `return` —
+    so an abandoned or crashed resolve session re-arms the story anyway. That gesture
+    accepted nothing, so it must not advance the watermark: the escalations the agent
+    walked away from would otherwise be invisible to every later cycle and reported to
+    the operator as already answered.
+
+    Driven as a whole SECOND cycle through the real walk, because the consequence is
+    what the next `resolve` shows, not what one field reads.
+
+    Ablation: remove the `if resolution_recorded:` gate in `rearm_escalation` and this
+    reddens on the watermark, then again on the second cycle's absent line."""
+    import json as _json
+
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_trail_run(tmp_path, details=("nobody ever answered this",))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "run_session", _marker_writing_session(run_dir_marker=False))
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-resume"]
+    assert cli.main(argv) == 0
+    assert "no resolution recorded for s1" in capsys.readouterr().err
+
+    task = load_state(run_dir).tasks["s1"]
+    assert task.escalations_resolved_upto == 0  # UNCHANGED
+    assert task.generation == 1  # positive control: the re-arm still ran
+
+    _redrive_escalates(run_dir, "raised by the re-drive")
+
+    assert cli.main(argv) == 0
+    assert "were not shown" not in capsys.readouterr().out
+    ctx = _json.loads(resolve.context_path(run_dir, "s1").read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == [
+        "raised by the re-drive",
+        "nobody ever answered this",
+    ]
 
 
 def test_resolve_in_ctl_session_detaches_before_resume(tmp_path, monkeypatch, capsys):
@@ -3431,7 +3918,7 @@ def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
         return True
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     called: list = []
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
@@ -3615,7 +4102,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
         return True
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
     rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
@@ -3675,12 +4162,14 @@ def test_resolve_rereads_isolation_after_the_agent_session(
 
     seen: list[bool] = []
 
-    def recording_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+    def recording_rearm(
+        rd, key, *, restore_patch=None, isolated_redrive=False, resolution_recorded=False
+    ):
         seen.append(isolated_redrive)
         return key
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
@@ -3713,7 +4202,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
         return True
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     called: list = []
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
@@ -3744,7 +4233,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
         return True
 
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
-    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(resolve, "run_session", fake_session)
     called: list = []
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
@@ -5056,7 +5545,7 @@ def test_diagnose_json_emits_pure_document(project, capsys):
 
     _seed_run(project.project)
     doc = machine_json(["diagnose", "--project", str(project.project), "--json"], capsys)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 3
     assert doc["runs"], "the document carries the run it resolved"
     for canary in CANARIES:
         assert canary not in json.dumps(doc), f"LEAK via CLI: {canary!r}"
@@ -5076,7 +5565,7 @@ def test_diagnose_json_out_writes_document_and_keeps_stdout_empty(project, tmp_p
     assert "written to" in err  # the confirmation moved to stderr
     written = out_file.read_text()
     doc = json.loads(written)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 3
     assert "```" not in written  # no fences in a file written in JSON mode
     for canary in CANARIES:
         assert canary not in written, f"LEAK via CLI: {canary!r}"

@@ -9,6 +9,13 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
+  The warn-only probe that lists the commits an abandoned attempt left below the re-drive's
+  new baseline used to swallow its `GitError` and write nothing — byte-identical to finding
+  no commits at all. It now records the baseline and the typed error, and both operator
+  surfaces render it through `runs.rearm_event_notice`. Advisory: it does not hold the
+  resume.
+
 - **Review-gate verify commands are journalled** (#656, partial). The three review gates
   (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
   `verify-command-result` per command, `verification_stage: "review"`, sharing the story's
@@ -21,6 +28,18 @@ breaking changes may land in a minor release.
   reintroduce #695's project-vs-repo root split; the guard now fails and names the file and
   line. Deliberately not widened to `run_verify_commands`, which has three legitimate callers
   on two roots.
+
+- **Source-scan parity guards for three invariants previously held only by docstring prose**
+  (DW-65, DW-66, DW-82). The task-directory artifact names move to one shared
+  `journal.TASK_CYCLE_ARTIFACTS` that both adapters and `resolve._gather_escalations` iterate,
+  and `tests/test_portability_guard.py` gains three detectors: a bare artifact literal outside
+  that constant, a session task id composed outside `engine._session_task_id`, and a journal
+  field name that neither `diagnostics`' redaction tables route nor the benign inventory
+  declares. Each carries positive and negative probes so a detector that stops detecting cannot
+  read as green, and an unresolvable `journal.append(**splat)`, a journal write whose kind is
+  not a string literal, and a benign entry whose producer has been deleted all fail loud rather
+  than being skipped. Journal field routing is graded per kind where `diagnostics` routes per
+  kind, and a declared forwarder's call sites (`plugins/bus.py::_log`) enter the inventory.
 
 - **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
   so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
@@ -57,6 +76,12 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **`bmad-loop diagnose --json` reports `schema_version: 3`.** Replacing a journal-entry value
+  with a presence key is a payload break under the additive-only rule, and the redaction fixes
+  above make two: a consumer reading `entry["question"]` on `decision-pending`, or an
+  off-schema key on `preference-escalation`, finds a `<name>_present` boolean instead. Exactly
+  what minted v2 for `patch` / `stashed_to`. Structure is otherwise unchanged.
 
 - **A story's `verification_sequence` now numbers its review passes too**, so the ordinals a
   `post_dev_verify` handler receives shift: for an unchanged run whose review gate sits between
@@ -207,9 +232,82 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An artifact the escalation walk cannot stat is recorded as unreadable rather than absent**
+  (DW-11). `resolve._gather_escalations` classified each task-cycle artifact with
+  `Path.is_file()` outside its guard, and that probe's answer to EACCES splits by interpreter.
+  Through 3.13 it re-raises anything outside `pathlib._IGNORED_ERRNOS`, so an artifact under an
+  unreadable directory escaped `build_context` and `cmd_resolve` to the top-level backstop as
+  `error: [Errno 13] ...` — a read fault ending the interactive command this reader's contract
+  says it must survive. On 3.14, where the body became `os.path.isfile`, the same fault was
+  swallowed as absence instead: the skip sink stayed empty, so the caller recorded coverage and
+  `escalations_resolved_upto` withheld every CRITICAL entry under that directory permanently.
+  Classification is now `stat`, which answers with an errno — ENOENT and ENOTDIR are genuine
+  absence and still cost nothing, while EACCES, EIO, ESTALE and EBADF join the shown-side skip
+  sink. ELOOP moves with them — the one reading that changes on every interpreter rather than
+  one, since a symlink cycle answered False through 3.13 (ELOOP is in the ignored tuple) and on
+  3.14 (`os.path.isfile` swallows it): a degrade withholds coverage rather than being laundered
+  into a durable claim. The regular-file check stays, because `stat` succeeds where `is_file()`
+  answered False — without it a directory at an artifact path would raise `IsADirectoryError`,
+  and a FIFO would block the read forever, wedging the interactive command.
+- **An aborted re-arm no longer leaves the spec re-armed against an escalated task**
+  (DW-79, DW-83, DW-85). `runs.rearm_escalation` published the status flip and stripped the
+  stale `## Auto Run Result` about 250 lines before `save_state`, and only two of the aborts
+  in that window undid those writes — a failing `journal.append` from the stale-restore
+  residue pass, a non-git fault from the commits probe, or a failing `save_state` each escaped
+  with the spec flipped on disk while persisted state still said ESCALATED. The window is now
+  one transaction with `save_state` as its single commit point: any fault — an interrupt
+  included, which is why the guard catches `BaseException` — restores the spec's BYTES to what
+  the re-arm found and re-raises the original fault unchanged. Clearing a stories sentinel is
+  deliberately outside that scope: it unlinks a file rather than writing spec bytes, and
+  `_clear_sentinel` already preserves a copy and is idempotent on retry. The rollback journals
+  `rearm-aborted` carrying `restored`, `unchanged` (proved byte-identical), `failed` or
+  `unknown`, which `resolve` and the TUI render through the one shared routing table — so the
+  residue notices they echo from a `finally` can no longer describe files as excluded from a
+  baseline that was never saved, and an outcome the undo could not confirm (the cleared
+  sentinel among them) reports the abort without claiming the file is intact. A rollback that
+  cannot write still raises, naming the possibly part-written spec to restore from git _or_
+  your own copy — an untracked or out-of-checkout spec has no committed version to recover —
+  with the original fault kept in the exception chain. The undo picks its writer the same
+  lexical way the three spec writers it undoes do, so a spec in an artifacts folder configured
+  outside the checkout is restored rather than refused; it declines to write at all when the
+  spec's bytes could not be CAPTURED from a file that is there and that the re-drive will
+  actually read, since a transient read fault followed by successful writes would leave a
+  published flip with nothing to put back; and it leaves a re-arm whose `save_state`
+  demonstrably committed alone, because that rename can be interrupted on the way out and
+  undoing the spec beneath it mirrors the same defect. An ORDINARY failure of the abort
+  record's OWN journal write is suppressed whatever its type, so an observation that cannot
+  be made never replaces the fault the operator is being told about — an interrupt still
+  leaves, since by then the rollback has already run and the operator asked to stop.
+
+- Stop an LLM-authored preference escalation from aborting the review leg. `_review_and_commit`
+  splats a review session's own `result.json` escalation entries into `journal.append`, so a
+  result.json carrying a `kind` or `story_key` key raised `TypeError: got multiple values for
+argument` and failed the story; a `ts` key did not raise and instead silently replaced the
+  entry's real timestamp, skewing every relative offset a diagnostic dump derives from it. Those
+  three journal-owned names are now dropped before the splat.
+
+- Close three journal-field leaks into `diagnose`, all found by the new field-routing guard and
+  each reproduced through `diagnostics._scrub_entry`. On `preference-escalation`, whose keys are
+  LLM-authored (`engine._review_and_commit` splats a session's own `result.json` entries into
+  the journal), every key outside the record's declared `{type, severity, detail}` schema now
+  renders as `<name>_present`; the key NAME still ships, a bound stated on the routing entry and
+  accepted rather than collapsed. `decision-pending`'s `question` joins the free-text drop set —
+  a multi-word question collapsed only by accident of the fallback forbidding spaces, while a
+  one-token one shipped verbatim; no operator surface loses it, since the TUI reads the raw
+  journal. And `story_keys` is aliased element-wise on `sweep-inflight-stranded`, which carried
+  raw bundle story keys because the value fell through to `scrub_json` — the identity on a list
+  of identifier-shaped strings — while the singular `story_key` beside it was already aliased;
+  a non-list value on any key-list field now fails closed instead of taking that same path.
+- Stop a second resolve cycle re-presenting escalations the human already answered
+  (DW-11). Only a re-arm that accepted a `resolution.json` watermarks the session
+  trail; later cycles show what came after it and print how many were withheld. A
+  cycle whose walk could not read a session artifact records no coverage at all, so
+  a transient read fault no longer buries the escalations it hid.
 - Emit `diagnose --json` v2, replacing journal `patch` / `stashed_to` paths with
   `patch_present` / `stashed_to_present`, and silently degrade Git stale-commit probe
   failures while propagating non-Git faults.
+- De-duplicate interactive-resolution escalations across repeated task IDs and mirrored
+  artifacts, and skip malformed artifacts without aborting resolution.
 - Prevent escalated sweep restarts from reusing abandoned session ids, and clear stale
   `escalation.json` artifacts when either adapter reuses a task directory.
 - Route interactive resolve task ids through the shared whole-composition sanitizer while

@@ -2965,10 +2965,16 @@ def _resolve_restore_patch(
 
 
 def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
-    """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
-    residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
-    `rearm-*` records the status flip, the advance and the re-stamp write. The commits
-    variant is the one the human must act on — nothing else will.
+    """Surface the events a just-completed re-arm journaled: the residue of the restore
+    attempt it abandoned — the `stale-restore-*` records AND `rearm-commits-probe-failed`,
+    all written by `runs._stale_restore_residue` — and the `rearm-*` records the status
+    flip, the advance and the re-stamp write. Split by PRODUCER, not on the prefix,
+    because the prefix does not partition them: the commits probe's failure record is
+    spelled `rearm-*` for the re-arm it degrades, not for the abandoned restore it
+    measures. The commits pair is what the human must act on — nothing else will tell
+    them — and it takes both, because `stale-restore-commits` is written only when the
+    probe ANSWERED: without its twin, that record's absence reads as "clean" whether or
+    not anyone could tell.
 
     Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
     echo and now carries the baseline family too, so a name from the narrower era
@@ -3098,10 +3104,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             print(err, file=sys.stderr)
             return 1
 
+    # DW-11: whether THIS gesture accepted a resolution, which is what gates the
+    # `escalations_resolved_upto` watermark in `runs.rearm_escalation`. False here
+    # covers `--no-interactive` deliberately: that path accepted nothing IN THIS
+    # GESTURE (the human may have fixed the spec by hand, but nothing recorded which
+    # escalations that answered), so the next cycle shows everything — today's
+    # behavior, and the safe direction. Not derived from `resolution.json`: the marker
+    # survives the re-arm that consumed it, so its presence says nothing about this
+    # gesture.
+    resolution_recorded = False
     if args.interactive:
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
-        resolve.build_context(state, run_dir, story_key, isolation=pol.scm.isolation)
+        _ctx_path, withheld, unreadable = resolve.build_context(
+            state, run_dir, story_key, isolation=pol.scm.isolation
+        )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -3123,6 +3140,46 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        # DW-11, second half. `produced` alone is not enough to record coverage,
+        # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
+        # covers every recorded session, INCLUDING the ones whose artifacts this walk
+        # could not read. `_gather_escalations` degrades on those by design (an
+        # observation path must not raise out of an interactive command), but the
+        # watermark turns that transient silence into a durable claim: the next cycle
+        # reads the file fine and withholds it as already answered. So a skipped
+        # artifact withholds COVERAGE instead. The cost is one repeated presentation;
+        # the alternative cost is an escalation nobody ever sees.
+        resolution_recorded = bool(produced) and not unreadable
+        # DW-11. Reported to the operator, never into `context.json`: filtering the
+        # agent's list silently would trade one misleading surface for another — the
+        # human would have no way to tell "nothing else was ever raised" from "the rest
+        # is hidden". Worded for what the code can prove: these entries were PRESENTED
+        # to an earlier resolve cycle that recorded a resolution — not that any
+        # particular one of them was individually answered.
+        #
+        # Printed here rather than beside the context build, because until
+        # `run_session` returns without `NotImplementedError` this adapter is not known
+        # to support an interactive session at all — and an operator whose command is
+        # about to fail must not be told escalations were withheld from an agent that
+        # never launched.
+        if withheld:
+            print(
+                f"{withheld} earlier escalation(s) for {story_key} were not shown to the "
+                "agent: they were presented to an earlier resolve cycle that recorded a "
+                "resolution"
+            )
+        if produced and unreadable:
+            # Only when a resolution WAS produced: with nothing recorded the watermark
+            # would not have advanced anyway, and reporting a withheld coverage the
+            # operator never had is noise. Counts, not paths — the operator's action is
+            # the same for one unreadable artifact as for five, and the run-dir names
+            # are not theirs to chase.
+            print(
+                f"{unreadable} session artifact(s) for {story_key} could not be read, so "
+                "this resolution was NOT recorded as covering the escalations they hold "
+                "— the next resolve will show every escalation for this story again",
+                file=sys.stderr,
+            )
         if not produced:
             print(
                 f"no resolution recorded for {story_key} (agent did not write resolution.json)",
@@ -3227,6 +3284,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             story_key,
             restore_patch=restore_patch,
             isolated_redrive=pol.scm.isolation == "worktree",
+            resolution_recorded=resolution_recorded,
         )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -3235,8 +3293,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # In the `finally`, not after the `try`: `_stale_restore_residue` journals
         # BEFORE the re-stamp block that raises `RearmError`, so on that path the
         # records were already written and returning early threw them away — including
-        # `stale-restore-commits`, the one record whose whole point is that nothing
-        # else will tell the human. An abort is when that residue matters most: the
+        # the commits PAIR (`stale-restore-commits` when the probe answered,
+        # `rearm-commits-probe-failed` when it could not), whose whole point is that
+        # nothing else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
         hold_resume = _echo_rearm_events(run_dir, before_entries)
     print(

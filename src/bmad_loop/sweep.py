@@ -543,10 +543,15 @@ def _rearm_generation(task: StoryTask) -> None:
     what makes the next dispatch re-mint ``attempt == 1`` — an id byte-equal to the
     abandoned attempt's, since ``engine._session_task_id`` emits its discriminator only
     above zero. The artifact a shared id corrupts is ``tasks/<id>/escalation.json``: the
-    sweep skill writes it and ``resolve._gather_escalations`` reads it once per RECORDED
-    session, so two records carrying one id return the abandoned cycle's escalation for
-    the fresh session too. ``result.json`` is NOT at risk: both adapters unlink it in
-    ``start_session``.
+    sweep skill writes it, and two records carrying one id both name that one mutable
+    file, so the abandoned cycle's escalation is the fresh session's too.
+    ``resolve._gather_escalations`` now opens each distinct ``task_id`` once and
+    de-duplicates entries by content, so it no longer reports the same aliased file
+    twice. Both adapters also unlink cycle outputs in ``start_session``, which stops a
+    healthy restart from inheriting stale contents — but cleanup still leaves the two
+    historical records naming one mutable directory: a healthy restart erases the
+    abandoned cycle's artifact, while a re-escalation replaces it for both records.
+    Minting a fresh id is what preserves one artifact namespace per recorded cycle.
 
     Same pattern as ``runs.rearm_escalation``, DIFFERENT reason: #705's harm is
     ``_resumable_session`` verdict replay, which runs only on the dev/review phases and

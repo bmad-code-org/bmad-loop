@@ -455,8 +455,11 @@ def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bo
     46-byte spec to 12.
 
     The write is CONFINED, and this is the canonical statement of the rule the
-    three spec writers share (`verify.set_frontmatter_field` and
-    `devcontract._atomic_write_spec` restate it by reference):
+    FOUR writers of a spec's bytes share (`verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` restate it by reference; `runs._restore_rearmed_spec`
+    — the re-arm transaction's UNDO — implements it so it can put back exactly what the
+    other three published, and a spec they can write but it refuses is the transaction's
+    write set going unhonoured):
 
     * A spec path under ``confine_root`` goes through
       `platform_util.atomic_write_bytes_confined`, which walks the components

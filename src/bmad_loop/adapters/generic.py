@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
-from ..journal import LOGS_DIR
+from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
@@ -543,10 +543,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
         # Task ids are supplied by the caller, so defensively reset cycle-scoped
         # outputs if one is reused. A silent session must not inherit a stale result.
-        (task_dir / "result.json").unlink(missing_ok=True)
-        # The sweep skill also writes escalation.json here, and
-        # `resolve._gather_escalations` reads it alongside result.json.
-        (task_dir / "escalation.json").unlink(missing_ok=True)
+        # The list is `journal.TASK_CYCLE_ARTIFACTS` rather than two literals here:
+        # `resolve._gather_escalations` reads the same names back, so a third
+        # artifact must not be able to reach the reader while missing this adapter.
+        for artifact in TASK_CYCLE_ARTIFACTS:
+            (task_dir / artifact).unlink(missing_ok=True)
 
         self._ensure_session(spec.cwd)
         # Stamped before launch: hook events carry wall-clock ns, and

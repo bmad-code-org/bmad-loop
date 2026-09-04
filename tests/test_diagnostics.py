@@ -599,12 +599,19 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    # The OTHER three kinds `runs.rearm_escalation` journals `spec_file` on. Routing is
+    # The OTHER four kinds the re-arm family journals `spec_file` on. Routing is
     # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
     # `rearm-baseline-restamped` and are correct today for free — which is exactly why
     # they belong in the sweep: the canary is what catches a field added to one of
-    # these kinds later, and a sweep that covers two of four grades the routing of a
+    # these kinds later, and a sweep that covers two of five grades the routing of a
     # record shape nobody re-checks.
+    #
+    # `rearm-aborted` is the fifth and the one written by a DIFFERENT function
+    # (`runs._rollback_rearm`, from the transaction guard's error path) rather than by
+    # `rearm_escalation` itself — the divergence that made the routing entry's own
+    # producer note undercount. It carries two fields the others do not: `error`, which
+    # the free-text drop set reaches, and `rollback`, a literal enum string that is
+    # declared benign rather than routed and must therefore still ship VERBATIM.
     siblings = [
         diagnostics._scrub_entry(
             {"ts": 3.0, "kind": kind, "story_key": STORY_KEY, "spec_file": SPEC_ABS, **extra},
@@ -616,11 +623,20 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
             ("rearm-spec-write-unreachable", {"target_branch": REARM_BRANCH}),
             ("rearm-spec-flip-skipped", {"status": "ready-for-dev"}),
             ("rearm-baseline-restamp-skipped", {"baseline": SHA}),
+            (
+                "rearm-aborted",
+                {"error": f"OSError: cannot write {HOME_PATH}/spec.md", "rollback": "restored"},
+            ),
         )
     ]
     # every one of them aliases to the SAME alias as the restamped record above: one
     # spec, one alias, however many kinds carry it
-    assert [s["spec_file"] for s in siblings] == [alias, alias, alias]
+    assert [s["spec_file"] for s in siblings] == [alias, alias, alias, alias]
+    # the abort record's own two fields: the free-text one is dropped (it quotes a host
+    # path back), the enum one is deliberately NOT aliased — both surfaces read the
+    # record for `rollback`, so pseudonymizing it would destroy the field's whole point
+    assert "error" not in siblings[3] and siblings[3]["error_present"] is True
+    assert siblings[3]["rollback"] == "restored"
     assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
 
     # `rearm-spec-write-unreachable` names the branch the re-drive cuts its replacement
@@ -641,6 +657,71 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
 
     rendered = json.dumps([advance_failed, restamped, *siblings])
     for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
+    """`old_baseline` is a 40-hex sha on BOTH of `_stale_restore_residue`'s records,
+    and routing is by field NAME, so one entry has to cover both kinds (DW-81).
+
+    It was declared benign in `tests/test_portability_guard.py`'s inventory, which is
+    the misfiling that inventory's own warning describes — "a name carrying a story
+    key, a branch, a sha, a spec filename, a path, or free text belongs in a
+    `diagnostics` table instead" — and the second producer is what forced it.
+
+    The two kinds are graded together rather than one standing in for the other,
+    because the value's whole use is a comparison an operator makes across them: the
+    probe-failure record says "I could not tell you what sits above this sha" and the
+    commits record says "these do". Aliasing one spelling and not the other would
+    destroy that correlation. That is also why the producer was not respelled to the
+    already-routed `baseline` — same sha, two spellings, two aliases in one dump.
+
+    Ablation: drop `"old_baseline"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at
+    the `next(...)` alias lookup with `StopIteration`. The canary sweep is not the
+    grade: depending on its entropy, the fallback may redact a sha as a secret rather
+    than preserving the correlatable alias this table promises.
+
+    `commits` remains deliberately outside this test and outside DW-81's routing
+    change. It is a list on `stale-restore-commits` but an integer count on
+    `rollback-manual-required`; routing it requires a separate, kind-scoped policy.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    probe_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "rearm-commits-probe-failed",
+            "story_key": STORY_KEY,
+            "old_baseline": SHA,
+            "error": f"GitError: git rev-list {SHA}..HEAD failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    commits = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "stale-restore-commits",
+            "story_key": STORY_KEY,
+            "old_baseline": SHA,
+            "commits": ["c" * 40],
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    # aliased, not dropped — the key stays and only the VALUE is replaced
+    assert probe_failed["old_baseline"] == commits["old_baseline"] == alias != SHA
+    # one legend entry for the shared baseline, not one per record spelling
+    assert {orig for ns, orig, _a in pseudo.entries() if ns == "commit"} == {SHA}
+    # the free-text sibling on the probe record quotes both the sha and a host path
+    # back, and is reached by the drop set rather than aliased
+    assert "error" not in probe_failed and probe_failed["error_present"] is True
+
+    rendered = json.dumps([probe_failed, commits])
+    for canary in (SHA, PROPRIETARY, HOME_PATH, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
@@ -892,6 +973,240 @@ def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
 
     rendered = json.dumps([*merges, board])
     for canary in (target_branch, unit_branch, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_stranded_bundle_story_keys_are_aliased_element_wise():
+    """`sweep-inflight-stranded` carries a LIST of story keys, and a list of
+    identifier-shaped strings is the one shape `scrub_json` passes through
+    untouched — `scrub_json(["1-1-acme-auth"]) == ["1-1-acme-auth"]`, verbatim.
+
+    So the plural field needs the same routing as the singular `story_key` beside
+    it, which was already aliased: `_JOURNAL_KEYLIST_FIELDS` reduces a list
+    element-wise, and the namespace selection has to send this one to `story` (not
+    to `dw`, which is only `dw_ids`) or one dump would carry two different aliases
+    for the same story. The epic lookup rides along, exactly as it does for `keys`.
+
+    Ablation: drop `story_keys` from `_JOURNAL_KEYLIST_FIELDS` and the alias
+    assertions redden with the raw keys coming back verbatim; flip the namespace
+    selection back to `"story" if k == "keys" else "dw"` and the cross-field
+    identity assertion reddens (a `dw-` alias for a story key).
+    """
+    other_key = "3.4-AcmeVaultRotation"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-inflight-stranded",
+            "story_keys": [STORY_KEY, other_key],
+        },
+        pseudo,
+        {STORY_KEY: 1, other_key: 3},
+        1.0,
+    )
+    # the SAME story, journalled singular by a neighbouring record, must resolve to
+    # the same alias — that identity is the whole reason this is aliased not dropped
+    singular = diagnostics._scrub_entry(
+        {"ts": 3.0, "kind": "sweep-bundle-recovered", "story_key": STORY_KEY},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert scrubbed["story_keys"] == [singular["story_key"], scrubbed["story_keys"][1]]
+    assert STORY_KEY not in scrubbed["story_keys"]
+    assert other_key not in scrubbed["story_keys"]
+    assert scrubbed["story_keys"][0] != scrubbed["story_keys"][1]
+    # the epic lookup still applies: `Pseudonymizer.alias` prefixes a story alias
+    # with `s<epic>`, so each element carries the epic it was looked up under —
+    # drop the `epic=` argument from the keylist branch and both prefixes become a
+    # bare `story-`
+    assert [a.split("-")[0] for a in scrubbed["story_keys"]] == ["s1", "s3"]
+    # …and nothing landed in the deferred-work namespace, which is where the old
+    # `"story" if k == "keys" else "dw"` selection would have put both of them
+    assert not [orig for ns, orig, _a in pseudo.entries() if ns == "dw"]
+
+    rendered = json.dumps([scrubbed, singular])
+    for canary in (STORY_KEY, other_key, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_scalar_story_keys_fails_closed_instead_of_shipping_verbatim():
+    """`_JOURNAL_KEYLIST_FIELDS` routing was gated on `isinstance(v, list)`, so a
+    SCALAR value on one of those names fell straight through to `scrub_json` — which
+    is the identity on an identifier-shaped string. `story_keys="1-1-acme-auth"` came
+    back verbatim.
+
+    Every producer passes a list today, so this is latent rather than live. That is
+    the argument FOR closing it rather than against: the routing decision would
+    otherwise rest on a survey of producers staying true, and the neighbouring
+    `story_keys` row above is graded on lists only, so nothing would notice.
+
+    Asserted on the raw value's ABSENCE, not on the presence key alone — a
+    presence-key assertion passes for every reason a value could be missing,
+    including the field never having been read.
+
+    Ablation: restore the `and isinstance(v, list)` gate on the `elif` and the
+    absence assertions redden with the raw key coming back."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "sweep-inflight-stranded", "story_keys": STORY_KEY},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert "story_keys" not in scrubbed, "the unknown-shaped value survived under its own name"
+    assert scrubbed["story_keys_present"] is True
+    rendered = json.dumps(scrubbed)
+    assert STORY_KEY not in rendered
+    for canary in CANARIES:
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_off_schema_preference_escalation_keys_are_collapsed_to_presence():
+    """`engine._review_and_commit` splats `escalation.preference_escalations(rj)`
+    into `journal.append`, and those entries come out of a session's own
+    `result.json` — so an LLM chooses the journal FIELD NAMES. No by-name table can
+    route a name nobody can enumerate, and `scrub_json` is the identity on an
+    identifier-shaped scalar, so `customer="AcmeVault"` shipped byte-identical into
+    a dump whose module docstring ends "the dump will be posted publicly".
+
+    `_JOURNAL_KIND_SCHEMAS` declares the record to be `{type, severity, detail}` and
+    collapses everything else on that kind. Both halves are graded here: the
+    off-schema value must be GONE, and the declared fields must NOT be — a policy
+    that flattened the whole record would pass an absence-only assertion while
+    destroying the field the record is read for.
+
+    ACCEPTED RESIDUAL, asserted so it stays honest rather than drifting: the key
+    NAME still reaches the dump as `<name>_present`. That was decided on 2026-08-30
+    over a name-free `unrouted_field_count` collapse; this row PINS it, so a future
+    reader finds it recorded as a decision rather than re-discovering it as a bug.
+
+    Ablation: drop the `preference-escalation` row from `_JOURNAL_KIND_SCHEMAS` and
+    the `AcmeVault` absence assertions redden."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "preference-escalation",
+            "story_key": STORY_KEY,
+            "type": "preference",
+            "severity": "MEDIUM",
+            "detail": "CANARY_ESCALATION prose about " + PROPRIETARY,
+            "customer": "AcmeVault",
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    # the off-schema key: collapsed, and its VALUE gone from the entry entirely
+    assert "customer" not in scrubbed
+    assert scrubbed["customer_present"] is True
+    assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema preference value"
+    # the declared schema is NOT collapsed — these are why the record is read
+    assert scrubbed["type"] == "preference"
+    assert scrubbed["severity"] == "MEDIUM"
+    # `detail` is in the schema but `_JOURNAL_DROP_FIELDS` reaches it first, which is
+    # the intended precedence: a stricter table always wins over this one
+    assert "detail" not in scrubbed and scrubbed["detail_present"] is True
+    # the entry stays correlatable — the kind policy replaces the FALLBACK only, so
+    # every routing rule above it still runs
+    assert scrubbed["story_key"] != STORY_KEY and scrubbed["story_key"].startswith("s1-")
+
+    rendered = json.dumps(scrubbed)
+    for canary in (STORY_KEY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_self_minted_fields_survive_a_declared_schema_kind():
+    """`Journal.append` stamps `log_task`/`log_pos` onto EVERY entry with
+    `setdefault`, including one whose kind carries a declared schema. They are
+    engine-authored, not LLM-authored, so the fail-closed arm must not touch them.
+
+    It did: `log_pos` is outside `{type, severity, detail}`, so a real
+    `preference-escalation` rendered `log_pos_present: true` and the pane-log byte
+    offset was gone — on exactly the records an operator opens a dump to trace.
+    `log_task` was never affected, since aliasing reaches it first; `log_pos` was the
+    only casualty, which is why a test naming the pair would have stayed green.
+
+    The exemption reads `journal.SELF_MINTED_FIELDS` rather than restating the pair,
+    so it cannot drift from the `setdefault` calls that create the fields.
+
+    Ablation: drop the `k not in SELF_MINTED_FIELDS` clause from `_scrub_entry`'s
+    fail-closed arm and the integer assertion reddens with `log_pos_present`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "preference-escalation",
+            "log_task": STORY_KEY,
+            "log_pos": 4096,
+            "type": "preference",
+            "customer": "AcmeVault",
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    # the byte offset survives as an INTEGER — the whole point of the exemption
+    assert scrubbed["log_pos"] == 4096
+    assert "log_pos_present" not in scrubbed
+    # the pane-log task pointer is still aliased, not dropped and not raw
+    assert scrubbed["log_task"] != STORY_KEY and scrubbed["log_task"].startswith("s1-")
+    # ...while the LLM-authored key on the same record is still collapsed, so the
+    # exemption did not widen into a general escape from the fail-closed arm
+    assert "customer" not in scrubbed and scrubbed["customer_present"] is True
+
+    rendered = json.dumps(scrubbed)
+    for canary in (STORY_KEY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_decision_pending_question_is_dropped_not_scrubbed():
+    """`sweep.py` journals `question=decision.question` on `decision-pending`, and it
+    was declared benign. A MULTI-WORD question does collapse — but only by accident
+    of `_IDENTIFIER_RE` forbidding spaces, which is not a property to route on. A
+    ONE-TOKEN question is identifier-shaped and shipped verbatim.
+
+    So it joins `detail`/`reason`/`blocker`/`suggestion`/`note` in
+    `_JOURNAL_DROP_FIELDS`, under the same free-text rule. No user-facing surface
+    loses the text: `tui/data.py`'s `decision_pending` reads the RAW journal on the
+    operator's own machine, not this dump.
+
+    The one-token case is the load-bearing one — grade the multi-word case alone and
+    the row stays green with the routing deleted, because the fallback happens to
+    redact it.
+
+    Ablation: drop `question` from `_JOURNAL_DROP_FIELDS` and the one-token absence
+    assertion reddens (the multi-word one does not — which is the point)."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    one_token = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "decision-pending", "dw_id": "DW-7", "question": "AcmeVault"},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "question" not in one_token
+    assert one_token["question_present"] is True
+    assert "AcmeVault" not in json.dumps(one_token), "LEAK: one-token decision question"
+    # the dw id beside it is untouched — it is the record's correlation handle
+    assert one_token["dw_id"] == "DW-7"
+
+    # an unset question still reports as absent rather than as set
+    empty = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "decision-pending", "dw_id": "DW-7", "question": ""},
+        pseudo,
+        {},
+        1.0,
+    )
+    assert empty["question_present"] is False
+
+    rendered = json.dumps([one_token, empty])
+    for canary in CANARIES:
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
@@ -1749,14 +2064,22 @@ def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
     `paused_reason_present` / `worktree_isolated` style, and a small counter. The path
     itself must NOT appear — that is what `_JOURNAL_DROP_FIELDS` drops.
 
-    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` from
-    `_task_diag`) and this reddens on the corresponding assertion; deleting the field
-    from the dataclass reddens as a TypeError at construction.
+    `escalations_resolved_upto` (DW-11) is projected on the same warrant and asserted
+    here for the same reason: a task whose older escalations are filtered out of
+    `context.json` dumps identically to one that only ever raised the entries shown,
+    so a support bundle cannot explain a short resolve context without it. A counter
+    too — it indexes `task.sessions`, so it carries no customer content.
+
+    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` /
+    `escalations_resolved_upto=` from `_task_diag`) and this reddens on the
+    corresponding assertion; deleting the field from the dataclass reddens as a
+    TypeError at construction.
     """
     run_dir = _seed_run(project.project)
     state = load_state(run_dir)
     state.repo_root = str(project.project / "code-tree")
     state.tasks[STORY_KEY].generation = 2
+    state.tasks[STORY_KEY].escalations_resolved_upto = 3
     save_state(run_dir, state)
 
     diag, _pseudo, combined = _render_all([run_dir])
@@ -1764,6 +2087,7 @@ def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
 
     assert run.repo_root_diverges is True
     assert run.tasks[0].generation == 2
+    assert run.tasks[0].escalations_resolved_upto == 3
     # a presence flag, never the path — the same rule `repo` is dropped under
     assert "code-tree" not in combined
 
@@ -1780,6 +2104,7 @@ def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
 
     assert run.repo_root_diverges is False
     assert run.tasks[0].generation == 0
+    assert run.tasks[0].escalations_resolved_upto == 0
 
 
 def _md_task_row(md: str) -> list[str]:
@@ -1800,19 +2125,28 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
 
     `generation` rides beside `attempt` because that is the column pair a #705-class
     replay turns on: a collided re-drive and a healthy post-re-arm task agree on every
-    other cell in this row.
+    other cell in this row. DW-11's `escalations_resolved_upto` rides beside it on the
+    same warrant, stated verbatim in its own field comment: it is the only field that
+    separates "this story raised one escalation" from "its earlier ones are filtered
+    out of `context.json` as already answered", and that question is asked of a bug
+    report. Seeded to a value that is neither the attempt, the generation nor the
+    review cycle, so a cell reading a NEIGHBOUR cannot pass.
 
     Ablation: drop the `code root differs from project` line from `render_markdown` and
     both this test and the sibling below redden on their first assertion. Drop
     `{t.generation}` from the row f-string together with its header and separator cells
-    and this test reddens at `names[4]` (`"rev" != "gen"`) while the sibling reddens at
-    the row cell — as `"1" != "0"`, the review cycle shifted left rather than a missing
-    key, which is why the cell is read positionally and the three widths are compared.
+    and this test reddens at `names[4]` (`"esc-upto" != "gen"`) while the sibling
+    reddens at the row cell — the review cycle shifted left rather than a missing key,
+    which is why the cell is read positionally and the three widths are compared. Drop
+    `{t.escalations_resolved_upto}` the same way and this test reddens at `names[5]`
+    (`"rev" != "esc-upto"`); drop ONLY the row cell and it reddens on the width
+    comparison, which is what a skewed table actually looks like.
     """
     run_dir = _seed_run(project.project)
     state = load_state(run_dir)
     state.repo_root = str(project.project / "code-tree")
     state.tasks[STORY_KEY].generation = 2
+    state.tasks[STORY_KEY].escalations_resolved_upto = 3
     save_state(run_dir, state)
 
     pseudo = sanitize.Pseudonymizer()
@@ -1825,11 +2159,13 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
     (rule,) = [ln for ln in md.splitlines() if ln.startswith("|---|")]
     names = [c.strip() for c in header.strip("|").split("|")]
     assert names[4] == "gen"
+    assert names[5] == "esc-upto"
     # header, separator and row must agree on width or the table renders skewed
-    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 12
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 13
     assert cells[3] == "2"  # attempt, seeded by `_seed_run`
     assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
-    assert cells[5] == "1"  # review cycle, still in its own column
+    assert cells[5] == "3"  # the DW-11 watermark, in its own column
+    assert cells[6] == "1"  # review cycle, still in its own column
     # still a flag and a counter: the path itself never renders
     assert "code-tree" not in md
 

@@ -18,10 +18,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
+from .escalation import critical_escalations
+from .journal import TASK_CYCLE_ARTIFACTS
 from .model import RunState
 from .platform_util import safe_segment
 from .runs import (
@@ -76,33 +79,198 @@ def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
     return doc
 
 
-def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[dict[str, Any]]:
-    """The CRITICAL escalations recorded by this story's sessions, newest first.
+def _gather_escalations(
+    run_dir: Path,
+    state: RunState,
+    story_key: str,
+    *,
+    start: int = 0,
+    skipped: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """The CRITICAL escalations recorded by this story's sessions, newest first,
+    each DISTINCT escalation exactly once, paired with how many DISTINCT entries
+    were withheld as already answered.
 
-    Reads each session's tasks/<task_id>/result.json (and escalation.json) — the
-    same files the engine inspected when it decided to pause."""
+    ``start`` is ``task.escalations_resolved_upto`` — a position in the append-only
+    ``task.sessions`` list, stamped by ``runs.rearm_escalation`` when a resolve cycle
+    recorded a resolution (DW-11). Records BELOW it were already put to the human and
+    answered, so their escalations are not shown again; the count of those the human
+    can no longer see is returned for the operator, never written into
+    ``context.json`` (the agent-facing contract is the unanswered set alone). The
+    default 0 reproduces the pre-DW-11 walk byte-for-byte, which is what a
+    pre-upgrade ``state.json`` deserializes to.
+
+    Reads each session's tasks/<task_id>/ artifacts — the same files the engine
+    inspected when it decided to pause. WHICH files is not spelled here: it is
+    ``journal.TASK_CYCLE_ARTIFACTS``, the one list this reader shares with the two
+    adapters that clear the same directory in ``start_session``, so a name added
+    there reaches all three sites at once. Ordering is `reversed(task.sessions)`
+    and, within a directory, that constant's own order — result.json before
+    escalation.json; a duplicate keeps its FIRST occurrence's position, which is
+    what preserves "newest first". Four guards, each for a defect this reader
+    hit on the way to the operator:
+
+    * ``seen_ids`` — ``task.sessions`` is append-only and a re-arm deliberately
+      does NOT clear it, so state can carry two records under one ``task_id``.
+      ``sweep._rearm_generation`` bumps the id namespace for new restarts but
+      does not migrate records already persisted, and both records address the
+      SAME mutable ``tasks/<id>/escalation.json`` — reading it per record
+      attributes the abandoned cycle's escalation to the fresh session too.
+      Open each directory once.
+    * the content-keyed map — the sweep skill's own contract
+      (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
+      write ``escalation.json`` and then mirror the same entries into
+      ``result.json`` ``escalations``. That mirroring is deliberate and stays;
+      the READER absorbs it, so a compliant producer is not shown to the human
+      twice. The key is canonical JSON because the two copies are parsed
+      separately — identity cannot see the mirroring and ``dict`` is unhashable
+      — and ``setdefault`` makes the first occurrence win. De-duplication is
+      global across the pass, not per directory; it removes only exact repeats,
+      so a directory holding CRITICAL A in one file and A + B in the other still
+      yields both.
+    * the ``except`` tuple and the ``list`` check — ``build_context`` is an
+      OBSERVATION path: a malformed artifact must cost its own contents and
+      nothing more, never raise out to the interactive resolve command.
+      ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError`` (the same
+      rationale recorded on ``read_resolution`` above), and ``json.loads`` can
+      also raise a plain ``ValueError`` when an integer exceeds Python's configured
+      digit limit. Deeply nested input can raise ``RecursionError`` while either
+      parsing the document or canonicalizing an entry, so both operations live
+      under the same artifact-level guard. Meanwhile,
+      ``critical_escalations`` iterates ``escalations`` with no list guard of its
+      own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
+      here. The guard belongs in this caller; the shared predicate stays the
+      single definition of CRITICAL.
+    * the ``stat`` classification and its ``S_ISREG`` check — deciding ABSENT from
+      UNREADABLE cannot go through ``Path.is_file()``, whose error behavior splits by
+      interpreter. Through 3.13 it re-raises anything outside
+      ``pathlib._IGNORED_ERRNOS`` (ENOENT, ENOTDIR, EBADF, ELOOP), so an artifact under
+      an EACCES directory raised straight out of this observation path and out of
+      ``cmd_resolve`` — the one thing the bullet above promises never happens. On 3.14
+      the body became ``os.path.isfile``, which swallows every error and calls that
+      same artifact ABSENT, so nothing reached ``skipped`` and the caller stamped
+      coverage over escalations it never read. ``stat`` answers with an errno instead:
+      ENOENT and ENOTDIR are genuine absence and stay a bare ``continue`` — the
+      dominant case, since a task dir normally holds only one of these names, and
+      counting it as a skip would withhold coverage from every resolve cycle,
+      permanently. Everything else — EACCES, EIO, ESTALE, EBADF, and now ELOOP — is an
+      artifact that EXISTS and cannot be read, so it joins ``skipped`` under the same
+      shown-side condition. ELOOP changing sides is deliberate, and it is the one
+      reading this switch changes on EVERY interpreter rather than just one: a symlink
+      cycle answered False through 3.13 because ELOOP(40) is IN the ignored tuple, and
+      on 3.14 because ``os.path.isfile`` swallows it too. It is a degrade either way,
+      and this module withholds coverage rather than laundering one into a durable
+      claim. ``Path.stat`` is what makes a single ``except OSError`` enough here:
+      MEASURED as ``OSError`` errno 40 on 3.11, 3.13 and 3.14 alike, unlike
+      ``Path.resolve``, which raises ``RuntimeError`` on a loop under 3.11 and nothing
+      at all under 3.13. ``S_ISREG`` survives the switch because ``is_file()`` answered
+      False for a directory or a FIFO at that path while ``stat`` succeeds on both —
+      without it a directory would reach ``read_text`` as an ``IsADirectoryError``, and
+      a FIFO would BLOCK there forever, wedging the interactive command this reader
+      serves.
+
+    The watermark is a FIFTH concern layered onto that same single walk, not a
+    second pass: ``reversed(task.sessions)`` reaches the unanswered tail first, so
+    entries are routed into two content-keyed maps by the record's own index and the
+    suppressed count is the answered keys that never appeared in the shown map. Two
+    consequences are deliberate. An entry raised on BOTH sides of the watermark is
+    shown and counted 0 — "not shown" is the claim the number makes, so it must never
+    count something the operator can see. And ``start`` only SELECTS a map; nothing is
+    indexed with it, so a watermark past the end of the list yields an empty shown
+    list rather than an IndexError. A ``task_id`` repeated across the watermark is
+    opened once by ``seen_ids``, at its newest occurrence — the shown side, the
+    conservative direction.
+
+    ``skipped`` is an OUT-parameter, and it exists because the degrade above is
+    silent in exactly the place silence is unaffordable. An artifact dropped by the
+    ``except`` costs its own escalations — but ``runs.rearm_escalation`` then stamps
+    ``escalations_resolved_upto = len(task.sessions)``, which covers the session that
+    artifact belonged to. A transient read fault (a network mount, a truncated write
+    still in flight) therefore buries every escalation in it FOREVER: the next cycle
+    reads the file fine and withholds it as already answered. The caller refuses to
+    record coverage when this set is non-empty, which is the same
+    observe-and-degrade contract this reader already keeps — it just stops the
+    degrade from being laundered into a durable claim.
+
+    It is an out-parameter rather than a third return value on purpose: the
+    ``(list, int)`` pair is asserted by ~20 tests and read positionally by
+    ``build_context``, and this signal has one consumer. Only skips on the SHOWN
+    side are recorded — ``target is found`` — because those are the records the
+    watermark would NEWLY cover. A skip below ``start`` was already covered by the
+    previous cycle's watermark, so re-covering it buries nothing; it costs only the
+    withheld COUNT, which claims nothing durable. Paths are collected rather than a
+    bare tally so a duplicate artifact cannot inflate the answer."""
     task = state.tasks.get(story_key)
-    found: list[dict[str, Any]] = []
     if task is None:
-        return found
-    for session in reversed(task.sessions):
+        return [], 0
+    seen_ids: set[str] = set()
+    found: dict[str, dict[str, Any]] = {}
+    answered: dict[str, dict[str, Any]] = {}
+    last = len(task.sessions) - 1
+    for offset, session in enumerate(reversed(task.sessions)):
+        if session.task_id in seen_ids:
+            continue
+        seen_ids.add(session.task_id)
+        target = found if last - offset >= start else answered
         task_dir = run_dir / "tasks" / session.task_id
-        for fname in ("result.json", "escalation.json"):
+        for fname in TASK_CYCLE_ARTIFACTS:
             fpath = task_dir / fname
-            if not fpath.is_file():
+            try:
+                st = fpath.stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                if skipped is not None and target is found:
+                    skipped.add(str(fpath))
+                continue
+            if not S_ISREG(st.st_mode):
                 continue
             try:
                 doc = json.loads(fpath.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                if not isinstance(doc, dict):
+                    raise ValueError("artifact is not a JSON object")
+                if "escalations" not in doc:
+                    # The ordinary shape of a clean ``result.json``: nothing was
+                    # raised, so there is nothing to show and nothing hidden. NOT a
+                    # skip — counting it as one would withhold coverage from every
+                    # resolve cycle, permanently.
+                    continue
+                if not isinstance(doc["escalations"], list):
+                    raise ValueError("'escalations' is not a list")
+                artifact_entries: dict[str, dict[str, Any]] = {}
+                for esc in critical_escalations(doc):
+                    artifact_entries.setdefault(json.dumps(esc, sort_keys=True), esc)
+            except (OSError, ValueError, RecursionError):
+                if skipped is not None and target is found:
+                    skipped.add(str(fpath))
                 continue
-            for esc in doc.get("escalations", []) if isinstance(doc, dict) else []:
-                if isinstance(esc, dict) and str(esc.get("severity", "")).upper() == "CRITICAL":
-                    found.append(esc)
-    return found
+            for key, esc in artifact_entries.items():
+                target.setdefault(key, esc)
+    return list(found.values()), sum(1 for key in answered if key not in found)
 
 
-def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str) -> Path:
-    """Write resolve/<story_key>/context.json for the resolve skill to read.
+def build_context(
+    state: RunState, run_dir: Path, story_key: str, *, isolation: str
+) -> tuple[Path, int, int]:
+    """Write resolve/<story_key>/context.json for the resolve skill to read, and
+    return it beside the number of already-answered escalations withheld from it and
+    the number of session artifacts this walk could NOT read.
+
+    The withheld count is for the OPERATOR's terminal (`cli.cmd_resolve` prints it) and
+    is deliberately not a `context.json` field: the skill's contract is singular —
+    resolve the escalation you are shown — and a count of things the agent cannot see is
+    not something it can act on. It comes from the same single walk that produced the
+    shown list, never from a second `_gather_escalations` call subtracting lengths.
+
+    The unreadable count rides the SAME walk for the same reason, and it is a third
+    return value rather than a second out-parameter because it has to cross a process's
+    worth of control flow: `cli.cmd_resolve` is the only surface that can advance
+    `escalations_resolved_upto` (the TUI hard-codes `resolution_recorded=False`), and a
+    non-zero count there means this cycle showed the human strictly less than the
+    watermark would claim they answered. The caller withholds coverage on it — see
+    `_gather_escalations`' `skipped` for why the alternative is permanent burial. Zero
+    on every ordinary run, so the coverage path is unchanged whenever the run-dir reads
+    cleanly.
 
     `isolation` is the LIVE policy's `scm.isolation`, and it is required rather than
     defaulted for the reason this surface exists at all: three of the fields below —
@@ -131,6 +299,17 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     # the main checkout while `stories_engine._stories_folder` was still the mount, so
     # one `context.json` could name two trees.
     stories_root = task_stories_root(task, state)
+    # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
+    # own watermark — 0 for a task never resolved, and for every pre-upgrade
+    # `state.json`, which is the unfiltered pre-DW-11 walk.
+    unreadable: set[str] = set()
+    escalations, withheld = _gather_escalations(
+        run_dir,
+        state,
+        story_key,
+        start=task.escalations_resolved_upto if task else 0,
+        skipped=unreadable,
+    )
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
@@ -151,7 +330,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
-        "escalations": _gather_escalations(run_dir, state, story_key),
+        "escalations": escalations,
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
@@ -204,7 +383,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2), encoding="utf-8")
-    return path
+    return path, withheld, len(unreadable)
 
 
 def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
