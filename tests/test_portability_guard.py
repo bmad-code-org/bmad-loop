@@ -1471,22 +1471,37 @@ def _kind_param_index(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
     return None
 
 
-# A positional `kind` the scan could not resolve, because a `*args` splat covers the
-# parameter's slot. Emitted AS a kind so the inventory arm reddens naming the site:
-# no row can declare it, and an unreadable position must not share its silence with
-# "this call passed no literal".
+# A `kind` argument at a declared dynamic-kind position that the scan could not
+# resolve: a `*args` splat covering the parameter's slot, or a non-literal expression
+# in that slot or in a `kind=` keyword. Emitted AS a kind so the inventory arm reddens
+# naming the site: no row can declare it, and an unreadable argument must not share
+# its silence with "this call passed no literal".
 UNRESOLVED_DYNAMIC_KIND = "<unresolved-positional-kind>"
 
 
 def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
     """The string literal a call hands a declared dynamic-kind position
-    POSITIONALLY; :data:`UNRESOLVED_DYNAMIC_KIND` when a ``*args`` splat covers that
-    slot; None when the slot holds no literal — a variable, or nothing at all, the
-    latter being the parameter default that the definition arm reports instead.
+    POSITIONALLY; :data:`UNRESOLVED_DYNAMIC_KIND` when that slot is OCCUPIED by
+    something the scan cannot read — a ``*args`` splat covering it, or a non-literal
+    expression in it; None only when the slot is EMPTY, which is the parameter default
+    the definition arm reports instead.
 
-    A non-literal in the slot is skipped rather than flagged, matching the keyword
-    arm: whether a position may be dynamic AT ALL is the literalness test's question,
-    and this arm only grades the literals that reach one."""
+    Empty and occupied-but-unreadable are different answers and must not share one
+    return value. ``sweep.py``'s own ``_close_bundle_ledger_when_spec_status(task,
+    str(spec_file), success_status)`` omits ``kind`` and relies on the default, so
+    folding the empty slot into the sentinel reddens the clean tree.
+
+    A non-literal in an occupied slot is FLAGGED, not skipped. Deferring it to the
+    literalness test — the rationale this arm used to carry, and the keyword arm with
+    it — holds only at the declared FORWARDER (``plugins/bus.py::_log``), whose
+    enclosing function at the CALL is not in ``JOURNAL_DYNAMIC_KIND_ALLOW``, so a
+    variable there reddens
+    ``test_journal_kinds_are_literal_or_the_position_is_declared`` anyway. At the two
+    non-forwarder positions (``engine._skip_review_and_commit``,
+    ``sweep._close_bundle_ledger_when_spec_status``) the allow set waives exactly that
+    test for the write INSIDE the position, so nothing else grades the slot: a caller
+    handing it a variable would reach the journal with a kind no row declares while
+    every arm stayed green."""
     if any(isinstance(arg, ast.Starred) for arg in node.args[: index + 1]):
         return UNRESOLVED_DYNAMIC_KIND
     if index >= len(node.args):
@@ -1494,7 +1509,7 @@ def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
     arg = node.args[index]
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
         return arg.value
-    return None
+    return UNRESOLVED_DYNAMIC_KIND
 
 
 def _is_journal_write(node: ast.AST, rel: str) -> bool:
@@ -2316,20 +2331,27 @@ def _scan_source(src: str, rel: str):
             and (rel, _called_name(node.func)) in JOURNAL_DYNAMIC_KIND_ALLOW
         ):
             for kw in node.keywords:
-                if (
-                    kw.arg == "kind"
-                    and isinstance(kw.value, ast.Constant)
-                    and isinstance(kw.value.value, str)
-                ):
-                    findings.append(
+                if kw.arg != "kind":
+                    continue
+                # A spelled-but-unreadable `kind=` is unresolvable, not absent, for
+                # the reason `_positional_kind_literal` states: the write inside a
+                # declared position spells a parameter and the literalness test is
+                # waived there, so skipping it lets an undeclared kind reach the
+                # journal with nothing red.
+                findings.append(
+                    (
+                        "journalkindliteral",
+                        rel,
+                        node.lineno,
+                        line_at(node.lineno),
                         (
-                            "journalkindliteral",
-                            rel,
-                            node.lineno,
-                            line_at(node.lineno),
-                            kw.value.value,
-                        )
+                            kw.value.value
+                            if isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, str)
+                            else UNRESOLVED_DYNAMIC_KIND
+                        ),
                     )
+                )
             # A declared FORWARDER (`plugins/bus.py::_log`) is itself a journal
             # write, so the main emit above already read its positional kind; this
             # arm exists for the declared positions that are not forwarders, where
@@ -5117,17 +5139,32 @@ def test_journal_kind_literal_probes_stay_silent_on_lookalikes():
         ),
         # The forwarder-kind arm is keyed `(file, name)` like the position it
         # serves: the same call in a file that declares no such position, a
-        # `kind=` keyword on an undeclared callee, a non-literal `kind=` at the
-        # declared position, and a non-string default on its def are all silent.
+        # `kind=` keyword on an undeclared callee, and a non-string default on its
+        # def are all silent.
         (
             'def f(self):\n    self._skip_review_and_commit(task, kind="review-skipped")\n',
             "sweep.py",
         ),
         ('def f(self):\n    self.emit(kind="review-skipped")\n', "engine.py"),
-        ("def f(self):\n    self._skip_review_and_commit(task, kind=chosen)\n", "engine.py"),
         ("def _skip_review_and_commit(self, task, *, kind=None):\n    return None\n", "engine.py"),
     ):
         assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+    # The one shape here that is NOT silent, and used to be. A non-literal `kind=` AT
+    # a declared position is unresolvable rather than absent: `JOURNAL_DYNAMIC_KIND_ALLOW`
+    # waives the literalness test for the write inside, so the inventory is the only
+    # arm left that can fail loud on it.
+    #
+    # Ablation: return None instead of the sentinel for a non-literal `kind=` and this
+    # reddens.
+    unresolvable = [
+        f[4]
+        for f in _scan_source(
+            "def f(self):\n    self._skip_review_and_commit(task, kind=chosen)\n", "engine.py"
+        )
+        if f[0] == "journalkindliteral"
+    ]
+    assert unresolvable == [UNRESOLVED_DYNAMIC_KIND], unresolvable
 
 
 # The declared position whose `kind` is positional-or-keyword, with NO default, so the
@@ -5179,14 +5216,21 @@ def test_journal_kind_literal_reads_a_positional_dynamic_kind():
 def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
     """The complement, in the four directions the positional arm must not invent a kind:
     a KEYWORD-ONLY `kind` (no positional slot exists, so a string in that argument
-    position is some other parameter's), a non-literal in the slot (the literalness
-    test's territory, as on the keyword arm), the same call in a file declaring no such
-    position, and a declared FORWARDER whose positional kind the journal-write emit
-    already reports — double-reporting one site would make a `found == [kind]` probe
-    redden for a reason that is not a defect.
+    position is some other parameter's), an EMPTY slot (the parameter default, which the
+    definition arm reports instead — `sweep.py`'s own
+    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)` call
+    relies on it, so flagging an omitted `kind` would redden the clean tree), the same
+    call in a file declaring no such position, and a declared FORWARDER whose positional
+    kind the journal-write emit already reports — double-reporting one site would make a
+    `found == [kind]` probe redden for a reason that is not a defect.
+
+    A slot OCCUPIED by a non-literal is the direction that is deliberately not here: it
+    is asserted RED below, because the literalness test that would otherwise catch it is
+    waived at a declared position.
 
     Ablation: drop the `_is_journal_write` guard and the forwarder row reddens with two
-    findings; key `kind_positions` by name alone and the wrong-file row reddens."""
+    findings; key `kind_positions` by name alone and the wrong-file row reddens; fold the
+    empty slot into `UNRESOLVED_DYNAMIC_KIND` and the omitted-`kind` row reddens."""
     for source, rel in (
         (
             "def _skip_review_and_commit(self, task, *, kind):\n"
@@ -5198,7 +5242,7 @@ def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
         ),
         (
             _POSITIONAL_KIND_DEF + "def caller(self):\n"
-            "    self._close_bundle_ledger_when_spec_status(task, spec, status, chosen)\n",
+            "    self._close_bundle_ledger_when_spec_status(task, spec, status)\n",
             "sweep.py",
         ),
         (
@@ -5208,6 +5252,25 @@ def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
         ),
     ):
         assert not [f for f in _scan_source(source, rel) if f[0] == "journalkindliteral"], source
+
+    # The slot this arm used to share with "no literal passed": OCCUPIED by a
+    # non-literal. `JOURNAL_DYNAMIC_KIND_ALLOW` waives the literalness test for the
+    # write inside the position, so the inventory is the only arm that can fail loud —
+    # and it stayed green while a variable carrying an undeclared kind reached the
+    # journal.
+    #
+    # Ablation: return None instead of the sentinel for a non-literal slot and this
+    # reddens.
+    unresolvable = [
+        f[4]
+        for f in _scan_source(
+            _POSITIONAL_KIND_DEF + "def caller(self):\n"
+            "    self._close_bundle_ledger_when_spec_status(task, spec, status, chosen)\n",
+            "sweep.py",
+        )
+        if f[0] == "journalkindliteral"
+    ]
+    assert unresolvable == [UNRESOLVED_DYNAMIC_KIND], unresolvable
 
     # The forwarder: exactly one finding, from the journal-write emit, not two.
     forwarder = (

@@ -13,13 +13,16 @@ breaking changes may land in a minor release.
   three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
   fed by a literal-kind emit that also sees kind-only writes, constructor-inline
   `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
-  to — and the `kind=` literals and parameter defaults that reach a declared dynamic-kind
-  position), the `_refuse_*`/`_reject_*` helper definitions counted with multiplicity
-  (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call sites counted
-  with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal helper, or refusal
-  call site reddens CI until its row lands; the row is the PR-time decision, and the
-  failure message demands the covering test land beside it. Each new detector arm carries
-  must-flag and must-stay-silent probe rows.
+  to — and every literal reaching a declared dynamic-kind position, by keyword, by
+  POSITION, or as the parameter default; a `kind` argument such a position cannot read —
+  a variable, or a `*args` splat over the slot — fails loud rather than passing as "no
+  literal here", which is the one way an undeclared kind could still reach the journal
+  with the inventory green), the `_refuse_*`/`_reject_*` helper definitions counted with
+  multiplicity (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call
+  sites counted with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal
+  helper, or refusal call site reddens CI until its row lands; the row is the PR-time
+  decision, and the failure message demands the covering test land beside it. Each new
+  detector arm carries must-flag and must-stay-silent probe rows.
 
 - **Interactive resolve context names both the BMAD project root and the run's code
   root.** `bmad-loop resolve` warns before a divergent-root session launches, keeps the
