@@ -38,7 +38,7 @@ from ..model import (
     RunState,
     StoryTask,
 )
-from ..platform_util import resolve_or_lexical
+from ..platform_util import LockUnavailableError, resolve_or_lexical
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
@@ -983,8 +983,25 @@ class BmadLoopApp(App[None]):
                 return
         before_entries = runs.journal_entries_or_none(run_dir)
         outcome: runs.RearmOutcome | None = None
+        contended = False
         try:
-            with state_lock(run_dir):
+            # `blocking=False` because this runs ON the message loop — the reason
+            # `_guarded` and `_commit_subject` bound their git calls at `timeout_s=5`.
+            # `_do_rearm` carries no `@work`, and its only caller is the synchronous
+            # `push_screen` dismiss callback, so the acquisition happens inline: on
+            # POSIX a blocking wait is UNBOUNDED (`fcntl.flock` does not time out),
+            # and the rival that holds this lock is typically `cli._prepare_resume_locked`,
+            # which holds it across config, skills, profiles and a git preflight each
+            # bounded only by `[limits] git_timeout_s` (120s by default). The whole
+            # dashboard freezes for that span, and the `_engine_possibly_live` gate on
+            # the modal does not head it off: `resume` takes the lock FIRST and
+            # publishes its pid LAST, so for that entire window liveness still reads
+            # dead and only the lock objects (the same window `cmd_clean` documents).
+            #
+            # Refusing loses nothing a wait would have won, either: the post-lock
+            # liveness re-check below is what the waiter would reach, and against a
+            # rival resume it refuses anyway. So the wait's only product is the freeze.
+            with state_lock(run_dir, blocking=False):
                 # Repeat the liveness decision after exclusion.  Config/policy work
                 # above is deliberately lock-free; only this bounded restamp+re-arm
                 # mutation gesture is serialized.
@@ -1032,6 +1049,23 @@ class BmadLoopApp(App[None]):
                     # escalations raised since the marker was written.
                     resolution_recorded=False,
                 )
+        except LockUnavailableError:
+            # ORDER IS LOAD-BEARING: `LockUnavailableError` SUBCLASSES `OSError`, so
+            # this arm must precede the one below or contention is reported as
+            # "re-arm failed" — a fault the operator would go looking for — and the
+            # non-blocking acquire above buys nothing at all.
+            #
+            # Caught here and NOT folded into that arm for `cmd_clean`'s reason: a
+            # bare `except OSError` cannot tell "someone else has this run" from
+            # `platform_util.UnconfinedWriteError`, and filing a containment refusal
+            # as a benign "busy" is the exact fold those two classes exist to prevent.
+            contended = True
+            self.notify(
+                f"run {run_id}: run state locked by another process — not re-arming; "
+                "wait for it to finish, then re-arm",
+                severity="warning",
+            )
+            return
         except (RearmError, OSError, runs.StateRootError) as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
@@ -1046,7 +1080,12 @@ class BmadLoopApp(App[None]):
             # path even after they were unified on routing — and an abort is when the
             # residue matters most: the re-arm half-ran and the operator has to decide
             # what to do with the tree.
-            if outcome is None:
+            #
+            # `not contended` because this recovery is for a gesture that RAN and
+            # aborted. A refused acquisition ran nothing, so every record appended
+            # between the read above and the refusal belongs to the HOLDER — echoing
+            # the rival's re-arm as this one's residue.
+            if outcome is None and not contended:
                 self._echo_rearm_events(run_dir, before_entries)
         assert outcome is not None
         self._echo_rearm_notices(outcome.notices)

@@ -5258,6 +5258,216 @@ def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypat
     assert checks == ["checked", "checked"]
 
 
+def test_escalation_rearm_declines_a_run_whose_state_lock_is_held(project, monkeypatch):
+    """A contended run is REFUSED with a toast, not queued behind its holder.
+
+    `_do_rearm` runs ON Textual's message loop: it carries no `@work`, and its only
+    caller is the synchronous `push_screen` dismiss callback, so the acquisition
+    happens inline and the whole dashboard freezes for however long the holder keeps
+    the lock — unbounded on POSIX, where `fcntl.flock` never times out. The realistic
+    holder is a rival `resume`, which takes the lock FIRST and publishes its pid LAST,
+    so the modal's `_engine_possibly_live` gate reads dead for that entire window (the
+    same window `cmd_clean` documents) and does not head the freeze off.
+
+    The contention is real — the run's own canonical sidecar — and taken through
+    `platform_util.file_lock` rather than `journal.state_lock` for the reason
+    test_cleanup states: `state_lock`'s reentrancy guard is thread-local, so acquiring
+    it here would let `_do_rearm` RE-ENTER the lock and pass for the wrong reason. The
+    holder sits on a background thread with a BOUNDED hold so that a regression to a
+    blocking acquire reddens on `elapsed` instead of hanging the suite.
+
+    Ablations, both of which must redden this: (1) MOVE the `except
+    LockUnavailableError` arm below the existing `except (RearmError, OSError,
+    runs.StateRootError)` — the subclass makes the moved arm dead and contention is
+    filed as "re-arm failed"; (2) drop `blocking=False` and the gesture queues for the
+    holder's full hold.
+    """
+    import threading
+    import time
+
+    from bmad_loop import platform_util
+    from bmad_loop.journal import STATE_FILE
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: a rival process holds the run state.",
+    )
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda _self, message, **kwargs: notes.append(
+            (str(message), str(kwargs.get("severity", "information")))
+        ),
+    )
+    monkeypatch.setattr(
+        runs_mod, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed a locked run")
+    )
+
+    lock_path = runs_mod.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    hold_s = 3.0
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with platform_util.file_lock(lock_path):
+            held.set()
+            release.wait(hold_s)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(30), "the rival never acquired the run's state lock"
+        started = time.monotonic()
+        BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(timeout=30)
+
+    assert elapsed < hold_s / 2  # refused at once, not queued behind the holder
+    # One toast, and it is the contention one: equality over the list covers both
+    # negatives at once — no "re-arm failed" fault report, and no residue echo
+    # crediting this gesture with journal records only the HOLDER can have written.
+    assert [severity for _message, severity in notes] == ["warning"]
+    assert "run state locked by another process" in notes[0][0]
+    assert "re-arm failed" not in notes[0][0]
+
+
+def test_rearm_contention_arm_precedes_the_generic_oserror_arm():
+    """`LockUnavailableError` SUBCLASSES `OSError`, so `_do_rearm`'s contention arm is
+    correct only in that ORDER: below the existing `except (RearmError, OSError,
+    runs.StateRootError)` it is unreachable and every contention is reported as a
+    fault, leaving the non-blocking acquire buying nothing.
+
+    The behavioral test above reddens on the same swap; this one names the property, so
+    the failure says what the invariant is instead of leaving the subclass relation to
+    be rediscovered from a toast.
+
+    Ablation: move the `except LockUnavailableError` arm after the OSError arm.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from bmad_loop import platform_util
+    from bmad_loop.tui import app as app_mod
+
+    assert issubclass(platform_util.LockUnavailableError, OSError)  # the whole hazard
+
+    def caught(handler: ast.ExceptHandler) -> set[str]:
+        if handler.type is None:
+            return {"BaseException"}
+        names: set[str] = set()
+        for node in ast.walk(handler.type):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+        return names
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(app_mod.BmadLoopApp._do_rearm)))
+    paired = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        arms = [caught(h) for h in node.handlers]
+        narrow = [i for i, names in enumerate(arms) if "LockUnavailableError" in names]
+        wide = [
+            i
+            for i, names in enumerate(arms)
+            if "LockUnavailableError" not in names and names & {"OSError", "BaseException"}
+        ]
+        if not narrow or not wide:
+            continue
+        paired += 1
+        assert max(narrow) < min(wide), (
+            "_do_rearm catches LockUnavailableError after a wider OSError arm — the "
+            "subclass makes the later arm unreachable, so contention is misreported"
+        )
+    assert paired == 1, "_do_rearm no longer pairs a LockUnavailableError arm with an OSError arm"
+
+
+def test_escalation_rearm_contention_does_not_echo_the_holders_journal_records(
+    project, monkeypatch
+):
+    """A refused acquisition claims none of the HOLDER's journal records.
+
+    `_do_rearm`'s `finally` recovers the re-arm records a raised call had already
+    written — abort-only diagnostic recovery, as its docstring says. A refused
+    acquisition is not that abort: it ran nothing, so every record appended between
+    the pre-lock read and the refusal was written by the process that HOLDS the lock,
+    and echoing it credits this gesture with a rival's re-arm.
+
+    The rival's append is injected through `journal_entries_or_none` rather than raced
+    on a real thread because the window is the microseconds between the pre-lock read
+    and a non-blocking refusal — a real race would be a coin flip, and a negative
+    assertion that only sometimes has anything to be negative about proves nothing.
+    The exclusion itself is still the real sidecar lock, so the refusal is genuine.
+
+    Ablation: drop `and not contended` from the `finally` and the holder's record is
+    toasted here as this gesture's own residue.
+    """
+    import threading
+
+    from bmad_loop import platform_util
+    from bmad_loop.journal import STATE_FILE
+
+    install_bmad_config(project)
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: a rival process holds the run state.",
+    )
+    notes: list[str] = []
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(
+        BmadLoopApp, "notify", lambda _self, message, **_kwargs: notes.append(str(message))
+    )
+
+    reads = 0
+
+    def racing_entries(_run_dir):
+        # First read is the pre-lock watermark; any later one would be the `finally`,
+        # by when the holder has appended a re-arm record of its own.
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return []
+        return [{"ts": 0.0, "kind": "stale-restore-excluded", "files": ["rival.py"]}]
+
+    monkeypatch.setattr(runs_mod, "journal_entries_or_none", racing_entries)
+
+    lock_path = runs_mod.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with platform_util.file_lock(lock_path):
+            held.set()
+            release.wait(3.0)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(30), "the rival never acquired the run's state lock"
+        BmadLoopApp(project.project)._do_rearm(run_dir.name, run_dir, "1")
+    finally:
+        release.set()
+        holder.join(timeout=30)
+
+    assert not any("excluded the abandoned restore" in note for note in notes)
+    assert [note for note in notes if "run state locked by another process" in note]
+    assert reads == 1  # the `finally` never took the second read at all
+
+
 def test_escalation_rearm_reloads_state_before_restamping(project, monkeypatch):
     """Ablation: delete _do_rearm's fresh state check and the TUI restamps a run
     whose escalation a rival already consumed while this gesture waited for the lock."""
@@ -5284,7 +5494,7 @@ def test_escalation_rearm_reloads_state_before_restamping(project, monkeypatch):
     )
 
     @contextlib.contextmanager
-    def rival_first(_run_dir):
+    def rival_first(_run_dir, **_kwargs):
         rival = load_state(run_dir)
         rival.tasks["1"].phase = Phase.PENDING
         save_state(run_dir, rival)
@@ -5329,7 +5539,7 @@ def test_escalation_rearm_refuses_a_newer_generation_from_an_open_review(project
     )
 
     @contextlib.contextmanager
-    def rival_first(_run_dir):
+    def rival_first(_run_dir, **_kwargs):
         rival = load_state(run_dir)
         rival.tasks["1"].generation = expected_generation + 1
         save_state(run_dir, rival)
@@ -5380,9 +5590,15 @@ def test_escalation_rearm_retains_outer_lock_through_rearm_call(project, monkeyp
 
 @pytest.mark.parametrize(
     "failure",
-    [OSError("lock unavailable"), runs_mod.StateRootError("no usable state root")],
+    [OSError("lock file could not be created"), runs_mod.StateRootError("no usable state root")],
 )
 def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, failure):
+    """The other half of the contention split: an acquisition fault that is NOT a
+    holder still reports "re-arm failed". Neither parameter may be a
+    `LockUnavailableError` — that subclass is contention, routed to its own arm — and
+    a plain `OSError` is exactly what `platform_util.file_lock` raises when the
+    sidecar cannot be PROVISIONED, which its docstring keeps deliberately unwrapped
+    because a broken path is not "someone is using this run"."""
     import contextlib
 
     from bmad_loop import runs
@@ -5401,7 +5617,7 @@ def test_escalation_rearm_reports_state_lock_failures(project, monkeypatch, fail
     monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("wrote unlocked"))
 
     @contextlib.contextmanager
-    def refusing_lock(_run_dir):
+    def refusing_lock(_run_dir, **_kwargs):
         raise failure
         yield
 

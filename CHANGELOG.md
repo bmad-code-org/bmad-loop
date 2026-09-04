@@ -256,6 +256,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The TUI's re-arm declines a contended run instead of waiting for it.** The
+  gesture runs on Textual's message loop, so taking the run's state lock blocking
+  froze the whole dashboard for as long as a rival held it — unbounded on POSIX,
+  where `fcntl.flock` never times out, and a rival `resume` holds it across a git
+  preflight bounded only by `[limits] git_timeout_s`. It now acquires without
+  waiting and toasts the contention; the post-lock liveness re-check refused that
+  re-arm anyway.
+
 - **An orphaned mount's reclaim no longer destroys the orchestrator's own artifacts.** The
   pre-reclaim snapshot drew its untracked candidates from `untracked_files`, which excludes
   ignored paths by contract, and the deferred-work ledger, sprint board and bound spec are
