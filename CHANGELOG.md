@@ -10,14 +10,12 @@ breaking changes may land in a minor release.
 ### Added
 
 - **Interactive resolve context names both the BMAD project root and the run's code
-  root.** `bmad-loop resolve` warns before a divergent-root session launches, while
-  keeping the session project-rooted and directing code fixes and commits to the code
-  root. The re-arm writes the same tree the context published: `runs.rearm_escalation`
-  takes the live project root from `resolve` and the TUI, so a moved project no longer
-  has the agent edit one copy of the spec while the re-arm flips another. A recorded
-  spelling that traverses out of the project through `..` (an external artifact root
-  named relative to it) is classified external and left unchanged rather than rebased
-  onto a different file under the moved project's new parent.
+  root.** `bmad-loop resolve` warns before a divergent-root session launches, keeps the
+  session project-rooted, and directs code fixes and commits to the code root. The
+  re-arm, from both `resolve` and the TUI, writes the tree the context published, so a
+  moved project no longer has the agent edit one copy of the spec while the re-arm flips
+  another. A recorded spelling that traverses out through `..` stays external and
+  unchanged.
 
 - **A failed re-arm commits probe now journals `rearm-commits-probe-failed`** (DW-81).
   The warn-only probe that lists the commits an abandoned attempt left below the re-drive's
@@ -251,6 +249,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A harvest's ledger anchor no longer adopts a rival entry that beat it to the lock.**
+  Both `deferredwork` mutators publish the whole post-edit file, so an entry appended
+  between the pre-harvest snapshot and their locked read was claimed by
+  `post_engine_ledger_digest`, and a later rejected attempt restored over it —
+  unrecoverably, on a gitignored ledger. The mark and append legs now re-anchor only when
+  the preimage they wrote over is still the bytes the run last claimed; the restore skips
+  and journals `ledger-restore-skipped-diverged`.
 - **An accepted spec reached through a link out of the unit worktree no longer counts as
   delivered.** The pre-dispatch check asked only whether a file existed at the mounted path,
   and that probe follows symlinks, so a spec directory the checkout carries as a link

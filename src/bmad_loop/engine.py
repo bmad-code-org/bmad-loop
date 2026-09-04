@@ -3984,6 +3984,33 @@ class Engine:
             return None
         return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
 
+    def _may_move_ledger_anchor(self, task: StoryTask, preimage: str | None) -> bool:
+        """May a ledger write that replaced `preimage` become the restore anchor?
+
+        Only when `preimage` is still the bytes this engine last claimed. The
+        published text a `deferredwork` mutator hands back is the WHOLE post-edit
+        file, so a rival entry that landed between this task's pre-harvest
+        snapshot and the mutator's locked read is inside it — re-published under
+        our name. Anchoring on that would have :meth:`_restore_ledger` read
+        ``ours`` as True on a rejected attempt and whole-file-overwrite the
+        rival's entry away, which is the very loss the anchor exists to prevent.
+        Declining to move the anchor leaves it naming the snapshot instead, so the
+        restore sees ``ours`` as False, skips, and journals
+        ``ledger-restore-skipped-diverged``.
+
+        The anchor is what is compared, not ``task.pre_harvest_ledger`` itself:
+        the harvest's mark leg legitimately moves the anchor before its append
+        leg runs, so the append's preimage is the mark's published text and
+        matching it against the raw snapshot would decline every contended-free
+        mark+append pair. An UNARMED anchor (``None``) claims nothing yet, so the
+        first publish establishes it — a state the engine's own harvest path never
+        reaches, since the snapshot at ``_run_story`` arms both together.
+        """
+        return (
+            task.post_engine_ledger_digest is None
+            or _digest_of(preimage) == task.post_engine_ledger_digest
+        )
+
     def _absorb_harvest_records(
         self,
         task: StoryTask,
@@ -4259,16 +4286,21 @@ class Engine:
             if not task.harvest_wrote_ledger:
                 task.harvest_wrote_ledger = True
                 self._save()
-            _, marked_published, stale = deferredwork.mark_seen_again_many(
+            _, marked_published, stale, marked_preimage = deferredwork.mark_seen_again_many(
                 ledger,
                 seen_again_ids,
                 self._today(),
                 f"spec-deferral harvest of {spec_name}",
             )
-            if marked_published is not None:
+            if marked_published is not None and self._may_move_ledger_anchor(task, marked_preimage):
                 # Re-anchor the pre-harvest restore's CAS on what the mark
                 # published; a following append overwrites this with its own
                 # published text (its locked read includes these marks).
+                #
+                # Conditional on the preimage: the published text is the whole
+                # post-edit file, so a rival that landed before this mark's
+                # locked read is re-published inside it. Anchoring then would let
+                # a rejected attempt's restore retract the rival's entry as ours.
                 task.post_engine_ledger_digest = _digest_of(marked_published)
                 self._save()
             if stale:
@@ -4333,9 +4365,9 @@ class Engine:
         # because each spec is applied to the text the previous one produced.
         # The scan above already ran, and the latch above already fired, so the
         # durability ordering the comment there describes is unchanged.
-        minted, published = deferredwork.append_entries_published(ledger, specs)
+        minted, published, append_preimage = deferredwork.append_entries_published(ledger, specs)
         filed = [dw_id for dw_id in minted if dw_id is not None]
-        if filed:
+        if filed and self._may_move_ledger_anchor(task, append_preimage):
             # Re-anchor the pre-harvest restore's compare-and-set on what this
             # append actually published. `append_entries_published` writes only
             # when some spec minted an id (it hands back None when every one
@@ -4349,6 +4381,13 @@ class Engine:
             # would then retract the rival's entry as if it were our own harvest.
             # That is the loss this change exists to prevent, so the anchor comes
             # from inside the hold instead.
+            #
+            # The preimage guards the other side of the same window. A rival that
+            # landed BEFORE the writer's locked read is inside the text it
+            # re-published, so the published bytes alone cannot say whose they
+            # are; `_may_move_ledger_anchor` declines the move when what we wrote
+            # over is no longer what we last claimed, leaving the anchor on the
+            # snapshot so the restore skips and journals instead of retracting.
             #
             # Durable before the decision that consumes it: a crash replay
             # re-runs the harvest, which either writes again (refreshing this)

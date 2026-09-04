@@ -13923,7 +13923,7 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
     rival_filed: list[bool] = []
 
     def append_then_a_rival_writes(*args, **kwargs):
-        minted, text = real_append(*args, **kwargs)
+        minted, text, preimage = real_append(*args, **kwargs)
         if not rival_filed:
             # Latched BEFORE the nested call, not after: the rival goes through
             # the ordinary public appender, which delegates down to this very
@@ -13939,7 +13939,7 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
                 source_spec="other.md",
                 reason="a rival writer got here first.",
             )
-        return minted, text
+        return minted, text, preimage
 
     monkeypatch.setattr(deferredwork, "append_entries_published", append_then_a_rival_writes)
 
@@ -13949,6 +13949,185 @@ def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monk
     assert "filed by another process" in on_disk  # the rival really did land
     assert published and task.post_engine_ledger_digest == _digest_of(published[0])
     assert task.post_engine_ledger_digest != _digest_of(on_disk)
+
+
+def _arm_ledger_snapshot(task, ledger):
+    """Arm the pre-harvest restore exactly as ``_run_story`` does, and hand back
+    the snapshot text so a test can assert the anchor never left it."""
+    snapshot = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+    task.pre_harvest_ledger = snapshot
+    task.pre_harvest_ledger_captured = True
+    task.post_engine_ledger_digest = _digest_of(snapshot)
+    return snapshot
+
+
+def test_harvest_append_declines_the_anchor_over_a_rival_that_beat_it_to_the_lock(
+    project, monkeypatch
+):
+    """A rival that lands BEFORE the writer's locked read must not be adopted.
+
+    The published text handed back from inside the hold is the WHOLE post-edit
+    file, so a rival entry appended between this task's pre-harvest snapshot and
+    the append's locked read is in the preimage, is re-published, and would land
+    in ``post_engine_ledger_digest``. A later rejected attempt then reads ``ours``
+    as True and whole-file-overwrites with the old snapshot, deleting the rival's
+    entry in silence — the default ledger is gitignored, so the digest is the sole
+    write authorization and git never republishes it.
+
+    The anchor therefore moves only when the bytes written over are still the
+    bytes this engine last claimed; here they are not, so it stays on the
+    snapshot, the restore declines and journals instead.
+
+    Ablation: drop the `_may_move_ledger_anchor` guard from the append site and
+    the anchor row reds, then the rival's entry vanishes from disk."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    real_append = deferredwork.append_entries_published
+    rival_filed: list[bool] = []
+
+    def a_rival_writes_then_append(*args, **kwargs):
+        if not rival_filed:
+            # Latched BEFORE the nested call: the rival goes through the ordinary
+            # public appender, which delegates down to this very symbol.
+            rival_filed.append(True)
+            deferredwork.append_entry(
+                ledger,
+                title="filed by another process",
+                origin="sweep, 2026-06-11",
+                source_spec="other.md",
+                reason="a rival writer got here first.",
+            )
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", a_rival_writes_then_append)
+    engine._harvest_spec_deferrals(task, result_json)
+    monkeypatch.setattr(deferredwork, "append_entries_published", real_append)
+
+    published = ledger.read_text(encoding="utf-8")
+    assert rival_filed and "filed by another process" in published  # the rival really did land
+    assert [e.title for e in _harvest_entries(project)][-1] == HARVEST_A["summary"]  # ours too
+    # The anchor never left the snapshot: what this append wrote over was not what
+    # the task last claimed, so the published bytes are not provably ours.
+    assert task.post_engine_ledger_digest == _digest_of(snapshot)
+    assert task.post_engine_ledger_digest != _digest_of(published)
+
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == published  # nothing retracted
+    assert "filed by another process" in ledger.read_text(encoding="utf-8")
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a" and event["ledger"] == str(ledger)
+
+
+def test_harvest_mark_declines_the_anchor_over_a_rival_that_beat_it_to_the_lock(
+    project, monkeypatch
+):
+    """The identical loss through the `seen-again:` leg, which files no entry.
+
+    `mark_seen_again_many` hands back the whole post-edit file too, so fixing only
+    the append site leaves this path re-publishing — and then retracting — a
+    rival's entry. Shaped so the harvest's append leg is inert: the one finding
+    matches an already-open entry from another spec, so nothing is filed and the
+    mark is the only ledger write this harvest makes.
+
+    Ablation: drop the `_may_move_ledger_anchor` guard from the mark site and the
+    anchor row reds, then the rival's entry vanishes from disk."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    real_mark = deferredwork.mark_seen_again_many
+
+    def a_rival_writes_then_mark(path, dw_ids, date, note):
+        deferredwork.append_entry(
+            path,
+            title="filed by another process",
+            origin="sweep, 2026-06-11",
+            source_spec="other.md",
+            reason="a rival writer got here first.",
+        )
+        return real_mark(path, dw_ids, date, note)
+
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", a_rival_writes_then_mark)
+    engine._harvest_spec_deferrals(task, result_json)
+    monkeypatch.setattr(deferredwork, "mark_seen_again_many", real_mark)
+
+    published = ledger.read_text(encoding="utf-8")
+    assert "filed by another process" in published  # the rival really did land
+    assert "seen-again: " in published  # and the mark really did write
+    # The append leg is inert here, so the mark's own decision is the only one
+    # that could have moved the anchor.
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+    assert task.post_engine_ledger_digest == _digest_of(snapshot)
+    assert task.post_engine_ledger_digest != _digest_of(published)
+
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == published  # nothing retracted
+    assert "filed by another process" in ledger.read_text(encoding="utf-8")
+    assert "ledger-restore-skipped-diverged" in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_harvest_anchor_still_moves_for_an_uncontended_mark_then_append(project):
+    """The control the conditional must not cost: with no rival, both legs anchor.
+
+    The append's locked read sees the text the mark published, not the raw
+    pre-harvest snapshot, so the guard compares against the anchor rather than the
+    snapshot. One finding matches an open entry (the mark) and a second does not
+    (the append), which is the only ordering where both legs write in one harvest."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    _seeded_ledger(project, origin=f"spec-deferred {fp}", source_spec="spec-9-9-z.md")
+
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
+    ledger = project.deferred_work
+    snapshot = _arm_ledger_snapshot(task, ledger)
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    published = ledger.read_text(encoding="utf-8")
+    assert "seen-again: " in published  # the mark leg wrote
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["seen_again"] == ["DW-1"] and event["dw_ids"] == ["DW-2"]  # and the append leg
+    assert task.post_engine_ledger_digest == _digest_of(published)
+    assert task.post_engine_ledger_digest != _digest_of(snapshot)
+
+    # And the restore still owns those bytes: an accepted-then-rejected attempt
+    # retracts this engine's own harvest exactly as it did before the guard.
+    engine._restore_persisted_ledger(task, replayed=False)
+    assert ledger.read_text(encoding="utf-8") == snapshot
 
 
 def test_spec_deferrals_dedup_sees_already_done_entries(project):
