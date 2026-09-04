@@ -1542,6 +1542,13 @@ class WorktreeFlow:
                 self.state.target_branch,
                 self.policy.scm.branch_per,
                 self.run_dir,
+                # The accepted spec the reclaim must not destroy. `_accepted_spec_seed`
+                # lays a gitignored spec into the mount and the shield then ignores it
+                # there, so the orphan holds the only copy; the isolation flip kept
+                # `spec_file` at its mount-relative spelling for exactly this reason
+                # (`release_spec_paths_from_mount`), which is the spelling the reclaim's
+                # snapshot resolves against the mount.
+                spec_file=task.spec_file,
                 # An orphan an isolation flip left standing at this unit's mount
                 # path is reclaimed by the open; its uncommitted state is parked
                 # first and named here so the recovery ref is discoverable from the

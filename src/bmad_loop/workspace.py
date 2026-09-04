@@ -114,11 +114,98 @@ def orphan_preserve_ref_name(run_id: str, head: str) -> str:
     return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-orphan"
 
 
+def _orphan_owned_rels(wt: Path, paths: ProjectPaths, spec_file: str | None) -> tuple[str, ...]:
+    """The mount-relative paths of the orchestrator's OWN artifacts inside an
+    orphaned mount at ``wt`` — the deferred-work ledger, the sprint board and the
+    accepted spec — for :func:`verify.snapshot_worktree`'s ``force_include``.
+
+    Without this the orphan snapshot cannot see them at all. Its untracked
+    candidates come from ``verify.untracked_files``, i.e. ``git ls-files --others
+    --exclude-standard``, which excludes IGNORED files by contract — and these three
+    are ignored inside every mount by construction: ``WorktreeFlow`` seeds them into
+    a checkout that carries tracked files only, and folds every seeded rel into the
+    worktree-local ``info/exclude`` so the unit's ``git add -A`` cannot ride them
+    onto the merge. So the mount holds the only copy, the reclaim's
+    ``worktree_remove(force=True)`` deletes it, and an orphan never merges — no
+    carry runs and no replay handle survives (`_replay_unlatched_ledger_carries`
+    gates on ``task.worktree_path``, cleared when the flip releases the mount).
+    Worse, over a CLEAN tracked tree ``snapshot_worktree`` returns ``None``, so the
+    loss came with no ref, no ``on_orphan_preserved`` callback and no journal line.
+
+    Deliberately NARROW: naming every ignored path instead would park the seeded
+    ``_bmad/`` tree, the adapters' MCP configs and venv residue into a
+    ``refs/attempt-preserve-dirty/*`` object that ``scm.preserve_keep`` retains 20
+    deep. Refusing the reclaim instead is no remedy either — every mount has
+    shielded ignored files by construction, so the flip-back path would never work
+    again.
+
+    Derived from ``paths`` rebased onto the mount, and each candidate is included
+    only when it is present there as a REGULAR FILE inside the mount root: the
+    ``git add -f`` in ``snapshot_worktree`` is a repair write that raises (and so
+    refuses the remount) on a path it cannot stage. ``resolve()`` decides
+    containment, so a candidate that lands outside the mount drops out.
+
+    Each candidate is judged ALONE, which is the whole point of the per-candidate
+    ``try``. An artifacts dir configured outside the project tree is a supported
+    shape, and ``ProjectPaths.rebased`` deliberately leaves it unmoved there
+    ("configured outside the project tree; doesn't move"): the ledger and the board
+    then resolve outside the mount and SHOULD drop, because they are shared rather
+    than per-checkout and the reclaim cannot destroy them. The spec must not drop
+    with them — ``WorktreeFlow._accepted_spec_seed`` lays it INSIDE the mount
+    whatever the artifacts dir is doing, so there it is still the only copy. A
+    single ``try`` around the loop returned ``()`` for all three the moment the
+    first candidate raised, making this fix silently inert in exactly that
+    configuration — the same silence it exists to remove.
+
+    Naming DEGRADES to ``()`` only on a setup fault (the mount path or the rebase
+    itself), in ``WorktreeFlow._ledger_seed``'s style: this function decides which
+    rels are orchestrator-owned, and an unanswerable question about that is not
+    evidence of work to lose. The #340 gate stays where the capture is — a rel this
+    DOES name that git then cannot stage raises and leaves the orphan standing.
+    """
+    # Setup only: a fault here has no per-candidate meaning, so it voids the answer.
+    try:
+        root = wt.resolve()
+        mounted = paths.rebased(wt)
+    except (OSError, RuntimeError):
+        return ()
+    spec_candidate: Path | None = None
+    if spec_file and not Path(spec_file).is_absolute():
+        try:
+            spec_candidate = verify.resolve_spec_path(spec_file, mounted)
+        except OSError:
+            # That probe decides between its two locations with `is_file()`, which
+            # re-raises EACCES through 3.13 (3.14 returns False instead — neither is
+            # relied on). An unreadable probe drops the SPEC leg alone.
+            spec_candidate = None
+    candidates = [mounted.deferred_work, mounted.sprint_status]
+    if spec_candidate is not None:
+        candidates.append(spec_candidate)
+    rels: list[str] = []
+    for candidate in candidates:
+        # Per candidate, never shared: one path that is out-of-mount, unreadable or a
+        # broken link drops ITSELF. A single try around the loop would have the
+        # out-of-tree artifacts dir — a supported configuration whose ledger and board
+        # correctly drop — take the spec down with them, and the spec IS in the mount.
+        try:
+            target = candidate.resolve()
+            if not target.is_file():
+                continue
+            rel = target.relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if rel and rel != "." and rel not in rels:
+            rels.append(rel)
+    return tuple(rels)
+
+
 def _preserve_orphan_state(
     repo_root: Path,
     wt: Path,
     run_id: str,
     unit_key: str,
+    paths: ProjectPaths,
+    spec_file: str | None,
     on_orphan_preserved: Callable[[str, str], None] | None,
 ) -> None:
     """Park the uncommitted work an orphaned mount at ``wt`` still holds before the
@@ -143,12 +230,21 @@ def _preserve_orphan_state(
     branch reset below moves that ref) so the parked commit is parented at the tree
     the orphan actually diverged from and holds only what was uncommitted.
 
-    A clean tree is a no-op (no ref, no callback). A capture failure raises
-    :class:`verify.GitError` and so refuses the remount (#340: a capture failure
-    over a tree with something to lose is a gate, not a footnote) — the orphan is
-    left standing for manual recovery, and the caller's ``worktree-open-failed``
-    path defers the unit. ``OSError`` from the snapshot's temp index is folded into
-    that same refusal rather than escaping untyped.
+    ``[]`` is nonetheless the MAXIMALLY preserving value and still not enough: the
+    parked set is the derived difference ``untracked_files(repo) -
+    baseline_untracked``, and ``untracked_files`` excludes ignored paths by
+    contract. The orchestrator's own artifacts are ignored inside every mount by
+    construction, so they need the narrow ``force_include``
+    :func:`_orphan_owned_rels` derives — which is also what makes a CLEAN tracked
+    tree stop being a silent total loss, since the forced ``add`` is what lifts the
+    snapshot tree above HEAD.
+
+    An orphan holding nothing in either set is a no-op (no ref, no callback). A
+    capture failure raises :class:`verify.GitError` and so refuses the remount
+    (#340: a capture failure over a tree with something to lose is a gate, not a
+    footnote) — the orphan is left standing for manual recovery, and the caller's
+    ``worktree-open-failed`` path defers the unit. ``OSError`` from the snapshot's
+    temp index is folded into that same refusal rather than escaping untyped.
     """
     if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
         return
@@ -170,7 +266,12 @@ def _preserve_orphan_state(
                 )
             ref = f"{base_ref}-r{serial}"
             serial += 1
-        parked = verify.snapshot_worktree(wt, ref, baseline_untracked=[])
+        parked = verify.snapshot_worktree(
+            wt,
+            ref,
+            baseline_untracked=[],
+            force_include=_orphan_owned_rels(wt, paths, spec_file),
+        )
     except OSError as e:
         raise verify.GitError(
             f"cannot snapshot orphaned worktree {wt} for {unit_key} before reclaim: {e}"
@@ -229,6 +330,7 @@ def open_unit_workspace(
     branch_per: str,
     run_dir: Path,
     *,
+    spec_file: str | None = None,
     on_orphan_preserved: Callable[[str, str], None] | None = None,
 ) -> UnitWorkspace:
     """Mount a fresh worktree for `unit_key` and return its rebased workspace.
@@ -259,11 +361,13 @@ def open_unit_workspace(
 
     Whatever already occupies the deterministic mount path is reclaimed first. If
     it is a registered worktree of ``repo_root`` (an orphan left standing by an
-    isolation flip, see the reclaim comment) its *uncommitted* state — tracked edits
-    and run-created untracked files — is parked under
-    ``refs/attempt-preserve-dirty/<run>-<head>-orphan`` before the force-remove; a
-    clean orphan parks nothing. ``on_orphan_preserved`` (worktree path, ref) fires
-    once per parked snapshot so a caller with a journal can record it —
+    isolation flip, see the reclaim comment) its *uncommitted* state — tracked edits,
+    run-created untracked files, and the orchestrator-owned artifacts the mount
+    shields as ignored (ledger, board, and the ``spec_file`` binding when one is
+    passed; see :func:`_orphan_owned_rels`) — is parked under
+    ``refs/attempt-preserve-dirty/<run>-<head>-orphan`` before the force-remove; an
+    orphan holding none of them parks nothing. ``on_orphan_preserved`` (worktree
+    path, ref) fires once per parked snapshot so a caller with a journal can record it —
     ``open_unit_workspace`` has none, in the style of ``close_unit_workspace``'s
     ``on_teardown_degraded``. A snapshot that cannot be written refuses the remount
     (raises ``GitError``) and leaves the orphan standing.
@@ -303,7 +407,7 @@ def open_unit_workspace(
     # Park an orphan's uncommitted state FIRST — before the story reset below moves
     # the ref the orphan's HEAD points at, so the snapshot is parented at the tree
     # the orphan actually holds and captures only what was never committed.
-    _preserve_orphan_state(repo_root, wt, run_id, unit_key, on_orphan_preserved)
+    _preserve_orphan_state(repo_root, wt, run_id, unit_key, paths, spec_file, on_orphan_preserved)
     if branch_tip is not None and branch_per == "story":
         commits = verify.commits_above(repo_root, pinned_base, branch_tip)
         if commits:

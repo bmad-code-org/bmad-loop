@@ -249,6 +249,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **An orphaned mount's reclaim no longer destroys the orchestrator's own artifacts.** The
+  pre-reclaim snapshot drew its untracked candidates from `untracked_files`, which excludes
+  ignored paths by contract, and the deferred-work ledger, sprint board and bound spec are
+  ignored inside every mount by construction. Over a clean tracked tree it therefore parked
+  nothing, so the force-remove took them with no ref, no callback and no journal line. Those
+  three are now force-included when the mount holds them as regular files, judged one by
+  one; no other ignored path is parked.
 - **A harvest's ledger anchor no longer adopts a rival entry that beat it to the lock.**
   Both `deferredwork` mutators publish the whole post-edit file, so an entry appended
   between the pre-harvest snapshot and their locked read was claimed by

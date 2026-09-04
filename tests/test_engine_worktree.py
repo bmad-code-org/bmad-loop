@@ -6628,6 +6628,203 @@ def test_remount_over_clean_orphan_parks_nothing(project):
     assert _dirty_refs(project) == []
 
 
+SPEC_REL = "_bmad-output/implementation-artifacts/story-1-1-a.md"
+
+
+def _ref_tree(project, ref: str) -> list[str]:
+    return git(project.project, "ls-tree", "-r", "--name-only", ref).splitlines()
+
+
+def _mount_ignored_artifacts(project, unit, *, ledger: str, board: str, spec: str) -> None:
+    """Lay the three orchestrator-owned artifacts into a mount as IGNORED files —
+    the state `WorktreeFlow` leaves behind when its ledger/board/accepted-spec seeds
+    copy them in and the shield folds every seeded rel into the worktree-local
+    `info/exclude`. Here the project's own committed `.gitignore` — checked out into
+    the mount like any tracked file — is the shield; the predicate git answers is the
+    same one, and `open_unit_workspace` is exercised directly, without provisioning."""
+    mounted = project.rebased(unit.path)
+    mounted.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    mounted.deferred_work.write_text(ledger, encoding="utf-8")
+    mounted.sprint_status.write_text(board, encoding="utf-8")
+    (unit.path / SPEC_REL).write_text(spec, encoding="utf-8")
+
+
+def test_remount_parks_the_orphans_owned_artifacts_over_a_clean_tree(project):
+    """The orchestrator's OWN artifacts — deferred-work ledger, sprint board, bound
+    spec — are ignored inside every mount by construction (seeded into a tracked-only
+    checkout, then folded into the shield), so `untracked_files` never offers them as
+    snapshot candidates and the reclaim's force-remove destroys the mount's only copy.
+
+    The severity is the SILENCE: with a clean tracked tree the old snapshot returned
+    ``None``, so there was no ref, no ``on_orphan_preserved`` callback and no journal
+    line while the files went. This pins the clean-tree case specifically — nothing
+    tracked is edited and there is not one non-ignored untracked file in the mount.
+
+    Ablation: drop ``force_include`` from ``_preserve_orphan_state``'s
+    ``snapshot_worktree`` call and the remount parks nothing — ``preserved == []``.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    ignore_before_commit(project, "**/deferred-work.md", "**/sprint-status.yaml", "**/story-*.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    unit = open_unit_workspace(*_open_args(project), spec_file=SPEC_REL)
+    _mount_ignored_artifacts(
+        project,
+        unit,
+        ledger="# Deferred Work\n\n### DW-1: closed in the orphan\n\nstatus: done\n",
+        board="development_status:\n  1-1-a: in-progress\n",
+        spec="# story 1-1-a\n\nthe orphan's bound spec\n",
+    )
+    orphan_head = rev_parse_head(unit.path)
+    # the tracked tree is CLEAN and nothing non-ignored is untracked: the whole
+    # uncommitted delta is the three ignored artifacts
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert verify.untracked_files(unit.path) == set()
+
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project),
+        spec_file=SPEC_REL,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    assert second.path == unit.path and second.path.is_dir()
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert "closed in the orphan" in git(
+        project.project,
+        "show",
+        f"{ref}:{project.deferred_work.relative_to(project.project).as_posix()}",
+    )
+    assert "in-progress" in git(
+        project.project,
+        "show",
+        f"{ref}:{project.sprint_status.relative_to(project.project).as_posix()}",
+    )
+    assert "bound spec" in git(project.project, "show", f"{ref}:{SPEC_REL}")
+    # the reclaim did what it always did — the mount's copies are gone
+    assert not project.rebased(second.path).deferred_work.exists()
+    assert not (second.path / SPEC_REL).exists()
+
+
+def test_remount_never_parks_an_orphans_unowned_ignored_files(project):
+    """The forced include is NARROW on purpose. Parking every ignored path instead
+    would push the seeded `_bmad/` tree, the adapters' MCP configs and venv residue
+    into a ``refs/attempt-preserve-dirty/*`` object ``scm.preserve_keep`` retains 20
+    deep — which is why that remedy was rejected. Only the three orchestrator-owned
+    rels ride the snapshot; every other ignored file is reclaimed as before.
+
+    Ablation A: widen ``_orphan_owned_rels`` to name every file under the mount.
+    Ablation B: widen the staging instead — make ``snapshot_worktree``'s forced add
+    ``git add -f -A``. Both park ``.venv/residue.txt`` and fail this test.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    ignore_before_commit(
+        project, "**/deferred-work.md", "**/sprint-status.yaml", "**/story-*.md", ".venv/", "*.log"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    unit = open_unit_workspace(*_open_args(project), spec_file=SPEC_REL)
+    _mount_ignored_artifacts(
+        project,
+        unit,
+        ledger="# Deferred Work\n\n### DW-1: item\n\nstatus: open\n",
+        board="development_status:\n  1-1-a: in-progress\n",
+        spec="# story 1-1-a\n",
+    )
+    (unit.path / ".venv").mkdir()
+    (unit.path / ".venv" / "residue.txt").write_text("venv residue\n", encoding="utf-8")
+    (unit.path / "session.log").write_text("stray ignored artifact\n", encoding="utf-8")
+    orphan_head = rev_parse_head(unit.path)
+
+    preserved: list[tuple[str, str]] = []
+    open_unit_workspace(
+        *_open_args(project),
+        spec_file=SPEC_REL,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert ".venv/residue.txt" not in _ref_tree(project, ref)
+    assert "session.log" not in _ref_tree(project, ref)
+    # exhaustive, not just those two: HEAD's tracked tree plus exactly the three
+    assert sorted(_ref_tree(project, ref)) == sorted(
+        [
+            *git(project.project, "ls-tree", "-r", "--name-only", "HEAD").splitlines(),
+            project.deferred_work.relative_to(project.project).as_posix(),
+            project.sprint_status.relative_to(project.project).as_posix(),
+            SPEC_REL,
+        ]
+    )
+
+
+def test_remount_parks_the_mounted_spec_when_the_artifacts_dir_is_out_of_tree(project):
+    """An artifacts dir configured OUTSIDE the project tree is a supported shape, and
+    `ProjectPaths.rebased` deliberately leaves it unmoved there — so the ledger and the
+    board resolve outside the mount and must drop from the forced include: they are
+    shared, not per-checkout, and the reclaim cannot destroy them.
+
+    The spec must NOT drop with them. `_accepted_spec_seed` lays it inside the mount
+    whatever the artifacts dir is doing, so there it is still the mount's only copy and
+    the force-remove still takes it. Judging the candidates as a group is what made
+    that leg inert: the ledger raises `ValueError` on `relative_to` first.
+
+    Ablation: put the whole candidate loop back under one `try ... except (OSError,
+    RuntimeError, ValueError): return ()` and the first candidate voids all three —
+    nothing is forced in, the clean tracked tree parks nothing, `preserved == []`.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    shared = project.project.parent / "shared-artifacts"
+    shared.mkdir()
+    paths = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=shared,
+        planning_artifacts=project.planning_artifacts,
+    )
+    # the two shared artifacts really exist, out of the repo entirely
+    (shared / "deferred-work.md").write_text("# Deferred Work\n", encoding="utf-8")
+    (shared / "sprint-status.yaml").write_text(
+        "development_status:\n  1-1-a: ready-for-dev\n", encoding="utf-8"
+    )
+    ignore_before_commit(project, "**/story-*.md")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore specs")
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    open_args = (project.project, paths, "test-run", "1-1-a", "main", "story", run_dir)
+    spec_rel = "specs/story-1-1-a.md"
+    unit = open_unit_workspace(*open_args, spec_file=spec_rel)
+    (unit.path / "specs").mkdir()
+    (unit.path / spec_rel).write_text("# story 1-1-a\n\nthe mount's only copy\n", encoding="utf-8")
+    orphan_head = rev_parse_head(unit.path)
+    # the ledger and board rebase OUTSIDE the mount; the spec is inside it
+    mounted = paths.rebased(unit.path)
+    assert mounted.deferred_work == shared / "deferred-work.md"
+    assert not mounted.deferred_work.is_relative_to(unit.path)
+    # and the tracked tree is clean, so only the forced include can park anything
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert verify.untracked_files(unit.path) == set()
+
+    preserved: list[tuple[str, str]] = []
+    open_unit_workspace(
+        *open_args,
+        spec_file=spec_rel,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert "the mount's only copy" in git(project.project, "show", f"{ref}:{spec_rel}")
+    # the shared pair is not in the ref — and was never the reclaim's to destroy
+    assert sorted(_ref_tree(project, ref)) == sorted(
+        [*git(project.project, "ls-tree", "-r", "--name-only", "HEAD").splitlines(), spec_rel]
+    )
+    assert (shared / "deferred-work.md").read_text(encoding="utf-8") == "# Deferred Work\n"
+    assert (shared / "sprint-status.yaml").is_file()
+
+
 def test_remount_over_plain_directory_never_snapshots_the_project_tree(project):
     """The run dir lives INSIDE the project checkout, so a plain (non-worktree)
     directory at the mount path must not have git run in it: `status`/`add` there
