@@ -1261,6 +1261,41 @@ def test_wait_for_completion_ignores_identified_session_end_before_session_start
     assert "/child.jsonl" not in json.dumps(ignored)
 
 
+def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(tmp_path):
+    """An unidentified SessionStart cannot attribute a later identified end.
+
+    The launched parent must remain live until its own identified start and stop
+    arrive, even when a nested child shares the hook relay in between.
+    """
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    outer_id = "outer-session"
+    child_id = "early-nested-child"
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("3-1-dev-1", "SessionStart", transcript_path="/unknown.jsonl"),
+            _hook_event("3-1-dev-1", "SessionEnd", child_id, "/child.jsonl"),
+            _hook_event("3-1-dev-1", "SessionStart", outer_id, "/outer.jsonl"),
+            _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == outer_id
+    assert result.transcript_path == "/outer.jsonl"
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "unattributed-hook-event-ignored"
+    ]
+    assert [entry["hook_event"] for entry in ignored] == ["SessionEnd"]
+    assert [entry["foreign_session_id"] for entry in ignored] == [child_id]
+
+
 def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
     """Profiles without SessionStart cannot supply the attribution proof, so
     their established identified-Stop completion behavior must remain intact."""

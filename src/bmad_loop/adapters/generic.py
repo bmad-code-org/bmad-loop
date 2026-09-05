@@ -1016,9 +1016,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # cover every foreign lifecycle event while exposing no transcript
             # or prompt payload.
             if event.event == "SessionStart":
-                session_start_seen = True
                 if event.session_id and outer_session_id is None:
                     outer_session_id = event.session_id
+                    session_start_seen = True
                 elif event.session_id and event.session_id != outer_session_id:
                     self._note_lifecycle(
                         handle.task_id,
@@ -1027,6 +1027,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         foreign_session_id=event.session_id,
                     )
                     continue
+                elif event.session_id:
+                    session_start_seen = True
             elif (
                 outer_session_id is not None
                 and event.session_id
