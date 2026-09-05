@@ -637,6 +637,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # wall clock stepped backward must not stretch the session).
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
+        # The first identified SessionStart belongs to the CLI session this
+        # adapter launched. Nested CLIs can inherit the hook relay environment
+        # and write into the same task event stream, so their lifecycle events
+        # must never be allowed to replace this identity or score this session.
+        # Events without an ID deliberately retain the legacy compatibility
+        # path below: there is no reliable attribution signal to enforce.
+        outer_session_id: str | None = None
+        session_start_seen = False
+        expects_session_start = "SessionStart" in self.profile.hooks.events.values()
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
@@ -998,6 +1007,61 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
                     )
+                continue
+            # Bind task attribution only from the launched session's first
+            # identified SessionStart. Once bound, reject a differently
+            # identified event before it can change identity, transcript,
+            # completion, or retry-driving state. This is intentionally ahead
+            # of profile-specific subagent filtering too: the diagnostic should
+            # cover every foreign lifecycle event while exposing no transcript
+            # or prompt payload.
+            if event.event == "SessionStart":
+                if event.session_id and outer_session_id is None:
+                    outer_session_id = event.session_id
+                    session_start_seen = True
+                elif event.session_id and event.session_id != outer_session_id:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "foreign-hook-event-ignored",
+                        hook_event=event.event,
+                        foreign_session_id=event.session_id,
+                    )
+                    continue
+                elif event.session_id:
+                    session_start_seen = True
+            elif (
+                outer_session_id is not None
+                and event.session_id
+                and event.session_id != outer_session_id
+            ):
+                self._note_lifecycle(
+                    handle.task_id,
+                    "foreign-hook-event-ignored",
+                    hook_event=event.event,
+                    foreign_session_id=event.session_id,
+                )
+                continue
+            elif (
+                expects_session_start
+                and not session_start_seen
+                and event.event == "SessionEnd"
+                and event.session_id
+            ):
+                # A profile that declares SessionStart has not established even
+                # the beginning of its launched session yet. An identified
+                # session-death event on the shared task channel is therefore
+                # unattributable and must fail closed instead of crashing on a
+                # child. Stop remains on the compatibility path: several CLIs
+                # and established adapters can validly deliver it without an
+                # observed SessionStart, while SessionEnd is the crash signal
+                # that caused this regression. Stop-only profiles likewise
+                # cannot establish this proof and retain their existing path.
+                self._note_lifecycle(
+                    handle.task_id,
+                    "unattributed-hook-event-ignored",
+                    hook_event=event.event,
+                    foreign_session_id=event.session_id,
+                )
                 continue
             if (
                 event.event == "Stop"
