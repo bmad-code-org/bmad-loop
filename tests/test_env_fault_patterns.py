@@ -92,15 +92,18 @@ OPENCODE_REAL = [
 #
 # Provenance, since a pattern here may only be seeded from a captured line: the
 # first two were captured in issue #194, run `20260718-191419-44e7`, on the
-# `claude` adapter. The last three come from Claude Code's own JSONL transcripts,
-# from entries structurally tagged `"isApiErrorMessage": true`.
+# `claude` adapter. The next three come from Claude Code's own JSONL transcripts,
+# from entries structurally tagged `"isApiErrorMessage": true`. The last is the
+# credit-exhaustion sentence captured in issue #610: two unattended
+# color-dev-loop runs on 2026-09-07 (skills-library run `20260907-084618-824f`,
+# prompts-hub run `20260907-090132-98e3`) — four sessions idled through the
+# stall-nudge cap because nothing matched before this pattern existed.
 #
-# The quota class is still ABSENT, and deliberately so: no captured Claude Code
-# usage-limit line exists — not in this repo, not in #194/#323/#507, not in the
-# local transcripts. Seeding one needs a captured line with its run cited, the
-# bar test_unseeded_profiles_stay_inert states; a plausible-looking string is
-# exactly what that bar refuses. So an Anthropic plan's usage limit is still
-# unclassified on this adapter — a real, deliberately-left gap (#323).
+# One quota class is still ABSENT: the session-limit sibling ("You've hit your
+# session limit · resets ...") from the same #610 evidence. It is a distinct,
+# time-boxed cause rather than a money gate, and stays unseeded until it too is
+# captured cleanly enough to pattern on its own — a plausible-looking string is
+# exactly what test_unseeded_profiles_stay_inert's bar refuses.
 CLAUDE_REAL = [
     "API Error: Unable to connect to API (ConnectionRefused)",
     "API Error: Unable to connect to API: Self-signed certificate detected. "
@@ -110,6 +113,8 @@ CLAUDE_REAL = [
     "in a moment. If it persists, check https://status.claude.com.",
     "API Error: 500 Internal server error. This is a server-side issue, usually temporary — "
     "try again in a moment. If it persists, check https://status.claude.com.",
+    "You're out of usage credits. Run /usage-credits to keep using Fable 5.1 or /model to "
+    "switch models.",
 ]
 
 # Every profile with patterns, paired with the lines its own CLI actually emits.
@@ -230,6 +235,12 @@ BAIT = [
     "docs: explain the quota model and the 429 response contract",
     "INFO cleanup prune=7.days",
     "timestamp=2026-07-26T15:45:39.732Z level=INFO message=stream providerID=zai-coding-plan",
+    # Near-misses for the #610 credit-exhaustion anchor: ordinary assistant/AC
+    # lines about running out of usage credits, none of which carry the CLI's
+    # own "You're out of usage credit" framing contiguously.
+    "- [ ] AC-3: show a banner when the user is out of usage credits",
+    "PASS tests/test_credits.py::test_out_of_usage_credits_banner",
+    "docs: implement the /usage-credits banner copy for AC-2",
     # A story's own passing test whose NAME mentions the very error class the
     # anchors key on — the nastiest realistic collision.
     "PASS tests/test_api_error_handling.py::test_rate_limit_error_is_retried",

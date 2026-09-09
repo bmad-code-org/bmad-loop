@@ -291,6 +291,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Seed the Claude Code credit-exhaustion sentence (`You're out of usage credit[s] …`) as an
+  env-fault pattern in the `claude` profile (#610).** Captured verbatim from two unattended
+  color-dev-loop runs on 2026-09-07; without this pattern, a credit-exhausted session idled
+  through the stall-nudge cap and charged a dev attempt instead of pausing for the operator.
+
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The
   gesture runs on Textual's message loop, so taking the run's state lock blocking
   froze the whole dashboard for as long as a rival held it — unbounded on POSIX,

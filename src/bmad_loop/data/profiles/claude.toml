@@ -47,16 +47,25 @@ seed_files = [
 # configuration as a provider outage (#507). Pinned by
 # test_shipped_patterns_do_not_match_their_own_profile_line.
 #
-# No usage-limit / quota cause is seeded: no captured Claude Code quota line
-# exists, and on a pane capture that vocabulary is what a story IMPLEMENTING
-# rate limiting prints all day. Seed one only from a captured line, citing the
-# run it came from — the bar test_unseeded_profiles_stay_inert states.
+# A subscription credit-exhaustion refusal is now seeded (#610), captured
+# verbatim from the Claude Code CLI across two unattended color-dev-loop runs on
+# 2026-09-07 (skills-library and prompts-hub); four sessions idled through the
+# stall-nudge cap because nothing matched before this pattern existed — see
+# #610's evidence comment. The captured sentence:
+#   You're out of usage credit[s]. Run /usage-credits to keep using Fable 5.1
+#   or /model to switch models.
+# It is an environment fault, not a dev fault, because the CLI never reaches
+# the API at all — pausing the run without burning a dev attempt is the #194
+# contract. The session-limit sibling ("You've hit your session limit ·
+# resets ...") is a separate, time-boxed cause and stays unseeded until it is
+# captured cleanly enough to pattern on its own.
 #
 # To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
 env_fault_patterns = [
   "API Error: Unable to connect t[o] API",
   "API Error: Connection closed mid-respons[e]",
   "API Error: (5[2]9 Overloaded|5[0]0 Internal server error)",
+  "You're out of usage credit[s]",
 ]
 
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
