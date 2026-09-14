@@ -57,7 +57,16 @@ def attempt_preserve_ref_name(run_id: str, tip: str) -> str:
 
 
 class _OwnedSpecAuthorityError(RuntimeError):
-    """A previously canonical owned-spec name became unsafe to restore."""
+    """A previously canonical owned spec lost trustworthy restore authority."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        published_without_verification: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.published_without_verification = published_without_verification
 
 
 def _target_stat_version(observed: os.stat_result) -> tuple[int, int, int]:
@@ -516,32 +525,16 @@ class RecoveryFlow:
                 raise _OwnedSpecAuthorityError(authority_message)
 
         def verify_fallback_bytes(_published_fd: int | None) -> None:
-            before = fallback_target_stat()
-            if before is None:
-                raise _OwnedSpecAuthorityError(authority_message)
-            restored = spec_path.read_bytes()
-            after = fallback_target_stat()
-            if after is None:
-                raise _OwnedSpecAuthorityError(authority_message)
-            before_signature = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
+            # The fallback writer no longer owns an inode-bound descriptor once
+            # publication completes. Reopening or even observing the final name
+            # would make a concurrent replacement authoritative. Publication has
+            # already happened, so refuse it without touching the target path and
+            # let the recovery state machine require explicit manual adoption.
+            raise _OwnedSpecAuthorityError(
+                "attempt-owned spec bytes were published but cannot be verified "
+                f"without descriptor-relative writes: {spec_path}",
+                published_without_verification=True,
             )
-            after_signature = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            if before_signature != after_signature:
-                raise _OwnedSpecAuthorityError(authority_message)
-            if restored != snapshot:
-                raise verify.FrontmatterWriteError(mismatch_message)
-            fallback_parent_is_canonical()
 
         # `require_writable_target=True` (#597): the spec this puts back is
         # operator-editable, and a temp-and-replace write needs write permission
@@ -611,6 +604,71 @@ class RecoveryFlow:
         # repair as a fail-safe for a legacy or externally edited state record;
         # it is the only permitted difference from the exact snapshot.
         cls._normalize_attempt_owned_spec(spec_path, target_status, confine_root=confine_root)
+
+    @staticmethod
+    def _owned_spec_restore_problem(
+        exc: _OwnedSpecAuthorityError,
+        *,
+        unsafe_context: str,
+        expected_status: str | None = None,
+    ) -> str:
+        if exc.published_without_verification:
+            status_guidance = (
+                f"; the adopted spec must have lifecycle status {expected_status!r}"
+                if expected_status is not None
+                else ""
+            )
+            return (
+                f"restoration bytes were published {unsafe_context}, but this platform "
+                "cannot verify the resulting file without descriptor-relative writes"
+                f"{status_guidance}; manual adoption is required"
+            )
+        return f"its path became unsafe {unsafe_context} ({exc})"
+
+    def _restore_attempt_owned_spec_bytes_or_pause(
+        self,
+        task: StoryTask,
+        spec_path: Path,
+        snapshot: bytes,
+        *,
+        unsafe_context: str,
+    ) -> None:
+        try:
+            self._restore_attempt_owned_spec_bytes(spec_path, snapshot)
+        except _OwnedSpecAuthorityError as exc:
+            self.pause_for_owned_spec_recovery(
+                task,
+                str(spec_path),
+                self._owned_spec_restore_problem(exc, unsafe_context=unsafe_context),
+            )
+
+    def _restore_attempt_owned_spec_or_pause(
+        self,
+        task: StoryTask,
+        spec_path: Path,
+        snapshot: bytes,
+        target_status: str,
+        *,
+        confine_root: Path,
+        unsafe_context: str,
+    ) -> None:
+        try:
+            self._restore_attempt_owned_spec(
+                spec_path,
+                snapshot,
+                target_status,
+                confine_root=confine_root,
+            )
+        except _OwnedSpecAuthorityError as exc:
+            self.pause_for_owned_spec_recovery(
+                task,
+                str(spec_path),
+                self._owned_spec_restore_problem(
+                    exc,
+                    unsafe_context=unsafe_context,
+                    expected_status=target_status,
+                ),
+            )
 
     def pause_for_owned_spec_recovery(
         self,
@@ -999,11 +1057,13 @@ class RecoveryFlow:
                     else:
                         if restore_redrive_snapshot:
                             assert task.dispatched_spec_snapshot is not None
-                            self._restore_attempt_owned_spec(
+                            self._restore_attempt_owned_spec_or_pause(
+                                task,
                                 spec_path,
                                 task.dispatched_spec_snapshot,
                                 target_status,
                                 confine_root=workspace.paths.project,
+                                unsafe_context="while restoring the pre-attempt retry input",
                             )
                             owned_snapshot_restored = True
                         else:
@@ -1068,8 +1128,13 @@ class RecoveryFlow:
                                 dirty = True
                                 normalized_status = None
                             elif spec_path.read_bytes() != task.dispatched_spec_snapshot:
-                                self._restore_attempt_owned_spec_bytes(
-                                    spec_path, task.dispatched_spec_snapshot
+                                self._restore_attempt_owned_spec_bytes_or_pause(
+                                    task,
+                                    spec_path,
+                                    task.dispatched_spec_snapshot,
+                                    unsafe_context=(
+                                        "while restoring the pre-launch operator input"
+                                    ),
                                 )
                                 owned_snapshot_restored = True
                                 normalized_status = None
@@ -1098,15 +1163,12 @@ class RecoveryFlow:
                     # recovery policy below. If baseline-status normalization did
                     # not prove the checkout clean, put its spec back byte-for-byte
                     # before that policy claims the tree was left untouched.
-                    try:
-                        self._restore_attempt_owned_spec_bytes(spec_path, original_spec)
-                    except _OwnedSpecAuthorityError as exc:
-                        self.pause_for_owned_spec_recovery(
-                            task,
-                            str(spec_path),
-                            "its path became unsafe while undoing a tentative "
-                            f"lifecycle repair ({exc})",
-                        )
+                    self._restore_attempt_owned_spec_bytes_or_pause(
+                        task,
+                        spec_path,
+                        original_spec,
+                        unsafe_context="while undoing a tentative lifecycle repair",
+                    )
                     normalized_status = None
         if (
             owned_snapshot_restored
@@ -1236,30 +1298,31 @@ class RecoveryFlow:
                 assert task.dispatched_spec_snapshot is not None
                 if redrive:
                     target_status = "in-review" if task.restore_patch else "ready-for-dev"
-                    self._restore_attempt_owned_spec(
+                    self._restore_attempt_owned_spec_or_pause(
+                        task,
                         owned_spec[0],
                         task.dispatched_spec_snapshot,
                         target_status,
                         confine_root=workspace.paths.project,
+                        unsafe_context="before the baseline reset",
                     )
                 else:
-                    self._restore_attempt_owned_spec_bytes(
-                        owned_spec[0], task.dispatched_spec_snapshot
+                    self._restore_attempt_owned_spec_bytes_or_pause(
+                        task,
+                        owned_spec[0],
+                        task.dispatched_spec_snapshot,
+                        unsafe_context="before the baseline reset",
                     )
                 owned_snapshot_restored = True
             self.safe_reset(task, preserve=protected)
             if restore_attempt_snapshot and owned_spec and owned_exclude and not redrive:
                 assert task.dispatched_spec_snapshot is not None
-                try:
-                    self._restore_attempt_owned_spec_bytes(
-                        owned_spec[0], task.dispatched_spec_snapshot
-                    )
-                except _OwnedSpecAuthorityError as exc:
-                    self.pause_for_owned_spec_recovery(
-                        task,
-                        str(owned_spec[0]),
-                        f"its path became unsafe after the baseline reset ({exc})",
-                    )
+                self._restore_attempt_owned_spec_bytes_or_pause(
+                    task,
+                    owned_spec[0],
+                    task.dispatched_spec_snapshot,
+                    unsafe_context="after the baseline reset",
+                )
                 owned_snapshot_restored = True
             if redrive and task.baseline_commit and owned_spec:
                 # A sibling source/artifact change bypasses the earlier spec-only
@@ -1279,19 +1342,14 @@ class RecoveryFlow:
                         owned_spec[1],
                     )
                 if restore_redrive_snapshot and task.dispatched_spec_snapshot is not None:
-                    try:
-                        self._restore_attempt_owned_spec(
-                            owned_spec[0],
-                            task.dispatched_spec_snapshot,
-                            target_status,
-                            confine_root=workspace.paths.project,
-                        )
-                    except _OwnedSpecAuthorityError as exc:
-                        self.pause_for_owned_spec_recovery(
-                            task,
-                            str(owned_spec[0]),
-                            f"its path became unsafe after the baseline reset ({exc})",
-                        )
+                    self._restore_attempt_owned_spec_or_pause(
+                        task,
+                        owned_spec[0],
+                        task.dispatched_spec_snapshot,
+                        target_status,
+                        confine_root=workspace.paths.project,
+                        unsafe_context="after the baseline reset",
+                    )
                 else:
                     self._normalize_attempt_owned_spec(
                         owned_spec[0],
@@ -1364,7 +1422,12 @@ class RecoveryFlow:
             # restoring the byte-exact pre-launch operator input cannot destroy
             # evidence even though sibling residue still requires manual policy.
             assert task.dispatched_spec_snapshot is not None
-            self._restore_attempt_owned_spec_bytes(owned_spec[0], task.dispatched_spec_snapshot)
+            self._restore_attempt_owned_spec_bytes_or_pause(
+                task,
+                owned_spec[0],
+                task.dispatched_spec_snapshot,
+                unsafe_context="before the ordinary manual-recovery pause",
+            )
             restored_before_pause = str(owned_spec[0])
             self.journal.append(
                 "rollback-owned-spec-restored",
