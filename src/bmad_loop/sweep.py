@@ -3147,8 +3147,9 @@ class SweepEngine(Engine):
         if not restart_isolated and task.baseline_commit:
             # latch resolved_redrive so the corrected spec + restored diff stay
             # protected through every reset of this re-drive, not just this
-            # first one; cause="resolved" keeps a human-initiated re-arm
-            # pause-free regardless of scm.rollback_on_failure
+            # first one; cause="resolved" keeps a human-initiated re-arm clear of
+            # the policy pause regardless of scm.rollback_on_failure. Unsafe
+            # attempt-owned authority may still require manual recovery.
             task.resolved_redrive = task.resolved_redrive or task.rearmed
             self._rollback_or_pause(task, cause="resolved" if task.rearmed else "stopped")
         task.rearmed = False  # past rollback (only reached when not paused)

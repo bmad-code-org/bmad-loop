@@ -25,9 +25,7 @@ from . import gates, verify
 from .model import Phase
 from .platform_util import (
     DIR_FD_ANCHORED_WRITES,
-    UnconfinedWriteError,
     atomic_write_bytes_at,
-    atomic_write_bytes_confined,
     open_dir_confined,
     safe_ref_segment,
 )
@@ -63,10 +61,10 @@ class _OwnedSpecAuthorityError(RuntimeError):
         self,
         message: str,
         *,
-        published_without_verification: bool = False,
+        safe_restoration_unavailable: bool = False,
     ) -> None:
         super().__init__(message)
-        self.published_without_verification = published_without_verification
+        self.safe_restoration_unavailable = safe_restoration_unavailable
 
 
 def _target_stat_version(observed: os.stat_result) -> tuple[int, int, int]:
@@ -226,7 +224,17 @@ class RecoveryFlow:
         confinement exists for. It reaches the spec-writer chokepoint rule
         stated in `frontmatter.set_frontmatter_status` — an artifacts folder
         configured outside the project is a trusted repair target here
-        (`_attempt_owned_spec`) and keeps the plain no-follow write."""
+        (`_attempt_owned_spec`) when descriptor-relative writes are available."""
+        # A path-based fallback cannot retain publication authority across the
+        # final replace. Refuse before any repair write so a substituted parent
+        # or target cannot redirect staging, publication, or cleanup.
+        if not DIR_FD_ANCHORED_WRITES:
+            raise _OwnedSpecAuthorityError(
+                "safe automatic attempt-owned spec restoration is unavailable because "
+                "it cannot be verified without descriptor-relative writes: "
+                f"{spec_path}",
+                safe_restoration_unavailable=True,
+            )
         verify.set_frontmatter_status(spec_path, target_status, confine_root=confine_root)
         if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
             raise verify.FrontmatterWriteError(
@@ -282,6 +290,14 @@ class RecoveryFlow:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             ) from exc
+
+        if not DIR_FD_ANCHORED_WRITES:
+            raise _OwnedSpecAuthorityError(
+                "safe automatic attempt-owned spec restoration is unavailable because "
+                "it cannot be verified without descriptor-relative writes: "
+                f"{spec_path}",
+                safe_restoration_unavailable=True,
+            )
 
         # Creation is a repair write. Preserve the established typed translation
         # for OS/symlink-loop failures, but let a ValueError from mkdir itself
@@ -467,127 +483,36 @@ class RecoveryFlow:
             # replacing the retained descriptor as authority.
             verify_parent_authority(parent_fd)
 
-        def fallback_parent_is_canonical() -> None:
-            try:
-                if (
-                    not parent.is_dir()
-                    or parent.is_symlink()
-                    or parent.resolve(strict=True) != parent
-                ):
-                    raise _OwnedSpecAuthorityError(authority_message)
-            except _OwnedSpecAuthorityError:
-                raise
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise _OwnedSpecAuthorityError(authority_message) from exc
-
-        def fallback_target_stat() -> os.stat_result | None:
-            try:
-                observed = os.lstat(spec_path)
-            except FileNotFoundError:
-                return None
-            if not stat.S_ISREG(observed.st_mode):
-                raise _OwnedSpecAuthorityError(authority_message)
-            return observed
-
-        def read_fallback_target() -> tuple[os.stat_result, bytes] | None:
-            before = fallback_target_stat()
-            if before is None:
-                return None
-            contents = spec_path.read_bytes()
-            after = fallback_target_stat()
-            if (
-                after is None
-                or len(contents) != before.st_size
-                or not os.path.samestat(before, after)
-                or _target_stat_version(before) != _target_stat_version(after)
-            ):
-                raise _OwnedSpecAuthorityError(authority_message)
-            return after, contents
-
-        def require_same_fallback_target(
-            expected: tuple[os.stat_result, bytes] | None,
-        ) -> None:
-            fallback_parent_is_canonical()
-            observed = read_fallback_target()
-            if expected is None:
-                if observed is not None:
-                    raise _OwnedSpecAuthorityError(authority_message)
-                return
-            if observed is None:
-                raise _OwnedSpecAuthorityError(authority_message)
-            expected_stat, expected_bytes = expected
-            observed_stat, observed_bytes = observed
-            if (
-                not os.path.samestat(expected_stat, observed_stat)
-                or _target_stat_version(expected_stat) != _target_stat_version(observed_stat)
-                or expected_bytes != observed_bytes
-            ):
-                raise _OwnedSpecAuthorityError(authority_message)
-
-        def verify_fallback_bytes(_published_fd: int | None) -> None:
-            # The fallback writer no longer owns an inode-bound descriptor once
-            # publication completes. Reopening or even observing the final name
-            # would make a concurrent replacement authoritative. Publication has
-            # already happened, so refuse it without touching the target path and
-            # let the recovery state machine require explicit manual adoption.
-            raise _OwnedSpecAuthorityError(
-                "attempt-owned spec bytes were published but cannot be verified "
-                f"without descriptor-relative writes: {spec_path}",
-                published_without_verification=True,
-            )
-
         # `require_writable_target=True` (#597): the spec this puts back is
         # operator-editable, and a temp-and-replace write needs write permission
         # on the parent directory, never on the entry it replaces. Anchor from
         # the filesystem root rather than the project so configured external
         # artifact roots remain valid repair targets.
-        if DIR_FD_ANCHORED_WRITES:
-            parent_fd = open_dir_confined(Path(spec_path.anchor), parent, search_only=True)
-            if parent_fd is None:
-                raise _OwnedSpecAuthorityError(
-                    f"attempt-owned spec target could not be revalidated: {spec_path}"
-                )
-            try:
-                expected = read_target_at(parent_fd)
-
-                def validate_target() -> None:
-                    require_same_target_at(parent_fd, expected)
-
-                def verify_published(published_fd: int) -> None:
-                    verify_published_inode(parent_fd, published_fd)
-
-                atomic_write_bytes_at(
-                    parent_fd,
-                    spec_path.name,
-                    snapshot,
-                    _require_writable_target=True,
-                    _before_staging=validate_target,
-                    _before_replace=validate_target,
-                    _after_replace=verify_published,
-                )
-            finally:
-                os.close(parent_fd)
-            return
-
-        expected = read_fallback_target()
-
-        def validate_fallback_target() -> None:
-            require_same_fallback_target(expected)
-
-        try:
-            atomic_write_bytes_confined(
-                spec_path,
-                snapshot,
-                confine_root=Path(spec_path.anchor),
-                require_writable_target=True,
-                _before_staging=validate_fallback_target,
-                _before_replace=validate_fallback_target,
-                _after_replace=verify_fallback_bytes,
-            )
-        except UnconfinedWriteError as exc:
+        parent_fd = open_dir_confined(Path(spec_path.anchor), parent, search_only=True)
+        if parent_fd is None:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
-            ) from exc
+            )
+        try:
+            expected = read_target_at(parent_fd)
+
+            def validate_target() -> None:
+                require_same_target_at(parent_fd, expected)
+
+            def verify_published(published_fd: int) -> None:
+                verify_published_inode(parent_fd, published_fd)
+
+            atomic_write_bytes_at(
+                parent_fd,
+                spec_path.name,
+                snapshot,
+                _require_writable_target=True,
+                _before_staging=validate_target,
+                _before_replace=validate_target,
+                _after_replace=verify_published,
+            )
+        finally:
+            os.close(parent_fd)
 
     @classmethod
     def _restore_attempt_owned_spec(
@@ -612,15 +537,15 @@ class RecoveryFlow:
         unsafe_context: str,
         expected_status: str | None = None,
     ) -> str:
-        if exc.published_without_verification:
+        if exc.safe_restoration_unavailable:
             status_guidance = (
                 f"; the adopted spec must have lifecycle status {expected_status!r}"
                 if expected_status is not None
                 else ""
             )
             return (
-                f"restoration bytes were published {unsafe_context}, but this platform "
-                "cannot verify the resulting file without descriptor-relative writes"
+                f"safe automatic restoration is unavailable {unsafe_context} because "
+                "this platform lacks descriptor-relative writes"
                 f"{status_guidance}; manual adoption is required"
             )
         return f"its path became unsafe {unsafe_context} ({exc})"
@@ -656,6 +581,32 @@ class RecoveryFlow:
             self._restore_attempt_owned_spec(
                 spec_path,
                 snapshot,
+                target_status,
+                confine_root=confine_root,
+            )
+        except _OwnedSpecAuthorityError as exc:
+            self.pause_for_owned_spec_recovery(
+                task,
+                str(spec_path),
+                self._owned_spec_restore_problem(
+                    exc,
+                    unsafe_context=unsafe_context,
+                    expected_status=target_status,
+                ),
+            )
+
+    def _normalize_attempt_owned_spec_or_pause(
+        self,
+        task: StoryTask,
+        spec_path: Path,
+        target_status: str,
+        *,
+        confine_root: Path,
+        unsafe_context: str,
+    ) -> None:
+        try:
+            self._normalize_attempt_owned_spec(
+                spec_path,
                 target_status,
                 confine_root=confine_root,
             )
@@ -741,13 +692,14 @@ class RecoveryFlow:
         through instead of re-pausing on the still-set ``baseline_commit``.
 
         A ``cause="resolved"`` re-drive is human-initiated (the operator ran the
-        resolve workflow and re-armed the story), so it always auto-recovers and
-        never pauses, regardless of ``scm.rollback_on_failure``. For the entire
-        re-drive (``task.resolved_redrive``, latched at resume and cleared once the
-        correction is committed) the BMAD artifact folders are preserved through
-        every reset — so a later mid-re-drive retry/defer reset can't silently
-        revert the correction. Whole folders never participate in the dirtiness
-        decision; sibling artifact residue remains visible there.
+        resolve workflow and re-armed the story), so it bypasses the policy pause
+        and selects auto-recovery regardless of ``scm.rollback_on_failure``.
+        Unsafe attempt-owned authority can still require manual recovery. For the
+        entire re-drive (``task.resolved_redrive``, latched at resume and cleared
+        once the correction is committed) the BMAD artifact folders are preserved
+        through every reset — so a later mid-re-drive retry/defer reset can't
+        silently revert the correction. Whole folders never participate in the
+        dirtiness decision; sibling artifact residue remains visible there.
 
         Otherwise (a stopped/abandoned attempt) recovery depends on where the
         attempt ran. Inside a mounted unit worktree it auto-recovers instead of
@@ -1067,10 +1019,14 @@ class RecoveryFlow:
                             )
                             owned_snapshot_restored = True
                         else:
-                            self._normalize_attempt_owned_spec(
+                            self._normalize_attempt_owned_spec_or_pause(
+                                task,
                                 spec_path,
                                 target_status,
                                 confine_root=workspace.paths.project,
+                                unsafe_context=(
+                                    "while restoring the attempt-owned lifecycle status"
+                                ),
                             )
                         normalized_status = target_status
 
@@ -1351,10 +1307,12 @@ class RecoveryFlow:
                         unsafe_context="after the baseline reset",
                     )
                 else:
-                    self._normalize_attempt_owned_spec(
+                    self._normalize_attempt_owned_spec_or_pause(
+                        task,
                         owned_spec[0],
                         target_status,
                         confine_root=workspace.paths.project,
+                        unsafe_context="after the baseline reset",
                     )
                 try:
                     checkout_dirty = verify.attempt_dirty(
