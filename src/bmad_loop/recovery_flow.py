@@ -60,6 +60,11 @@ class _OwnedSpecAuthorityError(RuntimeError):
     """A previously canonical owned-spec name became unsafe to restore."""
 
 
+def _target_stat_version(observed: os.stat_result) -> tuple[int, int, int]:
+    """Mutation-sensitive fields subordinate to an already-bound target inode."""
+    return observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns
+
+
 class RecoveryFlow:
     """Roll back or pause a stopped/abandoned attempt, parking any work it did on
     named recovery refs before the reset.
@@ -318,13 +323,77 @@ class RecoveryFlow:
                 raise _OwnedSpecAuthorityError(authority_message)
             return observed
 
-        def require_same_target_at(parent_fd: int, expected: os.stat_result | None) -> None:
+        def read_target_at(
+            parent_fd: int,
+        ) -> tuple[os.stat_result, bytes] | None:
             observed = target_stat_at(parent_fd)
+            if observed is None:
+                return None
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            try:
+                target_fd = os.open(spec_path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in {
+                    errno.ELOOP,
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.ENXIO,
+                    errno.ENODEV,
+                }:
+                    raise _OwnedSpecAuthorityError(authority_message) from exc
+                raise
+            try:
+                before = os.fstat(target_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or not os.path.samestat(observed, before)
+                    or _target_stat_version(observed) != _target_stat_version(before)
+                ):
+                    raise _OwnedSpecAuthorityError(authority_message)
+
+                os.lseek(target_fd, 0, os.SEEK_SET)
+                chunks: list[bytes] = []
+                remaining = before.st_size + 1
+                while remaining:
+                    chunk = os.read(target_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                contents = b"".join(chunks)
+
+                after = os.fstat(target_fd)
+                named = target_stat_at(parent_fd)
+                if (
+                    len(contents) != before.st_size
+                    or not os.path.samestat(before, after)
+                    or _target_stat_version(before) != _target_stat_version(after)
+                    or named is None
+                    or not os.path.samestat(after, named)
+                    or _target_stat_version(after) != _target_stat_version(named)
+                ):
+                    raise _OwnedSpecAuthorityError(authority_message)
+                return after, contents
+            finally:
+                os.close(target_fd)
+
+        def require_same_target_at(
+            parent_fd: int, expected: tuple[os.stat_result, bytes] | None
+        ) -> None:
+            observed = read_target_at(parent_fd)
             if expected is None:
                 if observed is not None:
                     raise _OwnedSpecAuthorityError(authority_message)
                 return
-            if observed is None or not os.path.samestat(expected, observed):
+            if observed is None:
+                raise _OwnedSpecAuthorityError(authority_message)
+            expected_stat, expected_bytes = expected
+            observed_stat, observed_bytes = observed
+            if (
+                not os.path.samestat(expected_stat, observed_stat)
+                or _target_stat_version(expected_stat) != _target_stat_version(observed_stat)
+                or expected_bytes != observed_bytes
+            ):
                 raise _OwnedSpecAuthorityError(authority_message)
 
         def verify_published_inode(parent_fd: int, published_fd: int) -> None:
@@ -411,14 +480,39 @@ class RecoveryFlow:
                 raise _OwnedSpecAuthorityError(authority_message)
             return observed
 
-        def require_same_fallback_target(expected: os.stat_result | None) -> None:
+        def read_fallback_target() -> tuple[os.stat_result, bytes] | None:
+            before = fallback_target_stat()
+            if before is None:
+                return None
+            contents = spec_path.read_bytes()
+            after = fallback_target_stat()
+            if (
+                after is None
+                or len(contents) != before.st_size
+                or not os.path.samestat(before, after)
+                or _target_stat_version(before) != _target_stat_version(after)
+            ):
+                raise _OwnedSpecAuthorityError(authority_message)
+            return after, contents
+
+        def require_same_fallback_target(
+            expected: tuple[os.stat_result, bytes] | None,
+        ) -> None:
             fallback_parent_is_canonical()
-            observed = fallback_target_stat()
+            observed = read_fallback_target()
             if expected is None:
                 if observed is not None:
                     raise _OwnedSpecAuthorityError(authority_message)
                 return
-            if observed is None or not os.path.samestat(expected, observed):
+            if observed is None:
+                raise _OwnedSpecAuthorityError(authority_message)
+            expected_stat, expected_bytes = expected
+            observed_stat, observed_bytes = observed
+            if (
+                not os.path.samestat(expected_stat, observed_stat)
+                or _target_stat_version(expected_stat) != _target_stat_version(observed_stat)
+                or expected_bytes != observed_bytes
+            ):
                 raise _OwnedSpecAuthorityError(authority_message)
 
         def verify_fallback_bytes(_published_fd: int | None) -> None:
@@ -461,7 +555,7 @@ class RecoveryFlow:
                     f"attempt-owned spec target could not be revalidated: {spec_path}"
                 )
             try:
-                expected = target_stat_at(parent_fd)
+                expected = read_target_at(parent_fd)
 
                 def validate_target() -> None:
                     require_same_target_at(parent_fd, expected)
@@ -482,7 +576,7 @@ class RecoveryFlow:
                 os.close(parent_fd)
             return
 
-        expected = fallback_target_stat()
+        expected = read_fallback_target()
 
         def validate_fallback_target() -> None:
             require_same_fallback_target(expected)
