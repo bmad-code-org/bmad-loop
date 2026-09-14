@@ -11454,6 +11454,18 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     }
     assert mismatched == {}, f"_commit_ledger calls declaring the wrong family: {mismatched}"
 
+    accepted_bindings = {
+        node.lineno: {
+            kw.arg for kw in node.keywords if kw.arg in {"accepted_text", "accepted_baseline_text"}
+        }
+        for node in calls
+        if any(kw.arg in {"accepted_text", "accepted_baseline_text"} for kw in node.keywords)
+    }
+    assert len(accepted_bindings) == 1
+    binding_line, binding_args = next(iter(accepted_bindings.items()))
+    assert published[binding_line] == "self.workspace.paths.deferred_work"
+    assert binding_args == {"accepted_text", "accepted_baseline_text"}
+
 
 # ------------------- DW-222/223/224: the DW-193 publisher's remaining residuals —
 # a decision-phase close stranded at the no-open exit, a terminal cycle stop that
@@ -31029,3 +31041,298 @@ def test_first_integration_after_terminal_crash_keeps_merge_hooks_and_commit_pin
     assert not summary.paused and not summary.crashed
     assert hooks == ["pre_integrate", "pre_merge", "post_merge"]
     assert operands == [task.commit_sha]
+
+
+# ------------------------ migration byte-binding transaction boundaries
+
+
+@pytest.mark.parametrize("record_name", ["migrate-baseline.md", "migrate-manifest.json"])
+def test_migration_refuses_rival_after_recovery_record_publication(
+    project, monkeypatch, record_name
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    rival = LEGACY_LEDGER + "\n<!-- concurrent migration input -->\n"
+    real_write = sweep_mod.atomic_write_text_confined
+    landed = []
+
+    def publish_then_rival(path, text, **kwargs):
+        result = real_write(path, text, **kwargs)
+        if path.name == record_name and not landed:
+            landed.append(True)
+            project.deferred_work.write_text(rival, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", publish_then_rival)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == [] and landed == [True]
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING
+    assert persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+    assert list(engine.run_dir.glob("migrate-*")) == []
+
+
+@pytest.mark.parametrize(
+    "fault_at",
+    [2, 3, 4],
+    ids=["setup-reread", "post-record-reread", "post-hook-prelaunch-reread"],
+)
+@pytest.mark.parametrize("fault_type", [deferredwork.LedgerReadError, OSError])
+def test_migration_reread_fault_retires_predispatch_authority(
+    project, monkeypatch, fault_at, fault_type
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    real_read = deferredwork.read_for_write
+    reads = []
+
+    def fault_selected_read(path):
+        reads.append(path)
+        if len(reads) == fault_at:
+            raise fault_type("injected migration reread fault")
+        return real_read(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", fault_selected_read)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert list(engine.run_dir.glob("migrate-*")) == []
+
+
+def test_migration_refuses_rival_between_cycle_read_and_setup_reread(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    rival = LEGACY_LEDGER + "\n<!-- rival after cycle read -->\n"
+    real_cycle_read = engine._read_cycle_ledger
+
+    def read_then_rival(path):
+        answer = real_cycle_read(path)
+        project.deferred_work.write_text(rival, encoding="utf-8")
+        return answer
+
+    monkeypatch.setattr(engine, "_read_cycle_ledger", read_then_rival)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+@pytest.mark.parametrize("stage", ["pre_migrate_session", "pre_session"])
+def test_migration_hook_rival_is_refused_at_the_true_launch_boundary(project, stage):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    rival = LEGACY_LEDGER + "\n<!-- hook rival -->\n"
+
+    class MutatingPlugin(Plugin):
+        def on_pre_migrate_session(self, _context):
+            if stage == "pre_migrate_session":
+                project.deferred_work.write_text(rival, encoding="utf-8")
+
+        def on_pre_session(self, _context):
+            if stage == "pre_session":
+                project.deferred_work.write_text(rival, encoding="utf-8")
+
+    manifest = PluginManifest(name=f"migration-{stage}")
+    registry = PluginRegistry(
+        [LoadedPlugin(manifest=manifest, instance=MutatingPlugin(manifest, {}))]
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())],
+        registry=registry,
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+def test_migration_mutating_veto_retires_authority_without_adapter_launch(project):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    rival = LEGACY_LEDGER + "\n<!-- vetoing hook rival -->\n"
+
+    class MutatingVetoPlugin(Plugin):
+        def on_pre_migrate_session(self, context):
+            project.deferred_work.write_text(rival, encoding="utf-8")
+            context.veto("defer", "migration input changed")
+
+    manifest = PluginManifest(name="migration-mutating-veto")
+    registry = PluginRegistry(
+        [LoadedPlugin(manifest=manifest, instance=MutatingVetoPlugin(manifest, {}))]
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())],
+        registry=registry,
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+    assert list(engine.run_dir.glob("migrate-*")) == []
+
+
+def test_migration_normal_launch_runs_the_prelaunch_validator_once(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    checks = []
+
+    def migrate_after_three_checks(spec):
+        # Setup owns the first two comparisons; a normal `_run_session` path
+        # contributes exactly one post-hook check before reaching the adapter.
+        assert len(checks) == 3
+        return migrate_effect(project, migrated_ledger(), mapping)(spec)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
+    engine, _adapter = make_sweep(
+        project,
+        [migrate_after_three_checks, triage_effect(plan)],
+    )
+    real_check = engine._migration_input_is_current
+
+    def count_check(expected):
+        checks.append(expected)
+        return real_check(expected)
+
+    monkeypatch.setattr(engine, "_migration_input_is_current", count_check)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert checks == [LEGACY_LEDGER, LEGACY_LEDGER, LEGACY_LEDGER]
+
+
+def test_migration_cleanup_fault_follows_durable_no_authority_state(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    real_write = sweep_mod.atomic_write_text_confined
+    rival = LEGACY_LEDGER + "\n<!-- rival before cleanup fault -->\n"
+
+    def manifest_then_rival(path, text, **kwargs):
+        result = real_write(path, text, **kwargs)
+        if path.name == "migrate-manifest.json":
+            project.deferred_work.write_text(rival, encoding="utf-8")
+        return result
+
+    real_remove = engine._remove_migration_record
+
+    def cleanup_fault(path):
+        if project.deferred_work.read_text(encoding="utf-8") == rival:
+            raise OSError("record cleanup fault")
+        return real_remove(path)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", manifest_then_rival)
+    monkeypatch.setattr(engine, "_remove_migration_record", cleanup_fault)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.attempt == 0
+    assert persisted.baseline_commit is None and persisted.baseline_untracked is None
+    assert persisted.migration_recovery_format == 0
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+@pytest.mark.parametrize("window", ["before-staging", "after-staging"])
+def test_migration_rival_during_bound_publication_replays_commit_only(project, monkeypatch, window):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, first_adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), mapping)]
+    )
+    original_head = verify.rev_parse_head(project.project)
+    accepted = migrated_ledger()
+    rival = accepted + "\n<!-- publication rival -->\n"
+    real_git = verify._git
+    landed = []
+
+    def inject_rival(git_repo, *args, **kwargs):
+        before_stage = window == "before-staging" and args[:2] == ("worktree", "add")
+        after_stage = (
+            window == "after-staging" and args[:1] == ("commit",) and git_repo != project.project
+        )
+        if (before_stage or after_stage) and not landed:
+            landed.append(True)
+            project.deferred_work.write_text(rival, encoding="utf-8")
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", inject_rival)
+    first = engine.run()
+
+    assert first.crashed and landed == [True] and len(first_adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    assert verify.rev_parse_head(project.project) == original_head
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+    monkeypatch.setattr(verify, "_git", real_git)
+    project.deferred_work.write_text(accepted, encoding="utf-8")
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
+    resumed, resumed_adapter = resume_sweep(project, engine, [triage_effect(plan)])
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(resumed_adapter.sessions) == 1
+    assert "--migrate" not in resumed_adapter.sessions[0].prompt
+    assert project.deferred_work.read_text(encoding="utf-8") == accepted
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_forwards_lexical_symlink_identity_to_bound_publisher(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    ledger = project.deferred_work
+    target = ledger.with_name("migration-ledger-target.md")
+    ledger.rename(target)
+    ledger.symlink_to(target.name)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track symlinked migration ledger")
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
+    engine, _adapter = make_sweep(
+        project,
+        [
+            migrate_effect(project, migrated_ledger(), _valid_migration_mapping()),
+            triage_effect(plan),
+        ],
+    )
+    real_publish = verify.commit_path_bound
+    seen = []
+
+    def record_publish(repo, message, path, **kwargs):
+        seen.append((path, kwargs.get("live_path")))
+        return real_publish(repo, message, path, **kwargs)
+
+    monkeypatch.setattr(verify, "commit_path_bound", record_publish)
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert seen == [(target.resolve(), ledger)]
+    assert ledger.is_symlink()
+    assert target.read_text(encoding="utf-8") == migrated_ledger()

@@ -8969,3 +8969,270 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)
+
+
+def _bound_live_ledger_identity(
+    live_path: Path,
+    target: Path,
+    accepted_text: str,
+    *,
+    identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Prove the live ledger is the accepted regular target without disclosing it."""
+    try:
+        resolved = live_path.resolve(strict=True)
+        before = target.lstat()
+        if resolved != target or not S_ISREG(before.st_mode):
+            raise GitError("accepted publication target changed shape")
+        observed = live_path.read_text(encoding="utf-8")
+        after = target.lstat()
+        if (
+            not S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or live_path.resolve(strict=True) != target
+            or observed != accepted_text
+        ):
+            raise GitError("accepted publication target changed during validation")
+    except GitError:
+        raise
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
+        raise GitError("accepted publication target could not be validated") from exc
+    current = (after.st_dev, after.st_ino)
+    if identity is not None and current != identity:
+        raise GitError("accepted publication target identity changed")
+    return current
+
+
+def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
+    proc = git_bytes(
+        repo,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-z",
+        "-r",
+        parent,
+        revision,
+        "--",
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git candidate scope probe failed in {repo}")
+    return {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
+
+
+class _BoundCandidateMismatch(GitError):
+    """A candidate was fully observed and structurally rejected."""
+
+
+def _bound_parent(repo: Path, revision: str) -> str:
+    rc, lineage, _detail = _git_out(repo, "rev-list", "--parents", "--max-count=1", revision)
+    if rc != 0:
+        raise GitError(f"git candidate parent probe failed in {repo}")
+    parts = lineage.split()
+    if not parts:
+        raise GitError(f"git candidate parent probe returned no evidence in {repo}")
+    if parts[0] != revision:
+        raise GitError(f"git candidate parent probe returned malformed evidence in {repo}")
+    if len(parts) != 2:
+        raise _BoundCandidateMismatch("exact-path candidate does not have exactly one parent")
+    return parts[1]
+
+
+def _validate_bound_candidate(
+    repo: Path,
+    revision: str,
+    parent: str,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> None:
+    if _bound_parent(repo, revision) != parent:
+        raise _BoundCandidateMismatch("exact-path candidate has an unexpected parent")
+    if _bound_changed_paths(repo, parent, revision) != {rel}:
+        raise _BoundCandidateMismatch(
+            "exact-path candidate changed paths outside its declared scope"
+        )
+    committed = revision_blob_oids(repo, revision, (rel,))
+    if committed.get(rel) != accepted_oid:
+        raise _BoundCandidateMismatch("exact-path candidate does not contain the accepted ledger")
+    parent_blob = revision_blob_oids(repo, parent, (rel,)).get(rel)
+    if parent_blob not in (None, baseline_oid):
+        raise _BoundCandidateMismatch(
+            "exact-path candidate parent does not contain the accepted baseline"
+        )
+
+
+def _accepted_bound_transition(
+    repo: Path,
+    head: str,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> str | None:
+    """Find the newest accepted ledger transition in first-parent ancestry."""
+    rc, out, _detail = _git_out(
+        repo,
+        "rev-list",
+        "--first-parent",
+        head,
+        "--",
+        *_literal_specs([rel]),
+    )
+    if rc != 0:
+        raise GitError(f"git accepted-transition probe failed in {repo}")
+    if not out:
+        return None
+    # `rev-list` is newest-first. A later commit may touch the ledger as part of
+    # a wider change (for example a mode-only edit beside an unrelated file)
+    # without invalidating the earlier exact one-path migration transition.
+    for candidate in out.splitlines():
+        try:
+            parent = _bound_parent(repo, candidate)
+            _validate_bound_candidate(repo, candidate, parent, rel, accepted_oid, baseline_oid)
+        except _BoundCandidateMismatch:
+            continue
+        return candidate
+    return None
+
+
+def _bound_index_oid(repo: Path, rel: str) -> str | None:
+    return staged_blob_oids(repo, (rel,)).get(rel)
+
+
+def _synchronize_bound_index(
+    repo: Path,
+    head: str,
+    rel: str,
+    accepted_oid: str,
+    observed_index_oid: str | None,
+) -> None:
+    # A target-local reset preserves every unrelated real-index entry.  Refuse
+    # an observed same-path writer instead of overwriting it between validation
+    # and housekeeping; the published commit remains authoritative and replayable.
+    if _bound_index_oid(repo, rel) != observed_index_oid:
+        raise GitError("real index target changed during exact-path publication")
+    rc, out = _git(repo, "reset", head, "--", *_literal_specs([rel]))
+    if rc != 0:
+        raise GitError(f"git target-local index synchronization failed in {repo}: {out}")
+    if _bound_index_oid(repo, rel) != accepted_oid:
+        raise GitError("real index target synchronization did not retain accepted content")
+
+
+def commit_path_bound(
+    repo: Path,
+    message: str,
+    path: Path,
+    *,
+    accepted_text: str,
+    baseline_text: str,
+    live_path: Path | None = None,
+) -> str | None:
+    """Publish one accepted ledger transition through a validated candidate.
+
+    The candidate is committed in a detached temporary worktree, so ordinary Git
+    hooks run without moving the authoritative checkout.  Its parent, exact path
+    delta, Git-clean-filtered blob, live decoded text, and path identity are all
+    validated before an expected-old ``HEAD`` update-ref publishes it.  Once that
+    CAS succeeds, target-only real-index reconciliation is replayable housekeeping:
+    no later fault rolls the truthful commit back.
+    """
+    try:
+        rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
+        if rc != 0:
+            raise GitError(f"git repository root probe failed in {repo}")
+        repo_root = Path(top).resolve()
+        target = path.resolve(strict=True)
+        rel = target.relative_to(repo_root).as_posix()
+    except GitError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise GitError("exact-path publication target could not be resolved safely") from exc
+
+    lexical = live_path if live_path is not None else path
+    accepted_bytes = accepted_text.encode("utf-8")
+    baseline_bytes = baseline_text.encode("utf-8")
+    accepted_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, accepted_bytes)
+    baseline_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, baseline_bytes)
+    identity = _bound_live_ledger_identity(lexical, target, accepted_text)
+    head = rev_parse_head(repo_root)
+
+    accepted = _accepted_bound_transition(repo_root, head, rel, accepted_oid, baseline_oid)
+    authority_parent = _bound_parent(repo_root, accepted) if accepted is not None else head
+    head_blob = revision_blob_oids(repo_root, head, (rel,)).get(rel)
+    parent_has_target = rel in revision_blob_oids(repo_root, authority_parent, (rel,))
+    observed_index_oid = _bound_index_oid(repo_root, rel)
+    allowed_index_oids: set[str | None] = {accepted_oid, baseline_oid}
+    if not parent_has_target:
+        # Original absence is the one accepted no-entry shape.  A tracked
+        # parent's absent real-index entry is a foreign staged deletion and is
+        # refused rather than silently re-added.
+        allowed_index_oids.add(None)
+    if observed_index_oid not in allowed_index_oids:
+        raise GitError("real index holds foreign content at the publication target")
+
+    if accepted is not None:
+        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        _synchronize_bound_index(repo_root, head, rel, accepted_oid, observed_index_oid)
+        return accepted
+
+    # Preserve generic clean/ignored behavior when no migration transition needs
+    # replay.  In particular, an ignored ledger never earns a synthetic commit.
+    clean = path_clean(repo_root, rel)
+    ignored_untracked = clean and head_blob is None and path_ignored(repo_root, target)
+    if clean and (head_blob == accepted_oid or ignored_untracked):
+        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        return None
+
+    active_error: BaseException | None = None
+    candidate: str | None = None
+    with tempfile.TemporaryDirectory() as td:
+        candidate_root = Path(td) / "candidate"
+        rc, out = _git(
+            repo_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(candidate_root),
+            head,
+        )
+        if rc != 0:
+            raise GitError(f"git detached candidate checkout failed in {repo_root}: {out}")
+        try:
+            candidate_path = candidate_root / rel
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+            candidate_path.write_bytes(accepted_bytes)
+            rc, out = _git(candidate_root, "add", "--", *_literal_specs([rel]))
+            if rc != 0:
+                raise GitError(f"git exact-path candidate staging failed in {repo_root}: {out}")
+            if staged_blob_oid(candidate_root, rel) != accepted_oid:
+                raise GitError("exact-path candidate staging changed accepted content")
+            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            rc, out = _git(candidate_root, "commit", "-m", message)
+            if rc != 0:
+                raise GitError(f"git exact-path candidate commit failed in {repo_root}: {out}")
+            candidate = rev_parse_head(candidate_root)
+            _validate_bound_candidate(repo_root, candidate, head, rel, accepted_oid, baseline_oid)
+            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            rc, out = _git(repo_root, "update-ref", "HEAD", candidate, head)
+            if rc != 0:
+                raise GitError("authoritative HEAD changed during exact-path publication")
+        except BaseException as exc:
+            active_error = exc
+            raise
+        finally:
+            rc, out = _git(
+                repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(candidate_root),
+            )
+            if rc != 0 and active_error is None:
+                raise GitError(f"git detached candidate cleanup failed in {repo_root}: {out}")
+
+    assert candidate is not None
+    published_head = rev_parse_head(repo_root)
+    if published_head != candidate:
+        raise GitError("authoritative HEAD changed after exact-path publication")
+    _synchronize_bound_index(repo_root, published_head, rel, accepted_oid, observed_index_oid)
+    return candidate

@@ -8047,6 +8047,422 @@ def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path
     assert paths.project != paths.repo_root
 
 
+# ------------------------------------------------ accepted exact-path publication
+
+
+def _bound_publish_inputs(project):
+    repo = project.project
+    path = repo / "src.txt"
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    return repo, path, baseline, accepted
+
+
+def test_commit_path_bound_publishes_only_accepted_path_and_preserves_real_index(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", sha) == "src.txt"
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+@pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
+def test_commit_path_bound_does_not_accept_a_false_clean_index_flag(project, index_flag):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    # Apply the hiding bit after the working-tree edit: both flags can suppress
+    # porcelain even though HEAD still contains the legacy baseline.
+    git(repo, "update-index", index_flag, "--", path.name)
+    assert verify.path_clean(repo, path.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha is not None
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_a_candidate_whose_parent_is_not_the_bound_baseline(project):
+    repo, path, _baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    wrong_baseline = "different claimed baseline\n"
+    shadow = repo / "wrong-baseline.txt"
+    shadow.write_text(wrong_baseline, encoding="utf-8")
+    wrong_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    git(repo, "update-index", "--cacheinfo", "100644", wrong_oid, path.name)
+
+    with pytest.raises(verify.GitError, match="parent.*accepted baseline"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=wrong_baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_mutation_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf 'hook bytes\\n' > src.txt\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="accepted ledger"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_added_paths_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\nprintf 'extra hook path\\n' > hook-extra.txt\ngit add -- hook-extra.txt\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="outside its declared scope"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert not (repo / "hook-extra.txt").exists()
+
+
+def test_bound_candidate_refuses_a_merge_commit_even_with_an_exact_path_delta(project):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    baseline = path.read_text(encoding="utf-8")
+    original_branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "bound-side")
+    accepted = "accepted merge candidate\n"
+    path.write_text(accepted, encoding="utf-8")
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "side ledger change")
+    git(repo, "checkout", "-q", original_branch)
+    git(repo, "merge", "-q", "--no-ff", "bound-side", "-m", "merge ledger candidate")
+    candidate = verify.rev_parse_head(repo)
+    first_parent = git(repo, "rev-parse", "HEAD^1")
+    accepted_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, accepted.encode())
+    baseline_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, baseline.encode())
+
+    with pytest.raises(verify.GitError, match="exactly one parent"):
+        verify._validate_bound_candidate(
+            repo,
+            candidate,
+            first_parent,
+            rel,
+            accepted_oid,
+            baseline_oid,
+        )
+
+
+def test_commit_path_bound_refuses_a_tracked_target_index_deletion(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "--", path.name)
+
+    with pytest.raises(verify.GitError, match="foreign content"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_expected_old_cas_preserves_concurrent_head(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_git = verify._git
+    concurrent_head = []
+
+    def advance_before_cas(git_repo, *args, **kwargs):
+        if args[:2] == ("update-ref", "HEAD") and not concurrent_head:
+            rival = repo / "concurrent.txt"
+            rival.write_text("keep concurrent commit\n", encoding="utf-8")
+            git(repo, "add", "--", rival.name)
+            git(repo, "commit", "-q", "-m", "concurrent commit")
+            concurrent_head.append(verify.rev_parse_head(repo))
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", advance_before_cas)
+
+    with pytest.raises(verify.GitError, match="HEAD changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == concurrent_head[0]
+    assert (repo / "concurrent.txt").read_text(encoding="utf-8") == "keep concurrent commit\n"
+
+
+def test_commit_path_bound_replays_accepted_ancestor_beneath_unrelated_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    descendant = repo / "descendant.txt"
+    descendant.write_text("keep descendant\n", encoding="utf-8")
+    git(repo, "add", "--", descendant.name)
+    git(repo, "commit", "-q", "-m", "unrelated descendant")
+    descendant_head = verify.rev_parse_head(repo)
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_skips_newer_invalid_same_ledger_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    extra = repo / "descendant-extra.txt"
+    extra.write_text("wider descendant\n", encoding="utf-8")
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "add", "--", extra.name)
+    git(repo, "commit", "-q", "-m", "multi-path same-ledger descendant")
+    descendant_head = verify.rev_parse_head(repo)
+    assert set(git(repo, "show", "--format=", "--name-only", "HEAD").splitlines()) == {
+        path.name,
+        extra.name,
+    }
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "show", "HEAD:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "newer ledger mode transition")
+    descendant_head = verify.rev_parse_head(repo)
+
+    def unavailable_scope(*_args, **_kwargs):
+        raise verify.GitError("candidate scope unavailable")
+
+    monkeypatch.setattr(verify, "_bound_changed_paths", unavailable_scope)
+
+    with pytest.raises(verify.GitError, match="candidate scope unavailable"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == descendant_head
+
+
+def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+    faulted = []
+
+    def fail_target_sync(git_repo, *args, **kwargs):
+        if args[:1] == ("reset",) and not faulted:
+            faulted.append(True)
+            return 1, "injected sync fault"
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", fail_target_sync)
+    with pytest.raises(verify.GitError, match="index synchronization"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    published = verify.rev_parse_head(repo)
+    assert published != original_head
+    monkeypatch.setattr(verify, "_git", real_git)
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        == published
+    )
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_refuses_foreign_target_index_change_before_sync(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    shadow = repo / "foreign-index.txt"
+    shadow.write_text("foreign staged ledger\n", encoding="utf-8")
+    foreign_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    real_git = verify._git
+    published = []
+
+    def change_index_after_cas(git_repo, *args, **kwargs):
+        result = real_git(git_repo, *args, **kwargs)
+        if args[:2] == ("update-ref", "HEAD") and result[0] == 0 and not published:
+            published.append(args[2])
+            git(repo, "update-index", "--cacheinfo", "100644", foreign_oid, path.name)
+        return result
+
+    monkeypatch.setattr(verify, "_git", change_index_after_cas)
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == published[0]
+    assert verify.staged_blob_oid(repo, path.name) == foreign_oid
+
+
+def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeypatch):
+    repo = project.project
+    attributes = repo / ".gitattributes"
+    attributes.write_text("src.txt filter=collapse\n", encoding="utf-8")
+    git(repo, "config", "filter.collapse.clean", "sed s/rival/accepted/")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "configure lossy filter")
+    repo, path, baseline, _accepted = _bound_publish_inputs(project)
+    accepted = "accepted\n"
+    path.write_text(accepted, encoding="utf-8")
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+
+    def rival_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.write_text("rival\n", encoding="utf-8")
+        return real_git(git_repo, *args, **kwargs)
+
+    assert verify.git_normalized_blob_oid_for_bytes(
+        repo, "src.txt", accepted.encode()
+    ) == verify.git_normalized_blob_oid_for_bytes(repo, "src.txt", b"rival\n")
+    monkeypatch.setattr(verify, "_git", rival_after_staging)
+
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == "rival\n"
+
+
+def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    replacement = repo / "replacement.txt"
+    replacement.write_text(accepted, encoding="utf-8")
+    real_git = verify._git
+
+    def substitute_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.unlink()
+            path.symlink_to(replacement.name)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", substitute_after_staging)
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.is_symlink()
+
+
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
     """Same rule for the stories-mode exclude: rooted where git runs."""
     paths = _repo_root_override(project, tmp_path)
