@@ -31075,6 +31075,7 @@ def test_migration_refuses_rival_after_recovery_record_publication(
     assert persisted.baseline_commit is None and persisted.baseline_untracked is None
     assert persisted.migration_recovery_format == 0
     assert project.deferred_work.read_text(encoding="utf-8") == rival
+    assert _records(engine, "session-start") == []
     assert list(engine.run_dir.glob("migrate-*")) == []
 
 
@@ -31303,6 +31304,44 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     assert len(resumed_adapter.sessions) == 1
     assert "--migrate" not in resumed_adapter.sessions[0].prompt
     assert project.deferred_work.read_text(encoding="utf-8") == accepted
+
+
+def test_migration_prepared_publication_fault_is_sanitized_and_replayable(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    accepted = migrated_ledger()
+    engine, first_adapter = make_sweep(project, [migrate_effect(project, accepted, mapping)])
+    original_head = verify.rev_parse_head(project.project)
+    real_run_git = verify._run_git
+    faulted = []
+
+    def fail_prepared_transaction(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None and not faulted:
+            faulted.append(True)
+            raise verify.GitError(f"git prepared ref transaction failed in {project.project}")
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", fail_prepared_transaction)
+    first = engine.run()
+
+    assert first.crashed and len(first_adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    assert verify.rev_parse_head(project.project) == original_head
+    failures = _records(engine, "sweep-ledger-commit-unavailable")
+    assert len(failures) == 1
+    assert failures[0]["error"] == f"git prepared ref transaction failed in {project.project}"
+    assert original_head not in failures[0]["error"]
+    assert accepted not in failures[0]["error"]
+
+    monkeypatch.setattr(verify, "_run_git", real_run_git)
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "later"}])
+    resumed, resumed_adapter = resume_sweep(project, engine, [triage_effect(plan)])
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(resumed_adapter.sessions) == 1
+    assert "--migrate" not in resumed_adapter.sessions[0].prompt
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
