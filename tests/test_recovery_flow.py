@@ -2095,7 +2095,12 @@ def test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset(
         flow.rollback_or_pause(task)
 
     assert source.read_text() == "baseline source\n"
-    assert spec.read_bytes() == corrected
+    # The reset's `preserve` round-trips the artifact folder through
+    # `git stash create` + `git checkout`, which under Git-for-Windows'
+    # `core.autocrlf=true` re-materializes this LF content as CRLF. What is
+    # asserted is the content the refused restoration left alone, so compare
+    # newline-normalized rather than raw.
+    assert spec.read_bytes().replace(b"\r\n", b"\n") == corrected
     assert "rollback-auto" in flow.journal.events()
     assert flow.calls.emits == ["pre_rollback"]
     _assert_owned_spec_manual_adoption_pause(
@@ -2575,7 +2580,11 @@ def test_resolved_cause_forced_fallback_pauses_after_completed_reset(project, mo
         flow.rollback_or_pause(task, cause="resolved")
 
     assert source.read_text() == "original\n"
-    assert spec.read_bytes() == remaining
+    # Same `git stash create` + `git checkout` preserve round trip as
+    # `test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset`:
+    # the refused restoration left the operator's `done` content in place, and
+    # only its line endings may differ under `core.autocrlf=true`.
+    assert spec.read_bytes().replace(b"\r\n", b"\n") == remaining
     assert "rollback-auto" in flow.journal.events()
     assert flow.calls.emits == ["pre_rollback"]
     _assert_owned_spec_manual_adoption_pause(

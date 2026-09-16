@@ -113,6 +113,16 @@ from bmad_loop.verify import (
 )
 
 QUIET = NotifyPolicy(desktop=False, file=True)
+# DW-310: attempt-owned spec restoration and lifecycle normalization refuse
+# before any write on a host without descriptor-relative writes (Windows) and
+# pause for manual adoption, so a rollback that has to put the bound spec back
+# cannot converge there by design. Mirrors `tests/test_recovery_flow.py`, which
+# pins that refusal directly; these rows assert the descriptor-capable
+# convergence and stay POSIX-only.
+requires_descriptor_restoration = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES,
+    reason="automatic owned-spec restore requires descriptor-relative writes (DW-310)",
+)
 
 
 def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAdapter]:
@@ -9887,6 +9897,7 @@ def test_resolved_escalation_resume_dirty_tree_auto_recovers(project):
     assert "rollback-manual-required" not in kinds
 
 
+@requires_descriptor_restoration
 def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(project):
     """T22: #123 ownership recovery and #630 explicit routing converge together.
 
@@ -10010,6 +10021,7 @@ def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(proje
     assert "rollback-manual-required" not in kinds
 
 
+@requires_descriptor_restoration
 @pytest.mark.parametrize("resolved_redrive", [False, True], ids=["plain", "resolved-redrive"])
 def test_bound_fixable_chain_restores_first_snapshot_before_fresh_retry(project, resolved_redrive):
     """A repair child cannot replace the correction retained for chain rollback.
@@ -10873,6 +10885,7 @@ def test_restore_redrive_prompt_points_at_the_spec(project):
     assert prompt != "/bmad-dev-auto 1-1-a"  # never the bare key on a restore
 
 
+@requires_descriptor_restoration
 def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
     """A non-fixable retry inside the restore re-drive resets to baseline (clearing
     the restored code), so the patch is re-applied before the next dispatch; the
@@ -13268,6 +13281,7 @@ def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
     assert engine._pick_next().key == "5-1-e5"
 
 
+@requires_descriptor_restoration
 def test_resolved_redrive_reescalates_instead_of_deferring(project):
     """Fix C (Bug 1): a story from a human-resolved CRITICAL escalation whose
     re-drive still can't converge must RE-ESCALATE (pause for the human), not
@@ -18132,6 +18146,7 @@ def test_pause_disarm_is_on_disk_before_run_paused_event(project, monkeypatch):
     assert seen_before_ambient_save == [(False, None)]
 
 
+@requires_descriptor_restoration
 def test_fixable_retry_chain_snapshot_reaches_phase_baseline(project, tmp_path):
     marker = tmp_path / "fixed.marker"
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -18157,6 +18172,7 @@ def test_fixable_retry_chain_snapshot_reaches_phase_baseline(project, tmp_path):
     assert not project.deferred_work.exists()
 
 
+@requires_descriptor_restoration
 def test_nonfixable_chain_rollback_rebases_ledger_proof_reference(project, tmp_path):
     marker = tmp_path / "fixed.marker"
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})

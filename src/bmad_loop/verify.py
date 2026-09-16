@@ -8,6 +8,7 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import hashlib
+import io
 import locale
 import os
 import queue
@@ -1638,9 +1639,17 @@ def _run_git(
                 )
             except OSError as exc:
                 raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}") from exc
-            assert proc.stdin is not None
+            # `text=True` wraps every pipe in a `TextIOWrapper(newline=None)`,
+            # whose WRITE side translates "\n" to `os.linesep` — "\r\n" on
+            # Windows — so `update-ref --stdin` would read `start\r` and die with
+            # `unknown command` before acknowledging. The protocol's terminator is
+            # LF on every host, so pin it on the command stream only: the reply
+            # stream keeps universal-newline reading, which folds either ending
+            # into the `"<label>: ok\n"` the `expect` below compares against.
+            assert isinstance(proc.stdin, io.TextIOWrapper)
             assert proc.stdout is not None
             assert proc.stderr is not None
+            proc.stdin.reconfigure(newline="\n")
             child_stdin = proc.stdin
             child_stdout = proc.stdout
             child_stderr = proc.stderr
