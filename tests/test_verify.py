@@ -8982,17 +8982,44 @@ def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):
     assert verify.rev_parse_head(repo) == oid
 
 
+def _bound_transaction_only(monkeypatch, timeout_s: float) -> list[str]:
+    """Bound only the prepared `update-ref --stdin` transaction to `timeout_s`.
+
+    Shrinking `_git_timeout_s` instead would put the same bound on every other
+    git child `commit_path_bound` spawns (`worktree add`, the candidate commit,
+    the index reconciliation), and a loaded runner — Windows CI in particular —
+    turned that into `git worktree timed out after 1s` before the transaction
+    under test ever started. Returns the log of how each bounded transaction
+    ended: `"ok"`, or the name of the `GitError` it raised."""
+    real_run_git = verify._run_git
+    outcomes: list[str] = []
+
+    def bounded(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is None:
+            return real_run_git(cmd, git_repo, **kwargs)
+        try:
+            result = real_run_git(cmd, git_repo, timeout_s=timeout_s, **kwargs)
+        except verify.GitError as exc:
+            outcomes.append(type(exc).__name__)
+            raise
+        outcomes.append("ok")
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", bounded)
+    return outcomes
+
+
 def test_commit_path_bound_recovers_post_commit_timeout(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     hook = repo / ".git" / "hooks" / "reference-transaction"
     hook.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
-        "  sleep 2\n"
+        "  sleep 4\n"
         "fi\n"
     )
     hook.chmod(0o755)
-    monkeypatch.setattr(verify, "_git_timeout_s", 1)
+    outcomes = _bound_transaction_only(monkeypatch, 2)
 
     published = verify.commit_path_bound(
         repo,
@@ -9002,12 +9029,23 @@ def test_commit_path_bound_recovers_post_commit_timeout(project, monkeypatch):
         baseline_text=baseline,
     )
 
+    # premise: the acknowledgement really was lost, and recovery observed the
+    # moved ref rather than retrying the transaction
+    assert outcomes == ["_GitCommitIndeterminate"]
     assert published == verify.rev_parse_head(repo)
     assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
     assert git(repo, "diff", "--cached", "--name-only") == ""
 
 
-def test_commit_path_bound_uses_fractional_remaining_timeout_at_one_second(project, monkeypatch):
+def test_commit_path_bound_hands_the_prepared_probe_its_fractional_remaining(project, monkeypatch):
+    """The lock-held probe gets what is LEFT of the transaction's budget, as a
+    float. A `prepared` hook that sleeps makes that remainder non-integral, so an
+    `int(...)` anywhere between the deadline and the probe's `timeout_s` shows up
+    as a whole number here — the shape that once truncated a sub-second remainder
+    to `0` and timed the probe out on the spot. Observed at the probe rather than
+    provoked with a one-second budget: the provoked form raced the runner's load
+    (the probe, commit and exit all had to fit in what the sleep left of 1s) and
+    reddened on healthy trees."""
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     hook = repo / ".git" / "hooks" / "reference-transaction"
     hook.write_text(
@@ -9017,7 +9055,17 @@ def test_commit_path_bound_uses_fractional_remaining_timeout_at_one_second(proje
         "fi\n"
     )
     hook.chmod(0o755)
-    monkeypatch.setattr(verify, "_git_timeout_s", 1)
+    budget = 5
+    _bound_transaction_only(monkeypatch, budget)
+    real_probe = verify._bound_direct_ref_probe
+    handed = []
+
+    def record_prepared_probe(git_repo, ref, *, timeout_s=None):
+        if timeout_s is not None:  # only the lock-held call carries a remainder
+            handed.append(timeout_s)
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", record_prepared_probe)
 
     published = verify.commit_path_bound(
         repo,
@@ -9028,6 +9076,10 @@ def test_commit_path_bound_uses_fractional_remaining_timeout_at_one_second(proje
     )
 
     assert published == verify.rev_parse_head(repo)
+    [remaining] = handed
+    assert isinstance(remaining, float)
+    assert 0 < remaining < budget - 0.2  # the sleep came off the budget...
+    assert remaining != int(remaining)  # ...and nothing rounded what was left
 
 
 def test_commit_path_bound_recovers_real_git_commit_ack_loss(project):
