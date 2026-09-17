@@ -10,11 +10,18 @@ drifted.
 from __future__ import annotations
 
 import json
-import os
 import sys
 
 import pytest
-from conftest import git, install_bmad_config, spec_path, write_spec, write_sprint
+from conftest import (
+    git,
+    install_bmad_config,
+    patch_publish_rename,
+    real_publish_rename,
+    spec_path,
+    write_spec,
+    write_sprint,
+)
 
 from bmad_loop import devcontract, operatoractions, platform_util, verify
 
@@ -178,19 +185,21 @@ def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
     `os.replace`, not `platform_util.atomic_replace`: the confined writer's
     anchored arm publishes with a bare dir_fd-relative `os.replace` and never
     reaches `atomic_replace` at all, so the old injection point would no longer
-    fire and this test would pass having faulted nothing. Filtered to the record's
-    own name so an unrelated replace during the test is not collateral.
+    fire and this test would pass having faulted nothing. Through
+    `patch_publish_rename`, which also covers the Windows anchored arm's
+    `win32_at.replace_at` for the same reason. Filtered to the record's own name
+    so an unrelated replace during the test is not collateral.
 
     Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
     `platform_util._atomic_write_at`'s except arm and this fails."""
-    real_replace = os.replace
+    real_replace = real_publish_rename
 
     def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         if str(dst).endswith(".json"):
             raise OSError(28, "No space left on device")
         return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "replace", boom)
+    patch_publish_rename(monkeypatch, boom)
     with pytest.raises(OSError):
         operatoractions.record_park(
             project.project,
@@ -332,7 +341,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
 
     Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
     `platform_util._atomic_write_at`'s except arm and this fails."""
-    real_replace = os.replace
+    real_replace = real_publish_rename
 
     def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         if str(dst).endswith(".json"):
@@ -345,7 +354,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     before = sorted(p.name for p in store.parent.iterdir())
     assert before == ["operator-actions.json"]  # a snapshot with something IN it
 
-    monkeypatch.setattr(os, "replace", boom)
+    patch_publish_rename(monkeypatch, boom)
     with pytest.raises(OSError):
         operatoractions.drop(project.project, "1-1-a")
 

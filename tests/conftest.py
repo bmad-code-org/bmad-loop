@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs
+from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
@@ -593,6 +593,48 @@ def remove_tree(path: Path) -> None:
             if not os.path.islink(entry):
                 os.chmod(entry, stat.S_IREAD | stat.S_IWRITE)
     shutil.rmtree(path)
+
+
+_REAL_OS_REPLACE = os.replace
+_REAL_WIN32_REPLACE_AT = win32_at.replace_at
+
+
+def real_publish_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) -> None:
+    """The rename a :func:`patch_publish_rename` interceptor falls through to.
+
+    ``os.replace``'s shape, routed to the syscall the arm actually publishes with:
+    a path-based rename is ``os.replace``, a dir_fd-relative one is ``os.replace``
+    on POSIX and ``win32_at.replace_at`` on Windows (where ``os.replace`` refuses
+    ``dir_fd`` outright). Bound to the ORIGINALS at import, so calling it from
+    inside the interceptor never re-enters the patch."""
+    if src_dir_fd is None and dst_dir_fd is None:
+        _REAL_OS_REPLACE(src, dst)
+    elif platform_util.DIR_FD_ANCHORED_WRITES:
+        _REAL_OS_REPLACE(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    else:
+        _REAL_WIN32_REPLACE_AT(src_dir_fd, src, dst_dir_fd, dst)
+
+
+def patch_publish_rename(monkeypatch: pytest.MonkeyPatch, fn) -> None:
+    """Route every rename a writer publishes with through ``fn``, on either arm.
+
+    ``fn(src, dst, *, src_dir_fd=None, dst_dir_fd=None)`` — ``os.replace``'s shape,
+    because on POSIX that IS the floor every publish reaches: the path-based
+    ``atomic_replace`` and the confined writer's anchored arm (a bare
+    dir_fd-relative ``os.replace``, #593) alike, so one patch covers both the
+    row's ablation and a reversion to the hand-rolled ``tmp + atomic_replace``.
+    Windows' anchored arm renames through ``win32_at.replace_at`` (handle-relative
+    ``NtSetInformationFile``; ``os.replace`` is never called), so a test patching
+    only ``os.replace`` fires on nothing there and passes having faulted nobody.
+    That name is patched too, with the argument order adapted, on the arm where
+    it is live. ``fn`` falls through with :func:`real_publish_rename`."""
+    monkeypatch.setattr(os, "replace", fn)
+    if win32_at.AVAILABLE:
+
+        def _at(src_dir_fd: int, src: str, dst_dir_fd: int, dst: str) -> None:
+            fn(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr(win32_at, "replace_at", _at)
 
 
 NOISY_GIT_KEY = "core.fsyncMethod"

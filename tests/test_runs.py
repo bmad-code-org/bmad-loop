@@ -15,7 +15,14 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from conftest import assert_run_state_lock_held, escalated_run, git, refuse_to_resolve
+from conftest import (
+    assert_run_state_lock_held,
+    escalated_run,
+    git,
+    patch_publish_rename,
+    real_publish_rename,
+    refuse_to_resolve,
+)
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
@@ -1269,12 +1276,14 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
     seam still covers the ablation the old dual patch existed for, and covers it
     better — `atomic_replace` is itself a wrapper around `os.replace`, so
     reverting `_write_stop_request` to the hand-rolled `tmp + atomic_replace`
-    routes through this same patch and must still redden this test.
+    routes through this same patch and must still redden this test. Through
+    `patch_publish_rename`, which also covers the Windows anchored arm's
+    `win32_at.replace_at` — there `os.replace` is never called at all.
 
     Filtered to the stop-request name so an unrelated replace during the test is
     not collateral."""
     run_dir = _make_state_run(tmp_path, "r1")
-    real_replace = os.replace
+    real_replace = real_publish_rename
     nested: list[str] = []
 
     def _interleave(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
@@ -1283,7 +1292,7 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
             runs._write_stop_request(run_dir, "graceful")
         return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "replace", _interleave)
+    patch_publish_rename(monkeypatch, _interleave)
 
     runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
 
