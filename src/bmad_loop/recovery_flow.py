@@ -24,10 +24,14 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 from . import gates, verify
 from .model import Phase
 from .platform_util import (
-    DIR_FD_ANCHORED_WRITES,
+    AT_NOFOLLOW,
+    AT_NONBLOCK,
+    HANDLE_ANCHORED_WRITES,
     atomic_write_bytes_at,
+    open_at,
     open_dir_confined,
     safe_ref_segment,
+    stat_at,
 )
 from .statemachine import advance
 
@@ -224,14 +228,17 @@ class RecoveryFlow:
         confinement exists for. It reaches the spec-writer chokepoint rule
         stated in `frontmatter.set_frontmatter_status` — an artifacts folder
         configured outside the project is a trusted repair target here
-        (`_attempt_owned_spec`) when descriptor-relative writes are available."""
+        (`_attempt_owned_spec`) when handle-anchored writes are available."""
         # A path-based fallback cannot retain publication authority across the
         # final replace. Refuse before any repair write so a substituted parent
-        # or target cannot redirect staging, publication, or cleanup.
-        if not DIR_FD_ANCHORED_WRITES:
+        # or target cannot redirect staging, publication, or cleanup. Both the
+        # POSIX `dir_fd` arm and the Windows handle-relative arm anchor
+        # (`platform_util.HANDLE_ANCHORED_WRITES`); only a host with neither
+        # reaches this refusal.
+        if not HANDLE_ANCHORED_WRITES:
             raise _OwnedSpecAuthorityError(
                 "safe automatic attempt-owned spec restoration is unavailable because "
-                "it cannot be verified without descriptor-relative writes: "
+                "it cannot be verified without handle-anchored writes: "
                 f"{spec_path}",
                 safe_restoration_unavailable=True,
             )
@@ -291,10 +298,10 @@ class RecoveryFlow:
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             ) from exc
 
-        if not DIR_FD_ANCHORED_WRITES:
+        if not HANDLE_ANCHORED_WRITES:
             raise _OwnedSpecAuthorityError(
                 "safe automatic attempt-owned spec restoration is unavailable because "
-                "it cannot be verified without descriptor-relative writes: "
+                "it cannot be verified without handle-anchored writes: "
                 f"{spec_path}",
                 safe_restoration_unavailable=True,
             )
@@ -341,7 +348,7 @@ class RecoveryFlow:
 
         def target_stat_at(parent_fd: int) -> os.stat_result | None:
             try:
-                observed = os.stat(spec_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                observed = stat_at(parent_fd, spec_path.name)
             except FileNotFoundError:
                 return None
             if not stat.S_ISREG(observed.st_mode):
@@ -354,9 +361,9 @@ class RecoveryFlow:
             observed = target_stat_at(parent_fd)
             if observed is None:
                 return None
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | AT_NOFOLLOW | AT_NONBLOCK
             try:
-                target_fd = os.open(spec_path.name, flags, dir_fd=parent_fd)
+                target_fd = open_at(parent_fd, spec_path.name, flags)
             except OSError as exc:
                 if exc.errno in {
                     errno.ELOOP,
@@ -425,9 +432,9 @@ class RecoveryFlow:
             # The writer keeps this exact staged inode open across publication.
             # Opening the live name no-follow/nonblocking proves it still names
             # that inode without following a link or waiting on a planted FIFO.
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | AT_NOFOLLOW | AT_NONBLOCK
             try:
-                live_fd = os.open(spec_path.name, flags, dir_fd=parent_fd)
+                live_fd = open_at(parent_fd, spec_path.name, flags)
             except OSError as exc:
                 if exc.errno in {
                     errno.ELOOP,
@@ -465,7 +472,7 @@ class RecoveryFlow:
                     raise _OwnedSpecAuthorityError(authority_message)
 
                 try:
-                    named = os.stat(spec_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    named = stat_at(parent_fd, spec_path.name)
                 except OSError as exc:
                     if exc.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
                         raise _OwnedSpecAuthorityError(authority_message) from exc
@@ -545,7 +552,7 @@ class RecoveryFlow:
             )
             return (
                 f"safe automatic restoration is unavailable {unsafe_context} because "
-                "this platform lacks descriptor-relative writes"
+                "this platform lacks handle-anchored writes"
                 f"{status_guidance}; manual adoption is required"
             )
         return f"its path became unsafe {unsafe_context} ({exc})"

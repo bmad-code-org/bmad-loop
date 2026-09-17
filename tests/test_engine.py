@@ -114,14 +114,14 @@ from bmad_loop.verify import (
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 # DW-310: attempt-owned spec restoration and lifecycle normalization refuse
-# before any write on a host without descriptor-relative writes (Windows) and
-# pause for manual adoption, so a rollback that has to put the bound spec back
-# cannot converge there by design. Mirrors `tests/test_recovery_flow.py`, which
-# pins that refusal directly; these rows assert the descriptor-capable
-# convergence and stay POSIX-only.
+# before any write on a host without handle-anchored writes and pause for
+# manual adoption, so a rollback that has to put the bound spec back cannot
+# converge there by design. Both real hosts have an arm — POSIX `dir_fd`,
+# Windows `platform_util.win32_at` — so these rows run on both; the marker
+# mirrors `tests/test_recovery_flow.py`'s and only a host with neither skips.
 requires_descriptor_restoration = pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES,
-    reason="automatic owned-spec restore requires descriptor-relative writes (DW-310)",
+    not platform_util.HANDLE_ANCHORED_WRITES,
+    reason="automatic owned-spec restore requires handle-anchored writes (DW-310)",
 )
 
 
