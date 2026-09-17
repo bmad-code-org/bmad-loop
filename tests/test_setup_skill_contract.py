@@ -64,6 +64,12 @@ def test_module_help_csv_shape(skill_root):
     for row in data:
         assert len(row) == len(header), f"ragged row: {row}"
         assert row[0] == "BMAD Loop Skills", f"unexpected module column: {row[0]!r}"
+    skill_column = header.index("skill")
+    csv_skills = {row[skill_column] for row in data}
+    assert csv_skills == set(MODULE_SKILLS), (
+        "module-help.csv must list exactly the module skills bmad-loop init "
+        f"installs: csv={csv_skills} MODULE_SKILLS={set(MODULE_SKILLS)}"
+    )
 
 
 # The legacy layout (#258) and the pre-rename module code: both are gone, and the
