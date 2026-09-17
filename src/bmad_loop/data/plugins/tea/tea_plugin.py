@@ -29,6 +29,7 @@ confidently-parsed FAIL/CONCERNS on an operator-marked-blocking gate escalates.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -169,6 +170,11 @@ class TeaPlugin(Plugin):
         for gate in gates:
             verdict = self._gate_verdict(gate, artifacts_dir)
             if verdict is None:
+                print(
+                    f"tea: gate {gate!r} has no parseable verdict under "
+                    f"{artifacts_dir}; failing open (treated as pass, commit proceeds)",
+                    file=sys.stderr,
+                )
                 continue  # fail-open: missing / unparseable / not-evaluated
             verdicts[gate] = verdict
             if verdict in BLOCKING_VERDICTS:
