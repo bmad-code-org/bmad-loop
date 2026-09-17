@@ -394,6 +394,8 @@ breaking changes may land in a minor release.
   cannot be read at a graceful stop journals `sweep-remaining-estimate-unreadable`
   next to the `run-stop` row, so a withheld estimate says why it was withheld.
 
+- Pinned a target version for the deprecated `[engine]` settings block.
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 
