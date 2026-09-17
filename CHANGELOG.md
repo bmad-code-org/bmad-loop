@@ -9,6 +9,8 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- The TEA plugin now prints a one-time notice at activation about the extra agent sessions its default settings add per story.
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
 
 - **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**

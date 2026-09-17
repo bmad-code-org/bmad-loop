@@ -29,6 +29,7 @@ confidently-parsed FAIL/CONCERNS on an operator-marked-blocking gate escalates.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,19 @@ if TYPE_CHECKING:
 # an operator is likely to enforce). Generation steps (td/atdd/automate) stay
 # advisory by design and are deliberately absent — they are never gate-enforced.
 GATE_STEPS = ("trace", "nfr", "review")
+
+# The six step-enable settings that gate the extra agent sessions TEA injects
+# per story. All default to true (see plugin.toml); when every one of them is
+# still at that default, validate() surfaces a one-time cost notice (see
+# _warn_if_defaults_costly) -- visibility only, never a default change.
+COST_SETTINGS = (
+    "td_enabled",
+    "atdd_enabled",
+    "automate_enabled",
+    "trace_enabled",
+    "nfr_enabled",
+    "review_enabled",
+)
 
 # Verdicts that escalate a blocking gate. PASS / WAIVED (an explicit human
 # approval to proceed) / an unknown-or-not-evaluated verdict never block.
@@ -138,6 +152,7 @@ class TeaPlugin(Plugin):
                 "require_tea = false under [plugins.tea] in .bmad-loop/policy.toml "
                 "to run the TEA workflows advisory-only without it."
             )
+        self._warn_if_defaults_costly()
 
     # --------------------------------------------------------- enforcement
 
@@ -190,6 +205,24 @@ class TeaPlugin(Plugin):
 
     def _require_tea(self) -> bool:
         return bool(self.settings.get("require_tea", True))
+
+    def _warn_if_defaults_costly(self) -> None:
+        """One-time, non-blocking notice on stderr: when all six step-enable
+        settings (COST_SETTINGS) are still at their true default, enabling tea
+        injects 6 extra agent sessions per story (3 post_dev_phase + 3
+        pre_commit_gate). Never raises and never changes a default -- this is a
+        visibility fix only; see docs/tea-plugin-guide.md for the cost
+        breakdown and how to disable steps that aren't needed."""
+        if not all(bool(self.settings.get(key, True)) for key in COST_SETTINGS):
+            return  # an operator already opted out of at least one step
+        sys.stderr.write(
+            "plugin 'tea': all six step settings (td_enabled, atdd_enabled, "
+            "automate_enabled, trace_enabled, nfr_enabled, review_enabled) are "
+            "at their true default -- enabling tea this way adds 6 extra agent "
+            "sessions per story (3 post_dev_phase + 3 pre_commit_gate). See "
+            "docs/tea-plugin-guide.md for the cost breakdown and how to disable "
+            "steps you don't need.\n"
+        )
 
     def _project_root(self) -> Path:
         """The project root, resolved the way the engine resolves it: the run's
