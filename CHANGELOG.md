@@ -167,6 +167,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- bmad-loop now warns when the legacy `review.on_status_contradiction = "retry"` mode is configured.
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 

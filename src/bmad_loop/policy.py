@@ -243,7 +243,8 @@ class ReviewPolicy:
     #       disagreement, so a human resolves it instead of the budget burning
     #       down onto a rollback.
     #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
-    #       review cycles to limits.max_review_cycles, then defer.
+    #       review cycles to limits.max_review_cycles, then defer. Slated for
+    #       removal in 0.12.0 (#813); loading it now emits a DeprecationWarning.
     # Keys on sprint-status only: the spec's own frontmatter status legitimately
     # cycles (in-review/in-progress) while a review patches, and `status: blocked`
     # remains the sanctioned way for a review to hand a story back to a human.
@@ -983,6 +984,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             "review.on_status_contradiction must be one of "
             f"{sorted(REVIEW_ON_STATUS_CONTRADICTION_MODES)}:"
             f" got {review.on_status_contradiction!r}"
+        )
+    if review.on_status_contradiction == "retry":
+        warnings.warn(
+            'review.on_status_contradiction = "retry" is legacy (superseded by '
+            '"escalate" per #334) and will be removed in 0.12.0 (#813). Switch to '
+            '"escalate" (the default).',
+            DeprecationWarning,
+            stacklevel=3,
         )
     stories = StoriesPolicy(
         source=_typed_str(stories_d, "stories", "source", StoriesPolicy.source).strip(),
