@@ -9,6 +9,8 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- The TEA plugin now prints an operator-visible notice when a gate's artifacts can't be found or parsed and the gate fails open.
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
 
 - **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**

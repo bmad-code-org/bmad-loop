@@ -524,21 +524,29 @@ def test_advisory_gate_never_blocks(project):
     assert "tea_gates" not in ctx.shared
 
 
-def test_missing_artifact_is_fail_open(project):
-    """A blocking gate with no artifact on disk never blocks the commit."""
+def test_missing_artifact_is_fail_open(project, capsys):
+    """A blocking gate with no artifact on disk never blocks the commit, and the
+    operator gets a visible stderr notice that the gate failed open."""
     ctx = pre_commit_ctx(project)
     _tea_instance(trace_blocking=True).on_pre_commit(ctx)
     assert not ctx.vetoed
+    stderr = capsys.readouterr().err
+    assert "trace" in stderr
+    assert "fail" in stderr.lower()
 
 
-def test_garbled_artifact_is_fail_open(project):
-    """An unparseable gate artifact never wrongly stops a commit."""
+def test_garbled_artifact_is_fail_open(project, capsys):
+    """An unparseable gate artifact never wrongly stops a commit, and the operator
+    gets a visible stderr notice that the gate failed open."""
     art = project.project / "_bmad-output" / "test-artifacts"
     art.mkdir(parents=True, exist_ok=True)
     (art / "gate-decision.json").write_text("{ this is not json", encoding="utf-8")
     ctx = pre_commit_ctx(project)
     _tea_instance(trace_blocking=True).on_pre_commit(ctx)
     assert not ctx.vetoed
+    stderr = capsys.readouterr().err
+    assert "trace" in stderr
+    assert "fail" in stderr.lower()
 
 
 def test_not_evaluated_verdict_is_fail_open(project):
