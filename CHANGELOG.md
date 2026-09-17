@@ -353,6 +353,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- bmad-loop-resolve is now listed in the module help catalog.
+
 - Adopt the current bundle's deferred-work ids before writing a reset sweep task's
   intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
   old and new ids as `sweep-bundle-dwids-adopted` when they differ.
