@@ -359,7 +359,11 @@ if sys.platform == "win32":
         if flags & (os.O_TRUNC | os.O_APPEND):
             raise ValueError("O_TRUNC/O_APPEND are not supported relative to a handle")
         writable = accmode in (os.O_WRONLY, os.O_RDWR)
-        access = 0
+        # FILE_READ_ATTRIBUTES on every open, as CreateFileW grants implicitly:
+        # `_refuse_link`'s GetFileInformationByHandleEx needs it, and a write-only
+        # open (FILE_GENERIC_WRITE carries only WRITE_ATTRIBUTES) is otherwise
+        # answered ERROR_ACCESS_DENIED at the attribute read, not at the open.
+        access = _FILE_READ_ATTRIBUTES
         if accmode in (os.O_RDONLY, os.O_RDWR):
             access |= _FILE_GENERIC_READ
         if writable:
