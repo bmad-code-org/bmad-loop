@@ -1,9 +1,13 @@
 """The capture hook runs as a real subprocess, like the CLI runs it."""
 
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_probe_hook.py"
 
@@ -82,3 +86,45 @@ def test_installed_copy_matches_source(tmp_path):
 
     packaged = resources.files("bmad_loop.data").joinpath("bmad_loop_probe_hook.py")
     assert packaged.read_text(encoding="utf-8") == SCRIPT.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_symlinked_capture_dir_writes_nothing_and_exits_zero(tmp_path):
+    """Parity with tests/test_hook_script.py's production-relay case: a driven
+    session can plant the capture dir as a symlink and redirect or swallow the
+    probe's capture -- the hook must refuse the link and degrade to a no-op
+    instead of writing through it.
+
+    Ablation guard: reverting _atomic_write to a plain
+    open()+json.dump()+os.replace() makes this fail -- the plain writer follows
+    the symlink and lands the payload in the attacker's directory."""
+    target = tmp_path / "attacker"
+    target.mkdir()
+    capture = tmp_path / "capture"
+    capture.symlink_to(target, target_is_directory=True)
+
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture), "BMAD_LOOP_TASK_ID": "probe"}
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    assert list(target.iterdir()) == []
+    assert list(capture.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_capture_files_mode_is_0600(tmp_path):
+    """The probe's capture dir holds the FULL raw CLI payload -- more sensitive
+    than the production relay's trimmed event -- so its files get the same
+    0o600 narrowing (from the umask-derived mode a plain open() produces).
+
+    Ablation guard: reverting _atomic_write to a plain open() makes this fail --
+    a plain open() produces an umask-derived mode, not 0o600."""
+    capture = tmp_path / "capture"
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture), "BMAD_LOOP_TASK_ID": "probe"}
+    proc = run_hook("Stop", env, {"session_id": "s1"})
+    assert proc.returncode == 0
+
+    written = list(capture.glob("*.signal.json")) + list(capture.glob("*.payload.json"))
+    assert len(written) == 2
+    for f in written:
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
