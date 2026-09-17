@@ -263,6 +263,26 @@ def test_readiness_skipped_when_require_tea_false(project, monkeypatch):
     _tea_instance(require_tea=False).validate(Policy())  # no raise
 
 
+def test_readiness_emits_cost_notice_when_defaults_in_effect(project, monkeypatch, capsys):
+    # All six step-enable settings still at their true default -> validate()
+    # surfaces the one-time cost notice on stderr, and still activates normally.
+    install_tea(project)
+    monkeypatch.chdir(project.project)
+    _tea_instance(require_tea=True).validate(Policy())  # no raise
+    err = capsys.readouterr().err
+    assert "6 extra agent sessions per story" in err
+    assert "docs/tea-plugin-guide.md" in err
+
+
+def test_readiness_skips_cost_notice_when_a_step_is_disabled(project, monkeypatch, capsys):
+    # An operator who already opted out of at least one step (e.g. disabled
+    # ATDD) no longer has all six settings at default -> no notice.
+    install_tea(project)
+    monkeypatch.chdir(project.project)
+    _tea_instance(require_tea=True, atdd_enabled=False).validate(Policy())  # no raise
+    assert capsys.readouterr().err == ""
+
+
 def test_engine_construction_fails_fast_without_tea(project, monkeypatch):
     """The engine runs registry.validate() at startup; an enabled tea plugin with
     no TEA install fails construction before any story runs."""

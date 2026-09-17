@@ -184,6 +184,8 @@ breaking changes may land in a minor release.
 
 - Correct the harvest exclusion docstring to name both `repo_root` override shapes (DW-169).
 
+- The TEA plugin now prints a one-time notice at activation about the extra agent sessions its default settings add per story.
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
 
 - Pin dynamically generated journal kind spellings in `recovery_flow` and detect
