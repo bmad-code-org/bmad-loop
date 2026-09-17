@@ -100,7 +100,7 @@ def test_untrusted_python_module_is_never_imported(tmp_path):
     reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)  # not enabled
     lp = reg.get("spy")
     assert lp is not None
-    assert lp.instance is None and lp.trusted is False
+    assert lp.instance is None and lp.manifest.python is not None
     # the smoking gun: the module's import-time side effect never happened
     assert not (pdir / "IMPORTED").exists()
     assert "plugin-untrusted" in journal.kinds()
@@ -112,7 +112,7 @@ def test_enabled_python_module_is_constructed(tmp_path):
     journal = FakeJournal()
     reg = PluginRegistry.build(tmp_path, policy=enable("trusted"), journal=journal)
     lp = reg.get("trusted")
-    assert lp.instance is not None and lp.trusted and not lp.disabled
+    assert lp.instance is not None and not lp.disabled
     assert lp.instance.name == "trusted"
     assert (pdir / "IMPORTED").exists()  # now it ran
     assert "plugin-loaded" in journal.kinds()
@@ -128,7 +128,7 @@ def test_dataonly_plugin_loads_without_enable(tmp_path):
     journal = FakeJournal()
     reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)
     lp = reg.get("decl")
-    assert lp.instance is None and lp.trusted  # trusted-but-codeless
+    assert lp.instance is None and lp.manifest.python is None  # data-only, no code to trust
     assert [h.stage for _, h in reg.hooks_for("pre_run")] == ["pre_run"]
     assert "plugin-loaded" in journal.kinds()
 

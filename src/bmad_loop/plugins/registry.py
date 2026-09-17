@@ -105,7 +105,7 @@ def _resolve(manifest: PluginManifest, policy, journal) -> LoadedPlugin:
                 plugin=manifest.name,
                 reason="[python] module requires [plugins] enabled",
             )
-        return LoadedPlugin(manifest=manifest, trusted=False, settings=settings)
+        return LoadedPlugin(manifest=manifest, settings=settings)
 
     try:
         instance = _instantiate(manifest, settings)
