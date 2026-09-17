@@ -167,6 +167,9 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **Docs: documented that bmad-loop validate detects a stale hook relay and bmad-loop init
+  resyncs it.**
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 

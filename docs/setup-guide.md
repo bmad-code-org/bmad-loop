@@ -325,6 +325,13 @@ bmad-loop validate --project <project-root>
 yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expected** — read its
 output as a readiness checklist, not an install failure.
 
+`validate` also detects a stale copy of the installed hook relay
+(`.bmad-loop/bmad_loop_hook.py`) with the `hooks.relay-stale` warning, and `bmad-loop init` is
+the existing resync for it — re-run `init` to refresh the copy. That resync is reliable when
+the relay was never installed before, but re-running `init` after an upgrade that changes the
+registered command's shape can report "hooks already registered" without actually updating an
+already-stale entry; see [#563](https://github.com/bmad-code-org/bmad-loop/issues/563).
+
 For the dashboard itself, see [docs/tui-guide.md](tui-guide.md). For the full policy
 reference, see the [Policy section](../README.md#policy-bmad-looppolicytoml) of the README.
 
