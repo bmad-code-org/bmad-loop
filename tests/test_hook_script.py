@@ -113,6 +113,26 @@ def test_camelcase_payload(tmp_path):
     assert event["transcript_path"].endswith("events.jsonl")
 
 
+def test_event_name_outside_canonical_set_warns_but_still_writes(tmp_path):
+    """profile.py already whitelists event names at hook-registration time
+    (SessionStart/Stop/SessionEnd/PreCompact), so reaching here with something
+    else means a hand-edited hook config or a profile that skipped that
+    validation -- defense in depth, not a gate. The event must still be
+    written exactly as any other, with a warning on stderr flagging the drift.
+
+    Ablation guard: dropping the `event_name not in CANONICAL_EVENTS` check
+    makes the stderr assertion fail while the rest of this test stays green."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook("Weird", env, {"session_id": "s1"})
+
+    assert proc.returncode == 0
+    assert "Weird" in proc.stderr and "canonical" in proc.stderr
+
+    files = list((tmp_path / "events").glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["event"] == "Weird"
+
+
 def test_tolerates_garbage_stdin(tmp_path):
     env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
     proc = run_hook("SessionEnd", env, None)  # empty stdin

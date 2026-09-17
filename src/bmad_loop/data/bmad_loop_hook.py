@@ -35,6 +35,15 @@ import stat
 import sys
 import time
 
+# The whitelist adapters/profile.py already enforces at hook-registration time
+# (SessionStart/Stop/SessionEnd/PreCompact), duplicated here because this file
+# is stdlib-only and cannot import bmad_loop.adapters.profile -- same twin
+# constraint as events.py below. Not a gate: an event_name outside this set
+# still gets written exactly as before, only with an added drift warning,
+# since a hand-edited hook config or a profile that skipped that validation is
+# the only way one reaches this script at all.
+CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
+
 # Windows reparse tags that make a directory entry REDIRECT somewhere else,
 # compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
 # os.path.isjunction(), which is 3.12+ — this relay runs under whatever
@@ -184,6 +193,16 @@ def main() -> int:
     if not run_dir or not task_id:
         return 0
     event_name = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
+    if event_name not in CANONICAL_EVENTS:
+        # Drift, not a gate: profile.py already enforces this whitelist before a
+        # hook is ever registered, so reaching here means a hand-edited hook
+        # config or a profile that skipped that validation. The event is still
+        # written exactly as below -- never withhold the signal the orchestrator
+        # waits on -- same never-fail treatment as the hooks.relay-stale check.
+        print(
+            f"bmad_loop_hook: event_name {event_name!r} is outside the canonical set {sorted(CANONICAL_EVENTS)}",
+            file=sys.stderr,
+        )
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):

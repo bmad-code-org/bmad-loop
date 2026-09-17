@@ -29,8 +29,18 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import time
 from typing import IO, Any
+
+# The whitelist adapters/profile.py already enforces at hook-registration time
+# (SessionStart/Stop/SessionEnd/PreCompact), duplicated here because this file
+# is stdlib-only and cannot import bmad_loop.adapters.profile -- same twin
+# constraint as the copied hook script above. Not a gate: an event_name outside
+# this set still gets written exactly as before, only with an added drift
+# warning, since a hand-edited hook config or a profile that skipped that
+# validation is the only way one reaches this relay at all.
+CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 
 # Windows reparse tags that make a directory entry REDIRECT somewhere else,
 # compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
@@ -246,6 +256,16 @@ def relay(event_name: str, stdin: IO[str]) -> int:
     task_id = os.environ.get("BMAD_LOOP_TASK_ID")
     if not run_dir or not task_id:
         return 0
+    if event_name not in CANONICAL_EVENTS:
+        # Drift, not a gate: profile.py already enforces this whitelist before a
+        # hook is ever registered, so reaching here means a hand-edited hook
+        # config or a profile that skipped that validation. The event is still
+        # written exactly as below -- never withhold the signal the orchestrator
+        # waits on -- same never-fail treatment as the hooks.relay-stale check.
+        print(
+            f"bmad_loop relay: event_name {event_name!r} is outside the canonical set {sorted(CANONICAL_EVENTS)}",
+            file=sys.stderr,
+        )
     ts = time.time_ns()
     event = shape_event(ts, event_name, task_id, _read_payload(stdin))
     # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the

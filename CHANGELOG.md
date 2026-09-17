@@ -184,6 +184,8 @@ breaking changes may land in a minor release.
 
 - Correct the harvest exclusion docstring to name both `repo_root` override shapes (DW-169).
 
+- The hook script now warns (non-blocking) if it receives an event name outside the canonical set, without ever dropping the signal.
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
 
 - Pin dynamically generated journal kind spellings in `recovery_flow` and detect
