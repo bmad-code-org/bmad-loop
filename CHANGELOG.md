@@ -353,6 +353,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- The interactive setup skill now recognizes opencode as a valid `--cli` adapter,
+  matching the docs and the shipped profile.
+
 - Adopt the current bundle's deferred-work ids before writing a reset sweep task's
   intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
   old and new ids as `sweep-bundle-dwids-adopted` when they differ.
