@@ -353,6 +353,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Docs: clarified that the "dropping a plugin folder in never runs code" guarantee
+  applies to Python plugins only, declarative plugin shell hooks still run on
+  discovery.
+
 - Adopt the current bundle's deferred-work ids before writing a reset sweep task's
   intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
   old and new ids as `sweep-bundle-dwids-adopted` when they differ.

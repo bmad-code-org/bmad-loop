@@ -11,7 +11,10 @@ Unity game-engine layer. A plugin can:
 Plugins are **folder-drop**: a directory with a `plugin.toml` manifest (plus any
 helper scripts) dropped under `.bmad-loop/plugins/<name>/`. No registration, no
 install step. A plugin that ships **in-process Python** is loaded only when you
-**trust** it by name — dropping a folder in never runs code.
+**trust** it by name — dropping a `[python]` plugin folder in never runs its
+code. Declarative plugins (shell hooks, no `[python]` module) are not gated the
+same way and run as soon as they are discovered — see
+[Trust & safety](#trust--safety) for both tiers.
 
 > Already wrote a [CLI adapter profile](../README.md#other-coding-clis) or the old
 > `[engine]` block? Same idea — declarative TOML + optional scripts, discovered and
