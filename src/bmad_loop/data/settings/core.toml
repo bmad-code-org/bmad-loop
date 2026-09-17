@@ -58,7 +58,7 @@ kind = "select"
 options_ref = "REVIEW_ON_STATUS_CONTRADICTION_MODES"
 default_ref = "ReviewPolicy.on_status_contradiction"
 label = "review revokes sprint sign-off"
-description = "escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back"
+description = "escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back; slated for removal in 0.12.0 (#813)"
 
 [[section]]
 name = "stories"
