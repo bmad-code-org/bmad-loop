@@ -1394,6 +1394,16 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   story spec in an artifacts folder configured _outside_ the checkout keeps the plain
   no-follow write — supported configuration a confined write cannot vouch for.
 
+### Security
+
+- Hardened the probe-adapter capture writer against symlink-based file replacement,
+  matching the production hook writer. `bmad_loop_probe_hook.py`'s `_atomic_write`
+  did a plain `open()`+`json.dump()`+`os.replace()` with no redirect check and no explicit
+  permissions; it now ports the same primitives `bmad_loop_hook.py`'s `_write_event` already
+  uses — a symlink/junction refusal, an `O_NOFOLLOW`/`dir_fd`-anchored create+rename, an
+  explicit `0o600` mode, and a short-write-safe write loop — duplicated rather than shared,
+  since both scripts are stdlib-only package data that cannot import each other.
+
 ## [0.11.1] — 2026-08-23
 
 ### Added
