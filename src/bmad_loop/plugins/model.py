@@ -264,7 +264,6 @@ class LoadedPlugin:
 
     manifest: PluginManifest
     instance: Plugin | None = None
-    trusted: bool = True
     disabled: bool = False
     error: str = ""
     # the plugin's resolved settings: manifest defaults overlaid by the

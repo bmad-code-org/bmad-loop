@@ -122,7 +122,7 @@ def test_unenabled_python_workflow_is_inert():
     # a [python] plugin that wasn't enabled has instance=None: its module never
     # ran, so its workflow must not inject a session either.
     m = wf_manifest("gated", python=True)
-    reg = PluginRegistry([LoadedPlugin(manifest=m, trusted=False)])
+    reg = PluginRegistry([LoadedPlugin(manifest=m)])
     assert reg.workflow_stages() == frozenset({"post_dev_phase"})  # declared...
     assert reg.workflows_for("post_dev_phase") == []  # ...but not active
 
@@ -660,6 +660,6 @@ def test_example_plugin_inert_until_enabled(project):
         project.project, Policy(gates=GatesPolicy(mode="none"), notify=QUIET)
     )
     gr = reg.get("guardrails")
-    assert gr is not None and gr.instance is None and gr.trusted is False
+    assert gr is not None and gr.instance is None and gr.manifest.python is not None
     # its workflow is declared but inert (the plugin is not active)
     assert reg.workflows_for("post_dev_phase") == []

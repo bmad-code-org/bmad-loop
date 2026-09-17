@@ -578,6 +578,12 @@ breaking changes may land in a minor release.
   bundled `plugin.toml` or default trips it, but this is a compatibility break on
   previously-loading config.
 
+### Removed
+
+- Remove the unused `trusted` field from `LoadedPlugin` and the `trusted=False` kwarg
+  passed at its one write site in `registry.py`, since nothing reads it anywhere in the
+  plugins package.
+
 ### Fixed
 
 - Bound the GitHub release body `scripts/release.py publish` sends at GitHub's
