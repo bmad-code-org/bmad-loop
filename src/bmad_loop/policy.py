@@ -127,7 +127,9 @@ class LimitsPolicy:
     # the refill until session_timeout_min, burning a turn per cycle (#149).
     # After this many total nudges the session is declared stalled instead
     # (post-kill reconcile still rescues a finished one whose artifact is on
-    # disk). 0 = stall on first grace expiry.
+    # disk). 0 = stall on first grace expiry. Safe range: keep this
+    # comfortably below session_timeout_min / (dev_stall_grace_s / 60), so
+    # the cap fires before the session timeout ceiling would anyway.
     dev_stall_nudges_cap: int = 6
     # same monotonic cap for injected plugin-workflow sessions: one that keeps
     # ending its turn without writing its completion marker is declared stalled
