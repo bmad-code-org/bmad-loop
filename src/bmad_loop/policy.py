@@ -1061,6 +1061,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     requested_parallel = _typed_int(scm_d, "scm", "max_parallel", ScmPolicy.max_parallel)
     if requested_parallel < 1:
         raise PolicyError(f"scm.max_parallel must be >= 1: got {requested_parallel}")
+    if requested_parallel > 1:
+        warnings.warn(
+            f"scm.max_parallel = {requested_parallel} is configured, but parallel "
+            "fan-out (Phase 5) is not built yet: the value is clamped to 1 and has "
+            "no effect (see #229).",
+            UserWarning,
+            stacklevel=3,
+        )
     # This one was strict before its sibling int knobs were (a TOML `true`, with
     # int(True) == 1, or a `1.9` coercing through int() would silently shrink a
     # safety-net budget); `_typed_int` is that same guard, message included.
