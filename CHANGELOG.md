@@ -167,6 +167,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Pinned a target version for the deprecated `[engine]` settings block.
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 
