@@ -9,6 +9,8 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- The hook script now warns (non-blocking) if it receives an event name outside the canonical set, without ever dropping the signal.
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
 
 - **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**

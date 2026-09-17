@@ -441,6 +441,26 @@ def test_relay_writes_the_event_and_says_nothing(tmp_path, monkeypatch, capsys):
     assert not list((tmp_path / "events").glob("*.tmp"))
 
 
+def test_relay_warns_but_still_writes_for_a_noncanonical_event_name(tmp_path, monkeypatch, capsys):
+    """The relay's own half of the drift-detection warning: profile.py already
+    whitelists event names before a hook is ever registered, so reaching this
+    relay with something else means a hand-edited hook config or a profile
+    that skipped that validation -- defense in depth, not a gate. The warning
+    goes to stderr, never stdout (the hosts parse hook stdout), and the event
+    is written exactly as any other.
+
+    Ablation guard: dropping the `event_name not in CANONICAL_EVENTS` check in
+    `events.relay` makes the stderr assertion fail while the rest stays green."""
+    assert _relay("Weird", {"session_id": "s1"}, monkeypatch, tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Weird" in err and "canonical" in err
+
+    files = list((tmp_path / "events").glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["event"] == "Weird"
+
+
 def test_relay_is_a_silent_noop_outside_a_driven_session(tmp_path, monkeypatch, capsys):
     """An operator (or a stray hook config) can invoke `bmad-loop relay` in a
     session bmad-loop never spawned. The session-protocol env is the detector, and
@@ -598,9 +618,15 @@ def test_relay_defaults_the_event_name_like_the_hook(tmp_path, monkeypatch, caps
     """The hook script reads `sys.argv[1] if len(sys.argv) > 1 else "Unknown"`, so
     a misconfigured registration that forgets the event name still produces a file
     the operator can see. argparse would otherwise turn that into a usage error at
-    rc 2, before any handler runs — nothing `cmd_relay` does could take it back."""
+    rc 2, before any handler runs — nothing `cmd_relay` does could take it back.
+
+    "Unknown" is itself outside CANONICAL_EVENTS, so this is exactly the drift the
+    canonical-set warning exists to flag — the file still lands, but now with a
+    stderr warning an operator can act on instead of a silent "Unknown" file."""
     assert _relay_no_event({"session_id": "s1"}, monkeypatch, tmp_path) == 0
-    assert capsys.readouterr() == ("", "")
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Unknown" in err and "canonical" in err
     assert "Unknown" in next((tmp_path / "events").glob("*.json")).name
 
 
