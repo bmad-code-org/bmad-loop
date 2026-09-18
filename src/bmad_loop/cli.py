@@ -69,7 +69,7 @@ from .documents import (
     status_document,
     validate_document,
 )
-from .engine import Engine
+from .engine import Engine, _publication_refusal
 from .escalation import display_pause_reason
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
@@ -3111,10 +3111,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
-    # DW-204: sweep runs only, and only for a ledger whose bytes do not currently
-    # decode (a read the OS refused propagates instead — see the helper). Gated
-    # HERE and not in `_resume_paused_run`, for the same reason the liveness block
-    # above is:
+    # DW-204: sweep runs only, for a ledger that cannot currently be read — bytes
+    # that do not decode, or (since DW-234) a read the OS refused; each names its
+    # own repair (see the helper). Gated HERE and not in `_resume_paused_run`, for
+    # the same reason the liveness block above is:
     # that helper is also resolve's re-arm path, which has already run its
     # interactive session and re-armed the escalation by the time it is reached, so
     # a refusal there would be a refusal after the side effects. Deliberately AFTER
@@ -4027,14 +4027,53 @@ def _land_confirmation(
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
-    try:
-        verify.commit_paths(
-            paths.repo_root,
-            f"chore(operator): confirm {story.story_key}",
-            [spec, record] if board_ignored else [spec, paths.sprint_status, record],
+    # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
+    # `commit_paths` forces every operand LITERAL, so an operand replaced by a
+    # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
+    # an unrelated tree published under this `chore(operator):` message.
+    # Family `"store"` at all three: the family names the validation POLICY, not
+    # the file's role, and a spec, a board and a park record all want exactly
+    # "a regular file is there" and nothing about their bytes.
+    # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
+    # not sink its siblings, which is the whole point of the `board_ignored` drop
+    # this joins.
+    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    survivors: list[Path] = []
+    for path in operands:
+        # The SAME resolve-then-guard the four carries take, imported rather than
+        # re-spelled: one rule, one place it can drift from. Its resolve fold matters
+        # here too — an operand `confirm` cannot even NAME must not be handed to git.
+        refusal = _publication_refusal(path, "store")
+        if refusal is None or refusal[0] == "target-absent":
+            # An ABSENT operand STAYS (#356): `record` was unlinked by the drop a few
+            # lines above, and its DELETION is exactly what must ride this commit —
+            # `commit_paths` keeps a missing-but-TRACKED path for that reason and
+            # drops one git has never seen. Only a present-but-wrong-TYPE or
+            # unreadable operand is a hazard to git, and only those are dropped.
+            survivors.append(path)
+            continue
+        cause, error = refusal
+        # ONE collapsed line per dropped operand: git's own text is multi-line
+        # where this prints on one, and the operator needs the full path (not the
+        # basename a journal row carries) to find what is sitting there.
+        detail = "" if error is None else f": {' '.join(error.split())}"
+        print(
+            f"warning: {path} was left out of the {story.story_key} confirm commit "
+            f"({cause}){detail} — the confirm's on-disk change landed before the path "
+            f"took this shape; inspect it and commit it by hand once the path is repaired.",
+            file=sys.stderr,
         )
-    except verify.GitError:
-        pass  # files are written; git history is best effort (as `decisions`)
+    if survivors:
+        # An empty list spawns no git at all, rather than handing `commit_paths`
+        # nothing and letting it decide what that means.
+        try:
+            verify.commit_paths(
+                paths.repo_root,
+                f"chore(operator): confirm {story.story_key}",
+                survivors,
+            )
+        except verify.GitError:
+            pass  # files are written; git history is best effort (as `decisions`)
     print(f"✓ {story.story_key} confirmed — spec and board are done")
     return 0
 

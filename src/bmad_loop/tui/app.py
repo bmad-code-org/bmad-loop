@@ -704,7 +704,9 @@ class BmadLoopApp(App[None]):
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
-        spec_path, spec_text, readable = self._paused_spec(state)
+        spec_path, spec_text, readable = (
+            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+        )
 
         def done(verb: str | None) -> None:
             if verb == "resume":
@@ -714,6 +716,11 @@ class BmadLoopApp(App[None]):
             # Spec-less gates: story-gate fires before the story is registered in
             # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
             # and epic-boundary has no story key. The pause reason is the payload.
+            # A story gate is ALWAYS about the ledger, never a spec, so it takes
+            # this arm even when the task carries a spec_file (DW-243: a sweep
+            # bundle re-armed after a dev escalation keeps its spec_file, and its
+            # intent-regeneration refusal pauses at this stage) — the repair steer
+            # is in the reason, which the spec viewer would hide.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key
@@ -1001,23 +1008,9 @@ class BmadLoopApp(App[None]):
         # probe answers or declines; this surface owns the channel (a toast, where the
         # CLI prints to stderr). Note `_do_resume` is deliberately NOT gated: it
         # mutates nothing before launching, so its child's refusal costs nothing.
-        #
-        # Wrapped for `OSError` because the probe propagates one by contract (a read the
-        # OS refuses is a different fault class from bytes that do not decode, and the
-        # arm for it is DW-234's to add, not this call site's). `main`'s tail routes
-        # that propagation for the CLI; a Textual message-loop callback has no such
-        # tail, so an escape here takes the dashboard down. This is the surface's own
-        # routing of an unrouted fault — it reports and returns unarmed, and must not be
-        # mistaken for the repair arm the probe is forbidden to grow.
-        try:
-            refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
-        except OSError as e:
-            self.notify(
-                f"cannot read the deferred-work ledger to check this sweep can resume "
-                f"({e}) — fix it, then re-arm; the story is still escalated",
-                severity="error",
-            )
-            return
+        # Since DW-234 the probe refuses an OS-refused read too, with the same
+        # repair route the CLI prints, so there is nothing left to catch here.
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
         if refusal is not None:
             self.notify(refusal, severity="error")
             return

@@ -4,6 +4,7 @@ import contextlib
 import json
 import shutil
 import sys
+from pathlib import Path
 
 import pytest
 from conftest import (
@@ -167,6 +168,69 @@ def test_load_pre_answers_tolerates_undecodable_bytes(project):
     store = decisions.store_path(project.project)
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_bytes(b'{"DW-1": {"effect": "\xff"}}')
+
+    assert decisions.load_pre_answers(project.project) == {}
+
+
+@pytest.mark.parametrize("is_file_answers", ["raises-like-3.13", "false-like-3.14"])
+def test_load_pre_answers_tolerates_a_refused_metadata_probe(project, monkeypatch, is_file_answers):
+    """DW-261. The docstring promises tolerance of "an unreadable one", and the
+    bare `if not path.is_file(): return {}` OUTSIDE the `try` made that false on
+    Python 3.11–3.13, where `is_file()` calls `stat()` and re-raises a metadata
+    refusal: a `PermissionError` escaped this "total" helper out of
+    `_decisions_phase` and every other caller. (On 3.14 the same probe
+    suppressed the refusal and answered False — silent `{}`, which is at least
+    the contract.) The probe is `stat` + `S_ISREG` INSIDE the `try` now, so the
+    refusal folds into the same `{}` every other fault class answers, on every
+    interpreter.
+
+    Two rows because the bug had a different face per interpreter, and the
+    ablation can only red through the 3.13 face. `raises-like-3.13` leaves
+    `Path.is_file` alone: on the 3.11–3.13 dev interpreter it reaches the
+    refused `stat` and raises, which is the escape DW-261 closes, and it is the
+    row the ablation reds. `false-like-3.14` pins `Path.is_file` False for the
+    store, the simulated-3.14 shape: it pins that the new probe answers `{}`
+    without consulting `is_file` at all, but a restored bare `is_file()` answers
+    `{}` for it too on 3.11–3.13; on a real 3.14 interpreter the ablated bare
+    `is_file()` ignores the pin's target-less `stat`, answers True for the
+    readable store and returns its content, so that row DOES red there.
+    Ablation: restore the bare `if not path.is_file(): return {}` above the `try`
+    and the `raises-like-3.13` row reds with `PermissionError` escaping."""
+    store = decisions.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('{"DW-1": {"effect": "build"}}', encoding="utf-8")
+    if is_file_answers == "false-like-3.14":
+        real_is_file = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == store else real_is_file(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, store, "stat")
+
+    assert decisions.load_pre_answers(project.project) == {}
+
+
+def test_load_pre_answers_tolerates_a_non_encodable_store_path(project):
+    """`Path.stat` raises `ValueError` for a path the OS cannot encode (an
+    embedded NUL), which the old bare `is_file()` absorbed; the helper stays
+    total for it.
+    Ablation: drop `ValueError` from the except tuple and this reds with it
+    escaping."""
+    assert decisions.load_pre_answers(Path(str(project.project) + "\0")) == {}
+
+
+def test_load_pre_answers_treats_a_directory_at_the_store_as_empty(project):
+    """The absence half of DW-261's classification: a DIRECTORY at the store's
+    name is a present target of the wrong TYPE, which `is_file()` answered False
+    for and `S_ISREG` answers False for too — `{}`, and nothing raised. Without
+    the `S_ISREG` test the directory would reach `read_text` as an
+    `IsADirectoryError`, still caught, but by the content arm rather than the
+    silent absence one this row pins.
+    Ablation: drop the `S_ISREG` test and this stays green only through the
+    `OSError` arm; drop both and it reds with `IsADirectoryError`."""
+    store = decisions.store_path(project.project)
+    store.mkdir(parents=True)
 
     assert decisions.load_pre_answers(project.project) == {}
 
@@ -1024,9 +1088,9 @@ def test_apply_pre_answer_refuses_a_store_a_directory_replaced_while_publishing_
     HEAD, and nothing raises out of a call whose on-disk record is already made.
 
     The token matters as much as the refusal. `target-absent` would send an operator
-    looking for a vanished file and `target-unreadable` for a permission or decode
-    fault; the repair here is "something is sitting at the store's name", which is a
-    third thing.
+    looking for a vanished file, `target-unreadable` for a permission fault and
+    `target-undecodable` (the ledger family only) for a decode fault; the repair
+    here is "something is sitting at the store's name", which is another thing.
 
     Ablation: revert the store leg to its existence-only probe and this reds two
     ways — no refusal is reported, and `git add` stages `swept-in.txt` into the
@@ -1051,7 +1115,10 @@ def test_apply_pre_answer_refuses_a_store_a_directory_replaced_while_publishing_
         real_record(*a, **kw)
         store = decisions.store_path(project.project)
         if fault == "metadata":
-            fault_metadata_probe(monkeypatch, store.resolve(), "is_file")
+            # `lstat`, the one probe the store leg takes since DW-257 — on
+            # `is_file` the injection would never fire and the row would silently
+            # stop faulting.
+            fault_metadata_probe(monkeypatch, store.resolve(), "lstat")
         else:
             store.unlink()
             store.mkdir()

@@ -17,10 +17,10 @@ import stat
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, assert_never
+from typing import Any, Callable, Iterable, Literal, NoReturn, assert_never
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
+from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor, _publication_refusal
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
@@ -35,6 +35,24 @@ from .statemachine import advance
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+class MissingLedgerEntriesError(Exception):
+    """`_write_intent` refused to brief a bundle whose ids are not all in the
+    ledger (DW-252). `ids` names every bundle id with NO parsed entry at all — a
+    present-but-closed entry is still emitted verbatim and is not missing.
+
+    Raised BEFORE any side effect: no `bundles/<dirname>/` directory, no file.
+    An intent document briefs a dev session; an empty "Ledger entries (verbatim)"
+    section briefed it on nothing, and the session was spent anyway.
+
+    A plain `Exception` on purpose, never `OSError` or `ValueError`: the arms
+    around the two writers catch `OSError` for the file's own I/O, and a subclass
+    would be swallowed by exactly the handler this refusal must escape."""
+
+    def __init__(self, ids: tuple[str, ...]) -> None:
+        self.ids = ids
+        super().__init__(f"no ledger entry for {', '.join(ids)}")
 
 
 TRIAGE_KEY = "sweep-triage"
@@ -103,7 +121,8 @@ _HANDBACK_LEDGER_MISS = " ".join(
 _HANDBACK_LEDGER_HALTED = " ".join(
     [
         "! answers saved, but the deferred-work ledger is not fit to publish",
-        "(see sweep-resolved-close-unavailable or sweep-decision-effect-unavailable in the journal) —",
+        "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable,",
+        "sweep-ledger-commit-refused or sweep-ledger-commit-unavailable in the journal) —",
         "repair the ledger and re-run",
     ]
 )
@@ -1385,15 +1404,20 @@ class SweepEngine(Engine):
         OR the RUN's persisted one (DW-218/219).
 
         The dispatch gate in `_cycle`, `_loop`'s shared stop arm,
-        `_prune_pre_answers`' refusal, and every ledger PUBLISHER a resume can
-        reach ahead of that gate — `_close_resolved`'s two commit arms,
-        `_publish_stranded_close`, the decision phase's tail publish and the
-        top-of-`_loop` debt settle — all read the doubt through here, so a future
-        arming site cannot be wired into one reader and missed by the others —
-        which is precisely how the close phase's fault reached `_write_intent`'s
-        bare `read_for_write` while the gate above it saw a False latch. The
-        persisted term is added HERE for the same reason: one reader, many
-        consumers, no second spelling to keep in step.
+        `_prune_pre_answers`' refusal, `_decisions_phase`'s tail publish, and every
+        ledger PUBLISHER a resume can reach ahead of that gate — `_close_resolved`'s
+        two commit arms, `_loop`'s in-flight recovery pass and the publish that
+        follows it (the debt settle included), `_loop`'s legacy-migration arm,
+        `_publish_stranded_close` (DW-250: the whole publisher, above both of its
+        probes) — and `_loop`'s no-open repair notice (DW-251) all read the doubt
+        through here, so a future arming site cannot be wired into one reader and
+        missed by the others — which is precisely how the close phase's fault
+        reached `_write_intent`'s bare `read_for_write` while the gate above it saw
+        a False latch. The persisted term is added HERE for the same reason: one
+        reader, however many consumers, no second spelling to keep in step. The
+        list above is not a count to keep exact; the invariant is that nothing
+        reads `state.sweep_ledger_in_doubt`, `_ledger_in_doubt` or
+        `_close_ledger_in_doubt` except through this method.
 
         The persisted term is safe beside the two cycle-scoped ones. `_loop` stops
         (repeat) or returns (non-repeat, `--decisions-only`) when doubt remains
@@ -1477,7 +1501,10 @@ class SweepEngine(Engine):
         the resumed cycle sails past every in-memory arm and dispatches — the exact
         resume the prune argument says cannot happen.
 
-        Only on the False->True EDGE, so the seven call sites cost one `_save()`
+        Only on the False->True EDGE, so the nine call sites (the close phase's
+        degrade, the five arms inside the decision phase, that phase's tail
+        publish, `_commit_ledger`'s ledger-family refusal arm since DW-244, and
+        its ledger-family resolve-fault arm since DW-260) cost one `_save()`
         per edge rather than one per arm — an edge, not a run: `_release_ledger_doubt`
         writing False re-opens it, so a fault/success/fault sequence inside one walk
         saves here more than once. That helper owns the lifetime from here: it clears
@@ -1758,6 +1785,9 @@ class SweepEngine(Engine):
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
+        # A regeneration refusal (DW-243/252) PAUSES from `_ensure_bundle_intent`
+        # and propagates here as `RunPaused`, exactly like the migrate gate below —
+        # and only when the recovery pass runs at all: see the gate just below.
         if self._ledger_unfit_to_publish():
             # DW-218/219, one gate AHEAD of `_cycle`'s dispatch gate. Read through
             # `_ledger_unfit_to_publish()` like every other consumer of the
@@ -1792,21 +1822,10 @@ class SweepEngine(Engine):
                 )
         else:
             recovered = self._finish_inflight_bundles()
-        # ...and the same verdict gates the publish that follows either trigger.
-        # The DEBT term is the one that can still be armed here: a process that
-        # armed `_record_ledger_doubt` and then died between an effect's publish
-        # and its commit resumes with BOTH latches set, and the debt describes
-        # exactly the bytes the doubt refuses to publish — the settle would walk
-        # the half-written ledger into HEAD ahead of every gate that withholds
-        # it. The doubt outranks the debt: the settle is skipped, the debt stays
-        # latched, and the run ends where the doubt ends it (the withheld
-        # dispatch, then `ledger-unreadable`); a fresh sweep is a NEW run with
-        # fresh state, so the unsettled debt contaminates nothing. `recovered` is
-        # 0 under doubt by construction above; it sits inside the gate anyway,
-        # so the publisher cannot be reached by a trigger added later.
-        if (
-            recovered or self.state.sweep_ledger_commit_owed
-        ) and not self._ledger_unfit_to_publish():
+        # ...and the same verdict gates the publish that follows either trigger,
+        # at the call site inside the arm (the DW-246 withhold below), so a
+        # trigger added later cannot reach the publisher around it.
+        if recovered or self.state.sweep_ledger_commit_owed:
             # a recovered bundle's ledger restore can leave the LEDGER dirty, and
             # triage plus the first bundle baseline read it, so it is published
             # here. Only it: unrelated dirt in the same repository is left for
@@ -1827,15 +1846,34 @@ class SweepEngine(Engine):
             # every one of the seven publishers: `self.paths.deferred_work` is a
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
-            self._commit_ledger(
-                (
-                    "chore(sweep): commit ledger after recovering in-flight bundles"
-                    if recovered
-                    else "chore(sweep): commit a ledger write an interrupted phase left unpublished"
-                ),
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
+            # ...and WITHHELD when the run already knows the ledger is unfit
+            # (DW-246), journaled `sweep-ledger-commit-withheld` rather than
+            # silently skipped. `recovered` is 0 under doubt by construction above,
+            # so the DEBT is the only term that can reach this arm: a process that
+            # armed `_record_ledger_doubt` and then died between an effect's
+            # publish and its commit resumes with BOTH latches set, and the debt
+            # describes exactly the bytes the doubt refuses to publish — the settle
+            # would walk the half-written ledger into HEAD ahead of every gate that
+            # withholds it. The doubt outranks the debt: the settle is withheld,
+            # the debt stays latched, and the run ends where the doubt ends it (the
+            # withheld dispatch, then `ledger-unreadable`); a fresh sweep is a NEW
+            # run with fresh state, so the unsettled debt contaminates nothing.
+            # Read through `_ledger_unfit_to_publish()`, the one reader; the gate
+            # sits AT the call site because `_commit_ledger` has publishers that
+            # deliberately stay ungated (see `_close_resolved`'s inventory).
+            publish_message = (
+                "chore(sweep): commit ledger after recovering in-flight bundles"
+                if recovered
+                else "chore(sweep): commit a ledger write an interrupted phase left unpublished"
             )
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish(publish_message)
+            else:
+                self._commit_ledger(
+                    publish_message,
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         while True:
             # First statement of the loop body: covers the boundary right after
             # _finish_inflight_bundles on resume and between repeat cycles. A
@@ -1937,6 +1975,31 @@ class SweepEngine(Engine):
                         cycles=cycle - 1,
                         reason="no-open",
                         stop_cause="no-open",
+                    )
+                # DW-251: a run that reaches this exit with the doubt armed
+                # withheld every publish it was offered — the stranded-close
+                # republish above withholds on the same verdict (DW-250) —
+                # and then ended on `no-open` with no repair instruction at all.
+                # Not because an earlier notice was lost: `gates.notify` APPENDS
+                # to `<run>/ATTENTION`, which a resume shares. The gap is that the
+                # class that ARMS the doubt never wrote one — the arms do not
+                # notify, the withheld branch's stop check exits ahead of its row,
+                # and a non-repeat run has no stop notice — so the process that
+                # withheld said nothing. That holds for a resume inheriting the
+                # DW-218/219 mirror and for a same-process arm alike (a refused
+                # `_publish_stranded_close` or migration publish under DW-244
+                # lands here in a fresh process too). So the shared notice is
+                # written here, with the same headline the repeat boundary's
+                # unfit stop uses, guarded on the one reader. AFTER the
+                # exit's own row and BEFORE its `return`, in both arms: the rows,
+                # their fields and the `return` are unchanged, no stop token is
+                # added, and the notice is deliberately NOT conditional on whether
+                # `_publish_stranded_close` published anything — the doubt is the
+                # run's verdict, and a human repair plus a fresh `bmad-loop sweep`
+                # is the only thing that clears an inherited one.
+                if self._ledger_unfit_to_publish():
+                    self._notify_ledger_repair(
+                        ledger, "the deferred-work ledger is not fit to publish"
                     )
                 return
             selected_ids = {entry.id for entry in selection.selected}
@@ -2100,51 +2163,63 @@ class SweepEngine(Engine):
         branch it dispatches a triage SESSION, and a nothing-open resume must never
         spend one.
 
-        Second term: the SAME per-id probe the phase arm uses
-        (`_resolved_write_pending`), over the cached plan's `already_resolved` ids
-        AND, since DW-222, over its `decisions` ids. One rule at both sites —
-        publish on positive per-id evidence of a landed write, never on the ledger
-        merely being dirty — so everything that method documents about what the
-        probe does and does not prove applies verbatim here, including its
-        empty-`ids` short-circuit.
+        Second term: the SAME per-id evidence the phase arm uses — one read of the
+        ledger through `_done_on_disk`, answering which named ids read `done` — over
+        the cached plan's `already_resolved` ids AND, since DW-222, over its
+        `decisions` ids. One rule at both sites — publish on positive per-id
+        evidence of a landed write, never on the ledger merely being dirty — so
+        everything that reader documents about what the probe does and does not
+        prove applies verbatim here, including its empty-`ids` short-circuit.
 
-        TWO PROBES combined with `or`, never one merged id list. The decision phase
-        strands a close the same way the close phase does: `_apply_decision_effect`
-        calls `deferredwork.record_decision(..., close_note=...)`, which flips the
-        entry to `status: done <date>` on disk, and `_decisions_phase` publishes
-        only at its own tail — so a crash between that write and that publish leaves
-        a decision-phase close durable on disk and off HEAD, and when it retired the
+        TWO PROBES combined with `or`, never one merged id list, and they are
+        DIFFERENT views of the reader. The decision phase strands a close the same
+        way the close phase does: `_apply_decision_effect` calls
+        `deferredwork.record_decision(..., close_note=...)`, which flips the entry
+        to `status: done <date>` on disk, and `_decisions_phase` publishes only at
+        its own tail — so a crash between that write and that publish leaves a
+        decision-phase close durable on disk and off HEAD, and when it retired the
         last open entry the resume reaches THIS exit with nothing else to run. The
-        combination has to be `or` because `_resolved_write_pending` answers
-        `all(id is done)`: merging the two id lists ANDs the terms, so a plan
-        carrying a stranded already-resolved close beside a decision id the ledger
-        no longer holds would stop publishing — a NARROWING of the arm that shipped,
-        not a widening. Separate calls are strictly a widening, and both short-
-        circuit on empty `ids` before reading anything, so a fresh sweep's "no git
-        at all" property is untouched.
+        already-resolved term is `_resolved_write_pending`, the `all` view: the
+        close phase closes its ids as ONE batch (`mark_done_many`), so a stranded
+        batch write is every id `done`. The decision term is `_any_write_pending`,
+        the `any` view (DW-249): decision closes land one effect at a time, so a
+        plan with two decision ids where one is absent from the ledger — retired
+        by a rival writer, or never closed at all — still carries a stranded close
+        under the other, and an `all` over the pair answered False and never
+        published it at this exit. Merging the two id lists into one `all` call
+        would AND the terms the same way (a NARROWING of the arm that shipped);
+        the `any` view makes an absent or unparseable id veto only itself. Both
+        views short-circuit on empty `ids` before reading anything, the decision
+        set is read ONCE, and the `or` still skips that read when the
+        already-resolved term proves the write.
 
-        BOTH terms sit behind the run's ledger-doubt verdict
-        (`_ledger_unfit_to_publish()`), read once ahead of either probe. A failed
-        decision effect can leave a decodable done flip without its audit line,
-        and DW-218/219 preserve that doubt across a resume; readability alone must
-        not authorize publishing those bytes. The gate has to cover the
-        already-resolved term too, and not only the decision term DW-222 added,
-        because the commit is of the FILE: a plan carrying a stranded
-        already-resolved close beside the doubted flip answers True on its first
-        probe, the `or` short-circuits past a decision-term guard, and
-        `_commit_ledger` publishes the ledger whole — the unaudited flip included —
-        at the one exit no dispatch gate ever sees (the Codex P1 on #792, and the
-        residual `_close_resolved`'s inventory names). A withheld publish reads
-        nothing and journals nothing here: the doubt already reached disk with its
-        own rows, `_loop`'s no-open stop follows unchanged, and the repair is the
-        documented one — a human edits the ledger and starts a fresh sweep.
+        THE DOUBT GATE sits above BOTH probes (DW-250), read through
+        `_ledger_unfit_to_publish()` and reported through `_withhold_ledger_publish`
+        with the union of both id lists in `dw_ids`. A failed decision effect can
+        leave a decodable done flip without its audit line, a ledger-family refusal
+        arms the same verdict (DW-244), and a crash preserves either across a
+        resume; readability alone must not authorize publishing those bytes. Until
+        DW-250 only the decision term read the verdict, so a resumed run holding
+        persisted doubt still published the WHOLE file — the unaudited flip
+        included — whenever its cached plan carried an already-resolved id that
+        read `done` (the Codex P1 on #792 met the same hole from the other side:
+        the `or` short-circuited past a decision-term guard), and a plan with only
+        decision ids under doubt returned with no row at all. The gate is placed AFTER the cache is validated and the two id
+        lists are known, and after the empty-plan short-circuit: an empty plan
+        would never have published (both probes short-circuit), so there is
+        nothing to decline and no row is owed — the same "only when a publish was
+        about to happen" shape the three DW-246 sites have — and a fresh sweep
+        returns even earlier, at the cache term, so its "no read, no git" property
+        is untouched. The gate does not change the shared reader or add a phase
+        gate; the phase arm's own gates are `_close_resolved`'s (DW-246).
 
         WHAT THE PROBE PROVES HERE is weaker than the rule's wording suggests, and
         reading it as a contradiction is the trap. This exit is reached only when
         the open set is EMPTY, so over a well-formed ledger every id still in the
         file already reads `done` — which makes the term close to a PRESENCE check
         at this one call site, for the decision ids and the already-resolved ids
-        alike. That is pre-existing, not something the widening introduced: the
+        alike (and, under the `any` view, presence of ANY ONE decision id). That
+        is pre-existing, not something the widening introduced: the
         already-resolved term has had exactly this property since DW-193, and it is
         tolerable for the reason `_resolved_write_pending` gives — the answer
         authorizes a COMMIT of the ledger, which is the right outcome for a durable
@@ -2159,7 +2234,9 @@ class SweepEngine(Engine):
         journals `sweep-resolved-close-unavailable` with `dw_ids` + `error`, the row
         `_close_resolved`'s degrade arm already writes for the same read. No new
         journal kind is minted at either — reusing the two readers' own rows keeps
-        the kind registry untouched. Neither publishes anything.
+        the kind registry untouched. Neither publishes anything. A WITHHELD publish
+        (DW-250) is the third non-publishing outcome and is not a fault: the gate
+        returns before any read, on `sweep-ledger-commit-withheld`.
 
         No `sweep-resolved-closed` row and no phase emissions: this is a PUBLISHER,
         not a replay of `_close_resolved`. `pre_close_resolved`/`post_close_resolved`
@@ -2205,22 +2282,28 @@ class SweepEngine(Engine):
         if plan is None:
             self.journal.append("sweep-triage-reload-failed", errors=errors)
             return
-        if self._ledger_unfit_to_publish():
-            # Ahead of BOTH probes, not inside the `or` (see the docstring): the
-            # commit is of the file, so a doubted ledger is withheld whichever
-            # term would have authorized it.
-            return
         ledger = self.workspace.paths.deferred_work
         resolved_ids = [entry.id for entry in plan.already_resolved]
         decision_ids = [decision.id for decision in plan.decisions]
+        if not resolved_ids and not decision_ids:
+            # Nothing would have been published — both probes short-circuit on an
+            # empty list — so there is nothing to decline: no read, no row, no git.
+            return
+        close_message = "chore(sweep): close resolved deferred-work entries"
+        if self._ledger_unfit_to_publish():
+            # DW-250: the run's verdict, over BOTH terms, before either probe reads.
+            # The row names the union — every id this publisher declined to prove.
+            self._withhold_ledger_publish(close_message, dw_ids=resolved_ids + decision_ids)
+            return
         try:
-            # `or`, and two calls: see the docstring — one merged list would AND the
-            # two terms through `_resolved_write_pending`'s `all(...)` and narrow the
+            # `or`, and two calls of two VIEWS: see the docstring — the
+            # already-resolved term is the `all` view, the decision term the `any`
+            # view (DW-249), and one merged `all` list would AND them and narrow the
             # arm that shipped. Short-circuit is deliberate too: a plan whose
             # already-resolved ids already prove the write never reads twice.
-            pending = self._resolved_write_pending(
-                ledger, resolved_ids
-            ) or self._resolved_write_pending(ledger, decision_ids)
+            pending = self._resolved_write_pending(ledger, resolved_ids) or self._any_write_pending(
+                ledger, decision_ids
+            )
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             # The UNION, because either probe can be the one that faulted and the
             # row is the operator's only account of which ids went unproven.
@@ -2238,7 +2321,7 @@ class SweepEngine(Engine):
         # spell it that way. Same message as `_close_resolved`'s two arms: the diff
         # being published IS the close of resolved entries.
         self._commit_ledger(
-            "chore(sweep): close resolved deferred-work entries",
+            close_message,
             path=self.workspace.paths.deferred_work,
             family="ledger",
         )
@@ -2261,7 +2344,20 @@ class SweepEngine(Engine):
         escalates keeps its ids open. A dev-leg discard never closes them; an
         in-place post-acceptance defer reopens this run's close, while an isolated
         unit's close dies with its unmerged worktree. The existing failed_ids filter
-        then drops the fresh plan's overlapping bundle."""
+        then drops the fresh plan's overlapping bundle.
+
+        One refusal sits between the recovery and the dispatch (DW-243/252), in
+        `_ensure_bundle_intent`: a regeneration the ledger cannot serve — a read
+        that faults, an absent file, or a readable ledger lacking an entry for one
+        of the task's ids — PAUSES the run at the story gate on that task, and the
+        `RunPaused` propagates straight through this frame to `Engine._run_inner`.
+        The pass does not continue: no later in-flight bundle is re-driven and no
+        cycle (hence no fresh triage) runs beside the refused task, so nothing can
+        overwrite its name or re-adopt its ids while it waits. The task stays
+        PENDING with its name, ids and attempt intact, the run stays un-finished,
+        and `bmad-loop resume` after the repair re-enters this pass, recovers the
+        same task, regenerates and re-drives it. Every refusal raises; a `True`
+        return from `_ensure_bundle_intent` is the only way out."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -2275,7 +2371,7 @@ class SweepEngine(Engine):
             )
             if self._recover_inflight_bundle(task):
                 continue
-            self._ensure_bundle_intent(task)
+            self._ensure_bundle_intent(task)  # every refusal raises RunPaused
             self._save()
             self._emit("pre_bundle", task)
             self._run_story(task)
@@ -3298,6 +3394,24 @@ class SweepEngine(Engine):
                 cached = _read_json(triage_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
                 self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
+                # DW-263: INVALIDATE before re-triaging. This is the one arm where
+                # a VALID plan can be sitting behind a transient fault: the fresh
+                # triage's write-back below is best-effort, so a refused overwrite
+                # would leave these older bytes in place for the next resume to
+                # replay as if they were this cycle's plan — off a ledger that has
+                # moved since. Not the metadata-fault arm (it cannot reliably unlink
+                # what it cannot stat) and not the validation-failed arm below
+                # (those bytes cannot be replayed as a plan at all). A refused
+                # unlink degrades the same way the read did: row, then fresh triage.
+                try:
+                    triage_path.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    self.journal.append(
+                        "sweep-triage-cache-unlink-failed",
+                        errors=[f"unremovable: {unlink_exc}"],
+                    )
+                else:
+                    self.journal.append("sweep-triage-cache-invalidated")
             else:
                 if isinstance(cached, dict):
                     plan, errors = validate_triage(cached, None)
@@ -3378,7 +3492,31 @@ class SweepEngine(Engine):
             if plan is not None:
                 advance(task, Phase.DONE)
                 self._save()
-                triage_path.write_text(json.dumps(result.result_json, indent=2), encoding="utf-8")
+                # Cache write failure must not discard this validated plan (DW-247).
+                # Use a WRITE kind: `sweep-triage-reload-failed` means an existing
+                # cache could not be read, not that a healthy triage could not save.
+                # With no usable cache, resume re-triages this cycle;
+                # `_publish_stranded_close` cannot recover its close at the no-open
+                # exit, and `bmad-loop decisions` cannot reconstruct its decisions.
+                # Written ATOMICALLY (DW-263): a short or refused write leaves either
+                # no cache or a complete one, never torn JSON — and the older bytes
+                # a transient read fault left behind were already unlinked in the
+                # reload arm above, so a refused write-back cannot leave a stale
+                # plan for the next resume to replay, except where that unlink was
+                # itself refused (`sweep-triage-cache-unlink-failed`) or the cache
+                # faulted at the metadata probe, whose arm does not unlink: there the
+                # older plan survives a refused write-back. A directory also reaches this
+                # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
+                # `PermissionError` on Windows.
+                try:
+                    atomic_write_text(triage_path, json.dumps(result.result_json, indent=2))
+                # `RuntimeError` too: the helper's `path.resolve()` raises it (not
+                # `OSError`) for a symlink loop on 3.11/3.12 — the same pair
+                # `platform_util.resolve_or_lexical` catches for the same reason.
+                except (OSError, RuntimeError) as exc:
+                    self.journal.append(
+                        "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
+                    )
                 self.journal.append(
                     "sweep-triage-result",
                     bundles=len(plan.bundles),
@@ -3548,16 +3686,17 @@ class SweepEngine(Engine):
             #     write, read back off disk after a crash lost only its commit),
             #     `_decisions_phase` (`any_effect_landed`), and
             #     `_publish_stranded_close` — `_loop`'s empty-open-set recovery
-            #     arm, which runs the SAME per-id probe as `pending` over the
-            #     CACHED triage plan and so gates on the same landed write. It
-            #     runs that probe TWICE (DW-222), once over the plan's
-            #     `already_resolved` ids and once over its `decisions` ids,
-            #     combined with `or` — the decision phase strands a close the same
+            #     arm, which reads the SAME per-id reader as `pending`
+            #     (`_done_on_disk`) over the CACHED triage plan and so gates on
+            #     the same landed write. Two VIEWS of that one reader, combined
+            #     with `or` (DW-222/DW-249): `all` over the plan's
+            #     `already_resolved` ids, as `pending` does, and `any` over its
+            #     `decisions` ids — the decision phase strands a close the same
             #     way this one does, since `record_decision` flips the entry to
-            #     `done` on disk and `_decisions_phase` publishes only at its tail.
-            #     Two calls and not one merged list: the probe answers
-            #     `all(id is done)`, so a union would AND the terms and narrow the
-            #     arm. Its extra term is the CACHE: `triage{suffix}.json` for the
+            #     `done` on disk and `_decisions_phase` publishes only at its
+            #     tail, one effect at a time. Two calls and not one merged `all`
+            #     list: a union would AND the terms and narrow the arm. Its
+            #     extra term is the CACHE: `triage{suffix}.json` for the
             #     current cycle must already be on disk, which is true only on a
             #     resume, so a fresh sweep over a ledger with nothing open still
             #     reaches no git at all.
@@ -3573,6 +3712,48 @@ class SweepEngine(Engine):
             #     bytes changing. The boundary publisher stays BELOW `_loop`'s
             #     ledger-fault / unfit-to-publish stops, which still return without
             #     publishing.
+            # The RUN'S DOUBT (`_ledger_unfit_to_publish()`, the one reader of the
+            # two cycle latches and the persisted DW-218/219 mirror) is a SECOND,
+            # non-uniform gate laid over the nine, and which sites read it is the
+            # other trap to read as uniform:
+            #   * FOUR read it at the call site and journal
+            #     `sweep-ledger-commit-withheld` instead of publishing: this site's
+            #     TWO arms and `_loop`'s post-recovery publisher, the debt settle
+            #     included (DW-246 — all three
+            #     run on a resume AHEAD of `_cycle`'s dispatch gate, so a run that
+            #     KNEW its ledger was unfit published the whole file, half-write
+            #     included, before the gate was ever consulted), and
+            #     `_publish_stranded_close` (DW-250 — the gate sits above BOTH of
+            #     its probes, and its row alone carries `dw_ids`, the union of the
+            #     cached plan's already-resolved and decision ids it declined to
+            #     prove; before DW-250 only its decision term read the verdict, so
+            #     a doubted resume still published on an already-resolved id).
+            #   * `_decisions_phase`'s tail publish already gated on the same
+            #     reader, silently: its withhold is part of the walk's own verdict
+            #     and is reported by `sweep-bundles-withheld` and the repeat stop,
+            #     so it writes no row of its own.
+            #   * `_loop`'s boundary publisher needs no gate of its own: it sits
+            #     BELOW the unfit-to-publish stop, which returns first.
+            #   * `_loop` reads it TWICE more, ahead of publishers rather than at
+            #     them: the in-flight recovery pass is withheld whole (a re-armed
+            #     bundle's own `commit_story` is a whole-tree `git add -A`;
+            #     `sweep-bundles-withheld`), and `_ensure_migration` is refused on
+            #     the doubt's own `ledger-unreadable` stop before any rewrite
+            #     session is spent — so its publisher never reads it itself.
+            #   * Both store prunes are about a different file and never read it.
+            # Reading is one direction; ARMING is the other, and since DW-244 it
+            # IS uniform across the ledger family: every LEDGER-family site — the
+            # migration publisher and `_publish_stranded_close` included, whether
+            # or not it reads the doubt — arms the mirror on a refusal inside
+            # `_commit_ledger`, while the store prunes neither read nor arm it.
+            # A refusal at the boundary publisher, which sits BELOW the unfit
+            # stop, is therefore honoured one cycle LATER: cycle N+1 withholds its
+            # bundles and ends on the unfit stop, unless one of its own effects
+            # lands and releases the arm.
+            # A withheld publish is NOT a refusal: no target was probed and no git
+            # was spawned, so it carries `reason="ledger-in-doubt"` (DW-217's token
+            # for a ledger that READS but is unfit) rather than a fifth
+            # `refuse_cause`.
             # Beneath all nine are TWO uniform floors, in this order:
             #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
             #     declared `family`'s file is still there and still readable before
@@ -3604,7 +3785,20 @@ class SweepEngine(Engine):
             # decision phase's tail publish and `_publish_stranded_close` apply.
             #
             # the ledger file: `mark_done_many` above wrote the ledger
-            if not self._ledger_unfit_to_publish():
+            # ...withheld on the run's doubt (DW-246): on a resume this arm runs
+            # ahead of `_cycle`'s dispatch gate, so it must read the same verdict
+            # that gate reads. The close itself LANDED and its row above stands;
+            # only the publish is withheld. It reaches HEAD through the human's
+            # own commit (the notice's clean-worktree precondition) or through a
+            # publisher in the fresh `bmad-loop sweep` that follows the repair —
+            # never through this run: an inherited mirror is not released
+            # in-process, and a repeating run with the doubt armed returns at the
+            # unfit stop BEFORE the boundary publisher. Gate AT the call site, not inside
+            # `_commit_ledger`: see the inventory above for the sites that stay
+            # ungated on purpose.
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish("chore(sweep): close resolved deferred-work entries")
+            else:
                 self._commit_ledger(
                     "chore(sweep): close resolved deferred-work entries",
                     path=self.workspace.paths.deferred_work,
@@ -3625,8 +3819,17 @@ class SweepEngine(Engine):
             # this pass latched (`owed_here`) is NOT retracted here: the probe just
             # proved a durable close on disk, so a commit that degrades leaves a
             # real debt for the next resume's settle, exactly as the `closed` arm's
-            # would. Behind the same doubt gate as that arm, for the same reason.
-            if not self._ledger_unfit_to_publish():
+            # would.
+            # ...and withheld on the run's doubt (DW-246), for the same reason as
+            # the `closed` arm and with more at stake: this arm is REACHED ONLY on
+            # a resume, which is exactly when the persisted mirror is the verdict
+            # in force, and the stranded `done` it would publish sits in the same
+            # file as whatever half-write armed that doubt. Kept as its own
+            # `if`/`else` rather than folded with the arm above so each arm's gate
+            # can be ablated on its own.
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish("chore(sweep): close resolved deferred-work entries")
+            else:
                 self._commit_ledger(
                     "chore(sweep): close resolved deferred-work entries",
                     path=self.workspace.paths.deferred_work,
@@ -3638,37 +3841,34 @@ class SweepEngine(Engine):
         self._emit("post_close_resolved")
         return len(closed)
 
-    def _resolved_write_pending(self, ledger: Path, ids: list[str]) -> bool:
-        """Whether every id in `ids` reads `done` in the ledger ON DISK (DW-193) —
-        the state a crash between `mark_done_many`'s write and its commit leaves
-        behind, which the resume's cached triage plan replays as an empty
-        `mark_done_many` return.
+    def _done_on_disk(self, ledger: Path, ids: list[str]) -> frozenset[str] | None:
+        """Which of `ids` read `done` in the ledger ON DISK, in ONE read (DW-193,
+        split out under DW-249) — the shared reader behind `_resolved_write_pending`
+        (the `all` view) and `_any_write_pending` (the `any` view). `None` means the
+        ledger is ABSENT (`read_for_write`'s own answer); an empty `ids` answers an
+        empty set WITHOUT reading, so a caller naming nothing takes no read at all.
 
         WHAT IT PROVES, exactly: that these ids read `done` NOW. Not that a previous
-        pass of this phase is what wrote them, and not that the bytes are still
-        those of that write. This read takes NO cross-process ledger lock, where
-        `mark_done_many` above took one for its read-edit-write, so the same rival
-        writers that lock names — a live run's harvest, the TUI decision modal,
-        `sweep --archive` — can have closed these entries instead, or can edit the
-        file between this read and the publish. That is tolerable because of what
-        the answer is USED for: a commit of the ledger file, which is the right
-        outcome for a durable close whoever wrote it, and which `_commit_ledger`
-        re-validates and no-ops on its own. It would NOT be tolerable for a claim
-        about this run's work, which is exactly why the caller writes no
-        `sweep-resolved-closed` row on this arm and still returns `len(closed)`.
+        pass of the caller's phase is what wrote them, and not that the bytes are
+        still those of that write. This read takes NO cross-process ledger lock,
+        where `mark_done_many` above took one for its read-edit-write, so the same
+        rival writers that lock names — a live run's harvest, the TUI decision
+        modal, `sweep --archive` — can have closed these entries instead, or can
+        edit the file between this read and the publish. That is tolerable because
+        of what the answer is USED for: a commit of the ledger file, which is the
+        right outcome for a durable close whoever wrote it, and which
+        `_commit_ledger` re-validates and no-ops on its own. It would NOT be
+        tolerable for a claim about this run's work, which is exactly why
+        `_close_resolved` writes no `sweep-resolved-closed` row on its `pending`
+        arm and still returns `len(closed)`.
 
         POSITIVE PROOF, per id. `[]` back from a non-empty `ids` is ambiguous:
         `mark_done_many` skips both already-done ids AND ids the ledger holds no
-        entry for. So every named id must parse to :attr:`DWEntry.done` here — an
-        id the ledger does not carry, or one carrying a status the format does not
-        understand, proves nothing and must not authorize a commit. `.done`, never
-        `not .open`, for the reason that property documents.
-
-        The empty-`ids` arm is CORRECTNESS, not merely an ordering nicety: `all()`
-        over an empty sequence is vacuously True, so deleting it makes a phase that
-        resolved nothing publish — the exact regression DW-185 closed. It also
-        keeps that phase from taking this read at all, which is the property
-        `test_a_phase_that_wrote_nothing_spawns_no_git` grades at the git seam.
+        entry for. So an id counts here only when it parses to :attr:`DWEntry.done`
+        — an id the ledger does not carry, or one carrying a status the format does
+        not understand, is simply not in the answer, proves nothing and must not
+        authorize a commit under either view. `.done`, never `not .open`, for the
+        reason that property documents.
 
         `read_for_write`, not `read_for_observation`: this gates a PUBLISH, so its
         `None`/`LedgerReadError`/`OSError` answers belong in the caller's existing
@@ -3678,15 +3878,50 @@ class SweepEngine(Engine):
         question; this method spawns no git and asks no second one.
         """
         if not ids:
-            return False
+            return frozenset()
         text = deferredwork.read_for_write(ledger)
         if text is None:
-            return False
+            return None
         # LAST-wins on a duplicate id, where the writer's `_apply_done` locates the
         # FIRST. The two can disagree only on a ledger carrying duplicate ids, which
         # is a corrupt shape `duplicate_ids` refuses elsewhere; not handled here.
         entries = {entry.id: entry for entry in deferredwork.parse_ledger(text)}
-        return all(dw_id in entries and entries[dw_id].done for dw_id in ids)
+        return frozenset(dw_id for dw_id in ids if dw_id in entries and entries[dw_id].done)
+
+    def _resolved_write_pending(self, ledger: Path, ids: list[str]) -> bool:
+        """Whether EVERY id in `ids` reads `done` in the ledger on disk (DW-193) —
+        the state a crash between `mark_done_many`'s write and its commit leaves
+        behind, which the resume's cached triage plan replays as an empty
+        `mark_done_many` return. The `all` view over `_done_on_disk`, whose
+        docstring holds everything about what one read does and does not prove;
+        `_close_resolved`'s `pending` arm and `_publish_stranded_close`'s
+        already-resolved term read through here.
+
+        The empty-`ids` arm is CORRECTNESS, not merely an ordering nicety: `all()`
+        over an empty sequence is vacuously True, so deleting it makes a phase that
+        resolved nothing publish — the exact regression DW-185 closed. It also
+        keeps that phase from taking this read at all, which is the property
+        `test_a_phase_that_wrote_nothing_spawns_no_git` grades at the git seam. An
+        absent ledger (`None` from the reader) proves nothing either.
+        """
+        if not ids:
+            return False
+        done = self._done_on_disk(ledger, ids)
+        return done is not None and all(dw_id in done for dw_id in ids)
+
+    def _any_write_pending(self, ledger: Path, ids: list[str]) -> bool:
+        """Whether ANY id in `ids` reads `done` in the ledger on disk (DW-249) —
+        the `any` view over the same one read, for `_publish_stranded_close`'s
+        decision term. A decision-phase close is stranded per DECISION: each
+        `_apply_decision_effect` flips its own entry, so one landed flip is a write
+        the exit must publish whether or not the plan's other decision ids are
+        still in the ledger, where the `all` view let one absent id veto its
+        sibling's publish. Same DW-185 properties as the `all` view: `[]` answers
+        False without reading, an absent ledger answers False, and an id the
+        ledger does not carry or cannot parse contributes nothing — it vetoes
+        ITSELF, no longer the others.
+        """
+        return bool(self._done_on_disk(ledger, ids))
 
     # `dict[str, Any]` per answer, not `dict[str, str]`: `unusable_answer_reason`
     # deliberately screens only the fields a reader consumes, so `resolution` and
@@ -3732,7 +3967,24 @@ class SweepEngine(Engine):
         answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
-        if decisions_path.is_file():
+        # `stat()` + `S_ISREG`, not `is_file()` (DW-248, the DW-224 shape). The
+        # convenience probe splits by RUNTIME on a metadata fault: 3.11-3.13
+        # re-raise a `PermissionError` out of this bookkeeping read — aborting the
+        # sweep before its saved answers can be consumed — while 3.14
+        # swallows it and answers False. The explicit call makes the degrade the
+        # comment above promises UNIFORM: absence and a non-directory path
+        # component stay SILENT, as `is_file()`'s False was, and only a real
+        # metadata fault earns the row — the same `sweep-decisions-reload-failed`
+        # the content faults below write, since either way the store on disk
+        # could not be used.
+        try:
+            store_mode = decisions_path.stat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            store_mode = None
+        except OSError as exc:
+            self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+            store_mode = None
+        if store_mode is not None and stat.S_ISREG(store_mode):
             try:
                 stored = _read_json(decisions_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
@@ -3942,10 +4194,12 @@ class SweepEngine(Engine):
                 # could not decode or an OS that refused the read — the two classes
                 # that make `_write_intent`'s bare `read_for_write` RAISE, which is
                 # what a bundle dispatched later this cycle runs into. ABSENCE stays
-                # out: `_write_intent` spells its read `or ""`, so a missing ledger
-                # briefs a thin intent rather than raising, and DW-176's discipline
-                # is that an absent ledger ends the NEXT cycle cleanly on `no-open`
-                # rather than stopping this one.
+                # out, on DW-176's discipline: `_loop`'s cycle-top read exits on
+                # `no-open` before any dispatch, so a bundle can meet an absent
+                # ledger at `_write_intent` only if the file vanishes MID-cycle —
+                # a `MissingLedgerEntriesError` there since DW-252, not a thin
+                # intent — and an absent ledger ends the NEXT cycle cleanly on
+                # `no-open` rather than stopping this one.
                 #
                 # This sets the LOCAL `ledger_in_doubt`, which a later landed effect
                 # clears, so the walk's own final verdict is unchanged by arming here
@@ -4246,10 +4500,12 @@ class SweepEngine(Engine):
                 # `ledger_in_doubt` is deliberately left ALONE — neither set nor
                 # cleared. The latch means "the bytes on disk are ones nobody could
                 # read", and a False return says nothing either way about that:
-                # `record_decision` answers False from `if not path.is_file()`
-                # BEFORE it reads anything, so a vanished ledger reaches here having
-                # read nothing at all, while a missing entry reaches here off a
-                # perfectly good read. So the latch keeps meaning what it meant —
+                # `record_decision` answers False from its presence guard
+                # (`_ledger_present`, DW-255) for a vanished ledger BEFORE it reads
+                # anything — a REFUSED ledger raises there instead — so a vanished
+                # ledger reaches here having read nothing at all, while a missing
+                # entry reaches here off a perfectly good read. So the latch keeps
+                # meaning what it meant —
                 # the verdict of the last attempt that actually READ — and this arm
                 # neither withholds a commit that may carry an earlier decision's
                 # authorized line nor clears a doubt it cannot speak to.
@@ -4343,9 +4599,12 @@ class SweepEngine(Engine):
         # reaches.
         #
         # Arms on the two classes that make `_write_intent`'s bare `read_for_write`
-        # RAISE and on nothing else: ABSENCE keeps DW-176's discipline, since that
-        # read is spelled `or ""` and an absent ledger ends the next cycle on
-        # `no-open`. Fixed `reason` token, fault text in `error` — both already
+        # RAISE and on nothing else: ABSENCE keeps DW-176's discipline — `_loop`'s
+        # cycle-top read exits on `no-open` before any dispatch, so a bundle meets
+        # an absent ledger at `_write_intent` only if the file vanishes mid-cycle
+        # (a `MissingLedgerEntriesError` there since DW-252), and an absent ledger
+        # ends the next cycle on `no-open`. Fixed `reason` token, fault text in
+        # `error` — both already
         # `diagnostics._JOURNAL_DROP_FIELDS`, so neither needs new routing. The two
         # tokens land on ONE stop: `_loop`'s shared arm reports `ledger-unreadable`,
         # and a persistent `OSError` also trips `_prune_pre_answers`' own read,
@@ -4736,12 +4995,27 @@ class SweepEngine(Engine):
         degrade, repair writes must raise (AGENTS.md); the ledger commit is the
         publication step of a repair, and the store commit is bookkeeping.
 
-        The RESOLVE degrades to the same row for the not-a-repository reason:
-        `path.resolve()` can raise `OSError` (a broken link chain, a
-        permission-denied component) or `RuntimeError` (a symlink loop), and
-        nothing was published from a path that could not be named. Best effort
-        applies to Git interrogation and resolution: journal I/O failures
-        propagate, as they do for other journal writes.
+        The RESOLVE degrades to the same row for the not-a-repository reason, but
+        from an arm of its OWN (DW-260): `path.resolve()` can raise `OSError` (a
+        broken link chain, a permission-denied component) or `RuntimeError` (a
+        symlink loop), and that pair is caught around the resolve alone, while
+        the arm around `unpublishable_target`/`path_clean`/`commit_paths` catches
+        `verify.GitError` alone. The split is by SITE, not by class, because the
+        two faults say different things: a resolve that fails is the ledger's own
+        path refusing to be walked — the readability fact `_cycle`'s dispatch
+        gate withholds on — so the resolve arm ARMS the run's doubt for the
+        ledger family exactly as the refusal arm below does, where a git fault
+        after a successful resolve says nothing about readability and arms
+        nothing. Narrowing the git arm loses no fault: `_run_git` translates
+        spawn, timeout and decode faults into the `GitError` taxonomy,
+        `verify.commit_paths` wraps its own resolves and `lstat` probes the same
+        way, and `unpublishable_target` returns a token rather than raising.
+        `verify.last_commit_for` guards its own resolve against the same pair.
+        Best effort applies to Git interrogation and resolution only: journal
+        I/O failures propagate, as they do for other journal writes, and so does
+        either arming arm's `state.json` write (`_record_ledger_doubt()` →
+        `_save()`, DW-244/DW-260) — a repair write must raise, the doctrine every
+        other arming site follows.
 
         `path` is a REQUIRED keyword argument with no default, replacing the old
         `root=None` arm and its runtime raise. That is strictly louder, not
@@ -4762,7 +5036,9 @@ class SweepEngine(Engine):
         would be published; before, because a refused publish must spawn no git at
         all — the same property the per-site guards buy. The two families need
         different validation (the seven ledger publishers read through
-        `deferredwork.read_for_write`, the two prunes require a REGULAR FILE), and
+        `deferredwork.read_for_write`, the two prunes probe the type directly —
+        though BOTH families require a REGULAR FILE and both name
+        `target-not-a-file` when they do not get one, since DW-238), and
         the family is a caller's declaration because deriving it from the path
         would be precisely the "chosen by role" test the rule above refuses; a
         required keyword-only argument also makes a NEW call site fail under
@@ -4771,20 +5047,35 @@ class SweepEngine(Engine):
         A refusal journals `sweep-ledger-commit-refused` and returns, exactly as
         the other two no-op arms do — never a raise, because the read this guard
         takes is bookkeeping and not the sweep's own read. `refuse_cause` is one of
-        THREE fixed tokens (`target-absent`, `target-unreadable`,
-        `target-not-a-file` — a store replaced by a directory or a link to one,
-        whose literal pathspec `git add` would stage recursively) and is minted for
+        FOUR fixed tokens (`target-absent`; `target-undecodable`, the ledger's own
+        decode fault; `target-unreadable`, a probe that raised;
+        `target-not-a-file` — EITHER family's target replaced by a directory (or,
+        for the store, a link to one), whose literal pathspec `git add` would
+        stage recursively; a FIFO or socket at the name takes the same token) and is minted for
         the reason `stop_cause` (DW-201), `drop_cause` and `regen_cause` were: the
         natural spelling is `reason`, which sits in
         `diagnostics._JOURNAL_DROP_FIELDS` and renders as a presence boolean, so a
-        scrubbed dump could not tell the two causes apart. The decode or OS fault
+        scrubbed dump could not tell the causes apart. The decode or OS fault
         rides in `error` beside it, which is dropped, and `file` carries the same
         lexical basename the sibling rows do. What this guard does NOT do is
         rescue the run: `_loop`'s own ledger read still refuses the same
         undecodable bytes right after the refusal and ends the run there (it raised
         until DW-197 degraded it; either way the cycle does not proceed), which is
         pre-existing behavior. What is gone is the publish that used to precede
-        it.
+        it. A LEDGER-family refusal also ARMS the run's doubt through
+        `_record_ledger_doubt()` after its row (DW-244): the refusal says the
+        ledger the run wrote cannot be published, which is the very fact
+        `_cycle`'s dispatch gate withholds on — without the arm a refusal after a
+        landed decision effect left the gate clear and the cycle's bundles reached
+        `_write_intent`'s bare `read_for_write` on the same ledger. A store
+        refusal says nothing about the ledger and arms nothing. The resolve arm
+        above ARMS on the same terms and for the same fact (DW-260): a ledger
+        whose `path.resolve()` raises is one whose component `read_for_write`'s
+        `stat` walks too, so a bundle dispatched behind the degrade crashed in
+        `_write_intent` exactly as it did behind a refusal. The git arm — a
+        `GitError` after a successful resolve — does NOT arm: git declining to
+        publish a file it could reach is bookkeeping, not evidence about the
+        file. Both arming arms are ledger-family only.
 
         The guard NARROWS a window it does not close, and the residual is worth
         naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target
@@ -4818,30 +5109,60 @@ class SweepEngine(Engine):
         a symlink to a target the OPERATOR named, so `target.name` can be
         arbitrary operator text of exactly the identifier shape `scrub_json`
         ships verbatim, and a benign row for it would be pre-approving that text.
-        Bound beside `root` and before the `try` for the same reason `root` is,
+        Bound beside `root` and before either `try` for the same reason `root` is,
         so the degrade row still names the file when the resolve is what failed.
         `repo` still carries the resolved directory for anyone reading the raw
         journal."""
-        # `root` is bound inside the `try` because the resolve that derives it can
-        # itself fail; until it succeeds the only directory known is the LEXICAL
-        # parent, which is what the degrade row then names.
+        # `root` is re-bound off the resolved target below because the resolve
+        # that derives it can itself fail; until it succeeds the only directory
+        # known is the LEXICAL parent, which is what the resolve arm's degrade
+        # row then names.
         root = path.parent
         # The LEXICAL tail, bound here rather than off `target` below: see the
         # docstring — it is a code constant at every caller, which is what lets it
         # be a benign (undropped) journal field, and the resolved tail is not.
         name = path.name
-        # Bound ahead of the `try` so neither is possibly-unbound below it: the
+        # Bound ahead of both `try`s so neither is possibly-unbound below them: the
         # refusal short-circuits past the two git calls, and `sha`'s `None` is the
         # same "nothing was published" the clean arm reads.
         sha: str | None = None
         clean = False
         refusal: tuple[str, str | None] | None = None
+        # TWO arms rather than one (DW-260), discriminated by SITE and not by class:
+        # the resolve's fault says the ledger's own path cannot be walked, which is
+        # the readability fact the dispatch gate withholds on; a git fault after a
+        # successful resolve says nothing about readability. The one-tuple handler
+        # that stood here could not tell them apart, so a refused resolve left the
+        # run holding the ledger publishable.
         # Flipped the moment `commit_paths` is entered: a `GitError` after that
         # point comes from a commit git was asked to make, not from a tree it could
         # not read (see the docstring — `path_clean` has already answered).
         attempted = False
         try:
             target = path.resolve()
+        except (OSError, RuntimeError) as e:
+            # `repo` (not `root`): an absolute host path, already routed out of
+            # diagnostics dumps, exactly as `rearm-baseline-advance-failed` spells
+            # the same value. The LEXICAL parent here — the resolve that would have
+            # replaced it is what failed. `file` is what SURVIVES a dump: `repo`,
+            # `message` and `error` are all dropped.
+            self.journal.append(
+                "sweep-ledger-commit-unavailable",
+                message=message,
+                repo=str(root),
+                error=str(e),
+                file=name,
+            )
+            # DW-260: the same arm the refusal branch below takes, for the same
+            # fact — a ledger whose path cannot be resolved cannot be read by
+            # `_write_intent`'s bare `read_for_write` either (its `stat` walks the
+            # same component). LEDGER family only, AFTER the row, through the
+            # mutate-then-`_save()` helper; see the refusal arm's comment for the
+            # release contract and why neither cycle latch is touched.
+            if family == "ledger":
+                self._record_ledger_doubt()
+            return
+        try:
             root = target.parent
             # THE TARGET VALIDATION (DW-199/203/205), between the resolve and
             # `path_clean` for two reasons the docstring states: git is asked about
@@ -4853,15 +5174,16 @@ class SweepEngine(Engine):
                 if not clean:
                     attempted = True
                     sha = verify.commit_paths(root, message, [target])
-        except (verify.GitError, OSError, RuntimeError) as e:
+        except verify.GitError as e:
             if attempted and family == "ledger":
                 raise  # a ledger commit git was asked to make failed: publication failed
-            # `repo` (not `root`): an absolute host path naming a git tree,
-            # already routed out of diagnostics dumps, exactly as
-            # `rearm-baseline-advance-failed` spells the same value. The RESOLVED
-            # directory, which is the one git was actually asked about — or the
-            # lexical parent when the resolve is what failed. `file` is what
-            # SURVIVES a dump: `repo`, `message` and `error` are all dropped.
+            # `verify.GitError` ALONE: `_run_git` translates spawn/timeout/decode
+            # faults and `commit_paths` its own resolves and `lstat` probes into
+            # this taxonomy, and `unpublishable_target` returns rather than raises,
+            # so nothing an `OSError`/`RuntimeError` arm could catch here escapes
+            # the helpers untranslated. The RESOLVED directory in `repo`, which is
+            # the one git was actually asked about. No doubt is armed: see the
+            # docstring.
             self.journal.append(
                 "sweep-ledger-commit-unavailable",
                 message=message,
@@ -4884,6 +5206,41 @@ class SweepEngine(Engine):
                 refuse_cause=cause,
                 **extra,
             )
+            # DW-244: the refusal is the run's evidence that the ledger it wrote
+            # cannot be published, so it ARMS the doubt `_cycle`'s dispatch gate
+            # reads. Bare, a ledger refusal after a landed decision effect
+            # (`_decisions_phase`'s tail publish) left every latch clear — the
+            # effect landed, so the walk's own verdict was False — and the cycle's
+            # bundles went on to `_write_intent`, whose bare `read_for_write`
+            # crashed on the same ledger the refusal had just declined. Every one
+            # of the four `refuse_cause` tokens arms: each is the same fact for the
+            # gate's purposes — including `target-absent`, on which that crash
+            # is not the hazard (`_loop`'s cycle-top read exits on `no-open`
+            # before any dispatch, so `_write_intent` meets an absent ledger only
+            # if it vanishes mid-cycle, a `MissingLedgerEntriesError` since
+            # DW-252): a bundle dispatched over an absent TRACKED
+            # ledger commits with a whole-tree `git add -A`, which would stage the
+            # ledger's DELETION under the bundle's message — the DW-199 hazard by
+            # another route — so absence is withheld on too, at the cost that the
+            # no-open notice then names a file to RESTORE rather than repair.
+            # Where the refusal fires matters for WHEN it is honoured: at the
+            # boundary publisher, which sits BELOW `_loop`'s unfit stop, the arm
+            # lands after that stop already passed, so cycle N+1 withholds its
+            # bundles and ends on the unfit stop — unless one of its own effects
+            # lands and releases the arm. LEDGER family only — a store refusal is about
+            # `decisions.json` and says nothing about the ledger. AFTER the row,
+            # the announce-then-persist order `_quarantine` documents, and through
+            # `_record_ledger_doubt()` (mutate-then-`_save()`, so it survives a
+            # crash) rather than a bare assignment. Neither cycle latch is touched:
+            # `_ledger_in_doubt` is `_decisions_phase`'s `=`-published verdict and
+            # `_close_ledger_in_doubt` the close phase's, and the mirror is what the
+            # one reader consults. A same-process arm, so it is released on the
+            # resolved contract — a LATER landed effect while the close latch is
+            # clear (`_release_ledger_doubt`) — which is intended: that is positive
+            # proof the ledger reads and writes again, the same proof the walk's
+            # own arms rest on.
+            if family == "ledger":
+                self._record_ledger_doubt()
             return
         # Git has now answered for the LEDGER: it is at HEAD, either because this
         # commit put it there or because it already was. That settles any debt a
@@ -4911,6 +5268,45 @@ class SweepEngine(Engine):
             self.journal.append("sweep-ledger-commit-clean", message=message, file=name)
             return
         self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
+
+    def _withhold_ledger_publish(self, message: str, *, dw_ids: list[str] | None = None) -> None:
+        """Journal a ledger publish the RUN declined to attempt because it already
+        holds the ledger unfit to publish (DW-246) — `sweep-ledger-commit-withheld`
+        with the `message` the publish would have carried, the LEXICAL basename in
+        `file` (`deferred-work.md`, as every sibling `_commit_ledger` row spells
+        it — DW-192) and `reason="ledger-in-doubt"`. `dw_ids` (DW-250) is the
+        list of ids the declining publisher would otherwise have set out to prove,
+        emitted ONLY when given: `_publish_stranded_close` names its cached plan's
+        already-resolved and decision ids, while the three DW-246 callers
+        deliberately pass none — `_close_resolved`'s arms have `closed` and `ids`
+        in scope, but their DW-246 row shape stays unchanged. `diagnostics`
+        already routes the field by name (`_JOURNAL_KEYLIST_FIELDS`).
+
+        A row of its OWN rather than a fifth `refuse_cause` on
+        `sweep-ledger-commit-refused`: a refusal is `verify.unpublishable_target`'s
+        verdict about the target's BYTES, and here no target was probed and no git
+        was spawned — the verdict is the run's, formed earlier by whichever arm
+        raised the doubt, and `_ledger_unfit_to_publish()` is the only thing this
+        row reports on. Widening `refuse_cause` would also widen a `Literal` that
+        `Engine._carry_harvested_deferrals` dispatches on exhaustively.
+        `ledger-in-doubt` rather than the dispatch gate's `ledger-unreadable`:
+        that gate chose the repeat stop's token because it ends on that stop; a
+        withheld publish happens over a ledger that READS, which is exactly the
+        state DW-217 minted `ledger-in-doubt` for at the pre-answer prune.
+
+        This helper writes the row and nothing else. It never wraps the
+        `_commit_ledger` call it stands in for: each gate sits AT its call site so
+        `test_every_sweep_ledger_commit_names_its_own_tree` still counts every
+        publisher, and so the publishers that deliberately stay ungated (see
+        `_close_resolved`'s inventory) can."""
+        fields: dict[str, Any] = {
+            "message": message,
+            "file": self.workspace.paths.deferred_work.name,
+            "reason": "ledger-in-doubt",
+        }
+        if dw_ids is not None:
+            fields["dw_ids"] = dw_ids
+        self.journal.append("sweep-ledger-commit-withheld", **fields)
 
     # ---------------------------------------------------------- bundles
 
@@ -5126,6 +5522,26 @@ class SweepEngine(Engine):
         `bundles` are that cache and its latch — so a cycle with no adopted `build`
         answer reaching the screen takes no read at all, and two candidates share
         one read (and one refusal row, since the fault is cached with it).
+
+        The same screen covers the PLAN's bundles too (DW-252), in the final keep
+        loop. The cache branch's `expected_open_ids=None` revalidation admits a
+        cached bundle naming an id a rival writer has since retired just as it
+        admits a stale decision, and the keep loop screened those bundles only
+        against `failed_ids | keep_open_ids` — so a resumed cycle spent a dev
+        session on a bundle whose intent document could not find one of its
+        entries. A bundle whose ids are not ALL open is dropped WHOLE (the triage
+        intent prose was authored for the whole id set, and the adjacent
+        `failed-or-escalated-earlier` lane already drops whole bundles on partial
+        overlap) under `sweep-bundle-skipped` `reason="entry-not-open"`, naming the
+        ids that are not open. It sits AFTER that overlap check so the older rows
+        keep precedence, shares the one lazy read and latch above (a refused read
+        screens nothing here either), and is a SKIP rather than a decision drop:
+        no `drop_cause`, no quarantine, and `answer_dropped` untouched — there is
+        no stored answer to release. A cycle whose only bundles were skipped this
+        way therefore reports NO progress, so a `--repeat` run stops on
+        `no-progress` there rather than re-triaging, and the skipped bundle's
+        still-open ids wait for the next `bmad-loop sweep`: the skip deliberately
+        errs toward stopping rather than being counted as progress.
         """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
@@ -5574,6 +5990,24 @@ class SweepEngine(Engine):
                     ),
                 )
                 continue
+            # DW-252: every bundle that reaches here — plan-authored or minted
+            # from a decision — must name only ids the ledger holds open NOW. The
+            # same lazy read and latch as the DW-214 lane, so a cycle whose
+            # decisions already paid for the read pays nothing more, and a refused
+            # read (`None`) screens NOTHING. Dropped whole, never trimmed, and a
+            # skip rather than a drop: see the docstring.
+            if not open_screen_read:
+                open_screen, open_screen_read = self._live_open_ids(), True
+            if open_screen is not None:
+                not_open = sorted(set(b.dw_ids) - open_screen)
+                if not_open:
+                    self.journal.append(
+                        "sweep-bundle-skipped",
+                        name=b.name,
+                        dw_ids=not_open,
+                        reason="entry-not-open",
+                    )
+                    continue
             kept.append(b)
         bundles = kept
         if len(bundles) > self.max_bundles:
@@ -5583,14 +6017,43 @@ class SweepEngine(Engine):
         self._emit("post_materialize_bundles")
         return bundles, answer_dropped
 
-    def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
-        ledger = self.workspace.paths.deferred_work
-        # REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
-        # session is dispatched on — an empty one would brief the session on
-        # nothing at all.
-        text = deferredwork.read_for_write(ledger) or ""
+    def _read_intent_ledger(self) -> str | None:
+        """The bare ledger read behind a bundle intent document; `None` is
+        absence, kept distinct so `_ensure_bundle_intent` can report it as
+        `ledger-absent` rather than as every entry missing.
+
+        REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
+        session is dispatched on — an empty one would brief the session on
+        nothing at all. `OSError` and `LedgerReadError` PROPAGATE, unchanged for
+        `_run_bundle` (DW-197's accepted residual); `_ensure_bundle_intent` is the
+        one caller that catches them, and it takes the read through here so the
+        catch covers the ledger alone and not the intent file's own I/O. A second
+        accepted residual sits beside that one since DW-252: `_run_bundle` calls
+        `_write_intent` bare, so a rival write that retires an entry between the
+        keep-loop screen's read and this one raises `MissingLedgerEntriesError`
+        out of the run — crashed, with no journal row — where the old code briefed
+        a thin document."""
+        return deferredwork.read_for_write(self.workspace.paths.deferred_work)
+
+    def _write_intent(self, bundle: Bundle, dirname: str, *, text: str | None = None) -> Path:
+        """Render `bundle`'s intent document under `bundles/<dirname>/` and return
+        its path. `text` is the ledger text to reproduce entries from; `None`
+        reads it here through `_read_intent_ledger`.
+
+        Refuses with `MissingLedgerEntriesError` BEFORE any side effect when a
+        bundle id has no ledger entry at all (DW-252): the document would carry an
+        empty "Ledger entries (verbatim)" section for that id and a dev session
+        would be spent on it anyway. Missing means no entry PARSED for the id; a
+        present-but-closed entry is still emitted verbatim, since the caller — a
+        `_run_bundle` on a fresh plan, or a regeneration of a persisted task —
+        may legitimately be briefing on work the ledger has since retired."""
+        if text is None:
+            text = self._read_intent_ledger() or ""
         entries = {e.id: e for e in deferredwork.parse_ledger(text)}
-        blocks = [entries[i].body.rstrip() for i in bundle.dw_ids if i in entries]
+        missing = tuple(i for i in bundle.dw_ids if i not in entries)
+        if missing:
+            raise MissingLedgerEntriesError(missing)
+        blocks = [entries[i].body.rstrip() for i in bundle.dw_ids]
         lines = [
             f"# Deferred-work bundle: {bundle.name}",
             "",
@@ -5659,23 +6122,89 @@ class SweepEngine(Engine):
             return None if found == set(task.dw_ids) else "dw-ids-mismatch"
         return "dw-ids-mismatch"
 
-    def _ensure_bundle_intent(self, task: StoryTask) -> None:
+    def _pause_on_intent_refusal(
+        self, task: StoryTask, reason: str, headline: str, detail: str
+    ) -> NoReturn:
+        """The tail every regeneration-site refusal in `_ensure_bundle_intent`
+        ends in (DW-243/252): notify with the RESUME route, clear the task's
+        baseline pair, save, and raise `RunPaused` at the story gate on the task.
+        The arm's journal row is written by the arm, before this. The
+        `_ensure_migration` duplicate-ids pause is the template.
+
+        `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
+        to a fresh `bmad-loop sweep`, which is the wrong route for a run that is
+        paused and resumable — following it abandons this run's in-flight task.
+
+        Clearing the baseline pair is safe and necessary: the recovery pass has
+        already rolled the attempt back before regeneration ran (or the task never
+        held one), so nothing of ours is outstanding, and a stale baseline left
+        behind would name the PRE-repair tree — the next env-fault's `_safe_reset`
+        would rewind to it and destroy the operator's repair commit (see the
+        `_ensure_migration` invariant comment). The next dispatch re-stamps HEAD.
+
+        PAUSE_STORY_GATE, not PAUSE_ESCALATION: the task stays PENDING, and every
+        escalation action requires Phase.ESCALATED, so an escalation stage would
+        offer only actions that must fail. The gate stage's single action is
+        "resume", which is the whole remedy once the ledger is repaired."""
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            headline,
+            f"{detail} — then `bmad-loop resume {self.state.run_id}`",
+        )
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        self._save()
+        raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
+
+    def _ensure_bundle_intent(self, task: StoryTask) -> bool:
         """Guarantee a recovered bundle has the intent file its dev prompt points
         at, and that the file it points at is the one for THIS task's ids. The
         rendered intent.md persists in the run dir and the prompt consumes nothing
-        else from the plan, so the normal case is to reuse it untouched.
+        else from the plan, so the normal case is to reuse it untouched. Returns
+        `True` when a usable intent document is on disk for the task.
 
         Only when `_bundle_intent_reason` rejects it — gone, unreadable, or naming
         other ids — do we rebuild a degraded one from the task itself. The triage
         session's authored intent prose is the single unrecoverable piece; the
         verbatim ledger entries _write_intent re-attaches carry the actual work, so
-        say plainly that they are now the contract."""
+        say plainly that they are now the contract.
+
+        The regeneration's ledger read is CAUGHT here (DW-243), and only the
+        ledger read: `_read_intent_ledger` is split out of `_write_intent` so an
+        `OSError` from the intent file's own `mkdir`/`atomic_write_text` still
+        propagates as before. Undecodable bytes (`LedgerReadError`) and an
+        `OSError` from the read journal `sweep-intent-ledger-refused` under the
+        existing pair of tokens (`ledger-unreadable`, `ledger-inaccessible`) and
+        then PAUSE the run through `_pause_on_intent_refusal`. Bare, the read
+        crashed the resume at this exact site, ahead of any cycle gate. A pause,
+        deliberately not a stop and not a doubt latch: `_finish_inflight_bundles`
+        stays ungated, and a stop can never keep the "re-driven on the next
+        resume" promise — `Engine._run_inner` persists `_loop`'s return as
+        `finished`, which `bmad-loop resume` refuses outright. `RunPaused` leaves
+        the run un-finished with `paused_*` set, which is exactly what
+        `cmd_resume` accepts once `runs.unreadable_sweep_ledger` reads the
+        repaired ledger.
+
+        A READABLE ledger that lacks an entry for one of the task's ids is the
+        other refusal (DW-252): `_write_intent` raises `MissingLedgerEntriesError`
+        before creating anything, and this method journals
+        `sweep-intent-regen-refused` (`reason="entry-missing"`; an ABSENT ledger
+        takes the same kind under `reason="ledger-absent"`, naming the task's
+        ids, so the operator is told to restore the file rather than entries in
+        a file that is not there) and pauses the same way, with `task.bundle_file`
+        and the phase exactly as they were. Pause rather than announce-and-strand:
+        a stranded task beside a recovery pass that went on into fresh triage
+        could have its name overwritten by a same-name bundle and its ids
+        re-adopted; pausing ends the pass, so no name-reservation or ownership
+        rule is needed. Every refusal raises; a `True` return is the only way
+        out."""
         reason = self._bundle_intent_reason(task)
         if reason is None:
-            return
+            return True
         match = BUNDLE_KEY_RE.match(task.story_key)
         if match is None:  # pragma: no cover - callers filter on BUNDLE_KEY_RE
-            return
+            return True
         cycle = int(match.group(1)) if match.group(1) else 1
         name = match.group(2)
         bundle = Bundle(
@@ -5689,7 +6218,90 @@ class SweepEngine(Engine):
             ),
         )
         dirname = name if cycle == 1 else f"c{cycle}-{name}"
-        task.bundle_file = str(self._write_intent(bundle, dirname))
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = self._read_intent_ledger()
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. Same row shape as
+            # `_read_cycle_ledger`: the decode detail is the message itself.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be decoded "
+                f"({e}); repair the ledger by hand and COMMIT the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be decoded ({e}); "
+                "repair it by hand and COMMIT the fix",
+            )
+        except OSError as e:
+            # The class NAME rides beside the message: "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
+                "the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
+            )
+        if text is None:
+            # ABSENT, kept apart from "every entry missing": `or ""` here would
+            # name each of the task's ids as missing and tell the operator to
+            # restore entries in a file that does not exist. Same kind as the
+            # missing-entries arm below, under its own `reason` token.
+            self.journal.append(
+                "sweep-intent-regen-refused",
+                story_key=task.story_key,
+                dw_ids=list(task.dw_ids),
+                reason="ledger-absent",
+            )
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and the ledger is absent at {ledger}; "
+                "restore the file and COMMIT the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger is absent at {ledger}, so the bundle is "
+                "left in flight and not dispatched; restore the file and COMMIT the "
+                "fix to re-drive it",
+            )
+        try:
+            task.bundle_file = str(self._write_intent(bundle, dirname, text=text))
+        except MissingLedgerEntriesError as e:
+            self.journal.append(
+                "sweep-intent-regen-refused",
+                story_key=task.story_key,
+                dw_ids=list(e.ids),
+                reason="entry-missing",
+            )
+            missing = ", ".join(e.ids)
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, which holds no entry for {missing}; "
+                "restore the entries and COMMIT the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger holds no entry for {missing}, so the "
+                "bundle is left in flight and not dispatched; restore the entries "
+                "and COMMIT the fix to re-drive it",
+            )
         self.journal.append(
             "sweep-intent-regenerated",
             story_key=task.story_key,
@@ -5701,6 +6313,7 @@ class SweepEngine(Engine):
             # this file (`drop_cause`) use the same convention for the same reason.
             regen_cause=reason,
         )
+        return True
 
     # ------------------------------------------------------ override seams
 
@@ -5930,6 +6543,26 @@ class SweepEngine(Engine):
         would cost the run its ``integrate_unit`` over bookkeeping whose real work is
         already done. The flips themselves are unguarded: losing them is the hazard
         this exists to prevent.
+
+        A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
+        ``verify.unpublishable_target`` answers a different question from a
+        ``GitError`` — not "can git own this path" but "is this operand a publishable
+        file at all". For the three DURABLE causes — ``target-absent``,
+        ``target-not-a-file`` and ``target-undecodable`` (bytes nobody can decode,
+        split from the OS fault by the guard itself; DW-237) — that
+        is answered off an on-disk shape a replay re-reads and refuses identically,
+        so there is nothing for a raise to buy even in principle.
+        ``target-unreadable`` is the one TRANSIENT cause, a probe fault the next pass
+        may not see, so that argument does not cover it — but nothing here needs it
+        to: this carry holds no commit latch, its flips are idempotent, and its
+        commit was already best effort, so a refusal costs it exactly what a
+        ``GitError`` already did. It is ``Engine._carry_harvested_deferrals``, the
+        one publisher with a durable latch, that keeps ``target-unreadable`` on its
+        retry path instead of refusing it — and refuses the durable three, the
+        undecodable one included, because git accepts any bytes and a fall-through
+        there commits the corrupt ledger. The row is journalled beside the
+        ``-uncommitted`` one rather than folded into it: the two name different
+        operator repairs.
         """
         super()._carry_isolated_ledger_writes(task)
         if not task.bundle_closes_intended:
@@ -5943,19 +6576,36 @@ class SweepEngine(Engine):
             self._bundle_close_operation_id(task),
         )
         if carried:
-            try:
-                verify.commit_paths(
-                    self.paths.repo_root,
-                    f"chore(deferred-work): close {task.story_key}'s bundle ids",
-                    [ledger],
-                )
-            except verify.GitError as e:
+            # The DW-237 publishable-target guard, before any git runs: `commit_paths`
+            # forces every operand LITERAL, so a ledger replaced by a DIRECTORY is
+            # handed to `git add` as a pathspec and staged RECURSIVELY under this
+            # `chore(deferred-work):` message. Refused, never raised, on every cause
+            # — see the docstring's best-effort argument, which covers this arm too.
+            refusal = _publication_refusal(ledger, "ledger")
+            if refusal is not None:
+                cause, error = refusal
+                extra = {} if error is None else {"error": error}
                 self.journal.append(
-                    "sweep-bundle-close-carry-uncommitted",
+                    "sweep-bundle-close-carry-refused",
                     story_key=task.story_key,
                     dw_ids=carried,
-                    error=str(e),
+                    refuse_cause=cause,
+                    **extra,
                 )
+            else:
+                try:
+                    verify.commit_paths(
+                        self.paths.repo_root,
+                        f"chore(deferred-work): close {task.story_key}'s bundle ids",
+                        [ledger],
+                    )
+                except verify.GitError as e:
+                    self.journal.append(
+                        "sweep-bundle-close-carry-uncommitted",
+                        story_key=task.story_key,
+                        dw_ids=carried,
+                        error=str(e),
+                    )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):

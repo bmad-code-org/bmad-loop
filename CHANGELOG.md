@@ -248,10 +248,12 @@ breaking changes may land in a minor release.
   observation sites now degrade on it as well as on undecodable bytes, so an
   `OSError` that used to escape `decisions.pending_missed_decisions` or abort
   `sweep --dry-run` with a bare traceback now yields an empty result or an
-  attributed `error:` instead. The observation arm covers its own `is_file()`
-  probe, so metadata exceptions it raises (including `EACCES` on Python 3.11–3.13)
-  become attributed faults. Errors the probe suppresses still mean absence;
-  Python 3.14 suppresses all OS errors there. A ledger that goes undecodable while a
+  attributed `error:` instead. The observation arm probes with `stat` + `S_ISREG`
+  inside its own guard (DW-254), so a metadata refusal — `EACCES` on every
+  supported interpreter, Python 3.14 included — becomes an attributed fault;
+  only `ENOENT`/`ENOTDIR` and a present non-regular file still mean absence, and a
+  symlink loop at the ledger is an attributed fault rather than a clean empty
+  read. A ledger that goes undecodable while a
   decision prompt is open still names the decision that did not land — in
   `bmad-loop decisions` and in the TUI's decision modal, which keeps degrading to a
   per-decision toast instead of taking the dashboard down. And a sweep whose ledger
@@ -444,6 +446,82 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Arm the sweep's persisted ledger doubt when the ledger's path cannot be resolved,
+  so the cycle's bundles are withheld instead of crashing at the bundle intent's
+  own ledger read (DW-260). A git-fault degrade after a successful resolve stays
+  un-armed; the `sweep-ledger-commit-unavailable` row is unchanged on both arms.
+- Make a resumed sweep honour and announce its own persisted ledger doubt (DW-246,
+  DW-244, DW-251). The three ledger publishers that run on a resume ahead of the
+  dispatch gate — the already-resolved close's own publish, its stranded-close
+  republish, and the publisher above the loop body (the post-recovery publish, and
+  the persisted commit-debt settle it shares — the only trigger that still reaches
+  it under doubt, since the recovery pass itself is withheld whole) — now read
+  `_ledger_unfit_to_publish()` and journal `sweep-ledger-commit-withheld`
+  (`message`, `file`, `reason="ledger-in-doubt"`) instead of committing a ledger
+  the run already holds unfit, or silently skipping the settle; a ledger-family `sweep-ledger-commit-refused` arms the persisted doubt after
+  its row, so a refusal after a landed decision effect withholds the cycle's bundles
+  instead of crashing at the bundle intent's own ledger read (store refusals arm
+  nothing; a refusal at the cycle-boundary publisher, which sits below the unfit
+  stop, is honoured one cycle later — cycle N+1 withholds and ends on the unfit stop
+  unless one of its own effects lands and releases the arm); and the nothing-open
+  exit writes the ledger-repair ATTENTION notice when the doubt is armed — the
+  arming class never wrote one, so the run that withheld said nothing — with its
+  rows and return unchanged.
+- Gate the nothing-open exit's stranded-close publisher whole on the run's persisted
+  ledger doubt, and probe its decision ids individually (DW-250, DW-249).
+  `_publish_stranded_close` now reads `_ledger_unfit_to_publish()` once, above BOTH of
+  its probes, after the triage cache validates and the plan names at least one id:
+  a doubted resume journals `sweep-ledger-commit-withheld` with the close message,
+  `file`, `reason="ledger-in-doubt"` and a `dw_ids` list naming every cached id it
+  declined to prove, instead of publishing the whole ledger — unaudited flip included
+  — on an already-resolved id that read `done`, or returning silently on a
+  decisions-only plan; an empty plan and a fresh sweep still reach no read and no
+  row. The decision term is now an `any` over the plan's decision ids (the
+  already-resolved term and the close phase's own arm keep their `all`), so one
+  decision id absent from the ledger or carrying an unparseable status no longer
+  vetoes a stranded close under its sibling; the decision set is still read once,
+  an empty list still authorizes nothing, and read faults still degrade to
+  `sweep-resolved-close-unavailable` with the union of ids.
+- Route a deferred-work ledger read fault at the engine's own sites and at the resume
+  gate (DW-231, DW-234). The base engine now catches `LedgerReadError` at its four
+  direct `read_for_write` sites: observation reads (proof-of-work digest, pre-harvest
+  and defer snapshots, both restores) degrade to a typed answer nothing can write back
+  and journal `ledger-read-degraded`; the two publish reads (spec-deferral harvest,
+  isolated carry) journal `ledger-read-refused`, notify `ACTION REQUIRED` and pause
+  the run without changing the task's phase, so `bmad-loop resume` retries the write
+  instead of crashing as `run-crash` — replaying the recorded session result where
+  one exists (dev and review legs), re-driving the leg otherwise. Residual, recorded
+  as a deferral: `deferredwork` mutators' own locked re-reads and the review-timeout
+  salvage refile still raise. `runs.unreadable_sweep_ledger` gains the
+  `except OSError` arm — its own permissions-or-storage attribution on the
+  `bmad-loop sweep` route the sweep's own stop already gives — a recorded
+  reversal: the arm was written, struck by the DW-204 resolution on scope grounds, and is restored under
+  DW-234's accepted decision; the TUI's stopgap `except OSError` around the probe is
+  removed as dead.
+- Propagate ledger metadata refusals consistently across supported Python versions
+  (DW-221). Treat ELOOP and EBADF as errors; a cyclic ledger symlink now stops a
+  story run before development instead of allowing completion with a close outage.
+- Report refused sweep ledger metadata as `ledger-inaccessible` with error details
+  and arm ledger doubt through the existing reader handlers (DW-253).
+- Report directories, FIFOs and sockets at the ledger path as `target-not-a-file`.
+  Preserve `target-unreadable` when metadata becomes inaccessible between probes
+  (DW-238).
+- Guard the five remaining `verify.commit_paths` callers with the publishable-target
+  check their sibling publishers already take, so a directory left at a ledger, board,
+  spec or park-record name is no longer handed to `git add` as a literal pathspec and
+  staged recursively under a `chore(...)` message. A refusal is journaled
+  (`harvest-carry-refused`, `story-deferred-close-carry-refused`,
+  `sweep-bundle-close-carry-refused`, `board-advance-carry-refused`) or, in `confirm`,
+  drops that operand alone; it never raises, and `confirm` still commits an ABSENT park
+  record's deletion. The guard's ledger leg now tells a DURABLE decode fault
+  (`target-undecodable`, a fourth `refuse_cause`) from a TRANSIENT OS fault
+  (`target-unreadable`), so the harvested-deferral carry refuses the former outright
+  and hands only the latter back to git, where its commit latch survives — an
+  undecodable ledger no longer reaches HEAD through that fall-through (DW-237).
+- Probe operand presence in `commit_paths` with `lstat`, which suppresses nothing on
+  any interpreter, so a tracked candidate under an unsearchable parent is reported as
+  uncertain instead of being ruled missing and staged as a deletion on Python 3.14
+  (DW-239).
 - Take the readable-ledger refusal at `bmad-loop resolve`'s entry and at the TUI's
   re-arm gesture, ahead of the interactive session and of `rearm_escalation`, so an
   escalated sweep over an undecodable ledger keeps its escalation instead of spending
@@ -463,6 +541,52 @@ breaking changes may land in a minor release.
   `chore(sweep): commit ledger at the sweep cycle boundary` (DW-223).
 - Degrade triage-cache metadata read failures to `sweep-triage-reload-failed` and
   fresh triage, with absent caches remaining silent (DW-224).
+- Degrade a refused triage-cache write-back to a new `sweep-triage-cache-write-failed`
+  journal kind and still return the validated plan, instead of crashing the sweep
+  after a healthy triage; a directory planted at the cache path lands on the same
+  row (DW-247).
+- Pause a resume at the story gate when an in-flight bundle's intent document must
+  be regenerated and the ledger read refuses, journaling `sweep-intent-ledger-refused`
+  (`ledger-unreadable` / `ledger-inaccessible`) and leaving the run resumable and the
+  bundle task PENDING, instead of crashing at that read ahead of every cycle gate;
+  `bmad-loop resume` after the repair re-drives the same bundle (DW-243).
+- Screen every bundle reaching the final keep loop — a cached plan's own bundles
+  included — against the ledger's live open set, skipping one whose ids are not all
+  open under `sweep-bundle-skipped` `reason="entry-not-open"`; `_write_intent` now
+  refuses (`MissingLedgerEntriesError`) to render a document for a bundle id with no
+  ledger entry, and the regeneration path journals that refusal as
+  `sweep-intent-regen-refused` and pauses the run the same way rather than dispatching
+  a session briefed on an empty entries section or letting fresh triage run beside
+  the refused bundle (DW-252).
+- Unlink a triage cache whose read faults before re-triaging
+  (`sweep-triage-cache-invalidated`, or `sweep-triage-cache-unlink-failed` on a refused
+  unlink) and write the cache back atomically, so a refused or short overwrite can no
+  longer leave an older or torn plan for the next resume to replay (DW-263).
+- Probe `<run>/decisions.json`'s metadata with `stat()` rather than `is_file()` so a
+  refusal of that probe degrades to `sweep-decisions-reload-failed` and the pending path on
+  Python 3.11–3.13 instead of aborting the sweep over a bookkeeping read (DW-248).
+- Raise a refused ledger out of the five write-bearing mutators (`mark_done_many`,
+  `mark_seen_again_many`, `mark_open_many`, `record_decision`, `archive_closed`) on
+  every interpreter: their pre-lock presence guard is `stat()` + `S_ISREG` and the
+  under-lock guard is the reader's own absence answer, so on Python 3.14 an `EACCES`
+  ledger no longer takes the no-op return — `sweep --archive` reporting success having
+  archived nothing, `record_decision` answering "no such entry" — and ELOOP and EBADF
+  move to the fault side on Python 3.11–3.13 too, so a symlink loop at the ledger's name
+  now raises out of all five instead of taking the no-op return. An absent ledger still
+  returns the no-op value without a lock (DW-255).
+- Answer the publishable-target guard's store leg from one `lstat()`, so a refused
+  store is `target-unreadable` on Python 3.14 too, where the
+  `is_file()`/`is_symlink()`/`exists()` probes suppressed the refusal and degraded it to
+  `target-absent`; a regular file and the 3.13+ symlink-loop link entry still publish,
+  a directory or FIFO is still `target-not-a-file` (DW-257).
+- Probe the project-level pre-answer store's metadata inside `load_pre_answers`' own
+  guard, so a refusal degrades to `{}` as the docstring promises instead of re-raising
+  out of `_decisions_phase` on Python 3.11–3.13 (DW-261).
+- Probe the ledger's metadata with `stat()` + `S_ISREG` in `read_for_observation`, so a
+  refused ledger degrades to an attributed `PermissionError:` fault on Python 3.14
+  instead of silent absence; `ENOENT`/`ENOTDIR` and a non-regular file stay absence,
+  and a symlink loop is now an attributed fault at the observation arm as it already
+  was at the write arm (DW-254).
 
 - Mirror a sweep cycle's ledger-in-doubt verdict onto run state at every site that
   ARMS it — not at the dispatch gate, and not at the decision phase's tail publish,
@@ -513,18 +637,21 @@ breaking changes may land in a minor release.
   successful write aborted `bmad-loop decisions`' walk or undercounted a TUI answer; the
   store guard now answers `target-unreadable` and `commit_paths` omits only the faulted
   candidate, raising just when no usable operand survives. Python 3.14 suppresses all OS
-  errors inside those probes, so there the fault never surfaces at all: the probes answer
-  False, the store degrades to `target-absent` and the candidate is ruled missing
+  errors inside those three convenience probes, so both sites have since moved to `lstat`
+  instead (`commit_paths` under DW-239, the store guard under DW-257), which reports the
+  fault on every interpreter and makes this fold uniform across them
   (DW-227).
 
 - Refuse `bmad-loop resume` for a sweep run whose deferred-work ledger does not decode,
   naming the file, the decode fault and the repair. Such a resume used to arm the run (pid
   publication, policy re-stamp, `run-resume` row) and only then meet the ledger, stopping
   with no repair route offered from this surface. An absent ledger is not a refusal and
-  story runs are unaffected. `deferredwork.read_for_write` itself is unwidened, so a ledger
-  read the OS refuses now ends `resume` at the entry probe with a bare
+  story runs are unaffected. `deferredwork.read_for_write` still lets `OSError` propagate,
+  so a ledger read the OS refuses now ends `resume` at the entry probe with a bare
   `error: [Errno 13] ...` and no repair route, where before it armed the run and stopped
-  through the sweep's own `ledger-inaccessible` steer (DW-204).
+  through the sweep's own `ledger-inaccessible` steer (DW-204). That propagation reaches
+  the entry probe on Python 3.14 only since DW-221 above, which is what makes the
+  behavior described here uniform across the supported interpreters.
 
 - Diagnose a `null` or bare-string member of a migration result's `mapping` list as the
   shape fault it is — `mapping[0] not an object: NoneType` — instead of reporting

@@ -18,6 +18,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, assert_never, overload
 
 import yaml
@@ -5088,9 +5089,13 @@ def patch_new_files(patch_path: Path) -> set[str]:
     return new_files
 
 
-def unpublishable_target(
-    target: Path, family: Literal["ledger", "store"]
-) -> tuple[Literal["target-absent", "target-unreadable", "target-not-a-file"], str | None] | None:
+def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
+    tuple[
+        Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
+        str | None,
+    ]
+    | None
+):
     """Why `target` must not be published, or `None` when it may be. Returns
     `(refuse_cause, error)` — the two fields a refusal carries beyond the
     caller's own identifying ones.
@@ -5116,11 +5121,36 @@ def unpublishable_target(
     contract (DW-146) already answers both questions in the two shapes this
     guard asks them — `None` for absence, `LedgerReadError` for bytes nobody
     can decode. Its `OSError` normally propagates; here it does not, because
-    both callers are best-effort bookkeeping whose whole degrade discipline
-    exists so a publication fault never aborts the work that wrote the file, so
-    it joins the undecodable cause rather than escaping. No lock is taken: this
-    is a read the writer above already took. A later disappearance or replacement
+    every caller is best-effort bookkeeping whose whole degrade discipline
+    exists so a publication fault never aborts the work that wrote the file. The
+    two faults are NOT folded into one cause, though (DW-237): `LedgerReadError`
+    returns `target-undecodable` and a raised
+    `OSError` returns `target-unreadable`, because they differ in the one way a
+    caller holding a retry obligation has to know about. Undecodable bytes are a
+    DURABLE content shape — a replay re-reads the same file and refuses it
+    identically, exactly like an absence or a directory — while an `OSError` a
+    probe RAISED (an EACCES parent, a WinError 64 from a
+    registered-but-not-serving UNC provider) is a TRANSIENT host answer the next
+    pass may well not see. So the four causes split three DURABLE
+    (`target-absent`, `target-not-a-file`, `target-undecodable`) against one
+    TRANSIENT (`target-unreadable`), and the split is drawn HERE, in the
+    classifier, rather than at a call site re-reading the ledger or matching the
+    fault text. The caller that needs it is `Engine._carry_harvested_deferrals`,
+    the one publisher carrying a durable `harvest_carry_commit_pending` latch
+    (DW-195/#552): it refuses every durable cause outright and hands only the
+    transient one back to `commit_paths`, where a `GitError` keeps the latch for
+    the replay. Before the split, both faults arrived as `target-unreadable`
+    and that fall-through published the undecodable bytes — git accepts any
+    bytes — so the corrupt ledger reached HEAD. The store leg never produces
+    `target-undecodable`: it asks nothing about bytes. No lock is taken: this is
+    a read the writer above already took. A later disappearance or replacement
     can still change what git publishes, as `_commit_ledger` documents.
+
+    A ledger read of `None` means absence or a non-regular file. Re-probe with
+    `stat` to distinguish `target-absent` from `target-not-a-file`; unlike
+    `exists`, it exposes OS refusals on every supported interpreter. Metadata
+    may change between probes, so this second probe must independently fold
+    non-absence errors into `target-unreadable`.
 
     STORE: a regular file must be there, except for the resolved symlink-loop
     entry described below. Nothing is asked about its bytes.
@@ -5133,43 +5163,53 @@ def unpublishable_target(
     alone let a store replaced by a DIRECTORY (or by a symlink to one) through
     the guard, and `commit_paths` hands the literal pathspec to `git add`, which
     stages a directory's descendants RECURSIVELY — an unrelated tree published
-    under a `chore(sweep):`/`chore(decisions):` message. `is_file()` FOLLOWS
-    symlinks, so a store symlinked to a regular file still publishes; a present
-    target of the wrong type (directory, FIFO, device, socket) is refused
-    `target-not-a-file`, which is neither absent nor unreadable and names a
-    different operator repair than either.
+    under a `chore(sweep):`/`chore(decisions):` message. The test is ONE guarded
+    `lstat()` on the argument (DW-257): `S_ISREG` publishes a regular file,
+    `S_ISLNK` publishes a link entry (see the resolved-argument paragraph for
+    which link that is), and any other present type (directory, FIFO, device,
+    socket) is refused `target-not-a-file`, which is neither absent nor
+    unreadable and names a different operator repair than either. A store
+    symlinked to a regular file still publishes: the callers hand over the
+    RESOLVED path, so this guard sees the regular target, and a caller that
+    hands over the link itself lands on the `S_ISLNK` arm.
 
-    Any of the store's probes can also FAIL rather than answer. On Python
-    3.11–3.13, `Path.exists()`, `is_file()` and `is_symlink()` absorb only the
-    `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISE the rest, so an `EACCES`
-    arriving after a successful write used to escape a best-effort publisher
-    (DW-227) — aborting `bmad-loop decisions`' walk or undercounting a TUI answer.
-    It is folded into `target-unreadable` here, for the same reason the ledger leg
-    folds its own `OSError`. Python 3.14 suppresses ALL OS errors inside those
-    three probes, so there the same `EACCES` never reaches this `except` at all:
-    every probe answers False and the store degrades to `target-absent` instead.
-    This guard attributes exceptions a probe raises; it cannot recover errors the
-    probe suppresses — the same boundary `deferredwork.read_for_observation`
-    states, and the runtime's false-probe meaning is preserved either way.
+    The probe can also FAIL rather than answer, and `lstat` is the probe that
+    REPORTS that on every supported interpreter. Until DW-257 this leg asked
+    `is_file()`/`is_symlink()`/`exists()`: on Python 3.11–3.13 those absorb only
+    the `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISE the rest, so an
+    `EACCES` arriving after a successful write used to escape a best-effort
+    publisher (DW-227) — aborting `bmad-loop decisions`' walk or undercounting a
+    TUI answer — and DW-227 folded that raise into `target-unreadable`, for the
+    same reason the ledger leg folds its own `OSError`. But Python 3.14
+    suppresses ALL OS errors inside those three probes, so there the same
+    `EACCES` never reached the `except` at all: every probe answered False and
+    the store degraded to `target-absent` — a present file reported as gone,
+    where this guard's own ledger leg said `target-unreadable`. `lstat`
+    suppresses nothing, so `FileNotFoundError`/`NotADirectoryError` are the
+    absence the old probes answered False for, and every other `OSError` — the
+    refusal included — folds into `target-unreadable` on 3.11 through 3.14
+    alike. The fold is DW-227's; the probe that lets it fire everywhere is
+    DW-257's.
 
-    Every probe is taken on the RESOLVED argument, which is what decides what
-    the `is_symlink()` disjunct actually buys — and it is not what the spelling
-    suggests. A DANGLING link does not survive the resolve as a link: non-strict
-    `Path.resolve` collapses it to the plain non-existent path it points at, so
-    all three probes answer False and the store is refused `target-absent`. That is
-    the right answer for it (the prune's writer,
-    `atomic_write_text_confined`, REFUSES to write through a link at the
-    store's own name, so a dangling one holds no write of ours to publish), but
-    it means the disjunct is doing a different job: on Python 3.13+, a symlink
-    LOOP resolves to the link ITSELF, which `exists()` calls False and
-    `is_symlink()` calls True. The disjunct preserves publication of that link
-    entry. Python 3.11–3.12 instead raise during resolve, which each caller
-    handles on its own — `_commit_ledger` takes its existing
-    `sweep-ledger-commit-unavailable` arm before this helper runs, and
-    `apply_pre_answer` folds the fault into a `target-unreadable` refusal.
+    The probe is taken on the RESOLVED argument, which is what decides what the
+    `S_ISLNK` arm actually buys — the same entry the old `is_symlink()`
+    disjunct bought, and not what the spelling suggests. A DANGLING link does
+    not survive the resolve as a link: non-strict `Path.resolve` collapses it to
+    the plain non-existent path it points at, so `lstat` raises `ENOENT` and the
+    store is refused `target-absent`. That is the right answer for it (the
+    prune's writer, `atomic_write_text_confined`, REFUSES to write through a
+    link at the store's own name, so a dangling one holds no write of ours to
+    publish), but it means the arm is doing a different job: on Python 3.13+, a
+    symlink LOOP resolves to the link ITSELF, which `lstat` — declining to
+    follow the last component — reports as a link where `stat` would raise
+    `ELOOP`. The `S_ISLNK` arm preserves publication of that link entry. Python
+    3.11–3.12 instead raise during resolve, which each caller handles on its
+    own — `_commit_ledger` takes its existing `sweep-ledger-commit-unavailable`
+    arm before this helper runs, and `apply_pre_answer` folds the fault into a
+    `target-unreadable` refusal.
 
     Returns the `refuse_cause` token as a `Literal` rather than a bare `str`,
-    which is what makes the closed three-value claim
+    which is what makes the closed four-value claim
     `tests/test_portability_guard.py` declares `refuse_cause` benign on a
     typechecked property rather than a comment. The union is spelled identically
     in `decisions.PublishRefusal.cause`; pyright rejects producer tokens the
@@ -5177,25 +5217,36 @@ def unpublishable_target(
     if family == "ledger":
         try:
             if deferredwork.read_for_write(target) is None:
-                return ("target-absent", None)
-        except (deferredwork.LedgerReadError, OSError) as e:
+                try:
+                    target.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    return ("target-absent", None)
+                return ("target-not-a-file", None)
+        except deferredwork.LedgerReadError as e:
+            # DURABLE: the bytes on disk are what nobody can decode, and a replay
+            # re-reads them identically. Kept apart from the `OSError` arm below so
+            # a latch-holding caller can refuse this and retry only the other.
+            return ("target-undecodable", str(e))
+        except OSError as e:
+            # TRANSIENT: a probe RAISED, which the next pass may not see.
             return ("target-unreadable", str(e))
         return None
     if family == "store":
+        # ONE `lstat`, never `is_file()`/`is_symlink()`/`exists()` (DW-257): those
+        # suppress every OS error on Python 3.14, so a refused store degraded to
+        # `target-absent` there. `lstat` reports the refusal on every interpreter
+        # and, declining to follow the last component, keeps the one entry the
+        # old `is_symlink()` disjunct bought — the 3.13+ symlink LOOP, which
+        # survives the caller's resolve as a link — publishable through `S_ISLNK`.
         try:
-            # `is_file()` FOLLOWS symlinks, so a store symlinked to a regular file
-            # publishes; the `is_symlink()` disjunct is what keeps the 3.13+ symlink
-            # LOOP's link entry publishable (see the RESOLVED-argument paragraph).
-            if target.is_file() or target.is_symlink():
-                return None
-            # Reached only once both answered False, so this is purely the
-            # discriminator between "present but the wrong TYPE" and "not there",
-            # and it costs nothing on the happy path.
-            if target.exists():
-                return ("target-not-a-file", None)
+            st = target.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return ("target-absent", None)
         except OSError as e:
             return ("target-unreadable", str(e))
-        return ("target-absent", None)
+        if S_ISREG(st.st_mode) or S_ISLNK(st.st_mode):
+            return None
+        return ("target-not-a-file", None)
     # Spelled as an exhaustive dispatch, not `if ledger / else store`: a THIRD
     # family added to the `Literal` would otherwise typecheck at every call site
     # and fall silently through to existence-only validation — precisely the
@@ -5221,14 +5272,40 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     contract for healthy siblings. If no usable operand survives that uncertainty,
     the call raises instead of reporting a successful no-op. TWO things can make a
     candidate uncertain and both take that one path: its `resolve()` can fail, and
-    so can the presence probe below it — on Python 3.11–3.13
-    `Path.exists()`/`is_symlink()` absorb only the `ENOENT`/`ENOTDIR`/`ELOOP`
-    class of errnos and RAISE the rest, so an `EACCES` under one operand used to
-    escape as a bare `OSError` into best-effort publishers that have no handler
-    for it (DW-227). Python 3.14 suppresses all OS errors inside those probes, so
-    there the fault never arrives: both answer False and the candidate is simply
-    ruled MISSING, taking the missing-but-tracked arm below. The guard handles
-    what a probe raises, not what it suppresses."""
+    so can the presence probe below it, which is a direct `Path.lstat()` for
+    exactly that reason (DW-239). `Path.exists()`/`is_symlink()` stood here until
+    a truthful probe was needed on every interpreter: on Python 3.11–3.13 they
+    absorb only `pathlib`'s ignored errnos (`ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`,
+    plus the `ERROR_NOT_READY`/`ERROR_INVALID_NAME`/`ERROR_CANT_RESOLVE_FILENAME`
+    winerrors) and RAISE the rest, so an `EACCES` under one operand escaped as a
+    bare `OSError` into best-effort publishers that have no handler for it
+    (DW-227); Python 3.14 suppresses ALL OS errors inside them, so there the same
+    fault never arrived at all — both probes answered False and a TRACKED candidate
+    under an unsearchable parent was ruled MISSING, taking the missing-but-tracked
+    arm below and offering its DELETION to `git add`. `lstat` suppresses nothing on
+    any interpreter: `EACCES`, an `ELOOP` on an intermediate component and
+    `ENAMETOOLONG` all REPORT into the uncertainty slot instead of answering False,
+    so that slot is now reachable everywhere. So does every errno the pair absorbed
+    but `ENOENT`/`ENOTDIR` — `EBADF` and those three winerrors included — and that
+    is a deliberate widening rather than a side effect: an operand a Windows host
+    calls not-ready or unspellable is a path this cannot say anything about, and
+    saying so is the whole of DW-239. The cost is disclosed: as a SOLE operand such
+    a path used to be a clean no-op and now raises `GitError`, which the best-effort
+    publishers above already handle and which is the honest answer.
+
+    It otherwise answers the same PRESENCE question the pair answered — success for
+    every directory entry that exists, and `ENOENT`/`ENOTDIR` for the absence the
+    pair reported as False. That equivalence includes the one entry the
+    `is_symlink()` disjunct was actually there to buy, and it is not the dangling
+    link the spelling suggests: every operand here is `resolve()`d first, and
+    non-strict resolve collapses a dangling link to the plain non-existent path it
+    points at, so `lstat` raises `FileNotFoundError` for it exactly as both probes
+    answered False. What survives the resolve AS a link is a symlink LOOP, which
+    Python 3.13+ resolves to the link itself — `exists()` False, `is_symlink()`
+    True — and `lstat` succeeds on it because it does not follow the last component.
+    `unpublishable_target`'s RESOLVED-argument paragraph makes the same distinction
+    for the same reason. The guard still handles what a probe raises, not what it
+    suppresses; there is simply nothing left here that suppresses."""
     rels: list[str] = []
     # The single per-candidate uncertainty slot, shared by BOTH sources (a failed
     # `resolve()` and a failed presence probe) because they have one contract: omit
@@ -5267,11 +5344,22 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     for r in rels:
         candidate = repo_root / r
         try:
-            present = candidate.exists() or candidate.is_symlink()
+            # `lstat` DIRECTLY, never `exists()`/`is_symlink()`: those suppress every
+            # OS error on Python 3.14, so an EACCES parent ruled a TRACKED candidate
+            # MISSING and staged its deletion (DW-239). It does not follow the last
+            # component, which keeps the one entry the `is_symlink()` disjunct bought
+            # — a symlink LOOP, the only link that survives the resolve above as a
+            # link — PRESENT; `ENOENT`/`ENOTDIR` are the absence the pair answered
+            # False for, a resolved-away dangling link among them.
+            candidate.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
         except OSError as e:
             if candidate_fault is None:
                 candidate_fault = (candidate, e, "a presence probe")
             continue
+        else:
+            present = True
         survivors.append(r)
         if not present:
             missing.append(r)

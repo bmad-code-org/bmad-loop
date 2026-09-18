@@ -509,10 +509,13 @@ artifacts the engine already wrote.
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
   gate inherits the same richer surface — including the anchored read and the refusal
   of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
-  spec to show — a story gate fires before the story is recorded, an epic boundary has
-  no story at all — so they open a compact pause-reason viewer instead: the reason names
-  the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
-  ledger, so a gate that is still open legitimately re-pauses.
+  spec to show — a story gate fires before the story is recorded, or on a sweep bundle
+  whose intent regeneration the ledger refused (its task may carry a spec file, but the
+  gate is about the ledger, not the spec), an epic boundary has no story at all — so
+  they open a compact pause-reason viewer instead: the reason names
+  the blocking entries and the remedy. **Resume** re-picks a gated sprint story;
+  for a bundle-regeneration pause, it recovers the same persisted bundle and regenerates
+  its intent document. Both re-ask the ledger, so an unresolved refusal re-pauses.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and

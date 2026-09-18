@@ -1300,7 +1300,8 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
 
 @pytest.mark.parametrize("render_format", ["markdown", "json"])
 @pytest.mark.parametrize(
-    "refuse_cause", ["target-absent", "target-unreadable", "target-not-a-file"]
+    "refuse_cause",
+    ["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
 )
 @pytest.mark.parametrize(
     "stop_cause",
@@ -1322,11 +1323,11 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
 
     The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
     says WHICH of the two published files went unpublished and `refuse_cause` says
-    WHY, and the two are separate claims — the causes are a closed trio
-    (`target-absent` | `target-unreadable` | `target-not-a-file`) whose natural
-    spelling, `reason`, is dropped, so without the minted field a scrubbed dump
-    could not tell a ledger that vanished from one nobody could decode, nor either
-    of those from a store a directory replaced.
+    WHY, and the two are separate claims — the causes are a closed quartet
+    (`target-absent` | `target-unreadable` | `target-not-a-file` |
+    `target-undecodable`) whose natural spelling, `reason`, is dropped, so without
+    the minted field a scrubbed dump could not tell a ledger that vanished from one
+    nobody could decode, nor either of those from a store a directory replaced.
 
     Ablation: remove Markdown's sweep-entry emission, drop
     `sweep-ledger-commit-refused` from the collected kind set, or add
@@ -1352,7 +1353,11 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
         message=message_value,
         file="deferred-work.md",
         refuse_cause=refuse_cause,
-        **({"error": error_value} if refuse_cause == "target-unreadable" else {}),
+        **(
+            {"error": error_value}
+            if refuse_cause in ("target-unreadable", "target-undecodable")
+            else {}
+        ),
     )
     journal.append(
         "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
@@ -1392,7 +1397,7 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     assert published["message_present"] is True and "message" not in published
     assert refused["message_present"] is True and "message" not in refused
     assert "error" not in refused
-    if refuse_cause == "target-unreadable":
+    if refuse_cause in ("target-unreadable", "target-undecodable"):
         assert refused["error_present"] is True
     else:
         assert "error_present" not in refused
@@ -1430,6 +1435,40 @@ def test_a_withheld_bundle_dispatch_keeps_its_count_through_a_dump(project):
     assert withheld["cycle"] == 3
     # ...while the free-text reason collapses exactly as it does on the stop row
     assert withheld["reason_present"] is True and "reason" not in withheld
+
+
+def test_a_withheld_ledger_publish_keeps_its_file_through_a_dump(project):
+    """DW-246: `sweep-ledger-commit-withheld` — a publish the run declined over
+    its own ledger doubt — is collected into the Markdown dump beside its
+    `_commit_ledger` siblings, with `file` verbatim (the already-benign lexical
+    basename) and `message`/`reason` collapsed to presence booleans.
+
+    Ablation: remove `sweep-ledger-commit-withheld` from the Markdown
+    collected-kind set; the JSON entry block disappears. Add `file` to
+    `_JOURNAL_DROP_FIELDS` and the `file` assertion fails.
+    """
+    run_dir = _seed_run(project.project)
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-withheld",
+        message=message_value,
+        file="deferred-work.md",
+        reason="ledger-in-doubt",
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-ledger-commit-withheld")
+    assert withheld["file"] == "deferred-work.md"
+    assert withheld["message_present"] is True and "message" not in withheld
+    assert withheld["reason_present"] is True and "reason" not in withheld
+    assert message_value not in markdown
 
 
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
@@ -2087,11 +2126,20 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
             "sweep-ledger-commit-unavailable",
             {"message": "m", "repo": HOME_PATH, "error": "fatal", "file": "deferred-work.md"},
         ),
+        (
+            "sweep-ledger-commit-withheld",
+            {
+                "message": "m",
+                "file": "deferred-work.md",
+                "reason": "ledger-in-doubt",
+                "dw_ids": ["DW-7"],
+            },
+        ),
         ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The five kinds `render_markdown` prints as a JSON block carry a declared
+    """The six kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
@@ -2117,6 +2165,9 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
             assert name not in scrubbed and scrubbed[f"{name}_present"] is True
     if "commit" in declared:
         assert scrubbed["commit"].startswith("commit-")
+    if "dw_ids" in declared:
+        # the keylist route runs ahead of the schema: aliased, never collapsed
+        assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

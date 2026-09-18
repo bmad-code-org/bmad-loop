@@ -4504,18 +4504,19 @@ async def test_tui_rearm_live_refusal_wins_over_the_ledger_gate(project, monkeyp
         assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
 
 
-async def test_tui_rearm_routes_an_os_refused_ledger_read_instead_of_crashing(project, monkeypatch):
-    """`unreadable_sweep_ledger` propagates `OSError` by contract — a fault class whose
-    repair arm is DW-234's to add, not this call site's. The CLI has `main`'s tail to
-    route that propagation; a Textual message-loop callback has none, so an escape here
-    takes the whole dashboard down mid-gesture. `_do_rearm` therefore routes it itself:
-    an error toast naming the fault, and a return with the escalation still armed.
+async def test_tui_rearm_refuses_an_os_refused_ledger_read_with_the_probe_route(
+    project, monkeypatch
+):
+    """The DW-234 row on the TUI surface. `runs.unreadable_sweep_ledger` now refuses an
+    OS-refused read itself, with the permissions-or-storage repair and the
+    `bmad-loop sweep` route, so `_do_rearm`'s stopgap `except OSError` (which toasted
+    the bare fault "rather than waiting for DW-234") is gone: the probe's refusal
+    reaches the error toast through the same `refusal is not None` arm the decode
+    refusal takes, and nothing is re-armed or launched.
 
-    This is ROUTING, not the struck repair arm — the toast carries no `bmad-loop sweep`
-    steer, because this surface still has no route for a permissions-or-storage fault.
-
-    Ablation: drop the `except OSError` around the probe call and the row fails on the
-    PermissionError escaping `_do_rearm`."""
+    Ablation: delete the probe's `except OSError` arm and the row fails on the
+    PermissionError escaping `_do_rearm` — there is no local catch left to absorb it,
+    which is the point: one arm, in the shared helper, for all three entry points."""
     from bmad_loop import deferredwork, runs
     from bmad_loop.journal import load_state
 
@@ -4546,8 +4547,11 @@ async def test_tui_rearm_routes_an_os_refused_ledger_read_instead_of_crashing(pr
             (m, s) for m, s in notifications_with_severity(app) if "Errno 13" in m
         )
         assert severity == "error"
-        assert "still escalated" in toast
-        assert "bmad-loop sweep" not in toast  # routing, not DW-234's repair arm
+        # The probe's own refusal, route included — not a locally-worded toast.
+        assert str(project.deferred_work) in toast
+        assert "permissions or storage" in toast
+        assert "bmad-loop sweep" in toast
+        assert "stays resumable" in toast
         assert rearms == []
         assert resumes == []
         assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
@@ -6596,14 +6600,34 @@ _GATE_REASON = (
         # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
         # has no spec_file — the other arm of _paused_spec's (None, "") return
         ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+        # DW-243: a sweep bundle re-armed after a dev escalation KEEPS its spec_file,
+        # and its intent-regeneration refusal pauses at the story gate. The gate is
+        # about the ledger, never the spec, so the reason (with its repair steer)
+        # must show — not the spec viewer's "Approve & resume". Ablation: drop the
+        # story-gate shortcut before `_paused_spec` in `_review_gate`
+        # and this case attempts the forbidden spec read.
+        ("dw-fix", {"dw-fix": "with-spec-file"}),
     ],
-    ids=["task-unregistered", "task-without-spec-file"],
+    ids=["task-unregistered", "task-without-spec-file", "task-with-spec-file"],
 )
 async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    if tasks.get("dw-fix") == "with-spec-file":
+        spec = project.implementation_artifacts / "spec-dw-fix.md"
+        spec.write_text("# spec-dw-fix\n", encoding="utf-8")
+        tasks = {
+            "dw-fix": StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+        }
     make_run(
         project.project,
         "20260611-100000-aaaa",
@@ -6615,6 +6639,7 @@ async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, s
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        assert spec_reads == [], "a story-gate reason viewer must not read the unused spec"
         await ready(pilot, "#reason Static")
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body
@@ -7552,6 +7577,10 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
         ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
     ],
 )
 async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
@@ -7629,6 +7658,10 @@ async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
         ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
     ],
 )
 async def test_decision_modal_toasts_an_answer_it_could_not_publish(

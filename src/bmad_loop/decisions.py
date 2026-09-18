@@ -55,6 +55,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Literal
 
 from . import bmadconfig, deferredwork, runs, verify
@@ -93,11 +94,20 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     codebase refuses. Readers that consume a value screen it themselves with
     `sweep.unusable_answer_reason`."""
     path = store_path(project)
-    if not path.is_file():
-        return {}
     try:
+        # `stat()` + `S_ISREG` INSIDE the `try`, never a bare `is_file()` outside
+        # it (DW-261): on Python 3.11–3.13 `is_file()` re-raises a metadata
+        # refusal, which escaped this "total" helper out of `_decisions_phase`
+        # and every other caller; on 3.14 it suppresses the refusal instead. The
+        # explicit probe folds the refusal into the same `{}` every other fault
+        # class already answers, on every interpreter. Absence — ENOENT, ENOTDIR,
+        # a directory at the store's name — stays a silent `{}` as before.
+        if not S_ISREG(path.stat().st_mode):
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+        # `ValueError`: `Path.stat` raises it for a non-encodable path (embedded
+        # NUL), which the old bare `is_file()` absorbed; total means `{}` here too.
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -406,17 +416,18 @@ class PublishRefusal:
     (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`), a code
     constant at both operands and never operator-controlled prose, which is what
     makes it safe for both surfaces to print verbatim. `cause` is
-    `verify.unpublishable_target`'s closed three-token enum, spelled here
+    `verify.unpublishable_target`'s closed four-token enum, spelled here
     IDENTICALLY to its return type — the two are one contract. Pyright rejects
     producer tokens this receiving union does not accept; it does not enforce
     equality of the unions. `error`
-    carries the decode or OS fault where the refusal has one to attribute, and is
-    `None` for the two refusals that have none to name: a plain absence, and a
-    store that is present but not a regular file (an empty string would read as a
-    fault)."""
+    carries the decode fault (`target-undecodable`, the ledger's bytes) or the OS
+    fault (`target-unreadable`, a probe that raised) where the refusal has one to
+    attribute, and is `None` for the two refusals that have none to name: a plain
+    absence, and a target that is present but not a regular file (an empty string
+    would read as a fault)."""
 
     file: str
-    cause: Literal["target-absent", "target-unreadable", "target-not-a-file"]
+    cause: Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"]
     error: str | None = None
 
 
@@ -474,10 +485,11 @@ class PreAnswerResult:
         appends it to the existing non-write toast or raises one of its own.
 
         The fault rides WITH the cause where the refusal has one, the way the
-        sweep's `error` field rides beside its `refuse_cause`. Without it the three
-        causes read alike at both surfaces, and `target-unreadable` is the one that
-        names something a human can act on — a decode fault, an `EACCES`, a symlink
-        loop. The other two have no exception text and take the bare wording:
+        sweep's `error` field rides beside its `refuse_cause`. Without it the four
+        causes read alike at both surfaces, and `target-undecodable` (the ledger's
+        decode fault) and `target-unreadable` (an `EACCES`, a symlink loop) are the
+        two that name something a human can act on. The other two have no
+        exception text and take the bare wording:
         `target-absent`, and `target-not-a-file` for a target present but of the
         wrong type. An empty parenthetical would read as a fault.
 
@@ -559,10 +571,16 @@ def apply_pre_answer(
     broken chain, `RuntimeError` on a symlink loop under 3.11–3.12) takes the same
     refusal arm with cause `target-unreadable` — a target whose path cannot be
     resolved cannot be read well enough to publish — because this module has no
-    journal to route it to and the cause enum is closed by contract. A store the
-    guard finds present but NOT a regular file takes the third token,
-    `target-not-a-file` (DW-211/228): publishing a directory's literal pathspec
-    would stage its descendants recursively under this call's own message.
+    journal to route it to and the cause enum is closed by contract. The LEDGER
+    operand alone can come back `target-undecodable` — its bytes were replaced by
+    ones nobody can decode between the write and the staging — carrying the
+    `LedgerReadError` text in `error`, and that refusal reaches the outcome line
+    and the toast like any other (DW-237). EITHER
+    family's target found present but NOT a regular file takes the token
+    `target-not-a-file` (DW-211/228 for the store, DW-238 for the ledger, which
+    reached it as `target-absent` until then): publishing a directory's literal
+    pathspec would stage its descendants recursively under this call's own
+    message, and a FIFO or socket at the name is refused the same way.
 
     A refusal drops only ITS operand; the survivors still publish, and a refusal
     never raises.

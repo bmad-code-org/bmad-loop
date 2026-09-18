@@ -469,8 +469,8 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
-    # The five kinds `render_markdown` lifts out of the scrubbed collection and
-    # prints as a JSON block in the DEFAULT dump (DW-191/192/201). Their names ARE
+    # The six kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
     # authored here, so the premise above does not hold for them — an unclaimed
     # key on one of these is a field a future producer added without routing.
     # Declared anyway, because Markdown is the render an operator pastes into an
@@ -485,6 +485,9 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "sweep-ledger-commit-clean": frozenset({"message", "file"}),
     "sweep-ledger-commit-refused": frozenset({"message", "file", "refuse_cause", "error"}),
     "sweep-ledger-commit-unavailable": frozenset({"message", "repo", "error", "file"}),
+    # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
+    # this table is consulted; named for the same completeness as `commit` above.
+    "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
 }
 
@@ -1411,6 +1414,9 @@ def render_markdown(
                 "sweep-ledger-commit-clean",
                 "sweep-ledger-commit-refused",
                 "sweep-ledger-commit-unavailable",
+                # DW-246: a publish the run declined over its own ledger doubt;
+                # `file` names which file, `reason` collapses to presence.
+                "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
             }
         ]

@@ -1299,14 +1299,16 @@ def fault_read_text(monkeypatch, target: Path) -> None:
 
 def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
     """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
-    other path, and every other probe on ``target``, still answers normally.
+    other path still answers normally, and so does every other probe on ``target`` —
+    with the ``stat`` family the documented exception, see its own paragraph below.
 
-    ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` — one probe at a
-    time, which does NOT make one guard-per-probe ablatable: a caller may well take
-    all three inside a single ``try``, where one ``except`` covers the lot. What it
-    buys is coverage of each ENTRY PATH into that one guard — each probe is reached
-    only after the ones before it answered a particular way, so a row per probe
-    proves every reachable arm is inside the guard rather than only the first.
+    ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` / ``stat`` /
+    ``lstat`` — one probe at a time, which does NOT make one guard-per-probe
+    ablatable: a caller may well take several inside a single ``try``, where one
+    ``except`` covers the lot. What it buys is coverage of each ENTRY PATH into
+    that one guard — each probe is reached only after the ones before it answered
+    a particular way, so a row per probe proves every reachable arm is inside the
+    guard rather than only the first.
 
     Selective monkeypatching rather than chmod, and here that is not merely the
     ``fault_read_text`` convention: chmod is a no-op for root, carries no read bit
@@ -1314,11 +1316,32 @@ def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
     internally, so a permission bit cannot raise out of that probe on Python 3.14.
 
     The point of the fault is that on Python 3.11–3.13 these calls do NOT swallow
-    everything: they absorb only the ``ENOENT``/``ENOTDIR``/``ELOOP`` class of
-    errnos and raise the rest, so ``EACCES`` is a real answer a caller must handle.
+    everything: they absorb only ``pathlib``'s ignored errnos
+    (``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP``) and raise the rest, so ``EACCES``
+    is a real answer a caller must handle.
     Python 3.14 suppresses all OS errors in them, so this helper INJECTS on every
     version the fault only the older ones raise on their own — which is the point:
-    the handler under grade must exist for the versions that can reach it."""
+    the handler under grade must exist for the versions that can reach it.
+
+    ``stat`` and ``lstat`` are the exception to that whole paragraph, and ``stat``
+    is why DW-221 moved the repair/write ledger reader onto it: neither suppresses
+    ANYTHING on any interpreter — CPython's pathlib docs name ``stat`` as the probe
+    that reports the error rather than answering False, which is exactly what
+    ``is_file()`` stopped doing in 3.14 when its body became ``os.path.isfile``, and
+    ``lstat`` is the same call declining to follow the last component. So a fault
+    injected on either is not a simulation of an older runtime the way the other
+    three are; it is the fault a real EACCES parent directory produces on 3.11
+    through 3.14 alike. DW-239 moved ``verify.commit_paths``' presence probe onto
+    ``lstat`` for exactly that reason, which is what makes that probe ablatable
+    here at all — on ``exists``/``is_symlink`` a 3.14 run could not reach the
+    handler under grade.
+
+    On Python 3.11–3.13, ``exists()``, ``is_file()`` and ``is_dir()`` call
+    ``self.stat()``, so this injection can affect sibling probes too. Their
+    default Python 3.14 implementations instead delegate to ``os.path`` and
+    bypass a ``Path.stat`` monkeypatch. A test simulating 3.14 suppression on an
+    older interpreter must also pin ``Path.is_file`` to return ``False``; see
+    ``test_read_for_write_propagates_a_refused_metadata_probe``."""
     real = getattr(Path, probe)
 
     def fake(self, *a, **kw):

@@ -3049,8 +3049,8 @@ def runs_past_retention(
 
 
 def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
-    """The refusal a resume-shaped entry point owes a sweep run whose ledger bytes
-    do not decode.
+    """The refusal a resume-shaped entry point owes a sweep run whose ledger cannot
+    be read — bytes that do not decode (DW-204) or a read the OS refuses (DW-234).
 
     Returns the operator-facing message, or None to decline (DW-204).
 
@@ -3069,9 +3069,11 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     `state.finished = True` on that return, so DW-204's own literal end state is
     persisted finished and is refused by `_prepare_resume_locked`'s `already
     finished`, which this gate declines to re-word. What is left, and what this
-    gate is for, is the UN-finished sweep runs — paused at an escalation or the
-    migrate gate, operator-stopped, or crashed — whose ledger is unreadable at the
-    moment someone resumes them.
+    gate is for, is the UN-finished sweep runs — paused at an escalation, the
+    migrate gate or an in-flight bundle's intent-regeneration refusal (DW-243: the
+    recovery pass pauses at the story gate rather than stopping, precisely so the
+    task is re-driven by a resume this gate fronts), operator-stopped, or crashed
+    — whose ledger is unreadable at the moment someone resumes them.
 
     Scope, all deliberate:
 
@@ -3081,37 +3083,48 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     * `LedgerReadError` is caught BY NAME. It is a plain `Exception` on purpose
       (DW-146) so that no OSError handler can swallow it; the flip side is that
       nothing catches it implicitly either.
-    * `OSError` is NOT caught here, and no arm for it may be added.
-      `deferredwork.read_for_write` documents that it propagates, and it keeps
-      propagating from this caller to `main`'s tail as a routeless
-      `error: [Errno 13] …` / `ExitCode.FAILURE`. The steer that propagation loses
-      is real — before this gate, an OS-refused ledger armed the run and stopped
-      through `_read_cycle_ledger`'s `ledger-inaccessible` arm WITH
-      `_notify_ledger_repair`'s route — and it is RECORDED AS A DEFERRAL rather
-      than repaired here: an arm of its own, with its own permissions-or-storage
-      repair, was written and then struck from this change's frozen contract, so
-      restoring one re-opens a settled decision instead of correcting a defect.
-      `deferredwork.read_for_write` itself is not widened either way. The
-      prohibition is not permanent: DW-234 carries an accepted decision to add the
-      `OSError` repair arm back here, so it stands only until that spec lands, and
-      that spec must replace BOTH pinning rows —
-      `test_resume_sweep_os_refused_ledger_propagates_to_mains_tail` and
-      `test_resolve_sweep_os_refused_ledger_propagates` — not the single row its
-      text names (written when this probe was `cli._unreadable_sweep_ledger` and
-      `resume` was its only caller, so its file/line coordinates are stale too).
-      A caller with no tail to propagate INTO routes the escape itself rather than
-      waiting for DW-234: `tui.app._do_rearm` catches `OSError` at its own call and
-      toasts it, because an escape from a Textual message-loop callback takes the
-      dashboard down. That is routing, not the arm.
+    * `OSError` IS caught here too, with its own permissions-or-storage repair —
+      the RECORDED REVERSAL (DW-234). The arm was first written at `e609604c`,
+      then struck by the DW-204 human resolution on SCOPE grounds: that resolution
+      froze this gate to the decode fault so DW-204 could ship without
+      re-litigating the DW-146 reader contract, and two propagation rows pinned
+      the exclusion. The steer the exclusion lost was real — before this gate, an
+      OS-refused ledger armed the run and stopped through `_read_cycle_ledger`'s
+      `ledger-inaccessible` arm WITH `_notify_ledger_repair`'s route, and the gate
+      then let the same fault reach `main`'s tail as a routeless
+      `error: [Errno 13] …` naming no repair at all. DW-204 has shipped, DW-234
+      carries the accepted 2026-09-09 decision to add the arm back, and this is
+      that arm: it shares the `bmad-loop sweep` + clean-worktree ROUTE
+      `sweep._notify_ledger_repair` already gives the sweep run for the same
+      fault (that notice names the route and nothing about the fault's class),
+      and the permissions-or-storage attribution is this arm's own. The arm is a
+      CALLER's: `deferredwork.read_for_write` still propagates `OSError`
+      unchanged, exactly as it does for every caller but this one and the sweep's
+      own reads. `tui.app._do_rearm` no longer wraps the probe in its own
+      `except OSError` — with the arm here the probe cannot raise one, so that
+      stopgap was dead code.
     * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
       / `parse_ledger("")` answer identically for absent and empty — a resumed
-      sweep on an absent ledger ends cleanly at `sweep-nothing-open`.
-    * Story runs are out of scope by the recorded decision, NOT because they are
-      safe: the base `Engine` reads the ledger through `read_for_write` too
-      (`_ledger_digest` among others) and catches `LedgerReadError` nowhere, so a
-      story run over the same ledger arms and faults just as a sweep would.
-      Widening the gate — and the engine's reads — is DW-146 scope, and the
-      deferral naming those reads stands.
+      sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
+      holds an in-flight bundle whose intent document must be regenerated: that
+      run re-pauses at the story gate under `sweep-intent-regen-refused`
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs.
+    * Story runs are out of scope, and since DW-231 that is SAFE rather than
+      merely decided at the engine's four direct `read_for_write` sites. Its
+      observation reads (`_ledger_digest`, the pre-harvest and defer snapshots,
+      the two restores) degrade to a typed answer nothing can write back and
+      journal `ledger-read-degraded`; its two publish reads (the spec-deferral
+      harvest and the isolated carry) pause the run with an `ACTION REQUIRED`
+      repair notice and no phase change, so `bmad-loop resume` after the repair
+      retries the write — replaying the recorded session result where one
+      exists, re-driving the leg otherwise. At those four sites a story run over
+      an undecodable ledger therefore no longer dies as `run-crash`. Residual,
+      recorded as a deferral: every `deferredwork` mutator's own locked re-read
+      (the harvest's and carry's `append_entries`, `mark_done_many_reopenable`)
+      still raises inside its window, and the review-timeout salvage refile
+      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) has no
+      pre-read at all — a ledger that goes bad in exactly those windows still
+      crashes the run.
 
     Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
     run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` at its
@@ -3191,6 +3204,24 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
             "`bmad-loop sweep` (which requires that worktree to be clean). This run "
             "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
             "keeps its in-flight bundle recovery instead of starting the cycle over"
+        )
+    except OSError as e:
+        # The OS refused the read (DW-234): a permissions or storage fault, not
+        # bytes that failed to decode. The class NAME rides along because the errno
+        # text alone ("[Errno 13] Permission denied") does not say what kind of
+        # refusal it was. The ROUTE (`bmad-loop sweep` in a clean worktree) is the
+        # one `sweep._notify_ledger_repair` gives the sweep run for the same fault;
+        # the permissions-or-storage attribution is this arm's own — that notice
+        # names the route and nothing about the fault's class. Every other clause
+        # is the decode refusal's, verbatim, for the same reasons.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — the deferred-work ledger "
+            f"{ledger} could not be read ({e.__class__.__name__}: {e}). Repair the "
+            "ledger's permissions or storage so it reads, then commit or stash any "
+            f"changes in {paths.repo_root} and run `bmad-loop sweep` (which requires "
+            "that worktree to be clean). This run stays resumable: `bmad-loop resume` "
+            "it again once the ledger reads, which keeps its in-flight bundle recovery "
+            "instead of starting the cycle over"
         )
     return None
 

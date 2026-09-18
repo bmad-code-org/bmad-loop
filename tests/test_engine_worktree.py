@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     _OK,
+    UNDECODABLE_LEDGER,
     _exists_run,
     _file_exists_cmd,
     _seeded_then_touch,
@@ -23,6 +24,7 @@ from conftest import (
     _touch_run,
     attach_profile,
     crash_at_merge_back,
+    fault_metadata_probe,
     git,
     ignore_before_commit,
     install_build_auto_skill,
@@ -45,7 +47,7 @@ from bmad_loop.install import (
     DEV_PRIMITIVE_NEW,
     MODULE_SKILLS,
 )
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import (
     GatesPolicy,
@@ -213,8 +215,88 @@ def make_engine(project, script, policy=None, run_id="test-run", **kwargs):
     return engine, adapter
 
 
+def resume_engine(project, engine, script=(), *, policy=None) -> tuple[Engine, MockAdapter]:
+    """Rebuild an Engine over the run's persisted state, as `cli.cmd_resume` does."""
+    state = load_state(engine.run_dir)
+    # `cli._resume_paused_run` refuses a finished run outright. Without the same
+    # refusal here a test can "resume" what the CLI never would, and prove a
+    # recovery path that does not exist (#284 round-6 review, finding 1).
+    assert not state.finished, "cli._resume_paused_run refuses a finished run"
+    # as cli.cmd_resume does before compose_resume; this also resets the
+    # `stopped`/`crashed`/`crash_error` flags a crash-replay site resumes from
+    state.clear_pause()
+    adapter = MockAdapter(list(script))
+    new_engine = Engine(
+        paths=project,
+        policy=policy or engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        # A real resume REOPENS the journal: `cli.cmd_resume` builds a fresh
+        # `Journal(run_dir)` and hands it to `runsetup.compose_resume`, so this
+        # harness builds the same shape (DW-241). `Journal` is file-backed either
+        # way; what a SHARED object leaks across the boundary is its
+        # `_log_task`/`_log_path` binding, which stamps `log_task`/`log_pos` onto
+        # rows a real resumed engine writes bare. See the row right below.
+        journal=Journal(engine.run_dir),
+        state=state,
+        # mirror cli._resume_paused_run: the run's scope + cap are restored from
+        # persisted state so a resumed `--epic N` run keeps its selector.
+        epic_filter=state.epic_filter,
+        story_filter=state.story_filter,
+        max_stories=state.max_stories,
+    )
+    return new_engine, adapter
+
+
 def journal_kinds(engine):
     return [e["kind"] for e in engine.journal.entries()]
+
+
+def test_the_resumed_engine_reopens_the_journal_off_disk(project):
+    """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
+    builds rather than handing the pre-pause engine's object back (DW-241) — the
+    `tests/test_sweep.py` row of the same name, carried over to the one helper this
+    file's resume sites now share.
+
+    `cli.cmd_resume` constructs `Journal(run_dir)` and passes it to
+    `runsetup.compose_resume`; a fresh `Journal` starts with `_log_task = None`.
+    Sharing one object carried the PRE-PAUSE session's `set_active_log` binding across
+    the resume boundary, and `Journal.append` stamps `log_task`/`log_pos` onto every
+    entry while that binding is set — so every row a resumed engine writes BEFORE
+    starting its own session (a replay pre-pass, a resume-carry, a merge replay) was
+    stamped with a log from the run before the pause. A real resume writes those rows
+    bare. `Journal` holds NO in-memory record list — `append` writes one line to
+    `run_dir/journal.jsonl` and `entries()` re-reads it — so the binding is the only
+    state a shared object could leak; every `journal_kinds(resumed)` claim in this
+    file's resume rows was already round-tripping through disk.
+
+    Graded on the CONSEQUENCE, never on object identity: `resumed.journal is not
+    engine.journal` would be tautological and would red for a refactor that changed
+    nothing observable.
+
+    Ablation, performed: hand `resume_engine` the pre-pause `engine.journal` back as
+    its `journal=` argument and the FINAL assertion reds — the appended row carries
+    the pre-pause `log_task` and `log_pos`. That one only: the two `first[...]` lines
+    above it are the PREMISE and stay green under both spellings (they describe the
+    pre-pause row, stamped either way), and the reopen half stays green too, because
+    the file is what both objects read."""
+    engine, _ = make_engine(project, [])
+    engine.journal.set_active_log("1-1-a-dev-1")  # stands in for the pre-pause session
+    engine.journal.append("run-start", cycle=1)
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_engine(project, engine)
+
+    # reopened, not re-created: the rows already on disk are still what it reads
+    assert journal_kinds(resumed) == ["run-start"]
+    resumed.journal.append("run-start", cycle=2)
+    first, second = [e for e in resumed.journal.entries() if e["kind"] == "run-start"]
+    assert (first["cycle"], second["cycle"]) == (1, 2)  # appended AFTER, same file
+    assert first["log_task"] == "1-1-a-dev-1"  # premise: the pre-pause row WAS stamped...
+    # ...with BOTH fields, so the conclusion below pins both. `0` is deliberate: it is
+    # `append`'s `except OSError: size = 0` arm, since no pane log exists on disk here.
+    assert first["log_pos"] == 0
+    assert "log_task" not in second and "log_pos" not in second
 
 
 # ----------------------------------------------------------------- happy path
@@ -1843,6 +1925,13 @@ def _harvest_carry_events(engine):
     return [entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carried"]
 
 
+def _rows(engine, kind: str) -> list[dict]:
+    """Every journal row of one kind. The negative form (`== []`) is half of what the
+    DW-237 refusal rows below assert: the refusal REPLACES the publish, so both the
+    commit row and the `-uncommitted` degrade row must be absent, not merely joined."""
+    return [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+
+
 def test_deferred_isolated_unit_carries_harvest_before_terminal_save(project):
     """A dropped failed worktree cannot be the only durable home of its finding."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -1907,17 +1996,7 @@ def test_deferred_carry_commit_failure_resumes_before_terminal_integration(proje
     assert "story-deferred" not in journal_kinds(engine)
     assert "unit-closed" not in journal_kinds(engine)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     restored = load_state(resumed.run_dir).tasks["1-1-a"]
@@ -1977,17 +2056,7 @@ def test_dev_defer_carry_failure_resumes_the_rejected_decision(project, monkeypa
     assert "story-deferred" not in journal_kinds(engine)
     assert "unit-closed" not in journal_kinds(engine)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     restored = load_state(resumed.run_dir).tasks["1-1-a"]
@@ -2068,6 +2137,96 @@ def test_done_isolated_unit_carries_gitignored_harvests_from_every_successful_pa
     assert [item["title"] for item in task.harvested_deferrals] == expected
     assert [entry.title for entry in _main_harvest_entries(project)] == expected
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1", "DW-2"]]
+
+
+def test_carry_harvest_over_undecodable_main_ledger_pauses_before_the_latch(project):
+    """The PUBLISH arm at the isolated carry (DW-231). The main ledger the unit's
+    findings are to be re-filed into cannot be read, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry`, an `ACTION REQUIRED` notice naming the ledger — and does so
+    BEFORE `harvest_carry_commit_pending` is latched: nothing records a commit
+    obligation this call never took on, nothing is written, and the phase is
+    untouched, so the `defer_reason` re-entry or `_replay_unlatched_ledger_carries`
+    re-runs the carry on resume.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and this reds with `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(bad)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == bad  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry"
+    assert refused["ledger"] == str(project.deferred_work) and "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def test_done_unit_carry_over_undecodable_main_ledger_pauses_and_resume_recarries(project):
+    """The carry pause on a FULL isolated run, and the recovery it is shaped for
+    (DW-231). The unit's dev session records a finding and files it in the unit's
+    own gitignored ledger; after the session, MAIN's ledger turns undecodable. The
+    merge lands, the carry cannot read main's ledger and pauses the run — task
+    `DONE`, `isolated_ledger_carried` still False, `ledger-read-refused` site
+    `harvest-carry`, no `harvest-carried`, main's bytes untouched. After the
+    repair, resume finds the merged-but-uncarried unit in
+    `_replay_unlatched_ledger_carries`, re-runs the carry (`resume-ledger-carry`,
+    then `harvest-carried`), files the entry into main and latches the carry —
+    with ZERO sessions re-run.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and the first half reds with `run-crash`."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    dev = wt_dev_effect(project, "1-1-a", followup_review=False, deferred=[_HARVEST_CARRY])
+
+    def dev_then_corrupt_main(spec):
+        result = dev(spec)
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        project.deferred_work.write_bytes(bad)
+        return result
+
+    engine, _ = make_engine(project, [dev_then_corrupt_main])
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and not summary.crashed
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried is False
+    assert [item["title"] for item in task.harvested_deferrals] == [_HARVEST_CARRY["summary"]]
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert _harvest_carry_events(engine) == []
+    assert "run-crash" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == bad
+
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "harvest-carried" in kinds
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried is True
 
 
 def test_carry_harvest_dedupe_stays_status_agnostic(project):
@@ -2190,6 +2349,246 @@ def test_carry_harvest_files_fresh_against_a_cross_spec_closed_twin(project):
     assert deferredwork.field_line_present(entries[1].body, "source_spec", record["source_spec"])
     (carried,) = _harvest_carry_events(engine)
     assert carried["dw_ids"] == ["DW-2"]
+
+
+def _replace_with_a_directory(path: Path) -> None:
+    """Swap a just-written operand for a DIRECTORY holding one tracked-looking file.
+
+    The shape DW-237 guards against, and the window it has to be staged in. Every
+    carry below WRITES its operand a statement or two before publishing it, so a
+    directory that was there all along never reaches the commit at all — the write
+    would have failed, or (for the board) `_carry_board_advance`'s own `is_file()`
+    pre-check would have refused first. What is reachable is the REPLACEMENT: an
+    operator, or a half-finished restore, putting a directory at the name inside the
+    window between the write and `commit_paths` — the same TOCTOU
+    `_carry_board_advance`'s docstring already names as #686. Each row opens that
+    window deterministically by wrapping the writer.
+
+    The descendant is what makes the hazard visible: `commit_paths` forces every
+    operand LITERAL, and `git add -- <dir>` stages a directory's descendants
+    RECURSIVELY, so an unrelated tree would be published under the carry's own
+    `chore(...)` message."""
+    path.unlink()
+    path.mkdir()
+    (path / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("not-a-file", "target-not-a-file", None),
+        ("absent", "target-absent", None),
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+    ],
+)
+def test_carry_harvest_refuses_a_durable_unpublishable_ledger(
+    project, monkeypatch, fault, cause, fragment
+):
+    """DW-237 at `_carry_harvested_deferrals`: the publishable-target guard its
+    sibling publishers already take, on the operand this one hands to `git add`,
+    for each of the three DURABLE causes.
+
+    The refusal never RAISES, where this method's `GitError` can: `may_degrade` asks
+    whether git can own the ledger, and a refusal answers a different question — the
+    operand is not a publishable file at all — which a replay re-reads and refuses
+    identically, so raising would cost the run its `integrate_unit` with nothing left
+    to retry. Every other statement in the frame is untouched: the latch clears and
+    `harvest-carried` is still journaled.
+
+    The three rows are three different things git would otherwise have done. A
+    DIRECTORY is staged recursively (`swept-in.txt` under a `chore(deferred-work):`
+    message). An ABSENT tracked ledger — unlinked after the append — is the
+    missing-but-TRACKED deletion `commit_paths` deliberately stages, which would
+    commit the ledger AWAY. Invalid UTF-8 is the one that, before DW-237's split,
+    arrived as `target-unreadable` and fell through: git
+    accepts any bytes, so the corrupt ledger reached HEAD; the guard now names it
+    `target-undecodable`, a durable cause, and it refuses here like the other two
+    while the transient `target-unreadable` still falls through (see the latch row
+    below). Every replacement is staged AFTER the append for the reason
+    `_replace_with_a_directory` states.
+
+    "No git" is graded at the call as well as on the outcome: a recording wrapper
+    around `verify.commit_paths` must see NO call, since an unchanged HEAD alone
+    would not tell a refusal from a `git add` that failed or staged read-only.
+
+    Ablation: delete the `refusal = _publication_refusal(...)` branch here and every
+    row reds — the directory row on `swept-in.txt` reaching `git ls-files`, the absent
+    row on HEAD advancing to the ledger's deletion, the undecodable row on HEAD
+    advancing to the corrupt blob — and all three on the `commit_paths` call count.
+    Collapse the guard's two ledger-leg `except` arms back into one returning
+    `target-unreadable` and the undecodable row alone reds the same way."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    real_append = deferredwork.append_entries
+
+    def append_then_break(ledger, specs):
+        ids = real_append(ledger, specs)
+        if fault == "not-a-file":
+            _replace_with_a_directory(ledger)
+        elif fault == "absent":
+            ledger.unlink()
+        else:
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_break)
+    commits: list[list[Path]] = []
+    real_commit = verify.commit_paths
+
+    def recording_commit(repo_root, message, paths, *a, **kw):
+        commits.append(list(paths))
+        return real_commit(repo_root, message, paths, *a, **kw)
+
+    monkeypatch.setattr(verify, "commit_paths", recording_commit)
+
+    engine._carry_harvested_deferrals(task)
+
+    [refused] = _rows(engine, "harvest-carry-refused")
+    assert refused["refuse_cause"] == cause
+    assert refused["dw_ids"] == ["DW-1"]
+    if fragment is None:
+        assert "error" not in refused  # a wrong TYPE or an absence has no fault text
+    else:
+        assert fragment in refused["error"]  # ...where the decode fault has, and carries it
+    assert _rows(engine, "harvest-carry-uncommitted") == []
+    # no git ran for the operand: nothing was handed to `commit_paths`, HEAD is
+    # untouched, the tracked ledger is still tracked and nothing under it is tracked
+    assert commits == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    tracked = git(project.project, "ls-files").splitlines()
+    assert ledger_rel in tracked
+    assert "swept-in.txt" not in tracked
+    if fault == "undecodable":
+        assert git(project.project, "show", f"HEAD:{ledger_rel}").encode() != UNDECODABLE_LEDGER
+    # ...and the frame's own bookkeeping is unchanged by the refusal
+    assert [e["dw_ids"] for e in _harvest_carry_events(engine)] == [["DW-1"]]
+    assert task.harvest_carry_commit_pending is False
+    assert not load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_carry_harvest_keeps_its_latch_when_the_ledger_becomes_unreadable(project, monkeypatch):
+    """The cause the DW-237 guard must NOT short-circuit at this site.
+
+    `target-absent`, `target-not-a-file` and `target-undecodable` are durable on-disk
+    shapes a replay reads again and refuses again, so refusing them costs nothing
+    (the row above grades all three). `target-unreadable` is
+    whatever a probe RAISED — an EACCES parent here, a WinError 64 from a
+    registered-but-not-serving UNC provider on the original DW-195/#552 report — and
+    the next pass may well not see it. This publisher alone carries a durable
+    `harvest_carry_commit_pending` latch, so turning that cause into a refusal would
+    journal an advisory success and clear the commit obligation forever. It falls
+    through to `may_degrade`/`commit_paths` instead, exactly as it did before the
+    guard landed: a TRACKED ledger may not degrade, so the `GitError` is re-raised
+    and the latch survives for the replay.
+
+    Both probes are faulted because a real unsearchable parent faults both: `stat` is
+    what `unpublishable_target`'s `"ledger"` leg reaches through
+    `deferredwork.read_for_write`, and `lstat` is `commit_paths`' own presence probe
+    since DW-239. Injected AFTER the append for the reason
+    `_replace_with_a_directory` states — a ledger unreadable from the start never
+    produces a carry to publish.
+
+    Ablation: delete the `refusal[0] == "target-unreadable"` filter at this site and
+    this reds on every assertion — the call returns cleanly, journals
+    `harvest-carry-refused`, and `harvest_carry_commit_pending` comes back False with
+    the commit obligation gone."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert verify.path_tracked(project.project, ledger_rel)  # so it may NOT degrade
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    real_append = deferredwork.append_entries
+
+    def append_then_fault(ledger, specs):
+        ids = real_append(ledger, specs)
+        for probe in ("stat", "lstat"):
+            fault_metadata_probe(monkeypatch, ledger.resolve(), probe)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_fault)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carry-refused" not in journal_kinds(engine)
+    assert "harvest-carried" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("not-a-file", "target-not-a-file", None),
+        ("absent", "target-absent", None),
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+    ],
+)
+def test_carry_story_deferred_closes_refuses_a_durable_unpublishable_ledger(
+    project, monkeypatch, fault, cause, fragment
+):
+    """The same guard at `_carry_story_deferred_closes`, whose commit was already
+    best effort — a refusal joins the `-uncommitted` row rather than replacing it,
+    because the two name different operator repairs. Every cause refuses here, the
+    three durable ones driven the way the harvest row above drives them: a
+    directory `git add` would stage recursively, a tracked ledger unlinked after
+    the write whose DELETION `commit_paths` would stage, and invalid UTF-8 git would
+    accept as any other bytes.
+
+    Ablation: delete this site's `refusal` branch and every row reds — the
+    directory row as `swept-in.txt` reaches `git ls-files` under a
+    `chore(deferred-work):` message, the absent row as HEAD advances to the
+    ledger's deletion, the undecodable row as HEAD advances to the corrupt blob."""
+    write_ledger(project, {"DW-1": "open"})
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, story_closes_intended=["DW-1"])
+    engine.state.tasks[task.story_key] = task
+    real_mark = deferredwork.mark_done_many_reopenable
+
+    def mark_then_break(ledger, *a, **kw):
+        ids = real_mark(ledger, *a, **kw)
+        if fault == "not-a-file":
+            _replace_with_a_directory(ledger)
+        elif fault == "absent":
+            ledger.unlink()
+        else:
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", mark_then_break)
+
+    engine._carry_story_deferred_closes(task)
+
+    [refused] = _rows(engine, "story-deferred-close-carry-refused")
+    assert refused["refuse_cause"] == cause and refused["dw_ids"] == ["DW-1"]
+    if fragment is None:
+        assert "error" not in refused  # a wrong TYPE or an absence has no fault text
+    else:
+        assert fragment in refused["error"]
+    assert _rows(engine, "story-deferred-close-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    tracked = git(project.project, "ls-files").splitlines()
+    assert ledger_rel in tracked
+    assert "swept-in.txt" not in tracked
+    if fault == "undecodable":
+        assert git(project.project, "show", f"HEAD:{ledger_rel}").encode() != UNDECODABLE_LEDGER
+    # the `-carried` row still lands: the flips are on disk, only the commit is not
+    assert [e["dw_ids"] for e in _rows(engine, "story-deferred-close-carried")] == [["DW-1"]]
 
 
 def _in_place_policy(*, limits: LimitsPolicy | None = None):
@@ -2603,15 +3002,7 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
 
     monkeypatch.setattr(deferredwork, "append_entries", real_append)
-    failed_state = load_state(engine.run_dir)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=failed_state,
-    )
+    resumed, _ = resume_engine(project, engine)
     after_story: list[str] = []
     monkeypatch.setattr(
         resumed,
@@ -2621,7 +3012,7 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     resumed._replay_unlatched_ledger_carries()
 
     restored = load_state(resumed.run_dir).tasks[task.story_key]
-    assert failed_state.tasks[task.story_key].isolated_ledger_carried is True
+    assert resumed.state.tasks[task.story_key].isolated_ledger_carried is True
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is True
     assert after_story == [task.story_key]
@@ -2671,14 +3062,7 @@ def test_tracked_harvest_carry_commit_failure_retries_its_pending_commit(
     assert failed.isolated_ledger_carried is False
 
     monkeypatch.setattr(verify, "commit_paths", real_commit)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    resumed, _ = resume_engine(project, engine)
     resumed._replay_unlatched_ledger_carries()
 
     restored = load_state(resumed.run_dir).tasks[task.story_key]
@@ -2904,7 +3288,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     assert not project.deferred_work.exists()
     assert "unit-merged" not in journal_kinds(engine)
 
-    monkeypatch.setattr(engine.journal, "append", real_append)
+    # no `append` restore: the resumed engine reopens its own `Journal` (DW-241)
     replay_collision_refs: list[str] = []
     replay_protected: list[object] = []
     replay_merge_refs: list[str] = []
@@ -2929,14 +3313,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
 
     monkeypatch.setattr(verify, "clean_incoming_collisions", record_collision_ref)
     monkeypatch.setattr(verify, "merge_branch", record_merge_ref)
-    resumed = Engine(
-        paths=project,
-        policy=wt_policy(merge_strategy=resumed_strategy),
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    resumed, _ = resume_engine(project, engine, policy=wt_policy(merge_strategy=resumed_strategy))
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -3006,15 +3383,8 @@ def test_merge_replay_rejects_a_unit_branch_advanced_after_recorded_source(
     advanced_head = rev_parse_head(unit_path)
     assert advanced_head != crashed.commit_sha
 
-    monkeypatch.setattr(engine.journal, "append", real_append)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    # no `append` restore: the resumed engine reopens its own `Journal` (DW-241)
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.paused and summary.escalated == 1 and not summary.crashed
@@ -3059,17 +3429,7 @@ def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project
     assert not Path(crashed.worktree_path).exists()
     assert not project.deferred_work.exists()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -3124,17 +3484,7 @@ def test_crashed_post_merge_harvest_carry_replays_when_teardown_leaves_directory
 
     monkeypatch.setattr(verify, "worktree_remove", real_remove)
     monkeypatch.setattr(workspace_mod, "_rmtree_confined", real_rmtree)
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -4247,21 +4597,13 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert len(worktree_list(project.project)) == 2
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([wt_review_effect(project, "1-1-a", clean=True)])
     in_place = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
         scm=ScmPolicy(isolation="none"),
     )
-    resumed = Engine(
-        paths=project,
-        policy=in_place,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
+    resumed, adapter = resume_engine(
+        project, engine, [wt_review_effect(project, "1-1-a", clean=True)], policy=in_place
     )
     summary2 = resumed.run()
 
@@ -4430,18 +4772,11 @@ def test_worktree_crash_restart_discards_stale_worktree(project):
     engine._save()
 
     # resume with a full dev+review script → restart should succeed
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter(
-        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
-    )
-    resumed = Engine(
-        paths=project,
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=wt_policy(),
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
     )
     summary = resumed.run()
 
@@ -4495,22 +4830,12 @@ def test_worktree_resume_committing_finishes_and_merges(project):
     engine.state.tasks["1-1-a"] = task
     engine._save()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
     in_place = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
         scm=ScmPolicy(isolation="none"),
     )
-    resumed = Engine(
-        paths=project,
-        policy=in_place,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine, policy=in_place)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed
@@ -6393,18 +6718,11 @@ def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):
 
     monkeypatch.setattr(verify, "worktree_remove", always_fail)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter(
-        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
-    )
-    resumed = Engine(
-        paths=project,
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=wt_policy(),
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
     )
     summary = resumed.run()
 
@@ -6768,6 +7086,49 @@ def test_awaiting_operator_isolated_unit_carries_its_board_advance(project):
     ]
 
 
+def test_board_carry_refuses_a_board_replaced_by_a_directory(project, monkeypatch):
+    """DW-237 at `_carry_board_advance`, the one guarded site whose family is
+    `"store"` rather than `"ledger"`: the family names the validation POLICY, not the
+    file's role — `"ledger"` is the leg that additionally asks
+    `deferredwork.read_for_write`, and a board wants only "a regular file is there".
+
+    Staged as a REPLACEMENT for the reason `_replace_with_a_directory` states, and
+    here the code says so itself: the method's own `is_file()` pre-check refuses a
+    board that was a directory all along, so what remains is the window that check
+    leaves open — the #686 TOCTOU its comment names. The `target` field rides the row
+    beside `refuse_cause`, as it does on all four of this method's sibling records.
+
+    Ablation: delete this site's `refusal` branch and this reds on both HEAD
+    assertions — `swept-in.txt` lands under a `chore(sprint-status):` message."""
+    from bmad_loop import engine as engine_module
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, board_advance_intended="done")
+    engine.state.tasks[task.story_key] = task
+    real_advance = engine_module.sprint_advance
+
+    def advance_then_replace(board, *a, **kw):
+        landed = real_advance(board, *a, **kw)
+        _replace_with_a_directory(board)
+        return landed
+
+    monkeypatch.setattr(engine_module, "sprint_advance", advance_then_replace)
+
+    engine._carry_board_advance(task)
+
+    [refused] = _rows(engine, "board-advance-carry-refused")
+    assert refused["refuse_cause"] == "target-not-a-file" and refused["target"] == "done"
+    assert "error" not in refused
+    assert _rows(engine, "board-advance-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert _sprint_carry_commits(project) == []
+    # the advance itself happened and is still reported: only the commit was withheld
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+
+
 def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
     """The common shape: a TRACKED board needs no carry and must not get a commit.
 
@@ -6893,17 +7254,7 @@ def test_crashed_post_merge_board_advance_replays_from_its_record(project):
     assert not crashed.story_closes_intended and not crashed.bundle_closes_intended
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -6957,16 +7308,7 @@ def test_replayed_board_carry_leaves_an_operators_edit_out_of_its_commit(project
     board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
     before = board.read_text(encoding="utf-8")
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed
@@ -7028,16 +7370,7 @@ def test_replayed_board_carry_refuses_before_it_overwrites_an_operators_row_edit
     set_sprint(project, "1-1-a", "awaiting-operator")
     before = board.read_bytes()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed
@@ -7088,16 +7421,7 @@ def test_replayed_board_carry_still_commits_a_crashed_passs_own_advance(project)
     sprintstatus.advance(board, "1-1-a", "done")
     assert rel in verify.dirty_paths(project.project)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed
@@ -7155,16 +7479,7 @@ def test_replayed_board_carry_with_a_deleted_board_journals_failed_not_a_crash(p
     board.unlink()  # the operator's window is the crash itself
     assert verify.dirty_paths(project.project).get(rel, "").strip() == "D"  # proving turns ON
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     resumed._replay_unlatched_ledger_carries()  # must not raise
 
     kinds = journal_kinds(resumed)
@@ -7193,16 +7508,7 @@ def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(proj
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
     before = project.sprint_status.read_bytes()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -7285,16 +7591,7 @@ def test_a_park_confirms_only_after_its_board_advance_is_carried(project):
     assert not parked.confirmable
     assert parked.committed_drift() == "the board now says ready-for-dev"
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     assert resumed.run().awaiting_operator == 1
 
     (parked,) = operatoractions.resolve(project.project, project)
@@ -7383,17 +7680,7 @@ def test_crashed_post_merge_story_close_replays_from_its_record(project):
     assert not crashed.harvested_deferrals
     assert _ledger_entry(project, "DW-1").open
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -7446,18 +7733,11 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
         == "1-1-a"
     )
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter(
-            # the resolve outcome: the story no longer claims to close anything
-            [wt_dev_effect(project, "1-1-a", followup_review=False)]
-        ),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        # the resolve outcome: the story no longer claims to close anything
+        [wt_dev_effect(project, "1-1-a", followup_review=False)],
     )
     summary = resumed.run()
 
@@ -7516,16 +7796,7 @@ def test_a_replayed_commit_still_records_the_story_close(project, monkeypatch):
     assert durable.phase == Phase.COMMITTING
     assert not durable.story_closes_intended  # never reached disk — the replay re-derives it
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused

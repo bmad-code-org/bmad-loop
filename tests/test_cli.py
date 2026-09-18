@@ -990,6 +990,13 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
             {"store": ("target-not-a-file", None)},
             "not committed to git: decisions.json (target-not-a-file)",
         ),
+        # DW-237's token, which ONLY the ledger family can produce (the store leg
+        # asks nothing about bytes): the decode fault rides after the cause.
+        (
+            {"ledger": ("target-undecodable", "deferred-work.md is not valid UTF-8: bad byte")},
+            "not committed to git: deferred-work.md "
+            "(target-undecodable: deferred-work.md is not valid UTF-8: bad byte)",
+        ),
     ],
 )
 def test_decisions_names_a_written_answer_it_could_not_publish(
@@ -1366,19 +1373,29 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
     nothing pinned it in either direction.
 
     Both legs of the guard are graded. `undecodable` was already degraded by DW-146's
-    `read_for_observation` conversion. `metadata` is the leg moving `is_file()` inside
-    that helper's try created: an `EACCES`-class fault on the probe used to escape the
-    helper entirely and reach `main`'s backstop as exit 1, so this row is the only
-    thing that would notice it silently becoming exit 0.
+    `read_for_observation` conversion. `metadata` is the leg the helper's probe
+    guard created: an `EACCES`-class fault on the probe used to escape the helper
+    entirely and reach `main`'s backstop as exit 1, so this row is the only thing
+    that would notice it silently becoming exit 0. Since DW-254 that probe is
+    `stat` + `S_ISREG`, so the fault is injected on `stat` with `is_file` pinned
+    False (the simulated-3.14 shape) — injected on `is_file`, as it was before
+    DW-254, it would never fire and the row would grade nothing.
 
-    Ablation: hoisting `read_for_observation`'s `is_file()` back above its `try`
-    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop) —
-    the leg isolated to this build. Reverting
+    What this row CANNOT tell apart, stated so nobody expects it to: a refused
+    ledger degraded to `("", None)` (the pre-DW-254 3.14 reading) and one
+    degraded to an attributed fault both leave `pending_missed_decisions` with no
+    open ids and no decision line, so restoring the helper's `is_file()` probe
+    leaves this row green — that switch is pinned at the helper by
+    `test_read_for_observation_degrades_on_a_metadata_fault`. This row pins the
+    surface: status exits 0 and drops the line, never exit 1.
+
+    Ablation: hoisting `read_for_observation`'s `stat` probe above its `try`
+    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop)
+    — the leg isolated to this build. Reverting
     `decisions.pending_missed_decisions`' read to
-    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens BOTH
-    rows, since that bare read re-exposes the codec error and the bare `is_file()`
-    beside it re-exposes the metadata fault; verified in both directions."""
-    from conftest import write_ledger, write_sprint
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens the
+    `undecodable` row, since that bare read re-exposes the codec error."""
+    from conftest import fault_metadata_probe, write_ledger, write_sprint
 
     install_bmad_config(project)
     write_sprint(project, {})
@@ -1388,13 +1405,12 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
         project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
     else:
         ledger, real = project.deferred_work, Path.is_file
-
-        def boom(self, *a, **kw):
-            if self == ledger:
-                raise PermissionError(13, "Permission denied")
-            return real(self, *a, **kw)
-
-        monkeypatch.setattr(Path, "is_file", boom)
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     assert cli.main(["status", "--project", str(project.project)]) == 0
 
@@ -7538,10 +7554,10 @@ def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
 # row) and only then meet a ledger it could not read, while every repair steer in
 # the product points at `bmad-loop sweep`. These rows pin the refusal and its
 # precedence, the scope on either side of it (rows that fail loudly if the gate is
-# ever widened past "sweep run, ledger does not decode"), the two declines the gate
-# makes so that `_prepare_resume_locked` keeps its own messages verbatim, and the
-# two boundaries the contract froze as behavior: the OSError propagation this gate
-# must NOT catch, and the accepted probe-to-lock race.
+# ever widened past "sweep run, ledger cannot be read"), the two declines the gate
+# makes so that `_prepare_resume_locked` keeps its own messages verbatim, the
+# accepted probe-to-lock race, and — since DW-234 reversed the frozen exclusion —
+# the OSError refusal with its own permissions-or-storage repair.
 
 
 def _resume_gate_run(
@@ -7643,10 +7659,11 @@ def test_resume_sweep_ledger_refusal_follows_the_unknown_warning(project, monkey
 
 
 def test_resume_story_run_ignores_undecodable_ledger(project, monkeypatch):
-    # Same corrupt ledger, `run_type` "story" (the default). Not because a story
-    # run is safe over it — the base Engine reads the ledger through the same
-    # `read_for_write` and catches nothing — but because the recorded decision
-    # scopes this gate to sweeps and leaves those reads to DW-146.
+    # Same corrupt ledger, `run_type` "story" (the default). The gate is scoped to
+    # sweeps by the recorded decision, and since DW-231 that decline is SAFE rather
+    # than merely decided: the base Engine routes its own `read_for_write` sites —
+    # observation reads degrade, the two publish reads pause the run with a repair
+    # notice — so a story run over these bytes no longer arms and crashes.
     reached = _resume_gate_run(
         project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
     )
@@ -7762,27 +7779,26 @@ def test_resume_control_alias_sweep_keeps_its_own_refusal_over_ledger(project, m
     assert "`bmad-loop sweep`" not in err
 
 
-def test_resume_sweep_os_refused_ledger_propagates_to_mains_tail(project, monkeypatch, capsys):
-    """`read_for_write`'s documented `OSError` propagation is preserved, not caught.
+def test_resume_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys
+):
+    """The DW-234 row, replacing `..._os_refused_ledger_propagates_to_mains_tail`.
 
-    An `except OSError` arm carrying its own permissions-or-storage repair was
-    written for this surface and then struck from the frozen contract, so this row
-    guards the EXCLUSION rather than the excluded message: the bare propagation to
-    `main`'s tail, plus the absence of every clause that arm would have printed.
-    The steer that propagation loses is real and is recorded as a deferral.
+    An OS-refused ledger read used to reach `main`'s tail as a routeless
+    `error: [Errno 13] …` — the `except OSError` arm was written, struck by the
+    DW-204 resolution on scope grounds, and pinned OUT by the row this replaces.
+    DW-234 carries the accepted decision to add it back: the gate now refuses with
+    the permissions-or-storage repair `sweep._notify_ledger_repair` gives the sweep
+    run for the same fault, plus every clause `_assert_ledger_refusal` pins.
 
-    What propagation DOES surface is the errno line and the ledger's own path — a
-    real `OSError` out of the reader carries `filename`, so the stub is raised with
-    it too rather than pinning an absence production would violate. What it does
-    not surface is a route: no `bmad-loop sweep` steer, no repair, no resumability
-    note. Ablation: restore an `except OSError` arm returning a refusal and this
-    row fails on the `error:` surface and on those absences.
+    The errno text and the path still surface (they are the fault), and the run is
+    never armed. Ablation: delete the `except OSError` arm in
+    `runs.unreadable_sweep_ledger` and this row fails on `error: [Errno 13]`
+    returning to stderr with none of the route.
 
-    The ledger on disk is DECODABLE, so the refused read is the only fault in play
-    — seeding undecodable bytes under a stub that always raises would describe a
-    file that is two faults at once and prove nothing about either. Monkeypatched
-    rather than chmod'd: a real mode bit does not hold as root and does not exist
-    on Windows, so the row would silently stop testing anything."""
+    The ledger on disk is DECODABLE, so the refused read is the only fault in play.
+    Monkeypatched rather than chmod'd: a real mode bit does not hold as root and
+    does not exist on Windows, so the row would silently stop testing anything."""
     from bmad_loop import deferredwork
 
     reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER)
@@ -7794,16 +7810,12 @@ def test_resume_sweep_os_refused_ledger_propagates_to_mains_tail(project, monkey
     rc = cli.main(["resume", "--project", str(project.project), "r1"])
     assert rc == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
-    assert "error: [Errno 13]" in err  # `main`'s tail, routeless by decision
-    # `OSError.__str__` quotes `filename` through `repr`, so on Windows the
-    # backslashes in the tail are doubled; compare the same rendering.
-    assert repr(str(project.deferred_work)) in err  # the errno's own filename, not a refusal
-    # None of the struck arm's wording: no route, no repair, no resumability note.
-    assert "`bmad-loop sweep`" not in err
-    assert "permissions or storage" not in err
-    assert "Repair the ledger by hand" not in err
-    assert "stays resumable" not in err
-    assert reached == []  # propagation still stops short of arming the run
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err  # the OS fault, attributed by class
+    assert "permissions or storage" in err  # the OS repair, not the bytes one
+    assert "Repair the ledger by hand" not in err  # the decode refusal's wording stays its own
+    assert "error: [Errno 13]" not in err  # no longer `main`'s routeless tail
+    assert reached == []  # never armed the run
 
 
 def test_resume_sweep_ledger_refusal_displaces_the_base_skills_refusal(
@@ -7978,7 +7990,8 @@ def test_resolve_refuses_sweep_run_on_undecodable_ledger(project, monkeypatch, c
 
 def test_resolve_story_run_ignores_undecodable_ledger(project, monkeypatch, capsys):
     # Scope is the same on this call site as on `resume`'s: sweeps only. A story run
-    # over the same corrupt ledger is DW-146 scope, not this gate's.
+    # over the same corrupt ledger is safe to decline since DW-231: the engine routes
+    # its own `read_for_write` sites, so the decline no longer hands it to a crash.
     _run_dir, rearms = _resolve_gate_run(
         project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
     )
@@ -8055,10 +8068,15 @@ def test_resolve_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch
     assert "`bmad-loop sweep`" not in err
 
 
-def test_resolve_sweep_os_refused_ledger_propagates(project, monkeypatch, capsys):
-    # The `OSError` exclusion holds at this call site too: `read_for_write` propagates
-    # to `main`'s tail rather than being converted into the ledger refusal, and nothing
-    # is re-armed on the way out.
+def test_resolve_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys
+):
+    """The DW-234 row at the `resolve` call site, replacing
+    `test_resolve_sweep_os_refused_ledger_propagates`: the same `OSError` arm
+    answers here, so an OS-refused ledger names its repair instead of reaching
+    `main`'s tail, and nothing is re-armed on the way out — the escalation stays
+    resolvable. Ablation: delete the arm and `error: [Errno 13]` returns with no
+    `bmad-loop sweep` route."""
     from bmad_loop import deferredwork
     from bmad_loop.journal import load_state
 
@@ -8073,9 +8091,10 @@ def test_resolve_sweep_os_refused_ledger_propagates(project, monkeypatch, capsys
     monkeypatch.setattr(deferredwork, "read_for_write", _refused)
     assert cli.main(["resolve", "--project", str(project.project), "r1"]) == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
-    assert "error: [Errno 13]" in err
-    assert "`bmad-loop sweep`" not in err
-    assert "Repair the ledger by hand" not in err
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err
+    assert "permissions or storage" in err
+    assert "error: [Errno 13]" not in err
     assert rearms == []
     _assert_escalation_intact(run_dir, before)
 
@@ -11524,6 +11543,132 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
 
     assert sentinel.is_file()
     assert "verify commands passed" in capsys.readouterr().out
+
+
+def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
+    """DW-237 at `_land_confirmation`, which reached `commit_paths` with three
+    operands and no publishable-target guard on any of them.
+
+    `commit_paths` forces every operand LITERAL, so `git add -- .bmad-loop/operator`
+    on a DIRECTORY at the record's name stages its descendants RECURSIVELY — an
+    unrelated tree published under a `chore(operator):` message. The drop is PER
+    OPERAND, like `decisions.apply_pre_answer`'s GATE TWO and like the `board_ignored`
+    drop beside it: the spec and the board still commit, and the confirmation still
+    exits 0, because the on-disk state is the value and git history is best effort.
+
+    Ablation: delete `_land_confirmation`'s per-operand guard loop and this reds —
+    `swept-in.txt` lands in `git ls-files` (or, where `git add` refuses the set,
+    the spec and board commit vanishes with it)."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    real_drop = operatoractions.drop
+
+    def drop_then_replace(*a, **kw):
+        # The drop unlinks the record; a directory arriving at its name afterwards is
+        # the window this guard closes. Staged through the seam because the drop is
+        # what creates the absence the #356 contract otherwise keeps as a deletion.
+        result = real_drop(*a, **kw)
+        record.mkdir(parents=True, exist_ok=True)
+        (record / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_replace)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert "target-not-a-file" in out.err and "✓ 1-1-a confirmed" in out.out
+    # the surviving operands still moved into history together...
+    assert git(project.project, "rev-parse", "HEAD") != head
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert sp.relative_to(project.project).as_posix() in changed
+    # ...and not one descendant of the directory rode in with them
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert not any(name.endswith("swept-in.txt") for name in changed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    # the dropped operand is dropped WHOLE: the record's own deletion does not ride
+    # this commit either, which is the honest cost of refusing its path — the
+    # `chore(operator):` commit is not the place to guess what belongs at a name a
+    # directory is sitting on, and HEAD still carries the record for the operator to
+    # reconcile by hand.
+    assert ".bmad-loop/operator/1-1-a.json" not in changed
+    assert git(project.project, "ls-files", "--", ".bmad-loop/operator/1-1-a.json").strip()
+
+
+@pytest.mark.parametrize("refused", ["record", "all"])
+def test_confirm_drops_operands_it_cannot_resolve(project, capsys, monkeypatch, refused):
+    """The OTHER cause `_land_confirmation`'s per-operand guard can return, and the
+    arm that grades `_publication_refusal`'s `except (OSError, RuntimeError)` fold:
+    `Path.resolve` fails before the family leg is ever asked, so without the fold a
+    bare `OSError` escapes into a publish that is best effort by construction.
+
+    The `all` row is the empty-survivors arm, and it is graded on the CALL rather
+    than on HEAD: `commit_paths` happens to no-op on an empty operand list, so a HEAD
+    assertion alone would pass whether or not the branch exists. What the branch
+    buys is that git is not entered at all — no `commit_paths`, and therefore none of
+    the `status`/`add` machinery inside it — rather than an empty list being handed
+    over and the function left to decide what that means. The confirmation still
+    exits 0 either way, because the spec's flip and the board's advance are already
+    on disk and git history is best effort here exactly as it is in `decisions`.
+
+    The refusal is installed through the `drop` seam for the reason its sibling row
+    above states: the operands are read and written by the statements ahead of the
+    guard, and only the window between the drop and the commit is this guard's.
+
+    Ablation: delete `_publication_refusal`'s `except (OSError, RuntimeError)` and
+    both rows red with the stubbed `OSError` escaping `cli.main`. Delete the
+    `if survivors:` test and the `all` row reds on its `commit_paths` call count."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    targets = [record] if refused == "record" else [sp, project.sprint_status, record]
+    real_drop = operatoractions.drop
+
+    def drop_then_refuse(*a, **kw):
+        result = real_drop(*a, **kw)
+        refuse_to_resolve(monkeypatch, *targets)
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_refuse)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+    published: list[list] = []
+    real_commit = cli.verify.commit_paths
+
+    def spy_commit(repo, message, paths):
+        published.append(list(paths))
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(cli.verify, "commit_paths", spy_commit)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert out.err.count("target-unreadable") == len(targets)
+    assert UNRESOLVABLE in out.err  # the fault text rides the warning
+    assert "✓ 1-1-a confirmed" in out.out
+    # the on-disk confirmation happened either way — git history is what varies
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+    if refused == "all":
+        assert published == []  # git was never entered, not entered with nothing
+        assert git(project.project, "rev-parse", "HEAD") == head
+    else:
+        assert [len(paths) for paths in published] == [2]  # spec + board, not the record
+        changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+        assert sp.relative_to(project.project).as_posix() in changed
+        assert ".bmad-loop/operator/1-1-a.json" not in changed  # the dropped operand
 
 
 def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
