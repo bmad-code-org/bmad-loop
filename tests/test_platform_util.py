@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 import pytest
+from conftest import NUL_PATH_RESOLVE_FAULTS, refuse_to_resolve
 
 from bmad_loop import platform_util
 
@@ -1652,6 +1653,28 @@ def test_resolve_or_lexical_degrades_when_the_os_refuses(exc, monkeypatch, capsy
     assert captured.out == ""  # `<cmd> --json` is a one-object-on-stdout contract
     assert _REFUSAL in captured.err, "the note must carry the cause, not just its own text"
     assert "cannot canonicalize" in captured.err
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_resolve_or_lexical_handles_value_error_family_with_safe_stderr(
+    resolve_fault, monkeypatch, tmp_path
+):
+    """The fallback note must remain encodable when the path itself is not."""
+    import io
+
+    path = tmp_path / "caf\xe9-\ud800-path"
+    refuse_to_resolve(monkeypatch, path, error=resolve_fault)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    assert platform_util.resolve_or_lexical(path) == path.absolute()
+
+    stderr.flush()
+    note = stderr_bytes.getvalue().decode("ascii")
+    assert "cannot canonicalize" in note
+    assert "caf\\xe9-\\ud800-path" in note
+    assert str(resolve_fault) in note
 
 
 def test_resolve_or_lexical_keeps_a_relative_path_relative_to_the_cwd(monkeypatch, capsys, unnoted):

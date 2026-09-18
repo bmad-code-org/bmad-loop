@@ -867,6 +867,12 @@ class BmadLoopApp(App[None]):
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
+        # Surface the shared ledger refusal here before it disappears into the
+        # detached CLI window. The probe owns the wording and scope (DW-270).
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        if refusal is not None:
+            self.notify(refusal, severity="error", markup=False)
+            return
         try:
             win_id = launch.resume_detached(self.project, run_id)
         except launch.LaunchError as e:
@@ -1006,8 +1012,8 @@ class BmadLoopApp(App[None]):
         # spent the escalation, and it would refuse into a pane nobody opens — so the
         # refusal is raised here, on screen, with the escalation still armed. The
         # probe answers or declines; this surface owns the channel (a toast, where the
-        # CLI prints to stderr). Note `_do_resume` is deliberately NOT gated: it
-        # mutates nothing before launching, so its child's refusal costs nothing.
+        # CLI prints to stderr). `_do_resume` also probes before launching so plain
+        # resume shows the refusal on the dashboard too (DW-270).
         # Since DW-234 the probe refuses an OS-refused read too, with the same
         # repair route the CLI prints, so there is nothing left to catch here.
         refusal = runs.unreadable_sweep_ledger(self.project, run_dir)

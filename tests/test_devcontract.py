@@ -78,6 +78,66 @@ def test_parse_bold_status():
     assert arr.status == "blocked"
 
 
+def test_parse_independently_bold_status_value():
+    arr = devcontract.parse_auto_run_result(
+        "## Auto Run Result\n\n**Status:** **done**\n\nsummary\n"
+    )
+    assert arr.status == "done"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Status: done", "done"),
+        ("- Status: blocked", "blocked"),
+        ("**Status:** in-review", "in-review"),
+        ("Status: **done**", "done"),
+        ("**Status**: **done**", "done"),
+        ("- **Status: done**", "done"),
+        ("\t*\tStAtUs\u00a0:\u00a0DoNe trailing prose", "done"),
+    ],
+)
+def test_parse_status_preserves_existing_line_shapes(line, expected):
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.status == expected
+
+
+def test_parse_bare_status_label_does_not_consume_next_line():
+    r"""Ablation: restoring ``\s*`` to the post-colon structural gaps makes this
+    capture ``done`` from the next line instead of failing closed."""
+    arr = devcontract.parse_auto_run_result("## Auto Run Result\n\nStatus:\ndone\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\r", "\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["cr", "lf", "vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+def test_parse_bare_status_label_rejects_vertical_separators(separator):
+    r"""Ablation: ``[^\S\r\n]`` still admits every row after LF, allowing
+    those split-line separators to join the bare label to ``done``."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\nStatus:{separator}done\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Status\n: done", "**Status\n:** done", "**Status**\n: **done**"],
+)
+def test_parse_status_colon_must_share_label_line(line):
+    r"""Ablation: restoring ``\s*`` before the colon makes both plain and
+    bold labels consume punctuation and values from the following line."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.present and arr.status == ""
+
+
+def test_parse_skips_bold_status_inside_fenced_marker_detail():
+    text = "## Auto Run Result\n\n" "```md\n**Status:** **blocked**\n```\n\n" "Status: done\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+
+
 def test_parse_last_section_wins():
     text = (
         "## Auto Run Result\n\nStatus: blocked\n\n"
@@ -289,6 +349,34 @@ def test_synth_status_inconsistent_flagged(tmp_path):
     sp = _spec(tmp_path / "s.md", status="done", auto_run="blocked")
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
     assert out.status_consistent is False
+
+
+def test_synth_bold_marker_mismatch_keeps_frontmatter_authoritative(tmp_path):
+    """Ablation: removing the value-bold opener makes the marker unreadable, so
+    the mismatch disappears and ``status_consistent`` incorrectly becomes true."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\n**Status:** **blocked**\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "done"
+    assert out.status_consistent is False
+
+
+def test_synth_bare_status_label_does_not_consume_next_line(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="blocked",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\nStatus:\ndone\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "blocked"
+    assert out.status_consistent is True
 
 
 def test_synth_blank_frontmatter_status_falls_back_to_prose_done(tmp_path):
@@ -506,6 +594,22 @@ def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_pa
     assert rj["park_asserted"] is False  # a done marker is no park
 
 
+def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
+    """The public grammar requires a separator between ``Artifact`` and ``only``.
+
+    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
+    fail because the concatenated label mints an artifact-only receipt again.
+    """
+    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
+    assert rj is not None and rj["artifact_only"] is False
+
+
 def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
     """The advertised Status-like bold shapes include a closing delimiter after
     the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
@@ -545,6 +649,31 @@ def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
     assert rj["artifact_only"] is False
     assert devcontract._artifact_only_asserted("Artifact only:\ntrue") is False
     assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+@pytest.mark.parametrize("gap", ["after-colon", "before-colon", "leading-bullet"])
+def test_artifact_only_rejects_vertical_separators(separator, gap):
+    r"""The same fail-open DW-285 closed for `Status:`: `[^\S\r\n]` admits
+    every separator `str.splitlines` treats as a line boundary except CR/LF,
+    while MULTILINE `$` anchors on LF alone — so `Artifact only:\x0btrue` read
+    as one line and minted the receipt where every other reader of the marker
+    sees a bare label and a stray token (#795 review). Every gap now takes
+    `_HORIZONTAL_WS_RE`; NBSP and tab still assert.
+
+    Ablation: restore `[^\S\r\n]` to any one gap and its row mints."""
+    if gap == "after-colon":
+        line = f"Artifact only:{separator}true"
+    elif gap == "before-colon":
+        line = f"Artifact only{separator}: true"
+    else:
+        line = f"-{separator}Artifact only: true"
+    assert devcontract._artifact_only_asserted(line) is False
+    assert devcontract._artifact_only_asserted(line.replace(separator, "\u00a0")) is True
 
 
 def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):

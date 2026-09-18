@@ -79,6 +79,11 @@ class GatesPolicy:
 class LimitsPolicy:
     max_review_cycles: int = 3
     max_dev_attempts: int = 2
+    # Raw ignored artifact bytes admitted into a frozen publication payload.
+    # These are MiB policy values; the publication helper receives byte limits
+    # so it remains independent of the policy model.
+    artifact_file_max_mb: int = 5
+    artifact_payload_max_mb: int = 10
     # additional review rounds the orchestrator grants *solely* because a
     # completed round finalized the story (status: done) yet still set
     # `followup_review_recommended: true`. Once this many such self-recommended
@@ -849,6 +854,18 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         max_dev_attempts=_typed_int(
             limits_d, "limits", "max_dev_attempts", LimitsPolicy.max_dev_attempts
         ),
+        artifact_file_max_mb=_typed_int(
+            limits_d,
+            "limits",
+            "artifact_file_max_mb",
+            LimitsPolicy.artifact_file_max_mb,
+        ),
+        artifact_payload_max_mb=_typed_int(
+            limits_d,
+            "limits",
+            "artifact_payload_max_mb",
+            LimitsPolicy.artifact_payload_max_mb,
+        ),
         max_followup_reviews=_typed_int(
             limits_d, "limits", "max_followup_reviews", LimitsPolicy.max_followup_reviews
         ),
@@ -898,6 +915,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
+    if limits.artifact_file_max_mb < 1:
+        raise PolicyError(
+            f"limits.artifact_file_max_mb must be >= 1: got {limits.artifact_file_max_mb}"
+        )
+    if limits.artifact_payload_max_mb < 1:
+        raise PolicyError(
+            f"limits.artifact_payload_max_mb must be >= 1: got {limits.artifact_payload_max_mb}"
+        )
     if limits.max_followup_reviews < 0:
         raise PolicyError(
             f"limits.max_followup_reviews must be >= 0: got {limits.max_followup_reviews}"
@@ -1282,6 +1307,8 @@ retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
 [limits]
 max_review_cycles = 3
 max_dev_attempts = 2
+artifact_file_max_mb = 5    # raw-byte cap for each ignored artifact selected for publication
+artifact_payload_max_mb = 10 # raw-byte cap across all selected ignored publication artifacts
 max_followup_reviews = 1     # additional review rounds granted solely because a finalized (status: done) round still recommended a follow-up; once spent, such a round converges + refiles the recommendation instead of burning another cycle. 0 = never honor a pass's own recommendation
 session_timeout_min = 90
 git_timeout_s = 120          # bound on any single git subprocess; exceeding it pauses/degrades (never crashes the run) — raise on a loaded host or a very large worktree

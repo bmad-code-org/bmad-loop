@@ -100,6 +100,29 @@ Every entry in the triage universe appears in exactly one category. The orchestr
 this deterministically; a missed or double-counted entry fails the whole
 result and burns a retry.
 
+For a bundle whose intended deliverables are confined to ignored content in the
+configured `implementation_artifacts` directory strictly inside the code repository,
+describe those deliverables and their location in the existing `intent` field.
+Do not add a triage receipt field or assert a receipt on the executing session's
+behalf. That session may write `Artifact only: true` on its own line beside
+`Status:`, with `true` on the same line as the label and no trailing explanation,
+in its own last genuine `## Auto Run Result` only when its actual deliverables
+qualify, never based on old artifacts alone. The marker must be authored in the
+current session, outside fenced blocks and without an orchestrator repair note; frontmatter does
+not assert it, and the value must be the strict boolean `true`. The ordinary
+proof-of-work probe must first positively find no changes, and the receipt gate
+requires a positive ignored-file listing scoped to that directory. All other
+verification and ledger-close checks still apply. In an isolated worktree, successful
+integration publishes the accepted ignored bundle spec before teardown. Additional
+ignored regular files must be named in the accepted spec's `artifact_deliverables`
+frontmatter list, using exact paths relative to `implementation_artifacts`. Describe
+these intended outputs in the bundle's `intent` so the executing session can declare
+them. Directories, globs, absolute paths, traversal, symlinks, and the orchestrator-owned
+ledger and sprint board are forbidden; undeclared files are not copied. Publication
+checks destination baselines captured before execution. Conflicting main-checkout
+changes pause publication and retain source artifacts for recovery. The receipt
+alone does not publish files.
+
 ### Step 4: Write the result and end your turn
 
 Write the result.json per `./automation-mode.md` and state in one line how

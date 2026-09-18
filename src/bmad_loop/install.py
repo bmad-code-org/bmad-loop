@@ -1314,7 +1314,7 @@ def _walk_traversable_files(
     if _is_dir(src):
         try:
             real = str(src.resolve()) if isinstance(src, Path) else None
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             if not _suppress_errors:
                 raise
             yield rel, src
@@ -1425,9 +1425,9 @@ def _copy_traversable(
     """Recursively copy a Traversable tree, optionally confined to a worktree.
 
     ``skip_existing`` remains the install helper's opt-in per-file no-clobber mode.
-    Supplying ``worktree`` makes no-clobber mandatory and adds destination
-    containment plus per-entry OSError degradation: provisioning never escapes the
-    worktree through a link or crashes the run because one entry cannot be read.
+    Supplying ``worktree`` makes no-clobber mandatory, confines destinations,
+    preserves the existing per-entry ``OSError`` handling for filesystem operations,
+    and degrades resolve-time invalid paths at containment observers.
     ``repo_root`` additionally refuses real source entries resolving outside the main
     checkout. Wheel Traversables have no source containment leg.
 
@@ -1455,7 +1455,7 @@ def _copy_traversable(
             return True
         try:
             return entry.resolve().is_relative_to(repo_root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def target_for(rel: str) -> Path:
@@ -1466,7 +1466,7 @@ def _copy_traversable(
             return True
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def should_descend(rel: str, entry) -> bool:

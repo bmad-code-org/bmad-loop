@@ -584,6 +584,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "located",
         "log_pos",
         "malformed",
+        # `artifact-publication-refused` size-admission diagnostics. The two
+        # counts are raw byte totals derived by the bounded publication reader,
+        # and `measurement_is_lower_bound` is the bool saying the count stopped
+        # at the limit (the reader is bounded, so a growing file is measured "at
+        # least"); none is authored text or an identifier, and the refused path
+        # remains inside dropped `error`.
+        "limit_bytes",
+        "measured_bytes",
+        "measurement_is_lower_bound",
         "mode",
         "model",
         "name",
@@ -623,6 +632,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
+        # A closed two-value enum (`file-limit` | `payload-limit`) emitted only
+        # for measured artifact publication admission refusals. The arbitrary
+        # path and exception prose ride `error`, which diagnostics drops.
+        "publication_cause",
         # `question` is NOT here any more: it moved to `_JOURNAL_DROP_FIELDS`
         # (schema v3) once a one-token `decision-pending` question was shown to
         # ship verbatim. Left as a note rather than a silent deletion, because a
@@ -1267,21 +1280,22 @@ JOURNAL_KINDS = frozenset(
         # target before spawning any git for it.
         "sweep-bundle-close-carry-refused",
         "sweep-bundle-close-carry-uncommitted",
-        # DW-280. A bundle-close mutator's own locked read refused — undecodable
-        # bytes inside the window before `mark_done_many_reopenable`'s
-        # `read_for_write` — at one of the sweep's three sites (`site`, each
-        # ending in `-locked`: `bundle-close-locked` for the accepted-dev close,
-        # `bundle-reclose-locked` for the review-leg reclose,
-        # `bundle-close-carry-locked` for the isolated carry). Bare, the raise
-        # crashed the run; now the run PAUSES at the story gate on the task with
-        # its phase and `bundle_closes_intended` untouched, so `bmad-loop resume`
-        # re-drives the close. The sweep's own route beside
+        # DW-280/DW-286. A bundle-close mutator's own locked read refused at one
+        # of the sweep's three close sites (`bundle-close-locked`,
+        # `bundle-reclose-locked`, `bundle-close-carry-locked`), or the terminal
+        # post-merge harvested append refused at `harvest-carry` or
+        # `harvest-carry-append-locked`. Bare, these raises crashed or selected
+        # the engine escalation route; now the run PAUSES at the story gate on
+        # the task with its phase and carry intent untouched, so
+        # `bmad-loop resume` re-drives the composite carry. Direct pre-terminal
+        # sweep defer carries retain the engine route. The sweep's own row beside
         # `sweep-bundle-close-carry-refused`, not the engine's
         # `ledger-read-refused`. No new diagnostics routing: `story_key` is an
-        # alias, `dw_ids` (the ids the close was about to publish) is a keylist,
-        # `site` and `ledger` are benign, and `reason` (one of the fixed tokens
-        # `ledger-unreadable` / `ledger-inaccessible`, by fault class) and `error`
-        # (the decode or OS detail) are both in `diagnostics._JOURNAL_DROP_FIELDS`.
+        # alias, `dw_ids` (empty for the append, otherwise the ids the close was
+        # about to publish) is a keylist, `site` and `ledger` are benign, and
+        # `reason` (one of the fixed tokens `ledger-unreadable` /
+        # `ledger-inaccessible`, by fault class) and `error` (the decode or OS
+        # detail) are both in `diagnostics._JOURNAL_DROP_FIELDS`.
         "sweep-bundle-close-refused",
         "sweep-bundle-closed",
         # DW-144. A reset in-flight bundle task adopting the ids of the bundle now
@@ -1625,6 +1639,7 @@ JOURNAL_KINDS = frozenset(
         "worktree-seed-dropped",
         "worktree-seed-skipped",
         "worktree-teardown-degraded",
+        "artifact-publication-refused",
     }
 )
 

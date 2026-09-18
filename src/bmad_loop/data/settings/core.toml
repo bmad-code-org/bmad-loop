@@ -91,6 +91,20 @@ kind = "int"
 minimum = 1
 default_ref = "LimitsPolicy.max_dev_attempts"
 [[section.field]]
+key = "artifact_file_max_mb"
+kind = "int"
+minimum = 1
+default_ref = "LimitsPolicy.artifact_file_max_mb"
+label = "artifact file cap (MiB)"
+description = "raw-byte limit for each ignored file selected for isolated artifact publication; tracked declarations ride Git and do not count"
+[[section.field]]
+key = "artifact_payload_max_mb"
+kind = "int"
+minimum = 1
+default_ref = "LimitsPolicy.artifact_payload_max_mb"
+label = "artifact payload cap (MiB)"
+description = "aggregate raw-byte limit across ignored files selected for isolated artifact publication; checked before base64 state encoding"
+[[section.field]]
 key = "max_followup_reviews"
 kind = "int"
 minimum = 0

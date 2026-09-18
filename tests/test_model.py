@@ -1150,6 +1150,37 @@ def test_result_mapping_absorbs_the_unchecked_session_record_rehydration():
     assert result_mapping(record.result_json) == {}
 
 
+def test_artifact_publication_state_round_trips_and_releases_with_mount():
+    task = StoryTask(story_key="dw-fix", epic=0)
+    old = StoryTask.from_dict({"story_key": "dw-fix", "epic": 0, "phase": "pending"})
+    assert old.artifact_baseline is None and old.artifact_payload is None
+    assert old.artifact_source_digests is None
+    assert old.artifact_tracked_source_oids is None
+    assert old.artifact_acceptance_identity is None
+    assert old.artifact_publication_complete is False
+    task.artifact_baseline = {"report.bin": "before"}
+    task.artifact_destination = "/project/artifacts"
+    task.artifact_source_digests = {"report.bin": "accepted"}
+    task.artifact_tracked_source_oids = {"tracked.bin": "blob-id"}
+    task.artifact_acceptance_identity = "review:2"
+    task.artifact_payload = {"report.bin": "AP8="}
+    task.artifact_publication_complete = True
+    loaded = StoryTask.from_dict(task.to_dict())
+    assert loaded.artifact_baseline == task.artifact_baseline
+    assert loaded.artifact_payload == task.artifact_payload
+    assert loaded.artifact_destination == task.artifact_destination
+    assert loaded.artifact_source_digests == task.artifact_source_digests
+    assert loaded.artifact_tracked_source_oids == task.artifact_tracked_source_oids
+    assert loaded.artifact_acceptance_identity == "review:2"
+    assert loaded.artifact_publication_complete
+    loaded.release_mount_owned_state()
+    assert loaded.artifact_baseline is None and loaded.artifact_payload is None
+    assert loaded.artifact_source_digests is None
+    assert loaded.artifact_tracked_source_oids is None
+    assert loaded.artifact_acceptance_identity is None
+    assert loaded.artifact_destination is None and not loaded.artifact_publication_complete
+
+
 # ------------------------------------ the artifact-only receipt's snapshot (DW-273)
 
 

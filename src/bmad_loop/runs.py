@@ -3110,13 +3110,14 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       run re-pauses at the story gate under `sweep-intent-regen-refused`
       `reason="ledger-absent"` (DW-243/252) before any cycle runs. A bundle close
       paused at the same gate under `sweep-bundle-close-refused` — the mutator's
-      own locked read at the accepted-dev close, the review-leg reclose or the
-      isolated close carry (DW-280) — resumes the same way once the ledger
-      reads: this gate fronts that resume for the MAIN checkout's ledger (the
-      in-place sites and the carry), and the existing recovery arms then
-      re-drive the close. Under `scm.isolation = "worktree"` the two close
-      sites write the unit worktree's copy, which the pause notice names and
-      this gate does not probe, so an unrepaired copy simply re-pauses on
+      own locked read at the accepted-dev close, review-leg reclose or isolated
+      close carry (DW-280), plus either read site in the terminal post-merge
+      harvested append (DW-286) — resumes the same way once the ledger reads.
+      This gate fronts that resume for the MAIN checkout's ledger (the terminal
+      carry and the in-place close sites), and the existing recovery arms then
+      re-drive the write. Under `scm.isolation = "worktree"` the two in-worktree
+      close sites write the unit worktree's copy, which the pause notice names
+      and this gate does not probe, so an unrepaired copy simply re-pauses on
       resume.
     * Story runs are out of scope, and since DW-231 (undecodable bytes) and
       DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
@@ -3127,7 +3128,10 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       and the isolated carry) pause the run with an `ACTION REQUIRED` repair
       notice and no phase change, so `bmad-loop resume` after the repair retries
       the write — replaying the recorded session result where one exists,
-      re-driving the leg otherwise. At those four sites a story run over an
+      re-driving the leg otherwise. The exception is a sweep's terminal
+      post-merge harvest carry: its caller-sensitive dispatch uses the sweep
+      story gate above, while a direct pre-terminal sweep defer carry retains the
+      engine escalation route. At those four sites a story run over an
       undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
       Since DW-259 the mutators' locked re-reads route the same way for decode
       faults, and DW-279 extends that route to OS metadata/text-read faults:

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
@@ -1545,6 +1545,104 @@ def _blob_oid_for_file(repo: Path, rel: str, path: Path) -> str:
     return proc.stdout.decode("ascii", "strict").strip()
 
 
+def git_normalized_blob_oid(repo: Path, rel: str, path: Path) -> str:
+    """Return the blob id Git would stage for ``path`` at literal ``rel``.
+
+    This public seam lets publication binding use the same clean-filter-aware
+    identity as the existing content guards without reproducing Git mechanics.
+    """
+    return _blob_oid_for_file(repo, rel, path)
+
+
+def git_normalized_blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
+    """Return Git's clean-filter-normalized blob id for a confined byte snapshot."""
+    return _blob_oid_for_bytes(repo, rel, data)
+
+
+def _valid_object_id(value: bytes) -> bool:
+    return len(value) in (40, 64) and all(byte in b"0123456789abcdef" for byte in value)
+
+
+def staged_blob_oids(repo: Path, rels: Iterable[str]) -> dict[str, str]:
+    """Read one strict snapshot of stage-zero regular-file blobs for ``rels``.
+
+    Requested paths absent from the index are omitted so callers can distinguish
+    accepted ignored paths (which must stay absent) from accepted tracked paths
+    (which must be present). Ambiguous, unmerged, malformed, or non-blob index
+    evidence raises a path-only ``GitError``. Object ids and Git output are
+    deliberately omitted because callers surface this at the publication
+    integrity boundary.
+    """
+    ordered = tuple(dict.fromkeys(rels))
+    if not ordered:
+        return {}
+    try:
+        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs(list(ordered)))
+    except (GitError, OSError) as exc:
+        raise GitError(f"git index blob probe failed for declared paths in {repo}") from exc
+    if proc.returncode != 0:
+        raise GitError(f"git index blob probe failed for declared paths in {repo}")
+    requested = {os.fsencode(rel): rel for rel in ordered}
+    observed: dict[str, str] = {}
+    for record in (item for item in proc.stdout.split(b"\0") if item):
+        try:
+            header, actual_path = record.split(b"\t", 1)
+            mode, oid, stage = header.split()
+            rel = requested[actual_path]
+            oid_text = oid.decode("ascii", "strict")
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
+            raise GitError(f"git index evidence is malformed for declared paths in {repo}") from exc
+        if (
+            stage != b"0"
+            or mode not in {b"100644", b"100755"}
+            or not _valid_object_id(oid)
+            or rel in observed
+        ):
+            raise GitError(f"git index evidence is not a regular stage-zero blob in {repo}")
+        observed[rel] = oid_text
+    return observed
+
+
+def staged_blob_oid(repo: Path, rel: str) -> str:
+    """Return the exact regular stage-zero blob id for one literal path."""
+    observed = staged_blob_oids(repo, (rel,))
+    if rel not in observed:
+        raise GitError(f"git index has no exact unambiguous entry for {rel!r} in {repo}")
+    return observed[rel]
+
+
+def revision_blob_oids(repo: Path, revision: str, rels: Iterable[str]) -> dict[str, str]:
+    """Read exact regular-file blob identities from one committed tree snapshot."""
+    ordered = tuple(dict.fromkeys(rels))
+    if not ordered:
+        return {}
+    try:
+        proc = git_bytes(repo, "ls-tree", "-rz", revision, "--", *_literal_specs(list(ordered)))
+    except (GitError, OSError) as exc:
+        raise GitError(f"git tree blob probe failed for declared paths in {repo}") from exc
+    if proc.returncode != 0:
+        raise GitError(f"git tree blob probe failed for declared paths in {repo}")
+    requested = {os.fsencode(rel): rel for rel in ordered}
+    observed: dict[str, str] = {}
+    for record in (item for item in proc.stdout.split(b"\0") if item):
+        try:
+            header, actual_path = record.split(b"\t", 1)
+            mode, kind, oid = header.split()
+            rel = requested[actual_path]
+            oid_text = oid.decode("ascii", "strict")
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
+            raise GitError(f"git tree evidence is malformed for declared paths in {repo}") from exc
+        if (
+            kind != b"blob"
+            or mode not in {b"100644", b"100755"}
+            or not _valid_object_id(oid)
+            or rel in observed
+        ):
+            raise GitError(f"git tree evidence is not a regular blob in {repo}")
+        observed[rel] = oid_text
+    return observed
+
+
 def file_holds_content(repo: Path, rel: str, path: Path, data: bytes) -> bool:
     """Whether the file at ``path`` holds ``data``, as GIT counts sameness for ``rel``.
 
@@ -3043,6 +3141,21 @@ def _reset_hard_head(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def reset_keep(repo: Path, revision: str) -> tuple[bool, str]:
+    """`reset --keep <revision>`: move HEAD and undo exactly the tracked paths that
+    differ between HEAD and `revision`, while a local modification on any such
+    path ABORTS the reset instead of being flattened, and modifications elsewhere
+    are left alone. The rollback shape for a merge commit that LANDED but must
+    not stand (the integrated-tree check in `worktree_flow.merge_local`): unlike
+    `_reset_hard_head` it never flattens an operator edit, at the price of
+    declining when one sits on a merged path. Returns `(restored, note)`; the
+    note is git's own text when the reset declined."""
+    rc, out = _git(repo, "reset", "--keep", revision)
+    if rc != 0:
+        return False, out.strip()
+    return True, ""
+
+
 def _index_unmerged(repo: Path) -> tuple[bool, GitError | None]:
     """`(the index carries unmerged stages — i.e. a merge really ran and left a
     content conflict to resolve, the probe failure when the reading itself
@@ -3631,7 +3744,7 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
             paths.planning_artifacts,
         )
         return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -3752,7 +3865,6 @@ def _verify_shared_gates(
     allow_ancestor_baseline: bool = False,
     fm: dict[str, Any] | None = None,
     artifact_only_dir: Path | None = None,
-    artifact_only_withheld: str | None = None,
 ) -> _SharedGateResult:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
@@ -3825,17 +3937,7 @@ def _verify_shared_gates(
     this gate never reads ``rj`` for it. It lives HERE rather than after the fact
     for the reason ``skipped_proof_zero_diff`` does: the ordinary probe's baseline
     can be re-anchored by the newer-claim branch above, and "the gate found
-    nothing" is known at exactly one point.
-
-    ``artifact_only_withheld`` is the caller's veto over that receipt, consulted
-    only when a directory was passed and ahead of every listing: a non-``None``
-    string refuses the receipt with that text as the cause, spawning no git. It
-    exists for what this gate cannot see — ``SweepEngine`` passes it when
-    ``paths`` is a unit worktree's rebase of an in-tree artifacts dir under
-    ``scm.isolation = "worktree"``, where an accepted ignored artifact is torn
-    down with the worktree after the merge and nothing carries it to the main
-    checkout (#794 review), so accepting would let the bundle land while its
-    sole deliverable is destroyed."""
+    nothing" is known at exactly one point."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return _SharedGateResult(
@@ -3986,15 +4088,6 @@ def _verify_shared_gates(
                 reason = "no changes in worktree since baseline commit"
                 if artifact_only_dir is None:
                     return _SharedGateResult(VerifyOutcome.retry(reason))
-                # The caller's veto first, ahead of every listing: nothing the
-                # worktree holds can be credited when the worktree's teardown is
-                # what happens to it next.
-                if artifact_only_withheld is not None:
-                    return _SharedGateResult(
-                        VerifyOutcome.retry(
-                            f"{reason} (artifact-only receipt refused: {artifact_only_withheld})"
-                        )
-                    )
                 # The receipt (DW-273): consulted only here, after the ordinary
                 # probe positively found nothing, and only on the leg whose caller
                 # asked. `None` (outside the tree, or git refused) and `[]` (git
@@ -4298,7 +4391,6 @@ def verify_dev_bundle(
     review_enabled: bool = True,
     *,
     engine_written: tuple[str, ...] = (),
-    artifact_only_withheld: str | None = None,
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
@@ -4334,13 +4426,7 @@ def verify_dev_bundle(
     off ``lstat`` fingerprints (mtime and size) rather than content — a rewrite
     that lands byte-identical with a preserved mtime is invisible to it, as it
     is to the ordinary probe. The assertion selects the receipt; the snapshot is
-    what makes it proof.
-
-    ``artifact_only_withheld`` is forwarded to the shared gate as its veto over
-    the receipt: the caller's reason the receipt cannot be honoured for THIS
-    unit whatever it wrote (``SweepEngine._artifact_only_withheld`` — an in-tree
-    artifacts dir rebased into a unit worktree, whose accepted artifacts the
-    teardown would destroy). ``None`` leaves the receipt to the snapshot."""
+    what makes it proof."""
     rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -4365,7 +4451,6 @@ def verify_dev_bundle(
         extra_exclude=engine_written,
         allow_ancestor_baseline=True,
         artifact_only_dir=paths.implementation_artifacts if artifact_only else None,
-        artifact_only_withheld=artifact_only_withheld,
     )
     if gate.outcome is not None:
         return gate.outcome
@@ -5234,7 +5319,14 @@ def commit_story(repo: Path, message: str) -> str:
     return rev_parse_head(repo)
 
 
-def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | None:
+def finalize_commit(
+    repo: Path,
+    baseline: str | None,
+    message: str,
+    *,
+    staged_validator: Callable[[], object] | None = None,
+    committed_validator: Callable[[str, object], None] | None = None,
+) -> str | None:
     """Collapse everything since `baseline` into ONE commit with `message`.
 
     bmad-build-auto now commits its own work at the end of each iteration (one
@@ -5247,9 +5339,25 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     per-story invariant and the message template / pre_commit hook stay
     authoritative regardless of how many times the skill committed.
 
-    Mechanics: stage the working tree (`add -A`), move HEAD back to `baseline`
-    keeping the index (`reset --soft`), then commit the accumulated index. The
-    working tree is never touched, so a failure leaves the chain intact.
+    Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
+    validator, move HEAD back to `baseline` keeping that same index (`reset
+    --soft`), then commit the accumulated index without restaging. An optional
+    committed-tree validator detects hook or concurrent-index mutation and rolls
+    HEAD back to the original chain before refusing. The working tree is never
+    touched, so a failure leaves the chain intact.
+
+    The no-op arm is validated the same way. "Nothing staged" is read off the
+    index AFTER the staged validator returned, so an index reset to `baseline`
+    inside that window (a concurrent writer — the same class the committed-tree
+    validator exists for) reads as a clean no-op while the validated snapshot
+    says a deliverable was staged. Returning `None` there would leave HEAD at
+    `baseline` with the accepted chain orphaned and let the caller record
+    `baseline` as the commit — a bundle closing without the pending-tracked
+    deliverable it was accepted on (#795 review). So when a committed-tree
+    validator is given, the no-op arm runs it against `baseline` itself: the
+    snapshot must already be IN the baseline tree for "nothing to commit" to be
+    true, and a disagreement restores the original chain and index (`reset
+    --mixed`) before the refusal propagates.
 
     Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
     of the reviewed diff and deliberately leaves unrelated `git status` residue
@@ -5269,12 +5377,26 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     rc, out = _git(repo, "add", "-A")
     if rc != 0:
         raise GitError(f"git add failed: {out}")
+    staged_snapshot = staged_validator() if staged_validator is not None else None
     rc, out = _git(repo, "reset", "--soft", baseline)
     if rc != 0:
         raise GitError(f"git reset --soft {baseline} failed: {out}")
     # index now holds the cumulative diff vs baseline; nothing staged → no-op
     rc, _ = _git(repo, "diff", "--cached", "--quiet")
     if rc == 0:
+        if committed_validator is not None:
+            try:
+                committed_validator(baseline, staged_snapshot)
+            except BaseException as exc:
+                # HEAD already sits at `baseline` and the index is whatever the
+                # concurrent writer left; put both back on the accepted chain.
+                restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
+                if restore_rc != 0:
+                    raise GitError(
+                        "no-op tree validation failed; additionally failed to restore "
+                        f"HEAD to {original_head[:12]}: {restore_out}"
+                    ) from exc
+                raise
         return None
     rc, out = _git(repo, "commit", "-m", message)
     if rc != 0:
@@ -5288,7 +5410,23 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
                 f"to {original_head[:12]}: {restore_out}"
             )
         raise GitError(f"git commit failed: {out}")
-    return rev_parse_head(repo)
+    committed_head = rev_parse_head(repo)
+    if committed_validator is not None:
+        try:
+            committed_validator(committed_head, staged_snapshot)
+        except BaseException as exc:
+            # Restore the accepted skill chain and its index while leaving the
+            # working tree untouched.  A soft reset would retain an ignored path
+            # that a hook force-added, making every replay fail staged validation
+            # even after the accepted bytes were restored.
+            restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
+            if restore_rc != 0:
+                raise GitError(
+                    "committed tree validation failed; additionally failed to restore "
+                    f"HEAD to {original_head[:12]}: {restore_out}"
+                ) from exc
+            raise
+    return committed_head
 
 
 def resolve_restore_path(raw: str, root: Path) -> Path:

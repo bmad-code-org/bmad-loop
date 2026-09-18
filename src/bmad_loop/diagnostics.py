@@ -1037,6 +1037,12 @@ def _scrub_entry(
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
+        elif kind == "artifact-publication-refused" and k == "publication_cause":
+            out[k] = v if v in ("file-limit", "payload-limit") else None
+        elif kind == "artifact-publication-refused" and k in ("measured_bytes", "limit_bytes"):
+            out[k] = v if type(v) is int and v >= 0 else None
+        elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
+            out[k] = v if type(v) is bool else None
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an

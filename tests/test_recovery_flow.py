@@ -13,15 +13,19 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
-from conftest import git, refuse_to_resolve
+from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
 
-from bmad_loop import verify
+from bmad_loop import recovery_flow, verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.platform_util import UnconfinedWriteError, is_absolute_path
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
-from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
+from bmad_loop.recovery_flow import (
+    PRESERVE_REF_PROBE_LIMIT,
+    RecoveryFlow,
+    _OwnedSpecAuthorityError,
+)
 from bmad_loop.verify import GitError, rev_parse_head
 from bmad_loop.workspace import Workspace
 
@@ -87,6 +91,147 @@ def test_owned_spec_restore_recreates_missing_canonical_parents(tmp_path):
     RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
 
     assert spec.read_bytes() == snapshot
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_translates_value_error_family_before_write(
+    tmp_path, monkeypatch, resolve_fault
+):
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes\n"
+    spec.write_bytes(original)
+    refuse_to_resolve(monkeypatch, spec.parent, error=resolve_fault)
+
+    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_translates_value_error_family_from_target_revalidation(
+    tmp_path, monkeypatch, resolve_fault
+):
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes\n"
+    spec.write_bytes(original)
+    refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
+
+    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_validates_full_missing_parent_before_creation(
+    tmp_path, monkeypatch, resolve_fault
+):
+    parent = tmp_path.resolve() / "new" / "deep"
+    spec = parent / "owned.md"
+    refuse_to_resolve(monkeypatch, parent, error=resolve_fault)
+
+    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert not parent.exists()
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_validates_missing_target_spelling_before_write(
+    tmp_path, monkeypatch, resolve_fault
+):
+    spec = tmp_path.resolve() / "missing.md"
+    writes: list[Path] = []
+    refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
+    monkeypatch.setattr(
+        recovery_flow,
+        "atomic_write_bytes",
+        lambda path, *_args, **_kwargs: writes.append(path),
+    )
+
+    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert writes == []
+    assert not spec.exists()
+
+
+@pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_does_not_translate_parent_mkdir_value_error(
+    tmp_path, monkeypatch, failure
+):
+    parent = tmp_path.resolve() / "new"
+    spec = parent / "owned.md"
+    real_mkdir = Path.mkdir
+
+    def fail_mkdir(path, *args, **kwargs):
+        if path == parent:
+            raise failure
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    with pytest.raises(type(failure)) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert excinfo.value is failure
+    assert not parent.exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError("atomic repair write failed"), id="oserror"),
+        pytest.param(RuntimeError("atomic repair write failed"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
+    tmp_path, monkeypatch, failure
+):
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes\n"
+    spec.write_bytes(original)
+
+    def fail_write(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes", fail_write)
+
+    with pytest.raises(type(failure)) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_does_not_translate_readback_value_error(tmp_path, monkeypatch, failure):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes\n")
+    real_read_bytes = Path.read_bytes
+
+    def fail_readback(path):
+        if path == spec:
+            raise failure
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_readback)
+
+    with pytest.raises(type(failure)) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert excinfo.value is failure
+    assert real_read_bytes(spec) == b"snapshot bytes\n"
 
 
 def test_attempt_owned_spec_refuses_a_posix_absolute_spec_path(tmp_path, monkeypatch):
@@ -1784,7 +1929,15 @@ def test_ambiguous_relative_attempt_binding_is_refused(project):
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
 
 
-def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("binding resolve failed"), id="oserror"),
+        pytest.param(RuntimeError("binding resolve failed"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch, resolve_fault):
     """T15/unsafe: uncertain ownership cannot become a mutation/exclusion grant.
 
     Ablation: let `_attempt_owned_spec` continue with the unresolved candidate
@@ -1795,7 +1948,7 @@ def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch):
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
     verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
-    refuse_to_resolve(monkeypatch, spec)
+    refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )

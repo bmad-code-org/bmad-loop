@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     RENDERER_STUB_SKILL_MD,
     git,
@@ -4015,33 +4016,46 @@ def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
 
 
 @pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected root resolve fault"), id="oserror"),
+        pytest.param(RuntimeError("injected root resolve fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
 def test_provision_worktree_root_resolution_fault_is_typed_and_precedes_writes(
-    tmp_path, monkeypatch, refused_root
+    tmp_path, monkeypatch, refused_root, resolve_fault
 ):
     """Provisioning cannot write against roots whose identity is uncertain.
 
-    Ablation: delete the provisioning-root translation and this raises raw
-    ``OSError`` instead of typed ``GitError`` before the seed or hook config write.
+    Ablation: delete the provisioning-root translation and this raises the raw
+    resolve fault instead of typed ``GitError`` before the seed or hook config write.
     """
     repo, wt = tmp_path / "repo", tmp_path / "wt"
     repo.mkdir()
     (repo / "seed.json").write_text("FROM_REPO\n", encoding="utf-8")
     profile = get_profile("claude")
     refused = wt if refused_root == "worktree" else repo
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     with pytest.raises(verify.GitError) as excinfo:
         provision_worktree(wt, [profile], repo, seed_files=["seed.json"])
 
     assert "provisioning roots" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, OSError)
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert not wt.exists()
     assert not (wt / "seed.json").exists()
     assert not (wt / profile.hooks.config_path).exists()
 
 
 @pytest.mark.parametrize("refused_side", ["source", "destination"])
+@pytest.mark.parametrize(
+    "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
+)
 def test_provision_worktree_refuses_one_explicit_seed_but_copies_healthy_sibling(
-    tmp_path, monkeypatch, refused_side
+    tmp_path, monkeypatch, refused_side, resolve_fault
 ):
     """Resolution uncertainty is scoped to one explicit seed entry.
 
@@ -4053,7 +4067,7 @@ def test_provision_worktree_refuses_one_explicit_seed_but_copies_healthy_sibling
     (repo / "refused.json").write_text("REFUSED\n", encoding="utf-8")
     (repo / "healthy.json").write_text("HEALTHY\n", encoding="utf-8")
     refused = repo / "refused.json" if refused_side == "source" else wt / "refused.json"
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     provision_worktree(
         wt,
@@ -4067,8 +4081,11 @@ def test_provision_worktree_refuses_one_explicit_seed_but_copies_healthy_sibling
 
 
 @pytest.mark.parametrize("refused_side", ["source", "destination"])
+@pytest.mark.parametrize(
+    "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
+)
 def test_provision_worktree_refuses_one_glob_match_but_copies_healthy_sibling(
-    tmp_path, monkeypatch, refused_side
+    tmp_path, monkeypatch, refused_side, resolve_fault
 ):
     """One uncertain glob match cannot abort the rest of a stable expansion.
 
@@ -4085,12 +4102,92 @@ def test_provision_worktree_refuses_one_glob_match_but_copies_healthy_sibling(
         if refused_side == "source"
         else wt / "plugins" / "a-refused.json"
     )
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
 
     assert not (wt / "plugins" / "a-refused.json").exists()
     assert (wt / "plugins" / "z-healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_provision_worktree_refuses_nested_seed_path_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, refused_side, resolve_fault
+):
+    """Directory seeds degrade at the shared nested containment and walk guards."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "plugins"
+    refused_dir = source / "a-refused"
+    refused_dir.mkdir(parents=True)
+    (refused_dir / "hidden.json").write_text("REFUSED\n", encoding="utf-8")
+    (source / "z-healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refused = refused_dir if refused_side == "source" else wt / "plugins" / "a-refused"
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    provision_worktree(wt, [], repo, seed_files=["plugins"])
+
+    assert not (wt / "plugins" / "a-refused").exists()
+    assert (wt / "plugins" / "z-healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_provision_worktree_refuses_nested_source_file_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, resolve_fault
+):
+    """A source leaf reaches the copier's containment observer after the walk."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "plugins"
+    source.mkdir(parents=True)
+    refused = source / "a-refused.json"
+    refused.write_text("REFUSED\n", encoding="utf-8")
+    (source / "z-healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    provision_worktree(wt, [], repo, seed_files=["plugins"])
+
+    assert not (wt / "plugins" / "a-refused.json").exists()
+    assert (wt / "plugins" / "z-healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="invalid POSIX path spellings")
+@pytest.mark.parametrize(
+    "invalid_component",
+    [pytest.param("bad\0", id="nul"), pytest.param("bad\ud800", id="lone-surrogate")],
+)
+def test_provision_worktree_malformed_glob_keeps_later_healthy_pattern(tmp_path, invalid_component):
+    """Pattern-enumeration faults stay scoped to their configured pattern."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    healthy = repo / "plugins" / "healthy.json"
+    healthy.parent.mkdir(parents=True)
+    healthy.write_text("HEALTHY\n", encoding="utf-8")
+
+    provision_worktree(
+        wt,
+        [],
+        repo,
+        seed_globs=[f"{invalid_component}/*", "plugins/*.json"],
+    )
+
+    assert (wt / "plugins" / "healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_provision_worktree_refuses_hook_config_but_keeps_unrelated_seed(
+    tmp_path, monkeypatch, resolve_fault
+):
+    """Hook destination uncertainty cannot suppress unrelated provisioning."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    (repo / "healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    profile = get_profile("claude")
+    config_path = wt / profile.hooks.config_path
+    refuse_to_resolve(monkeypatch, config_path, error=resolve_fault)
+
+    provision_worktree(wt, [profile], repo, seed_files=["healthy.json"])
+
+    assert (wt / "healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+    assert not config_path.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -8937,7 +9034,13 @@ def test_walk_keeps_sibling_symlinks_to_one_shared_tree(tmp_path):
     ]
 
 
-def test_walk_resolution_refusal_obeys_the_existing_suppression_split(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [pytest.param(OSError(0, "walk refusal"), id="oserror"), *NUL_PATH_RESOLVE_FAULTS],
+)
+def test_walk_resolution_refusal_obeys_the_existing_suppression_split(
+    tmp_path, monkeypatch, resolve_fault
+):
     """Cycle-key uncertainty is a named leaf only for observation/copy walks.
 
     Ablation: delete the cycle-key resolution guard and the suppressing walk raises
@@ -8951,15 +9054,15 @@ def test_walk_resolution_refusal_obeys_the_existing_suppression_split(tmp_path, 
     refused.mkdir(parents=True)
     (refused / "hidden.md").write_text("hidden\n", encoding="utf-8")
     (root / "sibling.md").write_text("sibling\n", encoding="utf-8")
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     walked = dict(_walk_traversable_files(root, _suppress_errors=True))
     assert sorted(walked) == ["refused", "sibling.md"]
     assert walked["refused"] == refused
 
-    with pytest.raises(OSError) as excinfo:
+    with pytest.raises(type(resolve_fault)) as excinfo:
         list(_walk_traversable_files(root, _suppress_errors=False))
-    assert "stubbed: the provider is registered but not serving" in str(excinfo.value)
+    assert excinfo.value.args == resolve_fault.args
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -9465,8 +9568,11 @@ def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
+@pytest.mark.parametrize(
+    "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
+)
 def test_provision_worktree_refuses_one_upstream_skill_and_preserves_required_result_gate(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, resolve_fault
 ):
     """An uncertain upstream source is skipped while healthy skills still copy.
 
@@ -9483,7 +9589,7 @@ def test_provision_worktree_refuses_one_upstream_skill_and_preserves_required_re
         customize="[workflow]\n" + _layer("blind", required_review),
     )
     _install_skills(repo, tree, {required_review: ()})
-    refuse_to_resolve(monkeypatch, repo / tree / required_review)
+    refuse_to_resolve(monkeypatch, repo / tree / required_review, error=resolve_fault)
 
     skipped = provision_worktree(wt, [get_profile("claude")], repo)
 
@@ -9686,8 +9792,11 @@ def test_worktree_seed_undelivered_names_an_escaped_source_despite_stale_destina
 
 
 @pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+@pytest.mark.parametrize(
+    "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
+)
 def test_worktree_seed_undelivered_reports_coarse_names_when_a_root_is_unresolvable(
-    tmp_path, monkeypatch, refused_root
+    tmp_path, monkeypatch, refused_root, resolve_fault
 ):
     """The journal-only probe reports uncertainty without becoming a run failure.
 
@@ -9699,7 +9808,7 @@ def test_worktree_seed_undelivered_reports_coarse_names_when_a_root_is_unresolva
     (repo / "plugins" / "b.json").write_text("{}\n", encoding="utf-8")
     (repo / "plugins" / "a.json").write_text("{}\n", encoding="utf-8")
     refused = wt if refused_root == "worktree" else repo
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     assert worktree_seed_undelivered(
         wt,
@@ -9707,6 +9816,69 @@ def test_worktree_seed_undelivered_reports_coarse_names_when_a_root_is_unresolva
         seed_files=["configured.json", "configured.json"],
         seed_globs=["plugins/*.json"],
     ) == ["configured.json", "plugins/a.json", "plugins/b.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="invalid POSIX path spellings")
+@pytest.mark.parametrize(
+    "invalid_component",
+    [pytest.param("bad\0", id="nul"), pytest.param("bad\ud800", id="lone-surrogate")],
+)
+@pytest.mark.parametrize("fallback_fault", [None, *NUL_PATH_RESOLVE_FAULTS])
+def test_worktree_seed_delivery_malformed_glob_keeps_later_healthy_pattern(
+    tmp_path, monkeypatch, invalid_component, fallback_fault
+):
+    """Normal and root-uncertain probes both continue per malformed pattern."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    source = repo / "plugins" / "healthy.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("HEALTHY\n", encoding="utf-8")
+    wt.mkdir()
+    if fallback_fault is not None:
+        refuse_to_resolve(monkeypatch, wt, error=fallback_fault)
+
+    assert worktree_seed_undelivered(
+        wt,
+        repo,
+        seed_globs=[f"{invalid_component}/*", "plugins/*.json"],
+    ) == ["plugins/healthy.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="invalid POSIX path spellings")
+@pytest.mark.parametrize(
+    "invalid_component",
+    [pytest.param("bad\0", id="nul"), pytest.param("bad\ud800", id="lone-surrogate")],
+)
+def test_worktree_seed_delivery_malformed_repo_root_degrades_twice(tmp_path, invalid_component):
+    """The coarse fallback remains total when its own glob root is malformed."""
+    repo = tmp_path / invalid_component
+
+    assert worktree_seed_undelivered(
+        tmp_path / "wt",
+        repo,
+        seed_files=["configured.json"],
+        seed_globs=["plugins/*.json"],
+    ) == ["configured.json"]
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_worktree_seed_delivery_descendant_fault_returns_undelivered(
+    tmp_path, monkeypatch, refused_side, resolve_fault
+):
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    rel = "plugins/tool"
+    source = repo / rel
+    destination = wt / rel
+    nested_source = source / "nested"
+    nested_destination = destination / "nested"
+    nested_source.mkdir(parents=True)
+    (nested_source / "config.json").write_text("CURRENT\n", encoding="utf-8")
+    nested_destination.mkdir(parents=True)
+    (nested_destination / "config.json").write_text("CURRENT\n", encoding="utf-8")
+    refused = nested_source if refused_side == "source" else nested_destination
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == [rel]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -9834,8 +10006,11 @@ def test_module_skills_seed_undelivered_reports_only_missing_content(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
+)
 def test_module_skills_seed_undelivered_reports_coarse_names_when_root_is_unresolvable(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, resolve_fault
 ):
     """The journal-only wheel probe names existing skills in stable tree order.
 
@@ -9843,7 +10018,7 @@ def test_module_skills_seed_undelivered_reports_coarse_names_when_root_is_unreso
     instead of reporting coarse uncertainty for the bundled skill surface.
     """
     wt = tmp_path / "wt"
-    refuse_to_resolve(monkeypatch, wt)
+    refuse_to_resolve(monkeypatch, wt, error=resolve_fault)
 
     assert module_skills_seed_undelivered(
         wt, [_MODULE_SKILL_TREE, ".agents/skills", _MODULE_SKILL_TREE]
@@ -9851,6 +10026,34 @@ def test_module_skills_seed_undelivered_reports_coarse_names_when_root_is_unreso
         f"{tree}/{skill}"
         for tree in (_MODULE_SKILL_TREE, ".agents/skills")
         for skill in MODULE_SKILLS
+    ]
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_module_skills_delivery_descendant_fault_returns_coarse_result(
+    tmp_path, monkeypatch, refused_side, resolve_fault
+):
+    """Filesystem source walks and destination containment both degrade."""
+    skill = MODULE_SKILLS[0]
+    skills_root = tmp_path / "skills"
+    source = skills_root / skill
+    nested_source = source / "notes"
+    nested_source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# skill\n", encoding="utf-8")
+    (nested_source / "extra.md").write_text("extra\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    destination = wt / _MODULE_SKILL_TREE / skill
+    nested_destination = destination / "notes"
+    nested_destination.mkdir(parents=True)
+    (destination / "SKILL.md").write_text("# skill\n", encoding="utf-8")
+    destination_file = nested_destination / "extra.md"
+    destination_file.write_text("extra\n", encoding="utf-8")
+    refused = nested_source if refused_side == "source" else destination_file
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
+        f"{_MODULE_SKILL_TREE}/{skill}"
     ]
 
 

@@ -50,34 +50,45 @@ from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 # marker on the spec-watch fallback; the `Status:` line within it is the only
 # field we parse structurally — everything else is free prose.
 AUTO_RUN_HEADING_RE = re.compile(r"^##\s+Auto Run Result\s*$", re.MULTILINE)
-# `Status:` possibly bulleted ("- Status: blocked") / bolded ("**Status:** done"),
-# case-insensitive on the label, value is the first token on the line.
+# Python's whitespace class includes several characters that ``str.splitlines``
+# treats as line boundaries. Structural gaps must exclude every such separator
+# while retaining horizontal Unicode whitespace such as tab and NBSP.
+_HORIZONTAL_WS_RE = r"[^\S\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]"
+# `Status:` possibly bulleted ("- Status: blocked") / bolded
+# ("**Status:** **done**"), case-insensitive on the label, value is the first
+# alphabetic-or-hyphen token on the line. Every structural gap is horizontal
+# whitespace: a bare label cannot borrow its value from the following line.
 STATUS_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Za-z-]+)",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?status(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*([A-Za-z-]+)",
     re.IGNORECASE | re.MULTILINE,
 )
 # The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
 # `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
 # space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
 # `Artifactonly: true` is no spelling of the contract and cannot relax the
-# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes the
-# bulleted/bolded shapes `STATUS_LINE_RE` tolerates PLUS bold around the value or
-# the whole line (`**Artifact only:** **true**`, `- **Artifact only: true**` — a
-# shape `STATUS_LINE_RE` does not read): every `**` is optional and the closing
-# one is consumed before the end-of-line anchor. Only the literal value `true`
-# ALONE on the line asserts — anchored to end of line so prose such as
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes
+# the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
+# optional and the closing one is consumed before the end-of-line anchor. Only
+# the literal value `true` ALONE on the line asserts — anchored to end of line so
+# prose such as
 # `Artifact only: true for the ledger, false for code` is no assertion; neither is
-# `false`, a bare label, or any other token. Every gap is HORIZONTAL whitespace of
-# any kind (`[^\S\r\n]*` — space, tab, NBSP..., never a line break), so unlike
-# `Status:` — whose `\s*` gaps read a value across a line boundary — the label and
-# its value must share one line: `Artifact only:` followed by `true` on the next
-# line, or `Artifact only` with `: true` on the next line, is a bare label and a
-# stray token, not an assertion. Matches are read through
-# `_artifact_only_asserted`, which skips a match inside a fenced block (a pasted
-# example within the marker).
+# `false`, a bare label, or any other token. Every gap is `_HORIZONTAL_WS_RE`
+# (space, tab, NBSP... — never CR/LF nor the vertical separators `splitlines`
+# honours), so as with `Status:`, the label and its value must share one line.
+# `Artifact only:` followed by `true` on the next line, or `Artifact only` with
+# `: true` on the next line, is a bare label and a stray token, not an
+# assertion — and so is `Artifact only:\x0btrue`, which `[^\S\r\n]` admitted
+# while MULTILINE `$` anchors on LF alone (#795 review). Matches are read
+# through `_artifact_only_asserted`, which skips a match inside a fenced block
+# (a pasted example within the marker).
 ARTIFACT_ONLY_LINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]+only(?:\*\*)?[^\S\r\n]*:"
-    r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?artifact[ _-]+only(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*true"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -198,7 +209,10 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
         return AutoRunResult(present=False, status="", detail="")
     last = matches[-1]
     body = text[last.end() : _next_heading_start(text, last.end())]
-    status_m = STATUS_LINE_RE.search(body)
+    status_m = next(
+        (match for match in STATUS_LINE_RE.finditer(body) if not _fenced(body, match.start())),
+        None,
+    )
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
 

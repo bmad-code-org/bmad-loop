@@ -1208,12 +1208,14 @@ class Engine:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         self._worktree_flow.merge_local(
             task,
             unit,
             replay=replay,
             replay_strategy=replay_strategy,
+            first_integration=first_integration,
         )
 
     def _keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
@@ -1699,7 +1701,16 @@ class Engine:
                 # invisible to every later sweep.
                 self._carry_harvested_deferrals(task)
                 continue
-            if task.isolated_ledger_carried or task.phase not in (
+            publication_pending = (
+                bool(task.dw_ids)
+                and not task.artifact_publication_complete
+                and (
+                    task.artifact_baseline is not None
+                    or task.artifact_payload is not None
+                    or (bool(task.worktree_path) and Path(task.worktree_path).exists())
+                )
+            )
+            if (task.isolated_ledger_carried and not publication_pending) or task.phase not in (
                 Phase.DONE,
                 Phase.AWAITING_OPERATOR,
             ):
@@ -1725,6 +1736,7 @@ class Engine:
                 or task.bundle_closes_intended
                 or task.story_closes_intended
                 or task.board_advance_intended
+                or publication_pending
             ):
                 continue
             if merged_key not in merged_units:
@@ -1732,27 +1744,51 @@ class Engine:
                 started_key = (*merged_key, source)
                 replay_strategy = started_units.get(started_key)
                 if not source or replay_strategy is None:
-                    continue
-                # The write-ahead record is intent, never merge proof. Re-run the
-                # exact merge and latch completion only after git confirms it;
-                # merge/ff are naturally idempotent, while squash enables its
-                # recovery-only clean-tree success arm.
-                self.journal.append(
-                    "resume-unit-merge",
-                    story_key=task.story_key,
-                    branch=task.branch,
-                    target=self.state.target_branch,
-                    strategy=replay_strategy,
-                    source=source,
-                )
-                unit = self._reopen_unit(task)
-                self._merge_local(
-                    task,
-                    unit,
-                    replay=True,
-                    replay_strategy=replay_strategy,
-                )
-                merged_units.add(merged_key)
+                    if not publication_pending:
+                        continue
+                    # Terminal bundle persisted before merge intent: integrate it
+                    # before sweep can re-triage or GC can remove its sources.
+                    self._merge_local(
+                        task, self._reopen_unit(task), replay=True, first_integration=True
+                    )
+                    merged_units.add(merged_key)
+                    replay_strategy = None
+                else:
+                    replay_strategy = str(replay_strategy)
+                if merged_key not in merged_units:
+                    # The write-ahead record is intent, never merge proof. Re-run the
+                    # exact merge and latch completion only after git confirms it;
+                    # merge/ff are naturally idempotent, while squash enables its
+                    # recovery-only clean-tree success arm.
+                    self.journal.append(
+                        "resume-unit-merge",
+                        story_key=task.story_key,
+                        branch=task.branch,
+                        target=self.state.target_branch,
+                        strategy=replay_strategy,
+                        source=source,
+                    )
+                    unit = self._reopen_unit(task)
+                    self._merge_local(
+                        task,
+                        unit,
+                        replay=True,
+                        replay_strategy=replay_strategy,
+                    )
+                    merged_units.add(merged_key)
+            if publication_pending and not task.artifact_publication_complete:
+                if task.artifact_payload is None:
+                    unit = self._reopen_unit(task)
+                    self._worktree_flow.prepare_publication(task, unit.workspace.paths)
+                    self._worktree_flow.finish_publication(task, unit)
+                else:
+                    # unit-merged proves integration; saved bytes are the source.
+                    # A removed original mount cannot invalidate this payload.
+                    self._worktree_flow.finish_publication(task, None)
+                    if Path(task.worktree_path).is_dir() and verify.worktree_is_registered(
+                        self.paths.repo_root, Path(task.worktree_path)
+                    ):
+                        self._worktree_flow.finish_publication(task, self._reopen_unit(task))
             self.journal.append("resume-ledger-carry", story_key=task.story_key)
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
@@ -1986,12 +2022,49 @@ class Engine:
                 return index
         return None
 
+    def _current_review_session_index(self, task: StoryTask) -> int | None:
+        """Index of the newest review record for the current cycle."""
+        task_id = _session_task_id(task.story_key, "review", task.review_cycle, task.generation)
+        for index in range(len(task.sessions) - 1, -1, -1):
+            if task.sessions[index].task_id == task_id:
+                return index
+        return None
+
+    def _bind_accepted_artifact_source(self, task: StoryTask, identity: str) -> None:
+        """Bind isolated bundle deliverables at an accepted verify boundary."""
+        if not task.dw_ids or not task.worktree_path:
+            return
+        self._worktree_flow.bind_publication(task, self.workspace.paths, identity)
+
     def _accept_current_dev_session(self, task: StoryTask) -> None:
         """Latch the current dev or repair record as the accepted tree owner."""
         accepted_index = self._current_dev_session_index(task)
         if accepted_index is None:
             raise RuntimeError(f"accepted dev decision for {task.story_key} has no session record")
         task.accepted_dev_session_index = accepted_index
+        self._bind_accepted_artifact_source(task, f"dev:{accepted_index}")
+
+    def _accept_review_artifact_source(self, task: StoryTask) -> None:
+        """Bind the result whose final review verification just passed."""
+        if not task.dw_ids or not task.worktree_path:
+            return
+        if task.phase == Phase.REVIEW_VERIFY:
+            accepted_index = self._current_review_session_index(task)
+            if accepted_index is None:
+                raise RuntimeError(
+                    f"accepted review decision for {task.story_key} has no session record"
+                )
+            self._bind_accepted_artifact_source(task, f"review:{accepted_index}")
+            return
+        accepted_index = task.accepted_dev_session_index
+        if accepted_index is None:
+            self._bind_accepted_artifact_source(task, "")
+            return
+        # No separate review session ran, but this deterministic final review
+        # gate is still a newly accepted boundary. Derive a distinct identity
+        # from the append-only dev record so it supersedes the provisional dev
+        # binding once, while crash replay of this same gate stays idempotent.
+        self._bind_accepted_artifact_source(task, f"review:dev:{accepted_index}")
 
     def _accepted_dev_session_matches(self, task: StoryTask) -> bool:
         """Whether the current primary dev record owns the PROCEED receipt."""
@@ -2284,7 +2357,7 @@ class Engine:
             ):
                 return None
             return str(resolved)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return None
 
     def _read_dispatched_spec_snapshot(self, task: StoryTask) -> tuple[str, bytes] | None:
@@ -2334,7 +2407,7 @@ class Engine:
                 or resolved.resolve(strict=True) != resolved
             ):
                 raise RuntimeError("attempt-owned spec changed identity while being read")
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return None
         return str(resolved), snapshot
 
@@ -2390,7 +2463,7 @@ class Engine:
                 or not verify.spec_within_roots(resolved, self.workspace.paths)
             ):
                 return False
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
         return str(resolved) == observed[0]
 
@@ -3538,11 +3611,43 @@ class Engine:
             # the workspace ahead of the `git add -A`, it reaches every clone the
             # story's commit does — including through the worktree merge-back.
             park_record = self._write_park_record(task)
+
             # bmad-build-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
             # was nothing to finalize (NO_VCS, or the tree already at baseline).
-            sha = verify.finalize_commit(self.workspace.root, task.baseline_commit, message)
+            def validate_staged_publication() -> object:
+                return self._worktree_flow.validate_staged_publication(task, self.workspace.paths)
+
+            def validate_committed_publication(revision: str, staged_snapshot: object) -> None:
+                self._worktree_flow.validate_committed_publication(
+                    task, self.workspace.paths, revision, staged_snapshot
+                )
+
+            staged_validator = (
+                validate_staged_publication if task.dw_ids and task.worktree_path else None
+            )
+            committed_validator = (
+                validate_committed_publication if task.dw_ids and task.worktree_path else None
+            )
+            legacy_commit_replay = bool(
+                task.dw_ids
+                and task.worktree_path
+                and task.artifact_tracked_source_oids is None
+                and task.artifact_payload is not None
+                and task.commit_sha is not None
+                and verify.rev_parse_head(self.workspace.root) == task.commit_sha
+            )
+            if legacy_commit_replay:
+                sha = task.commit_sha
+            else:
+                sha = verify.finalize_commit(
+                    self.workspace.root,
+                    task.baseline_commit,
+                    message,
+                    staged_validator=staged_validator,
+                    committed_validator=committed_validator,
+                )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
             # special preservation, so drop the re-drive latch. The restored diff
@@ -3567,6 +3672,8 @@ class Engine:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
             raise
+        if task.dw_ids and task.worktree_path:
+            self._worktree_flow.prepare_publication(task, self.workspace.paths)
         # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
         # otherwise DONE. Derived from PERSISTED task state, never from a local
         # flag, so the crash-resume arm that re-enters this method reaches the
@@ -4363,8 +4470,8 @@ class Engine:
         # orchestrator-owned roots steer a ledger write.
         try:
             within = verify.spec_within_roots(spec_path, self.workspace.paths)
-        except (OSError, RuntimeError):
-            # resolve() faulted (a symlink loop, an unreadable component):
+        except (OSError, RuntimeError, ValueError):
+            # resolve() faulted (an invalid spelling, symlink loop, unreadable component):
             # containment can vouch for nothing, so refuse the same way.
             within = False
         if not within:
@@ -4741,8 +4848,8 @@ class Engine:
         if spec_path is not None:
             try:
                 within = verify.spec_within_roots(spec_path, self.workspace.paths)
-            except (OSError, RuntimeError):
-                # resolve() faulted (a symlink loop, an unreadable component):
+            except (OSError, RuntimeError, ValueError):
+                # resolve() faulted (an invalid spelling, symlink loop, unreadable component):
                 # containment can vouch for nothing, so refuse the same way.
                 within = False
             if not within:
@@ -4968,7 +5075,7 @@ class Engine:
         the claim that stays true when nothing else is known."""
         try:
             return ledger.resolve().is_relative_to(self.workspace.root.resolve())
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def _restore_deferred_closes(self, task: StoryTask, snapshot: list[_ArmedClose]) -> None:
@@ -5358,7 +5465,9 @@ class Engine:
         own compare-and-set probe — and none of them is about to publish the
         text. The two reads that DO precede a publish (the harvest append and
         the isolated carry) call ``read_for_write`` directly and pause through
-        :meth:`_pause_for_ledger_repair` instead.
+        :meth:`_pause_for_ledger_repair` instead, except for a sweep's terminal
+        post-merge harvest carry, whose caller-sensitive dispatch selects the
+        sweep-owned story-gate repair route.
 
         Undecodable bytes DEGRADE to the typed :class:`_UndecodableLedger`
         (DW-231), which carries the raw bytes' digest so "did the ledger change"
@@ -5586,9 +5695,12 @@ class Engine:
             return ledger.relative_to(root).as_posix(), None
         except ValueError:
             try:
-                return ledger.resolve().relative_to(root.resolve()).as_posix(), None
-            except (OSError, RuntimeError) as e:
+                resolved_ledger = ledger.resolve()
+                resolved_root = root.resolve()
+            except (OSError, RuntimeError, ValueError) as e:
                 return None, e
+            try:
+                return resolved_ledger.relative_to(resolved_root).as_posix(), None
             except ValueError:
                 return None, None
 
@@ -5905,18 +6017,22 @@ class Engine:
         paths = self.workspace.paths
         root = paths.repo_root
         try:
-            rel = paths.deferred_work.resolve().relative_to(root.resolve())
-        except ValueError:
-            # The proof-of-work gate only sees the code tree, so a ledger outside it
-            # cannot satisfy the gate and needs no exclusion.
-            return ()
-        except (OSError, RuntimeError):
+            resolved_ledger = paths.deferred_work.resolve()
+            resolved_root = root.resolve()
+        except (OSError, RuntimeError, ValueError):
             # ProjectPaths are normalized when loaded. If filesystem resolution
             # nevertheless faults, keep a lexically in-tree ledger excluded:
             # uncertainty must not turn the engine's append into session proof.
             try:
                 rel = paths.deferred_work.relative_to(root)
             except ValueError:
+                return ()
+        else:
+            try:
+                rel = resolved_ledger.relative_to(resolved_root)
+            except ValueError:
+                # The proof-of-work gate only sees the code tree, so a ledger outside it
+                # cannot satisfy the gate and needs no exclusion.
                 return ()
         return (rel.as_posix(),)
 
@@ -6016,7 +6132,7 @@ class Engine:
         # targeted "done" and verify_dev asserted the board got there, so a board
         # now short of done is a review revoking that sign-off, not a stage never
         # reached (#334).
-        return verify.verify_review(
+        outcome = verify.verify_review(
             task,
             self.workspace.paths,
             self.policy,
@@ -6024,6 +6140,9 @@ class Engine:
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
         )
+        if outcome.ok:
+            self._accept_review_artifact_source(task)
+        return outcome
 
     def _review_prompt(self, task: StoryTask) -> str:
         # Re-invoking bmad-build-auto on a `done` spec resets review_loop_iteration
@@ -7737,7 +7856,7 @@ class Engine:
         sprint-status.yaml, which shares no state with the deferred-work ledger, so
         the appends-before-closes contract has nothing to say about it.
         """
-        self._carry_harvested_deferrals(task)
+        self._carry_harvested_deferrals(task, terminal_composite=True)
         self._carry_story_deferred_closes(task)
         self._carry_board_advance(task)
 
@@ -7750,17 +7869,49 @@ class Engine:
         """
         repo = self.paths.repo_root
         try:
-            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError):
+            resolved_ledger = ledger.resolve()
+            resolved_repo = repo.resolve()
+        except (OSError, RuntimeError, ValueError):
             return False
+        try:
+            rel = resolved_ledger.relative_to(resolved_repo).as_posix()
         except ValueError:
             return True  # a proven external ledger is an advisory artifact
         if verify.path_tracked(repo, rel):
             return False
         return rel not in verify.untracked_files(repo)
 
-    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
-        """Re-file an isolated unit's harvested findings into the main ledger."""
+    def _pause_for_harvest_carry_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        fault: deferredwork.LedgerReadError | OSError,
+        *,
+        site: str,
+        terminal_composite: bool,
+    ) -> NoReturn:
+        """Dispatch a harvested-carry read refusal to its owning run route.
+
+        The base route is deliberately invariant across call contexts: ordinary
+        story runs pause at escalation. ``SweepEngine`` may use the context bit to
+        redirect only the terminal post-merge composite carry; the direct
+        pre-terminal carry from :meth:`_defer` must retain this route. The fault
+        travels as the exception, not its text, so the sweep route can keep the
+        OS-versus-decode classification (DW-279) its own row and notice split on;
+        the base route attributes it here exactly as its other publish sites do.
+        """
+        self._pause_for_ledger_repair(task, ledger, _ledger_fault_text(ledger, fault), site=site)
+
+    def _carry_harvested_deferrals(
+        self, task: StoryTask, *, terminal_composite: bool = False
+    ) -> None:
+        """Re-file an isolated unit's harvested findings into the main ledger.
+
+        ``terminal_composite`` identifies the call from
+        :meth:`_carry_isolated_ledger_writes`; direct defer and deferred-replay
+        calls leave it false so subclasses cannot mistake a pre-terminal carry
+        for the merged-unit recovery path.
+        """
         if not task.harvested_deferrals:
             return
         ledger = self.paths.deferred_work
@@ -7774,8 +7925,12 @@ class Engine:
         try:
             text = deferredwork.read_for_write(ledger) or ""
         except (deferredwork.LedgerReadError, OSError) as e:
-            self._pause_for_ledger_repair(
-                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry"
+            self._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                e,
+                site="harvest-carry",
+                terminal_composite=terminal_composite,
             )
         seen = deferredwork.parse_ledger(text)
         specs: list[deferredwork.EntrySpec] = []
@@ -7827,8 +7982,12 @@ class Engine:
         try:
             appended = deferredwork.append_entries(ledger, specs)
         except deferredwork.LedgerReadError as e:
-            self._pause_for_ledger_repair(
-                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry-append-locked"
+            self._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                e,
+                site="harvest-carry-append-locked",
+                terminal_composite=terminal_composite,
             )
         carried = [dw_id for dw_id in appended if dw_id]
         commit_needed = bool(carried) or task.harvest_carry_commit_pending
@@ -8047,11 +8206,14 @@ class Engine:
         was down, and nothing git holds could prove otherwise."""
         repo = self.paths.repo_root
         try:
-            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            resolved_board = board.resolve()
+            resolved_repo = repo.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return True
+        try:
+            rel = resolved_board.relative_to(resolved_repo).as_posix()
         except ValueError:
             return False  # external board — never git's to commit in the first place
-        except (OSError, RuntimeError):
-            return True
         try:
             return rel in verify.dirty_paths(repo)
         except (verify.GitError, OSError, RuntimeError):

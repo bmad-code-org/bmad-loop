@@ -73,6 +73,7 @@ CANARIES = [
     "CANARY_RESULT",
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
+    "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw==",
     SHA,
     "AcmeVaultRotation",
 ]
@@ -114,6 +115,11 @@ def _seed_run(
         baseline_untracked=["AcmeSecret.py", "src/secret/thing.py"],
         worktree_path=f"{HOME_PATH}/worktrees/{BRANCH}",
         dw_ids=["DW-1", "DW-2"],
+        artifact_destination=HOME_PATH,
+        artifact_baseline={"AcmeSecret.py": SHA},
+        artifact_source_digests={"AcmeSecret.py": SHA},
+        artifact_acceptance_identity="review:1",
+        artifact_payload={"AcmeSecret.py": "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw=="},
     )
     task.record_session(
         SessionRecord(
@@ -139,6 +145,7 @@ def _seed_run(
         paused_stage="escalation",
         paused_story_key=STORY_KEY,
         policy_snapshot={
+            "limits": {"artifact_file_max_mb": 5, "artifact_payload_max_mb": 10},
             "adapter": {
                 "name": "claude",
                 "model": "claude-opus-4-8",
@@ -228,6 +235,58 @@ def test_known_safe_values_survive(project):
     assert "20260627-120000-aaaa" in combined  # run id is opaque/safe
     assert "escalated" in combined  # phase enum survives
     assert "input_tokens" in combined  # token count keys survive
+    assert '"artifact_file_max_mb": 5' in combined
+    assert '"artifact_payload_max_mb": 10' in combined
+
+
+def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
+    """Capacity diagnostics retain the closed cause and measured bounds only."""
+    secret_path = "/home/canaryuser/AcmeSecret/report.bin"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "artifact-publication-refused",
+            "story_key": STORY_KEY,
+            "error": f"artifact too large: {secret_path}",
+            "publication_cause": "file-limit",
+            "measured_bytes": 5_242_881,
+            "limit_bytes": 5_242_880,
+            "measurement_is_lower_bound": True,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed["publication_cause"] == "file-limit"
+    assert scrubbed["measured_bytes"] == 5_242_881
+    assert scrubbed["limit_bytes"] == 5_242_880
+    assert scrubbed["measurement_is_lower_bound"] is True
+    assert scrubbed["error_present"] is True
+    assert secret_path not in json.dumps(scrubbed)
+
+
+def test_artifact_size_refusal_rejects_malformed_safe_fields():
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "artifact-publication-refused",
+            "publication_cause": "AcmeSecret",
+            "measured_bytes": "AcmeSecret",
+            "limit_bytes": {"secret": "AcmeSecret"},
+            "measurement_is_lower_bound": "AcmeSecret",
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {
+        "kind": "artifact-publication-refused",
+        "publication_cause": None,
+        "measured_bytes": None,
+        "limit_bytes": None,
+        "measurement_is_lower_bound": None,
+    }
+    assert "AcmeSecret" not in json.dumps(scrubbed)
 
 
 def test_sweeps_refused_redacts_both_halves(project):

@@ -43,6 +43,12 @@ ID_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
 
 REQUIRED_FIELDS = ("id", "title", "description")
 
+
+def _diagnostic_text(text: str) -> str:
+    """Render refusal text using only ASCII, independent of stderr's codec."""
+    return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 # The dispatch-protocol read model. Non-terminal statuses a re-dispatch resumes
 # from (the session died mid-flight); `done` is terminal-skip; `blocked` stops
 # the run. A story spec that is absent reads as PENDING (never dispatched).
@@ -492,18 +498,22 @@ def relativize_spec_folder(project: Path, spec_folder: str) -> str:
     if not raw.is_absolute():
         return raw.as_posix()
     try:
-        return raw.resolve().relative_to(project.resolve()).as_posix()
-    except ValueError:
-        # Both sides canonicalized and simply share no prefix: genuinely outside
-        # the project tree, which the contract allows — keep it verbatim.
-        return raw.as_posix()
-    except (OSError, RuntimeError) as e:
-        raise StoriesError(
+        canonical_folder = raw.resolve()
+        canonical_project = project.resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        message = (
             f"cannot canonicalize the spec folder {spec_folder!r} against the project "
             f"root {str(project)!r}: {e} — whether it lies inside or outside the "
             "project tree cannot be determined, so no run can safely dispatch it. "
             "Run `bmad-loop validate` for what this host is doing."
-        ) from e
+        )
+        raise StoriesError(_diagnostic_text(message)) from e
+    try:
+        return canonical_folder.relative_to(canonical_project).as_posix()
+    except ValueError:
+        # Both sides canonicalized and simply share no prefix: genuinely outside
+        # the project tree, which the contract allows — keep it verbatim.
+        return raw.as_posix()
 
 
 def is_plan_halt_leg(spec_checkpoint: bool, state: StoryState) -> bool:

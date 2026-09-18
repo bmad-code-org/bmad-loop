@@ -11,6 +11,8 @@ def test_defaults_when_file_missing(tmp_path):
     pol = policy.load(tmp_path / "nope.toml")
     assert pol.gates.mode == "per-epic"
     assert pol.limits.max_review_cycles == 3
+    assert pol.limits.artifact_file_max_mb == 5
+    assert pol.limits.artifact_payload_max_mb == 10
     assert pol.adapter.name == "claude"
     assert pol.adapter.extra_args is None  # None = use the profile's bypass flags
     assert pol.dev.skill == "bmad-dev-auto"  # the sole supported dev skill
@@ -430,6 +432,24 @@ def test_git_timeout_default_parse_and_template():
     assert doc["limits"]["git_timeout_s"] == 120
 
 
+def test_artifact_publication_limits_parse_validate_and_render():
+    import tomllib
+
+    loaded = policy.loads("[limits]\nartifact_file_max_mb = 7\nartifact_payload_max_mb = 21\n")
+    assert loaded.limits.artifact_file_max_mb == 7
+    assert loaded.limits.artifact_payload_max_mb == 21
+    template = tomllib.loads(policy.POLICY_TEMPLATE)["limits"]
+    assert template["artifact_file_max_mb"] == policy.LimitsPolicy.artifact_file_max_mb
+    assert template["artifact_payload_max_mb"] == policy.LimitsPolicy.artifact_payload_max_mb
+
+
+@pytest.mark.parametrize("key", ["artifact_file_max_mb", "artifact_payload_max_mb"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_artifact_publication_limits_must_be_positive(key, bad):
+    with pytest.raises(policy.PolicyError, match=rf"limits\.{key}"):
+        policy.loads(f"[limits]\n{key} = {bad}\n")
+
+
 @pytest.mark.parametrize("bad", [0, -5])
 def test_git_timeout_must_be_positive(bad):
     with pytest.raises(policy.PolicyError, match=r"limits\.git_timeout_s"):
@@ -506,6 +526,8 @@ def test_dev_contract_nudge_rejects_non_boolean():
     [
         "max_review_cycles",
         "max_dev_attempts",
+        "artifact_file_max_mb",
+        "artifact_payload_max_mb",
         "max_followup_reviews",
         "session_timeout_min",
         "git_timeout_s",

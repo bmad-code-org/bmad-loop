@@ -167,7 +167,7 @@ class RecoveryFlow:
                     # hazard as a link at the final component.
                     return None
                 is_file = resolved.is_file()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 return None
             if is_file and resolved not in resolved_files:
                 resolved_files.append(resolved)
@@ -213,8 +213,15 @@ class RecoveryFlow:
     @staticmethod
     def _restore_attempt_owned_spec_bytes(spec_path: Path, snapshot: bytes) -> None:
         """Restore and verify the byte-exact pre-attempt input."""
+        parent = spec_path.parent
         try:
-            parent = spec_path.parent
+            # Validate the full spelling before creating any missing component.
+            # The nearest-existing-parent walk proves the live prefix separately;
+            # this non-strict probe catches an invalid unresolved suffix first.
+            if parent.resolve() != parent or spec_path.resolve() != spec_path:
+                raise _OwnedSpecAuthorityError(
+                    f"attempt-owned spec target became unsafe: {spec_path}"
+                )
             existing_parent = parent
             while not existing_parent.exists() and not existing_parent.is_symlink():
                 if existing_parent == existing_parent.parent:
@@ -245,7 +252,24 @@ class RecoveryFlow:
                 raise _OwnedSpecAuthorityError(
                     f"attempt-owned spec target became unsafe: {spec_path}"
                 )
+        except _OwnedSpecAuthorityError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target could not be revalidated: {spec_path}"
+            ) from exc
+
+        # Creation is a repair write. Preserve the established typed translation
+        # for OS/symlink-loop failures, but let a ValueError from mkdir itself
+        # escape raw rather than misclassifying it as an authority probe failure.
+        try:
             parent.mkdir(parents=True, exist_ok=True)
+        except (OSError, RuntimeError) as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target could not be revalidated: {spec_path}"
+            ) from exc
+
+        try:
             if not parent.is_dir() or parent.is_symlink() or parent.resolve(strict=True) != parent:
                 raise _OwnedSpecAuthorityError(
                     f"attempt-owned spec target became unsafe: {spec_path}"
@@ -258,7 +282,7 @@ class RecoveryFlow:
                 )
         except _OwnedSpecAuthorityError:
             raise
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             ) from exc

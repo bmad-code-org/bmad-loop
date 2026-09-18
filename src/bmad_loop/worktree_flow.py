@@ -28,7 +28,7 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
-from . import gates, verify
+from . import artifact_publication, gates, verify
 from .install import (
     _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
@@ -567,28 +567,30 @@ def worktree_seed_undelivered(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
                 matches = sorted(unresolved_repo_root.glob(pattern))
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
-        rels.extend(
-            match.relative_to(repo_root).as_posix() for match in sorted(repo_root.glob(pattern))
-        )
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        rels.extend(match.relative_to(repo_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
         try:
             return path.resolve().is_relative_to(root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Path, dst: Path) -> bool:
@@ -682,7 +684,7 @@ def module_skills_seed_undelivered(
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
     try:
         worktree = worktree.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # This is a journal-only observation. Root uncertainty means every
         # bundled skill the wheel actually carries is coarsely undelivered.
         return [
@@ -695,7 +697,7 @@ def module_skills_seed_undelivered(
     def contained(target: Path) -> bool:
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Traversable, dst: Path) -> bool:
@@ -817,7 +819,7 @@ def provision_worktree(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
             f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
@@ -857,7 +859,7 @@ def provision_worktree(
         try:
             src = (repo_root / rel).resolve()
             dst = raw.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
@@ -925,13 +927,17 @@ def provision_worktree(
     # copy-when-absent semantics. rel is taken from the unresolved match so the
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
-        for match in sorted(repo_root.glob(pattern)):
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for match in matches:
             rel = match.relative_to(repo_root)
             raw = worktree / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
@@ -1017,7 +1023,7 @@ def provision_worktree(
             dst = tree_dir / skill
             try:
                 src = (repo_root / tree / skill).resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
@@ -1063,7 +1069,7 @@ def provision_worktree(
                     break
                 cursor = cursor.parent
             config_path = raw_config_path.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if refused or config_path != raw_config_path or not config_path.is_relative_to(worktree):
             continue
@@ -1913,6 +1919,12 @@ class WorktreeFlow:
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )
         task.branch = unit.branch
+        if task.dw_ids:
+            try:
+                artifact_publication.capture(task, self.paths)
+            except (artifact_publication.PublicationError, OSError, ValueError) as exc:
+                self._save()
+                self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -2316,16 +2328,25 @@ class WorktreeFlow:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        if not replay:
+        if first_integration:
+            self._emit("pre_integrate", task)
+        if task.dw_ids:
+            self.prepare_publication(task, unit.workspace.paths)
+        if not replay or first_integration:
             self._emit("pre_merge", task)
         scm = self.policy.scm
         merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
         repo = self.paths.repo_root
         target = self.state.target_branch
         source = task.commit_sha or verify.rev_parse_head(unit.path)
-        merge_ref = unit.branch
+        # The completed task's recorded commit is the only source revision this
+        # run accepted.  A pre_merge plugin (or another process) may advance the
+        # unit branch after final verification, so never let the movable branch
+        # name choose bytes for either the collision probe or the merge itself.
+        merge_ref = source
         if replay:
             current_source = verify.rev_parse_head(unit.path)
             if current_source != source:
@@ -2337,10 +2358,8 @@ class WorktreeFlow:
                 )
                 self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
                 return
-            # Pin both the collision allowlist and the merge operand to the
-            # write-ahead SHA. The branch can move after the check; replay must
-            # integrate only the commit the completed session actually proved.
-            merge_ref = source
+            # ``merge_ref`` stays pinned to the write-ahead SHA even after this
+            # diagnostic check; the branch can move again before Git runs.
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
@@ -2421,7 +2440,7 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
-        if not replay:
+        if not replay or first_integration:
             # The task is already terminal and durable here. Record integration
             # intent immediately before git so a host loss after merge success but
             # before `unit-merged` can safely re-run the merge instead of losing a
@@ -2434,13 +2453,20 @@ class WorktreeFlow:
                 strategy=merge_strategy,
                 source=source,
             )
+        # The integrated-tree check below rolls a drifted merge back to THIS
+        # revision; read it only for a bundle carrying a Git deliverable binding,
+        # the one case the check runs for.
+        integrated_check = bool(task.dw_ids) and task.artifact_tracked_source_oids is not None
+        pre_merge_head = verify.rev_parse_head(repo) if integrated_check else None
         try:
             verify.merge_branch(
                 repo,
                 merge_ref,
                 strategy=merge_strategy,
                 message=self.merge_message(task),
-                allow_empty_squash=replay,
+                allow_empty_squash=(
+                    replay or (bool(task.dw_ids) and source == task.baseline_commit)
+                ),
             )
         except verify.MergePreflightError as e:
             # Subclass arm, so it must precede the GitError one below. git declined
@@ -2650,6 +2676,16 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
+        if integrated_check and pre_merge_head is not None:
+            # The unit-side validators proved the unit's commit; the target's own
+            # commit (`--no-ff`'s merge commit, the squash leg's `git commit`) runs
+            # the TARGET's hooks, which can rewrite and re-add a tracked
+            # deliverable after everything the run validated (#795 review). Read
+            # the integrated tree BEFORE `unit-merged` latches the merge as proof:
+            # a drifted merge is rolled back to the pre-merge revision and
+            # escalated with the unit kept, so a resume replays the merge rather
+            # than publishing over it.
+            self.validate_integrated_publication(task, unit, pre_merge_head)
         self.journal.append(
             "unit-merged",
             story_key=task.story_key,
@@ -2659,6 +2695,206 @@ class WorktreeFlow:
             source=source,
         )
         self._emit("post_merge", task)
+        self.finish_publication(task, unit)
+
+    def validate_integrated_publication(
+        self, task: StoryTask, unit: UnitWorkspace, pre_merge_head: str
+    ) -> None:
+        """Refuse a target integration whose tree drifted from the accepted deliverables.
+
+        On drift the target is returned to ``pre_merge_head`` with ``reset --keep``
+        — it undoes exactly the paths the merge changed and ABORTS rather than
+        flatten a local edit on one of them, so an operator's uncommitted work
+        outside the merge survives as `clean_incoming_collisions` promised — and
+        the unit is kept and escalated through the merge-failure route. A rollback
+        git declines is reported in the reason, never retried: the merge commit
+        is then still on the target and the operator's first step is to clear it.
+        """
+        try:
+            artifact_publication.validate_integrated(task, self.paths, "HEAD")
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            target = self.state.target_branch
+            restored, restore_out = verify.reset_keep(self.paths.repo_root, pre_merge_head)
+            if restored:
+                state = (
+                    f"{target} has been returned to {pre_merge_head[:12]}, so the drifted "
+                    f"merge commit is gone and the checkout needs nothing from you"
+                )
+            else:
+                state = (
+                    f"the drifted merge commit is STILL on {target} because the rollback "
+                    f"to {pre_merge_head[:12]} was declined ({restore_out}); "
+                    f"return {target} to that revision by hand first"
+                )
+            reason = (
+                f"integration of {unit.branch} into {target} was rolled back: the "
+                f"target's own commit did not carry the accepted Git deliverables — a "
+                f"target-side hook (`pre-merge-commit`, `pre-commit`) or a concurrent "
+                f"writer rewrote them after verification. {state}. Fix what rewrote "
+                f"the deliverables, then `bmad-loop resume {self.state.run_id}`. {exc}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+
+    def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
+        """Persist accepted bytes before merge can consume the unit."""
+        try:
+            limits = self.policy.limits
+            artifact_publication.prepare(
+                task,
+                self.paths,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+
+    def bind_publication(
+        self, task: StoryTask, source: ProjectPaths, acceptance_identity: str
+    ) -> None:
+        """Persist final-verification source authority for one accepted result.
+
+        Arm and save the append-only session identity before reading source
+        bytes. If the process dies during the read, replay sees the same identity
+        with no digest map and refuses rather than blessing whatever bytes are
+        present after restart.
+        """
+        if task.artifact_acceptance_identity == acceptance_identity:
+            if task.artifact_source_digests is None or task.artifact_tracked_source_oids is None:
+                exc = artifact_publication.PublicationError(
+                    "accepted artifact source binding is unavailable for replay"
+                )
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication binding failed: {exc}",
+                    task.story_key,
+                    cause=exc,
+                )
+            return
+        try:
+            artifact_publication.arm_binding(task, acceptance_identity)
+            self._save()
+            limits = self.policy.limits
+            artifact_publication.bind_armed(
+                task,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+
+    def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
+        """Validate final staged Git deliverables or retain the unit mount."""
+        try:
+            return artifact_publication.validate_staged(task, source)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication staging failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def validate_committed_publication(
+        self,
+        task: StoryTask,
+        source: ProjectPaths,
+        revision: str,
+        staged_snapshot: object,
+    ) -> None:
+        """Validate the committed tree or roll back while retaining the mount."""
+        try:
+            if not isinstance(staged_snapshot, dict) or not all(
+                isinstance(rel, str) and isinstance(identity, str)
+                for rel, identity in staged_snapshot.items()
+            ):
+                raise artifact_publication.PublicationError(
+                    "validated staged artifact snapshot is missing or malformed"
+                )
+            artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication commit validation failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
+        """Publish and latch before successful teardown, including merge replay."""
+        if task.dw_ids:
+            try:
+                artifact_publication.publish(task, self.paths)
+                self._save()
+            except (
+                artifact_publication.PublicationError,
+                verify.GitError,
+                OSError,
+                ValueError,
+            ) as exc:
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication failed: {exc}; source retained at {task.worktree_path}",
+                    task.story_key,
+                    cause=exc,
+                )
+        if unit is None:
+            return  # journal-proven merge can publish from durable bytes alone
+        scm = self.policy.scm
         close_unit_workspace(
             unit,
             success=True,
@@ -2711,18 +2947,24 @@ class WorktreeFlow:
     def gc_run_worktrees(self) -> None:
         """Reclaim this run's worktree scaffolding once it finishes cleanly.
 
-        DONE units drop their worktree at merge time; this is a safety net for a
-        worktree leaked by a crash between merge and teardown, plus it prunes
-        stale git admin entries and removes the now-empty run worktree dir.
+        DONE and AWAITING_OPERATOR units drop their worktree at merge time; this
+        is a safety net for a worktree leaked by a crash between merge and
+        teardown, plus it prunes stale git admin entries and removes the now-empty
+        run worktree dir.
         Worktrees deliberately kept for inspection (a kept-failed/escalated unit)
         are left in place and journaled so the operator can find them."""
         if not self.isolated:
             return
         repo = self.paths.repo_root
         for task in self.state.tasks.values():
-            if task.phase == Phase.DONE and task.worktree_path:
+            if task.phase in (Phase.DONE, Phase.AWAITING_OPERATOR) and task.worktree_path:
                 wt = Path(task.worktree_path)
                 if wt.is_dir():
+                    if task.dw_ids and not task.artifact_publication_complete:
+                        self._pause(
+                            f"artifact publication incomplete; source retained at {task.worktree_path}",
+                            task.story_key,
+                        )
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.

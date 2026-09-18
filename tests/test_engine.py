@@ -1765,24 +1765,72 @@ def test_snapshot_read_rejects_in_place_change_after_read(project, monkeypatch):
 
 @pytest.mark.parametrize(
     "fault",
-    [OSError(36, "File name too long"), RuntimeError("symlink loop")],
-    ids=["oserror", "runtime-error"],
+    [
+        pytest.param(OSError(36, "File name too long"), id="oserror"),
+        pytest.param(RuntimeError("symlink loop"), id="runtime-error"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
 )
 def test_dispatched_spec_observation_fault_leaves_attempt_unbound(project, monkeypatch, fault):
     """A filesystem observation fault cannot abort before DEV_RUNNING is saved.
 
-    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and both
-    rows raise instead of returning the deliberately unbound fallback.
+    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and the
+    fault rows raise instead of returning the deliberately unbound fallback.
     """
     engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file="recorded-spec.md")
-
-    def fail_observation(*_args, **_kwargs):
-        raise fault
-
-    monkeypatch.setattr(verify, "resolve_spec_path", fail_observation)
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    refuse_to_resolve(monkeypatch, recorded, error=fault)
 
     assert engine._dispatched_spec_for_attempt(task) is None
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_read_fault_retains_retry_authority(
+    project, monkeypatch, resolve_fault
+):
+    """A failed read observation does not erase an established retry binding."""
+    engine, _ = make_engine(project, [])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = recorded.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file=str(recorded.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, recorded, error=resolve_fault)
+
+    assert not engine._refresh_dispatched_spec_snapshot(task, clear_on_failure=False)
+    assert task.dispatched_spec_file == str(recorded)
+    assert task.dispatched_spec_snapshot == snapshot
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_validation_fault_returns_false_without_mutation(
+    project, monkeypatch, resolve_fault
+):
+    """Accepted-path uncertainty cannot replace retained retry-chain authority."""
+    engine, _ = make_engine(project, [])
+    owned = spec_path(project, "1-1-owned")
+    accepted = spec_path(project, "1-1-accepted")
+    write_spec(owned, "ready-for-dev", rev_parse_head(project.project))
+    write_spec(accepted, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = owned.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, accepted, error=resolve_fault)
+
+    assert not engine._validate_dispatched_spec_snapshot(task)
+    assert task.dispatched_spec_file == str(owned)
+    assert task.dispatched_spec_snapshot == snapshot
 
 
 def test_resume_continues_from_completed_review_session(project):
@@ -2752,6 +2800,23 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
 
     monkeypatch.setattr(Path, "resolve", resolve_fault)
     assert engine._harvest_gate_exclude(task) == ()
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_gate_value_error_family_resolution_fault_uses_lexical_exclusion(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+    paths = engine.workspace.paths
+    refused = paths.deferred_work if refused_operand == "ledger" else paths.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_gate_exclude(task) == (
+        "_bmad-output/implementation-artifacts/deferred-work.md",
+    )
 
 
 def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(project):
@@ -14779,18 +14844,29 @@ def test_spec_deferrals_skip_out_of_tree_session_spec(project, tmp_path):
     assert skipped[0]["spec"] == str(outside)
 
 
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
-def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, error_type):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected containment fault"), id="oserror"),
+        pytest.param(RuntimeError("injected containment fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, resolve_fault):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     task = StoryTask(story_key="1-1-a", epic=1)
     sp = spec_path(project, task.story_key)
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
 
-    def containment_fault(*args, **kwargs):
-        raise error_type("injected containment fault")
+    if isinstance(resolve_fault, (OSError, RuntimeError)):
 
-    monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+        def containment_fault(*_args, **_kwargs):
+            raise type(resolve_fault)(*resolve_fault.args)
+
+        monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+    else:
+        refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
     engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
 
     assert not project.deferred_work.exists()
@@ -14798,6 +14874,31 @@ def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch,
     assert task.harvest_wrote_ledger is False
     skipped = [
         e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-skipped-out-of-tree"
+    ]
+    assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_declared_deferred_ids_skip_value_error_family_containment_faults(
+    project, monkeypatch, resolve_fault
+):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", closes_deferred=["DW-1"])
+    task.spec_file = str(sp)
+    before = project.deferred_work.read_bytes()
+    refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
+
+    engine._close_declared_deferred(task)
+
+    assert project.deferred_work.read_bytes() == before
+    skipped = [
+        event
+        for event in engine.journal.entries()
+        if event["kind"] == "deferred-close-skipped-out-of-tree"
     ]
     assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
 
@@ -15612,6 +15713,19 @@ def test_ledger_classifier_reports_tracked_inside_workspace_as_gits(project):
     assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_in_repo_value_error_family_fault_is_observed_as_external(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else engine.workspace.root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._ledger_in_repo(ledger) is False
+
+
 @pytest.mark.skipif(
     sys.platform == "win32", reason="creating a directory symlink needs elevation on Windows"
 )
@@ -15708,6 +15822,76 @@ def test_ledger_rel_derives_lexically_before_resolving(project, monkeypatch):
     assert engine._ledger_rel() == ("_bmad-output/implementation-artifacts/deferred-work.md", None)
     # and the anchor stays authoritative rather than degrading to no-anchor
     assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_rel_value_error_family_resolution_fault_is_uncertain(
+    project, tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    lexical_alias = tmp_path / "workspace-alias"
+    engine.workspace = Workspace(root=lexical_alias, paths=project)
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else lexical_alias
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    rel, fault = engine._ledger_rel()
+
+    assert rel is None
+    assert fault is not None
+    assert type(fault) is type(resolve_fault)
+    assert fault.args == resolve_fault.args
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_carry_value_error_family_resolution_fault_cannot_degrade(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+
+
+def test_harvest_carry_degrades_only_for_a_successfully_resolved_external_ledger(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+    assert engine._harvest_carry_commit_may_degrade(tmp_path / "external-ledger.md") is True
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["board", "repo-root"])
+def test_board_carry_value_error_family_resolution_fault_requires_ownership_proof(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    refused = board if refused_operand == "board" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+
+
+def test_board_carry_distinguishes_in_repo_dirt_from_a_resolved_external_board(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    write_sprint(project, {"1-1-a": "in-progress"})
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+    git(project.project, "add", board.relative_to(project.project).as_posix())
+    git(project.project, "commit", "-q", "-m", "track sprint board")
+    assert engine._board_carry_must_prove_ownership(board) is False
+    assert engine._board_carry_must_prove_ownership(tmp_path / "external-board.yaml") is False
 
 
 def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):

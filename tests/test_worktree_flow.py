@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import git, refuse_to_resolve
+from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
 
 from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -542,10 +542,20 @@ def test_run_isolated_defers_on_open_failure(tmp_path):
     assert not any(e.startswith("unit-") for e in flow.journal.events())
 
 
-def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected mount resolve fault"), id="oserror"),
+        pytest.param(RuntimeError("injected mount resolve fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(
+    tmp_path, monkeypatch, resolve_fault
+):
     """An uncertain mount is an ordinary per-unit open failure, not a spawn fault.
 
-    Ablation: delete the mount-resolution translation and the raw provider fault
+    Ablation: delete the mount-resolution translation and the raw resolve fault
     escapes ``run_isolated`` instead of reaching DEFERRED/worktree-open-failed.
     """
     repo = tmp_path / "repo"
@@ -556,12 +566,13 @@ def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monk
         planning_artifacts=repo / "_bmad-output/planning-artifacts",
     )
     mount = unit_worktrees_dir(tmp_path) / "1-1"
-    refuse_to_resolve(monkeypatch, mount)
+    refuse_to_resolve(monkeypatch, mount, error=resolve_fault)
 
     with pytest.raises(verify.GitError) as excinfo:
         open_unit_workspace(repo, paths, "run-1", "1-1", "main", "story", tmp_path)
     assert "worktree mount path" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, OSError)
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
 
     state = SimpleNamespace(
         target_branch="main",
@@ -801,3 +812,55 @@ def test_setup_mcp_agent_id_mapping():
     assert _setup_mcp_agent_id("gemini") == "gemini"
     assert _setup_mcp_agent_id("cursor") == "cursor"
     assert _setup_mcp_agent_id("some-custom-profile") == "some-custom-profile"
+
+
+def test_gc_retains_unpublished_bundle_sources(project, tmp_path):
+    mount = tmp_path / "mounted-unit"
+    mount.mkdir()
+    task = StoryTask(
+        story_key="dw-fix", epic=0, phase=Phase.DONE, dw_ids=["DW-1"], worktree_path=str(mount)
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+    with pytest.raises(_Pause, match="publication incomplete"):
+        flow.gc_run_worktrees()
+    assert mount.is_dir()
+
+
+def test_gc_reclaims_published_awaiting_operator_source(project, tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    mount = tmp_path / "mounted-unit"
+    mount.mkdir()
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        phase=Phase.AWAITING_OPERATOR,
+        dw_ids=["DW-1"],
+        worktree_path=str(mount),
+        artifact_publication_complete=True,
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+
+    def discard(_repo, path, _branch, **_kwargs):
+        Path(path).rmdir()
+
+    monkeypatch.setattr(worktree_flow, "discard_worktree", discard)
+    monkeypatch.setattr(worktree_flow.verify, "worktree_prune", lambda *_: None)
+    flow.gc_run_worktrees()
+    assert not mount.exists()
+
+
+def test_gc_legacy_bundle_with_already_removed_mount_stays_compatible(project, tmp_path):
+    task = StoryTask(
+        story_key="dw-old",
+        epic=0,
+        phase=Phase.DONE,
+        dw_ids=["DW-1"],
+        worktree_path=str(tmp_path / "removed-before-upgrade"),
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+    flow.gc_run_worktrees()
+    assert flow.calls.pauses == []

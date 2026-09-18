@@ -14,6 +14,11 @@ class BmadConfigError(Exception):
     pass
 
 
+def _diagnostic_text(text: str) -> str:
+    """Render diagnostics using only ASCII, independent of stderr's codec."""
+    return text.replace("\x00", "\\x00").encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
     project: Path
@@ -141,13 +146,13 @@ def _canonical(expanded: Path, label: str) -> Path:
     so the message never calls a path "configured" that nobody configured."""
     try:
         return expanded.resolve()
-    except (OSError, RuntimeError) as e:
-        raise BmadConfigError(
-            f"cannot canonicalize the {label} ({expanded}): {e} — "
-            "whether it lies inside or outside the project tree cannot be determined, "
-            "so no run can safely proceed. Run `bmad-loop validate` for what this "
-            "host is doing."
-        ) from e
+    except (OSError, RuntimeError, ValueError) as e:
+        message = (
+            f"cannot canonicalize the {label} ({expanded}): {e} — whether it lies "
+            "inside or outside the project tree cannot be determined, so no run can "
+            "safely proceed. Run `bmad-loop validate` for what this host is doing."
+        )
+        raise BmadConfigError(_diagnostic_text(message)) from e
 
 
 def _resolve(raw: str, project: Path) -> Path:
@@ -179,12 +184,13 @@ def load_paths(project: Path) -> ProjectPaths:
     # pre-dispatch, where there is no handler to catch anything.
     try:
         project = Path(project).resolve()
-    except (OSError, RuntimeError) as e:
-        raise BmadConfigError(
+    except (OSError, RuntimeError, ValueError) as e:
+        message = (
             f"cannot canonicalize the project root {project}: {e} — artifact paths "
             "are derived from the canonical root, so no run can safely proceed. "
             "Run `bmad-loop validate` for what this host is doing."
-        ) from e
+        )
+        raise BmadConfigError(_diagnostic_text(message)) from e
     config_path = project / "_bmad" / "bmm" / "config.yaml"
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")

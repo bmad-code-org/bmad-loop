@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, NoReturn, assert_never
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor, _publication_refusal
+from .engine import (
+    Engine,
+    RunPaused,
+    _ArmedClose,
+    _ledger_fault_text,
+    _LedgerAnchor,
+    _publication_refusal,
+)
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
@@ -2915,6 +2922,13 @@ class SweepEngine(Engine):
         closes are rightfully its own.
         """
         task.bundle_closes_intended = []
+        task.artifact_baseline = None
+        task.artifact_destination = None
+        task.artifact_source_digests = None
+        task.artifact_tracked_source_oids = None
+        task.artifact_acceptance_identity = None
+        task.artifact_payload = None
+        task.artifact_publication_complete = False
         task.spec_file = None
         task.restore_patch = None
         task.attempt = 0
@@ -3213,7 +3227,11 @@ class SweepEngine(Engine):
             for e in legacy
         ]
         manifest_path = self.run_dir / "migrate-manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        atomic_write_text_confined(
+            manifest_path,
+            json.dumps(manifest, indent=2),
+            confine_root=_project_of_run_dir(self.run_dir),
+        )
 
         feedback: Path | None = None
         while True:
@@ -3268,8 +3286,10 @@ class SweepEngine(Engine):
             if not errors:
                 advance(task, Phase.DONE)
                 self._save()
-                (self.run_dir / "migrate-result.json").write_text(
-                    json.dumps(result.result_json, indent=2), encoding="utf-8"
+                atomic_write_text_confined(
+                    self.run_dir / "migrate-result.json",
+                    json.dumps(result.result_json, indent=2),
+                    confine_root=_project_of_run_dir(self.run_dir),
                 )
                 # the ledger file: the migration rewrote the ledger
                 self._commit_ledger(
@@ -6343,15 +6363,19 @@ class SweepEngine(Engine):
         self,
         task: StoryTask,
         ledger: Path,
-        fault: deferredwork.LedgerReadError,
+        fault: deferredwork.LedgerReadError | OSError,
         *,
         site: str,
         dw_ids: list[str],
+        operation: Literal["bundle-close", "harvested-deferral-append"] = "bundle-close",
     ) -> NoReturn:
-        """Pause the run over a ledger a bundle-close mutator could not read under
-        its own lock (DW-280): journal `sweep-bundle-close-refused`, notify with
-        the RESUME route, save, and raise `RunPaused` at the story gate on the
-        task, its phase and `bundle_closes_intended` exactly as they were.
+        """Pause a sweep bundle over a ledger its terminal write could not read.
+
+        Bundle-close mutators (DW-280) and the terminal post-merge harvested
+        append (DW-286) share ``sweep-bundle-close-refused``, the RESUME route,
+        and a story-gate pause. The operation argument keeps both the transient
+        notice and durable pause reason truthful while ``site`` remains the
+        machine-readable discriminator.
 
         `fault` is the mutator's own exception, not its text, so the row keeps
         the classification `LedgerReadFault` (DW-279) exists to carry: an OS
@@ -6364,19 +6388,22 @@ class SweepEngine(Engine):
         AHEAD of the parent class, as the read contract requires, and its
         `OSError` cause is what the token is read from: the wrapper alone, with
         no chained `OSError`, is treated as the decode arm rather than guessed
-        at. `error` is the exception's own text either way, which already names
-        the ledger path and, for the OS arm, the `OSError` class and errno.
+        at. The terminal harvest carry's pre-read may hand over a RAW `OSError`
+        (its `read_for_write` is not wrapped), which is the OS arm outright.
+        `error` is the fault's attributed text either way
+        (`engine._ledger_fault_text`), which already names the ledger path and,
+        for the OS arm, the `OSError` class and errno.
 
-        The sweep's own route for the two calls `Engine._pause_for_ledger_repair`
-        names as NOT covered — `_close_bundle_ledger_when_spec_status` (the
-        accepted-dev close and the review-leg reclose) and the sweep half of
+        The close sites are `_close_bundle_ledger_when_spec_status` (the
+        accepted-dev close and review-leg reclose) and the sweep half of
         `_carry_isolated_ledger_writes`. Each is a bare
         `deferredwork.mark_done_many_reopenable`, and every mutator takes its own
         locked `read_for_write` ahead of every write, so a `LedgerReadError` from
         the call itself — including `LedgerReadFault` for OS metadata/text-read
-        faults since DW-279 — proves nothing flipped: the pause costs no work. `site`
-        ends in `-locked` like the engine's, and names which of the three calls
-        raised.
+        faults since DW-279 — proves nothing flipped: the pause costs no work.
+        The terminal harvest carry also arrives here from the engine dispatch at
+        either its pre-read or locked-append site. The direct pre-terminal defer
+        carry deliberately stays on the engine escalation route.
 
         NOT `_pause_on_intent_refusal`: that tail clears the task's baseline pair,
         which is right for a task whose attempt was already rolled back and wrong
@@ -6389,7 +6416,7 @@ class SweepEngine(Engine):
 
         PAUSE_STORY_GATE, not PAUSE_ESCALATION, for the reason `_pause_on_intent_refusal`
         gives: every escalation action requires Phase.ESCALATED, which none of the
-        three sites' tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
+        affected tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
         stage's single action is "resume", which is the whole remedy once the
         ledger reads again. `runs.unreadable_sweep_ledger` fronts that resume for
         the MAIN checkout's ledger — the in-place sites and the carry; under
@@ -6405,11 +6432,13 @@ class SweepEngine(Engine):
         arm, so the pause takes its restart arm — `_rollback_or_pause` resets the
         attempt to baseline (rollback policy governing) and the bundle is
         re-driven from dev, whose accepted close then lands. That last is the
-        pre-existing sweep resume shape, not widened here."""
-        inaccessible = isinstance(fault, deferredwork.LedgerReadFault) and isinstance(
-            fault.__cause__, OSError
+        pre-existing sweep resume shape, not widened here. A terminal harvested
+        append pauses at DONE and replays through the same unlatched-carry
+        pre-pass, which appends before attempting the close again."""
+        inaccessible = isinstance(fault, OSError) or (
+            isinstance(fault, deferredwork.LedgerReadFault) and isinstance(fault.__cause__, OSError)
         )
-        error = str(fault)
+        error = _ledger_fault_text(ledger, fault)
         self.journal.append(
             "sweep-bundle-close-refused",
             story_key=task.story_key,
@@ -6420,12 +6449,12 @@ class SweepEngine(Engine):
             error=error,
         )
         ids = ", ".join(dw_ids)
-        # `error` is `LedgerReadError`'s text and already begins with the ledger's
-        # path, so neither string names the path a second time (the engine's
-        # `_pause_for_ledger_repair` does the same). One wording for all three
-        # sites, no per-site branch; the ONLY fork is the fault class, so the
-        # remediation matches the refusal — a permissions or storage repair is
-        # not a UTF-8 one. No "COMMIT the fix" steer, unlike
+        # `error` already begins with the ledger's path, so neither string names
+        # the path a second time (the engine's `_pause_for_ledger_repair` does the
+        # same). One wording per operation, no per-site branch; the only other
+        # fork is the fault class, so the remediation matches the refusal — a
+        # permissions or storage repair is not a UTF-8 one. No "COMMIT the fix"
+        # steer, unlike
         # `_pause_on_intent_refusal`: at the accepted-dev site the session's
         # uncommitted work sits beside the ledger, and a whole-tree commit by hand
         # would swallow it under the repair. The bundle's own commit carries a
@@ -6443,10 +6472,27 @@ class SweepEngine(Engine):
             verb = "decode"
             diagnosis = "the ledger could not be decoded"
             repair = "Repair the ledger by hand (it must be valid UTF-8)"
+        if operation == "harvested-deferral-append":
+            attempted = "publish a harvested-deferral append"
+            resume_detail = (
+                "the harvested-deferral append and then the isolated bundle close "
+                "with no session spent"
+            )
+            paused_operation = "harvested-deferral append"
+        else:
+            attempted = (
+                f"publish a bundle close for {ids} "
+                "(a close, or a re-assertion of one after review)"
+            )
+            resume_detail = (
+                "the recorded dev result at the accepted-dev close and the isolated "
+                "carry with no session spent, and restarting the bundle from dev at "
+                "the review-leg reclose, rollback policy governing"
+            )
+            paused_operation = f"bundle close for {ids}"
         notice = (
             f"**ACTION REQUIRED — {headline}**\n"
-            f"Bundle **{task.story_key}** was about to publish a ledger close for "
-            f"{ids} (a close, or a re-assertion of one after review), but the "
+            f"Bundle **{task.story_key}** was about to {attempted}, but the "
             f"orchestrator could not {verb} the deferred-work ledger to publish it: "
             f"{error}.\n"
             f"This write did not land and no work was discarded. {repair}"
@@ -6456,20 +6502,45 @@ class SweepEngine(Engine):
             self.run_dir,
             f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
             f"{notice} — then `bmad-loop resume {self.state.run_id}`, which re-drives "
-            "the write: replaying the recorded dev result at the accepted-dev close "
-            "and the isolated carry with no session spent, and restarting the bundle "
-            "from dev at the review-leg reclose, rollback policy governing",
+            f"{resume_detail}",
         )
         self._save()
         # The persisted reason (`state.paused_reason`, `run-paused`, the status
         # summary) carries the same diagnosis as the notice: an operator reading
         # only these surfaces must not be told to repair encoding that is fine.
         raise RunPaused(
-            f"bundle {task.story_key}: its ledger close for {ids} could not be "
+            f"bundle {task.story_key}: its {paused_operation} could not be "
             f"published because {diagnosis} ({error}); repair the ledger by hand, "
             "then resume",
             PAUSE_STORY_GATE,
             task.story_key,
+        )
+
+    def _pause_for_harvest_carry_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        fault: deferredwork.LedgerReadError | OSError,
+        *,
+        site: str,
+        terminal_composite: bool,
+    ) -> NoReturn:
+        """Use the sweep repair gate only for the terminal composite carry."""
+        if not terminal_composite:
+            super()._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                fault,
+                site=site,
+                terminal_composite=terminal_composite,
+            )
+        self._pause_for_bundle_close_repair(
+            task,
+            ledger,
+            fault,
+            site=site,
+            dw_ids=[],
+            operation="harvested-deferral-append",
         )
 
     def _ensure_bundle_intent(self, task: StoryTask) -> bool:
@@ -6669,6 +6740,30 @@ class SweepEngine(Engine):
         `_restore_patch` just laid onto the tree. The freeform intent.md pointer
         takes the path where that dirty-tree check runs first."""
         bundle_ref = task.bundle_file or task.story_key
+        artifact_only_guidance = (
+            "\n\nArtifact-only receipt: only if this session's actual deliverables are "
+            "confined to ignored content in the configured `implementation_artifacts` "
+            "directory strictly inside the code repository, you may write "
+            "`Artifact only: true` on its own line beside `Status:` in this session's "
+            "last genuine `## Auto Run Result` section. Author that marker in the "
+            "current session, outside fenced blocks and without an orchestrator "
+            "repair note; frontmatter does not assert the receipt. The value must "
+            "be the strict boolean `true`. Do not assert it for ordinary changes "
+            "or other nonqualifying deliverables, or based on old artifacts alone. "
+            "The ordinary proof-of-work probe must first positively find no changes; "
+            "the receipt gate then requires a positive ignored-file listing scoped "
+            "to that directory. The listing cannot prove which files you wrote. "
+            "All other verification and ledger-close checks still apply. In an "
+            "isolated worktree, successful integration publishes the accepted ignored "
+            "bundle spec before teardown. To publish additional ignored regular files, "
+            "list their exact paths relative to `implementation_artifacts` in the "
+            "accepted spec's `artifact_deliverables` frontmatter list. Directories, "
+            "globs, absolute paths, traversal, symlinks, and the orchestrator-owned "
+            "ledger and sprint board are forbidden. Undeclared files are not copied. "
+            "Publication checks destination baselines captured before execution; "
+            "conflicting main-checkout changes pause publication and retain source "
+            "artifacts for recovery. Accepting the receipt alone does not publish files."
+        )
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -6677,13 +6772,13 @@ class SweepEngine(Engine):
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
-                    f"resolution."
+                    f"resolution.{artifact_only_guidance}"
                 )
             return (
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
-                f"orchestrator records resolution."
+                f"orchestrator records resolution.{artifact_only_guidance}"
             )
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
@@ -6693,7 +6788,7 @@ class SweepEngine(Engine):
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
             f"contract or editing the deferred-work ledger. Verification evidence is "
-            f"in `{feedback}`."
+            f"in `{feedback}`.{artifact_only_guidance}"
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
@@ -6906,8 +7001,11 @@ class SweepEngine(Engine):
         catches it). It now routes to ``_pause_for_bundle_close_repair`` under
         ``bundle-close-carry-locked``, the latch left False by the call site — so
         ``bmad-loop resume`` replays the whole hook through
-        ``_replay_unlatched_ledger_carries`` once the ledger reads. The base half's
-        harvest carry routes its own locked read through the engine (DW-259).
+        ``_replay_unlatched_ledger_carries`` once the ledger reads. Since DW-286
+        the base half's harvest carry routes both its pre-read and locked append
+        through the same sweep-owned story-gate repair route. The direct
+        pre-terminal carry from ``Engine._defer`` retains the engine escalation
+        route.
 
         A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
         ``verify.unpublishable_target`` answers a different question from a
@@ -6986,44 +7084,6 @@ class SweepEngine(Engine):
                     )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
-    def _artifact_only_withheld(self) -> str | None:
-        """Why the artifact-only receipt (DW-273) cannot be honoured for the unit
-        `self.workspace` names whatever it writes — or `None` when it can.
-
-        Under `scm.isolation = "worktree"` an IN-TREE `implementation_artifacts`
-        is rebased into the unit worktree (`ProjectPaths.rebased`), so the
-        receipt's listing measures the worktree's copy of a gitignored dir. An
-        artifact-only result contributes no tracked change to the unit branch,
-        `integrate_unit` merges that unchanged branch and `merge_local` then
-        removes the worktree; `_carry_isolated_ledger_writes` re-applies the
-        ledger CLOSE to the main checkout but copies no file, so the accepted
-        spec or erratum — the bundle's sole deliverable — is destroyed with the
-        worktree while the ids read `done` (#794 review). Refusing the receipt
-        keeps such a bundle on the ordinary `no changes in worktree` retry, which
-        is loud and leaves the ids `open`, rather than landing a close whose
-        evidence no longer exists. The receipt stands under `isolation = "none"`,
-        where the workspace IS the main checkout — and that is the ONLY shape it
-        stands in: an out-of-tree artifacts dir is left where it is by `rebased`
-        and survives the teardown, so this veto does not fire on it, but the
-        receipt is refused for it anyway by the gate's own listing
-        (`_artifact_dir_entries` answers `None` for a dir outside the repo — git
-        lists nothing there), so moving the dir out of the tree is no remedy
-        (#794 review). Carrying the owned entries back before teardown is the
-        fix that would lift this; it is not this method's.
-
-        Compared by path, not by isolation flag: the flag says a worktree exists,
-        the path says whether the artifacts dir moved into it."""
-        unit_dir = self.workspace.paths.implementation_artifacts
-        if unit_dir == self.paths.implementation_artifacts:
-            return None
-        return (
-            "implementation_artifacts is rebased into the unit worktree under "
-            f'scm.isolation = "worktree" ({unit_dir}), and an ignored artifact written '
-            "there is removed with the worktree after the merge — nothing carries it to "
-            "the main checkout, so it cannot stand as the bundle's deliverable; run the "
-            'bundle with isolation = "none"'
-        )
-
     def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
         """Fingerprint the ignored entries under `implementation_artifacts` at the
         attempt's start, so `verify_dev_bundle`'s artifact-only receipt (DW-273)
@@ -7033,12 +7093,7 @@ class SweepEngine(Engine):
         `bundle-artifact-baseline-unavailable` and stamps `None`, on which the
         receipt refuses (the attempt is still driven; only the relaxation is
         withheld), rather than ending the run over a probe a bundle with a real
-        change never needs. `None` without a git call when
-        `_artifact_only_withheld` has already vetoed the receipt for this unit:
-        the gate refuses ahead of its snapshot arm, so a snapshot would measure
-        ownership nothing will read."""
-        if self._artifact_only_withheld() is not None:
-            return None
+        change never needs."""
         paths = self.workspace.paths
         try:
             return verify.artifact_dir_snapshot(self.workspace.root, paths.implementation_artifacts)
@@ -7058,7 +7113,6 @@ class SweepEngine(Engine):
             result_json,
             review_enabled=self._dev_review_enabled(),
             engine_written=self._harvest_gate_exclude(task),
-            artifact_only_withheld=self._artifact_only_withheld(),
         )
         # The accepted artifact-only receipt (DW-273) is never silent: one row per
         # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s
@@ -7096,12 +7150,15 @@ class SweepEngine(Engine):
                 kind="sweep-bundle-reclosed",
                 site="bundle-reclose-locked",
             )
-        return verify.verify_review_bundle(
+        outcome = verify.verify_review_bundle(
             task,
             self.workspace.paths,
             self.policy,
             on_results=self._review_command_sink(task),
         )
+        if outcome.ok:
+            self._accept_review_artifact_source(task)
+        return outcome
 
     def _operator_park_enabled(self) -> bool:
         # A bundle carries no sprint-status entry, so the pair a park is verified

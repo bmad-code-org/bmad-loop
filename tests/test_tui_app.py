@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    BMAD_CONFIG_REL,
     READABLE_LEDGER,
     UNDECODABLE_LEDGER,
     assert_run_state_lock_held,
@@ -4317,6 +4318,156 @@ async def test_tui_rearm_refuses_a_control_alias_run_before_mutating(project, mo
         app._do_rearm("ctl", run_dir, "1")
         await pilot.pause()
         assert rearms == []
+
+
+@pytest.mark.parametrize("fault", ["decode", "os"])
+async def test_resume_confirm_refuses_unreadable_sweep_ledger(project, monkeypatch, fault):
+    """DW-270: plain resume displays the real probe's refusal on the dashboard.
+
+    Ablation: remove the ledger refusal block from `_do_resume`; both rows fail
+    because the detached-launch recorder fills.
+    Ablation: remove `markup=False` from the refusal toast; its rendered text
+    loses the literal `[red]` path component.
+    """
+    install_bmad_config(project)
+    config = project.project / BMAD_CONFIG_REL
+    config.write_text(
+        config.read_text().replace("implementation-artifacts'", "implementation-artifacts/[red]'"),
+        encoding="utf-8",
+    )
+    ledger = project.implementation_artifacts / "[red]" / "deferred-work.md"
+    ledger.parent.mkdir()
+    ledger.write_bytes(UNDECODABLE_LEDGER if fault == "decode" else READABLE_LEDGER)
+    read_refused = True
+    if fault == "os":
+        read_text = Path.read_text
+
+        def refused_read(path, *args, **kwargs):
+            if path == ledger and read_refused:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_text(path, *args, **kwargs)
+
+        # Refuse only this sandbox file's text read, through the real reader and
+        # probe. chmod is not reliable under root or on Windows.
+        monkeypatch.setattr(Path, "read_text", refused_read)
+
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    original_state = (run_dir / "state.json").read_bytes()
+    refusal = runs_mod.unreadable_sweep_ledger(project.project, run_dir)
+    assert refusal is not None
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert resumes == []
+        assert (run_dir / "state.json").read_bytes() == original_state
+        assert (refusal, "error") in notifications_with_severity(app)
+        assert str(app.screen.query_one("Toast", Static).render()) == refusal
+        assert str(ledger) in refusal
+        assert "bmad-loop sweep" in refusal
+        assert "stays resumable" in refusal
+        if fault == "os":
+            assert "permissions or storage" in refusal
+
+        # Repair and retry in this same dashboard, retaining the paused run.
+        read_refused = False
+        ledger.write_bytes(READABLE_LEDGER)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert resumes == [run_dir.name]
+
+
+@pytest.mark.parametrize("case", ["readable", "story", "absent", "config", "state"])
+async def test_resume_confirm_ledger_probe_preserves_handoff(project, monkeypatch, case):
+    """The real probe permits readable sweeps and declines outside its scope.
+
+    Unavailable state is introduced AFTER opening the modal so the confirmation
+    reaches the probe; action_resume_run owns the earlier state-read refusal.
+    """
+    if case != "config":
+        install_bmad_config(project)
+    if case != "absent":
+        project.deferred_work.write_bytes(
+            READABLE_LEDGER if case == "readable" else UNDECODABLE_LEDGER
+        )
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        run_type="story" if case == "story" else "sweep",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        if case == "state":
+            (run_dir / "state.json").unlink()
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert any(f"resume of {run_dir.name} launched" in m for m in notifications(app))
+
+
+@pytest.mark.parametrize("guard", ["mux", "alive", "unknown"])
+async def test_resume_confirm_guards_precede_ledger_probe(project, monkeypatch, guard):
+    """Earlier guards win even if the sweep ledger is unreadable.
+
+    Ablation: move the ledger block above the mux/liveness guards in `_do_resume`;
+    the probe recorder fills instead of the existing guard owning the refusal.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    probes = []
+    resumes = []
+    probe = runs_mod.unreadable_sweep_ledger
+
+    def record_probe(root, run_dir):
+        probes.append(run_dir)
+        return probe(root, run_dir)
+
+    monkeypatch.setattr(runs_mod, "unreadable_sweep_ledger", record_probe)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        # Change the guard at confirmation time to exercise `_do_resume` itself.
+        if guard == "mux":
+            monkeypatch.setattr(launch, "mux_available", lambda: False)
+            message, severity = "multiplexer backend unavailable", "error"
+        else:
+            monkeypatch.setattr(data, "liveness", lambda run_dir: guard)
+            if guard == "unknown":
+                (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+            message, severity = "may still be live", "warning"
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert probes == []
+        assert resumes == []
+        assert any(message in m and s == severity for m, s in notifications_with_severity(app))
 
 
 def _escalated_sweep_run(root: Path, run_id: str = "20260611-100000-aaaa") -> Path:

@@ -350,8 +350,9 @@ def resolve_or_lexical(path: str | Path) -> Path:
 
     ``RuntimeError`` is caught alongside ``OSError`` because ``resolve()`` raises it,
     not an ``OSError``, for a symlink loop on the 3.11/3.12 floor — the asymmetry
-    ``install._shield_undo_extension`` documents; the pair is this repo's house guard,
-    applied at 17-odd sites already.
+    ``install._shield_undo_extension`` documents. ``ValueError`` covers invalid path
+    spellings such as embedded NULs and its ``UnicodeEncodeError`` subclass for lone
+    surrogates. Together the three classes are this repo's resolution guard.
 
     **Degrade, not fail** — deliberately, and bounded. The fallback is exactly
     ``Path(path).absolute()``: absolute, nothing else. It is enough for the
@@ -389,15 +390,19 @@ def resolve_or_lexical(path: str | Path) -> Path:
     there is no lexical answer to degrade to, and the backstop is the honest reply."""
     try:
         return Path(path).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         lexical = Path(path).absolute()
         if str(lexical) not in _LEXICAL_FALLBACK_NOTED:
             _LEXICAL_FALLBACK_NOTED.add(str(lexical))
             # stderr, never stdout: `<cmd> --json` is a one-object-on-stdout contract.
-            print(
+            note = (
                 f"note: cannot canonicalize {path}: {e} — continuing with the lexical "
                 f"path {lexical} (symlinks are not dereferenced). "
-                "Run `bmad-loop validate` for what this host is doing.",
+                "Run `bmad-loop validate` for what this host is doing."
+            )
+            encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
+            print(
+                note.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace"),
                 file=sys.stderr,
             )
         return lexical
@@ -767,6 +772,7 @@ def _atomic_write(
     encoding: str | None,
     follow_symlinks: bool = True,
     require_writable_target: bool = False,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     """The shared body of the two public helpers above — see
     :func:`atomic_write_text` for the contract every step here implements.
@@ -812,6 +818,8 @@ def _atomic_write(
         if follow_symlinks and target.exists():
             shutil.copymode(target, tmp)
             _copy_xattrs(target, tmp)
+        if before_replace is not None:
+            before_replace()
         atomic_replace(tmp, target)
     except BaseException:
         with suppress(OSError):
@@ -1097,7 +1105,13 @@ def _open_exclusive_at(dir_fd: int, prefix: str, name: str) -> tuple[int, str]:
 
 
 def _atomic_write_at(
-    dir_fd: int, name: str, payload: str | bytes, *, mode: str, encoding: str | None
+    dir_fd: int,
+    name: str,
+    payload: str | bytes,
+    *,
+    mode: str,
+    encoding: str | None,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     """The shared body of the two anchored helpers above — see
     :func:`atomic_write_text_at` for the contract every step here implements.
@@ -1123,6 +1137,8 @@ def _atomic_write_at(
             fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         with suppress(OSError):
@@ -1211,7 +1227,12 @@ def atomic_write_text_confined(
 
 
 def atomic_write_bytes_confined(
-    path: Path, data: bytes, *, confine_root: Path, require_writable_target: bool = False
+    path: Path,
+    data: bytes,
+    *,
+    confine_root: Path,
+    require_writable_target: bool = False,
+    _before_replace: Callable[[], None] | None = None,
 ) -> None:
     """:func:`atomic_write_text_confined`'s byte-exact sibling, whose docstring
     carries the shared contract (lexical ``confine_root`` gate, anchored parent on
@@ -1222,6 +1243,8 @@ def atomic_write_bytes_confined(
     ``data`` lands byte-for-byte on both arms: no encode, no newline translation.
     That is what the byte-verbatim writers in this cohort exist for — they read
     bytes precisely so a CRLF file keeps its line endings."""
+    # The optional publication validator runs after staging/fsync, immediately
+    # before replacement. It supplies no lock or atomic CAS guarantee.
     _atomic_write_confined(
         path,
         data,
@@ -1229,6 +1252,7 @@ def atomic_write_bytes_confined(
         encoding=None,
         confine_root=confine_root,
         require_writable_target=require_writable_target,
+        before_replace=_before_replace,
     )
 
 
@@ -1240,6 +1264,7 @@ def _atomic_write_confined(
     encoding: str | None,
     confine_root: Path,
     require_writable_target: bool,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     """The shared body of the two confined helpers above — see
     :func:`atomic_write_text_confined` for the contract every step implements.
@@ -1265,7 +1290,14 @@ def _atomic_write_confined(
         try:
             if require_writable_target:
                 _refuse_unwritable_target_at(dir_fd, path.name)
-            _atomic_write_at(dir_fd, path.name, payload, mode=mode, encoding=encoding)
+            _atomic_write_at(
+                dir_fd,
+                path.name,
+                payload,
+                mode=mode,
+                encoding=encoding,
+                before_replace=before_replace,
+            )
         finally:
             os.close(dir_fd)
         return
@@ -1278,6 +1310,7 @@ def _atomic_write_confined(
         encoding=encoding,
         follow_symlinks=False,
         require_writable_target=require_writable_target,
+        before_replace=before_replace,
     )
 
 

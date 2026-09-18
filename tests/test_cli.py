@@ -5627,6 +5627,44 @@ def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, caps
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_resolve_restore_patch_value_error_family_is_typed_before_rearm(
+    tmp_path, monkeypatch, capsys, resolve_fault
+):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch, error=resolve_fault)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert str(resolve_fault) in err
+    assert called == []
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None
+
+
 def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
     tmp_path, monkeypatch, capsys
 ):
@@ -10426,6 +10464,35 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
     assert "Run `bmad-loop validate` for what this host is doing." in cap.err
     assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
+
+
+def test_dry_run_stories_surrogate_refusal_is_safe_on_strict_ascii_stderr(project, monkeypatch):
+    install_bmad_config(project)
+    _write_policy(project.project)
+    abs_folder = str(project.project / "caf\xe9-\ud800")
+    fault = UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+    refuse_to_resolve(monkeypatch, Path(abs_folder), error=fault)
+    monkeypatch.setattr(cli, "_warn_preflight_would_abort", lambda *_args, **_kwargs: None)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    rc = cli.main(
+        [
+            "run",
+            "--project",
+            str(project.project),
+            "--spec",
+            abs_folder,
+            "--dry-run",
+        ]
+    )
+
+    stderr.flush()
+    message = stderr_bytes.getvalue().decode("ascii")
+    assert rc == 1
+    assert "stories mode: cannot canonicalize the spec folder" in message
+    assert "caf\\xe9-\\ud800" in message
 
 
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----

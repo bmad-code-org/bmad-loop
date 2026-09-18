@@ -5,12 +5,19 @@ worktree_isolation_conflict, the #414 refusal predicate built on the same pair."
 
 from __future__ import annotations
 
+import io
+import sys
 from pathlib import Path
 
 import pytest
-from conftest import UNRESOLVABLE, install_bmad_config, refuse_to_resolve
+from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
+    UNRESOLVABLE,
+    install_bmad_config,
+    refuse_to_resolve,
+)
 
-from bmad_loop import bmadconfig, platform_util
+from bmad_loop import bmadconfig, cli, platform_util
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.workspace import Workspace
 
@@ -156,6 +163,10 @@ def _write_config(root: Path, **keys: str) -> None:
     )
 
 
+def test_diagnostic_text_escapes_nul_and_non_ascii() -> None:
+    assert bmadconfig._diagnostic_text("bad-\x00-caf\xe9") == "bad-\\x00-caf\\xe9"
+
+
 def test_load_paths_raises_typed_when_the_root_cannot_canonicalize(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -178,6 +189,73 @@ def test_load_paths_raises_typed_when_the_root_cannot_canonicalize(
     # sharing that stem for a configured path, and this row pins the ROOT boundary
     with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize the project root"):
         bmadconfig.load_paths(root)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("boundary", ["project", "configured-path"])
+def test_load_paths_translates_value_error_family_at_canonicalization_boundaries(
+    tmp_path: Path, monkeypatch, resolve_fault, boundary: str
+) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    target = root / "artifacts"
+    _write_config(root, implementation_artifacts="{project-root}/artifacts")
+    refused = root if boundary == "project" else target
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    with pytest.raises(bmadconfig.BmadConfigError) as excinfo:
+        bmadconfig.load_paths(root)
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+
+
+def test_run_reports_configured_lone_surrogate_path_on_strict_stderr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    cfg = root / "_bmad" / "bmm"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yaml").write_text(
+        'implementation_artifacts: "{project-root}/caf\\u00e9-\\uD800"\n'
+        'planning_artifacts: "{project-root}/_bmad-output/planning-artifacts"\n',
+        encoding="utf-8",
+    )
+    configured = root / "caf\xe9-\ud800"
+    fault = UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+    refuse_to_resolve(monkeypatch, configured, error=fault)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    rc = cli.main(["run", "--project", str(root), "--dry-run"])
+
+    stderr.flush()
+    message = stderr_bytes.getvalue().decode("ascii")
+    assert rc == 1
+    assert "cannot canonicalize the configured path" in message
+    assert "caf\\xe9-\\ud800" in message
+
+
+def test_run_reports_project_root_lone_surrogate_path_on_strict_stderr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "caf\xe9-\ud800"
+    fault = UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+    refuse_to_resolve(monkeypatch, root, error=fault)
+    monkeypatch.setattr(cli, "_configure_mux", lambda _project: None)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    rc = cli.main(["run", "--project", str(root), "--dry-run"])
+
+    stderr.flush()
+    message = stderr_bytes.getvalue().decode("ascii")
+    assert rc == 1
+    assert "cannot canonicalize the project root" in message
+    assert "caf\\xe9-\\ud800" in message
 
 
 def test_worktree_isolation_conflict_degrades_rather_than_re_raising(

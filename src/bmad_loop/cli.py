@@ -3250,7 +3250,7 @@ def _resolve_restore_patch(
     # answer here could pass containment on the wrong directory.
     try:
         patch = verify.resolve_restore_path(raw, project).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         return None, (
             f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
             "lies inside or outside the project tree cannot be determined, so the "

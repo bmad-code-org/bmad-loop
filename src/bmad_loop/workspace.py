@@ -306,7 +306,7 @@ def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:
         return
     try:
         resolved = holder.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             f"unit branch {branch} is checked out at {holder}, which cannot be "
             f"resolved ({e}); refusing to move the branch under a checkout that is "
@@ -382,7 +382,7 @@ def open_unit_workspace(
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
     try:
         wt = unresolved_wt.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             f"cannot resolve worktree mount path for {unit_key} ({unresolved_wt}): {e}"
         ) from e
