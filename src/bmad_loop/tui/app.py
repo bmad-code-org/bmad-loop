@@ -406,12 +406,16 @@ class BmadLoopApp(App[None]):
         a ledger non-write. The toasts distinguish these by wording and severity;
         the caller excludes both from its count and continues the walk.
 
-        A publish REFUSAL (DW-209/213) is a third, orthogonal thing and does not
-        touch the boolean: the operand list `apply_pre_answer` commits is already
-        gated on what that call wrote, so a refusal means an answer that really
-        landed on disk is missing from git history — news worth a `warning` toast,
-        but not a reason to stop counting the answer as answered. It rides on the
-        non-write toast where there is one and raises its own otherwise.
+        An UNPUBLISHED operand is a third, orthogonal thing and does not touch the
+        boolean, in either of its lanes: a publish REFUSED before git ran
+        (DW-209/213), and a publish that reached git and FAILED (DW-225/226 — an
+        operand in no repository, a gitignored path). The operand list
+        `apply_pre_answer` commits is already gated on what that call wrote, so
+        either one means an answer that really landed on disk is missing from git
+        history — news worth a `warning` toast, but not a reason to stop counting
+        the answer as answered. Both arrive as the one `publish_note()` string,
+        which rides on the non-write toast where there is one and raises its own
+        otherwise.
         """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
@@ -988,6 +992,34 @@ class BmadLoopApp(App[None]):
         if self._blocked_by_control_alias(run_id):
             return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
+            return
+        # DW-204/DW-230: the same probe `cli.cmd_resume` and `cli.cmd_resolve` take,
+        # taken here beside the two gates above. The detached child this gesture ends
+        # in would refuse for the same reason, but only AFTER `rearm_escalation` has
+        # spent the escalation, and it would refuse into a pane nobody opens — so the
+        # refusal is raised here, on screen, with the escalation still armed. The
+        # probe answers or declines; this surface owns the channel (a toast, where the
+        # CLI prints to stderr). Note `_do_resume` is deliberately NOT gated: it
+        # mutates nothing before launching, so its child's refusal costs nothing.
+        #
+        # Wrapped for `OSError` because the probe propagates one by contract (a read the
+        # OS refuses is a different fault class from bytes that do not decode, and the
+        # arm for it is DW-234's to add, not this call site's). `main`'s tail routes
+        # that propagation for the CLI; a Textual message-loop callback has no such
+        # tail, so an escape here takes the dashboard down. This is the surface's own
+        # routing of an unrouted fault — it reports and returns unarmed, and must not be
+        # mistaken for the repair arm the probe is forbidden to grow.
+        try:
+            refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        except OSError as e:
+            self.notify(
+                f"cannot read the deferred-work ledger to check this sweep can resume "
+                f"({e}) — fix it, then re-arm; the story is still escalated",
+                severity="error",
+            )
+            return
+        if refusal is not None:
+            self.notify(refusal, severity="error")
             return
         # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
         # requires it: how the re-drive WILL run is a policy question, and the recorded

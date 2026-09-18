@@ -444,6 +444,88 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Take the readable-ledger refusal at `bmad-loop resolve`'s entry and at the TUI's
+  re-arm gesture, ahead of the interactive session and of `rearm_escalation`, so an
+  escalated sweep over an undecodable ledger keeps its escalation instead of spending
+  it; one shared probe now serves all three surfaces, and `docs/FEATURES.md` documents
+  the refusal, its declines and its precedence (DW-229, DW-230, DW-235).
+- Screen an adopted `build` answer against the ledger's live open set before it mints a
+  bundle, dropping an id the ledger no longer holds open under a fifth `drop_cause`,
+  `entry-not-open`; a ledger read that refuses screens nothing and journals
+  `sweep-decision-open-set-refused` (DW-214).
+- Recover stranded decision closes at the sweep's no-open exit, withholding the
+  whole recovery publish — its already-resolved term too, since the commit is of
+  the file — while the run retains ledger doubt; the close phase's own two commit
+  arms read the same verdict, so a resume that inherited a doubt no longer walks a
+  half-landed decision flip into HEAD ahead of the dispatch gate (DW-222).
+- Retry ledger publication before repeating sweeps stop on `no-progress` or
+  `max-cycles`; rename the commit message to
+  `chore(sweep): commit ledger at the sweep cycle boundary` (DW-223).
+- Degrade triage-cache metadata read failures to `sweep-triage-reload-failed` and
+  fresh triage, with absent caches remaining silent (DW-224).
+
+- Mirror a sweep cycle's ledger-in-doubt verdict onto run state at every site that
+  ARMS it — not at the dispatch gate, and not at the decision phase's tail publish,
+  whose span contains a human at a prompt — so a stop or crash between the arm and
+  the gate's report resumes into the same withholding rather than into a dispatch
+  that publishes a half-written ledger. Released again by the two sites that clear
+  the walk's own verdict — but only for an arm THIS process made: the mirror is
+  held while the close phase's latch is armed this cycle, and whenever it was
+  inherited across a resume, so in those two states it is deliberately stickier and
+  waits for a human repair plus a fresh sweep. The mirror also outranks the
+  persisted commit debt (`sweep_ledger_commit_owed`): a resume that inherits both
+  skips the top-of-`_loop` settle, since the doubted bytes are the debt. And it
+  withholds the resume's in-flight recovery pass whole: a bundle re-armed out of
+  band by `bmad-loop resolve` is not re-driven while the mirror is on disk — its
+  own commit is a whole-tree `git add -A` — and is journaled as withheld and then
+  stranded rather than dispatched around the gate. Legacy prose met on such a
+  resume is not migrated either: the rewrite session and its commit are refused
+  on the doubt's own `ledger-unreadable` stop and repair notice (DW-218/219).
+
+- Withhold sweep bundles and ledger commits after close, re-apply, or idle decision
+  faults; preserve pre-answers while the ledger is in doubt (DW-216/217/220).
+
+- Publish the out-of-band decisions answer ONE OPERAND AT A TIME, each rooted at that
+  operand's own resolved parent, and report a publish git could not make. One
+  `commit_paths(project, ...)` call over both operands failed two ways: a ledger
+  configured outside the project (or inside a disjoint `repo_root`) was relativized
+  away by `commit_paths`' `except ValueError: continue`, so the `decision:` line
+  reached no history and neither surface said so; and a gitignored operand made
+  `git add` exit 1 and took its publishable sibling down with it, swallowed by a bare
+  `except GitError: pass`. A `GitError` is now caught per operand into a
+  `PublishFailure` that the CLI line and the TUI toast both print through the shared
+  `publish_note()`, under a `commit-unavailable` token beside the existing refusals.
+  A `build`/`keep-open` answer whose operands share a repository now makes two commits
+  carrying the same message (DW-225, DW-226).
+
+- Refuse to publish a decisions store that is present but not a REGULAR FILE, under a
+  third `refuse_cause` token, `target-not-a-file`, preserving the existing symlink-loop
+  exception. The publishable-target guard checked
+  existence only, so a store replaced by a directory (or by a symlink to one) passed it
+  and `commit_paths` handed that literal pathspec to `git add`, which stages the
+  directory's descendants recursively. `is_file()` follows symlinks, so a store
+  symlinked to a regular file still publishes, and the store's bytes are still never
+  examined (DW-211, DW-228).
+
+- Fold a metadata-probe fault into a refusal instead of letting it escape a best-effort
+  publisher. On Python 3.11-3.13, `Path.exists()`/`is_file()`/`is_symlink()` raise on
+  anything outside the `ENOENT`/`ENOTDIR`/`ELOOP` class, so an `EACCES` arriving after a
+  successful write aborted `bmad-loop decisions`' walk or undercounted a TUI answer; the
+  store guard now answers `target-unreadable` and `commit_paths` omits only the faulted
+  candidate, raising just when no usable operand survives. Python 3.14 suppresses all OS
+  errors inside those probes, so there the fault never surfaces at all: the probes answer
+  False, the store degrades to `target-absent` and the candidate is ruled missing
+  (DW-227).
+
+- Refuse `bmad-loop resume` for a sweep run whose deferred-work ledger does not decode,
+  naming the file, the decode fault and the repair. Such a resume used to arm the run (pid
+  publication, policy re-stamp, `run-resume` row) and only then meet the ledger, stopping
+  with no repair route offered from this surface. An absent ledger is not a refusal and
+  story runs are unaffected. `deferredwork.read_for_write` itself is unwidened, so a ledger
+  read the OS refuses now ends `resume` at the entry probe with a bare
+  `error: [Errno 13] ...` and no repair route, where before it armed the run and stopped
+  through the sweep's own `ledger-inaccessible` steer (DW-204).
+
 - Diagnose a `null` or bare-string member of a migration result's `mapping` list as the
   shape fault it is — `mapping[0] not an object: NoneType` — instead of reporting
   `mapping invents unknown key ''` into the migrate-decision journal record, the retry

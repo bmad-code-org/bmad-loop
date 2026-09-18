@@ -2,10 +2,19 @@
 
 import contextlib
 import json
+import shutil
 import sys
 
 import pytest
-from conftest import fault_read_text, install_bmad_config, refuse_to_resolve, write_ledger
+from conftest import (
+    fault_metadata_probe,
+    fault_read_text,
+    git,
+    ignore_before_commit,
+    install_bmad_config,
+    refuse_to_resolve,
+    write_ledger,
+)
 
 from bmad_loop import decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
@@ -544,8 +553,13 @@ def test_apply_pre_answer_build_records_store_and_ledger(project, effect):
 
     opt = DecisionOption(key="1", label="Answer", effect=effect, intent="widen field")
     d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
-    decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
 
+    # The happy path is the row that says the two REPORT axes stay empty when both
+    # operands publish: a per-operand commit loop that reported its own successes
+    # as faults would still satisfy every git assertion below.
+    assert result.refusals == ()
+    assert result.failures == ()
     entries = {
         e.id: e
         for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
@@ -559,13 +573,24 @@ def test_apply_pre_answer_build_records_store_and_ledger(project, effect):
         == effect
     )
     assert "chore(decisions): pre-answer DW-1" in _git_log(project)
-    # BOTH written operands ride that one commit (DW-209/213). Asserting the
-    # pathspec, not merely that a commit exists: gate one builds the operand list
+    # Both written operands are published, and since DW-225/226 each rides its OWN
+    # commit: one commit per operand is what keeps a gitignored or out-of-tree
+    # operand from sinking its sibling, so a `build` under one project produces TWO
+    # commits carrying the SAME message and exactly one file each. Asserting the
+    # pathspecs, not merely that a commit exists: gate one builds the operand list
     # from what this call wrote, and a recorded `build` wrote both.
     # Ablation: delete `if recorded:` from that gate (never publish the ledger) and
-    # this reds here while every assertion above still passes.
-    published = _git(project, "show", "--name-only", "--format=", "HEAD").split()
-    assert sorted(published) == sorted(
+    # this reds here while every assertion above still passes. Ablation for the
+    # per-operand shape: restore the single `commit_paths(project, ..., operands)`
+    # call and the two-commit assertion reds on a single commit carrying both.
+    heads = [
+        _git(project, "show", "--name-only", "--format=%s", h).split("\n", 1)
+        for h in ("HEAD", "HEAD~1")
+    ]
+    assert [h[0] for h in heads] == ["chore(decisions): pre-answer DW-1"] * 2
+    published = [h[1].split() for h in heads]
+    assert all(len(names) == 1 for names in published)
+    assert sorted(n for names in published for n in names) == sorted(
         [
             project.deferred_work.relative_to(project.project).as_posix(),
             ".bmad-loop/decisions.json",
@@ -771,7 +796,10 @@ def test_apply_pre_answer_never_commits_away_a_ledger_that_vanished(project):
     result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
 
     assert result.recorded is False
-    assert result.refusals == ()  # nothing was WRITTEN, so nothing was refused either
+    # Nothing was WRITTEN, so nothing was refused — and nothing reached git to fail
+    # either: an empty operand list spawns no commit at all.
+    assert result.refusals == ()
+    assert result.failures == ()
     assert _git(project, "rev-parse", "HEAD").strip() == head_before
     assert _git(project, "show", f"HEAD:{rel}") == blob_before
     assert "chore(decisions): pre-answer" not in _git_log(project)
@@ -983,20 +1011,126 @@ def test_apply_pre_answer_publishes_the_survivor_when_one_operand_is_refused(
         )
 
 
-def test_apply_pre_answer_swallows_a_git_fault_without_refusing_or_raising(project, monkeypatch):
-    """The older degrade, unchanged by the two gates above it: git publication is
-    best effort, so a `GitError` — a non-git tree, a locked index, git absent —
-    leaves the on-disk record standing and never reaches the caller. It is NOT a
-    refusal: nothing declined to publish, the publish itself failed, and the two
-    surfaces have no report for it by design.
+@pytest.mark.parametrize("tracked", [False, True])
+@pytest.mark.parametrize("fault", ["directory", "metadata"])
+def test_apply_pre_answer_refuses_a_store_a_directory_replaced_while_publishing_the_ledger(
+    project, monkeypatch, tracked, fault
+):
+    """DW-211/228 at the OUT-OF-BAND publisher, through the real guard rather than a
+    stubbed one. The store is replaced by a DIRECTORY between the write and the
+    staging — exactly the race this second gate exists for, since the wrote-it gate
+    upstream already proved the write happened — and the refusal must drop only its
+    own operand: the ledger still commits, the directory's descendants never reach
+    HEAD, and nothing raises out of a call whose on-disk record is already made.
 
-    Ablation: remove `except verify.GitError: pass` from `apply_pre_answer` and
-    this reds where the call raises out of the fixture."""
+    The token matters as much as the refusal. `target-absent` would send an operator
+    looking for a vanished file and `target-unreadable` for a permission or decode
+    fault; the repair here is "something is sitting at the store's name", which is a
+    third thing.
+
+    Ablation: revert the store leg to its existence-only probe and this reds two
+    ways — no refusal is reported, and `git add` stages `swept-in.txt` into the
+    `chore(decisions): pre-answer` commit. Remove the store probe exception
+    handler and metadata rows raise instead of returning a refusal. Tracked rows
+    also pin preservation of the original store blob in HEAD."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    store = decisions.store_path(project.project)
+    if tracked:
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("{}\n", encoding="utf-8")
+        _git(project, "add", "--", ".bmad-loop/decisions.json")
+        _git(project, "commit", "-m", "seed tracked store")
+        store_head = _git(project, "show", "HEAD:.bmad-loop/decisions.json")
+    real_record = decisions.record_pre_answer
+
+    def record_then_replace(*a, **kw):
+        # The write really lands, and only THEN is the target replaced — the guard
+        # is the second gate, and the first one is already satisfied.
+        real_record(*a, **kw)
+        store = decisions.store_path(project.project)
+        if fault == "metadata":
+            fault_metadata_probe(monkeypatch, store.resolve(), "is_file")
+        else:
+            store.unlink()
+            store.mkdir()
+            (store / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+
+    monkeypatch.setattr(decisions, "record_pre_answer", record_then_replace)
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert len(result.refusals) == 1
+    refusal = result.refusals[0]
+    assert refusal.file == "decisions.json"
+    if fault == "metadata":
+        assert refusal.cause == "target-unreadable"
+        assert "Permission denied" in refusal.error
+    else:
+        assert refusal.cause == "target-not-a-file"
+        assert refusal.error is None
+        assert result.publish_note() == "not committed to git: decisions.json (target-not-a-file)"
+    # the survivor still publishes, alone
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    assert _git(project, "show", "--name-only", "--format=", "HEAD").split() == [ledger_rel]
+    assert "decision: 2026-06-13 Widen — widen field" in _git(project, "show", f"HEAD:{ledger_rel}")
+    assert "swept-in.txt" not in _git(project, "ls-files")
+    if tracked:
+        assert _git(project, "show", "HEAD:.bmad-loop/decisions.json") == store_head
+
+
+@pytest.mark.parametrize(
+    "symlinked",
+    [
+        False,
+        pytest.param(
+            True, marks=pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+        ),
+    ],
+)
+def test_apply_pre_answer_reports_a_git_fault_without_refusing_or_raising(
+    project, monkeypatch, symlinked
+):
+    """The publication degrade, unchanged by the two gates above it in everything
+    but its SILENCE: git publication is best effort, so a `GitError` — a non-git
+    tree, a locked index, git absent — leaves the on-disk record standing and
+    never reaches the caller as a raise. It is still NOT a refusal (nothing
+    declined to publish; the publish itself failed), which is why it takes its own
+    `PublishFailure` type rather than a fourth token on the closed `cause` union
+    `verify.unpublishable_target` shares.
+
+    What DW-226 changes is that both surfaces now hear about it: this used to
+    answer `publish_note() is None`, so an answer written to disk and absent from
+    git history was reported by neither the CLI nor the TUI.
+
+    The multi-line error is deliberate — git's stderr is — and the note is
+    rendered on ONE line at both surfaces, so the text is whitespace-collapsed.
+
+    Ablation: remove `except verify.GitError` from `apply_pre_answer` and this
+    reds where the call raises out of the fixture; keep the catch but drop the
+    `failures.append` and it reds on the note while the no-raise assertions pass;
+    drop the `" ".join(str(e).split())` collapse and it reds on the newline."""
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
 
+    if symlinked:
+        target = project.deferred_work.with_name("operator-ledger.md")
+        project.deferred_work.replace(target)
+        try:
+            project.deferred_work.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+        assert project.deferred_work.name != project.deferred_work.resolve().name
+        # Ablation: use target.name for PublishFailure.file; this case fails.
+
     def boom(*_a, **_k):
-        raise decisions.verify.GitError("git is unusable here")
+        raise decisions.verify.GitError("git is unusable here:\n  fatal: nope\n")
 
     monkeypatch.setattr(decisions.verify, "commit_paths", boom)
     d, opt = _close_decision()
@@ -1005,7 +1139,13 @@ def test_apply_pre_answer_swallows_a_git_fault_without_refusing_or_raising(proje
 
     assert result.recorded is True
     assert result.refusals == ()  # a failed publish is not a refused one
-    assert result.publish_note() is None
+    [failure] = result.failures
+    assert failure.file == "deferred-work.md"
+    assert failure.error == "git is unusable here: fatal: nope"
+    assert result.publish_note() == (
+        "not committed to git: deferred-work.md "
+        "(commit-unavailable: git is unusable here: fatal: nope)"
+    )
     # ...and the write the commit could not publish is still on disk
     entries = {
         e.id: e
@@ -1084,6 +1224,452 @@ def test_apply_pre_answer_commit_false_writes_on_disk_and_refuses_nothing(projec
         for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
     }
     assert entries["DW-1"].status.startswith("done")
+
+
+# ---------- per-operand rooting and the failed-publish report (DW-225/226)
+
+
+def _seed_repo(project, root):
+    """Copy this test's sandbox for an independent operand repository.
+
+    Reuse the project fixture's initialized repository and git configuration;
+    never initialize a second repository or mutate the session template.
+    """
+    shutil.copytree(project.project, root)
+    return root
+
+
+def _config_artifacts_at(project, artifacts):
+    """`install_bmad_config` with `implementation_artifacts` spelled ABSOLUTE — the
+    shape `bmadconfig._resolve` accepts verbatim and `ProjectPaths.rebased` leaves
+    unmoved, and the one that puts the ledger outside the project tree."""
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        f"implementation_artifacts: '{artifacts.as_posix()}'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+
+
+def _open_ledger(path, *dw_ids):
+    """`conftest.write_ledger`'s bytes for a ledger that is not under the project,
+    so its own tree (or no tree at all) owns the commit."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            ["# Deferred Work\n"]
+            + [
+                f"### {i}: item {i}\n\norigin: test, 2026-06-01\n"
+                f"location: src.txt:1\nreason: test entry.\nstatus: open\n"
+                for i in dw_ids
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _subject_and_files(out):
+    """Split `git show --name-only --format=%s` into (subject, [files]); git puts a
+    blank line between the two. Both are asserted: since DW-225/226 each operand
+    rides its OWN commit, so the file COUNT per commit is part of the claim."""
+    subject, _, names = out.partition("\n")
+    return subject, names.split()
+
+
+def _build_decision(dw_id="DW-1"):
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
+    return (
+        Decision(id=dw_id, question="build it?", context="", options=(opt,), recommendation="1"),
+        opt,
+    )
+
+
+def test_apply_pre_answer_publishes_a_disjoint_ledger_in_its_own_repository(project, tmp_path):
+    """DW-225, the reproduced silent drop. `implementation_artifacts` is an absolute
+    path inside a git repository DISJOINT from the project — legal, since
+    `bmadconfig._resolve` accepts any absolute path — so the project root is a tree
+    the write never touched. `verify.commit_paths(project, ...)` relativized the
+    ledger with `relative_to(repo_root)`, whose `ValueError` its `except ValueError:
+    continue` swallows, leaving no operand: it returned `None` for "these paths held
+    no change" and the `decision:` line reached no history at all, reported by
+    neither surface.
+
+    Premise before outcome: the two roots are compared RESOLVED and asserted
+    disjoint, because "committed in the ledger's own tree" is only a claim while
+    that tree is a different answer from the project.
+
+    Ablation: restore the single `verify.commit_paths(project, message, operands)`
+    call and this reds on the artifacts repo's HEAD — no `chore(decisions):` commit
+    exists there — while `recorded`, `refusals` and `failures` all still pass,
+    which is exactly the silence DW-225 names."""
+    artifacts_repo = _seed_repo(project, tmp_path / "artifacts-repo")
+    artifacts = artifacts_repo / "implementation-artifacts"
+    ledger_rel = "implementation-artifacts/deferred-work.md"
+    _config_artifacts_at(project, artifacts)
+    _open_ledger(artifacts / "deferred-work.md", "DW-1")
+    git(artifacts_repo, "add", "-A")
+    git(artifacts_repo, "commit", "-q", "-m", "ledger")
+    # premise: the ledger's enclosing repository really is DISJOINT from the project
+    assert artifacts_repo.resolve() != project.project.resolve()
+    assert artifacts_repo.resolve() in artifacts.resolve().parents
+    assert project.project.resolve() not in artifacts.resolve().parents
+    project_head = _git(project, "rev-parse", "HEAD").strip()
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()
+    assert result.failures == ()
+    assert result.publish_note() is None  # nothing to tell either surface about
+    # the `decision:` line is in the LEDGER repository's HEAD blob...
+    assert "decision: 2026-06-13 Close — superseded" in git(
+        artifacts_repo, "show", f"HEAD:{ledger_rel}"
+    )
+    assert "chore(decisions): pre-answer DW-1" in git(artifacts_repo, "log", "--oneline")
+    assert git(artifacts_repo, "show", "--name-only", "--format=", "HEAD").split() == [ledger_rel]
+    # ...and the project tree, which holds no part of this write, receives nothing
+    assert _git(project, "rev-parse", "HEAD").strip() == project_head
+    assert list(project.project.rglob("deferred-work.md")) == []
+
+
+def test_apply_pre_answer_publishes_each_operand_in_its_own_tree(project, tmp_path):
+    """DW-225 for a `build`, whose two operands live in two DIFFERENT trees: the
+    ledger under a disjoint `implementation_artifacts`, the pre-answer store at
+    `<project>/.bmad-loop/decisions.json` (a bare join off the project root that no
+    config knob can move). No single repository can commit both, which is what makes
+    per-operand rooting the only shape that publishes them.
+
+    Ablation: restore the single `commit_paths(project, ...)` call and the project
+    commits the store alone while the ledger is relativized away — this reds on the
+    artifacts repo's commit count, silently, with `failures == ()` still true."""
+    artifacts_repo = _seed_repo(project, tmp_path / "artifacts-repo")
+    artifacts = artifacts_repo / "implementation-artifacts"
+    ledger_rel = "implementation-artifacts/deferred-work.md"
+    _config_artifacts_at(project, artifacts)
+    _open_ledger(artifacts / "deferred-work.md", "DW-1")
+    git(artifacts_repo, "add", "-A")
+    git(artifacts_repo, "commit", "-q", "-m", "ledger")
+    # premise: two trees, neither inside the other, each holding exactly one operand
+    assert project.project.resolve() not in artifacts.resolve().parents
+    assert artifacts_repo.resolve() not in project.project.resolve().parents
+    before = {
+        "project": int(_git(project, "rev-list", "--count", "HEAD")),
+        "artifacts": int(git(artifacts_repo, "rev-list", "--count", "HEAD")),
+    }
+    d, opt = _build_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()
+    assert result.failures == ()
+    # exactly one new commit in each tree, each naming only its own file
+    assert int(_git(project, "rev-list", "--count", "HEAD")) == before["project"] + 1
+    assert int(git(artifacts_repo, "rev-list", "--count", "HEAD")) == before["artifacts"] + 1
+    assert _subject_and_files(_git(project, "show", "--name-only", "--format=%s", "HEAD")) == (
+        "chore(decisions): pre-answer DW-1",
+        [".bmad-loop/decisions.json"],
+    )
+    assert _subject_and_files(
+        git(artifacts_repo, "show", "--name-only", "--format=%s", "HEAD")
+    ) == ("chore(decisions): pre-answer DW-1", [ledger_rel])
+    # ...and neither tree received the other's file
+    assert ledger_rel not in _git(project, "ls-files")
+    assert "decisions.json" not in git(artifacts_repo, "ls-files")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_apply_pre_answer_commits_a_symlinked_ledger_in_its_target_repository(project, tmp_path):
+    """The parent is RESOLVED, not lexical — the same claim
+    `sweep._commit_ledger` carries for this file (DW-188), transplanted with the
+    rooting itself.
+
+    `platform_util.atomic_write_text` — the writer behind `record_decision` —
+    follows symlinks, so a ledger symlinked out of the project has its TARGET
+    rewritten. Rooting the commit at the LINK's own directory makes the write and
+    the commit name two different files: `commit_paths` relativizes the resolved
+    target against that lexical parent, hits `ValueError`, drops the only operand
+    on its `except ValueError: continue`, and returns `None` for "nothing to
+    commit" — the exact DW-225 silence, with `failures` empty because git never
+    failed. Resolving is what makes the write and the commit name one file.
+
+    Three claims, and the second and third are what stop a "fix" that merely
+    widened the scope: the target repo's HEAD carries the `decision:` line, the
+    link is still a LINK aimed at the same target (a publisher that replaced the
+    name would satisfy the first claim while destroying the operator's
+    indirection), and the project repo — which holds only the link — receives
+    nothing.
+
+    Premise before outcome (docs/testing.md): the indirection is real, the write
+    went through it, the two repositories are compared RESOLVED and asserted
+    DISJOINT rather than merely unequal, and both trees start clean.
+
+    Ablation: change `target.parent` to `path.parent` in `apply_pre_answer` and
+    this reds on the target repo's HEAD while `recorded`, `refusals`, `failures`
+    and `publish_note()` all still pass — which is why the row is needed at all."""
+    ledger_repo = _seed_repo(project, tmp_path / "ledger-repo")
+    target = ledger_repo / "deferred-work.md"
+    install_bmad_config(project)
+    link = project.deferred_work
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # pragma: no cover - host without symlink support
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    write_ledger(project, {"DW-1": "open"}, commit=False)  # writes THROUGH the link
+    for repo in (project.project, ledger_repo):
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "settle")
+
+    # premise before outcome
+    assert link.is_symlink() and link.readlink() == target  # the indirection is real
+    assert target.is_file() and not target.is_symlink()  # ...and the write went through it
+    project_resolved, ledger_resolved = project.project.resolve(), ledger_repo.resolve()
+    assert project_resolved != ledger_resolved
+    assert project_resolved not in ledger_resolved.parents  # DISJOINT, not merely unequal
+    assert ledger_resolved not in project_resolved.parents
+    assert git(project.project, "status", "--porcelain") == ""
+    assert git(ledger_repo, "status", "--porcelain") == ""
+    project_head = git(project.project, "rev-parse", "HEAD")
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()
+    assert result.failures == ()
+    assert result.publish_note() is None
+    # the commit is in the TARGET's repository, naming only that file
+    assert _subject_and_files(git(ledger_repo, "show", "--name-only", "--format=%s", "HEAD")) == (
+        "chore(decisions): pre-answer DW-1",
+        ["deferred-work.md"],
+    )
+    assert "decision: 2026-06-13 Close — superseded" in git(
+        ledger_repo, "show", "HEAD:deferred-work.md"
+    )
+    # ...the operator's indirection survives...
+    assert link.is_symlink() and link.readlink() == target
+    # ...and the project repo, which holds only the link, receives nothing
+    assert git(project.project, "rev-parse", "HEAD") == project_head
+    assert git(project.project, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize(
+    "ignored_rel,ignored_name",
+    [
+        ("_bmad-output/implementation-artifacts/deferred-work.md", "deferred-work.md"),
+        (".bmad-loop/decisions.json", "decisions.json"),
+    ],
+    ids=["ignored-ledger", "ignored-store"],
+)
+def test_apply_pre_answer_reports_a_gitignored_operand_without_sinking_its_sibling(
+    project, ignored_rel, ignored_name
+):
+    """DW-226, the reproduced mutual sinking, in BOTH directions. The two operands
+    are in ONE repository and one of them is GITIGNORED, so `commit_paths`'
+    `_literal_specs` — which forces `:(literal)` pathspecs precisely so an ignored
+    operand cannot be silently skipped — makes `git add` exit 1 for the pair. As a
+    single call that `GitError` took the publishable operand down with the ignored
+    one, and `except verify.GitError: pass` reported it at neither surface.
+
+    Both directions, because they are not symmetric in the code. The operand list
+    is built ledger-then-store, so `ignored-ledger` fails BEFORE its sibling
+    commits while `ignored-store` fails AFTER one already has — and the second is
+    DW-226's own trigger ("a project that gitignores `.bmad-loop/`"), where the
+    ledger is the casualty. Only a per-operand loop with a per-operand `except`
+    survives both: one commit that stops at the first fault passes the first row
+    and reds the second.
+
+    Ablation: restore the single `commit_paths(project, message, operands)` call and
+    this reds twice per row — the sibling is absent from HEAD, and `failures` is
+    empty; keep the loop but restore `except verify.GitError: pass` and only the
+    `failures` and note assertions red; hoist the `try` outside the loop and
+    `ignored-ledger` reds on the sibling's commit while `ignored-store` still
+    passes."""
+    install_bmad_config(project)
+    ignore_before_commit(project, ignored_rel)
+    write_ledger(project, {"DW-1": "open"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    published_rel = ledger_rel if ignored_name == "decisions.json" else ".bmad-loop/decisions.json"
+    # premise: git really does consider THIS operand ignored, so `add` will refuse
+    # it — and the sibling is not ignored, so the row grades a survivor and not a
+    # second failure
+    # (one call over BOTH paths: `check-ignore` exits 1 when nothing matched, and it
+    # echoes only the paths that DID, so this pins the sibling as not-ignored too)
+    assert _git(project, "check-ignore", ignored_rel, published_rel).split() == [ignored_rel]
+    d, opt = _build_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()  # nothing declined; the publish itself failed
+    [failure] = result.failures
+    assert failure.file == ignored_name  # the LEXICAL basename, as a refusal uses
+    assert "ignored" in failure.error
+    assert "\n" not in failure.error  # collapsed: both surfaces print one line
+    # ...and CLIPPED: git's ignored-path refusal is a multi-sentence hint block, so
+    # this is the row where the cap is actually exercised.
+    # Ablation: drop the clip in `apply_pre_answer` and this reds on real git output.
+    assert len(failure.error) <= decisions.PUBLISH_ERROR_MAX
+    note = result.publish_note()
+    assert note is not None
+    assert note.startswith(f"not committed to git: {ignored_name} (commit-unavailable: ")
+    # the publishable sibling still reaches HEAD, alone
+    assert _git(project, "show", "--name-only", "--format=", "HEAD").split() == [published_rel]
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    # ...and the write git could not publish is intact on disk
+    entries = {
+        e.id: e
+        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert "decision: 2026-06-13 Widen — widen field" in entries["DW-1"].body
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+
+
+@pytest.mark.parametrize("refuse_ledger", [False, True], ids=["two-failures", "mixed-reports"])
+def test_apply_pre_answer_reports_every_unpublished_operand(project, monkeypatch, refuse_ledger):
+    """Exercise report accumulation through the publisher with real git failures.
+
+    Ablation: retain only the first failure and the two-failures row fails.
+    Dropping either report list fails the mixed-reports row.
+    """
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    store_rel = ".bmad-loop/decisions.json"
+    ignore_before_commit(project, ledger_rel, store_rel)
+    assert set(_git(project, "check-ignore", ledger_rel, store_rel).splitlines()) == {
+        ledger_rel,
+        store_rel,
+    }
+    real_guard = decisions.verify.unpublishable_target
+    real_commit = decisions.verify.commit_paths
+    attempts = []
+
+    def guard(target, family):
+        if refuse_ledger and target == project.deferred_work.resolve():
+            return ("target-unreadable", "ledger probe unavailable")
+        return real_guard(target, family)
+
+    def commit(repo, message, paths):
+        attempts.extend(paths)
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(decisions.verify, "unpublishable_target", guard)
+    monkeypatch.setattr(decisions.verify, "commit_paths", commit)
+    d, opt = _build_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    store = decisions.store_path(project.project).resolve()
+    if refuse_ledger:
+        assert attempts == [store]
+        assert result.refusals == (
+            decisions.PublishRefusal(
+                "deferred-work.md", "target-unreadable", "ledger probe unavailable"
+            ),
+        )
+        assert [failure.file for failure in result.failures] == ["decisions.json"]
+    else:
+        assert attempts == [project.deferred_work.resolve(), store]
+        assert result.refusals == ()
+        assert [failure.file for failure in result.failures] == [
+            "deferred-work.md",
+            "decisions.json",
+        ]
+    note = result.publish_note()
+    assert note is not None
+    assert note.index("deferred-work.md (") < note.index("decisions.json (commit-unavailable:")
+    assert all("ignored" in failure.error for failure in result.failures)
+    assert "decision: 2026-06-13 Widen — widen field" in project.deferred_work.read_text(
+        encoding="utf-8"
+    )
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+
+
+def test_publish_note_renders_refusals_and_failures_together_in_order():
+    """Render both report types and preserve their order in one note.
+
+    A single call can refuse one operand and fail to commit another. This row
+    isolates formatting; producer-level rows cover how those reports accumulate.
+
+    Ablation: drop either list from the join and its assertion fails; swap the
+    lists and the ordering assertion fails.
+    """
+    note = decisions.PreAnswerResult(
+        recorded=True,
+        refusals=(decisions.PublishRefusal(file="deferred-work.md", cause="target-absent"),),
+        failures=(decisions.PublishFailure(file="decisions.json", error="git is unusable"),),
+    ).publish_note()
+    assert note == (
+        "not committed to git: deferred-work.md (target-absent), "
+        "decisions.json (commit-unavailable: git is unusable)"
+    )
+
+    # Render both failures when the producer supplies two.
+    both = decisions.PreAnswerResult(
+        recorded=True,
+        failures=(
+            decisions.PublishFailure(file="deferred-work.md", error="no repo"),
+            decisions.PublishFailure(file="decisions.json", error="ignored"),
+        ),
+    ).publish_note()
+    assert both == (
+        "not committed to git: deferred-work.md (commit-unavailable: no repo), "
+        "decisions.json (commit-unavailable: ignored)"
+    )
+    # the empty result is still silent — the note is a report, not a status line
+    assert decisions.PreAnswerResult(recorded=True).publish_note() is None
+
+
+def test_apply_pre_answer_reports_an_operand_that_is_in_no_repository(project, tmp_path):
+    """The third topology `sweep._commit_ledger` already carries (`_artifacts_in_no
+    _repository`): `implementation_artifacts` outside every git tree, which
+    `bmadconfig._resolve` also accepts. Nothing may raise, the on-disk write must
+    survive, and — this is DW-226's half — the miss is announced rather than
+    swallowed, carrying git's own message.
+
+    Premise before outcome: asserted over EVERY ancestor, since one `.git` anywhere
+    above would make this row grade a commit instead of the degrade.
+
+    Ablation: remove the `except verify.GitError` and this reds with the raise
+    escaping; keep it as a bare `pass` and it reds on `failures`."""
+    artifacts = tmp_path / "loose-artifacts"
+    artifacts.mkdir()
+    _config_artifacts_at(project, artifacts)
+    _open_ledger(artifacts / "deferred-work.md", "DW-1")
+    # premise: no git repository encloses the ledger at any depth
+    assert not any((p / ".git").exists() for p in (artifacts, *artifacts.parents))
+    project_head = _git(project, "rev-parse", "HEAD").strip()
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()
+    [failure] = result.failures
+    assert failure.file == "deferred-work.md"
+    assert "not a git repository" in failure.error  # git's own message, not ours
+    assert result.publish_note() == (
+        f"not committed to git: deferred-work.md (commit-unavailable: {failure.error})"
+    )
+    # the on-disk write SURVIVES — the degrade is about the commit, never the file
+    entries = {
+        e.id: e
+        for e in deferredwork.parse_ledger(
+            (artifacts / "deferred-work.md").read_text(encoding="utf-8")
+        )
+    }
+    assert entries["DW-1"].status.startswith("done")
+    # ...and the project, which holds no part of this write, is untouched
+    assert _git(project, "rev-parse", "HEAD").strip() == project_head
 
 
 def _git(project, *args):

@@ -1299,7 +1299,9 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
 
 
 @pytest.mark.parametrize("render_format", ["markdown", "json"])
-@pytest.mark.parametrize("refuse_cause", ["target-absent", "target-unreadable"])
+@pytest.mark.parametrize(
+    "refuse_cause", ["target-absent", "target-unreadable", "target-not-a-file"]
+)
 @pytest.mark.parametrize(
     "stop_cause",
     [
@@ -1320,10 +1322,11 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
 
     The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
     says WHICH of the two published files went unpublished and `refuse_cause` says
-    WHY, and the two are separate claims — the causes are a closed pair
-    (`target-absent` | `target-unreadable`) whose natural spelling, `reason`, is
-    dropped, so without the minted field a scrubbed dump could not tell a ledger
-    that vanished from one nobody could decode.
+    WHY, and the two are separate claims — the causes are a closed trio
+    (`target-absent` | `target-unreadable` | `target-not-a-file`) whose natural
+    spelling, `reason`, is dropped, so without the minted field a scrubbed dump
+    could not tell a ledger that vanished from one nobody could decode, nor either
+    of those from a store a directory replaced.
 
     Ablation: remove Markdown's sweep-entry emission, drop
     `sweep-ledger-commit-refused` from the collected kind set, or add

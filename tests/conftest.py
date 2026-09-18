@@ -1297,6 +1297,38 @@ def fault_read_text(monkeypatch, target: Path) -> None:
     monkeypatch.setattr(Path, "read_text", fake)
 
 
+def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
+    """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
+    other path, and every other probe on ``target``, still answers normally.
+
+    ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` — one probe at a
+    time, which does NOT make one guard-per-probe ablatable: a caller may well take
+    all three inside a single ``try``, where one ``except`` covers the lot. What it
+    buys is coverage of each ENTRY PATH into that one guard — each probe is reached
+    only after the ones before it answered a particular way, so a row per probe
+    proves every reachable arm is inside the guard rather than only the first.
+
+    Selective monkeypatching rather than chmod, and here that is not merely the
+    ``fault_read_text`` convention: chmod is a no-op for root, carries no read bit
+    on Windows, and since Python 3.14 ``Path.is_file()`` suppresses OS errors
+    internally, so a permission bit cannot raise out of that probe on Python 3.14.
+
+    The point of the fault is that on Python 3.11–3.13 these calls do NOT swallow
+    everything: they absorb only the ``ENOENT``/``ENOTDIR``/``ELOOP`` class of
+    errnos and raise the rest, so ``EACCES`` is a real answer a caller must handle.
+    Python 3.14 suppresses all OS errors in them, so this helper INJECTS on every
+    version the fault only the older ones raise on their own — which is the point:
+    the handler under grade must exist for the versions that can reach it."""
+    real = getattr(Path, probe)
+
+    def fake(self, *a, **kw):
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, fake)
+
+
 def write_sprint(paths: ProjectPaths, statuses: dict[str, str]) -> None:
     doc = dict(SPRINT_TEMPLATE)
     doc["development_status"] = dict(statuses)
@@ -1710,6 +1742,15 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
 # ----------------------------------------------------------- sweep helpers
 
 
+# The two ledger byte strings the DW-204/DW-229/DW-230 readable-ledger rows screen on,
+# shared by test_cli and test_tui_app so the CLI and TUI surfaces are provably graded on
+# the SAME bytes: 0xff is not a legal UTF-8 start byte in any position (the decode fault
+# the refusal itself reports), and the readable counterpart must actually decode, since
+# an ABSENT ledger takes a different arm of the probe and cannot stand in for it.
+UNDECODABLE_LEDGER = b"### DW-1: broken\n\xff\xfe not utf-8\n"
+READABLE_LEDGER = b"### DW-1: fine\nstatus: open\n"
+
+
 def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = True) -> None:
     """Write a DW-format deferred-work ledger; statuses maps id -> status
     value. Committed by default — sweeps start from a clean tree."""
@@ -1929,6 +1970,7 @@ def escalated_run(
     worktree_path: str = "",
     with_session: bool = False,
     git_project: bool = False,
+    run_type: str = "story",
 ) -> EscalatedRun:
     """A saved RunState paused at a CRITICAL escalation, with one ESCALATED task —
     the shared shape behind test_runs / test_resolve / test_cli, whose three local
@@ -1938,7 +1980,10 @@ def escalated_run(
     fixture-specific assertion is weakened by the dedup.
 
     ``with_session`` appends the completed review SessionRecord the resolve-context
-    builder reads. ``git_project`` makes ``state.project`` a REAL repo (spec files
+    builder reads. ``run_type`` defaults to the story pipeline; ``"sweep"`` builds the
+    escalated SWEEP run that `runs.unreadable_sweep_ledger` is scoped to (an escalated
+    sweep is a real state — the ledger gate at resolve's entry is graded on it).
+    ``git_project`` makes ``state.project`` a REAL repo (spec files
     already written are committed, run state is gitignored) so `rearm_escalation`'s
     baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD.
     That refresh reads `state.code_root`, not `state.project`; the two name the same
@@ -1982,6 +2027,7 @@ def escalated_run(
         run_id=run_id,
         project=str(project),
         started_at=started_at,
+        run_type=run_type,
         paused_reason=paused_reason,
         paused_stage=PAUSE_ESCALATION,
         paused_story_key=story_key,

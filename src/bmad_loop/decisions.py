@@ -63,6 +63,12 @@ from .sweep import Decision, DecisionOption, unusable_answer_reason, validate_tr
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
 _TRIAGE_RE = re.compile(r"^triage(?:-(\d+))?\.json$")
+# How much of git's own message a `PublishFailure` carries. Both surfaces render
+# the note INLINE on one line — appended to a `bmad-loop decisions` outcome line,
+# and inside a single Textual toast — and git's ignored-path refusal is a
+# multi-sentence hint block, so uncapped it is a several-hundred-character tail
+# on both.
+PUBLISH_ERROR_MAX = 200
 
 
 def store_path(project: Path) -> Path:
@@ -400,13 +406,45 @@ class PublishRefusal:
     (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`), a code
     constant at both operands and never operator-controlled prose, which is what
     makes it safe for both surfaces to print verbatim. `cause` is
-    `verify.unpublishable_target`'s closed two-token enum; `error` carries the
-    decode or OS fault where the refusal has one to attribute, and is `None` for a
-    plain absence (an empty string would read as a fault)."""
+    `verify.unpublishable_target`'s closed three-token enum, spelled here
+    IDENTICALLY to its return type — the two are one contract. Pyright rejects
+    producer tokens this receiving union does not accept; it does not enforce
+    equality of the unions. `error`
+    carries the decode or OS fault where the refusal has one to attribute, and is
+    `None` for the two refusals that have none to name: a plain absence, and a
+    store that is present but not a regular file (an empty string would read as a
+    fault)."""
 
     file: str
-    cause: Literal["target-absent", "target-unreadable"]
+    cause: Literal["target-absent", "target-unreadable", "target-not-a-file"]
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class PublishFailure:
+    """One operand `apply_pre_answer` WROTE and then tried and FAILED to publish
+    (DW-226): git itself answered `GitError` — a parent in no repository, a
+    gitignored path `git add` refuses with rc 1, a locked index, git absent.
+
+    A SEPARATE type from `PublishRefusal`, not a fourth token on its `cause`,
+    and that is a contract rather than taste: `PublishRefusal.cause` is spelled
+    IDENTICALLY to `verify.unpublishable_target`'s return type and the two are
+    ONE contract, so a token describing something that guard can never return
+    would silently break the equality the next reader is entitled to assume. The
+    two reports also answer different questions — a refusal is a publish
+    DECLINED before any git ran, a failure is git having run and been unable —
+    and a failure always has an error to name where a refusal may not.
+
+    `file` is the LEXICAL basename under the same rule `PublishRefusal.file` is
+    held to: a code constant at both operands (`deferred-work.md`,
+    `decisions.json`) and never operator-controlled prose, which is what lets
+    both surfaces print it verbatim. `error` is git's own message with
+    whitespace COLLAPSED and then CLIPPED to `PUBLISH_ERROR_MAX` — git stderr is
+    multi-line and its ignored-path refusal is a multi-sentence hint block, while
+    both surfaces render this note inline on one line."""
+
+    file: str
+    error: str
 
 
 @dataclass(frozen=True)
@@ -419,29 +457,44 @@ class PreAnswerResult:
     nothing about whether the ledger was readable. `refusals` is a separate axis
     and usually empty: the operand list is already gated on what this call wrote,
     so a refusal means an answer that really WAS written could not be published,
-    which is why both surfaces report it rather than treating it as noise."""
+    which is why both surfaces report it rather than treating it as noise.
+    `failures` is the same axis for the other lane (DW-226) — an operand that
+    reached git and could not be committed — and carries the same weight for the
+    same reason: the write landed on disk and is missing from git history."""
 
     recorded: bool
     refusals: tuple[PublishRefusal, ...] = ()
+    failures: tuple[PublishFailure, ...] = ()
 
     def publish_note(self) -> str | None:
         """One shared wording for both out-of-band surfaces, or `None` when no
-        target was refused. Publication remains best effort. The caller supplies
-        its own separator: `cli` appends it to the outcome line it already prints,
-        and the TUI either
+        target was refused and none failed. Publication remains best effort. The
+        caller supplies its own separator: `cli` appends it to the outcome line it
+        already prints, and the TUI either
         appends it to the existing non-write toast or raises one of its own.
 
         The fault rides WITH the cause where the refusal has one, the way the
-        sweep's `error` field rides beside its `refuse_cause`. Without it the two
+        sweep's `error` field rides beside its `refuse_cause`. Without it the three
         causes read alike at both surfaces, and `target-unreadable` is the one that
         names something a human can act on — a decode fault, an `EACCES`, a symlink
-        loop. `target-absent` has no exception text and takes the bare wording; an
-        empty parenthetical would read as a fault."""
-        if not self.refusals:
+        loop. The other two have no exception text and take the bare wording:
+        `target-absent`, and `target-not-a-file` for a target present but of the
+        wrong type. An empty parenthetical would read as a fault.
+
+        A FAILED publish (DW-226) joins the same `not committed to git: ...` list
+        under its own token, `commit-unavailable`, after the refusals — the
+        refusal wording and ordering are untouched, and neither surface needs a
+        branch of its own to report the new lane. The token deliberately echoes
+        the sweep's `sweep-ledger-commit-unavailable` journal row, which names
+        the same `verify.GitError` about the same files."""
+        if not self.refusals and not self.failures:
             return None
         named = ", ".join(
-            f"{r.file} ({r.cause})" if r.error is None else f"{r.file} ({r.cause}: {r.error})"
-            for r in self.refusals
+            [
+                f"{r.file} ({r.cause})" if r.error is None else f"{r.file} ({r.cause}: {r.error})"
+                for r in self.refusals
+            ]
+            + [f"{f.file} (commit-unavailable: {f.error})" for f in self.failures]
         )
         return f"not committed to git: {named}"
 
@@ -453,8 +506,9 @@ def apply_pre_answer(
     `decision:` audit line actually landed. `close` also flips the entry to done
     (so it leaves the open set now), while `build`/`keep-open` are saved to the
     pre-answer store for the next sweep to consume. When `commit`, the files THIS
-    call wrote are committed on their own (only those paths) — best effort, so a
-    non-git or dirty tree never blocks the on-disk record.
+    call wrote are committed ONE AT A TIME, each on its own (only that path) and
+    each rooted at its OWN resolved parent — best effort, so a non-git or dirty
+    tree never blocks the on-disk record.
 
     `PreAnswerResult.recorded` is `record_decision`'s own boolean, and it is the
     CALLER's non-write signal, not decoration — the same discipline
@@ -505,12 +559,53 @@ def apply_pre_answer(
     broken chain, `RuntimeError` on a symlink loop under 3.11–3.12) takes the same
     refusal arm with cause `target-unreadable` — a target whose path cannot be
     resolved cannot be read well enough to publish — because this module has no
-    journal to route it to and the cause enum is closed by contract.
+    journal to route it to and the cause enum is closed by contract. A store the
+    guard finds present but NOT a regular file takes the third token,
+    `target-not-a-file` (DW-211/228): publishing a directory's literal pathspec
+    would stage its descendants recursively under this call's own message.
 
     A refusal drops only ITS operand; the survivors still publish, and a refusal
-    never raises. The swallowed `verify.GitError` below is a different, older
-    degrade and stays silent and unreported: the files are written, and git
-    history is best effort. The commit stays OUTSIDE every lock (#286).
+    never raises.
+
+    THE COMMIT IS PER OPERAND, ROOTED AT THAT OPERAND'S OWN RESOLVED PARENT
+    (DW-225/226) — the rule `sweep._commit_ledger` already publishes this same
+    ledger under (DW-160/DW-175): NAME THE FILE YOU PUBLISHED, and let the
+    repository follow from the file rather than from a role. `target` is already
+    resolved by GATE TWO, so `target.parent` needs no second resolve and
+    `commit_paths` relativizes the operand to a bare basename — the one-file
+    scope that bounds the blast radius.
+
+    ONE `commit_paths(project, ..., [ledger, store])` call for BOTH operands
+    failed two ways at once. The ledger hangs off `implementation_artifacts`,
+    which `bmadconfig._resolve` accepts as any absolute path, so it may sit
+    outside the project or inside a disjoint `repo_root`; against a project root
+    `commit_paths`' `relative_to` raised `ValueError` and its `except ValueError:
+    continue` dropped that operand SILENTLY — nothing committed and nothing
+    reported (DW-225). And a single `git add` over both operands exits 1 when
+    either one is gitignored (`_literal_specs` forces literal pathspecs, and git
+    refuses an explicitly named ignored path), so a gitignored ledger took its
+    publishable sibling down with it (DW-226). One commit per operand is the
+    decided shape for both: the two cannot sink each other, at the cost of two
+    commits carrying the same message where the operands share a repository.
+
+    That cost has two consequences, both decided rather than discovered. The pair
+    is no longer ATOMIC: an interrupt between the two, or a `pre-commit` hook that
+    is now invoked TWICE and fails the second time, can leave the ledger published
+    and the store not — a split a single commit could not produce. It is accepted
+    because the alternative is the DW-226 sinking, and because both files are
+    already on disk and the next sweep reads them from there, not from HEAD. And
+    the split-TREE case is deliberately UNREPORTED: two operands landing in two
+    repositories is the CORRECT outcome of per-operand rooting, not a degrade, so
+    `refusals`, `failures` and `publish_note()` all stay empty for it. Only a
+    publish that was refused or that git could not make is news.
+
+    A `verify.GitError` still never escapes — the files are written and git
+    history is best effort — but it is no longer SILENT: it is caught per
+    operand into a `PublishFailure` that both surfaces print through
+    `publish_note()`, beside the refusals and under its own
+    `commit-unavailable` token. So a project that is no git repository at all
+    now reports on every answer where it previously said nothing; that report is
+    the DW-226 lane, not noise. The commit stays OUTSIDE every lock (#286).
 
     Precondition: `date` is ISO `YYYY-MM-DD`. The ledger writers raise
     `ValueError` on anything else (it would otherwise land a `status:` line that
@@ -548,8 +643,13 @@ def apply_pre_answer(
     # GATE TWO — the shared publishable-target guard, on the RESOLVED operand
     # because that is the file git would publish, and before any git runs because
     # a refused publish must spawn none.
-    operands: list[Path] = []
+    # `(target, path)` pairs, not bare targets: the commit needs the RESOLVED
+    # target (it is the file git publishes and its parent is the repository to run
+    # in), while a failure report needs the LEXICAL basename for the same reason a
+    # refusal does — see the `path.name` comment below.
+    operands: list[tuple[Path, Path]] = []
     refusals: list[PublishRefusal] = []
+    failures: list[PublishFailure] = []
     for path, family in wrote:
         try:
             target = path.resolve()
@@ -558,7 +658,7 @@ def apply_pre_answer(
             continue
         refusal = verify.unpublishable_target(target, family)
         if refusal is None:
-            operands.append(target)
+            operands.append((target, path))
             continue
         cause, error = refusal
         # `path.name`, never `target.name`, and here is where that is a CHOICE: a
@@ -568,9 +668,25 @@ def apply_pre_answer(
         # what lets both surfaces print it verbatim — the same rule
         # `sweep._commit_ledger`'s `file` journal field is held to.
         refusals.append(PublishRefusal(file=path.name, cause=cause, error=error))
-    if operands:
+    # ONE COMMIT PER OPERAND, in the operand's OWN tree (DW-225/226 — see the
+    # docstring). An empty operand list spawns no git at all, which is GATE ONE's
+    # rule and is why this needs no `if operands:` of its own.
+    message = f"chore(decisions): pre-answer {decision.id}"
+    for target, path in operands:
         try:
-            verify.commit_paths(project, f"chore(decisions): pre-answer {decision.id}", operands)
-        except verify.GitError:
-            pass  # files are written; git history is best effort
-    return PreAnswerResult(recorded=recorded, refusals=tuple(refusals))
+            verify.commit_paths(target.parent, message, [target])
+        except verify.GitError as e:
+            # Caught PER OPERAND: a failing publish must not skip its sibling's,
+            # which is half of what DW-226 is. Still never raised — the file is
+            # written and git history is best effort — but reported now rather
+            # than swallowed. `path.name` for the same reason a refusal uses it,
+            # and git's stderr is multi-line where both surfaces print this note
+            # on ONE line, so the text is whitespace-collapsed.
+            collapsed = " ".join(str(e).split())
+            if len(collapsed) > PUBLISH_ERROR_MAX:
+                # ...and CLIPPED: git's ignored-path refusal is a multi-sentence hint
+                # block, which uncapped is a several-hundred-character tail on one CLI
+                # outcome line and inside one toast.
+                collapsed = collapsed[: PUBLISH_ERROR_MAX - 1] + "…"
+            failures.append(PublishFailure(file=path.name, error=collapsed))
+    return PreAnswerResult(recorded=recorded, refusals=tuple(refusals), failures=tuple(failures))

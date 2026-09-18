@@ -188,6 +188,57 @@ def test_sweep_decision_quarantines_coerce_their_elements():
     assert back.sweep_unlanded_decisions == ["3"]
 
 
+def test_sweep_ledger_in_doubt_round_trips():
+    """DW-218/219. The sweep's ledger-publication doubt is CYCLE-scoped on the
+    engine instance (`_ledger_in_doubt`, `_close_ledger_in_doubt`) and so is lost
+    the moment the process ends — which is precisely what a stop request observed
+    in the withheld branch, or a crash between the arming site and the dispatch
+    gate's report, does. The RUN's copy of the verdict rides `state.json` so the
+    resume withholds instead of dispatching.
+
+    A plain bool, so `json.dumps` encodes it directly; the dumps/loads here is the
+    same round-trip discipline the three lists above carry.
+
+    Ablation: delete `"sweep_ledger_in_doubt"` from `to_dict` and this fails while
+    the absent-key row below stays green — to_dict always writes the key, so the
+    two rows cover disjoint halves."""
+    state = _state()
+    assert state.sweep_ledger_in_doubt is False
+    state.sweep_ledger_in_doubt = True
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.sweep_ledger_in_doubt is True
+
+
+def test_sweep_ledger_in_doubt_defaults_when_absent_from_dict():
+    """A `state.json` written before DW-218/219 carries no such key, and reading it
+    absent as False is what makes an old paused run resume with no doubt — which is
+    exactly what it had. The default is the SAFE direction only because no such run
+    ever armed the latch; a True default would withhold every bundle of every
+    resumed sweep in the archive.
+
+    Ablation: change from_dict's `d.get("sweep_ledger_in_doubt", False)` to
+    `d["sweep_ledger_in_doubt"]` and this fails with KeyError."""
+    d = _state().to_dict()
+    del d["sweep_ledger_in_doubt"]
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is False
+
+
+def test_sweep_ledger_in_doubt_coerces_a_hand_edited_value():
+    """Coerced with `bool()` the way `finished`/`stopped`/`crashed` are, so every
+    reader of `_ledger_unfit_to_publish()` sees a bool rather than whatever a
+    hand-edited or foreign state file put there. The gate is an `or` chain, so a
+    truthy non-bool would work by accident today and stop working the moment a
+    reader asserts identity.
+
+    Ablation: drop the `bool()` in from_dict and the `is True` / `is False` below
+    fail on the coerced values."""
+    d = _state().to_dict()
+    d["sweep_ledger_in_doubt"] = 1
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is True
+    d["sweep_ledger_in_doubt"] = ""
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is False
+
+
 def test_sweeps_refused_coerces_both_halves():
     """Both halves are coerced with str(). The value is the JSON-reachable one —
     a number survives a dumps/loads round trip as a number — and the key is

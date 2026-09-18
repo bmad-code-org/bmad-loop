@@ -18,6 +18,7 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
     _Omit,
+    fault_metadata_probe,
     fault_read_text,
     git,
     make_git_noisy,
@@ -5960,7 +5961,8 @@ def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, m
 
 
 def test_unpublishable_target_refuses_an_absent_store(project):
-    """The store family, whose whole probe is existence.
+    """The store family's absence arm, which is now the arm reached only after BOTH
+    type probes answered False and `exists()` agreed nothing is there.
 
     Ablation: return `None` unconditionally from the store arm and this reds."""
     store = project.project / ".bmad-loop" / "decisions.json"
@@ -5970,7 +5972,8 @@ def test_unpublishable_target_refuses_an_absent_store(project):
 
 
 def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(project):
-    """EXISTENCE ONLY for the store, and that boundary is exactly why the family is
+    """NO CONTENT POLICY for the store — DW-211/228 tightened the store leg to a
+    TYPE test, not a bytes test — and that boundary is exactly why the family is
     DECLARED by the caller rather than derived from the path: the store's writer
     emits valid UTF-8 JSON, so bytes that will not decode represent a replacement
     after that write, and publication deliberately preserves the existing
@@ -5983,6 +5986,179 @@ def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(pr
     store.write_bytes(b'{"DW-1": "\xff"}')  # present, and not UTF-8
 
     assert verify.unpublishable_target(store, "store") is None
+
+
+def test_unpublishable_target_refuses_a_store_replaced_by_a_directory(project):
+    """DW-211/228: a DIRECTORY at the store's own name is present, so the old
+    existence-only probe published it — and `commit_paths` hands the literal
+    pathspec to `git add`, which stages a directory's descendants RECURSIVELY. The
+    wrong TYPE is neither absent nor unreadable, so it gets its own token and names
+    its own operator repair.
+
+    Ablation: drop `is_file()` from the store leg's first arm (leaving bare
+    `exists()`), or drop the `target-not-a-file` arm entirely, and this reds — the
+    directory publishes, or is misreported as an absence."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.mkdir(parents=True)
+    (store / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+
+    assert verify.unpublishable_target(store, "store") == ("target-not-a-file", None)
+
+
+def test_unpublishable_target_refuses_a_store_symlinked_to_a_directory(project):
+    """The same refusal reached the other way — and the row that pins WHICH path the
+    type test is taken on. Callers hand this guard the RESOLVED target (DW-188), and
+    a link to a directory resolves to that directory: `is_file()` False,
+    `is_symlink()` False, `exists()` True, so it lands on `target-not-a-file`. `git
+    add` on the operand would otherwise stage that directory's descendants exactly
+    as a directory in place of the store does.
+
+    The second half is the property that keeps the tightening from over-refusing:
+    `is_file()` FOLLOWS symlinks, so a store symlinked to a regular file publishes
+    whether the guard sees the link or its target.
+
+    Ablation: drop `is_file()` from the first arm (leaving bare `exists()`) and the
+    resolved directory publishes again; make the first arm `is_file()` alone,
+    dropping the `is_symlink()` disjunct, and the link-to-a-regular-file half still
+    passes while the 3.13+ loop row above it reds — the two disjuncts answer
+    different questions."""
+    root = project.project / ".bmad-loop"
+    root.mkdir(parents=True, exist_ok=True)
+    elsewhere = root / "operator-chosen-dir"
+    elsewhere.mkdir()
+    (elsewhere / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+    store = root / "decisions.json"
+    try:
+        store.symlink_to(elsewhere)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    # premise: the lexical path really is a link, and the RESOLVE is what the
+    # publishers hand over — it lands on the directory itself
+    assert store.is_symlink()
+    resolved = store.resolve()
+    assert resolved == elsewhere.resolve() and resolved.is_dir()
+
+    assert verify.unpublishable_target(resolved, "store") == ("target-not-a-file", None)
+
+    # ...while a link to a REGULAR file publishes, seen either way
+    regular = root / "operator-chosen-file.json"
+    regular.write_text("{}", encoding="utf-8")
+    store.unlink()
+    store.symlink_to(regular)
+    assert verify.unpublishable_target(store, "store") is None  # is_file() follows
+    assert verify.unpublishable_target(store.resolve(), "store") is None
+
+
+@pytest.mark.parametrize(
+    "probe,kind",
+    [
+        ("is_file", "file"),  # faults on the very first probe
+        ("is_symlink", "dir"),  # `is_file()` answers False first, then this raises
+        ("exists", "dir"),  # both type probes answer False, then this raises
+    ],
+)
+def test_unpublishable_target_folds_a_store_metadata_fault_into_the_refusal(
+    project, monkeypatch, probe, kind
+):
+    """DW-227: each store probe can FAIL rather than answer. On Python 3.11–3.13
+    `Path.exists()`, `is_file()` and `is_symlink()` absorb only the
+    `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISE the rest, so an `EACCES`
+    arriving after a successful write escaped this best-effort guard — aborting
+    `bmad-loop decisions`' walk or undercounting a TUI answer. Python 3.14
+    suppresses all OS errors in those probes, where the same store instead answers
+    `target-absent`; the fault is INJECTED here, so the handler is graded on every
+    version rather than only where the runtime can raise it on its own.
+
+    All three probes sit inside ONE `try`, so these rows do not ablate three
+    guards. What the per-probe parametrization grades is each ENTRY PATH into that
+    one guard: `is_file()` is reached first, `is_symlink()` only once it answered
+    False, and `exists()` only once both did — so every reachable arm is proved to
+    be inside the `try` rather than just the first.
+
+    Ablation: delete the store leg's `except OSError` and every row reds with the
+    `PermissionError` escaping instead of the tuple coming back."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        store.write_text("{}", encoding="utf-8")
+    else:
+        store.mkdir()
+    fault_metadata_probe(monkeypatch, store, probe)
+
+    cause, error = verify.unpublishable_target(store, "store")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
+@pytest.mark.parametrize("probe", ["exists", "is_symlink"])
+@pytest.mark.parametrize("staged", [False, True])
+def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(
+    project, monkeypatch, probe, staged
+):
+    """DW-227 at the other probe site: `commit_paths`' own presence check can raise,
+    and that fault takes the SAME per-candidate uncertainty path a failed `resolve()`
+    takes — omit this candidate, commit the healthy sibling, never escape as a bare
+    `OSError` into a publisher with no handler for it.
+
+    Ablation: remove the `try/except OSError` around the presence probe and this
+    reds with the `PermissionError` escaping before the healthy sibling commits."""
+    repo = project.project.resolve()
+    faulted = repo / "src.txt"
+    faulted.write_text("operator edit\n")
+    if staged:
+        git(repo, "add", "--", "src.txt")
+        staged_blob = git(repo, "show", ":src.txt")
+    healthy = repo / "healthy.txt"
+    healthy.write_text("commit me\n")
+    if probe == "is_symlink":
+        faulted.unlink()  # exists() must answer False to reach the second probe
+    fault_metadata_probe(monkeypatch, faulted, probe)
+
+    sha = verify.commit_paths(repo, "chore: healthy only", [faulted, healthy])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["healthy.txt"]
+    status = git(repo, "status", "--porcelain")
+    assert "src.txt" in status  # the faulted path stayed uncommitted
+    assert "healthy.txt" not in status
+    if staged:
+        assert git(repo, "show", ":src.txt") == staged_blob
+
+
+@pytest.mark.parametrize("probe", ["exists", "is_symlink"])
+def test_commit_paths_raises_when_the_only_candidates_presence_probe_faults(
+    project, monkeypatch, probe
+):
+    """The no-survivor half of the same contract: a sole faulted candidate is a typed
+    exact-write failure, not a successful no-op — the harvested-deferral carry clears
+    its durable commit-pending latch on a clean return, so `None` here would suppress
+    the retry forever. The `OSError` rides as `__cause__`, and no `git add` runs.
+
+    Ablation: record no fault for a faulted presence probe (leave the uncertainty
+    slot untouched) and this returns `None` instead of raising."""
+    repo = project.project.resolve()
+    faulted = repo / "src.txt"
+    faulted.write_text("uncommitted exact write\n")
+    if probe == "is_symlink":
+        faulted.unlink()  # exists() must answer False to reach the second probe
+    fault_metadata_probe(monkeypatch, faulted, probe)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains") as caught:
+        verify.commit_paths(repo, "chore: exact", [faulted])
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    if probe == "exists":
+        assert faulted.read_text() == "uncommitted exact write\n"
 
 
 def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(project):

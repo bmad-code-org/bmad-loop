@@ -5090,7 +5090,7 @@ def patch_new_files(patch_path: Path) -> set[str]:
 
 def unpublishable_target(
     target: Path, family: Literal["ledger", "store"]
-) -> tuple[Literal["target-absent", "target-unreadable"], str | None] | None:
+) -> tuple[Literal["target-absent", "target-unreadable", "target-not-a-file"], str | None] | None:
     """Why `target` must not be published, or `None` when it may be. Returns
     `(refuse_cause, error)` — the two fields a refusal carries beyond the
     caller's own identifying ones.
@@ -5122,16 +5122,41 @@ def unpublishable_target(
     is a read the writer above already took. A later disappearance or replacement
     can still change what git publishes, as `_commit_ledger` documents.
 
-    STORE: existence only, preserving the publishers' existing content
-    policy. The writer emits valid UTF-8 JSON, but this guard does not check
-    whether those bytes were replaced after the write. `_prune_pre_answers`'
-    own DW-176 absence refusal is about the LEDGER it reads, not the store.
+    STORE: a regular file must be there, except for the resolved symlink-loop
+    entry described below. Nothing is asked about its bytes.
+    The writer emits valid UTF-8 JSON, but this guard does not check whether
+    those bytes were replaced after the write, so a present, non-UTF-8 regular
+    file stays publishable. `_prune_pre_answers`' own DW-176 absence refusal is
+    about the LEDGER it reads, not the store.
 
-    Both probes are taken on the RESOLVED argument, which is what decides what
+    The TYPE test is the DW-211/228 half, and it is not decoration: existence
+    alone let a store replaced by a DIRECTORY (or by a symlink to one) through
+    the guard, and `commit_paths` hands the literal pathspec to `git add`, which
+    stages a directory's descendants RECURSIVELY — an unrelated tree published
+    under a `chore(sweep):`/`chore(decisions):` message. `is_file()` FOLLOWS
+    symlinks, so a store symlinked to a regular file still publishes; a present
+    target of the wrong type (directory, FIFO, device, socket) is refused
+    `target-not-a-file`, which is neither absent nor unreadable and names a
+    different operator repair than either.
+
+    Any of the store's probes can also FAIL rather than answer. On Python
+    3.11–3.13, `Path.exists()`, `is_file()` and `is_symlink()` absorb only the
+    `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISE the rest, so an `EACCES`
+    arriving after a successful write used to escape a best-effort publisher
+    (DW-227) — aborting `bmad-loop decisions`' walk or undercounting a TUI answer.
+    It is folded into `target-unreadable` here, for the same reason the ledger leg
+    folds its own `OSError`. Python 3.14 suppresses ALL OS errors inside those
+    three probes, so there the same `EACCES` never reaches this `except` at all:
+    every probe answers False and the store degrades to `target-absent` instead.
+    This guard attributes exceptions a probe raises; it cannot recover errors the
+    probe suppresses — the same boundary `deferredwork.read_for_observation`
+    states, and the runtime's false-probe meaning is preserved either way.
+
+    Every probe is taken on the RESOLVED argument, which is what decides what
     the `is_symlink()` disjunct actually buys — and it is not what the spelling
     suggests. A DANGLING link does not survive the resolve as a link: non-strict
     `Path.resolve` collapses it to the plain non-existent path it points at, so
-    both probes answer False and the store is refused `target-absent`. That is
+    all three probes answer False and the store is refused `target-absent`. That is
     the right answer for it (the prune's writer,
     `atomic_write_text_confined`, REFUSES to write through a link at the
     store's own name, so a dangling one holds no write of ours to publish), but
@@ -5144,9 +5169,11 @@ def unpublishable_target(
     `apply_pre_answer` folds the fault into a `target-unreadable` refusal.
 
     Returns the `refuse_cause` token as a `Literal` rather than a bare `str`,
-    which is what makes the closed two-value claim
+    which is what makes the closed three-value claim
     `tests/test_portability_guard.py` declares `refuse_cause` benign on a
-    typechecked property rather than a comment."""
+    typechecked property rather than a comment. The union is spelled identically
+    in `decisions.PublishRefusal.cause`; pyright rejects producer tokens the
+    receiving union does not accept, but does not enforce equality of the unions."""
     if family == "ledger":
         try:
             if deferredwork.read_for_write(target) is None:
@@ -5155,9 +5182,20 @@ def unpublishable_target(
             return ("target-unreadable", str(e))
         return None
     if family == "store":
-        if not (target.exists() or target.is_symlink()):
-            return ("target-absent", None)
-        return None
+        try:
+            # `is_file()` FOLLOWS symlinks, so a store symlinked to a regular file
+            # publishes; the `is_symlink()` disjunct is what keeps the 3.13+ symlink
+            # LOOP's link entry publishable (see the RESOLVED-argument paragraph).
+            if target.is_file() or target.is_symlink():
+                return None
+            # Reached only once both answered False, so this is purely the
+            # discriminator between "present but the wrong TYPE" and "not there",
+            # and it costs nothing on the happy path.
+            if target.exists():
+                return ("target-not-a-file", None)
+        except OSError as e:
+            return ("target-unreadable", str(e))
+        return ("target-absent", None)
     # Spelled as an exhaustive dispatch, not `if ledger / else store`: a THIRD
     # family added to the `Literal` would otherwise typecheck at every call site
     # and fall silently through to existence-only validation — precisely the
@@ -5181,9 +5219,24 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     deletion to stage. An uncertain repo root raises before staging; uncertainty
     in one candidate omits only that candidate, preserving the partial-path
     contract for healthy siblings. If no usable operand survives that uncertainty,
-    the call raises instead of reporting a successful no-op."""
+    the call raises instead of reporting a successful no-op. TWO things can make a
+    candidate uncertain and both take that one path: its `resolve()` can fail, and
+    so can the presence probe below it — on Python 3.11–3.13
+    `Path.exists()`/`is_symlink()` absorb only the `ENOENT`/`ENOTDIR`/`ELOOP`
+    class of errnos and RAISE the rest, so an `EACCES` under one operand used to
+    escape as a bare `OSError` into best-effort publishers that have no handler
+    for it (DW-227). Python 3.14 suppresses all OS errors inside those probes, so
+    there the fault never arrives: both answer False and the candidate is simply
+    ruled MISSING, taking the missing-but-tracked arm below. The guard handles
+    what a probe raises, not what it suppresses."""
     rels: list[str] = []
-    resolution_fault: tuple[Path, OSError | RuntimeError] | None = None
+    # The single per-candidate uncertainty slot, shared by BOTH sources (a failed
+    # `resolve()` and a failed presence probe) because they have one contract: omit
+    # the candidate, and raise only if nothing survives. FIRST fault wins, so the
+    # message names a real cause rather than the last one seen. The third element
+    # is the STAGE, so the raise below can say which probe failed while keeping the
+    # `no exact commit operand remains` prefix two test suites match on.
+    candidate_fault: tuple[Path, OSError | RuntimeError, str] | None = None
     try:
         repo_root = repo.resolve()
     except (OSError, RuntimeError) as e:
@@ -5198,12 +5251,31 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
             # wildmatch ESCAPES rather than separators.
             rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
         except (OSError, RuntimeError) as e:
-            if resolution_fault is None:
-                resolution_fault = (Path(p), e)
+            if candidate_fault is None:
+                candidate_fault = (Path(p), e, "path resolution")
             continue
         except ValueError:
             continue
-    missing = [r for r in rels if not ((repo_root / r).exists() or (repo_root / r).is_symlink())]
+    # Each presence probe is guarded on its own: a fault under ONE candidate must
+    # not decide the fate of its healthy siblings, and it must not escape either —
+    # this is the last probe before `git add`, and both publishers above it treat a
+    # publication fault as bookkeeping. A faulted candidate leaves BOTH lists: it is
+    # not staged, and it is not offered to `ls-files` as a possible deletion, since
+    # nothing here can tell "removed" from "cannot say".
+    survivors: list[str] = []
+    missing: list[str] = []
+    for r in rels:
+        candidate = repo_root / r
+        try:
+            present = candidate.exists() or candidate.is_symlink()
+        except OSError as e:
+            if candidate_fault is None:
+                candidate_fault = (candidate, e, "a presence probe")
+            continue
+        survivors.append(r)
+        if not present:
+            missing.append(r)
+    rels = survivors
     if missing:
         rc, out = _git_raw(repo, "ls-files", "-z", "--", *_literal_specs(missing))
         if rc != 0:
@@ -5211,10 +5283,10 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
         tracked = {t for t in out.split("\0") if t}
         rels = [r for r in rels if r not in missing or r in tracked]
     if not rels:
-        if resolution_fault is not None:
-            failed_path, error = resolution_fault
+        if candidate_fault is not None:
+            failed_path, error, stage = candidate_fault
             raise GitError(
-                "no exact commit operand remains after path resolution failed "
+                f"no exact commit operand remains after {stage} failed "
                 f"for {failed_path}: {error}"
             ) from error
         return None

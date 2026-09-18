@@ -3111,6 +3111,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
+    # DW-204: sweep runs only, and only for a ledger whose bytes do not currently
+    # decode (a read the OS refused propagates instead — see the helper). Gated
+    # HERE and not in `_resume_paused_run`, for the same reason the liveness block
+    # above is:
+    # that helper is also resolve's re-arm path, which has already run its
+    # interactive session and re-armed the escalation by the time it is reached, so
+    # a refusal there would be a refusal after the side effects. Deliberately AFTER
+    # the 'unknown' warning, so the recovery warning still prints; the live-engine
+    # refusal above still wins outright and never probes the ledger.
+    #
+    # The probe lives in `runs` because two more entry points take it at their own
+    # entries for that same reason (DW-229/DW-230): `cmd_resolve` below, and the
+    # TUI's `_do_rearm`. One implementation, so the three cannot drift.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     return _resume_paused_run(project, run_dir)
 
 
@@ -3343,6 +3359,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if story_key is None or task is None or task.phase != Phase.ESCALATED:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
+
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, not paused at an escalation,
+    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -4140,12 +4169,14 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 outcome += f": {why}"
             if option.effect != "close":
                 outcome += "; your answer was saved to the pre-answer store"
-        # A written operand that could not be published (DW-209/213). Separate from
-        # the non-write above and reportable on TOP of a successful record: the
-        # operand list is already gated on what the call wrote, so a refusal means
-        # an answer that really landed on disk is missing from git history. It is
-        # not an error — the exit code, the walk and the outcome wording above are
-        # all unchanged by it.
+        # A written operand that could not be published, in either of its two
+        # lanes: REFUSED before any git ran (DW-209/213), or FAILED once git ran
+        # and answered `GitError` (DW-225/226 — an operand in no repository, a
+        # gitignored path). Separate from the non-write above and reportable on TOP
+        # of a successful record: the operand list is already gated on what the
+        # call wrote, so either lane means an answer that really landed on disk is
+        # missing from git history. Neither is an error — the exit code, the walk
+        # and the outcome wording above are all unchanged by both.
         note = result.publish_note()
         if note is not None:
             outcome += f"; {note}"

@@ -835,6 +835,32 @@ class RunState:
     # `sweep_dropped_decisions`. An id no later drop announces remains until the
     # run ends; this list never doubles as a second announcement gate.
     sweep_unlanded_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and the RUN's ledger-publication doubt rather than a
+    # cycle's (DW-218/219). `_ledger_in_doubt` / `_close_ledger_in_doubt` live on
+    # the SweepEngine instance and are cycle-scoped by design; this mirrors them
+    # the moment either is armed, because the window that loses them is between
+    # the arming site and `_cycle`'s dispatch gate reporting: a stop request
+    # observed in the withheld branch, or any crash in the same span, ends the
+    # process with the verdict held only in memory, and the resume then dispatches
+    # the bundles whose `git add -A` sweeps the half-written ledger into HEAD.
+    # It follows the latch it mirrors rather than outliving it: a later effect
+    # landing in the same decision walk proves the ledger reads and writes again,
+    # and `_release_ledger_doubt` clears the mirror there — but ONLY for an arm
+    # THIS process made. The mirror is left standing while the close phase's latch
+    # is armed this cycle, and whenever it was inherited from a previous process,
+    # because "the ledger reads and writes again" is a statement about this
+    # process's LAST ATTEMPT and nothing wider — not about a write a different
+    # phase made, nor about bytes a previous process left on disk. Those two wait
+    # for the documented repair: a human edits the ledger
+    # and re-runs `bmad-loop sweep`, which is a NEW run with fresh state, so the
+    # residual stickiness cannot contaminate a later cycle: `_loop` stops or
+    # returns when doubt remains armed at the boundary. A cycle that releases its
+    # doubt can continue repeating with a clear mirror. Absent from an
+    # older `state.json`, it reads False: a compatibility default, so that run
+    # resumes exactly as it does today. Not evidence the run which wrote it was
+    # healthy — it could have armed an instance latch and lost it at the same
+    # interruption this field closes.
+    sweep_ledger_in_doubt: bool = False
     # sweep runs only: a ledger write this run published whose commit has not yet
     # landed. Latched BEFORE the already-resolved close and each decision effect
     # write, cleared by the ledger-family `_commit_ledger` once git says the file
@@ -939,6 +965,7 @@ class RunState:
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
             "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
+            "sweep_ledger_in_doubt": self.sweep_ledger_in_doubt,
             "sweep_ledger_commit_owed": self.sweep_ledger_commit_owed,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
@@ -977,6 +1004,7 @@ class RunState:
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
             sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
+            sweep_ledger_in_doubt=bool(d.get("sweep_ledger_in_doubt", False)),
             sweep_ledger_commit_owed=bool(d.get("sweep_ledger_commit_owed", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
