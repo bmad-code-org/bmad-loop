@@ -378,12 +378,28 @@ def test_pre_commit_gate_workflow_not_rerun_on_commit_resume(project):
     """#115: a task persisted at COMMITTING already ran its pre_commit_gate
     workflows — the phase save lands only after the gate loop returns clean.
     The resume re-drive must not re-charge them (and could not legally unwind
-    a blocking failure anyway: COMMITTING has no move to DEFERRED)."""
+    a blocking failure anyway: COMMITTING has no move to DEFERRED).
+
+    Ablation: restore `journal=engine.journal` in the inline resume constructor
+    and the clean resume-row assertion fails on inherited log_task/log_pos;
+    the persisted-history and active-log premises still pass.
+    With the earlier metadata assertion bypassed, each actual resume-commit
+    and story-done row also fails the emitted-row metadata assertion (checked
+    independently for each kind).
+    """
     reg = PluginRegistry(
         [LoadedPlugin(manifest=wf_manifest("wf", stage="pre_commit_gate", blocking=True))]
     )
     engine, _ = make_engine(project, [], reg)
     committing_crash_state(project, engine)
+    log = engine.run_dir / "logs" / "1-1-a-dev-1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"pre-pause session output\n")
+    engine.journal.set_active_log("1-1-a-dev-1")
+    engine.journal.append("run-start", cycle=1)
+    history = engine.journal.entries()
+    assert history[-1]["log_task"] == "1-1-a-dev-1"
+    assert history[-1]["log_pos"] == log.stat().st_size > 0
 
     state = load_state(engine.run_dir)
     state.clear_pause()
@@ -393,10 +409,18 @@ def test_pre_commit_gate_workflow_not_rerun_on_commit_resume(project):
         policy=engine.policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        journal=Journal(engine.run_dir),
         state=state,
         registry=reg,
     )
+    reopened_history = resumed.journal.entries()
+    assert reopened_history[: len(history)] == history
+    resumed.journal.append("run-start", cycle=2)
+    entries = resumed.journal.entries()
+    assert entries[:-1] == reopened_history
+    resume_row = entries[-1]
+    assert resume_row["kind"] == "run-start" and resume_row["cycle"] == 2
+    assert "log_task" not in resume_row and "log_pos" not in resume_row
     summary = resumed.run()
 
     assert summary.done == 1
@@ -405,6 +429,11 @@ def test_pre_commit_gate_workflow_not_rerun_on_commit_resume(project):
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "workflow-start" not in kinds
     assert "resume-commit" in kinds and "story-done" in kinds
+    for kind in ("resume-commit", "story-done"):
+        rows = [e for e in resumed.journal.entries() if e["kind"] == kind]
+        assert rows
+        for row in rows:
+            assert "log_task" not in row and "log_pos" not in row
 
 
 def test_no_workflow_no_extra_session(project):

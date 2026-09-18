@@ -3098,33 +3098,51 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       `sweep._notify_ledger_repair` already gives the sweep run for the same
       fault (that notice names the route and nothing about the fault's class),
       and the permissions-or-storage attribution is this arm's own. The arm is a
-      CALLER's: `deferredwork.read_for_write` still propagates `OSError`
-      unchanged, exactly as it does for every caller but this one and the sweep's
-      own reads. `tui.app._do_rearm` no longer wraps the probe in its own
-      `except OSError` — with the arm here the probe cannot raise one, so that
+      CALLER's: since DW-279, `deferredwork.read_for_write` wraps OS failures
+      as `LedgerReadFault`, handled before the decode parent here to preserve
+      the original OS attribution. `tui.app._do_rearm` no longer wraps the probe
+      in its own `except OSError` — with the arm here the probe cannot raise one, so that
       stopgap was dead code.
     * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
       / `parse_ledger("")` answer identically for absent and empty — a resumed
       sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
       holds an in-flight bundle whose intent document must be regenerated: that
       run re-pauses at the story gate under `sweep-intent-regen-refused`
-      `reason="ledger-absent"` (DW-243/252) before any cycle runs.
-    * Story runs are out of scope, and since DW-231 that is SAFE rather than
-      merely decided at the engine's four direct `read_for_write` sites. Its
-      observation reads (`_ledger_digest`, the pre-harvest and defer snapshots,
-      the two restores) degrade to a typed answer nothing can write back and
-      journal `ledger-read-degraded`; its two publish reads (the spec-deferral
-      harvest and the isolated carry) pause the run with an `ACTION REQUIRED`
-      repair notice and no phase change, so `bmad-loop resume` after the repair
-      retries the write — replaying the recorded session result where one
-      exists, re-driving the leg otherwise. At those four sites a story run over
-      an undecodable ledger therefore no longer dies as `run-crash`. Residual,
-      recorded as a deferral: every `deferredwork` mutator's own locked re-read
-      (the harvest's and carry's `append_entries`, `mark_done_many_reopenable`)
-      still raises inside its window, and the review-timeout salvage refile
-      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) has no
-      pre-read at all — a ledger that goes bad in exactly those windows still
-      crashes the run.
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs. A bundle close
+      paused at the same gate under `sweep-bundle-close-refused` — the mutator's
+      own locked read at the accepted-dev close, the review-leg reclose or the
+      isolated close carry (DW-280) — resumes the same way once the ledger
+      reads: this gate fronts that resume for the MAIN checkout's ledger (the
+      in-place sites and the carry), and the existing recovery arms then
+      re-drive the close. Under `scm.isolation = "worktree"` the two close
+      sites write the unit worktree's copy, which the pause notice names and
+      this gate does not probe, so an unrepaired copy simply re-pauses on
+      resume.
+    * Story runs are out of scope, and since DW-231 (undecodable bytes) and
+      DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
+      the engine's four direct `read_for_write` sites. Its observation reads
+      (`_ledger_digest`, the pre-harvest and defer snapshots, the two restores)
+      degrade to a typed answer nothing can write back and journal
+      `ledger-read-degraded`; its two publish reads (the spec-deferral harvest
+      and the isolated carry) pause the run with an `ACTION REQUIRED` repair
+      notice and no phase change, so `bmad-loop resume` after the repair retries
+      the write — replaying the recorded session result where one exists,
+      re-driving the leg otherwise. At those four sites a story run over an
+      undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
+      Since DW-259 the mutators' locked re-reads route the same way for decode
+      faults, and DW-279 extends that route to OS metadata/text-read faults:
+      every `deferredwork` mutator takes its own locked
+      `read_for_write` — after a routed pre-read at the harvest and the harvest
+      carry, after an observation snapshot at the commit-boundary close, and with
+      no pre-read at all at the review-timeout salvage refile
+      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) and the
+      isolated close carry — so a `LedgerReadError` raised from the mutator call
+      itself (the harvest's mark and append, the commit-boundary close, the
+      salvage refile, the isolated carries' append and close) now pauses through
+      the same `ledger-read-refused` route under a site name ending in `-locked`,
+      with the phase untouched. `LedgerReadFault(LedgerReadError)` identifies
+      OS read failures with the original `OSError` chained; pre-lock presence
+      probes, lock acquisition and writes keep their raw `OSError` behavior.
 
     Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
     run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` at its
@@ -3189,23 +3207,9 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     ledger = paths.deferred_work
     try:
         deferredwork.read_for_write(ledger)
-    except deferredwork.LedgerReadError as e:
-        # `e` already names the file AND the codec fault; repeating either would only
-        # drift from it. The clean-worktree precondition rides along because
-        # `cmd_sweep` enforces it and this fault leaves the ledger DIRTY, so an
-        # unqualified "run `bmad-loop sweep`" sends the human into an exit-1 nobody
-        # warned them about. And this run is still resumable by construction (the
-        # gate declines for finished runs), so the message says so: following the
-        # sweep steer alone would abandon the paused run's in-flight bundle state,
-        # whose recovery includes a ledger restore.
-        return (
-            f"run {run_dir.name}: cannot resume this sweep — {e}. Repair the ledger by "
-            f"hand, then commit or stash any changes in {paths.repo_root} and run "
-            "`bmad-loop sweep` (which requires that worktree to be clean). This run "
-            "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
-            "keeps its in-flight bundle recovery instead of starting the cycle over"
-        )
-    except OSError as e:
+    except (OSError, deferredwork.LedgerReadFault) as e:
+        if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+            e = e.__cause__  # Preserve the original OS attribution.
         # The OS refused the read (DW-234): a permissions or storage fault, not
         # bytes that failed to decode. The class NAME rides along because the errno
         # text alone ("[Errno 13] Permission denied") does not say what kind of
@@ -3222,6 +3226,22 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
             "that worktree to be clean). This run stays resumable: `bmad-loop resume` "
             "it again once the ledger reads, which keeps its in-flight bundle recovery "
             "instead of starting the cycle over"
+        )
+    except deferredwork.LedgerReadError as e:
+        # `e` already names the file AND the codec fault; repeating either would only
+        # drift from it. The clean-worktree precondition rides along because
+        # `cmd_sweep` enforces it and this fault leaves the ledger DIRTY, so an
+        # unqualified "run `bmad-loop sweep`" sends the human into an exit-1 nobody
+        # warned them about. And this run is still resumable by construction (the
+        # gate declines for finished runs), so the message says so: following the
+        # sweep steer alone would abandon the paused run's in-flight bundle state,
+        # whose recovery includes a ledger restore.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — {e}. Repair the ledger by "
+            f"hand, then commit or stash any changes in {paths.repo_root} and run "
+            "`bmad-loop sweep` (which requires that worktree to be clean). This run "
+            "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
+            "keeps its in-flight bundle recovery instead of starting the cycle over"
         )
     return None
 

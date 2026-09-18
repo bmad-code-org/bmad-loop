@@ -453,6 +453,234 @@ def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_proven
     assert rj["park_asserted"] is False
 
 
+# ------------------------------------- the bundle's artifact-only mint (DW-273)
+
+
+def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) the artifact-only line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"- {line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Artifact only: true",
+        "artifact_only: true",
+        "**Artifact only:** TRUE",
+        "Artifact-only: true",
+        "**Artifact only:** **true**",
+        "**Artifact only: true**",
+        "Artifact only: **true**",
+        "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
+    ],
+    ids=[
+        "prose",
+        "snake",
+        "bold-upper",
+        "hyphen",
+        "balanced-bold",
+        "bold-whole-line",
+        "bold-value",
+        "nbsp",
+    ],
+)
+def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
+    """The four-part shape `park_asserted` uses: a present, genuine (no synth
+    note), session-authored marker carrying the line. The line tolerates the
+    same bullet/bold spellings `STATUS_LINE_RE` does.
+
+    Ablation: drop the `"artifact_only"` key from the result and every parameter
+    fails on the `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["status"] == "done"
+    assert rj["artifact_only"] is True
+    assert rj["park_asserted"] is False  # a done marker is no park
+
+
+def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
+    """The advertised Status-like bold shapes include a closing delimiter after
+    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
+    regex consumes it before the end-of-line anchor, so the value is still
+    `true` alone on the line.
+
+    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
+    both shapes fall to the `$` anchor."""
+    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
+    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
+    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
+
+
+def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
+    """The label and its value must share one line. `Artifact only:` with `true`
+    on the NEXT line — or `Artifact only` with `: true` on the next line — is a
+    bare label and a stray token: every gap in the regex is horizontal
+    whitespace (`[^\\S\\r\\n]*`), so the match cannot cross the boundary the `$`
+    anchor holds, on either side of the colon.
+
+    Ablation: restore `\\s*` AFTER the colon and the spec row mints; restore
+    `\\s*` BEFORE the colon and the pre-colon assertion mints."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only:\ntrue")
+    assert "Artifact only:\ntrue\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted("Artifact only:\ntrue") is False
+    assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
+
+
+def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):
+    """The value is anchored to end of line: `true` followed by prose is a
+    sentence, not an assertion."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: true for the ledger, false for code")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_path):
+    """A pasted example inside the genuine marker's own body is documentation:
+    a match inside a fenced block mints nothing when no real line follows."""
+    sp = _artifact_only_spec(tmp_path, line=None, extra="\n```\n- Artifact only: true\n```\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+
+
+def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line=None)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Artifactonly: true", "artifactonly: true", "**Artifactonly:** **true**"],
+    ids=["fused", "fused-lower", "fused-bold"],
+)
+def test_synth_artifact_only_fused_words_fail_closed(tmp_path, line):
+    """The contract's spellings put at least one space, underscore or hyphen
+    between the two words; the fused `Artifactonly` is none of them, and a
+    malformed or accidental token must not relax the bundle gate (#794 review).
+    Ablation: `[ _-]+` back to `[ _-]*` in `ARTIFACT_ONLY_LINE_RE` and every row
+    reds on `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted(line) is False
+
+
+def test_synth_artifact_only_false_value_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: false")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_repaired_marker_fails_closed(tmp_path):
+    """The orchestrator's missing-marker repair cannot retroactively assert on the
+    session's behalf, exactly as it cannot for a park."""
+    sp = _artifact_only_spec(tmp_path, extra=f"\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_defaults_to_unasserted_without_session_provenance(tmp_path):
+    """`park_marker_session_authored` is the ONE authorship proof serving both
+    mints: without it a genuine-looking marker asserts nothing."""
+    sp = _artifact_only_spec(tmp_path)
+
+    rj = devcontract.synthesize_result(sp, story_key="dw-bundle").result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_frontmatter_never_mints(tmp_path):
+    """Frontmatter-only fallback (no marker at all) mints nothing, even with the
+    key spelled in the frontmatter."""
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None)
+    text = sp.read_text(encoding="utf-8").replace(
+        "status: 'done'\n", "status: 'done'\nartifact_only: true\n"
+    )
+    sp.write_text(text, encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_reads_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine marker cannot authorize a later
+    result, mirroring the park row above."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n```\n"
+            "\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
 def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
     marker = "## Auto Run Result\n\nStatus: awaiting-operator\n"
 

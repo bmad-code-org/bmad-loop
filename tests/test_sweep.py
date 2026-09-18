@@ -13,6 +13,7 @@ from typing import Literal
 import pytest
 from conftest import (
     _OK,
+    NUL_PATH_RESOLVE_FAULTS,
     UNRESOLVABLE,
     _file_exists_cmd,
     _spec_baseline,
@@ -22,6 +23,7 @@ from conftest import (
     bundle_review_effect,
     bundle_spec_path,
     crash_at_merge_back,
+    fault_locked_ledger_read,
     fault_metadata_probe,
     fault_read_text,
     git,
@@ -3481,6 +3483,7 @@ def test_replayed_bundle_close_leaves_the_open_set_before_the_sweep_loop_reads_i
         ("undecodable", "target-undecodable", "not valid UTF-8"),
         ("unreadable", "target-unreadable", "Permission"),
         ("unresolvable", "target-unreadable", UNRESOLVABLE),
+        ("nul", "target-unreadable", "lstat: embedded null character in path"),
     ],
 )
 def test_bundle_close_carry_refuses_an_unpublishable_ledger(
@@ -3506,19 +3509,23 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
     invalid UTF-8 after the write — refused here like every other cause, since this
     carry holds no latch), the DW-227 metadata fault, and a RESOLVE that fails — the
     last two both landing on `target-unreadable`. A wrong type has no exception text
-    to carry in `error` (an empty string would read as one); the other three do. The
-    resolve row is the one that grades `_publication_refusal`'s own
-    `except (OSError, RuntimeError)` fold: `Path.resolve` is what fails first, before
+    to carry in `error` (an empty string would read as one); the others do. The
+    two resolve rows are the ones that grade `_publication_refusal`'s own
+    `except (OSError, RuntimeError, ValueError)` fold, per class: `unresolvable` on
+    `OSError`, `nul` on `ValueError` (DW-275, an embedded NUL, injected with CPython's
+    3.12+ wording so a publisher-level journal row observes the fold for that class
+    too). `Path.resolve` is what fails first, before
     the family leg is ever asked, and without the fold a bare `OSError` escapes into
-    bookkeeping whose whole degrade discipline exists to prevent that. Both faults
+    bookkeeping whose whole degrade discipline exists to prevent that. All faults
     are injected through their seams rather than with chmod so they hold on every
     supported interpreter.
 
     Ablation: delete this site's `refusal` branch and every row reds — the wrong-type
-    row on its HEAD assertions as `swept-in.txt` reaches `git ls-files`, the other
-    two on the fault escaping into a caller with no handler for it. Delete
-    `_publication_refusal`'s `except (OSError, RuntimeError)` and the resolve row
-    reds alone."""
+    row on its HEAD assertions as `swept-in.txt` reaches `git ls-files`, the others
+    on the fault escaping into a caller with no handler for it. Delete
+    `_publication_refusal`'s whole `except (OSError, RuntimeError, ValueError)` and
+    both resolve rows red alone; drop `ValueError` ALONE from it and the `nul` row
+    reds alone, with the `ValueError` escaping."""
     write_ledger(project, {"DW-1": "open"})
     head = git(project.project, "rev-parse", "HEAD")
     engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
@@ -3539,6 +3546,11 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
             # The #552 shape: a resolve that FAILS rather than answering. It is the
             # first thing the guard does, so the family leg never runs at all.
             refuse_to_resolve(monkeypatch, ledger)
+        elif fault == "nul":
+            # DW-275: the same resolve failure on its `ValueError` class.
+            refuse_to_resolve(
+                monkeypatch, ledger, error=ValueError("lstat: embedded null character in path")
+            )
         else:
             # AFTER the write, for the same reason the directory arrives after it:
             # the guard's own probe is what must meet the fault, and a ledger
@@ -4341,6 +4353,308 @@ def test_generic_bundle_review_verify_recloses_ledger_after_review_rewrites_it(p
     assert entries["DW-2"].status.startswith("done")
     assert "resolved by sweep bundle dw-fix-things" in entries["DW-1"].body
     assert "sweep-bundle-reclosed" in {e["kind"] for e in engine.journal.entries()}
+
+
+# DW-280: the window INSIDE the sweep's two bundle-close mutator calls. Every
+# `deferredwork` mutator takes its own locked `read_for_write` ahead of every
+# write, so bytes that go bad before that read raise `LedgerReadError` from the
+# `mark_done_many_reopenable` call itself, with nothing flipped. The engine routes
+# its own six calls (DW-259); the sweep's accepted-dev close, review-leg reclose
+# and isolated close carry were bare. Decode rows corrupt bytes before calling
+# the real mutator. OS rows (DW-279) keep valid bytes and refuse metadata/text
+# access only under its real lock. Both execute the real reader and assert
+# the sweep's own pause: `sweep-bundle-close-refused` under a `-locked`
+# site, `RunPaused` at the story gate, phase and `bundle_closes_intended`
+# untouched, so the existing resume arms re-drive the close.
+
+
+def _corrupt_ledger_before_mark(
+    monkeypatch, project, *, main_only: bool = False, fault_mode="decode"
+):
+    """Fault the real close mutator's authoritative read.
+
+    Decode rows corrupt bytes immediately before the mutator. With `main_only`,
+    only main's copy changes, so the isolated worktree closes successfully and
+    the carry refuses. OS rows keep valid bytes and refuse main's metadata/text
+    read only under its real lock. Return the bytes that must survive; undo
+    before resume."""
+    if fault_mode != "decode":
+        return fault_locked_ledger_read(monkeypatch, project.deferred_work, fault_mode)
+    real = deferredwork.mark_done_many_reopenable
+
+    def corrupt_then_mark(path, *a, **kw):
+        if not main_only:
+            assert Path(path) == project.deferred_work
+        if Path(path) == project.deferred_work:
+            path.write_bytes(_UNDECODABLE_LEDGER)
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", corrupt_then_mark)
+    return _UNDECODABLE_LEDGER
+
+
+def _assert_bundle_close_pause(
+    engine, task_key, *, site, dw_ids, fault_mode="decode", paused_reason=None
+):
+    """The DW-280 row and notice, shared by the three sites. `paused_reason` is
+    the raised `RunPaused.reason` for a caller that invokes the site directly
+    (no `run()` loop persisted it); otherwise `state.paused_reason` is read."""
+    [refused] = _records(engine, "sweep-bundle-close-refused")
+    assert refused["story_key"] == task_key
+    assert refused["site"] == site
+    assert refused["dw_ids"] == dw_ids
+    assert refused["ledger"] == str(engine.paths.deferred_work)
+    # The row keeps `LedgerReadFault`'s classification (DW-279): an OS refusal is
+    # `ledger-inaccessible` with a permissions/storage steer, undecodable bytes
+    # `ledger-unreadable` with a UTF-8 steer — the sweep's two existing tokens,
+    # never the decode token for both.
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    # ...and the persisted pause reason (`state.paused_reason`, `run-paused`)
+    # carries the same diagnosis, not the notice's alone.
+    if paused_reason is None:
+        paused_reason = engine.state.paused_reason or ""
+    if fault_mode == "decode":
+        assert refused["reason"] == "ledger-unreadable"
+        assert "not valid UTF-8" in refused["error"]
+        assert "ledger unreadable" in attention
+        assert "could not decode" in attention
+        assert "must be valid UTF-8" in attention
+        assert "permissions or storage" not in attention
+        assert "the ledger could not be decoded" in paused_reason
+        assert "could not be read" not in paused_reason
+    else:
+        assert refused["reason"] == "ledger-inaccessible"
+        assert "PermissionError" in refused["error"]
+        assert "ledger inaccessible" in attention
+        assert "could not read" in attention
+        assert "permissions or storage" in attention
+        assert "valid UTF-8" not in attention
+        assert "the ledger could not be read" in paused_reason
+        assert "could not be decoded" not in paused_reason
+    # the sweep's route, not the engine's
+    assert _records(engine, "ledger-read-refused") == []
+    assert "ACTION REQUIRED" in attention
+    assert str(engine.paths.deferred_work) in attention
+    assert f"then `bmad-loop resume {engine.state.run_id}`" in attention
+    assert "re-run `bmad-loop sweep`" not in attention  # the fresh-sweep route is wrong here
+    return refused
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_accepted_dev_bundle_close_pauses_when_the_ledger_turns_undecodable_under_the_lock(
+    project, monkeypatch, fault_mode
+):
+    """DW-280 at `_close_bundle_ledger_when_spec_status`'s accepted-dev call, in
+    place. Bare, the `LedgerReadError` from the mutator's locked read escaped
+    `_post_dev_accepted_sync` and ended the run as `run-crash` with the accepted
+    session's work on disk and no repair route. It now pauses at the story gate
+    under `sweep-bundle-close-refused` site `bundle-close-locked`, the task left at
+    DEV_VERIFY with `bundle_closes_intended` already assigned and its baseline pair
+    intact (NOT `_pause_on_intent_refusal`, which clears it — an accepted attempt
+    still owns its baseline), the ledger's bytes untouched. Decode rows corrupt
+    bytes before the close; OS rows keep them valid and refuse metadata/text
+    access only under its real lock.
+
+    The resume half is the whole point of the phase being untouched:
+    `_recover_inflight_bundle`'s DEV_VERIFY + accepted-session arm re-enters
+    `_resume_after_dev_verify` → `_post_dev_accepted_sync`, which re-drives the
+    close with ZERO sessions, and the bundle lands DONE with both ids `done`.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in
+    `_close_bundle_ledger_when_spec_status` and this reds on `summary.paused` with
+    a `run-crash` row naming `LedgerReadError`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix-things", ["DW-1", "DW-2"], mark_ledger=False),
+        ],
+        policy=pol,
+    )
+    expected = _corrupt_ledger_before_mark(monkeypatch, project, fault_mode=fault_mode)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert _records(engine, "run-crash") == []
+    assert [s.role for s in adapter.sessions] == ["triage", "dev"]
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
+    assert engine.state.paused_story_key == "dw-fix-things"
+    [paused] = _gate_pauses(engine)
+    assert paused["reason"] == summary.paused_reason
+    assert str(project.deferred_work) in paused["reason"]
+    _assert_bundle_close_pause(
+        engine,
+        "dw-fix-things",
+        fault_mode=fault_mode,
+        site="bundle-close-locked",
+        dw_ids=["DW-1", "DW-2"],
+    )
+    assert "sweep-bundle-closed" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == expected  # nothing flipped
+    on_disk = load_state(engine.run_dir)
+    assert not on_disk.finished and on_disk.paused_stage == PAUSE_STORY_GATE
+    for task in (engine.state.tasks["dw-fix-things"], on_disk.tasks["dw-fix-things"]):
+        assert task.phase == Phase.DEV_VERIFY
+        assert task.bundle_closes_intended == ["DW-1", "DW-2"]
+        assert task.baseline_commit is not None  # the accepted attempt still owns it
+        assert task.accepted_dev_session_index == len(task.sessions) - 1
+
+    # repair by hand (the bundle's own commit carries the tracked repair), resume
+    monkeypatch.undo()
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # the close re-drives off the persisted receipt
+    assert [e["dw_ids"] for e in _records(resumed, "sweep-bundle-closed")] == [["DW-1", "DW-2"]]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix-things"].phase == Phase.DONE
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_isolated_bundle_close_carry_pauses_when_the_main_ledger_is_undecodable_under_the_lock(
+    project, monkeypatch, fault_mode
+):
+    """DW-280 at the sweep half of `_carry_isolated_ledger_writes`. The worktree
+    copy's close passes, the branch merges, and then main's locked read refuses.
+    Decode rows corrupt main's bytes before the mutator; OS rows preserve them
+    and refuse metadata/text access under its lock. Bare, the raise crashed the
+    run after `unit-merged` with
+    `isolated_ledger_carried` False — nothing in `worktree_flow.integrate_unit` or
+    `_replay_unlatched_ledger_carries` catches it. It now pauses at the story gate
+    under site `bundle-close-carry-locked`, with the task DONE, the latch still
+    False (the call site owns it, and the pause propagates past it) and
+    `bundle_closes_intended` intact, main bytes untouched.
+
+    That unlatched shape IS the resume story: `_replay_unlatched_ledger_carries`
+    re-runs the whole carry hook ahead of `_loop` once the ledger reads, with zero
+    sessions, and DW-1 lands `done` in the main checkout.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in the sweep's
+    `_carry_isolated_ledger_writes` and this reds on `summary.paused` with a
+    `run-crash` row naming `LedgerReadError`."""
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+    expected = _corrupt_ledger_before_mark(
+        monkeypatch, project, fault_mode=fault_mode, main_only=True
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert _records(engine, "run-crash") == []
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds  # the merge landed; the carry is what refused
+    assert "sweep-bundle-close-carried" not in kinds
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
+    assert engine.state.paused_story_key == "dw-fix"
+    _assert_bundle_close_pause(
+        engine, "dw-fix", fault_mode=fault_mode, site="bundle-close-carry-locked", dw_ids=["DW-1"]
+    )
+    assert project.deferred_work.read_bytes() == expected  # main: nothing flipped
+    paused = load_state(engine.run_dir).tasks["dw-fix"]
+    assert paused.phase == Phase.DONE
+    assert not paused.isolated_ledger_carried
+    assert paused.bundle_closes_intended == ["DW-1"]
+    assert paused.worktree_path  # the replay keys on the recorded mount
+
+    # repair by hand (gitignored: nothing to commit), resume
+    monkeypatch.undo()
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # no re-triage: the replayed close left the open set first
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "sweep-bundle-close-carried" in kinds
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_review_leg_reclose_pauses_when_the_ledger_turns_undecodable_under_the_lock(
+    project, monkeypatch, fault_mode
+):
+    """DW-280 at `_verify_review`'s reclose — the second caller of
+    `_close_bundle_ledger_when_spec_status`, told apart from the accepted-dev close
+    only by `site="bundle-reclose-locked"`. Driven directly, like the reclose row
+    above it: decode rows corrupt bytes before the mutator; OS rows keep valid
+    bytes and refuse metadata/text access only under its lock. The call raises `RunPaused` at the story gate instead of a bare `LedgerReadError`, with
+    no `sweep-bundle-reclosed` row, the bytes untouched, and the task's phase and
+    `bundle_closes_intended` as the call left them.
+
+    The resume shape at this site is the sweep's pre-existing restart arm —
+    `_recover_inflight_bundle` has no `_resumable_session` arm, so a REVIEW_VERIFY
+    pause resets the attempt to baseline and re-drives the bundle from dev, whose
+    accepted close then lands; not widened here, so not driven here.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in
+    `_close_bundle_ledger_when_spec_status` and this reds on `pytest.raises` with
+    the bare `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    baseline = git(project.project, "rev-parse", "HEAD")
+    spec = project.implementation_artifacts / "spec-dw-fix-things.md"
+    write_spec(spec, "done", baseline)
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1", "DW-2"],
+        spec_file=str(spec),
+    )
+    task.phase = Phase.REVIEW_VERIFY
+    engine.state.tasks[task.story_key] = task
+    expected = _corrupt_ledger_before_mark(monkeypatch, project, fault_mode=fault_mode)
+
+    with pytest.raises(RunPaused) as raised:
+        engine._verify_review(task)
+
+    assert raised.value.stage == PAUSE_STORY_GATE
+    assert raised.value.story_key == "dw-fix-things"
+    assert str(project.deferred_work) in raised.value.reason
+    _assert_bundle_close_pause(
+        engine,
+        "dw-fix-things",
+        fault_mode=fault_mode,
+        site="bundle-reclose-locked",
+        dw_ids=["DW-1", "DW-2"],
+        paused_reason=raised.value.reason,
+    )
+    assert "sweep-bundle-reclosed" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == expected  # nothing flipped
+    for saved in (task, load_state(engine.run_dir).tasks["dw-fix-things"]):
+        assert saved.phase == Phase.REVIEW_VERIFY
+        assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
 
 
 def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
@@ -6531,14 +6845,18 @@ def test_preanswered_keep_open_whose_option_was_re_authored_stops_suppressing(pr
 # ------------------------------- the two per-run `decisions.json` writes (cf. #363)
 #
 # `sweep.atomic_write_text_confined` (#593) is the binding the two `_decisions_phase`
-# writes below share. The module's OTHER two writers — the `_ensure_migration` ledger
-# restore and `_write_bundle_intent` — kept the plain `sweep.atomic_write_text`, so
-# splitting the adoption narrowed what these patches can reach. The FILENAME filter
-# and the delegate-otherwise arm stay anyway: a bare module-wide boom would make the
-# "revert this site" ablation pass for the WRONG REASON — the run still crashes on
-# "disk full", just raised from somewhere else — and the filter is what keeps that
-# true if a third site in this module ever adopts the confined helper. Both plans
-# carry ZERO bundles so the bundle-intent write is unreachable too.
+# writes below share — and, since DW-269, the `_ensure_triage` cache write-back and
+# `_write_intent` too. Of the module's `atomic_write_text` callers only the
+# `_ensure_migration` ledger restore keeps the plain helper (a project-level ledger
+# write with its own symlink policy, DW-188); the migration's two run-dir JSON
+# records, `migrate-manifest.json` and `migrate-result.json`, are bare `Path.write_text`
+# and go through neither binding. The FILENAME filter and the delegate-otherwise arm
+# are therefore load-bearing: a bare module-wide boom would make the "revert this
+# site" ablation pass for the WRONG REASON — the triage cache write-back DEGRADES
+# (DW-247), so a module-wide boom would leave a stray `sweep-triage-cache-write-failed`
+# row with the plan still acted on, and would crash the intent write wherever a plan
+# carries a bundle — and the filter is what keeps each row graded on its own site.
+# Both plans carry ZERO bundles so the bundle-intent write is unreachable too.
 #
 # The filter is safe against the project-level pre-answer store, which is also named
 # `decisions.json`: that goes through `decisions.atomic_write_text_confined`, a
@@ -6567,7 +6885,13 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     rows, on an AttributeError) — the `sweep.atomic_write_text` binding survives the
     revert because three other sites still use it. That is exactly why the stub
     filters by filename: a module-wide boom would keep this green through the
-    revert, crashing on a write this test is not about."""
+    revert, crashing on a write this test is not about.
+
+    Since DW-262 the seeded write-back DEGRADES rather than crashing the run: the
+    refusal lands on `sweep-decisions-store-write-failed` naming the seeded id, and
+    the run carries on with the answer in memory. The no-stranded-temp assertion is
+    unchanged — the helper's unlink-on-raise runs before the guard sees the
+    `OSError`."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -6603,7 +6927,9 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
-    assert summary.crashed and "disk full" in str(summary.crash_error)
+    assert not summary.crashed  # DW-262: the seeded write-back degrades
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"] and "disk full" in failed["error"]
     assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
     assert not (engine.run_dir / "decisions.json").exists()
     assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
@@ -9537,18 +9863,22 @@ def _cache_triage(engine, result_json, cycle: int = 1) -> Path:
 
 def _fault_cache_write(monkeypatch, cache: Path) -> None:
     """Make `_ensure_triage`'s write-back of exactly `cache` raise `PermissionError`
-    at the `bmad_loop.sweep.atomic_write_text` seam; every other atomic write the
-    run makes (intent documents, the sandbox ledger) still lands. The helper, not
-    `Path.write_text`: since DW-263 the write-back is atomic, and a `write_text`
-    fault would sail past it."""
-    real = sweep_mod.atomic_write_text
+    at the `bmad_loop.sweep.atomic_write_text_confined` seam; every other write
+    the run makes (the other intent documents, the decisions store, the sandbox
+    ledger) still lands. The helper, not `Path.write_text`: since DW-263 the
+    write-back is atomic, and since DW-269 it is CONFINED, so a fault at either
+    `write_text` or the plain `atomic_write_text` would sail past it. The DW-243
+    `intent-write` row aims this same seam at a regenerated intent document."""
+    real = sweep_mod.atomic_write_text_confined
 
-    def refused(path, *args, **kwargs):
+    def refused(path, text, *, confine_root, require_writable_target=False):
         if path == cache:
             raise PermissionError(13, "Permission denied", str(path))
-        return real(path, *args, **kwargs)
+        return real(
+            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+        )
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", refused)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", refused)
 
 
 def _no_git(monkeypatch, where: str):
@@ -11605,16 +11935,17 @@ def test_a_triage_cache_write_fault_degrades_and_keeps_the_plan(project, monkeyp
 
     Premise before outcome (docs/testing.md): the ledger is valid, the adapter carries
     exactly one triage effect whose plan validates, and the fault is a SELECTIVE
-    `bmad_loop.sweep.atomic_write_text` monkeypatch keyed on the cache path alone
-    (chmod is a no-op for root and carries no write bit on Windows; since DW-263 the
-    write-back goes through that helper rather than `Path.write_text`, so a
+    `bmad_loop.sweep.atomic_write_text_confined` monkeypatch keyed on the cache path alone
+    (chmod is a no-op for root and carries no write bit on Windows; since DW-263/DW-269
+    the write-back goes through that helper rather than `Path.write_text`, so a
     `write_text` fault no longer bites it), so every other write this run makes —
     state, journal, sandbox ledger — still lands. The plan contains one close and
     one `wontfix` skip: the sandbox ledger must record the close while leaving the
     skipped entry open, proving the plan reached its downstream effects.
 
-    Ablation: restore a bare `atomic_write_text(triage_path, ...)` and this reds on
-    `crashed` — the `PermissionError` propagates out of `_ensure_triage`. Delete only
+    Ablation: remove the write-back's `except OSError` handling, leaving the
+    `atomic_write_text_confined` call bare, and this reds on `crashed` — the
+    `PermissionError` propagates out of `_ensure_triage`. Delete only
     the journal write inside the `except OSError` arm and the row assertion reds while
     the run stays healthy; reuse `sweep-triage-reload-failed` there instead and the
     new-kind assertion reds the same way. Clear `plan.already_resolved` in the
@@ -11675,10 +12006,12 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, 
     What this row grades is the GUARD, which is why the outcome asserted is the
     journal's silence plus a fresh session. Past the guard, the `directory` shape
     reaches the write-back: a fresh triage writes its plan back to that same path
-    (`atomic_write_text`, since DW-263), whose `os.replace` of the staged temp onto
-    a directory is refused whichever guard stood in front of it (`IsADirectoryError`
-    on POSIX, `PermissionError` on Windows — the row asserts the path both carry,
-    not the message). Since DW-247 that write DEGRADES to
+    (`atomic_write_text_confined`, since DW-263/DW-269), whose `os.replace` of the
+    staged temp onto a directory is refused whichever guard stood in front of it
+    (`IsADirectoryError` on POSIX, `PermissionError` on Windows — the row asserts
+    the FILENAME both carry, not the message: the anchored POSIX arm replaces
+    dir_fd-relative, so its error names `triage.json` bare, while the win32 arm's
+    plain no-follow write names the full path). Since DW-247 that write DEGRADES to
     `sweep-triage-cache-write-failed` rather than crashing the run, so both shapes
     now end healthy; the `directory` row asserts that write-side row on top of the
     guard's silence, and the `stat-not-a-directory` shape (whose refusal is only on
@@ -11724,11 +12057,12 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, 
     if shape == "directory":
         [failed] = write_failed  # the planted directory refuses the fresh plan's write-back
         assert failed["errors"][0].startswith("unwritable: ")
-        # the path, not the message: POSIX raises `IsADirectoryError`, Windows a
-        # `PermissionError` from the same `open`, and both carry the filename —
-        # rendered through `repr` by `OSError.__str__`, so compare that spelling
-        # (Windows doubles the backslashes there)
-        assert repr(str(cache)) in failed["errors"][0]
+        # the DESTINATION's name, not the message: POSIX raises `IsADirectoryError`,
+        # Windows a `PermissionError` from the same `open`, and both quote the
+        # filename (the confined POSIX arm's dir_fd-relative replace names it bare,
+        # DW-269). The closing quote is what rules out the staged temp, whose
+        # `triage.json.<pid>.<hex>.tmp'` the bare name alone would also match.
+        assert f"{cache.name}'" in failed["errors"][0]
     else:
         assert write_failed == []  # only `stat` was refused; the write landed
         # read, not `is_file()`: the refused `stat` is still installed on this path
@@ -12582,6 +12916,11 @@ def test_a_reapply_whose_ledger_write_faults_degrades_and_carries_on(project, mo
             "the ledger file is gone",
             id="file-gone",
         ),
+        pytest.param(
+            lambda project: project.deferred_work.write_text(""),
+            "the ledger holds no entry for this id",
+            id="file-emptied",
+        ),
     ],
 )
 def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
@@ -12612,11 +12951,20 @@ def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
     since nothing was re-applied; the miss attributed with THIS row's sentence; and
     no commit.
 
-    Ablations, RUN: replace `if not recorded:` with `if False:` and both rows red
+    The `file-emptied` row is the edge between the other two: a ledger truncated
+    to 0 bytes is a file the recorder REACHED and found no entry in, so it takes
+    the missing-entry sentence — where the text-only observation reader answers
+    the same `""` it answers for absence, and `_non_write_state` once tested that
+    text for truth and called the file gone (PR #794 review). It is why the
+    sentence asks the presence-aware `observe_ledger`.
+
+    Ablations, RUN: replace `if not recorded:` with `if False:` and all rows red
     with `closed == 1` and a `sweep-decision-effect-reapplied` row for a line that
     was never written. Replace `_non_write_state`'s `the ledger file is gone` return
     with the missing-entry sentence and the `file-gone` row alone reds — the
-    `entry-gone` row cannot see that branch, which is why both are here."""
+    `entry-gone` row cannot see that branch, which is why both are here. Switch
+    `_non_write_state` back to `read_for_observation` + `not text` and the
+    `file-emptied` row alone reds with "the ledger file is gone"."""
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
     _seed_run_store(engine, {"DW-1": _stored_close_answer()})
@@ -12639,34 +12987,139 @@ def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
     assert _records(engine, "sweep-ledger-commit") == []
 
 
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
+def test_non_write_state_does_not_call_a_refused_ledger_gone(project, monkeypatch, shape):
+    """DW-265, the direct unit row beside the `file-gone` absence row above.
+    `_non_write_state` probed absence with `is_file()` BEFORE asking the reader;
+    on Python 3.14 that probe suppresses every OS error and answers False, so a
+    ledger sitting in place, unreadable, was reported as GONE — the sentence that
+    tells the operator every `decision:` line already written went with it.
+    Absence is now the reader's own `("", None)` answer; a refused ledger is an
+    attributed fault with the empty text and falls through to the documented
+    unreadable sentence, "the ledger holds no entry for this id". `metadata-3.14`
+    pins `Path.is_file` False for the ledger and refuses `stat`; `metadata-3.13`
+    refuses `stat` alone (which the old `try/except OSError` already absorbed into
+    the same fallthrough). Ablation: restore the `if not ledger.is_file(): return
+    "the ledger file is gone"` pre-gate and the `metadata-3.14` row reds with
+    "the ledger file is gone"."""
+    engine, _ = make_sweep(project, [])
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    if shape == "metadata-3.14":
+        real = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, ledger, "stat")
+
+    assert engine._non_write_state("DW-1") == "the ledger holds no entry for this id"
+
+
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
+def test_an_interactive_non_write_does_not_call_a_refused_ledger_gone(project, monkeypatch, shape):
+    """DW-281, the site row beside the DW-265 unit row above: the INTERACTIVE arm of
+    `_decisions_phase` wrote its own sentence from a bare `is_file()` probe on the
+    ledger, outside any `try`, instead of asking `_non_write_state`. On Python
+    3.14 that probe suppresses every OS error and answers False, so a ledger
+    sitting in place, unreadable, was journaled as GONE — the sentence that tells
+    the operator every `decision:` line already written went with it; on 3.11–3.13
+    the same probe raised the `PermissionError` straight out of `_decisions_phase`
+    and ended `run()`. The arm now takes the sentence from `_non_write_state`,
+    whose absence is the observation reader's own `("", None)` answer, so a
+    refused ledger falls through to "the ledger holds no entry for this id" and
+    nothing raises.
+
+    The entry is retired inside the patched recorder so the REAL `record_decision`
+    refuses it (answers False) off a good read; only then is the shape installed,
+    so the refusal is genuine and the fault lands on the diagnostic alone.
+    `metadata-3.14` pins `Path.is_file` False for the ledger and refuses `stat`;
+    `metadata-3.13` refuses `stat` alone. Dispositions are the DW-186 ones,
+    unchanged: `closed == 0`, no `sweep-ledger-commit`.
+
+    In green both rows exercise the identical reader path — nothing calls
+    `is_file` on the ledger any more — so the pin matters only under the ablation.
+
+    Ablation: restore the inline `"...gone" if not ...deferred_work.is_file() else
+    "...no entry"` conditional at the arm. The pinned `metadata-3.14` row reds with
+    "the ledger file is gone" on every interpreter. The `metadata-3.13` row reds
+    only on 3.11–3.13, with the `PermissionError` escaping `_decisions_phase`; on a
+    real 3.14 `is_file()` bypasses the `Path.stat` monkeypatch and answers True, so
+    that row stays GREEN ("holds no entry") and the pinned row is the only
+    discriminating one — a complementary pair, the DW-265 doctrine."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_close_or_keep_decision("DW-1"),))
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    ledger = project.deferred_work
+    real_record = deferredwork.record_decision
+
+    def retire_then_refuse_probe(*args, **kwargs):
+        write_ledger(project, {}, commit=False)  # a rival writer retired the entry
+        recorded = real_record(*args, **kwargs)
+        assert recorded is False
+        if shape == "metadata-3.14":
+            real_is_file = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real_is_file(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
+        return recorded
+
+    monkeypatch.setattr(deferredwork, "record_decision", retire_then_refuse_probe)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    assert _records(engine, "sweep-ledger-commit") == []
+    # a refused OBSERVATION probe must not arm the doubt latch
+    assert engine.state.sweep_ledger_in_doubt is False
+    # the human's answer survives the degrade
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-1"]
+
+
 @pytest.mark.parametrize("fault", [PermissionError("denied"), OSError("metadata I/O failure")])
 def test_a_refused_replay_survives_a_fault_in_its_diagnostic_probe(project, monkeypatch, fault):
     """A metadata fault after refusal is observation, so it must not crash replay.
 
     Retire the entry after the gate and let the real recorder refuse it. Only
-    then fault the diagnostic's is_file probe, leaving the earlier repair reads
-    intact. Removing the diagnostic guard must raise here before its journal row.
+    then fault the diagnostic's `stat` presence probe — the one
+    `read_for_observation` takes for `_non_write_state` since DW-265 retired the
+    site's own `is_file()` pre-gate — leaving the earlier repair reads intact.
+    The reader attributes the fault and answers the empty text, which falls
+    through to the missing-entry sentence rather than crashing the replay.
 
-    Ablation, RUN: the test fails with the unguarded probe, then passes with the
-    guard; the effect stays uncounted and no ledger commit is attempted.
+    Ablation, RUN: hoist the diagnostic's read out of the reader (a bare
+    `ledger.read_text(...) if S_ISREG(ledger.stat().st_mode) else ""`) and this
+    reds with the injected fault escaping `_decisions_phase`; with the reader the
+    effect stays uncounted and no ledger commit is attempted.
     """
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
     _seed_run_store(engine, {"DW-1": _stored_close_answer()})
     plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
     real_record = deferredwork.record_decision
-    real_is_file = Path.is_file
+    real_stat = Path.stat
 
     def fault_ledger_probe(path, *args, **kwargs):
         if path == project.deferred_work:
             raise fault
-        return real_is_file(path, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
 
     def retire_then_fault_probe(*args, **kwargs):
         write_ledger(project, {}, commit=False)
         recorded = real_record(*args, **kwargs)
         assert recorded is False
-        monkeypatch.setattr(Path, "is_file", fault_ledger_probe)
+        monkeypatch.setattr(Path, "stat", fault_ledger_probe)
         return recorded
 
     monkeypatch.setattr(deferredwork, "record_decision", retire_then_fault_probe)
@@ -14528,8 +14981,8 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
       * move `name = path.name` inside the `try` beside `target` and this reds with
         a `NameError` escaping a method the docstring calls strictly best effort —
         which makes the BINDING POSITION, not merely the field, the graded thing;
-      * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError)`
-        tuple in `_commit_ledger` and this reds with the refusal escaping
+      * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError,
+        ValueError)` tuple in `_commit_ledger` and this reds with the refusal escaping
         `_commit_ledger` on BOTH legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename. The row
@@ -14622,7 +15075,7 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
 
     Ablations, all performed:
       * delete `RuntimeError` ALONE from the RESOLVE arm's `except (OSError,
-        RuntimeError)` tuple in `_commit_ledger` and this reds with the
+        RuntimeError, ValueError)` tuple in `_commit_ledger` and this reds with the
         `RuntimeError` escaping `_commit_ledger`, on both legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename, even though
@@ -14652,6 +15105,64 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(published.parent)
     assert loop_error in failed["error"]
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
+    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
+    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+    # DW-260: the ledger leg arms the run's doubt, in memory and on disk; the store
+    # leg arms nothing
+    assert engine._ledger_unfit_to_publish() is (family == "ledger")
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
+
+
+@pytest.mark.parametrize("family", ["ledger", "store"])
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_the_degrade_row_survives_a_value_error_from_the_resolve(
+    project, monkeypatch, fault, family
+):
+    """The `ValueError` CLASS of the same resolve `except` tuple, driven on its own
+    (DW-275), in the shape of the `RuntimeError` row above.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL and `UnicodeEncodeError`
+    (a `ValueError` subclass) for a lone surrogate outside the `surrogateescape`
+    range on CPython 3.11-3.14 POSIX, and the two-class tuple that stood here let
+    both escape a method whose docstring calls it strictly best effort. Both faults
+    come from `NUL_PATH_RESOLVE_FAULTS` and are injected through `refuse_to_resolve`
+    for the reason the constant states — `ntpath.realpath` tolerates a NUL, so a real
+    NUL path is not a cross-platform driver here — and the injected `nul` fault
+    carries CPython's 3.12+ wording (3.11 says `embedded null byte`) so the stand-in
+    is faithful. Every claim the sibling row makes is made again on this
+    class: the one `sweep-ledger-commit-unavailable` row with `file` the lexical
+    tail and `repo` the lexical parent, HEAD unmoved, no `sweep-ledger-commit`,
+    `-refused` or `-clean`, and the DW-260 doubt half — the ledger leg arms
+    `sweep_ledger_in_doubt` in memory and on disk, the store leg does not — since the
+    arm reads `family` AFTER the row, and a class that escaped the tuple would skip
+    the arm along with the row.
+
+    Ablation, per class: delete `ValueError` ALONE from the RESOLVE arm's
+    `except (OSError, RuntimeError, ValueError)` tuple in `_commit_ledger` and all
+    four legs red with the injected fault escaping `_commit_ledger`, while the
+    `OSError` and `RuntimeError` rows above stay green."""
+    # shared frame for both legs: on the store leg this ledger is deliberately
+    # ignored — never published, never resolved, never asserted on
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()  # a state file for the store leg's `load_state` to read back
+    published, tail = _resolve_degrade_target(project, family)
+    head = git(project.project, "rev-parse", "HEAD")
+    refuse_to_resolve(monkeypatch, published, error=fault)
+
+    engine._commit_ledger(
+        "chore(sweep): nul target", path=published, family=family
+    )  # must not raise
+
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["message"] == "chore(sweep): nul target"
+    assert failed["file"] == tail  # bound before the try, so still here
+    # the LEXICAL parent: the resolve that would have replaced it is what failed
+    assert failed["repo"] == str(published.parent)
+    assert str(fault) in failed["error"]
     assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
@@ -16166,7 +16677,8 @@ def test_a_landed_effect_cannot_publish_a_faulted_close_phases_half_write(projec
     assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
 
 
-def test_a_probe_over_an_os_refused_ledger_takes_its_own_token(project, monkeypatch):
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_a_probe_over_an_os_refused_ledger_takes_its_own_token(project, monkeypatch, operation):
     """The probe's SECOND leg, which has its own fixed token and its own error
     spelling — the class name riding beside the message, because "[Errno 13]
     Permission denied" alone does not say which refusal it was.
@@ -16176,16 +16688,17 @@ def test_a_probe_over_an_os_refused_ledger_takes_its_own_token(project, monkeypa
     `_prune_pre_answers`' own `_prune_ledger_inaccessible` carry, which is a
     different arm's business.
 
-    Ablation: fold the `except OSError` leg into the `LedgerReadError` one and the
-    token reds; drop the class-name prefix and the error spelling reds."""
+    Selective metadata/text faults exercise the real reader and its wrapper.
+    Ablation: remove `LedgerReadFault` from this OS catch and both rows take
+    the decode token; drop the class-name prefix and the error spelling reds."""
     write_ledger(project, {"DW-2": "open"})
     engine, _ = make_sweep(project, [])  # unattended: the one decision is skipped
     plan = TriagePlan(open_ids=frozenset({"DW-2"}), decisions=(_reapply_decision("DW-2"),))
 
-    def refuse(_path):
-        raise PermissionError(13, "Permission denied")
-
-    monkeypatch.setattr(deferredwork, "read_for_write", refuse)
+    if operation == "stat":
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+    else:
+        fault_read_text(monkeypatch, project.deferred_work)
 
     engine._decisions_phase(plan)
 
@@ -18708,6 +19221,308 @@ def test_whole_file_fault_is_replaced_by_interactive_decision_write_back(project
     assert rewritten["DW-1"]["effect"] == "build"
 
 
+def test_a_directory_at_the_run_store_degrades_the_seeded_write_back(project):
+    """DW-262. A directory planted at `<run>/decisions.json` is SILENT at the
+    `S_ISREG` probe (DW-248, pinned above) — so the phase reaches the seeded
+    write-back with a project pre-answer adopted, and `os.replace` onto the
+    directory raises `IsADirectoryError` (POSIX) / `PermissionError` (win32). Bare,
+    that aborted an otherwise healthy sweep at a bookkeeping write of an answer the
+    human already gave out of band. Now the phase returns the adopted answer, one
+    `sweep-decisions-store-write-failed` names the store's basename and exactly the
+    seeded id, and the directory is left where it was. No withheld row: the store
+    was READABLE (silently absent), so DW-264's flag was never set.
+
+    Premise before outcome: the pre-answer is adopted (`decision-preanswered`), so
+    the only thing the write-back's fault can cost is the persist.
+
+    Ablation: remove the `try`/`except OSError` around the seeded
+    `atomic_write_text_confined` and this reds with the `IsADirectoryError` out of
+    `_decisions_phase`; widen the withheld branch to fire on the directory shape
+    and the "no withheld row" assertion reds."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": good}), encoding="utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)  # returns, never raises
+
+    assert answers == {"DW-1": good}
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["file"] == "decisions.json"
+    assert failed["dw_ids"] == ["DW-1"]
+    assert failed["error"]  # exception text, never answer prose
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-reload-failed") == []  # probe stayed silent
+    assert run_store.is_dir()  # left where it was
+
+
+def test_the_failed_write_back_row_names_only_the_seeded_ids(project, monkeypatch):
+    """DW-262's `dw_ids` is the ids adopted from the PROJECT store this cycle, not
+    every id in `answers`. The directory row above cannot tell the two apart — its
+    run store contributes nothing to `answers` — so here a VALID run store already
+    holds DW-2's answer, the project store pre-answers DW-1, and the plan raises
+    both. `answers` ends up with both ids, but the write the stub refuses was made
+    for DW-1 alone, and the row says so.
+
+    The stub filters by filename, as `test_seeded_decisions_write_failure_strands_nothing`
+    does, so no other write this phase makes is touched.
+
+    Ablation: change the row's `dw_ids=list(seeded_ids)` to `dw_ids=list(answers)` and
+    this reds with `["DW-2", "DW-1"]`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_decision_for("DW-1"), _decision_for("DW-2")),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text(json.dumps({"DW-2": old}), encoding="utf-8")
+
+    real = sweep_mod.atomic_write_text_confined
+
+    def boom(path, text, *, confine_root, require_writable_target=False):
+        if Path(path).name == "decisions.json":
+            raise OSError("disk full")
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
+
+    assert set(answers) == {"DW-1", "DW-2"}  # both in memory for this cycle
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]  # the SEEDED id alone, not `list(answers)`
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+
+
+def test_a_directory_at_the_run_store_does_not_abort_the_sweep(project):
+    """DW-262 at the surface the ledger entry names: the SWEEP no longer aborts when
+    the seeded write-back of `<run>/decisions.json` lands on a directory planted at
+    the store. The phase-level row above grades the guard; this one runs
+    `engine.run()` end to end, the way the DW-248 twin
+    `test_a_metadata_fault_on_the_stored_answers_does_not_abort_the_sweep` does.
+
+    The pre-answer is `keep-open`, so no bundle is dispatched and the run's health
+    is decided by this write alone.
+
+    Ablation: remove the `try`/`except OSError` around the seeded write-back and
+    this reds on `crashed`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(triage_result(["DW-1"], decisions=[_decision("DW-1", _widen_or_keep)]))],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never aborts
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]
+    assert run_store.is_dir()  # still there
+
+
+@pytest.mark.parametrize("fault", ["stat", "read_text"])
+def test_an_unreadable_run_store_withholds_the_seeded_write_back(project, monkeypatch, fault):
+    """DW-264. An `OSError` at the store's metadata probe or its content read says
+    nothing about the BYTES on disk: a store full of valid answers merely could
+    not be read this cycle, and `answers`/`unusable` start empty, so the seeded
+    write-back would replace it with a map that had lost every answer it held.
+    It is WITHHELD while that flag is set: the adopted answer stays in memory for
+    this cycle's bundling (a resume re-adopts it from the project store), the old
+    bytes survive untouched, and one `sweep-decisions-store-write-withheld` names
+    the id that did not persist. No `sweep-decisions-store-write-failed` row: the
+    withheld check precedes the write, so no write is attempted at all. The
+    interactive arm under the same flag is the next row's: it has no second copy,
+    so there the PROMPT is withheld rather than the write.
+
+    The two decode arms (truncated JSON, non-object top level) deliberately do NOT
+    withhold — the `test_whole_file_fault_is_replaced_by_*` rows above pin that
+    replacement stays their repair.
+
+    Premise before outcome: a VALID store holding DW-2's answer is planted first,
+    and `read_bytes` (untouched by both fault helpers) reads it back afterwards.
+
+    Ablation: stop setting `store_unreadable` on the `stat` (metadata) arm and the
+    `stat` row reds on the surviving bytes — the write lands and replaces DW-2's
+    answer; stop setting it on the content `OSError` arm and the `read_text` row
+    reds the same way. Fold the split content arm back into one
+    `except (json.JSONDecodeError, OSError, UnicodeDecodeError)` without the flag
+    and the `read_text` row reds. Move the withheld check AFTER the `try` and both
+    rows red on the surviving bytes too — the write lands before the row is
+    written, which is the ordering the withheld-first check exists to forbid."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    original_bytes = json.dumps({"DW-2": old}).encode("utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_bytes(original_bytes)
+    # premise: the stored answer WOULD have been adopted had the read succeeded
+    assert sweep_mod.unusable_answer_reason(old, allow_close=True) is None
+    if fault == "stat":
+        fault_metadata_probe(monkeypatch, run_store, "stat")
+    else:
+        fault_read_text(monkeypatch, run_store)
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)  # never raises
+
+    assert answers["DW-1"]["effect"] == "build"  # in memory for this cycle's bundling
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    [withheld] = _records(engine, "sweep-decisions-store-write-withheld")
+    assert withheld["file"] == "decisions.json"
+    assert withheld["dw_ids"] == ["DW-1"]
+    assert "error" not in withheld  # nothing was attempted, so nothing to report
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert _records(engine, "sweep-decisions-prompt-withheld") == []  # nothing to ask
+    assert run_store.read_bytes() == original_bytes  # old answers survive the cycle
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+
+
+@pytest.mark.parametrize("fault", ["stat", "read_text"])
+def test_an_unreadable_run_store_withholds_the_interactive_prompt(project, monkeypatch, fault):
+    """DW-264's interactive half, re-drawn (#794 review). The first cut took the
+    human's answer and withheld only its WRITE, on the theory that the ledger's
+    `decision:` line was the durable record. It is not one anything reads: a
+    `build` answer lived in memory alone, and a process that died between the
+    answer and `_materialize_bundles`' save resumed with the old store, re-asked
+    the question — or, unattended, quarantined it — and the authorization was
+    lost. An answer that cannot be persisted is therefore not TAKEN: the prompter
+    is never called (an empty script here would raise `StopIteration` if it
+    were), no `decision-pending`/`decision-answered` row is written, the ledger
+    gets no `decision:` line, one `sweep-decisions-prompt-withheld` names the ids
+    not asked with the refusal's text, the ATTENTION notice says what to repair,
+    and the decision stays pending and UNQUARANTINED so the next interactive
+    sweep over a readable store asks it. The old bytes survive, as in the seeded
+    row, and no store write is attempted or reported.
+
+    Ablation: restore the prompt loop for the unreadable store (drop the `elif`)
+    and both rows red on the prompter being called with an empty script; keep the
+    loop but restore the old in-loop write-withhold and they red on
+    `decision-answered` present and the `decision:` line landed."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    original_bytes = json.dumps({"DW-2": old}).encode("utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=[], prompting=True)  # asking would raise
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_bytes(original_bytes)
+    if fault == "stat":
+        fault_metadata_probe(monkeypatch, run_store, "stat")
+    else:
+        fault_read_text(monkeypatch, run_store)
+
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # never raises
+
+    assert "DW-1" not in answers and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    [withheld] = _records(engine, "sweep-decisions-prompt-withheld")
+    assert withheld["file"] == "decisions.json"
+    assert withheld["dw_ids"] == ["DW-1"]
+    assert "Permission denied" in withheld["error"]
+    assert _records(engine, "decision-pending") == []
+    assert _records(engine, "decision-answered") == []
+    assert _records(engine, "decision-skipped-unattended") == []
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert "decision:" not in ledger_entries(project)["DW-1"].body  # no effect ran
+    assert "DW-1" not in engine.state.sweep_skipped_decisions  # asked again next time
+    assert run_store.read_bytes() == original_bytes  # old answers survive the cycle
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "1 deferred-work decisions not asked" in attention
+    assert "could not be read" in attention and "interactively again" in attention
+
+
+def test_an_unreadable_run_store_does_not_withhold_on_a_decode_fault(project):
+    """DW-264's boundary, the seeded arm: the flag is set on the two `OSError` arms
+    ONLY. A truncated store is corrupt bytes, not a refusal, so the seeded
+    write-back still replaces it wholesale and no withheld row appears — the
+    `test_whole_file_fault_is_replaced_by_*` rows pin the replacement; this one
+    pins the ABSENCE of the withheld row beside it.
+
+    Ablation: set `store_unreadable = True` on the decode arm and this reds on
+    the withheld row (and the replacement)."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": good}), encoding="utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
+
+    assert answers == {"DW-1": good}
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert json.loads(run_store.read_text(encoding="utf-8")) == {"DW-1": good}  # replaced
+
+
+def test_a_directory_at_the_run_store_still_raises_at_the_interactive_write_back(project):
+    """DW-262's deliberate asymmetry: only the SEEDED write-back is guarded. A
+    human's answer at the prompt that cannot be persisted stops the sweep loudly —
+    there is no second copy in the project store for a resume to re-adopt it
+    from. The store is readable (silently absent at the `S_ISREG` probe), so the
+    DW-264 withhold does not apply either, and the bare call propagates.
+
+    Ablation: wrap the interactive `atomic_write_text_confined` in the same
+    `try`/`except OSError` as the seeded one and this reds on `pytest.raises`."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    with pytest.raises(OSError):
+        engine._decisions_phase(plan)
+
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+
+
 def test_malformed_pre_answer_is_dropped_and_the_write_back_keeps_the_unusable_value(project):
     """DW-134, both halves in one row. `decisions.load_pre_answers` validates only
     the TOP level, so a project-store VALUE can be any JSON and used to reach
@@ -20723,6 +21538,66 @@ def test_resume_committing_bundle_finishes_commit(project):
     assert not mount.exists()
 
 
+@pytest.mark.parametrize("pauses", [False, True], ids=["rollback", "manual-recovery-pause"])
+def test_sweep_restart_clears_a_latched_salvage_before_rollback(project, monkeypatch, pauses):
+    """`_recover_inflight_bundle` has no `_pending_salvage_session` replay (the
+    same deliberate narrowing as its missing `_resumable_session` arm), so a
+    bundle whose review-timeout salvage latched `salvage_refile_pending` — at
+    the handoff save every salvage now takes, or at the refile's repair pause —
+    restarts here. Restarting ABANDONS that product's salvage retry, so the
+    latch must go with it, as the base restart arm clears it (#794 review):
+    left set, it rode onto the replacement attempt and forced
+    `_review_and_commit` down the review path (`review.enabled = false` and the
+    `recommended` trigger both defer to the latch), a review the fresh attempt
+    never asked for. Cleared BEFORE `_rollback_or_pause`, so the manual-recovery
+    pause under `rollback_on_failure = false` persists the task unlatched too:
+    the `manual-recovery-pause` row stubs the pause to raise once it has seen
+    the latch already down.
+
+    Ablation: drop `task.salvage_refile_pending = False` from the restart tail
+    and both rows red — `rollback` on the latch still set at PENDING,
+    `manual-recovery-pause` on the stub seeing it set."""
+    engine, _ = make_sweep(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(isolation="none", rollback_on_failure=not pauses),
+        ),
+    )
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=verify.rev_parse_head(project.project),
+        baseline_untracked=[],
+        spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        salvage_refile_pending=True,
+    )
+    engine.state.tasks[task.story_key] = task
+    seen_latched: list[bool] = []
+
+    def pause_after_looking(_task, cause):
+        seen_latched.append(_task.salvage_refile_pending)
+        if pauses:
+            raise RunPaused("manual recovery", PAUSE_STORY_GATE, _task.story_key)
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", pause_after_looking)
+
+    if pauses:
+        with pytest.raises(RunPaused):
+            engine._recover_inflight_bundle(task)
+        assert task.phase == Phase.REVIEW_VERIFY  # the reset tail was never reached
+    else:
+        assert engine._recover_inflight_bundle(task) is False
+        assert task.phase == Phase.PENDING
+
+    assert seen_latched == [False]  # already cleared when the rollback/pause ran
+    assert task.salvage_refile_pending is False
+    assert "resume-restart" in [e["kind"] for e in engine.journal.entries()]
+
+
 def test_sweep_isolation_flip_restart_releases_mount_state_without_main_rollback(
     project, monkeypatch
 ):
@@ -20896,8 +21771,8 @@ def test_a_refused_ledger_pauses_the_resume_at_intent_regeneration(project, monk
     routes to `bmad-loop resume <run_id>`, never to a fresh `bmad-loop sweep`.
 
     Only the LEDGER read is caught: `_read_intent_ledger` is split out of
-    `_write_intent` so the intent file's own `mkdir`/`atomic_write_text` faults still
-    propagate — the `intent-write` case, which refuses the regenerated document's
+    `_write_intent` so the intent file's own `mkdir`/`atomic_write_text_confined`
+    faults still propagate — the `intent-write` case, which refuses the regenerated document's
     own write and asserts the run CRASHES with no refusal row, no pause and no
     "by hand" notice: a run-dir write refusal reported as `ledger-inaccessible`
     would send the operator to repair a ledger that reads perfectly.
@@ -21895,6 +22770,407 @@ def test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape(project
     assert engine._verify_dev_artifacts(task, result_json).ok
 
 
+# ------------------------- the bundle's artifact-only receipt, engine-driven (DW-273)
+
+
+def _artifact_only_bundle_tree(project, engine):
+    """`_bmad-output/` gitignored and COMMITTED before the baseline, so the bundle
+    spec written under `implementation_artifacts` afterwards is invisible to the
+    ordinary proof-of-work probe and visible only to a `--ignored` listing — the
+    DW-236 shape (a spec-only erratum on a project that keeps BMAD output out of
+    git). Returns `(task, spec_path)` with the spec at `done`, since
+    `_dev_review_enabled` is False on the generic dev path."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"])
+    task.baseline_commit = verify.rev_parse_head(project.repo_root)
+    # the attempt-start snapshot `_dev_phase` stamps through the sweep's own
+    # `_artifact_baseline` override, taken BEFORE the spec below is written so
+    # the spec is this attempt's residue and the ledger written above is not
+    task.baseline_artifacts = engine._artifact_baseline(task)
+    sp = bundle_spec_path(project, "fix-things")
+    write_spec(sp, "done", task.baseline_commit)
+    return task, sp
+
+
+def test_bundle_artifact_only_receipt_is_accepted_and_journaled(project):
+    """DW-273, through the engine's own `_verify_dev_artifacts` so the wiring is
+    part of what reddens: an asserted artifact-only bundle over an artifact-only
+    tree clears the dev gate on the receipt, and the acceptance is journaled once
+    as `bundle-artifact-only-accepted` with the listing's count.
+
+    The unasserted control in the same row is what makes the acceptance
+    attributable to the assertion: the identical tree without `artifact_only`
+    keeps the verbatim refusal and writes no row.
+
+    Ablation, MEASURED: drop `artifact_only_dir=` from `verify_dev_bundle`'s call
+    into `_verify_shared_gates` and this fails on `assert outcome.ok`."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+
+    # the control: no assertion, the ordinary refusal, no record
+    refused = engine._verify_dev_artifacts(task, {"workflow": "auto-dev", "spec_file": str(sp)})
+    assert not refused.ok
+    assert refused.reason == "no changes in worktree since baseline commit"
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"
+    ] == []
+
+    # `count` is pinned to the files THIS ATTEMPT wrote: the spec, written after
+    # the snapshot, and not the ledger `_artifact_only_bundle_tree` wrote before
+    # it — both ignored, both listed, one owned
+    assert {p.name for p in project.implementation_artifacts.iterdir()} == {
+        sp.name,
+        project.deferred_work.name,
+    }
+    outcome = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+
+    assert outcome.ok
+    assert outcome.artifact_only_accepted is True
+    rows = [e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"]
+    assert len(rows) == 1
+    assert rows[0]["story_key"] == "dw-fix-things"
+    assert rows[0]["attempt"] == task.attempt
+    assert rows[0]["dw_ids"] == ["DW-1"]
+    assert rows[0]["count"] == 1
+
+
+def test_bundle_artifact_only_receipt_refuses_residue_that_predates_the_attempt(project):
+    """The ownership half of the receipt, through the engine's wiring: an asserted
+    artifact-only bundle over a tree whose ignored residue was ALL there when the
+    attempt started — the snapshot `_artifact_baseline` stamped lists every entry
+    with its current fingerprint — is refused with the ordinary prefix and the
+    receipt's "none created or changed" cause, and no row is written. A session
+    that wrote nothing cannot clear the gate on last week's erratum.
+
+    Ablation, MEASURED: make `_artifact_dir_owned_entries` return every listed
+    entry (drop the baseline comparison) and this fails on `assert not refused.ok`
+    with a `bundle-artifact-only-accepted` row of count 2."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+    # everything now on disk predates "this" attempt
+    task.baseline_artifacts = engine._artifact_baseline(task)
+    assert task.baseline_artifacts is not None and len(task.baseline_artifacts) == 2
+
+    refused = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+
+    assert not refused.ok and refused.retryable
+    assert refused.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists 2 ignored entries, none created or changed by this attempt" in refused.reason
+    assert refused.artifact_only_accepted is False
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"
+    ] == []
+
+
+def test_bundle_artifact_baseline_degrades_when_git_refuses_the_snapshot(project, monkeypatch):
+    """`_artifact_baseline` is observation, so a `GitError` on the snapshot's
+    listing degrades — `bundle-artifact-baseline-unavailable` naming the fault,
+    `None` stamped — rather than ending the run; the receipt then refuses this
+    attempt for want of a snapshot while a bundle with a real change still passes
+    the ordinary arm.
+
+    Ablation: drop the `except verify.GitError` and this raises out of
+    `_artifact_baseline`."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+
+    def fault(repo, artifact_dir):
+        raise verify.GitError("simulated: git status timed out")
+
+    monkeypatch.setattr(verify, "artifact_dir_snapshot", fault)
+    assert engine._artifact_baseline(task) is None
+    [row] = [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-baseline-unavailable"
+    ]
+    assert row["story_key"] == "dw-fix-things"
+    assert row["attempt"] == task.attempt
+    assert "git status timed out" in row["error"]
+
+    task.baseline_artifacts = None
+    refused = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+    assert not refused.ok and refused.retryable
+    assert "no attempt-start snapshot" in refused.reason
+
+
+def _artifact_only_dev_effect(project, name, dw_ids, *, write_spec_file: bool):
+    """A bundle dev session whose ONLY residue is its spec under the gitignored
+    artifacts dir (`write_spec_file=True`), or that writes nothing at all — both
+    asserting `artifact_only` in the result. Mirrors `bundle_dev_effect` with
+    `write_src=False` plus the assertion, which the mock adapter hands the engine
+    verbatim as `result_json`."""
+
+    def effect(spec):
+        baseline = verify.rev_parse_head(project.project)
+        sp = bundle_spec_path(project, name)
+        if write_spec_file:
+            write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+                "followup_review_recommended": False,
+                "artifact_only": True,
+            },
+        )
+
+    return effect
+
+
+def test_dev_phase_stamps_the_artifact_snapshot_so_the_run_credits_only_its_own_residue(project):
+    """DW-273 end to end through `engine.run()`: `_dev_phase` stamps
+    `baseline_artifacts` through the sweep's `_artifact_baseline` override at the
+    attempt's start, so a bundle whose session wrote its spec under the ignored
+    artifacts dir clears the gate on THAT file alone — the stale erratum planted
+    before the run is in the snapshot and is not counted — and the snapshot
+    persists on the task in state.json.
+
+    Ablation: drop the `task.baseline_artifacts = self._artifact_baseline(task)`
+    stamp from `Engine._dev_phase` and this fails on the receipt's "no
+    attempt-start snapshot" refusal (the task ends failed, no accepted row)."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    stale = project.implementation_artifacts / "last-weeks-erratum.md"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("old\n", encoding="utf-8")
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            _artifact_only_dev_effect(project, "fix-things", ["DW-1"], write_spec_file=True),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE
+    stale_rel = stale.relative_to(project.repo_root).as_posix()
+    assert task.baseline_artifacts is not None
+    assert stale_rel in task.baseline_artifacts
+    assert load_state(engine.run_dir).tasks["dw-fix-things"].baseline_artifacts == (
+        task.baseline_artifacts
+    )
+    [row] = _records(engine, "bundle-artifact-only-accepted")
+    assert row["count"] == 1  # the spec; not the stale erratum, not the ledger
+
+
+def test_bundle_that_writes_nothing_cannot_clear_the_gate_on_stale_ignored_residue(project):
+    """The hole the snapshot closes, end to end: the same stale erratum under the
+    ignored artifacts dir, a session that asserts `artifact_only` and writes
+    NOTHING — before the snapshot, the listing of that erratum was the receipt
+    and the bundle closed DW-1 on it. Now the attempt is refused with the
+    ownership cause, no accepted row is written, and the id stays open."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    sp = bundle_spec_path(project, "fix-things")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # the spec too predates the run, already `done`: nothing for the session to do
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    (project.implementation_artifacts / "last-weeks-erratum.md").write_text(
+        "old\n", encoding="utf-8"
+    )
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            _artifact_only_dev_effect(project, "fix-things", ["DW-1"], write_spec_file=False),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix-things"].phase != Phase.DONE
+    assert _records(engine, "bundle-artifact-only-accepted") == []
+    assert ledger_entries(project)["DW-1"].open
+    [decision] = _records(engine, "dev-decision")
+    assert decision["reason"].startswith("no changes in worktree since baseline commit (")
+    # the spec, the erratum and the ledger: all three predate the run
+    assert "lists 3 ignored entries, none created or changed by this attempt" in decision["reason"]
+
+
+def _wt_artifact_only_dev(project, name="fix", dw_ids=("DW-1",)):
+    """`wt_bundle_dev` with NO source change: the session writes its spec and an
+    erratum under the unit worktree's rebased artifacts dir and asserts
+    `artifact_only` — the DW-236 shape run under `scm.isolation = "worktree"`."""
+
+    def effect(spec):
+        wt = project.rebased(spec.cwd)
+        baseline = verify.rev_parse_head(spec.cwd)
+        sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        write_spec(sp, "done", baseline)
+        (wt.implementation_artifacts / "erratum.md").write_text("the deliverable\n")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+                "followup_review_recommended": False,
+                "artifact_only": True,
+            },
+        )
+
+    return effect
+
+
+def test_isolated_bundle_artifact_only_receipt_is_refused_because_teardown_destroys_it(project):
+    """Under `scm.isolation = "worktree"` an in-tree gitignored artifacts dir is
+    rebased into the unit worktree, so the receipt's listing measures the
+    worktree's copy. An artifact-only unit contributes no tracked change, the
+    merge lands nothing, and `merge_local`'s success teardown removes the worktree
+    — with the accepted spec and erratum in it; `_carry_isolated_ledger_writes`
+    copies no file. Before the veto (#794 review) that bundle went DONE with a
+    `bundle-artifact-only-accepted` row of count 2, `DW-1` read `done`, and the
+    main checkout held only the ledger: a close whose evidence had been destroyed.
+
+    Now `_artifact_only_withheld` vetoes the receipt for a rebased artifacts dir,
+    so the attempt keeps the ordinary refusal with the isolation cause appended,
+    writes no accepted row, and `DW-1` stays `open` for a run that can carry the
+    work — loud and recoverable where the acceptance was silent loss. The main
+    checkout's artifacts dir is untouched either way; the row pins that too.
+
+    Two layers, both MEASURED. Drop `artifact_only_withheld=` from the sweep's
+    `verify_dev_bundle` call alone and this reds on the CAUSE: `_artifact_baseline`
+    still stamps `None` for the vetoed unit, so the gate refuses for want of a
+    snapshot — the right verdict under a misleading name. Drop that skip too and
+    it reds on `phase != DONE` with the accepted row present — the
+    destroyed-deliverable shape above."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan)] + [_wt_artifact_only_dev(project)] * 3,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase != Phase.DONE
+    assert task.baseline_artifacts is None  # vetoed: no snapshot is taken either
+    assert _records(engine, "bundle-artifact-only-accepted") == []
+    assert ledger_entries(project)["DW-1"].open
+    reasons = [r["reason"] for r in _records(engine, "dev-decision") if r["reason"]]
+    assert reasons and all(
+        r.startswith(
+            "no changes in worktree since baseline commit (artifact-only receipt refused: "
+        )
+        and "rebased into the unit worktree" in r
+        for r in reasons
+    )
+    # nothing of the unit's reached the main checkout — and nothing was destroyed there
+    assert sorted(p.name for p in project.implementation_artifacts.iterdir()) == [
+        project.deferred_work.name
+    ]
+
+
+def test_artifact_only_withheld_keys_on_the_artifacts_dir_moving_not_on_isolation(
+    project, tmp_path
+):
+    """The veto compares PATHS: the rebased in-tree dir names the worktree copy
+    the teardown removes, while an out-of-tree artifacts dir is left unmoved by
+    `ProjectPaths.rebased` and survives — so THIS veto does not fire on it, and
+    the gate goes on to refuse the receipt for it on its own (`_artifact_dir_entries`
+    lists nothing outside the repo). The veto's job is the teardown hazard only;
+    it must not fold in a refusal the gate already owns, or its sentence would
+    name a hazard that is not the reason. `replace(project, project=...,
+    repo_root=...)` is exactly the shape `rebased` produces for an out-of-tree
+    dir: a new root with the artifacts dir where it was.
+    The sentence names the ONE remedy that works, `isolation = "none"`, and not
+    "move the artifacts dir outside the code tree" (#794 review): that dir escapes
+    this veto but is refused by the gate's own listing regardless
+    (`test_verify_dev_bundle_artifacts_dir_outside_the_tree_refuses_without_git`),
+    so advertising it sends the operator through every attempt again.
+
+    Ablation: compare `self._isolated()` instead of the two paths and the shared
+    row reds with a veto on a dir the teardown never touches; restore the
+    "outside the code tree" remedy to the sentence and the wording row reds."""
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    assert engine._artifact_only_withheld() is None  # in place: the checkout itself
+
+    wt = tmp_path / "unit"
+    wt.mkdir()
+    engine.workspace = Workspace(root=wt, paths=project.rebased(wt))
+    withheld = engine._artifact_only_withheld()
+    assert withheld is not None
+    assert str(engine.workspace.paths.implementation_artifacts) in withheld
+    assert "rebased into the unit worktree" in withheld
+    assert 'isolation = "none"' in withheld
+    assert "outside the code tree" not in withheld  # a remedy the gate refuses anyway
+
+    shared = replace(project, project=wt, repo_root=wt)  # artifacts dir did not move
+    assert shared.implementation_artifacts == project.implementation_artifacts
+    engine.workspace = Workspace(root=wt, paths=shared)
+    assert engine._artifact_only_withheld() is None
+
+
+def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(project):
+    """The receipt relaxes the dev proof-of-work gate and NOTHING downstream: an
+    accepted artifact-only bundle whose ledger ids are still open is refused by
+    `verify_review_bundle` on those ids exactly as before, and the receipt closed
+    nothing in the ledger on its own."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+
+    accepted = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+    assert accepted.ok and accepted.artifact_only_accepted is True
+    assert task.spec_file == str(sp)
+    assert ledger_entries(project)["DW-1"].open
+
+    review = verify.verify_review_bundle(task, project, engine.policy)
+
+    assert not review.ok and review.fixable
+    assert "DW-1" in review.reason
+
+
 # ------------------------- the per-run decisions writes, confined to the project (#593)
 
 
@@ -21903,11 +23179,14 @@ def _redirect_the_run_dir(project, tmp_path):
     project, and hand back where it points.
 
     The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
-    engine writes its journal, state and triage records into this same directory
-    through the ordinary (unconfined) writers, and those must keep working so the
-    run reaches the decisions phase at all. Only the two confined writes walk the
-    components from the project root, so only they refuse — which makes the
-    refusal attributable to the site under test rather than to a broken run."""
+    engine writes its journal and state into this same directory through the
+    ordinary (unconfined) writers, and those must keep working so the run reaches
+    the site under test at all. Only the confined writes walk the components from
+    the project root, so only they refuse — which makes the refusal attributable
+    to the site under test rather than to a broken run. Since DW-269 the triage
+    cache write-back is one of them: through this link it refuses and DEGRADES
+    (`sweep-triage-cache-write-failed`), so a decisions-phase row driven through
+    here also carries that row, and the run still reaches the phase."""
     run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / "outside"
@@ -21930,8 +23209,13 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
     the phase was never entered.
 
     Ablation: revert this site to `atomic_write_text(..., follow_symlinks=False)`
-    and this fails — the run stops crashing and `decisions.json` appears in
-    `outside/`."""
+    and this fails — the refusal row disappears and `decisions.json` appears in
+    `outside/`.
+
+    Since DW-262 the refusal no longer crashes the run: `UnconfinedWriteError` is an
+    `OSError`, so the seeded guard journals it as `sweep-decisions-store-write-failed`
+    (the refusal's message in `error`) and the run carries on. The confinement is
+    what this row grades, and it is unchanged — nothing escapes either way."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -21960,8 +23244,10 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
 
     summary = engine.run()
 
-    assert summary.crashed
-    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert not summary.crashed  # DW-262: the seeded write-back degrades
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]
+    assert "without a redirect" in failed["error"]  # `UnconfinedWriteError`'s message
     assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
     assert not (outside / "decisions.json").exists()  # nothing escaped the project
 
@@ -22032,6 +23318,225 @@ def test_the_decisions_writes_land_on_a_clean_tree(project):
     assert not summary.crashed
     landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
     assert landed["DW-1"]["effect"] == "close"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_triage_cache_write_back_refuses_a_redirected_run_dir(project, tmp_path):
+    """The #593 escape on `_ensure_triage`'s cache write-back (DW-269). The cache
+    `<run>/triage.json` sits three deep under the project root, and the plain
+    `atomic_write_text` resolved every directory above it by name, so a link
+    planted at `.bmad-loop/`, `runs/` or the run dir aimed both the staged temp
+    and the published cache out of the project.
+
+    The refusal DEGRADES, on the row DW-247 already gave this site:
+    `UnconfinedWriteError` is an `OSError`, so the write-back's `except OSError`
+    journals it as `sweep-triage-cache-write-failed` (`unwritable: ...` carrying
+    the refusal's message) before `sweep-triage-result`, and the validated plan
+    is still acted on — the sandbox ledger records the close.
+
+    Precondition: `sweep-triage-result` proves a fresh triage validated and reached
+    the write-back; without it "nothing escaped" would pass because no triage ran.
+    The row's ordering and the ledger closure prove the degrade, not a crash.
+
+    Ablation: restore `atomic_write_text(triage_path, ...)` at the site and this
+    reds on `outside/triage.json` — the cache lands outside the project — and on
+    the refusal row, which never appears."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1", "DW-2"],
+                    skip=[{"id": "DW-1", "reason": "wontfix"}],
+                    already_resolved=[{"id": "DW-2", "evidence": "fixed in abc123"}],
+                )
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-triage-cache-write-failed")
+    assert failed["errors"] and failed["errors"][0].startswith("unwritable: ")
+    assert "without a redirect" in failed["errors"][0]  # `UnconfinedWriteError`'s message
+    kinds = journal_kinds(engine)
+    assert kinds.index("sweep-triage-cache-write-failed") < kinds.index("sweep-triage-result")
+    [result] = _records(engine, "sweep-triage-result")  # PRECONDITION: the site was reached
+    assert result["skip"] == 1 and result["already_resolved"] == 1
+    assert len(adapter.sessions) == 1  # exactly the one fresh triage ran
+    entries = ledger_entries(project)  # the plan still landed
+    assert entries["DW-1"].open
+    assert entries["DW-2"].status.startswith("done")
+    assert not (outside / "triage.json").exists()  # nothing escaped the project
+    assert list(outside.glob("triage*")) == []  # and no staged temp either
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_bundle_intent_write_refuses_a_redirected_bundles_dir(project, tmp_path):
+    """The #593 escape on `_write_intent` (DW-269). The intent document lands at
+    `<run>/bundles/<dirname>/intent.md`, and `path.parent.mkdir(parents=True,
+    exist_ok=True)` accepts a symlink-to-a-directory at any component, so a link
+    planted at `bundles/` survived the setup step and the plain `atomic_write_text`
+    then wrote the document — and its temp — wherever the link pointed.
+
+    The link goes at `bundles/` rather than the run dir so the journal, state and
+    (now-confined, degrading) triage cache are untouched: the crash is attributable
+    to the intent write alone. The refusal PROPAGATES — `_write_intent` has no
+    degrade arm by design (DW-243 pins that its own write faults crash rather than
+    being misreported as a ledger fault), and `UnconfinedWriteError` is an
+    `OSError`, so this is exactly the `PermissionError` shape that row grades.
+
+    Precondition: the `mkdir` runs before the write, so `outside/<dirname>/`
+    exists — the site was reached — while `intent.md` under it does not; and
+    `sweep-triage-result` counts the one bundle the plan carried. Exactly one
+    session ran: the crash lands before any dev session is dispatched.
+
+    Ablation: restore `atomic_write_text(path, ...)` at the site and this reds on
+    the crash MESSAGE (the run carries on into a dev session the script has no
+    effect for, so `crashed` alone would not tell), on the session count, and on
+    `outside/fix/intent.md`, which lands."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}]
+                )
+            )
+        ],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (engine.run_dir / "bundles").symlink_to(outside, target_is_directory=True)
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert "without a redirect" in str(summary.crash_error)  # `UnconfinedWriteError`'s message
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    [result] = _records(engine, "sweep-triage-result")
+    assert result["bundles"] == 1
+    assert len(adapter.sessions) == 1  # the triage ran; no dev session was dispatched
+    assert _records(engine, "sweep-intent-ledger-refused") == []  # not a ledger fault
+    assert _records(engine, "sweep-intent-regen-refused") == []
+    assert (outside / "fix").is_dir()  # PRECONDITION: `_write_intent`'s mkdir ran
+    assert not (outside / "fix" / "intent.md").exists()  # nothing escaped the project
+    assert list((outside / "fix").iterdir()) == []  # and no staged temp either
+    assert (engine.run_dir / "triage.json").is_file()  # the cache, under a REAL run dir, landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_bundle_intent_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The intent write's root, pinned. The `bundles/` row above plants its link
+    BELOW the run dir, so `confine_root=self.run_dir` at the intent site would pass
+    it — a file confined against a parent still walks the components under it.
+    This row plants the link AT the run dir (`_redirect_the_run_dir`), which only
+    a walk anchored above it — at the project root — can refuse.
+
+    The cache write-back refuses through the same link and DEGRADES, so
+    `sweep-triage-cache-write-failed` is present beside `sweep-triage-result`;
+    the intent write then refuses and PROPAGATES, exactly one session having run.
+
+    Ablation: `confine_root=self.run_dir` at the intent site and this reds — the
+    run carries on into a dev session the script has no effect for, and
+    `outside/bundles/fix/intent.md` lands."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}]
+                )
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert "without a redirect" in str(summary.crash_error)
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert len(adapter.sessions) == 1  # the triage ran; no dev session was dispatched
+    kinds = journal_kinds(engine)
+    assert "sweep-triage-cache-write-failed" in kinds and "sweep-triage-result" in kinds
+    assert not (outside / "bundles" / "fix" / "intent.md").exists()  # nothing escaped
+    assert not (outside / "triage.json").exists()
+
+
+def test_the_confined_sweep_writes_land_under_a_disjoint_repo_root(project, tmp_path):
+    """Both DW-269 roots, pinned against `self.workspace.root`. Under the
+    supported `repo_root` override (`isolation = "none"`) the workspace root is a
+    separate CODE repo while the run dir stays under the PROJECT, so a
+    workspace-rooted confinement would refuse every cache write-back (a lost cache
+    per cycle) and crash every bundle at its intent write. Both sites derive their
+    root from the run dir's own shape (`_project_of_run_dir`), which no workspace
+    swap moves — the same root `_decisions_phase` uses.
+
+    The premise is guarded before the outcome, as every divergent-root row here
+    must be (docs/testing.md): the two roots are compared RESOLVED and asserted
+    DISJOINT, since nested (`repo_root` an ancestor of the project) a
+    workspace-rooted confinement would still accept the run dir and grade nothing.
+    The scripted dev session edits the CODE repo and claims its HEAD as baseline, so
+    the bundle completes and the run ends healthy.
+
+    Ablation: `confine_root=self.workspace.root` at either site and this reds — the
+    cache row appears (the cache never lands), or the run crashes at the intent
+    write."""
+    from bmad_loop.verify import rev_parse_head
+
+    elsewhere = tmp_path / "code-repo"
+    # Copy this test's disposable sandbox, retaining the fixture's Git settings;
+    # never initialize another ad hoc repo or touch the shared template.
+    shutil.copytree(project.project, elsewhere)
+    paths = replace(project, repo_root=elsewhere)
+    write_ledger(paths, {"DW-1": "open"})
+
+    def dev(spec):
+        baseline = rev_parse_head(elsewhere)
+        (elsewhere / "src.txt").write_text("original\nchange for dw-fix\n", encoding="utf-8")
+        sp = bundle_spec_path(paths, "fix")
+        write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "dw-fix",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": ["DW-1"],
+                "followup_review_recommended": False,
+            },
+        )
+
+    plan = triage_result(["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}])
+    engine, adapter = make_sweep(paths, [triage_effect(plan), dev])
+    # premise before outcome: resolved, and DISJOINT — not merely unequal
+    code_root, project_root = engine.workspace.root.resolve(), paths.project.resolve()
+    assert code_root != project_root
+    assert project_root not in code_root.parents and code_root not in project_root.parents
+    assert engine.run_dir.resolve().is_relative_to(
+        project_root
+    )  # the run dir stays with the PROJECT
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2  # triage, then the one dev session
+    assert (engine.run_dir / "triage.json").is_file()
+    assert _records(engine, "sweep-triage-cache-write-failed") == []
+    assert (engine.run_dir / "bundles" / "fix" / "intent.md").is_file()
+    assert list(elsewhere.rglob("triage.json")) == [] and list(elsewhere.rglob("intent.md")) == []
 
 
 # ------------------------------------------ batched locked ledger adoption (#286/#469)

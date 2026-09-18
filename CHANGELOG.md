@@ -9,6 +9,24 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Accept a session-asserted artifact-only sweep bundle at the dev proof-of-work gate
+  (DW-273). A bundle whose only deliverable lives under a gitignored
+  `implementation_artifacts` (a spec-only erratum) burned every attempt on
+  `no changes in worktree since baseline commit`. The bundle dev session may assert
+  `Artifact only: true` in its `## Auto Run Result` marker (`Artifact only`,
+  `artifact_only` or `Artifact-only` — at least one separator between the words, so
+  the fused `Artifactonly` asserts nothing), and `verify_dev_bundle` —
+  the bundle path alone — then accepts ignored entries under the artifacts dir once
+  the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`. Only
+  artifacts this attempt created or changed count; residue that predates the attempt
+  or cannot be measured refuses the receipt, and a fault taking the attempt's
+  snapshot degrades to `bundle-artifact-baseline-unavailable` with the attempt still
+  driven. Under `scm.isolation = "worktree"` the receipt is refused outright, since
+  the success teardown would remove the accepted artifact with the worktree — the
+  receipt works only for an in-tree ignored dir, so `isolation = "none"` is the one
+  configuration that honours it. The review gate's every-id-`done` check is
+  unchanged.
+
 - Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
   outcome that publishes nothing. An ignored path reads clean, so a project
   that gitignores its `implementation_artifacts` skipped every ledger commit with no
@@ -216,6 +234,9 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Organize decision-answer and publication documentation into navigable operator sections
+  for stale answers, store validation, publication refusals and recovery (DW-240).
+
 - Display scrubbed sweep publication and repeat-stop details in the default Markdown diagnostic report.
 
 - Pin the real-tmux xdist grouping guard at EXACT per-module gated-def counts instead of
@@ -233,7 +254,8 @@ breaking changes may land in a minor release.
 
 - **The deferred-work ledger-read contract is settled repo-wide** (DW-146).
   `deferredwork` now owns both arms as named readers — `read_for_write` (repair/write:
-  absence is `None`, `OSError` propagates, undecodable bytes raise the new
+  absence is `None`, OS metadata/text-read faults raise `LedgerReadFault`
+  with the original `OSError` chained (DW-279), undecodable bytes raise
   `LedgerReadError` with the codec error chained) and `read_for_observation`
   (observation: never raises, degrading to an empty text plus an attributed fault) —
   documented once in the module docstring alongside the advisory pre-lock probes that
@@ -243,9 +265,10 @@ breaking changes may land in a minor release.
   `bmad-loop status` on a ledger that is not valid UTF-8, `sweep --dry-run` refuses
   such a ledger with an attributed `error:` naming the file instead of an anonymous
   traceback (never a fabricated empty listing), and `verify.verify_review_bundle`
-  plus the TUI's deferred pane reach their existing degrade arms for it. `OSError`
-  is unchanged at every repair/write site, where it still propagates untouched;
-  observation sites now degrade on it as well as on undecodable bytes, so an
+  plus the TUI's deferred pane reach their existing degrade arms for it. Pre-lock
+  presence probes, lock acquisition and writes retain raw `OSError`; authoritative
+  reads now distinguish OS faults through `LedgerReadFault` (DW-279).
+  Observation sites degrade on OS faults as well as on undecodable bytes, so an
   `OSError` that used to escape `decisions.pending_missed_decisions` or abort
   `sweep --dry-run` with a bare traceback now yields an empty result or an
   attributed `error:` instead. The observation arm probes with `stat` + `S_ISREG`
@@ -446,6 +469,68 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause existing engine and sweep locked-read repair routes on OS metadata and
+  text-read faults, preserving task phase, pending work and ledger bytes (DW-279).
+  Wrap these faults as `LedgerReadFault(LedgerReadError)` with the original
+  `OSError` chained; retain absence/decode handling, OS refusal attribution, and
+  raw `OSError` from pre-lock probes, lock acquisition and writes.
+
+- Resume a pending review-timeout salvage refile over the preserved product after
+  ledger repair, rerunning verification without rebuilding or new dev/review sessions
+  under either rollback policy; retain ordinary commit gates (DW-278). The latch is
+  set at every salvage's handoff save — the first, fault-free salvage included, not
+  only the repair-pause arm — so a host lost between that save and the commit
+  (notification, a `pre_commit_gate` workflow) replays the salvage with zero sessions
+  instead of restart recovery, which erased the published refile under rollback and
+  paused without it. A sweep bundle has no replay arm and restarts instead; its
+  restart now clears the latch, which otherwise rode onto the replacement attempt and
+  forced a review the fresh attempt never asked for.
+
+- Notify operators when a ledger snapshot outage leaves story-declared deferred
+  closes unapplied, naming the story, every declared ID, and the fault (DW-277).
+
+- Fold a `ValueError` from the publisher target resolve into `target-unreadable` at
+  the three publisher arms — `engine._publication_refusal`, `SweepEngine._commit_ledger`,
+  `decisions.apply_pre_answer` — instead of letting it escape best-effort bookkeeping
+  (DW-275). `Path.resolve()` raises `ValueError` for an embedded NUL, and its
+  `UnicodeEncodeError` subclass for a lone surrogate, on CPython 3.11-3.14 POSIX; the
+  arms caught `(OSError, RuntimeError)` only. The refusal row, journal row and cause
+  are unchanged; the fault text rides in `error`.
+
+- Pause at the story gate under `sweep-bundle-close-refused` with a `-locked` site,
+  instead of `run-crash`, when a deferred-work ledger turns undecodable inside the
+  locked window of one of the sweep's three bundle-close mutator calls — the
+  accepted-dev close, the review-leg reclose, the isolated close carry (DW-280,
+  the DW-259 residual). The task's phase and recorded close intent are left
+  untouched, so `bmad-loop resume` re-drives the close — with no session spent at
+  the accepted-dev close and the carry; through the sweep's restart arm (the
+  bundle re-driven from dev) at the reclose. DW-279 extends the same locked-read
+  route to OS metadata/text-read faults, and the row keeps that classification:
+  `reason="ledger-inaccessible"` with a permissions-or-storage steer for an OS
+  refusal, `reason="ledger-unreadable"` with a UTF-8 steer for undecodable bytes,
+  never the decode token for both; lock/write failures remain raw `OSError`.
+
+- Pause for repair under `ledger-read-refused` with a `-locked` site, instead of
+  `run-crash`, when a deferred-work ledger turns undecodable inside a mutator's own
+  locked window — the harvest's seen-again mark and append, the commit-boundary
+  `closes_deferred:` close, the review-timeout salvage refile, the isolated harvest
+  and close carries (DW-259). `bmad-loop resume` retries the write; the notice now
+  names a declared close. DW-279 extends the same locked-read route to OS
+  metadata/text-read faults; lock/write failures remain raw `OSError`.
+
+- Route a deferred-work ledger read the OS refuses (EACCES, EIO, ELOOP) at the
+  engine's four direct `read_for_write` sites the way DW-231 routes a decode fault
+  (DW-258), instead of ending the run as `run-crash` with the completed session's
+  work on disk. The observation reads (proof-of-work digest, pre-harvest and defer
+  snapshots, both restores) degrade to a typed `_UnreadableLedger` that carries no
+  digest and journal `ledger-read-degraded`; the two publish reads (spec-deferral
+  harvest, isolated carry) journal `ledger-read-refused`, notify `ACTION REQUIRED`
+  (now naming both repairs: valid UTF-8; permissions or storage) and pause without
+  changing the task's phase, so `bmad-loop resume` after the repair replays the
+  recorded session result. The attribution digest of a refused read is the
+  `<unreadable>` sentinel, and `_ledger_changed_since_baseline` treats a sentinel
+  on either side as unknown — never credited — so the engine's own harvest append
+  after the repair cannot pass a session that wrote nothing.
 - Arm the sweep's persisted ledger doubt when the ledger's path cannot be resolved,
   so the cycle's bundles are withheld instead of crashing at the bundle intent's
   own ledger read (DW-260). A git-fault degrade after a successful resolve stays
@@ -490,17 +575,20 @@ breaking changes may land in a minor release.
   isolated carry) journal `ledger-read-refused`, notify `ACTION REQUIRED` and pause
   the run without changing the task's phase, so `bmad-loop resume` retries the write
   instead of crashing as `run-crash` — replaying the recorded session result where
-  one exists (dev and review legs), re-driving the leg otherwise. Residual, recorded
-  as a deferral: `deferredwork` mutators' own locked re-reads and the review-timeout
-  salvage refile still raise. `runs.unreadable_sweep_ledger` gains the
-  `except OSError` arm — its own permissions-or-storage attribution on the
-  `bmad-loop sweep` route the sweep's own stop already gives — a recorded
-  reversal: the arm was written, struck by the DW-204 resolution on scope grounds, and is restored under
+  one exists (dev and review legs), re-driving the leg otherwise. The residual —
+  `deferredwork` mutators' own locked re-reads and the review-timeout salvage refile
+  still raised — was recorded as a deferral and is closed by DW-259 (entry above).
+  `runs.unreadable_sweep_ledger` gains the `except OSError` arm — its own
+  permissions-or-storage attribution on the `bmad-loop sweep`
+  route the sweep's own stop already gives — a recorded reversal: the arm was
+  written, struck by the DW-204 resolution on scope grounds, and is restored under
   DW-234's accepted decision; the TUI's stopgap `except OSError` around the probe is
   removed as dead.
 - Propagate ledger metadata refusals consistently across supported Python versions
-  (DW-221). Treat ELOOP and EBADF as errors; a cyclic ledger symlink now stops a
-  story run before development instead of allowing completion with a close outage.
+  (DW-221). Treat ELOOP and EBADF as errors; a cyclic ledger symlink is a refusal
+  rather than an absence at every `read_for_write` site — routed where the harvest
+  reads (DW-258 above: degraded observation, paused publish); where no publish read
+  is reached, the story completes and a declared close journals the outage.
 - Report refused sweep ledger metadata as `ledger-inaccessible` with error details
   and arm ledger doubt through the existing reader handlers (DW-253).
 - Report directories, FIFOs and sockets at the ledger path as `target-not-a-file`.
@@ -565,6 +653,21 @@ breaking changes may land in a minor release.
 - Probe `<run>/decisions.json`'s metadata with `stat()` rather than `is_file()` so a
   refusal of that probe degrades to `sweep-decisions-reload-failed` and the pending path on
   Python 3.11–3.13 instead of aborting the sweep over a bookkeeping read (DW-248).
+- Degrade a refused SEEDED write-back of `<run>/decisions.json` (a directory planted at
+  the store; a refused or redirected parent — `UnconfinedWriteError`, the #593 confinement
+  refusal) to a new `sweep-decisions-store-write-failed` journal kind naming the adopted
+  ids, and carry on with the answers in memory, instead of aborting an otherwise healthy
+  sweep; the interactive write-back stays bare so a human's answer whose write FAILS still
+  stops the sweep loudly (DW-262).
+- Withhold the seeded `<run>/decisions.json` write-back for the cycle when the store's
+  metadata probe or content read was refused with an `OSError`, journaling
+  `sweep-decisions-store-write-withheld` with the adopted ids whose answers stay in memory,
+  so a transient read refusal no longer replaces a store of valid answers with an empty
+  map; decode faults and a non-object top level still replace the file wholesale (DW-264).
+  In the same cycle the interactive prompt is not put at all
+  (`sweep-decisions-prompt-withheld`, ATTENTION notice): an answer that cannot be
+  persisted is not taken, so a crash can no longer lose a `build` authorization held only
+  in memory; the decisions stay pending for the next interactive sweep.
 - Raise a refused ledger out of the five write-bearing mutators (`mark_done_many`,
   `mark_seen_again_many`, `mark_open_many`, `record_decision`, `archive_closed`) on
   every interpreter: their pre-lock presence guard is `stat()` + `S_ISREG` and the
@@ -587,6 +690,54 @@ breaking changes may land in a minor release.
   instead of silent absence; `ENOENT`/`ENOTDIR` and a non-regular file stay absence,
   and a symlink loop is now an attributed fault at the observation arm as it already
   was at the write arm (DW-254).
+- Probe the ledger's metadata with `stat()` + `S_ISREG` inside `Engine._refuse_gated_story`'s
+  own `try`, so a refused ledger pauses the run at `PAUSE_STORY_GATE` on Python 3.14 too,
+  where `is_file()` suppressed the refusal and the `gate:` hard gate failed OPEN — the story
+  dispatched and `story-gate-unreadable` was unreachable; `ENOENT`/`ENOTDIR` and a
+  non-regular file stay the empty ledger, and a symlink loop at the ledger's name now
+  pauses at the gate instead of passing it (DW-266; also closes DW-276). A configured
+  ledger path the OS cannot encode takes the same pause instead of crashing the run.
+- Same probe inside `validate`'s deferred-ledger read and `verify_review_bundle`'s, so on
+  Python 3.14 a refused ledger is the `deferred.ledger-unreadable` problem rather than a
+  clean deferred check, and the non-fixable "deferred-work ledger unreadable" retry rather
+  than the fixable "entries not marked done" one (DW-267). A configured ledger path the
+  OS cannot encode is that problem and that retry rather than a crash.
+- Take ledger absence from the observation reader's own answer in `sweep --dry-run` and
+  `SweepEngine._non_write_state`, and probe the archive's post-report presence inside its
+  `try`, so a refused ledger is the attributed `error: ... cannot be read` failure, the
+  "holds no entry" fallthrough and the `cannot archive` failure respectively — not "no
+  deferred-work ledger" / "the ledger file is gone" on Python 3.14, and at the two CLI
+  sites not a `PermissionError` traceback on 3.11–3.13 (`_non_write_state` already
+  degraded there). A 0-byte ledger now reads as "no deferred-work ledger" in the dry-run
+  listing (DW-265).
+- Retire the two decision non-write `is_file()` probes that DW-265 left behind: the
+  sweep's interactive decision arm now takes its `sweep-decision-effect-unavailable`
+  sentence from `_non_write_state`, and `bmad-loop decisions`' outcome line asks the
+  observation reader, so a refused ledger reads "holds no entry for this id" and
+  "no decision line was written; ledger state unavailable" respectively on Python 3.14
+  — not "the ledger file is gone" — and the sweep arm no longer ends `run()` with a
+  `PermissionError` on 3.11–3.13. The sweep-arm exposure is the window between the
+  recorder's False answer and the diagnostic probe (a ledger refused at the recorder
+  itself already took the `except` arm). Absence still reads "gone" at both sites, and
+  a present 0-byte ledger reads "holds no entry" at both — the recorder reached it and
+  found nothing — through a presence-aware sibling of the observation reader
+  (`deferredwork.observe_ledger`, `None` text for absence) rather than the text-only
+  reader's empty text, which had made an empty ledger read as gone (DW-281, DW-282).
+- Absorb pathlib's ignored winerrors (21 `ERROR_NOT_READY`, 123 `ERROR_INVALID_NAME`,
+  1921 `ERROR_CANT_RESOLVE_FILENAME`) and the `ValueError` a non-encodable path raises as
+  ABSENCE at the ledger's repair/write reader, the five mutators' pre-lock guard and both
+  legs of the publishable-target guard, through one shared `deferredwork.probe_absence`
+  — the set `is_file()` absorbed before the `stat()` probes replaced it — so a ledger on
+  a disconnected mapped drive or at a lexically invalid Windows path now READS AS ABSENCE
+  (an empty ledger) at every `read_for_write` consumer, as it did before DW-221: the
+  sweep's cycle gates end on `no-open` instead of `ledger-inaccessible`, the resume entry
+  gate admits the resume instead of refusing with the DW-234 storage-fault route, and the
+  mutators take their no-op return. A NUL in the store path no longer escapes the guard
+  as a `ValueError` (the publishers' own `resolve()` arms still raise it on POSIX,
+  unchanged).
+  `EACCES`/`EIO`/`ESTALE`/`EBADF`/`ELOOP` and every other winerror still raise or fold
+  to `target-unreadable`; `commit_paths` keeps reporting the winerrors into uncertainty
+  (DW-256, DW-268).
 
 - Mirror a sweep cycle's ledger-in-doubt verdict onto run state at every site that
   ARMS it — not at the dispatch gate, and not at the decision phase's tail publish,
@@ -646,12 +797,10 @@ breaking changes may land in a minor release.
   naming the file, the decode fault and the repair. Such a resume used to arm the run (pid
   publication, policy re-stamp, `run-resume` row) and only then meet the ledger, stopping
   with no repair route offered from this surface. An absent ledger is not a refusal and
-  story runs are unaffected. `deferredwork.read_for_write` still lets `OSError` propagate,
-  so a ledger read the OS refuses now ends `resume` at the entry probe with a bare
-  `error: [Errno 13] ...` and no repair route, where before it armed the run and stopped
-  through the sweep's own `ledger-inaccessible` steer (DW-204). That propagation reaches
-  the entry probe on Python 3.14 only since DW-221 above, which is what makes the
-  behavior described here uniform across the supported interpreters.
+  story runs are unaffected (DW-204). DW-234 also routes OS refusal at this entry
+  gate with a permissions/storage repair notice; DW-279 preserves that attribution
+  when `read_for_write` wraps the original `OSError` as `LedgerReadFault`. The
+  metadata probe reports refusal on every supported interpreter since DW-221.
 
 - Diagnose a `null` or bare-string member of a migration result's `mapping` list as the
   shape fault it is — `mapping[0] not an object: NoneType` — instead of reporting
@@ -1963,6 +2112,30 @@ decisions` and the TUI decision modal now also catch the state-root failure that
 
 ### Security
 
+- **Confine the sweep's triage-cache write-back and bundle intent write to the project
+  root** (DW-269). `_ensure_triage`'s `<run>/triage{suffix}.json` write-back and
+  `_write_intent`'s `<run>/bundles/<dirname>/intent.md` still went through the plain
+  `atomic_write_text`, which resolves every directory above the file by name, so a link
+  planted at any directory component below the project root (`.bmad-loop/`, `runs/`, the
+  run dir, `bundles/` or `bundles/<dirname>/`) aimed both the staged temp and the
+  published file out of the project — the escape #593 already closed for the sibling
+  `<run>/decisions.json` writes. Both now write through `atomic_write_text_confined`
+  against the project that owns the run dir. The cache write-back's refusal degrades on
+  its existing `sweep-triage-cache-write-failed` row (`UnconfinedWriteError` is an
+  `OSError`), costing the cycle its cache and nothing else; the intent write's refusal
+  propagates exactly as any other write fault there does (DW-243). No new journal kind,
+  pause stage or policy field.
+  A link (or symlink loop) planted at the file's OWN name is no longer followed either:
+  the plain writer resolved it and rewrote its target, the confined writer replaces the
+  name (DW-247's `RuntimeError` loop arm goes with the `resolve()` it guarded), and the
+  file lands `0600` with no mode inherited.
+  On POSIX the `sweep-triage-cache-write-failed` `errors[0]` text now names the bare
+  filename rather than the full path — the replace is dir_fd-relative.
+  Accepted residual, unchanged: the run dir's other writers — the journal, `state.json`,
+  `ATTENTION`, and `_ensure_migration`'s `migrate-manifest.json`/`migrate-result.json` —
+  still go through plain writers. The intent's preceding `mkdir` can still create
+  directories through a redirected parent; a failed cache read can still unlink
+  `triage{suffix}.json` through one. This change confines only the two file writes.
 - **`bmad-loop diagnose` no longer ships a merge record's target branch verbatim** (#640).
   The leak PRE-DATES the re-arm work this section is otherwise about: all three producers
   and the by-name routing shipped in earlier releases, so any dump of a run that merged a

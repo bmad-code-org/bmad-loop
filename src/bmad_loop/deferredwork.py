@@ -47,17 +47,21 @@ the classification recorded at the site:
 
 * REPAIR/WRITE — :func:`read_for_write`. The text decides published bytes: it is
   edited and written back, or it becomes an artifact a session is dispatched on.
-  Absence answers ``None``; ``OSError`` propagates; undecodable bytes raise
-  :class:`LedgerReadError` with the ``UnicodeDecodeError`` chained as
-  ``__cause__``. A repair write must never proceed from bytes nobody could read.
-  That ``OSError``-propagates half is true on every supported interpreter only
-  since DW-221: the arm's ``is_file()`` probe answered False for a refused
-  metadata call on Python 3.14, reporting a refusal as ABSENCE. It probes with
-  ``Path.stat`` + ``S_ISREG`` now — see the function's own docstring.
+  Absence answers ``None``; OS metadata and text-read faults raise
+  :class:`LedgerReadFault`, a :class:`LedgerReadError` subclass (DW-279), with
+  the original ``OSError`` chained as ``__cause__``. Undecodable bytes still
+  raise :class:`LedgerReadError` with the ``UnicodeDecodeError`` chained.
+  A repair write must never proceed from bytes nobody could read. The probe
+  uses ``Path.stat`` + ``S_ISREG`` (DW-221) so a refused metadata call cannot
+  silently become absence on Python 3.14. Pre-lock presence probes, lock
+  acquisition and writes retain their raw ``OSError`` behavior.
 * OBSERVATION — :func:`read_for_observation`. The text informs a report, a hint,
   or a flag, and nothing is written from it. Absence answers ``("", None)``; both
   ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")`` so
   the caller can journal the attributed fault and carry on. It never raises.
+  :func:`observe_ledger` is the same arm with presence kept: ``None`` text for
+  absence, ``""`` for a present 0-byte ledger — for the sites whose sentence
+  says whether the file is there rather than what it holds.
   The helper never raising does not oblige its CALLER to stay quiet: the arm is
   about who WRITES, not about how loud the response is. An observation caller may
   legitimately answer louder than a silent degrade — ``cli._sweep_dry_run`` fails
@@ -90,16 +94,26 @@ snapshot. So a degraded read there journals ``deferred-close-ledger-unavailable`
 writes nothing, and leaves the entries ``open`` — it must NOT raise
 :class:`LedgerReadError`, because nothing at that site was about to be published.
 
-Only the undecodable-bytes case is retyped, and deliberately so.
+DW-146 originally retyped only the undecodable-bytes case, deliberately.
 ``UnicodeDecodeError`` is a ``ValueError``, so a handler spelled ``except
 OSError`` never caught it. Two sites were spelled that way — ``verify``'s
 ``verify_review_bundle`` and ``tui.data.deferred_entries`` — and both had a
 degrade arm sitting right there (a retryable outcome, an unavailable pane) that
 undecodable bytes flew straight past; each now catches both. The other two
 inline observation sites, ``Engine._refuse_gated_story`` and
-``cli._validate_deferred_ledger``, already caught the pair and are unchanged.
-No repair/write site's ``OSError`` behavior changes anywhere IN DW-146's OWN
-DIFF: ``read_for_write`` lets it propagate untouched. (DW-221 later made that
+``cli._validate_deferred_ledger``, already caught the pair and were unchanged by
+DW-146; since DW-266/267 their presence probe is ``stat`` + ``S_ISREG`` inside
+that same ``try`` (as is ``verify_review_bundle``'s), so on Python 3.14 the pair
+is reached for a refused probe too, where ``is_file()`` had answered False and
+read the refusal as an empty ledger. All three now spell the tuple ``(OSError,
+ValueError)``: ``Path.stat`` raises a plain ``ValueError`` for an embedded NUL
+in the configured path and a ``UnicodeEncodeError`` for a lone surrogate — the
+faults :func:`probe_absence` classifies as absence for the WRITE arm — and an
+observation arm attributes them as a fault instead, which is where
+``UnicodeDecodeError`` alone had let them escape the ``try`` uncaught.
+DW-146 left repair/write ``OSError`` propagation untouched; DW-279 now wraps
+metadata and text-read faults as :class:`LedgerReadFault`, so existing locked
+read-refusal handlers can distinguish them from lock and write failures. (DW-221 later made that
 propagation actually HAPPEN on Python 3.14, where the ``is_file()`` probe had
 been reporting a refusal as absence. Eleven call sites that read the reader's
 answer directly — ``append_entries_published``'s preimage read and
@@ -118,11 +132,13 @@ the reader's ``stat`` + ``S_ISREG`` classification and PROPAGATES every
 ``OSError`` that is not absence, and the under-lock guard is the reader's own
 ``None`` answer, so a refused ledger raises out of every mutator on every
 interpreter and an absent one still takes the no-op return without a lock
-(#736). The contract sentence above is what did not
-change.) :class:`LedgerReadError` derives from ``Exception``
-rather than ``OSError`` or ``ValueError`` so that neither those two widened
-handlers nor any future ``except OSError`` silently swallows the one fault this
-contract exists to attribute.
+(#736). DW-279 preserves this absence classification and the pre-lock raw
+``OSError``, wrapping only the authoritative reader's OS faults.)
+:class:`LedgerReadError` derives from ``Exception`` rather than ``OSError`` or
+``ValueError`` so that neither those two widened handlers nor any future
+``except OSError`` silently swallows the one fault this contract exists to
+attribute. Consumers that distinguish OS refusal from decode failure must
+handle its :class:`LedgerReadFault` subclass before the parent class.
 
 The WRITE half of every mutator is typed too. Each locked read->edit->write ends in
 :func:`_publish`, and an ``OSError`` raised there — ``ENOSPC``, ``EROFS``, a failed
@@ -167,11 +183,65 @@ from .platform_util import atomic_write_text, file_lock, neutralize_surrogates
 
 
 class LedgerReadError(Exception):
-    """A repair/write site could not decode the deferred-work ledger.
+    """A repair/write site could not read the deferred-work ledger.
 
     A plain ``Exception`` on purpose (DW-146): an ``OSError`` or ``ValueError``
     subclass would be swallowed by the very ``except`` arms this fault escaped.
     """
+
+
+class LedgerReadFault(LedgerReadError):
+    """The OS refused a repair/write read; the original OSError is chained.
+
+    Kept separate from lock and publication failures, which remain raw OSError.
+    """
+
+
+ABSENCE_WINERRORS: tuple[int, ...] = (21, 123, 1921)
+"""Windows error codes a metadata probe reports for a target that is as good as
+absent — ``ERROR_NOT_READY`` (a disconnected mapped drive), ``ERROR_INVALID_NAME``
+(a lexically invalid path) and ``ERROR_CANT_RESOLVE_FILENAME``. This is EXACTLY
+pathlib's ``_IGNORED_WINERRORS`` (CPython ``pathlib._abc`` on 3.13, ``pathlib`` on
+3.11–3.12), the set ``Path.is_file()`` absorbed before DW-221 replaced it with
+``stat()`` + ``S_ISREG`` at the ledger's readers. ``install._ABSENCE_WINERRORS``
+is the identical tuple, deliberately NOT shared across the layering: the errno
+half of that classification differs (``install._ABSENCE_ERRNOS`` also absorbs
+``EBADF``/``ELOOP``, which stay faults here), so the two stay independent."""
+
+
+def probe_absence(exc: BaseException) -> bool:
+    """Does this fault out of a ``stat()``/``lstat()`` PROBE mean absence?
+
+    The ONE classification behind :func:`read_for_write`, :func:`_ledger_present`
+    and both legs of ``verify.unpublishable_target`` (DW-256/DW-268), so the
+    absorbed set cannot drift between the reader and the guard. True for:
+
+    - ``FileNotFoundError`` / ``NotADirectoryError`` — ``ENOENT``/``ENOTDIR``,
+      the absence DW-221 kept;
+    - an ``OSError`` whose ``winerror`` is in :data:`ABSENCE_WINERRORS` — the
+      test is on ``.winerror`` alone and the subclass is irrelevant (CPython's
+      errmap makes 21 a ``PermissionError`` and 123/1921 ``EINVAL``), which is
+      why this takes the exception rather than being a class tuple: no tuple
+      can select it;
+    - any ``ValueError`` except ``UnicodeDecodeError`` — ``Path.stat`` raises a
+      plain ``ValueError`` for an embedded NUL and a ``UnicodeEncodeError`` for
+      a lone surrogate, both paths the OS cannot encode, which ``is_file()``
+      answered False for on every interpreter.
+
+    Everything else stays a FAULT: ``EACCES``, ``EIO``, ``ESTALE``, ``EBADF``,
+    ``ELOOP`` and an ``OSError`` carrying any other ``winerror`` (5, say) — DW-221's
+    deliberate call for ``EBADF``/``ELOOP``, unchanged. PROBE faults only: a
+    ``UnicodeDecodeError`` out of ``read_text`` is itself a ``ValueError`` and
+    is the ONE ``ValueError`` deliberately NOT absence, so the write arm's
+    decode arm stays :class:`LedgerReadError`. Classification, not disposition — the observation
+    arm and ``decisions.load_pre_answers`` never call this: they attribute or
+    degrade the same ``ValueError`` as a fault, which is their contract.
+    """
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "winerror", None) in ABSENCE_WINERRORS
+    return isinstance(exc, ValueError) and not isinstance(exc, UnicodeDecodeError)
 
 
 class LedgerWriteError(OSError):
@@ -228,47 +298,79 @@ def read_for_write(path: Path) -> str | None:
 
     Absence answers ``None`` — callers that treat an absent ledger like an empty
     one spell that ``or ""`` at the site, which is exact because ``open_ids("")``
-    and ``parse_ledger("")`` already answer identically for both. ``OSError``
-    propagates unchanged. Undecodable bytes become :class:`LedgerReadError`, so a
-    site about to publish bytes escalates instead of writing from a text nobody
-    could read.
+    and ``parse_ledger("")`` already answer identically for both. Nonabsence OS
+    metadata faults and all text-read ``OSError`` failures become
+    :class:`LedgerReadFault` with the original exception as ``__cause__``
+    (DW-279). This includes disappearance or type-change races after the probe.
+    Undecodable bytes remain :class:`LedgerReadError` with a
+    ``UnicodeDecodeError`` cause. A refused read publishes nothing; pre-lock
+    probes, lock acquisition and writes retain their raw ``OSError`` behavior.
 
     Use ``Path.stat`` plus ``S_ISREG`` because ``Path.is_file`` suppresses all
-    OS errors on Python 3.14. ENOENT, ENOTDIR and non-regular files remain
-    absence; every other OS error propagates. ELOOP and EBADF deliberately
-    become errors on older interpreters too, where ``is_file`` suppressed them.
-    The regular-file check also prevents blocking on a FIFO.
+    OS errors on Python 3.14. What the probe's fault MEANS is decided by
+    :func:`probe_absence`, the classification shared with :func:`_ledger_present`
+    and ``verify.unpublishable_target`` (DW-256/DW-268): ENOENT, ENOTDIR,
+    non-regular files, pathlib's ignored winerrors (:data:`ABSENCE_WINERRORS` —
+    21/123/1921, CPython ``pathlib._abc`` on 3.13, ``pathlib`` on 3.11–3.12) and
+    the ``ValueError`` a non-encodable path raises are absence — the set
+    ``is_file()`` absorbed before DW-221 — and every other OS error is wrapped.
+    ELOOP and EBADF deliberately become errors on older interpreters too, where
+    ``is_file`` suppressed them. The regular-file check also prevents blocking
+    on a FIFO.
 
-    Keep the absence classification aligned with ``resolve.build_context``.
-    Its disposition differs: that observation path degrades other OS errors,
-    whereas this repair/write reader must propagate them.
+    ``resolve.build_context`` shares the errno/``S_ISREG`` half of this
+    classification (``ENOENT``/``ENOTDIR``/non-regular are absence there too)
+    and keeps the narrow tuple: the winerror/``ValueError`` widening is the
+    ledger readers' own. Its disposition differs as well: that observation path
+    degrades other OS errors, whereas this repair/write reader raises
+    :class:`LedgerReadFault` from them.
     """
     try:
         st = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return None
+    except (OSError, ValueError) as e:
+        if probe_absence(e):
+            return None
+        if isinstance(e, OSError):
+            raise LedgerReadFault(f"{path} could not be read ({type(e).__name__}: {e})") from e
+        raise
     if not S_ISREG(st.st_mode):
         return None
     try:
         return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise LedgerReadFault(f"{path} could not be read ({type(e).__name__}: {e})") from e
     except UnicodeDecodeError as e:
         raise LedgerReadError(f"{path} is not valid UTF-8: {e}") from e
 
 
-def read_for_observation(path: Path) -> tuple[str, str | None]:
-    """OBSERVATION arm of the ledger-read contract (DW-146).
+def observe_ledger(path: Path) -> tuple[str | None, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146), presence-aware.
 
-    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
-    the empty text every observation site already read for a missing ledger. Both
-    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
-    — attributed, so a caller holding a journal can record WHICH fault it
-    degraded on rather than reporting an empty ledger. Never raises.
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``(None, None)``.
+    A present, readable ledger answers its text — ``""`` for a 0-byte file, which
+    is a ledger that EXISTS and holds no entry, not a missing one. Both ``OSError``
+    and ``UnicodeDecodeError`` degrade to ``(None, "<Class>: <msg>")`` —
+    attributed, so a caller holding a journal can record WHICH fault it degraded
+    on rather than reporting an empty ledger. Never raises.
 
-    Both arms share ONE classification and differ only in DISPOSITION. The
-    probe is ``Path.stat`` + ``S_ISREG``, the same as :func:`read_for_write`'s
-    (DW-221 there, DW-254 here): ``FileNotFoundError``/``NotADirectoryError``
-    and a present non-regular file are absence, and every other ``OSError`` is a
-    fault. The write arm RAISES that fault; this arm attributes and degrades it.
+    This is the reader for a site whose SENTENCE turns on presence — "the ledger
+    file is gone" against "the ledger holds no entry for this id" — because
+    :func:`read_for_observation` folds absence and a 0-byte file into the one
+    empty text, and testing that text's truthiness reported a present, empty
+    ledger as gone (PR #794 review). Presence is taken from the same ``stat`` the
+    read is gated on, never from a second probe beside it: two probes could
+    disagree across a rival's unlink, and a second ``is_file()`` would bring back
+    the Python 3.14 suppression DW-254 retired.
+
+    Both arms share the ``ENOENT``/``ENOTDIR``/non-regular classification and
+    differ in DISPOSITION. The probe is ``Path.stat`` + ``S_ISREG``, the same as
+    :func:`read_for_write`'s (DW-221 there, DW-254 here):
+    ``FileNotFoundError``/``NotADirectoryError`` and a present non-regular file
+    are absence at both. Since DW-256 the write arm ADDITIONALLY absorbs
+    :func:`probe_absence`'s wider set — pathlib's ignored winerrors and a
+    non-encodable path — as absence; this arm keeps attributing those as faults,
+    and every other ``OSError`` is a fault at both. The write arm RAISES its
+    faults; this arm attributes and degrades them.
     Until DW-254 this arm probed with ``is_file()``, which raises ``EACCES`` on
     Python 3.11–3.13 (attributed here, as promised) but suppresses every OS
     error on 3.14 and answers False — so a refused ledger degraded to
@@ -286,24 +388,46 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
         try:
             st = path.stat()
         except (FileNotFoundError, NotADirectoryError):
-            return "", None
+            return None, None
         if not S_ISREG(st.st_mode):
-            return "", None
+            return None, None
         return path.read_text(encoding="utf-8"), None
     except (OSError, UnicodeDecodeError, ValueError) as e:
         # `ValueError`: `Path.stat` raises it for a path the OS cannot encode (an
-        # embedded NUL), which `is_file()` absorbed; never-raises keeps it a fault.
-        return "", f"{e.__class__.__name__}: {e}"
+        # embedded NUL). `probe_absence` ABSORBS that class as absence at the
+        # write arm (DW-256); this arm never calls it — never-raises keeps the
+        # `ValueError` an attributed fault rather than classifying it as absence.
+        return None, f"{e.__class__.__name__}: {e}"
+
+
+def read_for_observation(path: Path) -> tuple[str, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146).
+
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
+    the empty text every observation site already read for a missing ledger. Both
+    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
+    — attributed, so a caller holding a journal can record WHICH fault it
+    degraded on rather than reporting an empty ledger. Never raises.
+
+    The text-only projection of :func:`observe_ledger`: a 0-byte ledger and a
+    missing one answer the same ``""`` here, which is right for every site that
+    parses the text (nothing to parse either way) and wrong for a site whose
+    sentence says whether the FILE is there — those call :func:`observe_ledger`.
+    """
+    text, fault = observe_ledger(path)
+    return text or "", fault
 
 
 def _ledger_present(path: Path) -> bool:
     """Pre-lock presence guard shared by the five write-bearing mutators (DW-255).
 
-    True for a regular file at ``path``; False for absence — ``ENOENT``,
-    ``ENOTDIR``, or a present non-regular file (a directory, a FIFO) — which is
-    exactly the classification :func:`read_for_write` answers ``None`` for.
-    Every other ``OSError`` PROPAGATES: a refused ledger is a fault the caller
-    must see, never "nothing to do".
+    True for a regular file at ``path``; False for absence — whatever
+    :func:`probe_absence` says the probe's fault means (``ENOENT``, ``ENOTDIR``,
+    pathlib's ignored winerrors, a non-encodable path), or a present non-regular
+    file (a directory, a FIFO) — which is exactly the classification
+    :func:`read_for_write` answers ``None`` for. Every other ``OSError``
+    PROPAGATES: a refused ledger is a fault the caller must see, never "nothing
+    to do".
 
     ``Path.is_file()`` was the wrong probe here for the reason it was the wrong
     probe in the reader: on Python 3.14 its body is ``os.path.isfile``, which
@@ -315,18 +439,19 @@ def _ledger_present(path: Path) -> bool:
     DW-221 made: a path that exists and cannot be read is not an absent one.
 
     Only the PRE-LOCK guard uses this; under the lock each mutator branches on
-    the reader's own ``None``. This helper carries its own copy of the absorbed
-    tuple, so the shared classification is pinned by
-    ``test_a_directory_at_the_ledger_is_absence_for_every_mutator`` rather than
-    guaranteed by construction. A ``ValueError`` for a non-encodable path and
-    pathlib's Windows-only absorbed winerrors (21/123/1921) now raise out of
-    this guard exactly as they do out of :func:`read_for_write` — the class
-    DW-256 already records as a pending decision for the reader.
+    the reader's own ``None``. The classification is SHARED with the reader by
+    construction — both ask :func:`probe_absence` (DW-256/DW-268) — so the guard
+    cannot drift from the reader: a ``ValueError`` for a non-encodable path and
+    pathlib's Windows-only absorbed winerrors (21/123/1921) are absence here
+    exactly as they are at :func:`read_for_write`. Until DW-256 this helper
+    carried its own copy of the narrow tuple and both raised out of it.
     """
     try:
         st = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
+    except (OSError, ValueError) as e:
+        if probe_absence(e):
+            return False
+        raise
     return S_ISREG(st.st_mode)
 
 

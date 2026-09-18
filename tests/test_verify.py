@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import hashlib
 import inspect
 import io
@@ -13,6 +14,7 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     OMIT,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
@@ -21,6 +23,7 @@ from conftest import (
     fault_metadata_probe,
     fault_read_text,
     git,
+    ignore_before_commit,
     make_git_noisy,
     nested_repo_root_paths,
     plant_root_markers,
@@ -2817,6 +2820,12 @@ def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
 def make_bundle_task(paths, dw_ids=("DW-1", "DW-2")):
     task = StoryTask(story_key="dw-test-bundle", epic=0, dw_ids=list(dw_ids))
     task.baseline_commit = verify.rev_parse_head(paths.project)
+    # the attempt-start snapshot `SweepEngine._artifact_baseline` stamps beside
+    # the baseline, so the receipt (DW-273) can tell this attempt's residue from
+    # what was already there — `None` where the dir cannot be listed at all
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        paths.repo_root, paths.implementation_artifacts
+    )
     return task
 
 
@@ -2872,6 +2881,478 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     out = verify.verify_dev_bundle(task, project, rj)
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+# ------------------------------------------- the bundle's artifact-only receipt (DW-273)
+
+
+def ignore_artifacts_before_baseline(paths) -> None:
+    """Gitignore the whole `_bmad-output/` tree and COMMIT the rule, so the baseline
+    a task cut afterwards already carries it and everything later written under
+    `implementation_artifacts` is ignored — invisible to the ordinary
+    proof-of-work probe (tracked + untracked-not-ignored) and visible only to a
+    `--ignored` listing. This is the production shape DW-236 hit: a project that
+    keeps its BMAD output out of git."""
+    ignore_before_commit(paths, "_bmad-output/")
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "ignore bmad output")
+
+
+def artifact_only_bundle(paths, *, status: str = "in-review"):
+    """The accepted-receipt tree: `_bmad-output/` ignored before the baseline, and
+    the attempt's ENTIRE residue the bundle spec under `implementation_artifacts`.
+    Returns `(task, spec_path)`; the ordinary probe finds nothing here."""
+    ignore_artifacts_before_baseline(paths)
+    task = make_bundle_task(paths)
+    sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, status, task.baseline_commit)
+    return task, sp
+
+
+def test_verify_dev_bundle_accepts_an_asserted_artifact_only_receipt(project):
+    """DW-273. A bundle whose only permitted deliverable lives under a gitignored
+    `implementation_artifacts` (a spec-only erratum) can never satisfy the ordinary
+    proof-of-work probe. With the strict `artifact_only: True` assertion in the
+    result, the bundle gate consults a directory-scoped `git status --ignored`
+    listing instead and accepts a positive one, carrying the count out.
+
+    Ablation, MEASURED: drop the `artifact_only_dir=` argument from
+    `verify_dev_bundle`'s call into `_verify_shared_gates` and this fails on
+    `assert out.ok` — the retry reason is the verbatim
+    `no changes in worktree since baseline commit`."""
+    task, sp = artifact_only_bundle(project)
+    # a second ignored file, so the count is pinned to FILES: dropping
+    # `--untracked-files=all` collapses the listing to one directory record
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 2
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_refuses_ignored_residue_that_predates_the_attempt(project):
+    """The ownership half of the receipt. Everything under the artifacts dir was
+    already there — with the same fingerprint — when the attempt's snapshot was
+    taken, so an asserted bundle that wrote nothing is refused with the verbatim
+    prefix and a cause naming the listing's size and that none of it is this
+    attempt's; nothing is accepted, no count is carried.
+
+    Ablation, MEASURED: make `_artifact_dir_owned_entries` return every listed
+    entry (drop the baseline comparison) and this passes the gate with
+    `artifact_only_residue == 2`."""
+    task, sp = artifact_only_bundle(project)
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    # re-snapshot AFTER the residue: the attempt "starts" now and writes nothing
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None and len(task.baseline_artifacts) == 2
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists 2 ignored entries, none created or changed by this attempt" in out.reason
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_credits_a_pre_existing_entry_the_attempt_changed(project):
+    """ "Created OR changed": an entry that was in the snapshot but now carries a
+    different fingerprint — rewritten with more bytes, so size differs whatever
+    the filesystem's mtime granularity — is this attempt's, and is the ONLY one
+    counted beside an untouched sibling.
+
+    Ablation: compare presence alone (`rel not in baseline`) and this refuses."""
+    task, sp = artifact_only_bundle(project)
+    sibling = project.implementation_artifacts / "erratum-note.md"
+    sibling.write_text("note\n", encoding="utf-8")
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    # the attempt: append to the spec, leave the sibling alone
+    sp.write_text(sp.read_text(encoding="utf-8") + "\n## Erratum\n\nfixed\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_without_a_snapshot_refuses_the_receipt(project):
+    """No attempt-start snapshot on the task — a pre-upgrade run, a story task
+    handed to the bundle verifier, or a capture that degraded — is uncertainty,
+    and uncertainty keeps the gate strict: refused with a cause naming the missing
+    snapshot (not "outside the tree": the dir IS listable, and the cause says so
+    by not claiming otherwise).
+
+    Ablation: treat a `None` snapshot as `{}` and this accepts with a count of 1."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = None
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "no attempt-start snapshot" in out.reason
+    assert "outside the code tree" not in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_unmeasurable_snapshot_entry_is_never_credited(project):
+    """An entry the snapshot lists as `None` — present at attempt start but
+    `lstat` refused it — is not credited even though it measures now: a
+    fingerprint that could not be taken proves no change. The sibling the attempt
+    genuinely created still counts, alone.
+
+    Ablation: treat a `None` baseline fingerprint as "absent" and the count
+    reads 2."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None
+    [spec_rel] = list(task.baseline_artifacts)
+    task.baseline_artifacts[spec_rel] = None
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_artifact_dir_snapshot_keys_are_paths_git_would_otherwise_quote(project):
+    """The listing is read as `-z` bytes and `os.fsdecode`d, so a non-ASCII
+    artifact name is a key the receipt can `lstat` — under `core.quotePath`'s
+    default the ordinary porcelain would have C-quoted it (`"\\303\\251..."`), a
+    record no fingerprint can be taken of. Pins the decode by the fingerprint:
+    the snapshot carries the file's real size.
+
+    Ablation: read `--porcelain` text lines instead of `-z` bytes and the key
+    is the quoted spelling, whose `lstat` fails and whose fingerprint is `None`."""
+    ignore_artifacts_before_baseline(project)
+    named = project.implementation_artifacts / "r\u00e9sum\u00e9-erratum.md"
+    named.parent.mkdir(parents=True, exist_ok=True)
+    named.write_bytes(b"12345")
+
+    snapshot = verify.artifact_dir_snapshot(project.repo_root, project.implementation_artifacts)
+
+    assert snapshot is not None
+    rel = named.relative_to(project.repo_root).as_posix()
+    assert list(snapshot) == [rel]
+    assert snapshot[rel] is not None and snapshot[rel][1] == 5
+
+
+def test_verify_dev_bundle_unasserted_artifact_only_tree_is_refused(project):
+    """The same tree WITHOUT the assertion keeps the ordinary refusal, reason
+    verbatim — the receipt is never consulted on the session's behalf.
+
+    Ablation: make the receipt unconditional (pass `artifact_only_dir` regardless
+    of `rj`) and this passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp)}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+@pytest.mark.parametrize("loose", ["true", 1, "yes"], ids=["str-true", "int-1", "str-yes"])
+def test_verify_dev_bundle_loose_truthy_artifact_only_is_no_assertion(project, loose):
+    """The selector is `is True` — a truthy string or int never asserts, the same
+    strictness `park_asserted` holds.
+
+    Ablation: change the selector to `bool(rj.get("artifact_only"))` and every
+    parameter passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": loose}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_story_ignores_an_artifact_only_assertion(project):
+    """The receipt fires on the bundle path ONLY. A sprint story result carrying
+    `artifact_only: True` over an artifact-only tree still owes the ordinary diff
+    and no receipt field is set.
+
+    Ablation: pass `artifact_only_dir=paths.implementation_artifacts` from
+    `verify_dev` and this passes the gate."""
+    ignore_artifacts_before_baseline(project)
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_stories_ignores_an_artifact_only_assertion(project):
+    """Stories-mode twin of the sprint row above: `verify_dev_stories` never
+    passes `artifact_only_dir`, so the assertion changes nothing."""
+    ignore_artifacts_before_baseline(project)
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = StoryTask(story_key="1", epic=0)
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    d = spec_folder / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    sp = d / "1-user-auth.md"
+    write_spec(sp, "done", task.baseline_commit)
+    # artifact-only residue the bundle receipt WOULD have counted
+    (project.implementation_artifacts / "spec-1.md").write_text("erratum\n", encoding="utf-8")
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev_stories(
+        task, project, rj, spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_real_change_passes_the_ordinary_arm_without_a_receipt(project):
+    """An asserted bundle that ALSO changed a tracked file passes through the
+    ordinary probe; the receipt is consulted only after a positive "nothing
+    changed", so nothing is accepted on its account and no count is carried."""
+    task, sp = artifact_only_bundle(project)
+    (project.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt(project):
+    """An asserted bundle whose artifacts dir holds NO ignored or untracked entry
+    — the spec is a tracked file outside it and the attempt only flipped its
+    status, which the probe already excludes — is refused with the verbatim
+    prefix and the receipt's cause.
+
+    Ablation: make the receipt accept on `entries is not None` and this passes."""
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_tracked_spec_status_flip_under_a_not_ignored_dir_is_refused(project):
+    """The `bmad-loop init` default layout: `_bmad-output/` is NOT gitignored. An
+    asserted bundle whose only residue is its own TRACKED spec's status flip (a
+    ` M` record the ordinary probe already excludes) must not be accepted on that
+    record — only `!!` entries count.
+
+    Ablation: keep every porcelain record in `_artifact_dir_entries` and this
+    passes the gate with a count of one."""
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec under the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_untracked_spec_under_a_not_ignored_dir_is_refused(project):
+    """Same default layout, the other excluded record: the bundle spec newly
+    written (`??`) under a not-ignored `implementation_artifacts` is what the
+    ordinary probe excludes as the spec path, and it is no receipt either."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` is not a legal filename on Windows")
+def test_verify_dev_bundle_glob_magic_artifacts_dir_is_listed_literally(project):
+    """An ignored artifacts dir whose name carries pathspec magic (`impl*`) is
+    listed as ITSELF — pins `_literal_specs`. Measured: git literal-prefix-matches
+    a `[1]` or `?` name either way, so a bracket or question mark cannot separate
+    the two spellings; a `*` can, because as a glob it sweeps a SIBLING ignored
+    dir (`impl-sibling/`) into the listing and the count reads 2 for a dir
+    holding one file.
+
+    Ablation, MEASURED: hand `rel.as_posix()` to git bare instead of through
+    `_literal_specs` and this fails on the count (2, not 1)."""
+    magic = project.output_folder / "impl*"
+    magic.mkdir(parents=True)
+    sibling = project.output_folder / "impl-sibling"
+    sibling.mkdir()
+    paths = dataclasses.replace(project, implementation_artifacts=magic)
+    ignore_artifacts_before_baseline(paths)
+    (sibling / "unrelated.md").write_text("not this bundle's\n", encoding="utf-8")
+    task = make_bundle_task(paths)
+    sp = magic / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, paths, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_artifacts_dir_at_the_repo_root_refuses_without_git(project, monkeypatch):
+    """An `implementation_artifacts` that IS `repo_root` would make the receipt's
+    pathspec `.`, listing every ignored file in the tree (`.venv`, caches) and
+    accepting the receipt trivially. Refused before any `status --ignored` is
+    spawned, with the same cause as the outside-the-tree shape."""
+    at_root = dataclasses.replace(project, implementation_artifacts=project.project)
+    task = make_bundle_task(at_root)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, at_root, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_artifacts_dir_outside_the_tree_refuses_without_git(
+    project, tmp_path, monkeypatch
+):
+    """An `implementation_artifacts` configured OUTSIDE `repo_root` cannot be listed
+    by git in the code tree, so the receipt is refused before any `status --ignored`
+    is spawned — fail closed, no git call for the receipt."""
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    external = dataclasses.replace(project, implementation_artifacts=outside)
+    task = make_bundle_task(external)
+    sp = outside / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, external, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_refusing_the_listing_refuses_the_receipt(project, monkeypatch):
+    """rc 128 on the receipt's `status --ignored` is a REFUSAL, not an answer: the
+    receipt fails closed onto the ordinary retry with the cause named."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def refuse_listing(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "status" in cmd and "--ignored" in cmd:
+            proc.returncode = 128
+            proc.stderr = "fatal: simulated refusal\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", refuse_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "git refused to list it" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_fault_on_the_listing_escalates(project, monkeypatch):
+    """A `GitError` from the receipt's listing is an environment fault and takes
+    the same `except GitError` the ordinary probe's does: escalate, never retry."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def hang_listing(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            raise verify.GitTimeoutError(f"git status timed out after 1s in {repo}")
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", hang_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "git status timed out" in out.reason
 
 
 def test_verify_dev_bundle_ancestor_baseline_passes(project):
@@ -3858,15 +4339,37 @@ def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_p
     assert ("in-progress" if mode == "review" else "DW-1") in refused.reason
 
 
-def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch, fault):
     """The ledger read is the same TOCTOU class as the spec read beside it — the
-    orchestrator's own `mark_done` rewrites it between the dev and review gates."""
+    orchestrator's own `mark_done` rewrites it between the dev and review gates.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-267). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat` — the Python 3.14 shape, where
+    `is_file()` suppresses every OS error and answers False, so the old
+    `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and the verify retried with the misleading "entries not marked done"
+    verdict, fixable. `metadata-3.13` refuses `stat` alone. Ablation: restore
+    `if ledger.is_file() else ""` and the `metadata-3.14` row reds with "DW-1"
+    in the reason and `fixable=True`."""
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
     write_spec(sp, "done", task.baseline_commit)
     task.spec_file = str(sp)
     bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
-    fault_read_text(monkeypatch, project.deferred_work)  # spec reads fine
+    ledger = project.deferred_work
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)  # spec reads fine
+    else:
+        if fault == "metadata-3.14":
+            real = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     out = verify.verify_review_bundle(task, project, Policy())
     assert not out.ok and out.retryable and not out.fixable
@@ -3894,6 +4397,39 @@ def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
     assert not out.ok and out.retryable and not out.fixable
     assert "deferred-work ledger unreadable" in out.reason
     assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_verify_review_bundle_non_encodable_ledger_path_degrades_to_retry(
+    project, monkeypatch, fault
+):
+    """The `ValueError` class of this arm's `except`, driven at the PROBE rather
+    than the read. `Path.stat` raises a plain `ValueError` for an embedded NUL in
+    the configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and the verify retried, fixable, naming every id; after it the probe
+    raised past a tuple spelled `(OSError, UnicodeDecodeError)` and the verify
+    ABORTED (#794 review). An observation arm attributes a non-encodable path as a
+    fault, never as absence, so the outcome is the SAME shape as the two rows
+    above — retryable, not fixable, naming the fault's class. Injected through
+    `fault_metadata_probe(..., "stat", error=)` from `NUL_PATH_RESOLVE_FAULTS` so
+    both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both
+    rows red with the injected fault escaping `verify_review_bundle`; the
+    `UnicodeDecodeError` row above stays green."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert type(fault).__name__ in out.reason and str(fault) in out.reason
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
@@ -5460,6 +5996,37 @@ def test_path_clean_ignores_stderr_chatter_on_success(project):
     assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
 
 
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt_under_host_noise(project):
+    """`_artifact_dir_entries` inherits `path_clean`'s hazard: `status --porcelain`
+    exits 0 while warning on stderr, so read against a merged stream an EMPTY
+    artifacts dir would list one phantom record and the receipt would be accepted
+    over nothing. Only stdout counts.
+
+    Two guards stand between the chatter and the receipt — the stdout-alone read
+    and the `!! ` record filter — and either alone keeps this row green, so the
+    row pins the PAIR: it holds as long as at least one survives. Ablation,
+    MEASURED: build the entries from `(proc.stdout + proc.stderr)` AND keep every
+    non-blank line, and this fails with the receipt accepted over an empty dir;
+    the merged stream with the filter kept still passes, which is why the filter
+    is not a license to drop the stdout-alone read (the filter is about which
+    RECORDS count, not about which STREAM carries them)."""
+    make_git_noisy(project.project)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
 # ------------------------------------------ probes that return git's text (#442)
 #
 # The rest of the family #441 documented and did not widen to. A real git config
@@ -6143,11 +6710,13 @@ def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, mon
 def test_unpublishable_target_refuses_an_absent_store(project, shape):
     """The store family's absence arm: `lstat` raised `FileNotFoundError`, or
     `NotADirectoryError` for a regular file standing where `.bmad-loop/` should
-    be — the two shapes the leg absorbs as absence (DW-257), matching the
-    reader classification `deferredwork.read_for_write` makes.
+    be — the two errno shapes the leg absorbs as absence (DW-257), through the
+    same `deferredwork.probe_absence` the reader asks (DW-268; the winerror and
+    NUL shapes it also absorbs are
+    `test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults`).
 
     Ablation: return `None` unconditionally from the store arm and both rows red;
-    drop `NotADirectoryError` from the absorbed tuple and `enotdir-parent` reds
+    drop `NotADirectoryError` from `probe_absence` and `enotdir-parent` reds
     with `target-unreadable`."""
     store = project.project / ".bmad-loop" / "decisions.json"
     if shape == "enoent":
@@ -6333,6 +6902,83 @@ def test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_inte
 
     assert cause == "target-unreadable"
     assert error is not None and "Permission denied" in error
+
+
+ABSORBED_PROBE_FAULTS = ["winerror-21", "winerror-123", "winerror-1921", "nul-path"]
+"""The four probe-fault shapes `deferredwork.probe_absence` absorbs beyond
+`ENOENT`/`ENOTDIR` (DW-256/DW-268) — pathlib's `_IGNORED_WINERRORS` and the
+`ValueError` a non-encodable path raises; the twin of the table in
+`tests/test_deferredwork.py`."""
+
+
+def _absorb_probe_fault(monkeypatch, target: Path, shape: str, probe: str) -> Path:
+    """Install shape `shape` at `target`'s `probe` and return the path to hand the
+    guard. Winerrors are simulated the `tests/test_install.py` way — an
+    `OSError(errno.EIO)` with `.winerror` set, for this path only, on every
+    platform; `nul-path` swaps the target for a sibling with a REAL embedded NUL,
+    which the probe refuses with `ValueError` everywhere, so nothing is patched."""
+    if shape == "nul-path":
+        return Path(str(target.parent) + "/bad\0" + target.name)
+    fault = OSError(errno.EIO, "metadata refused", str(target))
+    fault.winerror = int(shape.removeprefix("winerror-"))
+    real = getattr(Path, probe)
+
+    def faulting(self, *a, **kw):
+        if self == target:
+            raise fault
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, faulting)
+    return target
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-268 at the store leg. DW-257's one `lstat()` kept only
+    `FileNotFoundError`/`NotADirectoryError` as absence, but the
+    `is_file()`/`is_symlink()`/`exists()` probes it replaced had also absorbed
+    pathlib's `_IGNORED_WINERRORS` (21/123/1921) and the `ValueError` a
+    non-encodable path raises — so a store on a disconnected mapped drive folded
+    to `target-unreadable` where the old probes said absent, and a NUL in the
+    store path ESCAPED as a `ValueError` past every caller's `except OSError`.
+    The leg asks `deferredwork.probe_absence` now, the same classification the
+    ledger's reader makes, so all four shapes are `target-absent`; `EACCES` is
+    still `target-unreadable`
+    (`test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_interpreter`).
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` (with the
+    `except OSError` fold below it) at the store leg and the winerror rows red
+    with `target-unreadable`, the `nul-path` row with `ValueError` escaping."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    target = _absorb_probe_fault(monkeypatch, store, shape, "lstat")
+
+    assert verify.unpublishable_target(target, "store") == ("target-absent", None)
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_ledger_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-256/DW-268 at the ledger leg. The reader answers `None` for these four
+    shapes now (`test_read_for_write_absorbs_pathlibs_ignored_probe_faults`), and
+    the leg's `stat()` re-probe — which discriminates `target-absent` from
+    `target-not-a-file` — asks the SAME `probe_absence`, so the answer is
+    `target-absent`, inherited, and never an escaping `ValueError`: the enclosing
+    `except OSError` would not catch one, and this is a best-effort publisher.
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` at the
+    re-probe alone and the winerror rows red with `target-unreadable` (the
+    re-raised `OSError` lands in the fold), the `nul-path` row with `ValueError`
+    escaping; restore it at `read_for_write` instead and every row reds the
+    same way one step earlier."""
+    write_ledger(project, {"DW-1": "open"})
+    target = _absorb_probe_fault(monkeypatch, project.deferred_work, shape, "stat")
+
+    assert verify.unpublishable_target(target, "ledger") == ("target-absent", None)
 
 
 @pytest.mark.parametrize("staged", [False, True])

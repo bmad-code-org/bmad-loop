@@ -212,6 +212,32 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     return str(root / path)
 
 
+def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
+    """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
+    path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
+    key, or a shape a hand edit mangled — reads as "no snapshot", on which the
+    artifact-only receipt refuses rather than guesses."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int] | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            out[str(key)] = None
+        elif (
+            isinstance(value, list)
+            and len(value) == 2
+            # `bool` is an `int`; a `[true, 42]` is a mangled record, not a fingerprint
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        ):
+            out[str(key)] = [value[0], value[1]]
+        else:
+            # Never `int(...)` a value here: a `["bad", 42]` or `[null, 42]` must
+            # read as "no snapshot", not raise out of `from_dict` and keep the
+            # whole run state — and `bmad-loop resume` — from loading.
+            return None
+    return out
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -255,16 +281,32 @@ class StoryTask:
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
     # done spec); otherwise it skips it.
     followup_review_recommended: bool = False
+    # A timeout salvage verified this product but could not refile its follow-up
+    # over an unreadable ledger. Resume retries that current review's salvage,
+    # including authoritative verification, instead of rebuilding the attempt.
+    salvage_refile_pending: bool = False
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Attempt-start fingerprints (`[st_mtime_ns, st_size]`, or None when the entry
+    # was listed but could not be measured) of every IGNORED entry under
+    # `implementation_artifacts`, keyed by repo-relative posix path — the baseline
+    # the bundle path's artifact-only receipt (DW-273) measures ownership against,
+    # since ignored paths have no git baseline of their own. Stamped beside the
+    # pair above at every genuinely new attempt, cleared with them. None = no
+    # snapshot (a story task, a pre-upgrade run, or a capture that degraded), on
+    # which the receipt refuses.
+    baseline_artifacts: dict[str, list[int] | None] | None = None
     # Deferred-work bookkeeping is persisted before its readers land so an older
     # state.json remains resumable throughout the forward-port.  The nullable
     # snapshot text and its captured flag are deliberately separate: None means
     # "no ledger existed", while False means "no snapshot was taken".
+    # A `_digest_of` sha256, or `engine._UNREADABLE_LEDGER_DIGEST` when the
+    # baseline read was refused by the OS (DW-258): still a `str`, but not a
+    # digest — `engine._ledger_changed_since_baseline` reads it as "unknown".
     baseline_ledger_digest: str | None = None
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
@@ -452,8 +494,10 @@ class StoryTask:
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
+            "salvage_refile_pending": self.salvage_refile_pending,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_artifacts": self.baseline_artifacts,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
@@ -570,6 +614,7 @@ class StoryTask:
         self.release_spec_paths_from_mount()
         self.baseline_commit = None
         self.baseline_untracked = None
+        self.baseline_artifacts = None
 
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
@@ -650,12 +695,14 @@ class StoryTask:
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
+            salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_artifacts=_baseline_artifacts_from(d.get("baseline_artifacts")),
             baseline_ledger_digest=(
                 str(d.get("baseline_ledger_digest"))
                 if d.get("baseline_ledger_digest") is not None
@@ -1085,6 +1132,28 @@ class VerifyOutcome:
     # only what the waived gate would have found. `True` / `False` / `None` have
     # the same no-diff / diff / unknown meanings as `park_zero_diff`.
     plan_halt_zero_diff: bool | None = None
+    # A deferred-work BUNDLE's artifact-only receipt (DW-273). `True` when the
+    # bundle path's proof-of-work gate found nothing it counts, the session's
+    # synthesized result asserted `artifact_only: true` (the strict boolean
+    # `devcontract` mints from the current session's genuine marker, exactly as
+    # `park_asserted`), and a directory-scoped `git status --ignored` listing of
+    # the configured `implementation_artifacts` dir held IGNORED entries (`!!`
+    # records — the tracked and untracked ones are what the probe already
+    # measured). Only
+    # `verify.verify_dev_bundle` sets it; the sprint and stories legs never
+    # consult the receipt, so on their outcomes it is always `False`.
+    #
+    # It is a receipt, not a waiver: the gate still ran and positively answered
+    # "nothing changed" before the receipt was consulted, and what the receipt
+    # proves is bounded — ignored paths carry no baseline, so the listing shows
+    # only that the artifacts dir holds session-reachable content under the code
+    # tree, never WHICH entry this session wrote. The assertion is the
+    # load-bearing half, as it is for a park.
+    artifact_only_accepted: bool = False
+    # The number of ignored entries the receipt's listing held, carried to the journal
+    # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
+    # accepted, including on every non-bundle leg.
+    artifact_only_residue: int | None = None
 
     @classmethod
     def passed(
@@ -1093,12 +1162,16 @@ class VerifyOutcome:
         park_proof_skipped: bool = False,
         park_zero_diff: bool | None = None,
         plan_halt_zero_diff: bool | None = None,
+        artifact_only_accepted: bool = False,
+        artifact_only_residue: int | None = None,
     ) -> "VerifyOutcome":
         return cls(
             ok=True,
             park_proof_skipped=park_proof_skipped,
             park_zero_diff=park_zero_diff,
             plan_halt_zero_diff=plan_halt_zero_diff,
+            artifact_only_accepted=artifact_only_accepted,
+            artifact_only_residue=artifact_only_residue,
         )
 
     @classmethod

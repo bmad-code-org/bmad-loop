@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     _OK,
+    NUL_PATH_RESOLVE_FAULTS,
     UNDECODABLE_LEDGER,
     _exists_run,
     _file_exists_cmd,
@@ -24,7 +25,9 @@ from conftest import (
     _touch_run,
     attach_profile,
     crash_at_merge_back,
+    fault_locked_ledger_read,
     fault_metadata_probe,
+    fault_read_text,
     git,
     ignore_before_commit,
     install_build_auto_skill,
@@ -40,7 +43,7 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine, _story_label_stripped
+from bmad_loop.engine import Engine, _publication_refusal, _story_label_stripped
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -2178,6 +2181,49 @@ def test_carry_harvest_over_undecodable_main_ledger_pauses_before_the_latch(proj
     assert "`bmad-loop resume test-run`" in attention
 
 
+def test_carry_harvest_over_os_refused_main_ledger_pauses_before_the_latch(project, monkeypatch):
+    """The PUBLISH arm at the isolated carry for a read the OS refuses (DW-258),
+    the EACCES twin of the DW-231 row above. The main ledger the unit's findings
+    are to be re-filed into raises `PermissionError`, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry` naming `PermissionError`, an `ACTION REQUIRED` notice naming
+    the ledger — BEFORE `harvest_carry_commit_pending` is latched: nothing records
+    a commit obligation, nothing is written, no `harvest-carried` row.
+
+    Injected with `conftest.fault_read_text` (selective, never `chmod`; `read_bytes`
+    is untouched so the bytes can be asserted unchanged).
+
+    Ablation: narrow the carry's `except` tuple back to `LedgerReadError` and this
+    reds with `PermissionError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    before = b"# Deferred Work\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(before)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == before  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert refused["ledger"] == str(project.deferred_work)
+    assert "PermissionError" in refused["error"] and str(project.deferred_work) in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
 def test_done_unit_carry_over_undecodable_main_ledger_pauses_and_resume_recarries(project):
     """The carry pause on a FULL isolated run, and the recovery it is shaped for
     (DW-231). The unit's dev session records a finding and files it in the unit's
@@ -2527,6 +2573,82 @@ def test_carry_harvest_keeps_its_latch_when_the_ledger_becomes_unreadable(projec
     assert "harvest-carried" not in journal_kinds(engine)
 
 
+@pytest.mark.parametrize("family", ["ledger", "store"])
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_publication_refusal_folds_a_value_error_from_the_resolve(
+    project, monkeypatch, fault, family
+):
+    """The `ValueError` CLASS of `_publication_refusal`'s resolve `except` tuple,
+    driven on its own (DW-275), at the pure-helper layer four of the five publishers
+    fold through.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL (`lstat: embedded null
+    character in path` on 3.12+; `embedded null byte` on 3.11) and
+    `UnicodeEncodeError` (a `ValueError` subclass) for a lone surrogate outside the
+    `surrogateescape` range on CPython 3.11-3.14 POSIX, and the
+    two-class tuple that stood here let both escape best-effort bookkeeping whose
+    whole degrade discipline exists to prevent exactly that. The fold lands on
+    `target-unreadable` with `str(e)` as its text — the same transient cause the
+    `OSError`/`RuntimeError` classes take, for the reason the docstring gives: a
+    caller reads the cause alone and never asks which call produced it.
+
+    INJECTED through `refuse_to_resolve(..., error=)` rather than driven with a real
+    NUL so the row holds on every supported interpreter and platform:
+    `ntpath.realpath` tolerates a NUL, so neither is a cross-platform driver at the
+    publisher. The real-driver sibling below shows both stand-ins match what
+    `Path.resolve()` actually raises on POSIX.
+    Parametrized over both families for the SHAPE only: the fold sits ahead of the
+    family leg, so `family` never reaches anything on this arm — which is what
+    `never` grades.
+
+    Ablation, per class: delete `ValueError` ALONE from `_publication_refusal`'s
+    `except (OSError, RuntimeError, ValueError)` and both rows red with the injected
+    fault escaping the helper; the `OSError`/`RuntimeError` rows in
+    `tests/test_sweep.py` and `tests/test_cli.py` stay green, which is why a per-class
+    row is the only honest one for a multi-class handler."""
+    ledger = project.deferred_work
+    refuse_to_resolve(monkeypatch, ledger, error=fault)
+
+    def never(*_a, **_k):
+        raise AssertionError("the family leg was asked about an unresolvable target")
+
+    monkeypatch.setattr(verify, "unpublishable_target", never)
+
+    assert _publication_refusal(ledger, family) == ("target-unreadable", str(fault))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ntpath.realpath tolerates a NUL")
+@pytest.mark.parametrize(
+    "tail,fragment",
+    [
+        pytest.param("\0x", "embedded null", id="nul"),
+        pytest.param("\ud800", "surrogates not allowed", id="lone-surrogate"),
+    ],
+)
+def test_publication_refusal_folds_a_real_nul_path_on_posix(project, tail, fragment):
+    """The real faults behind the two injected rows above, on the one platform where
+    they ARE drivers (DW-275): a ledger path with an embedded NUL, and one with a lone
+    surrogate outside the `surrogateescape` range, no stub, each fold into
+    `target-unreadable` carrying CPython's own text — which is what shows the
+    `NUL_PATH_RESOLVE_FAULTS` stand-ins match what `Path.resolve()` actually raises.
+
+    The NUL leg asserts the shared `embedded null` fragment rather than the full
+    wording because CPython 3.11 says `embedded null byte` where 3.12+ says
+    `lstat: embedded null character in path`, and 3.11 is the `requires-python`
+    floor and a CI leg.
+
+    Ablation: delete `ValueError` from `_publication_refusal`'s resolve arm and both
+    legs red with the fault escaping the helper."""
+    ledger = Path(f"{project.deferred_work}{tail}")
+
+    refusal = _publication_refusal(ledger, "ledger")
+
+    assert refusal is not None
+    cause, error = refusal
+    assert cause == "target-unreadable"
+    assert error is not None and fragment in error
+
+
 @pytest.mark.parametrize(
     "fault,cause,fragment",
     [
@@ -2589,6 +2711,132 @@ def test_carry_story_deferred_closes_refuses_a_durable_unpublishable_ledger(
         assert git(project.project, "show", f"HEAD:{ledger_rel}").encode() != UNDECODABLE_LEDGER
     # the `-carried` row still lands: the flips are on disk, only the commit is not
     assert [e["dw_ids"] for e in _rows(engine, "story-deferred-close-carried")] == [["DW-1"]]
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_carry_harvest_over_a_main_ledger_corrupted_under_the_lock_pauses(
+    project, monkeypatch, fault_mode
+):
+    """The writer's own locked re-read at the isolated harvest carry (DW-259).
+    The carry's pre-read succeeds. Decode rows corrupt main's bytes before
+    `append_entries`; OS rows keep them valid and refuse metadata/text access
+    under its real lock. The mutator raises ahead of any write.
+    The engine routes it exactly as the pre-read's fault — `RunPaused` at
+    `escalation`, `ledger-read-refused` site `harvest-carry-append-locked`, no
+    `harvest-carried`, main's bytes untouched — rather than letting a bare
+    `LedgerReadError` end the run. The commit latch was already set by then,
+    which is fine: a replay retries the append and the latched commit with it.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `append_entries` and this reds with `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    phase = task.phase
+    if fault_mode == "decode":
+        expected = UNDECODABLE_LEDGER
+        real_append = deferredwork.append_entries
+
+        def corrupt_then_append(ledger, *a, **kw):
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+            return real_append(ledger, *a, **kw)
+
+        monkeypatch.setattr(deferredwork, "append_entries", corrupt_then_append)
+    else:
+        expected = fault_locked_ledger_read(monkeypatch, project.deferred_work, fault_mode)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.phase == task.phase == phase
+    assert saved.harvested_deferrals == [_harvest_record()]
+    assert saved.harvest_carry_commit_pending
+    assert task.harvest_carry_commit_pending is True  # latched ahead of the write; a replay retries
+    assert project.deferred_work.read_bytes() == expected  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry-append-locked"
+    assert (
+        refused["ledger"] == str(project.deferred_work)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_carry_story_deferred_closes_over_an_undecodable_main_ledger_pauses(
+    project, monkeypatch, fault_mode
+):
+    """The close carry has no pre-read of its own: `mark_done_many_reopenable`'s
+    locked `read_for_write` is the only authoritative read. Decode rows corrupt
+    main's bytes before the mutator (DW-259); OS rows keep them valid and refuse
+    metadata/text access under its real lock (DW-279). Either raises ahead of
+    any write. The engine routes
+    it as a repair pause — `RunPaused` at `escalation`, `ledger-read-refused`
+    site `story-close-carry-locked`, no `story-deferred-close-carried`, no
+    commit, main's bytes untouched — rather than a bare `LedgerReadError`. A
+    pause leaves `isolated_ledger_carried` False, so
+    `_replay_unlatched_ledger_carries` re-runs the whole carry hook on resume.
+
+    Ablation: delete the `except LedgerReadError` around the close carry's
+    `mark_done_many_reopenable` and this reds with `LedgerReadError` escaping
+    the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, story_closes_intended=["DW-1"])
+    engine.state.tasks[task.story_key] = task
+    phase = task.phase
+    if fault_mode == "decode":
+        expected = UNDECODABLE_LEDGER
+        real_mark = deferredwork.mark_done_many_reopenable
+
+        def corrupt_then_mark(ledger, *a, **kw):
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+            return real_mark(ledger, *a, **kw)
+
+        monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", corrupt_then_mark)
+    else:
+        expected = fault_locked_ledger_read(monkeypatch, project.deferred_work, fault_mode)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_story_deferred_closes(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.phase == task.phase == phase
+    assert saved.story_closes_intended == ["DW-1"]
+    assert not saved.isolated_ledger_carried
+    assert task.isolated_ledger_carried is False
+    assert project.deferred_work.read_bytes() == expected  # nothing written
+    assert _rows(engine, "story-deferred-close-carried") == []
+    assert _rows(engine, "story-deferred-close-carry-refused") == []
+    assert git(project.project, "rev-parse", "HEAD") == head  # no commit
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "story-close-carry-locked"
+    assert (
+        refused["ledger"] == str(project.deferred_work)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
 
 
 def _in_place_policy(*, limits: LimitsPolicy | None = None):

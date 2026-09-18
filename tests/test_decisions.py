@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
     fault_metadata_probe,
     fault_read_text,
     git,
@@ -1269,6 +1270,56 @@ def test_apply_pre_answer_folds_a_resolve_fault_into_target_unreadable(project, 
     assert f"target-unreadable: {refusal.error}" in note
 
 
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_apply_pre_answer_folds_a_value_error_from_the_resolve_into_target_unreadable(
+    project, monkeypatch, fault
+):
+    """The `ValueError` CLASS of GATE TWO's resolve `except` tuple, driven on its own
+    (DW-275), in the shape of the row above.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL and `UnicodeEncodeError`
+    (a `ValueError` subclass) for a lone surrogate on CPython 3.11-3.14 POSIX. This
+    publisher has no journal to route that to, so the refusal is the fault's only
+    route out: `target-unreadable` with the fault's text, `recorded` True, git never
+    entered, and the text on the note where a bare cause would read like a plain
+    absence. Injected AFTER the ledger write through `refuse_to_resolve(...,
+    error=)` for the reasons the row above states, and from
+    `NUL_PATH_RESOLVE_FAULTS` so the row holds on every interpreter and platform.
+
+    Ablation, per class: delete `ValueError` ALONE from GATE TWO's
+    `except (OSError, RuntimeError, ValueError)` in `apply_pre_answer` and both rows
+    red with the injected fault propagating out; the `OSError` row above stays
+    green."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    real_record = decisions.deferredwork.record_decision
+
+    def record_then_break(*a, **kw):
+        out = real_record(*a, **kw)
+        refuse_to_resolve(monkeypatch, project.deferred_work, error=fault)
+        return out
+
+    monkeypatch.setattr(decisions.deferredwork, "record_decision", record_then_break)
+
+    def never(*_a, **_k):
+        raise AssertionError("an unresolvable operand reached git")
+
+    monkeypatch.setattr(decisions.verify, "commit_paths", never)
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == (
+        decisions.PublishRefusal(
+            file="deferred-work.md", cause="target-unreadable", error=str(fault)
+        ),
+    )
+    note = result.publish_note()
+    assert note is not None and note.startswith("not committed to git: deferred-work.md (")
+    assert f"target-unreadable: {fault}" in note
+
+
 def test_apply_pre_answer_commit_false_writes_on_disk_and_refuses_nothing(project):
     """`commit=False` short-circuits ahead of both gates: no git, no refusals, and
     the on-disk writes are unchanged.
@@ -2201,3 +2252,37 @@ def test_a_store_noop_succeeds_when_no_state_root_is_derivable(project, monkeypa
         decisions.record_pre_answer(project.project, "DW-9", _OPT, date="2026-06-13")
 
     assert store.read_bytes() == before  # the real write raised rather than writing unlocked
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_pre_answer_locked_read_fault_preserves_ledger_store_and_head(
+    project, monkeypatch, operation
+):
+    """DW-279: a refused decision read reaches the grouped parent handlers.
+
+    Neither the answer store nor git may publish after the authoritative read
+    refuses. Removing the corresponding read wrap fails the named-class assert.
+    """
+    from conftest import fault_locked_ledger_read
+
+    from bmad_loop.sweep import Decision
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    opt = DecisionOption(key="1", label="Build", effect="build", intent="fix it")
+    decision = Decision(
+        id="DW-1", question="build?", context="", options=(opt,), recommendation="1"
+    )
+    before = fault_locked_ledger_read(monkeypatch, project.deferred_work, operation)
+    head = _git(project, "rev-parse", "HEAD")
+    store = decisions.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_bytes(b"{}\n")  # bytes: write_text would CRLF on win32
+
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        decisions.apply_pre_answer(project.project, decision, opt, date="2026-09-12")
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert project.deferred_work.read_bytes() == before
+    assert store.read_bytes() == b"{}\n"
+    assert _git(project, "rev-parse", "HEAD") == head

@@ -1675,14 +1675,11 @@ class SweepEngine(Engine):
         `open_ids("")` and `open_ids(<absent>)` say the same thing about a ledger
         nobody is writing — or `("", token)` after journaling the refusal.
 
-        Both fault classes degrade, and they degrade to DIFFERENT tokens.
-        Undecodable bytes (`LedgerReadError`, a plain `Exception` on purpose, so no
-        `except OSError` upstream would ever see it) mean a human has to edit the
-        file; an `OSError` means the OS refused the read and the repair is
-        permissions or storage. `read_for_write` documents that `OSError`
-        propagates and that contract is UNCHANGED for its callers elsewhere — what
-        changed is that this caller catches it, the same widened shape
-        `verify.unpublishable_target` already takes.
+        Both fault classes degrade to different tokens. Undecodable bytes
+        (`LedgerReadError`) require a file repair; an OS refusal requires a
+        permissions or storage repair. The `LedgerReadFault` subclass wraps OS
+        read faults (DW-279) and must be caught before its decode parent, retaining
+        the original OS attribution and `ledger-inaccessible` token.
 
         Bare, either fault ended a `--repeat` run as CRASHED at the top of cycle
         N+1, throwing away the report for cycles 1..N that had already completed.
@@ -1693,15 +1690,9 @@ class SweepEngine(Engine):
             # REPAIR/WRITE (DW-146): this text drives migration and the whole
             # write-bearing cycle below it.
             return (deferredwork.read_for_write(ledger) or "", None)
-        except deferredwork.LedgerReadError as e:
-            self.journal.append(
-                "sweep-cycle-ledger-refused",
-                ledger=str(ledger),
-                reason="ledger-unreadable",
-                error=str(e),
-            )
-            return ("", "ledger-unreadable")
-        except OSError as e:
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
             # The class NAME is kept beside the message because the message alone
             # ("[Errno 13] Permission denied") does not say what kind of refusal it
             # was, and this whole field is dropped from a scrubbed dump anyway —
@@ -1713,6 +1704,14 @@ class SweepEngine(Engine):
                 error=f"{e.__class__.__name__}: {e}",
             )
             return ("", "ledger-inaccessible")
+        except deferredwork.LedgerReadError as e:
+            self.journal.append(
+                "sweep-cycle-ledger-refused",
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            return ("", "ledger-unreadable")
 
     def _stop_on_ledger_fault(
         self,
@@ -2531,14 +2530,16 @@ class SweepEngine(Engine):
         retired would otherwise take the human's pre-answer with it, committed. It
         carries nothing: the latch it read is already `_loop`-bound.
 
-        `_close_resolved` and `_decisions_phase` also catch `OSError` around
-        `mark_done_many` and `record_decision`, covering both their internal reads
-        and lock failures. The DW-167 re-apply gate catches its direct read too:
+        `_close_resolved` and `_decisions_phase` also catch `OSError` and
+        `LedgerReadFault` around `mark_done_many` and `record_decision`, covering
+        OS read, lock and write failures. The DW-167 re-apply gate catches its
+        direct read too:
         a fault prevents repairing a stored close, leaving the entry open for a
         later cycle. Here the read protects the human's stored answers, so its
         refusal also carries to `_loop`; `_read_cycle_ledger` instead stops before
-        starting work. `read_for_write` itself remains unchanged and propagates
-        `OSError` to every caller that does not catch it.
+        starting work. `read_for_write` wraps OS metadata and text-read faults as
+        `LedgerReadFault` (DW-279); pre-lock probes, lock and write failures
+        remain raw `OSError`.
         """
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
@@ -2547,6 +2548,30 @@ class SweepEngine(Engine):
         # and pruning from bytes nobody could read would drop live answers.
         try:
             text = deferredwork.read_for_write(ledger)
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # THE OS REFUSED THE READ (DW-197) — EACCES, EIO, a vanished mount. The
+            # ledger may be perfectly well-formed; nobody here can tell, and that is
+            # precisely the undecodable case's own argument: the open set is the
+            # KEEP list for a store write, so a ledger this process cannot read is
+            # unknown open work, not zero of it. Same kind and same `reason`-is-a-
+            # fixed-token shape as the two arms around it, under a third token,
+            # with the errno text in `error` (a `_JOURNAL_DROP_FIELDS` field). The
+            # class name rides beside the message because "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-preanswer-prune-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            # ...and CARRIED, for the same reason as the decode arm below: the repeat boundary
+            # commits the ledger, and cycle N+1's own read meets the same refusal.
+            # Its own latch rather than the decode latch, because the two stops report
+            # different closed tokens — see the declaration in `__init__`.
+            self._prune_ledger_inaccessible = True
+            return
         except deferredwork.LedgerReadError as e:
             # UNDECODABLE is refused for the same reason absence is (DW-182), and
             # under the same kind: the open set is the KEEP list for a store write,
@@ -2569,28 +2594,6 @@ class SweepEngine(Engine):
             # state, not `state` — see the declaration in `__init__`. The absence
             # arm below sets nothing: an absent ledger ends the next cycle cleanly.
             self._prune_ledger_unreadable = True
-            return
-        except OSError as e:
-            # THE OS REFUSED THE READ (DW-197) — EACCES, EIO, a vanished mount. The
-            # ledger may be perfectly well-formed; nobody here can tell, and that is
-            # precisely the undecodable case's own argument: the open set is the
-            # KEEP list for a store write, so a ledger this process cannot read is
-            # unknown open work, not zero of it. Same kind and same `reason`-is-a-
-            # fixed-token shape as the two arms around it, under a third token,
-            # with the errno text in `error` (a `_JOURNAL_DROP_FIELDS` field). The
-            # class name rides beside the message because "[Errno 13] Permission
-            # denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-preanswer-prune-refused",
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
-            )
-            # ...and CARRIED, for the reason the arm above is: the repeat boundary
-            # commits the ledger, and cycle N+1's own read meets the same refusal.
-            # Its own latch rather than the one above, because the two stops report
-            # different closed tokens — see the declaration in `__init__`.
-            self._prune_ledger_inaccessible = True
             return
         # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
         # every observation-shaped caller uses is exact for them because
@@ -3011,7 +3014,16 @@ class SweepEngine(Engine):
         post-session window still restarts rather than replaying its recorded
         result. Lifting that is a resume-fidelity change of its own. The
         COMMITTING window IS recovered, though — same as the base engine's
-        resume-commit arm (#115).
+        resume-commit arm (#115). The base's `_pending_salvage_session` replay
+        (DW-278) is not mirrored either: a bundle whose review-timeout salvage
+        latched `salvage_refile_pending` — at its handoff save, or at the
+        refile's repair pause — restarts here like every other post-session
+        window, so the restart arm below CLEARS the latch as the base restart
+        arm does (#794 review). Left set, the abandoned product's latch would
+        ride onto the replacement attempt and force `_review_and_commit` down
+        the review path it exists to bypass for a latched replay. Mirroring the
+        replay is the same resume-fidelity change as the `_resumable_session`
+        arm and is deferred with it.
 
         The reset tail below deliberately does NOT zero `attempt` or re-arm the
         session-id generation: like the base restart arm it mirrors, a plain
@@ -3074,6 +3086,11 @@ class SweepEngine(Engine):
             # Live in-place policy applies to the replacement attempt, not to an
             # incomplete attempt's mount-owned baselines, paths, and claims.
             self._release_orphaned_mount(task)
+        # Abandoning this product's salvage retry: the replacement attempt owes
+        # its own review decision, not the latched replay's. Cleared BEFORE the
+        # rollback below, as the base restart arm does, so a rollback pause
+        # persists the task unlatched.
+        task.salvage_refile_pending = False
         if not restart_isolated and task.baseline_commit:
             # latch resolved_redrive so the corrected spec + restored diff stay
             # protected through every reset of this re-drive, not just this
@@ -3507,13 +3524,25 @@ class SweepEngine(Engine):
                 # faulted at the metadata probe, whose arm does not unlink: there the
                 # older plan survives a refused write-back. A directory also reaches this
                 # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
-                # `PermissionError` on Windows.
+                # `PermissionError` on Windows. Confined to the project root (#593,
+                # DW-269): the plain writer resolved `.bmad-loop/`, `runs/` and the
+                # run dir by name, so a link planted at any of them aimed the temp
+                # and the published cache out of the project. The root is the
+                # PROJECT that owns the run dir (`_decisions_phase` says why not
+                # `self.workspace.root`), not `self.run_dir` — a file confined
+                # against its own parent walks no components and refuses nothing.
+                # A refused parent reaches this catch as `UnconfinedWriteError`,
+                # itself an `OSError`, so it costs the cycle its cache and nothing
+                # else. `OSError` alone: unlike `atomic_write_text`, the confined
+                # helper never `resolve()`s, so DW-247's `RuntimeError` arm has
+                # nothing to catch here.
                 try:
-                    atomic_write_text(triage_path, json.dumps(result.result_json, indent=2))
-                # `RuntimeError` too: the helper's `path.resolve()` raises it (not
-                # `OSError`) for a symlink loop on 3.11/3.12 — the same pair
-                # `platform_util.resolve_or_lexical` catches for the same reason.
-                except (OSError, RuntimeError) as exc:
+                    atomic_write_text_confined(
+                        triage_path,
+                        json.dumps(result.result_json, indent=2),
+                        confine_root=_project_of_run_dir(self.run_dir),
+                    )
+                except OSError as exc:
                     self.journal.append(
                         "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
                     )
@@ -3959,14 +3988,36 @@ class SweepEngine(Engine):
         #
         # `unusable` keeps the PER-VALUE drops so the two write-backs below
         # re-publish their parsed values unchanged: on that arm the degrade really is
-        # in-memory and this method neither repairs nor trims the file. The two
-        # WHOLE-FILE arms cannot offer that — an unreadable file and a non-object
-        # top level leave nothing per-value to carry — so `unusable` stays empty
-        # there and the next write this phase makes for its own reasons (a seeded
-        # pre-answer, an in-run answer) replaces the corrupt file wholesale.
+        # in-memory and this method neither repairs nor trims the file. The
+        # WHOLE-FILE arms cannot offer that — nothing per-value is left to carry —
+        # and they split two ways by what the fault says about the bytes on disk:
+        #
+        # - A DECODE fault (`JSONDecodeError`, `UnicodeDecodeError`) or a non-object
+        #   top level means the bytes themselves are corrupt, so `unusable` stays
+        #   empty and the next write this phase makes for its own reasons (a
+        #   seeded pre-answer, an in-run answer) replaces the corrupt file
+        #   wholesale — that replacement IS the repair.
+        # - An `OSError` at the metadata probe or the content read says nothing
+        #   about the bytes: a store full of valid answers merely could not be read
+        #   THIS cycle. Replacing it from an `answers` that started empty would
+        #   turn a transient refusal into permanent loss of every answer it held
+        #   (DW-264), so `store_unreadable` is set on those two arms alone and
+        #   the SEEDED write-back below is withheld while it is set — the adopted
+        #   answers stay in memory for this cycle's bundling and the row
+        #   `sweep-decisions-store-write-withheld` names the ids that did not
+        #   persist (a resume re-adopts them from the project store). The
+        #   INTERACTIVE arm has no second copy, so there the PROMPT is withheld
+        #   instead (`sweep-decisions-prompt-withheld`, below): an answer taken
+        #   at a prompt this cycle would live in memory alone, and a crash before
+        #   the bundle it authorizes is materialized would lose it — nothing reads
+        #   a `build` back off the ledger's `decision:` line (#794 review). The
+        #   withheld check precedes the write at the seeded site, so a withheld
+        #   write is never also reported as a failed one.
         answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
+        store_unreadable = False
+        store_fault = ""  # the refusal's text, for the prompt-withheld notice below
         # `stat()` + `S_ISREG`, not `is_file()` (DW-248, the DW-224 shape). The
         # convenience probe splits by RUNTIME on a metadata fault: 3.11-3.13
         # re-raise a `PermissionError` out of this bookkeeping read — aborting the
@@ -3984,10 +4035,20 @@ class SweepEngine(Engine):
         except OSError as exc:
             self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             store_mode = None
+            store_unreadable = True  # DW-264: the bytes may be fine; withhold the writes
+            store_fault = str(exc)
         if store_mode is not None and stat.S_ISREG(store_mode):
             try:
                 stored = _read_json(decisions_path)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            # Two arms, one row: the classes are disjoint (`JSONDecodeError` and
+            # `UnicodeDecodeError` are both `ValueError`s), and the split exists
+            # because only the I/O refusal earns the withhold flag — the decode
+            # arm keeps wholesale replacement as its repair (comment block above).
+            except OSError as exc:
+                self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+                store_unreadable = True
+                store_fault = str(exc)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             else:
                 if isinstance(stored, dict):
@@ -4019,7 +4080,10 @@ class SweepEngine(Engine):
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
         pre = decisions_store.load_pre_answers(project_root)
-        seeded = False
+        # The ids adopted from the project store THIS cycle, not every id in
+        # `answers`: the write-back rows below name exactly what this phase tried
+        # to persist, not the answers the run store already held.
+        seeded_ids: list[str] = []
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
                 continue
@@ -4047,7 +4111,7 @@ class SweepEngine(Engine):
                 dw_id=decision.id,
                 effect=pre_answer.get("effect"),
             )
-            seeded = True
+            seeded_ids.append(decision.id)
         if malformed:
             # The PER-VALUE record: one, however many values it covers, naming the
             # ids that lost their answer and the store each came from. It is not
@@ -4057,7 +4121,18 @@ class SweepEngine(Engine):
             # store names and type names only: an answer's prose stays out of the
             # journal, the way `sweep-decision-option-mismatch` keeps it out.
             self.journal.append("sweep-decisions-reload-failed", errors=malformed)
-        if seeded:
+        if seeded_ids and store_unreadable:
+            # DW-264, withheld FIRST: while the store could not be read, no write
+            # is attempted at all — so the failed row below is unreachable here and
+            # a withheld write is never also reported as failed. Ids and the
+            # store's basename only, never answer prose; both fields are already
+            # routed (`dw_ids` keylist, `file` benign), so no new field is minted.
+            self.journal.append(
+                "sweep-decisions-store-write-withheld",
+                file=decisions_path.name,
+                dw_ids=list(seeded_ids),
+            )
+        elif seeded_ids:
             # Same helper as `decisions._write_store` (#363), but NOT for #363's
             # reason: `decisions_path` here is the PER-RUN file under
             # `.bmad-loop/runs/<id>/`, which init gitignores, so a stranded temp
@@ -4073,15 +4148,37 @@ class SweepEngine(Engine):
             # `self.workspace.root`) — and not `self.run_dir` either: a file
             # confined against its own parent walks no components at all, which
             # would refuse nothing.
-            atomic_write_text_confined(
-                decisions_path,
-                # `unusable` first so a well-shaped answer always wins the key:
-                # the entries it holds are the ones the read above could not use,
-                # re-published unchanged rather than dropped by a write this
-                # method makes for an unrelated reason.
-                json.dumps({**unusable, **answers}, indent=2),
-                confine_root=project_root,
-            )
+            #
+            # Guarded (DW-262), the DW-247 shape: a directory planted at the store
+            # — which the `S_ISREG` probe above deliberately answers SILENTLY —
+            # reaches `os.replace` here as `IsADirectoryError` (POSIX) or
+            # `PermissionError` (win32), and a refused parent reaches it as
+            # `UnconfinedWriteError`, itself an `OSError`. Bare, either aborted an
+            # otherwise healthy sweep at a bookkeeping write of answers the human
+            # ALREADY gave out of band. The answers stay in `answers` for this
+            # cycle's bundling; the row says the store and the ids did not persist,
+            # so a resume re-adopts them from the project store instead. Its own
+            # kind, not `sweep-decisions-reload-failed`, which is a READER's row.
+            # `OSError` alone: unlike `atomic_write_text`, the confined helper
+            # never `resolve()`s, so DW-247's `RuntimeError` arm has nothing to
+            # catch here.
+            try:
+                atomic_write_text_confined(
+                    decisions_path,
+                    # `unusable` first so a well-shaped answer always wins the key:
+                    # the entries it holds are the ones the read above could not use,
+                    # re-published unchanged rather than dropped by a write this
+                    # method makes for an unrelated reason.
+                    json.dumps({**unusable, **answers}, indent=2),
+                    confine_root=project_root,
+                )
+            except OSError as exc:
+                self.journal.append(
+                    "sweep-decisions-store-write-failed",
+                    file=decisions_path.name,
+                    dw_ids=list(seeded_ids),
+                    error=str(exc),
+                )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         # THREE flags, because the commit and the hand-back ask different
@@ -4350,6 +4447,37 @@ class SweepEngine(Engine):
             # silently swallowing the announcement rather than repeating it.
             for decision in pending:
                 self._quarantine(self.state.sweep_skipped_decisions, decision.id)
+        elif store_unreadable and pending:
+            # DW-264's interactive half, re-drawn (#794 review): while the run
+            # store could not be read this cycle, an answer taken at the prompt
+            # could not be persisted — the write is withheld for the reason above,
+            # and unlike the seeded arm's adopted answers it has no second copy.
+            # Taking it anyway left the authorization in memory alone: the effect
+            # walk landed the ledger's `decision:` line, but nothing reads a `build`
+            # back off that line, so a process that died between the answer and
+            # `_materialize_bundles`' save resumed with the old store, re-asked the
+            # question (or, unattended, quarantined it) and the human's `build` was
+            # lost. So the question is NOT put: one row names the ids not asked,
+            # the notice tells the human what to repair, and the decisions stay
+            # pending and UNQUARANTINED — the unattended arm's quarantine is what
+            # stops a repeated announcement, and these were never announced as
+            # skipped — so the next interactive sweep over a readable store asks
+            # them. `store_fault` is the refusal's own text; `dw_ids` and `file`
+            # are the withheld row's fields, `error` is diagnostics-dropped.
+            self.journal.append(
+                "sweep-decisions-prompt-withheld",
+                file=decisions_path.name,
+                dw_ids=[d.id for d in pending],
+                error=store_fault,
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"{len(pending)} deferred-work decisions not asked",
+                f"{decisions_path} could not be read ({store_fault}), so an answer could "
+                "not be persisted and none was taken — fix the file, then run "
+                "`bmad-loop sweep` interactively again",
+            )
         else:
             for decision in pending:
                 # announce before blocking on input so observers (TUI, ATTENTION
@@ -4375,6 +4503,15 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
+                # Deliberately BARE, unlike the seeded write-back above (DW-262):
+                # a human just answered at a prompt, and a write that FAILS must
+                # stop the sweep loudly rather than be spent on a bundle a resume
+                # cannot reconstruct — the seeded arm can re-adopt from the
+                # project store; this one has no second copy. Not reached while
+                # the store could not be READ this cycle (DW-264): that arm
+                # withholds the prompt itself above, since a write here would
+                # replace valid answers the refusal merely hid and an answer held
+                # only in memory does not survive a crash.
                 atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
                     decisions_path,
                     json.dumps({**unusable, **answers}, indent=2),  # as above
@@ -4513,20 +4650,30 @@ class SweepEngine(Engine):
                 # WHICH of the two states it was is named in `error`, because they
                 # are not the same news: a missing entry is one retired id, where a
                 # ledger that is gone means every earlier `decision:` line this walk
-                # wrote went with it. `is_file()` is the same probe `record_decision`
-                # made, re-taken rather than plumbed out of it — this is a journal
-                # sentence, not a control decision, and a race between the two only
-                # ever mislabels a row nothing acts on.
+                # wrote went with it. The sentence comes from `_non_write_state` —
+                # the same call the DW-167 re-apply walk makes — whose absence answer
+                # is the observation reader's own `("", None)` (DW-265), not an
+                # `is_file()` probe re-taken here (DW-281). The window is narrow but
+                # real: a ledger refused at the recorder itself raises out of
+                # `_ledger_present` and takes the `except` arm above, so this probe
+                # sees a fault only when the ledger goes unreadable BETWEEN the
+                # recorder's False answer and the probe. In that window `is_file()`
+                # suppresses every OS error on Python 3.14 and answers False, so a
+                # ledger sitting in place read as GONE, and on 3.11–3.13 it raised
+                # the `PermissionError` straight out of this bare arm and ended
+                # `run()`. Through the reader a refused ledger reads "holds no entry"
+                # and the probe cannot raise. This is a journal sentence, not a
+                # control decision: the helper's third sentence ("present but no
+                # longer open") is reachable here only as a race — a rival writer
+                # adding and closing the entry between `record_decision`'s refusal
+                # and the probe — and a race between the two only ever mislabels a
+                # row nothing acts on.
                 if not recorded:
                     self.journal.append(
                         "sweep-decision-effect-unavailable",
                         dw_id=decision.id,
                         effect=option.effect,
-                        error=(
-                            "record_decision wrote no line: the ledger file is gone"
-                            if not self.workspace.paths.deferred_work.is_file()
-                            else "record_decision wrote no line: the ledger holds no entry for this id"
-                        ),
+                        error=f"record_decision wrote no line: {self._non_write_state(decision.id)}",
                     )
                     if option.effect == "build":
                         # DW-200. The build lane routed purely on the stored
@@ -4619,21 +4766,23 @@ class SweepEngine(Engine):
             probe_ledger = self.workspace.paths.deferred_work
             try:
                 deferredwork.read_for_write(probe_ledger)
+            except (OSError, deferredwork.LedgerReadFault) as e:
+                if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                    e = e.__cause__  # Preserve the original OS attribution.
+                self.journal.append(
+                    "sweep-decision-ledger-refused",
+                    ledger=str(probe_ledger),
+                    reason="ledger-inaccessible",
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+                ledger_in_doubt = True
+                self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
             except deferredwork.LedgerReadError as e:
                 self.journal.append(
                     "sweep-decision-ledger-refused",
                     ledger=str(probe_ledger),
                     reason="ledger-unreadable",
                     error=str(e),
-                )
-                ledger_in_doubt = True
-                self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
-            except OSError as e:
-                self.journal.append(
-                    "sweep-decision-ledger-refused",
-                    ledger=str(probe_ledger),
-                    reason="ledger-inaccessible",
-                    error=f"{e.__class__.__name__}: {e}",
                 )
                 ledger_in_doubt = True
                 self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
@@ -4770,20 +4919,35 @@ class SweepEngine(Engine):
         """Which of `record_decision`'s non-write states an id is in, as the tail
         of a `sweep-decision-effect-unavailable` sentence.
 
-        THREE states, which is one more than the interactive arm can reach: the
-        DW-167 replay walk passes `require_open=True`, so beside "no ledger file"
+        THREE states. Both arms of `_decisions_phase` call this (the interactive
+        arm since DW-281), but only the DW-167 replay walk can be refused into the
+        third by design: it passes `require_open=True`, so beside "no ledger file"
         and "no entry carries this id" it can also be refused for an entry that is
         present and no longer open — a rival writer closed it between the walk's
         gate and its write, which means the close being repaired is already
         recorded. That is not a missing entry and must not be reported as one:
         the operator would go hunting a vanished entry that is sitting in the
-        ledger, done.
+        ledger, done. The interactive arm passes no `require_open`, so it reaches
+        the third sentence only as a race — an entry added and closed between
+        `record_decision`'s refusal and this probe — which is prose on a row
+        nothing acts on, not a state the refusal saw.
 
         A fresh best-effort read, taken only to write the sentence. The OBSERVATION
         arm (DW-146) is the right one precisely because nothing is written from it
         and it never raises — a ledger that has gone unreadable since the refusal
         answers the empty text, which falls through to "no entry carries this id",
-        the same sentence the pre-DW-167 code gave.
+        the same sentence the pre-DW-167 code gave. Absence is the reader's own
+        `(None, None)` answer, not an `is_file()` pre-gate (DW-265): that gate
+        suppresses every OS error on Python 3.14 and answers False, so a refused
+        ledger was reported as GONE there — a sentence that tells the operator
+        every `decision:` line already written went with it, when the file is
+        sitting in place, unreadable. The reader is the presence-aware
+        `observe_ledger`, not `read_for_observation`, for the mirror-image reason
+        (PR #794 review): the text-only reader answers the same `""` for a
+        present 0-byte ledger as for a missing one, so testing the text's
+        truthiness called a ledger that EXISTS and holds no entry gone. `None`
+        is absence; `""` is a present, empty ledger, and falls through to the
+        missing-entry sentence like any other text without this id.
 
         `.done`, never `not .open` — the derivation `DWEntry.done`'s docstring
         exists to refuse. Two states of the entry fall through to the
@@ -4803,15 +4967,10 @@ class SweepEngine(Engine):
         otherwise let this sentence describe a different entry than the write
         did."""
         ledger = self.workspace.paths.deferred_work
-        try:
-            if not ledger.is_file():
-                return "the ledger file is gone"
-            text, _fault = deferredwork.read_for_observation(ledger)
-        except OSError:
-            # The extra absence probe is observation too: metadata faults must
-            # degrade to the same fallback as the observation reader's faults.
-            text = ""
-        entry = next((e for e in deferredwork.parse_ledger(text) if e.id == dw_id), None)
+        text, fault = deferredwork.observe_ledger(ledger)
+        if fault is None and text is None:
+            return "the ledger file is gone"
+        entry = next((e for e in deferredwork.parse_ledger(text or "") if e.id == dw_id), None)
         if entry is not None and entry.done:
             return "the ledger entry is present but no longer open"
         return "the ledger holds no entry for this id"
@@ -5133,14 +5292,17 @@ class SweepEngine(Engine):
         # the readability fact the dispatch gate withholds on; a git fault after a
         # successful resolve says nothing about readability. The one-tuple handler
         # that stood here could not tell them apart, so a refused resolve left the
-        # run holding the ledger publishable.
+        # run holding the ledger publishable. `ValueError` sits in the resolve arm's
+        # tuple (DW-275): `Path.resolve()` raises it for an embedded NUL, and its
+        # `UnicodeEncodeError` subclass for a lone surrogate, on CPython POSIX — the
+        # same fold `engine._publication_refusal` makes.
         # Flipped the moment `commit_paths` is entered: a `GitError` after that
         # point comes from a commit git was asked to make, not from a tree it could
         # not read (see the docstring — `path_clean` has already answered).
         attempted = False
         try:
             target = path.resolve()
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             # `repo` (not `root`): an absolute host path, already routed out of
             # diagnostics dumps, exactly as `rearm-baseline-advance-failed` spells
             # the same value. The LEXICAL parent here — the resolve that would have
@@ -5421,6 +5583,18 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         try:
             text = deferredwork.read_for_write(ledger)
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # The class name rides beside the message because "[Errno 13]
+            # Permission denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-decision-open-set-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return None
         except deferredwork.LedgerReadError as e:
             # `LedgerReadError` is a plain `Exception` on purpose (DW-146), so it
             # must be named: no `except OSError` would ever see it.
@@ -5429,16 +5603,6 @@ class SweepEngine(Engine):
                 ledger=str(ledger),
                 reason="ledger-unreadable",
                 error=str(e),
-            )
-            return None
-        except OSError as e:
-            # The class name rides beside the message because "[Errno 13]
-            # Permission denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-decision-open-set-refused",
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
             )
             return None
         # `is None`, never falsiness: an empty-but-PRESENT ledger genuinely holds
@@ -6024,7 +6188,8 @@ class SweepEngine(Engine):
 
         REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
         session is dispatched on — an empty one would brief the session on
-        nothing at all. `OSError` and `LedgerReadError` PROPAGATE, unchanged for
+        nothing at all. `LedgerReadError`, including the OS-read subclass
+        `LedgerReadFault` (DW-279), PROPAGATES; failure handling is unchanged for
         `_run_bundle` (DW-197's accepted residual); `_ensure_bundle_intent` is the
         one caller that catches them, and it takes the read through here so the
         catch covers the ledger alone and not the intent file's own I/O. A second
@@ -6046,7 +6211,15 @@ class SweepEngine(Engine):
         would be spent on it anyway. Missing means no entry PARSED for the id; a
         present-but-closed entry is still emitted verbatim, since the caller — a
         `_run_bundle` on a fresh plan, or a regeneration of a persisted task —
-        may legitimately be briefing on work the ledger has since retired."""
+        may legitimately be briefing on work the ledger has since retired.
+
+        The write is confined to the project root (#593, DW-269): a link planted
+        at any directory component below the project root (`.bmad-loop/`,
+        `runs/`, the run dir, `bundles/` or `bundles/<dirname>/`) refuses with
+        `UnconfinedWriteError` rather than landing the document outside the
+        project. That refusal is an `OSError` and PROPAGATES like any other write
+        fault here — no degrade arm, by design (DW-243): the document's own write
+        faults must never be misreported as a ledger fault."""
         if text is None:
             text = self._read_intent_ledger() or ""
         entries = {e.id: e for e in deferredwork.parse_ledger(text)}
@@ -6075,7 +6248,15 @@ class SweepEngine(Engine):
         # later. Line breaks are deliberately *kept* — this file is markdown, so
         # `_one_line`'s collapse would be damage, and the ledger blocks are read
         # back from a strict-UTF-8 file and so pass through byte-unchanged.
-        atomic_write_text(path, neutralize_surrogates("\n".join(lines)))
+        # Confined against the PROJECT that owns the run dir, never
+        # `self.workspace.root` (`_decisions_phase` says why): the `mkdir` above
+        # accepts a symlink-to-a-directory at any component, so it is the
+        # anchored walk here that refuses a planted parent.
+        atomic_write_text_confined(
+            path,
+            neutralize_surrogates("\n".join(lines)),
+            confine_root=_project_of_run_dir(self.run_dir),
+        )
         return path
 
     def _bundle_intent_reason(self, task: StoryTask) -> str | None:
@@ -6154,8 +6335,142 @@ class SweepEngine(Engine):
         )
         task.baseline_commit = None
         task.baseline_untracked = None
+        task.baseline_artifacts = None
         self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
+
+    def _pause_for_bundle_close_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        fault: deferredwork.LedgerReadError,
+        *,
+        site: str,
+        dw_ids: list[str],
+    ) -> NoReturn:
+        """Pause the run over a ledger a bundle-close mutator could not read under
+        its own lock (DW-280): journal `sweep-bundle-close-refused`, notify with
+        the RESUME route, save, and raise `RunPaused` at the story gate on the
+        task, its phase and `bundle_closes_intended` exactly as they were.
+
+        `fault` is the mutator's own exception, not its text, so the row keeps
+        the classification `LedgerReadFault` (DW-279) exists to carry: an OS
+        metadata/text-read refusal (`EACCES`, `EIO`, a vanished mount) journals
+        `reason="ledger-inaccessible"` and steers the operator at the path's
+        permissions or storage, where undecodable bytes journal
+        `reason="ledger-unreadable"` and steer at the UTF-8 — the same two tokens
+        and the same repairs `sweep-cycle-ledger-refused` and
+        `sweep-preanswer-prune-refused` split. A `LedgerReadFault` is tested
+        AHEAD of the parent class, as the read contract requires, and its
+        `OSError` cause is what the token is read from: the wrapper alone, with
+        no chained `OSError`, is treated as the decode arm rather than guessed
+        at. `error` is the exception's own text either way, which already names
+        the ledger path and, for the OS arm, the `OSError` class and errno.
+
+        The sweep's own route for the two calls `Engine._pause_for_ledger_repair`
+        names as NOT covered — `_close_bundle_ledger_when_spec_status` (the
+        accepted-dev close and the review-leg reclose) and the sweep half of
+        `_carry_isolated_ledger_writes`. Each is a bare
+        `deferredwork.mark_done_many_reopenable`, and every mutator takes its own
+        locked `read_for_write` ahead of every write, so a `LedgerReadError` from
+        the call itself — including `LedgerReadFault` for OS metadata/text-read
+        faults since DW-279 — proves nothing flipped: the pause costs no work. `site`
+        ends in `-locked` like the engine's, and names which of the three calls
+        raised.
+
+        NOT `_pause_on_intent_refusal`: that tail clears the task's baseline pair,
+        which is right for a task whose attempt was already rolled back and wrong
+        here — an accepted dev attempt still owns its baseline, and the resume
+        re-drives from it. NOT the engine's `_pause_for_ledger_repair` either: its
+        `ledger-read-refused` row is the engine's inventory, and the sweep carries
+        its own refusal vocabulary (`sweep-bundle-close-carry-refused` beside it).
+        `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
+        to a fresh `bmad-loop sweep`, which abandons this run's in-flight task.
+
+        PAUSE_STORY_GATE, not PAUSE_ESCALATION, for the reason `_pause_on_intent_refusal`
+        gives: every escalation action requires Phase.ESCALATED, which none of the
+        three sites' tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
+        stage's single action is "resume", which is the whole remedy once the
+        ledger reads again. `runs.unreadable_sweep_ledger` fronts that resume for
+        the MAIN checkout's ledger — the in-place sites and the carry; under
+        `scm.isolation = "worktree"` the two close sites write the unit worktree's
+        copy (`self.workspace.paths.deferred_work`), which the notice names via
+        `error` and the gate does not probe, so an unrepaired copy simply
+        re-pauses here on resume. With the phase untouched the existing resume arms redo the
+        close: at DEV_VERIFY, `_recover_inflight_bundle`'s accepted-session arm
+        re-enters `_resume_after_dev_verify` → `_post_dev_accepted_sync` and the
+        close re-drives with no session spent; at DONE with the latch left False,
+        `Engine._replay_unlatched_ledger_carries` re-runs the whole carry hook
+        ahead of `_loop`; at REVIEW_VERIFY the sweep has no `_resumable_session`
+        arm, so the pause takes its restart arm — `_rollback_or_pause` resets the
+        attempt to baseline (rollback policy governing) and the bundle is
+        re-driven from dev, whose accepted close then lands. That last is the
+        pre-existing sweep resume shape, not widened here."""
+        inaccessible = isinstance(fault, deferredwork.LedgerReadFault) and isinstance(
+            fault.__cause__, OSError
+        )
+        error = str(fault)
+        self.journal.append(
+            "sweep-bundle-close-refused",
+            story_key=task.story_key,
+            dw_ids=list(dw_ids),
+            site=site,
+            ledger=str(ledger),
+            reason="ledger-inaccessible" if inaccessible else "ledger-unreadable",
+            error=error,
+        )
+        ids = ", ".join(dw_ids)
+        # `error` is `LedgerReadError`'s text and already begins with the ledger's
+        # path, so neither string names the path a second time (the engine's
+        # `_pause_for_ledger_repair` does the same). One wording for all three
+        # sites, no per-site branch; the ONLY fork is the fault class, so the
+        # remediation matches the refusal — a permissions or storage repair is
+        # not a UTF-8 one. No "COMMIT the fix" steer, unlike
+        # `_pause_on_intent_refusal`: at the accepted-dev site the session's
+        # uncommitted work sits beside the ledger, and a whole-tree commit by hand
+        # would swallow it under the repair. The bundle's own commit carries a
+        # tracked ledger's repair once it lands.
+        if inaccessible:
+            headline = "deferred-work ledger inaccessible"
+            verb = "read"
+            diagnosis = "the ledger could not be read"
+            repair = (
+                "Repair the ledger's path, permissions or storage by hand (the "
+                "orchestrator must be able to read it)"
+            )
+        else:
+            headline = "deferred-work ledger unreadable"
+            verb = "decode"
+            diagnosis = "the ledger could not be decoded"
+            repair = "Repair the ledger by hand (it must be valid UTF-8)"
+        notice = (
+            f"**ACTION REQUIRED — {headline}**\n"
+            f"Bundle **{task.story_key}** was about to publish a ledger close for "
+            f"{ids} (a close, or a re-assertion of one after review), but the "
+            f"orchestrator could not {verb} the deferred-work ledger to publish it: "
+            f"{error}.\n"
+            f"This write did not land and no work was discarded. {repair}"
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
+            f"{notice} — then `bmad-loop resume {self.state.run_id}`, which re-drives "
+            "the write: replaying the recorded dev result at the accepted-dev close "
+            "and the isolated carry with no session spent, and restarting the bundle "
+            "from dev at the review-leg reclose, rollback policy governing",
+        )
+        self._save()
+        # The persisted reason (`state.paused_reason`, `run-paused`, the status
+        # summary) carries the same diagnosis as the notice: an operator reading
+        # only these surfaces must not be told to repair encoding that is fine.
+        raise RunPaused(
+            f"bundle {task.story_key}: its ledger close for {ids} could not be "
+            f"published because {diagnosis} ({error}); repair the ledger by hand, "
+            "then resume",
+            PAUSE_STORY_GATE,
+            task.story_key,
+        )
 
     def _ensure_bundle_intent(self, task: StoryTask) -> bool:
         """Guarantee a recovered bundle has the intent file its dev prompt points
@@ -6172,8 +6487,8 @@ class SweepEngine(Engine):
 
         The regeneration's ledger read is CAUGHT here (DW-243), and only the
         ledger read: `_read_intent_ledger` is split out of `_write_intent` so an
-        `OSError` from the intent file's own `mkdir`/`atomic_write_text` still
-        propagates as before. Undecodable bytes (`LedgerReadError`) and an
+        `OSError` from the intent file's own `mkdir`/`atomic_write_text_confined`
+        still propagates as before. Undecodable bytes (`LedgerReadError`) and an
         `OSError` from the read journal `sweep-intent-ledger-refused` under the
         existing pair of tokens (`ledger-unreadable`, `ledger-inaccessible`) and
         then PAUSE the run through `_pause_on_intent_refusal`. Bare, the read
@@ -6221,6 +6536,28 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         try:
             text = self._read_intent_ledger()
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # The class NAME rides beside the message: "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
+                "the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
+            )
         except deferredwork.LedgerReadError as e:
             # A plain `Exception` on purpose (DW-146), so it must be named: no
             # `except OSError` would ever see it. Same row shape as
@@ -6240,26 +6577,6 @@ class SweepEngine(Engine):
                 f"bundle {task.story_key}: intent document not regenerated",
                 f"the deferred-work ledger {ledger} could not be decoded ({e}); "
                 "repair it by hand and COMMIT the fix",
-            )
-        except OSError as e:
-            # The class NAME rides beside the message: "[Errno 13] Permission
-            # denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-intent-ledger-refused",
-                story_key=task.story_key,
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
-            )
-            self._pause_on_intent_refusal(
-                task,
-                f"bundle {task.story_key}: its intent document must be regenerated "
-                f"off the deferred-work ledger, and {ledger} could not be read "
-                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
-                "the fix, then resume",
-                f"bundle {task.story_key}: intent document not regenerated",
-                f"the deferred-work ledger {ledger} could not be read "
-                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
             )
         if text is None:
             # ABSENT, kept apart from "every entry missing": `or ""` here would
@@ -6406,7 +6723,9 @@ class SweepEngine(Engine):
         if not spec_file:
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"
-        self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
+        self._close_bundle_ledger_when_spec_status(
+            task, str(spec_file), success_status, site="bundle-close-locked"
+        )
 
     def _bundle_close_operation_id(self, task: StoryTask) -> str:
         """Stable identity for a close and its possible defer-time undo."""
@@ -6432,7 +6751,30 @@ class SweepEngine(Engine):
         spec_file: str,
         success_status: str,
         kind: str = "sweep-bundle-closed",
+        *,
+        site: str,
     ) -> None:
+        """Mark the bundle's ids ``done`` once its spec reaches ``success_status``.
+
+        Called once after accepted dev (``_post_dev_accepted_sync``,
+        ``site="bundle-close-locked"``) and again by the review-leg reclose
+        (``_verify_review``, ``site="bundle-reclose-locked"``). The catch sits here
+        rather than at those callers so there is one arm and one row shape; the
+        ``site`` kwarg is what tells the two apart in the journal — keyword-only
+        with no default, so a further caller must name its own token rather than
+        inherit the accepted-dev one.
+
+        The mutator's own locked re-read (DW-280): ``mark_done_many_reopenable``
+        takes ``read_for_write`` under the ledger lock ahead of every write, so a
+        ledger that turns undecodable or suffers an OS read fault (DW-279) raises
+        ``LedgerReadError`` from the call itself with nothing flipped. Bare, that crashed the run at
+        the accepted-dev close with the session's work on disk. It now routes to
+        ``_pause_for_bundle_close_repair`` — the sweep's own route, not the
+        engine's ``ledger-read-refused`` — with ``bundle_closes_intended`` already
+        assigned, so the resume arms re-drive the close. ``LedgerReadError`` ALONE:
+        an ``OSError`` here is a write fault as often as a read one and stays on
+        the DW-182/186 contract.
+        """
         spec_path = verify.resolve_spec_path(spec_file, self.workspace.paths)
         if not spec_path.is_file():
             return
@@ -6448,13 +6790,21 @@ class SweepEngine(Engine):
         # normally finds every entry already done, so `marked` is empty; deriving
         # the record from it would erase exactly the state a landing bundle needs.
         task.bundle_closes_intended = list(task.dw_ids)
-        marked = deferredwork.mark_done_many_reopenable(
-            ledger,
-            task.dw_ids,
-            self._today(),
-            note,
-            self._bundle_close_operation_id(task),
-        )
+        try:
+            marked = deferredwork.mark_done_many_reopenable(
+                ledger,
+                task.dw_ids,
+                self._today(),
+                note,
+                self._bundle_close_operation_id(task),
+            )
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. The record above stays as
+            # assigned — it is what the resume's re-drive closes.
+            self._pause_for_bundle_close_repair(
+                task, ledger, e, site=site, dw_ids=list(task.dw_ids)
+            )
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
 
@@ -6544,6 +6894,21 @@ class SweepEngine(Engine):
         already done. The flips themselves are unguarded: losing them is the hazard
         this exists to prevent.
 
+        One fault here RAISES, as a pause rather than a crash — the mutator's own
+        locked read (DW-280). ``mark_done_many_reopenable`` takes ``read_for_write``
+        under the ledger lock ahead of every write, so a MAIN ledger that is
+        undecodable when this half runs raises ``LedgerReadError`` from the call
+        itself, before the flips the carry exists to make. That is the one fault
+        the best-effort argument does not cover: nothing is on disk yet, so
+        degrading would lose exactly the closes this hook is for. Bare, it crashed
+        the run after the merge with ``isolated_ledger_carried`` False (neither
+        ``worktree_flow.integrate_unit`` nor ``_replay_unlatched_ledger_carries``
+        catches it). It now routes to ``_pause_for_bundle_close_repair`` under
+        ``bundle-close-carry-locked``, the latch left False by the call site — so
+        ``bmad-loop resume`` replays the whole hook through
+        ``_replay_unlatched_ledger_carries`` once the ledger reads. The base half's
+        harvest carry routes its own locked read through the engine (DW-259).
+
         A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
         ``verify.unpublishable_target`` answers a different question from a
         ``GitError`` — not "can git own this path" but "is this operand a publishable
@@ -6568,13 +6933,26 @@ class SweepEngine(Engine):
         if not task.bundle_closes_intended:
             return
         ledger = self.paths.deferred_work
-        carried = deferredwork.mark_done_many_reopenable(
-            ledger,
-            task.bundle_closes_intended,
-            self._today(),
-            self._bundle_close_note(task),
-            self._bundle_close_operation_id(task),
-        )
+        try:
+            carried = deferredwork.mark_done_many_reopenable(
+                ledger,
+                task.bundle_closes_intended,
+                self._today(),
+                self._bundle_close_note(task),
+                self._bundle_close_operation_id(task),
+            )
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. `LedgerReadError` includes the
+            # OS-read subclass `LedgerReadFault` (DW-279); pre-lock probes and
+            # lock/write failures retain raw `OSError` and their existing route.
+            self._pause_for_bundle_close_repair(
+                task,
+                ledger,
+                e,
+                site="bundle-close-carry-locked",
+                dw_ids=list(task.bundle_closes_intended),
+            )
         if carried:
             # The DW-237 publishable-target guard, before any git runs: `commit_paths`
             # forces every operand LITERAL, so a ledger replaced by a DIRECTORY is
@@ -6608,14 +6986,100 @@ class SweepEngine(Engine):
                     )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
+    def _artifact_only_withheld(self) -> str | None:
+        """Why the artifact-only receipt (DW-273) cannot be honoured for the unit
+        `self.workspace` names whatever it writes — or `None` when it can.
+
+        Under `scm.isolation = "worktree"` an IN-TREE `implementation_artifacts`
+        is rebased into the unit worktree (`ProjectPaths.rebased`), so the
+        receipt's listing measures the worktree's copy of a gitignored dir. An
+        artifact-only result contributes no tracked change to the unit branch,
+        `integrate_unit` merges that unchanged branch and `merge_local` then
+        removes the worktree; `_carry_isolated_ledger_writes` re-applies the
+        ledger CLOSE to the main checkout but copies no file, so the accepted
+        spec or erratum — the bundle's sole deliverable — is destroyed with the
+        worktree while the ids read `done` (#794 review). Refusing the receipt
+        keeps such a bundle on the ordinary `no changes in worktree` retry, which
+        is loud and leaves the ids `open`, rather than landing a close whose
+        evidence no longer exists. The receipt stands under `isolation = "none"`,
+        where the workspace IS the main checkout — and that is the ONLY shape it
+        stands in: an out-of-tree artifacts dir is left where it is by `rebased`
+        and survives the teardown, so this veto does not fire on it, but the
+        receipt is refused for it anyway by the gate's own listing
+        (`_artifact_dir_entries` answers `None` for a dir outside the repo — git
+        lists nothing there), so moving the dir out of the tree is no remedy
+        (#794 review). Carrying the owned entries back before teardown is the
+        fix that would lift this; it is not this method's.
+
+        Compared by path, not by isolation flag: the flag says a worktree exists,
+        the path says whether the artifacts dir moved into it."""
+        unit_dir = self.workspace.paths.implementation_artifacts
+        if unit_dir == self.paths.implementation_artifacts:
+            return None
+        return (
+            "implementation_artifacts is rebased into the unit worktree under "
+            f'scm.isolation = "worktree" ({unit_dir}), and an ignored artifact written '
+            "there is removed with the worktree after the merge — nothing carries it to "
+            "the main checkout, so it cannot stand as the bundle's deliverable; run the "
+            'bundle with isolation = "none"'
+        )
+
+    def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
+        """Fingerprint the ignored entries under `implementation_artifacts` at the
+        attempt's start, so `verify_dev_bundle`'s artifact-only receipt (DW-273)
+        credits only what THIS attempt creates or changes. Stamped from
+        `self.workspace` — the unit under isolation — like the baseline pair the
+        receipt is measured beside. Observation may degrade: a git fault journals
+        `bundle-artifact-baseline-unavailable` and stamps `None`, on which the
+        receipt refuses (the attempt is still driven; only the relaxation is
+        withheld), rather than ending the run over a probe a bundle with a real
+        change never needs. `None` without a git call when
+        `_artifact_only_withheld` has already vetoed the receipt for this unit:
+        the gate refuses ahead of its snapshot arm, so a snapshot would measure
+        ownership nothing will read."""
+        if self._artifact_only_withheld() is not None:
+            return None
+        paths = self.workspace.paths
+        try:
+            return verify.artifact_dir_snapshot(self.workspace.root, paths.implementation_artifacts)
+        except verify.GitError as e:
+            self.journal.append(
+                "bundle-artifact-baseline-unavailable",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                error=str(e),
+            )
+            return None
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
-        return verify.verify_dev_bundle(
+        outcome = verify.verify_dev_bundle(
             task,
             self.workspace.paths,
             result_json,
             review_enabled=self._dev_review_enabled(),
             engine_written=self._harvest_gate_exclude(task),
+            artifact_only_withheld=self._artifact_only_withheld(),
         )
+        # The accepted artifact-only receipt (DW-273) is never silent: one row per
+        # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s
+        # `park-proof-of-work-skipped`. `count` is the number of IGNORED files
+        # under `implementation_artifacts` this ATTEMPT created or changed —
+        # measured against the `_artifact_baseline` snapshot, since ignored paths
+        # carry no git baseline to attribute against — never the directory's
+        # whole listing. The bound is the park record's: the flag rides the
+        # `passed()` return, so a receipt refused by the dw_ids cross-check inside
+        # `verify_dev_bundle` records nothing, while the `[verify]` commands, the
+        # review gate (`verify_review_bundle` still requires every id `done`) and
+        # the commit all run AFTER this append and may still reject the attempt.
+        if outcome.artifact_only_accepted:
+            self.journal.append(
+                "bundle-artifact-only-accepted",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                dw_ids=list(task.dw_ids),
+                count=outcome.artifact_only_residue,
+            )
+        return outcome
 
     def _verify_review(self, task: StoryTask):
         # Generic bundle dev sessions are told not to edit deferred-work.md; the
@@ -6626,7 +7090,11 @@ class SweepEngine(Engine):
         # makes "a review rewrote the ledger" greppable when diagnosing runs.
         if self._generic_dev() and task.spec_file:
             self._close_bundle_ledger_when_spec_status(
-                task, task.spec_file, "done", kind="sweep-bundle-reclosed"
+                task,
+                task.spec_file,
+                "done",
+                kind="sweep-bundle-reclosed",
+                site="bundle-reclose-locked",
             )
         return verify.verify_review_bundle(
             task,
@@ -6639,7 +7107,10 @@ class SweepEngine(Engine):
         # A bundle carries no sprint-status entry, so the pair a park is verified
         # against does not exist, and `verify_review_bundle` gates on closed dw
         # ids instead. Whether a deferred-work bundle can owe a human action is a
-        # separate question from whether a story can; not answered here.
+        # separate question from whether a story can; not answered here. The one
+        # relaxation a bundle DOES get is the artifact-only receipt in
+        # `verify.verify_dev_bundle` (DW-273), which is a gate-side receipt over
+        # the artifacts dir, not a park: no status change, no waiver.
         return False
 
     def _commit_message(self, task: StoryTask) -> str:

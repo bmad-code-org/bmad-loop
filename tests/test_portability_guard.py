@@ -126,8 +126,10 @@ LEDGER_RECEIVER_NAMES = {"ledger", "ledger_path", "deferred_work"}
 LEDGER_OWNER_RECEIVER_NAMES = {"path", "archive_path"}
 LEDGER_OWNER = "deferredwork.py"
 # The two arms' own bodies: the one place a bare `read_text` of the ledger is the
-# point rather than a bypass.
-LEDGER_READER_BODIES = {"read_for_write", "read_for_observation"}
+# point rather than a bypass. The observation arm's body is `observe_ledger`, the
+# presence-aware reader `read_for_observation` projects to text (PR #794 review);
+# the projection holds no `read_text` of its own.
+LEDGER_READER_BODIES = {"read_for_write", "observe_ledger"}
 
 # The one file allowed to CALL ``verify_commands_outcome`` — and within it, only
 # from inside ``_verify_review_commands``, the helper that resolves the review
@@ -1073,16 +1075,17 @@ JOURNAL_KINDS = frozenset(
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
         "ledger-baseline-probe-failed",
-        # DW-231. The two routes a ledger read fault takes inside the base
-        # `Engine`. `ledger-read-degraded` is the OBSERVATION arm — `_ledger_text`
-        # (behind `_ledger_digest`, the pre-harvest snapshot and the two restores)
-        # and `_defer`'s in-place snapshot answered a typed `_UndecodableLedger` or
-        # `None` that nothing can write back, and the run went on. `ledger-read-
-        # refused` is the PUBLISH arm — the spec-deferral harvest or the isolated
-        # carry was about to write from the text and paused the run for repair
-        # instead (`_pause_for_ledger_repair`, no phase change). Both carry only
-        # already-declared fields: `story_key` (routed), `site` (benign), `ledger`
-        # (benign) and `error` (dropped).
+        # DW-231 (decode faults) and DW-258 (reads the OS refuses). The two
+        # routes a ledger read fault takes inside the base `Engine`.
+        # `ledger-read-degraded` is the OBSERVATION arm — `_ledger_text` (behind
+        # `_ledger_digest`, the pre-harvest snapshot and the two restores) and
+        # `_defer`'s in-place snapshot answered a typed `_UndecodableLedger` or
+        # `_UnreadableLedger`, or `None`, that nothing can write back, and the run
+        # went on. `ledger-read-refused` is the PUBLISH arm — the spec-deferral
+        # harvest or the isolated carry was about to write from the text and
+        # paused the run for repair instead (`_pause_for_ledger_repair`, no phase
+        # change). Both carry only already-declared fields: `story_key` (routed),
+        # `site` (benign), `ledger` (benign) and `error` (dropped).
         "ledger-read-degraded",
         "ledger-read-refused",
         "ledger-restore-failed",
@@ -1232,6 +1235,22 @@ JOURNAL_KINDS = frozenset(
         "stories-validated",
         "stories-wedged",
         # sweep.py
+        # DW-273. The bundle path's artifact-only receipt was ACCEPTED at the dev
+        # proof-of-work gate: the ordinary probe positively found nothing, the
+        # session's synthesized result asserted the strict `artifact_only: true`
+        # boolean, and the directory-scoped `git status --ignored` listing of the
+        # configured `implementation_artifacts` held ignored (`!!`) entries. Mirrors
+        # the sprint leg's `park-proof-of-work-skipped`. `story_key` and `dw_ids`
+        # are routed, `attempt` and `count` (the number of ignored files under the
+        # artifacts dir THIS attempt created or changed, measured against the
+        # attempt-start snapshot below) are benign.
+        "bundle-artifact-only-accepted",
+        # The receipt's attempt-start snapshot (`verify.artifact_dir_snapshot`)
+        # could not be taken — a `GitError` on the listing — so the task carries
+        # no ownership baseline and the receipt refuses for this attempt; the
+        # attempt is still driven. `story_key` is an alias, `attempt` benign,
+        # `error` (the git detail) in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "bundle-artifact-baseline-unavailable",
         "bundle-start",
         "decision-answered",
         "decision-pending",
@@ -1248,6 +1267,22 @@ JOURNAL_KINDS = frozenset(
         # target before spawning any git for it.
         "sweep-bundle-close-carry-refused",
         "sweep-bundle-close-carry-uncommitted",
+        # DW-280. A bundle-close mutator's own locked read refused — undecodable
+        # bytes inside the window before `mark_done_many_reopenable`'s
+        # `read_for_write` — at one of the sweep's three sites (`site`, each
+        # ending in `-locked`: `bundle-close-locked` for the accepted-dev close,
+        # `bundle-reclose-locked` for the review-leg reclose,
+        # `bundle-close-carry-locked` for the isolated carry). Bare, the raise
+        # crashed the run; now the run PAUSES at the story gate on the task with
+        # its phase and `bundle_closes_intended` untouched, so `bmad-loop resume`
+        # re-drives the close. The sweep's own route beside
+        # `sweep-bundle-close-carry-refused`, not the engine's
+        # `ledger-read-refused`. No new diagnostics routing: `story_key` is an
+        # alias, `dw_ids` (the ids the close was about to publish) is a keylist,
+        # `site` and `ledger` are benign, and `reason` (one of the fixed tokens
+        # `ledger-unreadable` / `ledger-inaccessible`, by fault class) and `error`
+        # (the decode or OS detail) are both in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "sweep-bundle-close-refused",
         "sweep-bundle-closed",
         # DW-144. A reset in-flight bundle task adopting the ids of the bundle now
         # being run. Both id lists are routed (`dw_ids` by name, `previous_dw_ids`
@@ -1372,6 +1407,36 @@ JOURNAL_KINDS = frozenset(
         # (`JOURNAL_BENIGN_FIELDS`), and no answer prose goes near it, so the
         # record needs no `diagnostics` routing row.
         "sweep-decisions-reload-failed",
+        # DW-262. `_decisions_phase`'s SEEDED write-back of `<run>/decisions.json`
+        # refused by the OS (a directory planted at the store, which the `S_ISREG`
+        # probe answers silently; a refused parent): the pre-answers adopted from
+        # the project store stay in memory for this cycle's bundling but did not
+        # persist. Its own kind, not `sweep-decisions-reload-failed` (a READER's
+        # row). The interactive write-back is deliberately NOT guarded — a human's
+        # answer that cannot be persisted stops the sweep loudly. `file` is the
+        # store's basename (a code constant, benign above), `dw_ids` the routed
+        # keylist, `error` the dropped exception text — no new field minted.
+        "sweep-decisions-store-write-failed",
+        # DW-264. Both write-backs of `<run>/decisions.json` WITHHELD because the
+        # store's metadata probe or content read was refused with an `OSError`
+        # this cycle: the bytes on disk may hold valid answers that merely could
+        # not be read, so replacing them from an `answers` that started empty
+        # would turn a transient refusal into permanent loss. Decode faults and a
+        # non-object top level do NOT withhold — there the replacement is the
+        # repair. Same fields as the failed row minus `error`; the withheld check
+        # precedes the write, so one write never lands on both rows. The seeded
+        # site is the only writer since #794's review: the interactive arm
+        # withholds the PROMPT instead (next row).
+        "sweep-decisions-store-write-withheld",
+        # DW-264's interactive half (#794 review). While `<run>/decisions.json`
+        # could not be READ this cycle, the human is not asked: an answer taken at
+        # the prompt could not be persisted (the write is withheld above), it has
+        # no second copy, and nothing reads a `build` back off the ledger's
+        # `decision:` line, so a crash before the bundle was materialized lost the
+        # authorization. `file` is the store's basename, `dw_ids` the pending ids
+        # not asked, `error` the read refusal's text (diagnostics-dropped); the
+        # decisions stay pending and unquarantined for the next interactive run.
+        "sweep-decisions-prompt-withheld",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
         # DW-243. `_ensure_bundle_intent`'s regeneration read of the ledger

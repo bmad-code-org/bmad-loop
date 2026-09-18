@@ -15,7 +15,12 @@ present. A genuine `## Auto Run Result` marker has three narrow roles: its
 status/detail route the blocked→PAUSE decision; its status is a compatibility
 fallback that may populate the synthesized result when frontmatter is blank or
 missing; and proof that the current session authored the marker supplies
-attempt ownership for `park_asserted`. From that compatibility result, `done`
+attempt ownership for `park_asserted` — and, since DW-273, for `artifact_only`,
+the bundle leg's assertion that its whole deliverable lives under the gitignored
+artifacts dir. Both booleans are minted by the same four-part shape (a present,
+genuine, session-authored marker carrying the line, with no orchestrator synth
+note) and `park_marker_session_authored` is the one authorship proof serving
+both; frontmatter never mints either. From that compatibility result, `done`
 alone may be reconciled onto disk, `blocked` routes to PAUSE, and
 `awaiting-operator` remains subject to the on-disk frontmatter/status gate.
 Where the marker and populated frontmatter disagree we surface it
@@ -51,6 +56,38 @@ STATUS_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Za-z-]+)",
     re.IGNORECASE | re.MULTILINE,
 )
+# The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
+# `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
+# space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
+# `Artifactonly: true` is no spelling of the contract and cannot relax the
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes the
+# bulleted/bolded shapes `STATUS_LINE_RE` tolerates PLUS bold around the value or
+# the whole line (`**Artifact only:** **true**`, `- **Artifact only: true**` — a
+# shape `STATUS_LINE_RE` does not read): every `**` is optional and the closing
+# one is consumed before the end-of-line anchor. Only the literal value `true`
+# ALONE on the line asserts — anchored to end of line so prose such as
+# `Artifact only: true for the ledger, false for code` is no assertion; neither is
+# `false`, a bare label, or any other token. Every gap is HORIZONTAL whitespace of
+# any kind (`[^\S\r\n]*` — space, tab, NBSP..., never a line break), so unlike
+# `Status:` — whose `\s*` gaps read a value across a line boundary — the label and
+# its value must share one line: `Artifact only:` followed by `true` on the next
+# line, or `Artifact only` with `: true` on the next line, is a bare label and a
+# stray token, not an assertion. Matches are read through
+# `_artifact_only_asserted`, which skips a match inside a fenced block (a pasted
+# example within the marker).
+ARTIFACT_ONLY_LINE_RE = re.compile(
+    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]+only(?:\*\*)?[^\S\r\n]*:"
+    r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _artifact_only_asserted(detail: str) -> bool:
+    """True when the marker body carries a genuine (non-fenced) artifact-only line.
+    A match inside a fenced block is documentation, not an assertion — the same
+    reading `_section_headings` gives a fenced heading."""
+    return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
+
 
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
@@ -384,6 +421,15 @@ def synthesize_result(
     whose prose ``## Auto Run Result`` says ``done`` while the frontmatter lags,
     so a plan-halt ``ready-for-dev`` (no such prose) is never reconciled to
     ``done`` and this leg's success outcome is not clobbered.
+
+    ``park_marker_session_authored`` is the adapter's proof that the LAST genuine
+    marker was written by the session being synthesized (``GenericDevAdapter``
+    fingerprints the marker at launch and compares at Stop). It serves two mints,
+    deliberately under one name: ``park_asserted`` (a park's proof-of-work
+    waiver, #676) and ``artifact_only`` (a bundle's artifact-only receipt,
+    DW-273). Both are attempt-ownership claims about the same marker, so one
+    authorship proof is the right number — a second flag could only disagree
+    with the first.
     """
     try:
         fm = read_frontmatter(spec_path)
@@ -450,6 +496,17 @@ def synthesize_result(
         "park_asserted": (
             arr.present
             and arr.status == AWAITING_OPERATOR
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
+        # The bundle leg's artifact-only assertion (DW-273), minted by the same
+        # four-part shape and from the same authorship proof: the current
+        # session's genuine marker carries the line, and nothing else — not
+        # frontmatter, not a repaired marker — can assert it. `verify_dev_bundle`
+        # is the only consumer; the sprint and stories gates never read it.
+        "artifact_only": (
+            arr.present
+            and _artifact_only_asserted(arr.detail)
             and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
             and park_marker_session_authored
         ),

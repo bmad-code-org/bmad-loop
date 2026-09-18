@@ -107,7 +107,10 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
         # `ValueError`: `Path.stat` raises it for a non-encodable path (embedded
-        # NUL), which the old bare `is_file()` absorbed; total means `{}` here too.
+        # NUL), which the old bare `is_file()` absorbed and which
+        # `deferredwork.probe_absence` now classifies as absence at the ledger's
+        # write arm and the publish guard (DW-256/DW-268); this loader never asks
+        # the helper — total means `{}` for that class and every other alike.
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -671,7 +674,10 @@ def apply_pre_answer(
     for path, family in wrote:
         try:
             target = path.resolve()
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
+            # `ValueError` too (DW-275): an embedded NUL, or a lone surrogate as its
+            # `UnicodeEncodeError` subclass, on CPython POSIX. This publisher has no
+            # journal, so the refusal is the fault's only route out.
             refusals.append(PublishRefusal(file=path.name, cause="target-unreadable", error=str(e)))
             continue
         refusal = verify.unpublishable_target(target, family)

@@ -1082,6 +1082,28 @@ def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
 
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
+# The two `ValueError`-family faults `Path.resolve()` raises on CPython 3.11-3.14 POSIX
+# (DW-275), spelled once for the three publisher rows that drive them through
+# `refuse_to_resolve(..., error=)`: an embedded NUL in the path raises `ValueError`
+# with CPython's own `lstat: embedded null character in path` wording (3.12+; 3.11
+# says `embedded null byte`), and a lone surrogate OUTSIDE the `surrogateescape`
+# range (`\ud800`; a `\udcff` round-trips through `os.fsencode` and does not raise)
+# raises `UnicodeEncodeError`, a `ValueError` subclass, which `refuse_to_resolve`
+# reconstructs faithfully from its five args. INJECTED rather than driven with a
+# real path because `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
+# cross-platform driver at the publisher. `Path.stat()` bottoms out in the same
+# `os.stat` and raises the same two, so the observation-arm rows that grade the
+# `stat` + `S_ISREG` presence probe (DW-266/267) drive them through
+# `fault_metadata_probe(..., "stat", error=)`; a real lone surrogate is not a
+# cross-platform driver there either (the Windows W-API accepts it).
+NUL_PATH_RESOLVE_FAULTS = [
+    pytest.param(ValueError("lstat: embedded null character in path"), id="nul"),
+    pytest.param(
+        UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+        id="lone-surrogate",
+    ),
+]
+
 
 def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
     """Make ``Path.resolve()`` fail for exactly ``targets``.
@@ -1297,10 +1319,56 @@ def fault_read_text(monkeypatch, target: Path) -> None:
     monkeypatch.setattr(Path, "read_text", fake)
 
 
-def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
+def fault_locked_ledger_read(
+    monkeypatch, target: Path, operation: str, *, lock_target: Path | None = None
+) -> bytes:
+    """Refuse only the authoritative read inside the real ledger lock (DW-279).
+
+    Earlier probes remain healthy. Each wrap is independently ablatable by
+    selecting the stat or read_text rows. Return the target bytes that must survive.
+    `lock_target` permits an archive sibling read under the main ledger lock.
+    """
+    from bmad_loop import deferredwork
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_text("# Deferred Work\n", encoding="utf-8")
+    before = target.read_bytes()
+    lock_target = target if lock_target is None else lock_target
+    real_lock = deferredwork.ledger_lock
+    real_read = getattr(Path, operation)
+
+    def refuse(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_read(path, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def locked(path):
+        with real_lock(path):
+            with monkeypatch.context() as patch:
+                if path == lock_target:
+                    patch.setattr(Path, operation, refuse)
+                yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", locked)
+    return before
+
+
+def fault_metadata_probe(
+    monkeypatch, target: Path, probe: str, *, error: Exception | None = None
+) -> None:
     """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
     other path still answers normally, and so does every other probe on ``target`` —
     with the ``stat`` family the documented exception, see its own paragraph below.
+
+    ``error`` supplies a DIFFERENT fault instead, on the same terms as
+    ``refuse_to_resolve(..., error=)``: RE-CONSTRUCTED from its class and args on
+    every matching probe rather than re-raised as one object, so a consumer probing
+    the target twice does not see the first raise's frames on the second. Its use
+    is the ``ValueError`` family ``Path.stat`` raises for a path the OS cannot
+    encode (:data:`NUL_PATH_RESOLVE_FAULTS`), which no ``PermissionError`` row can
+    reach and no ``except OSError`` catches.
 
     ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` / ``stat`` /
     ``lstat`` — one probe at a time, which does NOT make one guard-per-probe
@@ -1346,7 +1414,9 @@ def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
 
     def fake(self, *a, **kw):
         if self == target:
-            raise PermissionError(13, "Permission denied")
+            if error is None:
+                raise PermissionError(13, "Permission denied")
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
         return real(self, *a, **kw)
 
     monkeypatch.setattr(Path, probe, fake)
