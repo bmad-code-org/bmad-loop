@@ -1900,6 +1900,7 @@ def test_destination_edit_during_fsync_refuses_replace(publication_case, monkeyp
         destination.write_bytes(b"operator during fsync")
 
     if fallback:
+        monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
         monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
         monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
     monkeypatch.setattr(os, "fsync", edit_during_fsync)

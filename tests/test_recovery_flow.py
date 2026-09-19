@@ -34,9 +34,33 @@ from bmad_loop.workspace import Workspace
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 requires_descriptor_restoration = pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES,
-    reason="automatic restore requires descriptor-relative writes",
+    not platform_util.HANDLE_ANCHORED_WRITES,
+    reason="automatic restore requires handle-anchored writes",
 )
+# Rows that rename a directory OUT FROM UNDER a writer holding a handle beneath it.
+# Windows refuses that rename outright (ERROR_ACCESS_DENIED while any handle is
+# open below the directory), so the swap these rows stage cannot be performed
+# there — the OS closes the race before the anchored writer has to. The refusal
+# itself is pinned on the win32 arm by tests/test_win32_at.py.
+posix_parent_swap_under_writer = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows refuses to rename a directory with a handle open beneath it",
+)
+
+
+def _plant_directory_redirect(link: Path, target: Path) -> None:
+    """Plant a directory redirect at ``link`` the confined walk must refuse.
+
+    A symlink on POSIX; on Windows a JUNCTION, which needs no elevation where a
+    directory symlink needs SeCreateSymbolicLinkPrivilege — and is the redirect
+    an unprivileged session can actually plant, so it is the one worth pinning
+    against the ``win32_at`` walk."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 def _policy(**scm) -> Policy:
@@ -102,7 +126,8 @@ def test_owned_spec_restore_recreates_missing_canonical_parents(tmp_path):
 
 
 def test_owned_spec_restore_forced_fallback_refuses_before_path_writer(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     spec = tmp_path.resolve() / "owned.md"
     original = b"operator bytes\n"
@@ -125,7 +150,8 @@ def test_owned_spec_restore_forced_fallback_refuses_before_path_writer(tmp_path,
 
 
 def test_owned_spec_restore_forced_fallback_does_not_create_missing_parents(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     first_missing_parent = tmp_path.resolve() / "new"
     spec = first_missing_parent / "deep" / "owned.md"
@@ -143,7 +169,8 @@ def test_owned_spec_restore_forced_fallback_does_not_create_missing_parents(tmp_
 
 
 def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     spec = tmp_path.resolve() / "owned.md"
     original = b"---\nstatus: in-progress\n---\n\noperator bytes\n"
@@ -168,12 +195,19 @@ def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows coverage")
-def test_owned_spec_restore_native_windows_refuses_before_path_writer(tmp_path, monkeypatch):
-    assert not recovery_flow.DIR_FD_ANCHORED_WRITES
+def test_owned_spec_restore_native_windows_anchors_at_a_handle(tmp_path, monkeypatch):
+    """Windows restores through the handle-relative arm, not the path writer.
+
+    DW-309/310 first made this host fail closed because CPython offers no
+    `dir_fd` there; `platform_util.win32_at` now supplies the same anchor through
+    NT handle-relative opens, so the row that pinned the refusal pins the
+    restoration instead — and that the generic confined PATH writer is still
+    never reached, which is what the refusal existed to guarantee."""
     assert not platform_util.DIR_FD_ANCHORED_WRITES
+    assert recovery_flow.HANDLE_ANCHORED_WRITES
     spec = tmp_path.resolve() / "owned.md"
-    original = b"operator bytes\n"
-    spec.write_bytes(original)
+    spec.write_bytes(b"operator bytes\n")
+    snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
     path_writer_calls: list[Path] = []
 
     def path_writer_is_forbidden(path, *_args, **_kwargs):
@@ -181,12 +215,21 @@ def test_owned_spec_restore_native_windows_refuses_before_path_writer(tmp_path, 
         raise AssertionError("generic confined writer was called")
 
     monkeypatch.setattr(platform_util, "_atomic_write_confined", path_writer_is_forbidden)
+    real_write = platform_util.atomic_write_bytes_at
+    anchored: list[str] = []
 
-    with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable"):
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+    def spy(dir_fd, name, data, **kwargs):
+        anchored.append(name)
+        return real_write(dir_fd, name, data, **kwargs)
 
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", spy)
+
+    RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert anchored == ["owned.md"]
     assert path_writer_calls == []
-    assert spec.read_bytes() == original
+    assert spec.read_bytes() == snapshot
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 @pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
@@ -320,7 +363,7 @@ def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
 
 @pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_does_not_translate_content_read_value_error(
     tmp_path, monkeypatch, failure
@@ -351,8 +394,9 @@ def test_owned_spec_restore_preserves_byte_hostile_snapshot(tmp_path):
     assert spec.read_bytes() == snapshot
 
 
+@posix_parent_swap_under_writer
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 @pytest.mark.parametrize("victim_matches", [False, True], ids=["different-victim", "equal-victim"])
 def test_owned_spec_restore_parent_swap_before_publication_stays_anchored(
@@ -374,7 +418,7 @@ def test_owned_spec_restore_parent_swap_before_publication_stays_anchored(
     def swap_before_replace(dir_fd, name, data, **kwargs):
         def swap() -> None:
             parent.rename(moved)
-            parent.symlink_to(outside, target_is_directory=True)
+            _plant_directory_redirect(parent, outside)
 
         kwargs["_before_replace"] = swap
         return real_write(dir_fd, name, data, **kwargs)
@@ -386,11 +430,11 @@ def test_owned_spec_restore_parent_swap_before_publication_stays_anchored(
 
     assert victim.read_bytes() == victim_before
     assert (moved / spec.name).read_bytes() == snapshot
-    assert parent.is_symlink()
+    assert platform_util.is_link_like(parent)
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_parent_swap_before_filesystem_root_walk(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -411,7 +455,7 @@ def test_owned_spec_restore_refuses_parent_swap_before_filesystem_root_walk(tmp_
         if not swapped:
             swapped = True
             parent.rename(moved)
-            parent.symlink_to(outside, target_is_directory=True)
+            _plant_directory_redirect(parent, outside)
         return real_open(root, target, **kwargs)
 
     monkeypatch.setattr(recovery_flow, "open_dir_confined", swap_before_walk)
@@ -423,8 +467,9 @@ def test_owned_spec_restore_refuses_parent_swap_before_filesystem_root_walk(tmp_
     assert (moved / spec.name).read_bytes() == original
 
 
+@posix_parent_swap_under_writer
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_ancestor_swap_before_publication_stays_anchored(tmp_path, monkeypatch):
     ancestor = tmp_path.resolve() / "artifacts"
@@ -442,7 +487,7 @@ def test_owned_spec_restore_ancestor_swap_before_publication_stays_anchored(tmp_
     def swap_before_replace(dir_fd, name, data, **kwargs):
         def swap() -> None:
             ancestor.rename(moved)
-            ancestor.symlink_to(outside, target_is_directory=True)
+            _plant_directory_redirect(ancestor, outside)
 
         kwargs["_before_replace"] = swap
         return real_write(dir_fd, name, data, **kwargs)
@@ -457,7 +502,7 @@ def test_owned_spec_restore_ancestor_swap_before_publication_stays_anchored(tmp_
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -478,7 +523,7 @@ def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_p
         probes += 1
         if probes == 1:
             parent.rename(moved)
-            parent.symlink_to(outside, target_is_directory=True)
+            _plant_directory_redirect(parent, outside)
         return fd
 
     monkeypatch.setattr(recovery_flow, "open_dir_confined", swap_after_first_probe)
@@ -492,12 +537,25 @@ def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_p
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
-@pytest.mark.parametrize("replacement", ["missing", "symlink", "fifo", "socket", "directory"])
+@pytest.mark.parametrize(
+    "replacement", ["missing", "symlink", "junction", "fifo", "socket", "directory"]
+)
 def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
     tmp_path, monkeypatch, replacement
 ):
+    """Every shape the name can take after publication is authority loss, on
+    both anchored arms. ``fifo``/``socket`` are POSIX entry types; ``symlink`` at
+    a FILE name needs elevation on Windows, where ``junction`` is the redirect an
+    unprivileged writer plants instead (a directory reparse point the win32 arm
+    must refuse as it refuses a link) and has no POSIX counterpart."""
+    if replacement in {"fifo", "socket"} and sys.platform == "win32":
+        pytest.skip(f"{replacement} is a POSIX entry type")
+    if replacement == "symlink" and sys.platform == "win32":
+        pytest.skip("file symlink creation may need elevation")
+    if replacement == "junction" and sys.platform != "win32":
+        pytest.skip("junctions are a Windows reparse point")
     parent = tmp_path.resolve() / "artifacts"
     parent.mkdir()
     spec = parent / "owned.md"
@@ -519,6 +577,8 @@ def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
             spec.unlink()
             if replacement == "symlink":
                 spec.symlink_to(victim)
+            elif replacement == "junction":
+                _plant_directory_redirect(spec, outside)
             elif replacement == "fifo":
                 os.mkfifo(spec)
             elif replacement == "socket":
@@ -545,6 +605,8 @@ def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
     assert victim.read_bytes() == b"external victim"
     if replacement == "symlink":
         assert spec.is_symlink()
+    elif replacement == "junction":
+        assert platform_util.is_link_like(spec)
     elif replacement == "fifo":
         assert stat.S_ISFIFO(spec.lstat().st_mode)
     elif replacement == "socket":
@@ -556,7 +618,7 @@ def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_anchored_snapshot_plus_suffix_is_a_genuine_mismatch(
     tmp_path, monkeypatch
@@ -586,7 +648,7 @@ def test_owned_spec_restore_anchored_snapshot_plus_suffix_is_a_genuine_mismatch(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_preserves_raw_anchored_os_read_failure(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
@@ -606,7 +668,7 @@ def test_owned_spec_restore_preserves_raw_anchored_os_read_failure(tmp_path, mon
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_preserves_raw_postpublication_os_read_failure(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
@@ -644,7 +706,7 @@ def test_owned_spec_restore_preserves_raw_postpublication_os_read_failure(tmp_pa
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_anchored_uses_filesystem_anchor_for_external_target(
     tmp_path, monkeypatch
@@ -669,7 +731,7 @@ def test_owned_spec_restore_anchored_uses_filesystem_anchor_for_external_target(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_preserves_anchored_writable_target_refusal(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
@@ -690,7 +752,7 @@ def test_owned_spec_restore_preserves_anchored_writable_target_refusal(tmp_path,
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_anchored_refuses_missing_target_appearing_before_staging(
     tmp_path, monkeypatch
@@ -747,7 +809,7 @@ def _replace_target(spec: Path, data: bytes) -> None:
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_target_replacement_after_staging(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -778,7 +840,7 @@ def test_owned_spec_restore_refuses_target_replacement_after_staging(tmp_path, m
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_in_place_target_edit_after_staging(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -813,7 +875,7 @@ def test_owned_spec_restore_refuses_in_place_target_edit_after_staging(tmp_path,
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_in_place_edit_during_initial_content_read(
     tmp_path, monkeypatch
@@ -846,7 +908,7 @@ def test_owned_spec_restore_refuses_in_place_edit_during_initial_content_read(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_short_initial_content_sample(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -864,7 +926,7 @@ def test_owned_spec_restore_refuses_short_initial_content_sample(tmp_path, monke
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_compares_bounded_multichunk_content_after_staging(
     tmp_path, monkeypatch
@@ -914,7 +976,7 @@ def test_owned_spec_restore_compares_bounded_multichunk_content_after_staging(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_refuses_name_replacement_during_prepublication_read(
     tmp_path, monkeypatch
@@ -958,7 +1020,7 @@ def test_owned_spec_restore_refuses_name_replacement_during_prepublication_read(
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_preserves_raw_content_comparison_failure(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -993,7 +1055,7 @@ def test_owned_spec_restore_preserves_raw_content_comparison_failure(tmp_path, m
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_rejects_equal_byte_final_entry_replacement(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
@@ -1023,7 +1085,7 @@ def test_owned_spec_restore_rejects_equal_byte_final_entry_replacement(tmp_path,
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_rejects_live_name_replacement_during_readback(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
@@ -1064,7 +1126,7 @@ def test_owned_spec_restore_rejects_live_name_replacement_during_readback(tmp_pa
 
 
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_rejects_in_place_mutation_during_readback(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
@@ -1106,8 +1168,9 @@ def test_owned_spec_restore_rejects_in_place_mutation_during_readback(tmp_path, 
     assert spec.read_bytes() == snapshot + b"x"
 
 
+@posix_parent_swap_under_writer
 @pytest.mark.skipif(
-    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
 )
 def test_owned_spec_restore_real_parent_replacement_stays_in_retained_directory(
     tmp_path, monkeypatch
@@ -1288,7 +1351,7 @@ def _assert_owned_spec_manual_adoption_pause(
         "spec": str(spec.resolve()),
         "problem": (
             f"safe automatic restoration is unavailable {stage} because "
-            "this platform lacks descriptor-relative writes"
+            "this platform lacks handle-anchored writes"
             f"{status_guidance}; manual adoption is required"
         ),
     }
@@ -1607,7 +1670,8 @@ def test_plain_owned_spec_forced_fallback_pauses_while_undoing_lifecycle_repair(
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="attempt-owned lifecycle status"):
@@ -1765,7 +1829,8 @@ def test_plain_tracked_snapshot_forced_fallback_pauses_before_write(project, mon
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="manual adoption is required"):
@@ -1831,7 +1896,8 @@ def test_plain_forced_fallback_pauses_after_completed_baseline_reset(project, mo
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="after the baseline reset"):
@@ -1906,7 +1972,8 @@ def test_plain_sibling_residue_forced_fallback_preempts_generic_manual_pause(pro
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="before the ordinary manual-recovery pause"):
@@ -1978,7 +2045,8 @@ def test_latched_redrive_snapshot_equal_forced_fallback_pauses_for_retry_input(
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="pre-attempt retry input"):
@@ -2050,7 +2118,8 @@ def test_latched_redrive_forced_fallback_pauses_after_preservation(project, monk
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="manual adoption is required"):
@@ -2088,7 +2157,8 @@ def test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset(
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="after the baseline reset"):
@@ -2210,7 +2280,8 @@ def test_plain_git_invisible_snapshot_forced_fallback_pauses_before_reset(
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="manual adoption is required"):
@@ -2297,7 +2368,8 @@ def test_latched_redrive_index_only_forced_fallback_pauses_after_preservation(
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="before the baseline reset"):
@@ -2573,7 +2645,8 @@ def test_resolved_cause_forced_fallback_pauses_after_completed_reset(project, mo
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="after the baseline reset"):
@@ -3085,7 +3158,8 @@ def test_patch_restore_redrive_forced_fallback_requires_in_review_adoption(proje
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
 
     with pytest.raises(_Pause, match="lifecycle status 'in-review'"):

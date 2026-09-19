@@ -296,6 +296,7 @@ REFUSAL_HELPER_DEFS = {
     ("resolve.py", "_reject_json_constant"),
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
+    ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
     ("workspace.py", "_refuse_foreign_checkout"),
     ("worktree_flow.py", "_refuse_integrated_artifacts"),
 }

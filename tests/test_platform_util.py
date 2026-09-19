@@ -1837,9 +1837,16 @@ def test_walk_files_unlinked_refuses_a_link_like_top(tmp_path, monkeypatch):
 DIR_FD = pytest.mark.skipif(
     not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
 )
+# The rows below that need only what BOTH anchored arms provide — a confined
+# directory handle, the ``*_at`` writers, the confined writers — run on Windows
+# too, through ``win32_at``; ``DIR_FD`` stays on the rows that also need
+# ``scandir(fd)``, mode bits, or a symlink the runner may not be allowed to plant.
+ANCHORED = pytest.mark.skipif(
+    not platform_util.HANDLE_ANCHORED_WRITES, reason="needs a handle-anchored write arm"
+)
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_returns_a_descriptor_for_a_clean_chain(tmp_path):
     """The positive control the refusals below need: an unplanted chain hands back
     a descriptor for the directory that was asked for, not merely a non-None int.
@@ -1875,7 +1882,7 @@ def test_open_dir_confined_refuses_a_symlinked_component(tmp_path):
     assert platform_util.open_dir_confined(root, root / ".bmad-loop" / "runs") is None
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_refuses_a_target_outside_the_root(tmp_path):
     """Confinement is refused before a single directory is opened: a target that is
     not under the root has no chain to walk, however clean its own ancestry is."""
@@ -1887,7 +1894,7 @@ def test_open_dir_confined_refuses_a_target_outside_the_root(tmp_path):
     assert platform_util.open_dir_confined(root, elsewhere) is None
 
 
-@DIR_FD
+@ANCHORED
 def test_open_dir_confined_refuses_a_missing_component(tmp_path):
     """An absent directory is refused rather than created. The confined writers
     lean on this: they require the parent to EXIST, because a walk cannot vouch
@@ -2017,8 +2024,13 @@ def test_open_dir_confined_search_only_crosses_execute_only_intermediate_directo
 
 @contextmanager
 def _dir_fd(directory: Path):
-    """The descriptor the anchored helpers take, closed on the way out."""
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    """The descriptor the anchored helpers take, closed on the way out — the
+    ``O_DIRECTORY`` open on POSIX, a directory handle through ``win32_at`` on
+    Windows, exactly as `open_dir_confined` anchors on each arm."""
+    if platform_util.DIR_FD_ANCHORED_WRITES:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    else:
+        fd = platform_util.win32_at.open_directory(directory)
     try:
         yield fd
     finally:
@@ -2070,7 +2082,7 @@ def test_atomic_write_bytes_at_lands_a_private_mode(tmp_path):
     assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_preserves_crlf_verbatim(tmp_path):
     """The reason a bytes-anchored variant had to exist at all (#593).
 
@@ -2095,7 +2107,7 @@ def test_atomic_write_bytes_at_preserves_crlf_verbatim(tmp_path):
     assert (tmp_path / "spec.md").read_bytes() == payload
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_text_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
     """A failed anchored write leaves the directory as it found it.
 
@@ -2117,7 +2129,7 @@ def test_atomic_write_text_at_removes_its_temp_when_the_write_fails(tmp_path, mo
     assert list(tmp_path.glob("*.tmp")) == []  # and nothing was stranded beside it
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
     """The bytes arm's own cleanup pin — mirrored, per the banner's reasoning."""
     target = tmp_path / "policy.toml"
@@ -2135,7 +2147,7 @@ def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, m
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_writable_refusal_precedes_staging(tmp_path, monkeypatch):
     target = tmp_path / "owned.md"
     target.write_bytes(b"before")
@@ -2163,7 +2175,7 @@ def test_atomic_write_bytes_at_writable_refusal_precedes_staging(tmp_path, monke
     assert target.read_bytes() == b"before"
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_at_does_not_verify_after_prepublication_failure(tmp_path):
     target = tmp_path / "owned.md"
     target.write_bytes(b"before")
@@ -2330,6 +2342,24 @@ def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
     assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
 
 
+def test_atomic_write_text_confined_lands_the_platform_line_ending(tmp_path):
+    """The confined TEXT writer keeps `atomic_write_text`'s translating newline
+    default on every arm — LF on POSIX, CRLF on Windows — so anchoring the write
+    through `win32_at` changed no byte a ledger or decisions file lands there.
+    `atomic_write_text_at` (records, POSIX-only callers) is the one that never
+    translates; the confined writer is what the operator-edited cohort uses.
+
+    Ablation: drop the `newline=None` the confined arm passes `_atomic_write_at`
+    and this reddens on Windows with LF where the path writer landed CRLF."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+
+    platform_util.atomic_write_text_confined(parent / "ledger.md", "a\nb\n", confine_root=root)
+
+    assert (parent / "ledger.md").read_bytes() == f"a{os.linesep}b{os.linesep}".encode()
+
+
 def test_atomic_write_confined_refuses_a_parent_ref_below_the_root(tmp_path):
     """`is_relative_to` is a lexical PREFIX test, so `root/specs/../../outside/f`
     passes it while naming a path outside the root — and `..` is a real directory
@@ -2379,6 +2409,7 @@ def test_atomic_write_confined_refuses_a_parent_ref_on_the_fallback_arm(tmp_path
     Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE`,
     with the payload landing over `outside/victim.md` through the plain no-follow
     write."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     (root / "specs").mkdir(parents=True)
@@ -2469,6 +2500,7 @@ def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypa
         platform_util.create_exclusive_confined(target, confine_root=root)
     assert list(outside.iterdir()) == []  # nothing landed outside
 
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
         platform_util.create_exclusive_confined(target, confine_root=root)
@@ -2577,7 +2609,7 @@ def test_atomic_write_bytes_confined_preserves_crlf_verbatim(tmp_path):
     assert (parent / "story.md").read_bytes() == payload
 
 
-@DIR_FD
+@ANCHORED
 def test_atomic_write_bytes_confined_runs_callback_with_live_published_fd(tmp_path):
     root = tmp_path / "project"
     parent = root / "specs"
@@ -2596,11 +2628,13 @@ def test_atomic_write_bytes_confined_runs_callback_with_live_published_fd(tmp_pa
     )
 
     assert observed and observed[0][1] == b"published"
-    with pytest.raises(OSError, match="Bad file descriptor"):
-        os.fstat(observed[0][0])
+    with pytest.raises(OSError) as closed:  # EBADF: "Bad file descriptor" on POSIX,
+        os.fstat(observed[0][0])  # "Invalid handle" on Windows
+    assert closed.value.errno == errno.EBADF
 
 
 def test_atomic_write_bytes_confined_fallback_post_callback_receives_no_fd(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     parent = root / "specs"
@@ -2620,6 +2654,7 @@ def test_atomic_write_bytes_confined_fallback_post_callback_receives_no_fd(tmp_p
 
 
 def test_confined_fallback_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     parent = root / "specs"
@@ -2648,7 +2683,7 @@ def test_confined_fallback_callback_failure_does_not_unlink_reused_temp_name(tmp
     assert reused.read_bytes() == b"another writer"
 
 
-@DIR_FD
+@ANCHORED
 def test_confined_anchored_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
     root = tmp_path / "project"
     parent = root / "specs"
@@ -2658,12 +2693,7 @@ def test_confined_anchored_callback_failure_does_not_unlink_reused_temp_name(tmp
     failure = RuntimeError("post-publication verification failed")
 
     def fixed_temp(dir_fd: int, _prefix: str, _name: str) -> tuple[int, str]:
-        fd = os.open(
-            reused.name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-            dir_fd=dir_fd,
-        )
+        fd = platform_util.open_at(dir_fd, reused.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         return fd, reused.name
 
     published_fds: list[int] = []
@@ -2684,8 +2714,9 @@ def test_confined_anchored_callback_failure_does_not_unlink_reused_temp_name(tmp
     assert excinfo.value is failure
     assert target.read_bytes() == b"published"
     assert reused.read_bytes() == b"another writer"
-    with pytest.raises(OSError, match="Bad file descriptor"):
-        os.fstat(published_fds[0])
+    with pytest.raises(OSError) as closed:  # EBADF: "Bad file descriptor" on POSIX,
+        os.fstat(published_fds[0])  # "Invalid handle" on Windows
+    assert closed.value.errno == errno.EBADF
 
 
 @DIR_FD
@@ -2733,6 +2764,7 @@ def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypa
 
     Ablation: delete the `path_is_confined` check and this fails `DID NOT RAISE`,
     with the file landing in `outside/` exactly as the unguarded POSIX path did."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     root.mkdir()
@@ -2759,6 +2791,7 @@ def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypa
 
 
 def test_confined_fallback_rejects_before_writable_probe_and_staging(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
     monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     root = tmp_path / "project"
     parent = root / "specs"

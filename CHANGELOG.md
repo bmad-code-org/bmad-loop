@@ -9,6 +9,16 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Restore and normalize attempt-owned specs on Windows through NT handle-relative
+  opens instead of pausing for manual adoption. `win32_at` binds `NtCreateFile` with a
+  `RootDirectory` handle plus `FileRenameInformationEx`/`FileDispositionInformationEx`
+  (POSIX semantics, classic classes as the fallback) and refuses a symlink or junction
+  as `O_NOFOLLOW` refuses a link; `platform_util.HANDLE_ANCHORED_WRITES` joins that arm
+  to the POSIX `dir_fd` one behind `open_at`/`stat_at`/`replace_at`/`unlink_at`, so the
+  confined spec writers and `open_dir_confined` anchor at a handle on both hosts. The
+  DW-309/DW-310 refusal now fires only on a host with neither arm; its journaled
+  `problem` reads `lacks handle-anchored writes`.
+
 - Accept a session-asserted artifact-only sweep bundle at the dev proof-of-work gate
   (DW-273). A bundle whose only deliverable lives under a gitignored
   `implementation_artifacts` (a spec-only erratum) burned every attempt on
