@@ -88,3 +88,15 @@ def test_triage_path_sequence():
     ):
         advance(task, phase)
     assert task.terminal
+
+
+def test_migration_triage_commit_path_sequence():
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    for phase in (
+        Phase.TRIAGE_RUNNING,
+        Phase.TRIAGE_VERIFY,
+        Phase.COMMITTING,
+        Phase.DONE,
+    ):
+        advance(task, phase)
+    assert task.terminal

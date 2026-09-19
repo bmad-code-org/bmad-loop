@@ -468,6 +468,158 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Restore the accepted commit chain and index when the post-squash HEAD identity
+  probe fails, retaining the probe fault if rollback also fails (DW-305).
+
+- Preserve accepted tracked artifact identities through target merge, squash,
+  fast-forward, hooks, and crash replay; snapshot the complete target transaction
+  into aggregate-limited streamed sidecars, preserve exact index/worktree and
+  cleanup-phase state, and refuse drift with verified, retained-source recovery
+  when ref, index, worktree, ignored-path, topology, or submodule evidence is unsafe
+  (DW-302/DW-303). The incoming paths are held to the integrated commit too — a
+  target hook's rewrite of an ordinary incoming source file, staged, left in the
+  checkout, or sealed into the squash leg's own commit, is refused and restored
+  rather than recorded as `unit-merged`; so is an incoming path the unit deletes
+  that a target hook recreates unstaged, which no index reading can see; and so
+  is any change a target hook leaves outside every receipt-owned set — a clean
+  tracked file edited, staged, deleted or renamed, a new file written beside it
+  — which a whole-tree reading names (after the hooks the target may hold only
+  the strays the guard tolerated before the merge), the orchestrator's own
+  `.bmad-loop/` included — the hook relay script, a committed `policy.toml`,
+  a profile overlay — with only the run's own records left out, and the
+  pre-merge guard tolerating or blocking a stray there on the same terms as
+  any other — and a hook's `update-index --assume-unchanged` on a clean
+  tracked file outside the incoming set, which status never lists, is
+  refused by the receipt's digest of every other index entry's flag word
+  and named from its map of the marked ones (a rename's source is incoming
+  too — `diff --name-only` had named the destination alone — so a renaming
+  bundle is not refused over the entry its merge deletes), and a hook's
+  gitignored write anywhere — beside an incoming path in a directory the
+  target already held populated, which no reading listed, or over an
+  ignored file that was already there, which leaves the path set unchanged
+  and `status` and `diff` silent — is refused by the receipt's sealed
+  listing of the whole tree's ignored entries, each with its `lstat`
+  identity (a sidecar under the operation's capture root; bytes never
+  read, removals not read, a tolerated stray an incoming `.gitignore`
+  change turned ignored left out) and named; the restore reverts what
+  the hook staged and leaves unstaged, untracked and ignored entries in place, named
+  for the operator; and a directory the unit creates, where the receipt
+  proved nothing was — or proved an empty untracked directory, which git
+  never tracks and no reading lists — or where the receipt captured a
+  tracked file, a symlink, or an unpopulated gitlink the unit replaced — is
+  walked on disk
+  against the integrated commit, so a hook's gitignored write or nested
+  `.git` there — which no `status` reading lists — is refused too (that
+  restore is the proved-absent directory's existing doctrine: it removes
+  nothing it cannot attribute, and pauses as not safely restorable with the
+  path named; the replaced file's restore goes through its own path, git
+  taking the directory with it, and the replaced gitlink's puts the empty
+  directory back once git has taken the commit's files, refusing over
+  anything else left there). A unit
+  that deletes a populated target submodule integrates: git leaves the checkout
+  behind (`?? path/`), which is accepted only as the exact captured checkout
+  and otherwise refused, with the refusal's restore undoing a hook's writes
+  into a captured submodule checkout rather than pausing unrestored; a unit
+  that replaces a populated submodule with a tracked directory integrates the
+  same way — git writes the commit's files into the checkout it could not
+  remove, and that leftover is accepted only owned, at the captured HEAD, and
+  holding nothing beyond what the integrated tree holds under it. A gitlink
+  the unit adds is read the same way as a captured one — index at the gitlink
+  (skip-worktree accepted on a sparse target's out-of-cone gitlink — on a
+  sparse target only, git stripping a hook's bit from an in-pattern entry
+  and a hook alone setting it elsewhere — and a hook's `update-index
+  --assume-unchanged` or `--skip-worktree` on an incoming file, which no
+  diff reading sees, refused by its index flag word; an
+  operator's assume-unchanged bit on a captured gitlink is recorded and
+  preserved — every modern integration into a target holding one paused,
+  even of a bundle that never touched the submodule — a hook's flip of the
+  captured word is drift, and the restore puts the word back where
+  `git restore` cleared it),
+  a populated checkout this repository's, clean (ignored entries included, the
+  path having been proved absent), at the gitlink — since an
+  incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update
+--init` and everything it writes from every `git diff` reading; the restore
+  removes such a hook-made checkout at a receipt-proved-absent path — and the
+  accepted artifact paths are
+  resolved before the receipt is armed, so a resolver refusal pauses ahead of any
+  target mutation instead of snapshotting short of them. A collision-cleanup fault
+  restores only the paths the cleanup touched, never a planned path it had not
+  reached. Restoration completeness reads the receipt-attributable inventory, so an
+  operator's unstaged edit elsewhere during the merge window no longer fails a
+  completed restore or blocks its replay; a refused no-ref-update attempt records
+  its unchanged revision so the receipt stays replayable instead of reading as
+  malformed on resume. A unit that turns a tracked file into a directory
+  (`a` deleted, `a/b` added) integrates — the capture read the leaf beneath
+  the file as a fault rather than as absent, pausing before the merge and
+  again on every resume — and its refusal restores the old shape through the
+  parent path alone, git refusing the pair (a symlink it turns into a
+  directory — a dangling one too, whose leaf beneath is absent by topology
+  rather than "an unavailable parent", and one that resolves, into the
+  repository or out of it, to a directory holding the leaf's own name,
+  which the capture dereferenced and refused as a redirected parent or an
+  escaped path: git tracks no path through a symlink, so a leaf beneath a
+  link the incoming set replaces is absent by topology wherever the link
+  points, the link captured and put back as bytes under its own path and
+  every receipt reading confining the leaf by the link's parent rather than
+  reading through it — the checked-path restore refusing a parent swapped
+  for a link before its first write — and the reverse transition, a tracked
+  directory the commit turns into such a link, no longer read as a deleted
+  leaf recreated — and a leaf it puts deeper beneath the file, restore the same
+  way: the restore refused the put-back symlink as a redirection and crashed
+  opening the restored file as the deeper leaf's parent); a target cloned without
+  `--recurse-submodules`, every gitlink an empty directory, integrates too —
+  the capture probed each one for its superproject and called it foreign —
+  and the receipt records such a gitlink unpopulated, so a checkout a target
+  hook's `submodule update --init` makes there is the refusal's to remove
+  (a repository of any other kind there refuses the restore) rather than
+  the next capture's baseline. Receipt paths are held to the Win32 name
+  rules — reserved characters, device aliases, a drive prefix, a backslash —
+  on a Windows host alone: on POSIX git permits `:`, `?`, `*`, `\` and
+  control characters in a name, every reading round-trips them
+  NUL-delimited, and holding them everywhere paused each modern bundle that
+  touched such a file as malformed (containment — absolute, `..`, `.git`, NUL —
+  holds on every host); an ignored file that was already there and that an
+  incoming `.gitignore` change uncovers — `??` after the merge, never in
+  the tolerated set since the pre-merge guard never listed it — is no
+  longer named as a hook's stray when the receipt's ignored listing holds
+  it at the identity it still has (it used to pause every retry until the
+  operator deleted it), while one the listing holds under another identity
+  is still named; and the receipt's absent-parent topology is read by
+  git's slash hierarchy, the one the capture wrote: the Windows reading took
+  `a:` for a drive and a backslash for a separator, so a POSIX receipt naming
+  such a parent was refused as malformed at the replay that needed it. No
+  record retires a live receipt or stands for a modern bundle's
+  completion: a coding session holds the writable run directory and can
+  append a `unit-merged` row under its own key — the receipt's operation
+  identity included — and it holds the shared repository, so the target
+  reflog transition under that identity is its to write too (`git
+  update-ref -m bmad-loop-integrate:<id>`, on a branch checked out in
+  another worktree as well); reading the pair as the validated completion
+  skipped the deterministic target validation after a host loss (receipt
+  gone, merge skipped, publication over whatever the session had put on
+  the target). A live receipt always replays the merge, which finds the
+  moved ref under the receipt and validates it, or pauses with evidence;
+  with no live receipt — a host lost before one was armed, or after a
+  successful integration retired it — the merge replays while the unit's
+  source is still mounted (it stages nothing again over a landed result,
+  re-validates the target's bytes and re-records — an integration that
+  made no ref update, an artifact-only bundle's squash, the same way), and
+  once the completed integration has consumed the source (worktree torn
+  down, branch gone) the completion stands only on the target as it is
+  now — the unit's commit in its history, or, since a squash seals a
+  commit of its own and never that one, every change the unit made over
+  its baseline folded into the target's tree blob for blob (mode and
+  object id per added or rewritten path, each deleted path absent) — and
+  every accepted artifact blob in its tree and index — or pauses naming
+  the reason (the released legacy payload integrates without a receipt
+  and keeps its bare row).
+
+- Recover sweep migration publication faults without persisting unearned `DONE`
+  state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
+  pre-dispatch baseline after publication refusal, restore result-faulted ledgers
+  by compare-and-set, and resume a durable `COMMITTING` task through the commit-only
+  tail.
+
 - Bind tracked and pending-tracked isolated bundle deliverables to their accepted
   Git-normalized bytes and validate their exact staged entries before commit (DW-300).
   Drift now pauses with path-only recovery evidence and retains the source mount;
@@ -476,11 +628,10 @@ breaking changes may land in a minor release.
   (a concurrent writer) no longer reads as "nothing to commit" with the accepted chain
   orphaned and baseline recorded as the bundle's commit — the committed-tree validator
   runs against baseline, the original chain and index are restored, and the run pauses.
-  The integrated target tree is validated ahead of `unit-merged` as well: a target-side
-  `pre-commit` hook rewriting a tracked deliverable in the squash leg's own commit no
-  longer lands it under the bundle's name — the target is returned to its pre-merge
-  revision (`reset --keep`, never flattening a local edit), the refusal is journaled and
-  the unit is kept and escalated, so a resume replays the merge.
+  The integrated target commit and post-hook index are validated ahead of `unit-merged`
+  as well, so a target-side hook rewriting a tracked deliverable in the integration's own
+  commit never lands it under the bundle's name (the receipt-backed refusal and restore
+  are DW-302/DW-303's, below).
 
 - Sample destination pathname identity after streamed artifact probes, refusing observed
   detachment while retaining checked-fallback races (DW-301).
@@ -488,6 +639,10 @@ breaking changes may land in a minor release.
 - Stream artifact destination hashing and equality checks in fixed-size chunks, bounding
   baseline-capture and publication memory even when operator-owned files are large or grow
   during validation (DW-298/DW-299).
+
+- Restore attempt-owned specs through descriptor-capable parent-anchored publication and
+  verification on POSIX, preventing late parent substitution from redirecting bytes; retain
+  checked path-based restoration on no-descriptor platforms (DW-295).
 
 - Bind explicitly published ignored bundle deliverables to the exact bytes accepted by final
   dev, repair, or review verification (DW-290). Preparation now refuses post-verification byte

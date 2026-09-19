@@ -3533,6 +3533,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     crashed = load_state(engine.run_dir).tasks["1-1-a"]
     landed_head = rev_parse_head(project.project)
     assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.dw_ids == [] and crashed.integration_attempt is None
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     assert Path(crashed.worktree_path).is_dir()
     assert not project.deferred_work.exists()
@@ -3567,6 +3568,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert resumed.state.tasks["1-1-a"].integration_attempt is None
     assert rev_parse_head(project.project) == landed_head
     assert replay_collision_refs == [crashed.commit_sha]
     # The replay reaches `merge_local` by its own route, so the carry-path guard has

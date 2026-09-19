@@ -705,39 +705,122 @@ def validate_committed(
         )
 
 
-def validate_integrated(task: StoryTask, paths: ProjectPaths, revision: str) -> None:
-    """Require the integrated target ``revision`` to carry the accepted Git deliverables.
+def validate_integrated(task: StoryTask, target: ProjectPaths, revision: str) -> bool:
+    """Validate the target commit and post-hook index against accepted blobs.
 
-    The unit-side validators prove the unit's own commit; this one proves what the
-    target integration landed. ``merge_branch``'s ``--no-ff`` and squash legs each
-    seal the result with a commit of the TARGET's own, where its hooks run and can
-    rewrite and re-add a tracked deliverable (#795 review) — the same drift the
-    committed-tree validator refuses on the unit side. Tracked and pending-tracked
-    rels must sit in ``revision`` at their accepted blob identity, and an ignored
-    rel must not have been force-added: the same predicate as the staged and
-    committed checks, read off the target's tree.
+    Returns ``False`` only for a legacy frozen payload which predates accepted
+    source maps.  Such a payload keeps its historical integration/publication
+    path; missing authority is never synthesized from target or live source
+    bytes.  Once either new-style map (or its acceptance owner) exists, both
+    complete maps are required and malformed evidence fails closed.
     """
+    if not requires_target_integration_receipt(task):
+        return False
+
     ignored, tracked = _validated_source_maps(task)
+    repo_rels = _integrated_repo_rels(target, ignored, tracked)
+    path_list = tuple(repo_rels.values())
+    try:
+        committed = verify.revision_blob_oids(target.repo_root, revision, path_list)
+    except verify.GitError as exc:
+        raise PublicationError(
+            "target commit artifact evidence is unavailable for declared paths: "
+            + ", ".join(sorted(repo_rels))
+        ) from exc
+    committed_observed = {
+        rel: committed[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in committed
+    }
+    _validate_git_snapshot(ignored, tracked, committed_observed)
+
+    try:
+        staged = verify.staged_blob_oids(target.repo_root, path_list)
+    except verify.GitError as exc:
+        raise PublicationError(
+            "target index artifact evidence is unavailable for declared paths: "
+            + ", ".join(sorted(repo_rels))
+        ) from exc
+    staged_observed = {
+        rel: staged[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in staged
+    }
+    _validate_git_snapshot(ignored, tracked, staged_observed)
+    return True
+
+
+def _validated_frozen_payload(task: StoryTask) -> dict[str, str]:
+    payload = task.artifact_payload
+    if not isinstance(payload, dict) or not all(
+        isinstance(rel, str) and isinstance(encoded, str) for rel, encoded in payload.items()
+    ):
+        raise PublicationError("frozen artifact publication payload is missing or malformed")
+    for rel, encoded in payload.items():
+        _relative(rel)
+        try:
+            base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise PublicationError("frozen artifact publication payload is malformed") from exc
+    return payload
+
+
+def requires_target_integration_receipt(task: StoryTask) -> bool:
+    """Classify complete modern authority versus the released legacy payload.
+
+    The legacy arm is deliberately narrow: only a valid historical dictionary
+    payload with no tracked map bypasses the target receipt/reflog contract.
+    Partial modern shapes and malformed payloads fail before any target mutation.
+    """
+    if task.artifact_tracked_source_oids is not None:
+        ignored, _tracked = _validated_source_maps(task)
+        if task.artifact_payload is not None:
+            payload = _validated_frozen_payload(task)
+            if payload.keys() != ignored.keys() or any(
+                _digest(base64.b64decode(payload[rel], validate=True)) != digest
+                for rel, digest in ignored.items()
+            ):
+                raise PublicationError(
+                    "frozen artifact payload differs from accepted ignored source binding"
+                )
+        if (
+            not isinstance(task.artifact_acceptance_identity, str)
+            or not task.artifact_acceptance_identity
+        ):
+            raise PublicationError("accepted artifact acceptance identity is missing or malformed")
+        return True
+
+    _validated_frozen_payload(task)
+    if task.artifact_tracked_source_oids is None:
+        ignored = task.artifact_source_digests
+        owner = task.artifact_acceptance_identity
+        if ignored is not None and (
+            not isinstance(ignored, dict)
+            or not all(
+                isinstance(rel, str) and isinstance(value, str) for rel, value in ignored.items()
+            )
+        ):
+            raise PublicationError("legacy artifact source binding is malformed")
+        if owner is not None and (not isinstance(owner, str) or not owner):
+            raise PublicationError("legacy artifact acceptance identity is malformed")
+        return False
+    raise AssertionError("unreachable")
+
+
+def integrated_artifact_repo_paths(task: StoryTask, target: ProjectPaths) -> tuple[str, ...]:
+    """Return validated target-repository paths covered by accepted authority."""
+    ignored, tracked = _validated_source_maps(task)
+    return tuple(_integrated_repo_rels(target, ignored, tracked).values())
+
+
+def _integrated_repo_rels(
+    target: ProjectPaths, ignored: dict[str, str], tracked: dict[str, str]
+) -> dict[str, str]:
     rels = tuple(ignored) + tuple(tracked)
     if rels:
-        _root(paths)
-    repo_rels = {
-        rel: (paths.implementation_artifacts / _relative(rel))
-        .relative_to(paths.repo_root)
+        _root(target)
+    return {
+        rel: (target.implementation_artifacts / _relative(rel))
+        .relative_to(target.repo_root)
         .as_posix()
         for rel in rels
     }
-    try:
-        integrated = verify.revision_blob_oids(paths.repo_root, revision, repo_rels.values())
-    except verify.GitError as exc:
-        raise PublicationError(
-            "Git artifact deliverables have unavailable integration evidence: "
-            + ", ".join(sorted(repo_rels))
-        ) from exc
-    observed = {
-        rel: integrated[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in integrated
-    }
-    _validate_git_snapshot(ignored, tracked, observed)
 
 
 def prepare(

@@ -8,6 +8,9 @@ under a real Engine stays covered by test_engine.py.
 
 from __future__ import annotations
 
+import os
+import socket
+import stat
 import sys
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -15,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
 
-from bmad_loop import recovery_flow, verify
+from bmad_loop import platform_util, recovery_flow, verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
@@ -152,8 +155,13 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
     refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
     monkeypatch.setattr(
         recovery_flow,
-        "atomic_write_bytes",
+        "atomic_write_bytes_confined",
         lambda path, *_args, **_kwargs: writes.append(path),
+    )
+    monkeypatch.setattr(
+        recovery_flow,
+        "atomic_write_bytes_at",
+        lambda _fd, path, *_args, **_kwargs: writes.append(Path(path)),
     )
 
     with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
@@ -205,7 +213,8 @@ def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
     def fail_write(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes", fail_write)
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", fail_write)
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", fail_write)
 
     with pytest.raises(type(failure)) as excinfo:
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
@@ -215,12 +224,36 @@ def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
 
 
 @pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
 def test_owned_spec_restore_does_not_translate_readback_value_error(tmp_path, monkeypatch, failure):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes\n")
+
+    def fail_readback(fd, size):
+        raise failure
+
+    monkeypatch.setattr(recovery_flow.os, "read", fail_readback)
+
+    with pytest.raises(type(failure)) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == b"snapshot bytes\n"
+
+
+@pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
+def test_owned_spec_restore_fallback_preserves_raw_readback_value_error(
+    tmp_path, monkeypatch, failure
+):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
     spec = tmp_path.resolve() / "owned.md"
     spec.write_bytes(b"operator bytes\n")
     real_read_bytes = Path.read_bytes
 
-    def fail_readback(path):
+    def fail_readback(path: Path) -> bytes:
         if path == spec:
             raise failure
         return real_read_bytes(path)
@@ -231,7 +264,738 @@ def test_owned_spec_restore_does_not_translate_readback_value_error(tmp_path, mo
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
 
     assert excinfo.value is failure
-    assert real_read_bytes(spec) == b"snapshot bytes\n"
+    with spec.open("rb") as fh:
+        assert fh.read() == b"snapshot bytes\n"
+
+
+def test_owned_spec_restore_preserves_byte_hostile_snapshot(tmp_path):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"old")
+    snapshot = b"---\r\nstatus: caf\xe9\r\n---\r\n\x00tail"
+
+    RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == snapshot
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+@pytest.mark.parametrize("victim_matches", [False, True], ids=["different-victim", "equal-victim"])
+def test_owned_spec_restore_parent_swap_before_publication_stays_anchored(
+    tmp_path, monkeypatch, victim_matches
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes\n"
+    moved = tmp_path / "moved-artifacts"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / spec.name
+    victim_before = snapshot if victim_matches else b"external victim"
+    victim.write_bytes(victim_before)
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def swap_before_replace(dir_fd, name, data, **kwargs):
+        def swap() -> None:
+            parent.rename(moved)
+            parent.symlink_to(outside, target_is_directory=True)
+
+        kwargs["_before_replace"] = swap
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", swap_before_replace)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert victim.read_bytes() == victim_before
+    assert (moved / spec.name).read_bytes() == snapshot
+    assert parent.is_symlink()
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_parent_swap_before_filesystem_root_walk(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    moved = tmp_path / "moved-artifacts"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / spec.name
+    victim.write_bytes(b"external victim")
+    real_open = recovery_flow.open_dir_confined
+    swapped = False
+
+    def swap_before_walk(root: Path, target: Path, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            parent.rename(moved)
+            parent.symlink_to(outside, target_is_directory=True)
+        return real_open(root, target, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "open_dir_confined", swap_before_walk)
+
+    with pytest.raises(_OwnedSpecAuthorityError):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert victim.read_bytes() == b"external victim"
+    assert (moved / spec.name).read_bytes() == original
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_ancestor_swap_before_publication_stays_anchored(tmp_path, monkeypatch):
+    ancestor = tmp_path.resolve() / "artifacts"
+    parent = ancestor / "nested"
+    parent.mkdir(parents=True)
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    moved = tmp_path / "moved-artifacts"
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    victim = outside / "nested" / spec.name
+    victim.write_bytes(b"external victim")
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def swap_before_replace(dir_fd, name, data, **kwargs):
+        def swap() -> None:
+            ancestor.rename(moved)
+            ancestor.symlink_to(outside, target_is_directory=True)
+
+        kwargs["_before_replace"] = swap
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", swap_before_replace)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert victim.read_bytes() == b"external victim"
+    assert (moved / "nested" / spec.name).read_bytes() == b"snapshot bytes"
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    moved = tmp_path / "moved-artifacts"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / spec.name
+    victim.write_bytes(b"external victim")
+    real_open = recovery_flow.open_dir_confined
+    probes = 0
+
+    def swap_after_first_probe(root: Path, target: Path, **kwargs):
+        nonlocal probes
+        fd = real_open(root, target, **kwargs)
+        probes += 1
+        if probes == 1:
+            parent.rename(moved)
+            parent.symlink_to(outside, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(recovery_flow, "open_dir_confined", swap_after_first_probe)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert probes == 2
+    assert victim.read_bytes() == b"external victim"
+    assert (moved / spec.name).read_bytes() == b"snapshot bytes"
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+@pytest.mark.parametrize("replacement", ["missing", "symlink", "fifo", "socket", "directory"])
+def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
+    tmp_path, monkeypatch, replacement
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"external victim")
+    published: list[bytes] = []
+    listeners: list[socket.socket] = []
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def mutate_after_publish(dir_fd, name, data, **kwargs):
+        verifier = kwargs["_after_replace"]
+
+        def replace_then_verify(published_fd):
+            published.append(spec.read_bytes())
+            spec.unlink()
+            if replacement == "symlink":
+                spec.symlink_to(victim)
+            elif replacement == "fifo":
+                os.mkfifo(spec)
+            elif replacement == "socket":
+                listener = socket.socket(socket.AF_UNIX)
+                listener.bind(str(spec))
+                listeners.append(listener)
+            elif replacement == "directory":
+                spec.mkdir()
+            verifier(published_fd)
+
+        kwargs["_after_replace"] = replace_then_verify
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", mutate_after_publish)
+
+    try:
+        with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+            RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+    finally:
+        for listener in listeners:
+            listener.close()
+
+    assert published == [snapshot]
+    assert victim.read_bytes() == b"external victim"
+    if replacement == "symlink":
+        assert spec.is_symlink()
+    elif replacement == "fifo":
+        assert stat.S_ISFIFO(spec.lstat().st_mode)
+    elif replacement == "socket":
+        assert stat.S_ISSOCK(spec.lstat().st_mode)
+    elif replacement == "directory":
+        assert spec.is_dir()
+    else:
+        assert not spec.exists()
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_anchored_snapshot_plus_suffix_is_a_genuine_mismatch(
+    tmp_path, monkeypatch
+):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_write = recovery_flow.atomic_write_bytes_at
+    real_read = os.read
+    requested: list[int] = []
+
+    def write_suffix(dir_fd, name, data, **kwargs):
+        return real_write(dir_fd, name, data + b"x", **kwargs)
+
+    def bounded_read(fd: int, size: int) -> bytes:
+        requested.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", write_suffix)
+    monkeypatch.setattr(recovery_flow.os, "read", bounded_read)
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == snapshot + b"x"
+    assert requested == [len(snapshot) + 1]
+
+
+def test_owned_spec_restore_fallback_snapshot_plus_suffix_is_a_genuine_mismatch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_write = recovery_flow.atomic_write_bytes_confined
+
+    def write_suffix(path, data, **kwargs):
+        return real_write(path, data + b"x", **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", write_suffix)
+
+    with pytest.raises(verify.FrontmatterWriteError):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == snapshot + b"x"
+
+
+def test_owned_spec_restore_translates_only_confined_writer_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    refusal = UnconfinedWriteError("refused filesystem walk")
+
+    def refuse(*_args, **_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", refuse)
+
+    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert excinfo.value.__cause__ is refusal
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_preserves_raw_anchored_os_read_failure(tmp_path, monkeypatch):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    failure = OSError("ordinary read failed")
+
+    def fail_read(_fd, _size):
+        raise failure
+
+    monkeypatch.setattr(recovery_flow.os, "read", fail_read)
+
+    with pytest.raises(OSError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == b"snapshot bytes"
+
+
+def test_owned_spec_restore_preserves_raw_fallback_read_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    failure = OSError("ordinary read failed")
+    real_read_bytes = Path.read_bytes
+
+    def fail_read(path: Path) -> bytes:
+        if path == spec:
+            raise failure
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+
+    with pytest.raises(OSError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert excinfo.value is failure
+    with spec.open("rb") as fh:
+        assert fh.read() == b"snapshot bytes"
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_anchored_uses_filesystem_anchor_for_external_target(
+    tmp_path, monkeypatch
+):
+    external = tmp_path.resolve() / "trusted-external-artifacts"
+    external.mkdir()
+    spec = external / "owned.md"
+    snapshot = b"snapshot bytes"
+    seen_roots: list[Path] = []
+    real_open = recovery_flow.open_dir_confined
+
+    def record_root(root, target, **kwargs):
+        seen_roots.append(root)
+        return real_open(root, target, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "open_dir_confined", record_root)
+
+    RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert seen_roots and set(seen_roots) == {Path(spec.anchor)}
+    assert spec.read_bytes() == snapshot
+
+
+def test_owned_spec_restore_fallback_supports_external_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    external = tmp_path.resolve() / "trusted-external-artifacts"
+    external.mkdir()
+    spec = external / "owned.md"
+    snapshot = b"snapshot bytes"
+    roots: list[Path] = []
+    real_write = recovery_flow.atomic_write_bytes_confined
+
+    def record_root(path, data, **kwargs):
+        roots.append(kwargs["confine_root"])
+        return real_write(path, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", record_root)
+
+    RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert roots == [Path(spec.anchor)]
+    assert spec.read_bytes() == snapshot
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_preserves_anchored_writable_target_refusal(tmp_path, monkeypatch):
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    failure = PermissionError("target is read-only")
+
+    def refuse(_dir_fd, _name):
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target_at", refuse)
+
+    with pytest.raises(PermissionError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == original
+
+
+def test_owned_spec_restore_preserves_fallback_writable_target_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    failure = PermissionError("target is read-only")
+
+    def refuse(_target, *, follow_symlinks):
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", refuse)
+
+    with pytest.raises(PermissionError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_anchored_refuses_missing_target_appearing_before_staging(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    appeared = b"new owner bytes"
+    real_write = recovery_flow.atomic_write_bytes_at
+    later_calls: list[str] = []
+
+    def appear_before_writer(dir_fd, name, data, **kwargs):
+        spec.write_bytes(appeared)
+        return real_write(dir_fd, name, data, **kwargs)
+
+    def unexpected_probe(*_args, **_kwargs):
+        later_calls.append("writable-probe")
+        raise AssertionError("writable probe ran after authority loss")
+
+    def unexpected_stage(*_args, **_kwargs):
+        later_calls.append("temp")
+        raise AssertionError("temp creation ran after authority loss")
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", appear_before_writer)
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target_at", unexpected_probe)
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", unexpected_stage)
+
+    # This simultaneously pins recovery's initially-missing target authority
+    # and `_before_staging` ordering ahead of the probe and temp creation.
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert later_calls == []
+    assert spec.read_bytes() == appeared
+
+
+def test_owned_spec_restore_fallback_refuses_missing_target_appearing_before_staging(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    appeared = b"new owner bytes"
+    real_write = recovery_flow.atomic_write_bytes_confined
+    later_calls: list[str] = []
+
+    def appear_before_writer(path, data, **kwargs):
+        spec.write_bytes(appeared)
+        return real_write(path, data, **kwargs)
+
+    def unexpected_probe(*_args, **_kwargs):
+        later_calls.append("writable-probe")
+        raise AssertionError("writable probe ran after authority loss")
+
+    def unexpected_stage(*_args, **_kwargs):
+        later_calls.append("temp")
+        raise AssertionError("temp creation ran after authority loss")
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", appear_before_writer)
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", unexpected_probe)
+    monkeypatch.setattr(platform_util, "_mkstemp_beside", unexpected_stage)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert later_calls == []
+    assert spec.read_bytes() == appeared
+
+
+def _replace_target(spec: Path, data: bytes) -> None:
+    """Swap the entry at `spec` for a NEW file holding `data`, distinguishable
+    from the original by the identity the restore guard compares (`samestat`).
+
+    Not `unlink()` then `write_bytes()`: the guard's pre-replace predicate is
+    st_dev/st_ino, and ext4 hands a just-freed inode number straight back to the
+    next creation in the same directory, so on the CI runners that sequence
+    produced a "replacement" the guard could not tell from the original (it
+    differed on the dev box only because that filesystem allocates differently). The
+    replacement is created while the original still exists — two live entries
+    cannot share an inode — and then renamed over it, which is also the only
+    portable spelling: Windows refuses to unlink a file this process holds
+    open, so "hold the original open across the swap" is not an option there.
+    """
+    replacement = spec.with_name(spec.name + ".replacement")
+    replacement.write_bytes(data)
+    os.replace(replacement, spec)
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_target_replacement_after_staging(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def replace_before_publish(dir_fd, name, data, **kwargs):
+        validate = kwargs["_before_replace"]
+
+        def replace_then_validate() -> None:
+            _replace_target(spec, b"replacement")
+            validate()
+
+        kwargs["_before_replace"] = replace_then_validate
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", replace_before_publish)
+
+    # Ablation: removing recovery's pre-replace predicate publishes over the
+    # replacement and this authority-loss assertion fails.
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert spec.read_bytes() == b"replacement"
+    assert list(parent.glob("*.tmp")) == []
+
+
+def test_owned_spec_restore_fallback_refuses_target_replacement_after_staging(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    real_write = recovery_flow.atomic_write_bytes_confined
+
+    def replace_before_publish(path, data, **kwargs):
+        validate = kwargs["_before_replace"]
+
+        def replace_then_validate() -> None:
+            _replace_target(spec, b"replacement")
+            validate()
+
+        kwargs["_before_replace"] = replace_then_validate
+        return real_write(path, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", replace_before_publish)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert spec.read_bytes() == b"replacement"
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_rejects_equal_byte_final_entry_replacement(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def replace_after_publish(dir_fd, name, data, **kwargs):
+        verify_after = kwargs["_after_replace"]
+
+        def replace_then_verify(published_fd: int) -> None:
+            spec.unlink()
+            spec.write_bytes(snapshot)
+            verify_after(published_fd)
+
+        kwargs["_after_replace"] = replace_then_verify
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", replace_after_publish)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == snapshot
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_rejects_live_name_replacement_during_readback(tmp_path, monkeypatch):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_read = os.read
+    replaced = False
+
+    def replace_name_then_read(fd: int, size: int) -> bytes:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            spec.unlink()
+            spec.write_bytes(snapshot)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(recovery_flow.os, "read", replace_name_then_read)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert replaced is True
+    assert spec.read_bytes() == snapshot
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_rejects_in_place_mutation_during_readback(tmp_path, monkeypatch):
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_read = os.read
+    mutated = False
+
+    def mutate_then_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            with spec.open("ab") as fh:
+                fh.write(b"x")
+        return real_read(fd, size)
+
+    monkeypatch.setattr(recovery_flow.os, "read", mutate_then_read)
+
+    # Ablation: removing the before/after metadata comparison turns this into a
+    # stable-mismatch classification instead of authority loss.
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert mutated is True
+    assert spec.read_bytes() == snapshot + b"x"
+
+
+def test_owned_spec_restore_fallback_rejects_in_place_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    real_read_bytes = Path.read_bytes
+    mutated = False
+
+    def mutate_then_read(path: Path) -> bytes:
+        nonlocal mutated
+        if path == spec and not mutated:
+            mutated = True
+            with spec.open("ab") as fh:
+                fh.write(b"x")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_then_read)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert mutated is True
+    assert real_read_bytes(spec) == snapshot + b"x"
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_real_parent_replacement_stays_in_retained_directory(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    moved = tmp_path / "moved-artifacts"
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def replace_parent_before_publish(dir_fd, name, data, **kwargs):
+        def replace_parent() -> None:
+            parent.rename(moved)
+            parent.mkdir()
+
+        kwargs["_before_replace"] = replace_parent
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", replace_parent_before_publish)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert (moved / spec.name).read_bytes() == b"snapshot"
+    assert not (parent / spec.name).exists()
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES
+    or not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_owned_spec_restore_supports_search_only_parent(tmp_path):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    snapshot = b"snapshot bytes"
+    parent.chmod(0o300)
+    try:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+    finally:
+        parent.chmod(0o700)
+
+    assert spec.read_bytes() == snapshot
 
 
 def test_attempt_owned_spec_refuses_a_posix_absolute_spec_path(tmp_path, monkeypatch):

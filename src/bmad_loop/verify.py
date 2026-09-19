@@ -7,17 +7,19 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 
 from __future__ import annotations
 
+import hashlib
 import locale
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, assert_never, overload
 
@@ -36,7 +38,15 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome, result_mapping
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .platform_util import (
+    DIR_FD_ANCHORED_WRITES,
+    atomic_write_bytes,
+    atomic_write_bytes_confined,
+    has_parent_ref,
+    names_tree_root,
+    names_win32_alias,
+    open_dir_confined,
+)
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -322,6 +332,1159 @@ class MergeResidueUnreadError(GitError):
     there."""
 
 
+class IntegrationEvidenceError(GitError):
+    """The target ref update for an integration cannot be proven safely."""
+
+
+class IntegrationRestoreError(GitError):
+    """A proven integration result could not be restored completely."""
+
+
+class IntegrationCleanupChangedError(IntegrationEvidenceError):
+    """A cleanup operand changed after capture and before its mutation."""
+
+    def __init__(self, cleaned: Iterable[str]) -> None:
+        super().__init__("target collision identity changed immediately before cleanup")
+        self.cleaned = tuple(cleaned)
+
+
+@dataclass(frozen=True)
+class IntegrationRefUpdate:
+    old_revision: str
+    new_revision: str
+
+
+@dataclass(frozen=True)
+class IncomingCollisionPlan:
+    """One preflight reading whose mutations can be snapshotted before use."""
+
+    cleaned: tuple[str, ...]
+    tolerated: tuple[str, ...]
+    untracked: tuple[str, ...]
+
+
+_INTEGRATION_SNAPSHOT_DIR = "integration-snapshots"
+_INTEGRATION_SNAPSHOT_CHUNK = 1024 * 1024
+
+
+def preflight_integration_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """Validate the complete prospective Git pathset before target mutation."""
+    return tuple(dict.fromkeys(_portable_integration_path(path) for path in paths))
+
+
+def _index_state(repo: Path, rel: str) -> dict[str, object]:
+    """Return the exact persisted index stages for one repository path.
+
+    ``ls-files --stage`` is the plumbing representation accepted by
+    ``update-index --index-info``.  The debug flag carries the otherwise invisible
+    intent-to-add bit, which must not be mistaken for an ordinary empty blob.
+    """
+    validated = _portable_integration_path(rel)
+    proc = git_bytes(repo, "ls-files", "--stage", "-z", "--", validated)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("target index evidence is unavailable")
+    entries: list[dict[str, object]] = []
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, oid, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError("target index evidence is malformed") from exc
+        if os.fsdecode(raw_path) != validated:
+            raise IntegrationEvidenceError("target index evidence changed path identity")
+        mode_text, oid_text, stage_text = map(os.fsdecode, (mode, oid, stage))
+        if (
+            not re.fullmatch(r"[0-7]{6}", mode_text)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid_text)
+            or stage_text not in {"0", "1", "2", "3"}
+        ):
+            raise IntegrationEvidenceError("target index evidence is malformed")
+        entries.append({"mode": mode_text, "oid": oid_text, "stage": int(stage_text)})
+    debug = git_bytes(repo, "ls-files", "--debug", "-z", "--", validated)
+    if debug.returncode != 0:
+        raise IntegrationEvidenceError("target index flag evidence is unavailable")
+    flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
+    if len(flags) != len(entries):
+        raise IntegrationEvidenceError("target index flag evidence is malformed")
+    for entry, raw_flags in zip(entries, flags, strict=True):
+        entry["flags"] = os.fsdecode(raw_flags).lower()
+    intent = any(int(flag, 16) & 0x20000000 for flag in flags)
+    return {"entries": entries, "intent_to_add": intent}
+
+
+def _validated_index_state(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"entries", "intent_to_add"}:
+        raise IntegrationEvidenceError("persisted target index snapshot is malformed")
+    entries = value.get("entries")
+    intent = value.get("intent_to_add")
+    if not isinstance(entries, list) or not isinstance(intent, bool):
+        raise IntegrationEvidenceError("persisted target index snapshot is malformed")
+    normalized: list[dict[str, object]] = []
+    seen_stages: set[int] = set()
+    for raw in entries:
+        if not isinstance(raw, dict) or set(raw) != {"mode", "oid", "stage", "flags"}:
+            raise IntegrationEvidenceError("persisted target index snapshot is malformed")
+        mode, oid, stage, flags = (
+            raw.get("mode"),
+            raw.get("oid"),
+            raw.get("stage"),
+            raw.get("flags"),
+        )
+        if (
+            not isinstance(mode, str)
+            or not re.fullmatch(r"[0-7]{6}", mode)
+            or not isinstance(oid, str)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid)
+            or not isinstance(stage, int)
+            or isinstance(stage, bool)
+            or stage not in {0, 1, 2, 3}
+            or stage in seen_stages
+            or not isinstance(flags, str)
+            or not re.fullmatch(r"[0-9a-f]+", flags)
+        ):
+            raise IntegrationEvidenceError("persisted target index snapshot is malformed")
+        seen_stages.add(stage)
+        normalized.append(dict(raw))
+    if intent and (len(normalized) != 1 or normalized[0]["stage"] != 0):
+        raise IntegrationEvidenceError("persisted target index snapshot is malformed")
+    return {"entries": normalized, "intent_to_add": intent}
+
+
+# Whether receipt paths are held to Win32 name rules: the host's own, like
+# `DIR_FD_ANCHORED_WRITES`, and monkeypatched by tests to read the other arm.
+WIN32_PATH_NAMES = sys.platform == "win32"
+
+
+def _portable_integration_path(value: object) -> str:
+    """Validate a persisted repository-relative operand before any mutation.
+
+    Containment holds on every host: a string, non-empty, no NUL, not
+    absolute, no ``.``/``..``/empty segment, never a ``.git`` component or the
+    tree root. The Win32 name rules — reserved characters, control characters,
+    device aliases, a drive prefix, a backslash separator — hold on a Windows
+    host alone (`WIN32_PATH_NAMES`): on POSIX git permits ``:``, ``?``, ``*``,
+    ``\\`` and control characters short of NUL in a name, every reading here
+    round-trips them NUL-delimited, and holding them everywhere paused each
+    modern bundle that touched such a file as malformed (#796 review).
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\0" in value
+        or value.startswith("/")
+        or names_tree_root(value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+        or any(part.casefold() == ".git" for part in value.split("/"))
+    ):
+        raise IntegrationEvidenceError("persisted target integration path is malformed")
+    if WIN32_PATH_NAMES and (
+        PureWindowsPath(value).drive
+        or "\\" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(char in '<>:"|?*' for char in value)
+        or names_win32_alias(value)
+    ):
+        raise IntegrationEvidenceError("persisted target integration path is malformed")
+    return value
+
+
+def _symlink_ancestor(repo: Path, candidate: Path) -> Path | None:
+    """The topmost symlink strictly above ``candidate`` on the way down from ``repo``.
+
+    Read top-down with ``lstat`` semantics, so a component beneath a link is
+    never dereferenced to answer: git tracks no path through a symlink, and
+    whatever stands at ``candidate`` through one is another path's.
+    """
+    probe = repo
+    for part in candidate.relative_to(repo).parts[:-1]:
+        probe = probe / part
+        if probe.is_symlink():
+            return probe
+        if not probe.exists():
+            return None
+    return None
+
+
+def _confined_repo_operand(repo: Path, rel: object) -> tuple[str, Path]:
+    validated = _portable_integration_path(rel)
+    root = repo.resolve(strict=True)
+    candidate = repo / validated
+    if has_parent_ref(candidate.relative_to(repo)):
+        raise IntegrationEvidenceError("persisted target integration path is malformed")
+    # a symlink on the way (a tracked `a -> dir`, or a dangling `a -> missing`,
+    # the incoming commit replaces with a directory holding `a/b`) is never
+    # followed: git tracks no path through one, so the operand beneath it is
+    # absent by topology wherever the link points — a resolving link's
+    # destination may well hold the leaf's name — and the link's own parent
+    # is what confines it (#796 review). The operand itself, when a link, is
+    # confined by its parent the same way.
+    link = _symlink_ancestor(repo, candidate)
+    probe = link.parent if link is not None else candidate
+    if link is None and candidate.is_symlink():
+        probe = candidate.parent
+    while not probe.exists() and probe != repo:
+        probe = probe.parent
+    try:
+        resolved = probe.resolve(strict=True)
+    except OSError as exc:
+        raise IntegrationEvidenceError(
+            "persisted target integration path has an unavailable parent"
+        ) from exc
+    if resolved != root and not resolved.is_relative_to(root):
+        raise IntegrationEvidenceError("persisted target integration path escaped the repository")
+    return validated, candidate
+
+
+def _integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
+        raise IntegrationEvidenceError("persisted target integration operation is malformed")
+    run_root = run_dir.resolve(strict=True)
+    parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
+    if parent.is_symlink():
+        raise IntegrationEvidenceError("target integration snapshot directory was redirected")
+    if not parent.exists():
+        parent.mkdir(mode=0o700)
+    parent_resolved = parent.resolve(strict=True)
+    if parent.is_symlink() or (
+        parent_resolved != run_root and not parent_resolved.is_relative_to(run_root)
+    ):
+        raise IntegrationEvidenceError("target integration snapshot directory was redirected")
+    root = parent / operation_identity
+    if root.exists() or root.is_symlink():
+        raise IntegrationEvidenceError("target integration snapshot operation already exists")
+    root.mkdir(mode=0o700)
+    try:
+        _fsync_directory(parent)
+    except OSError:
+        root.rmdir()
+        raise
+    resolved = root.resolve(strict=True)
+    if resolved.parent.resolve(strict=True) != parent_resolved:
+        raise IntegrationEvidenceError("target integration snapshot directory was redirected")
+    if resolved != run_root and not resolved.is_relative_to(run_root):
+        raise IntegrationEvidenceError("target integration snapshot directory escaped the run")
+    return root
+
+
+def _stream_snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    max_bytes: int | None = None,
+    source_root: Path | None = None,
+) -> tuple[int, str]:
+    """Publish one file sidecar atomically while keeping memory usage bounded."""
+    if not DIR_FD_ANCHORED_WRITES:
+        fd, temporary = tempfile.mkstemp(prefix=".capture-", dir=destination.parent)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with source.open("rb") as stream, os.fdopen(fd, "wb") as target:
+                fd = -1
+                while chunk := stream.read(
+                    min(
+                        _INTEGRATION_SNAPSHOT_CHUNK,
+                        (
+                            max_bytes - size + 1
+                            if max_bytes is not None
+                            else _INTEGRATION_SNAPSHOT_CHUNK
+                        ),
+                    )
+                ):
+                    target.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                    if max_bytes is not None and size > max_bytes:
+                        raise IntegrationEvidenceError(
+                            "target integration recovery snapshots exceed the aggregate artifact payload limit"
+                        )
+                target.flush()
+                os.fsync(target.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return size, digest.hexdigest()
+    root_fd = os.open(
+        destination.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
+    source_fd = -1
+    source_parent_fd = -1
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        if source_root is not None:
+            opened = open_dir_confined(source_root, source.parent)
+            if opened is None:
+                raise IntegrationEvidenceError(
+                    "target integration snapshot source parent was redirected"
+                )
+            source_parent_fd = opened
+            source_fd = os.open(
+                source.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_parent_fd,
+            )
+        else:
+            source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(source_fd, "rb") as stream, os.fdopen(fd, "wb") as target:
+            source_fd = -1
+            fd = -1
+            while chunk := stream.read(
+                min(
+                    _INTEGRATION_SNAPSHOT_CHUNK,
+                    max_bytes - size + 1 if max_bytes is not None else _INTEGRATION_SNAPSHOT_CHUNK,
+                )
+            ):
+                target.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+                if max_bytes is not None and size > max_bytes:
+                    raise IntegrationEvidenceError(
+                        "target integration recovery snapshots exceed the aggregate artifact payload limit"
+                    )
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temporary, 0o600, dir_fd=root_fd, follow_symlinks=False)
+        os.replace(temporary, destination.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+        anchored = os.fstat(root_fd)
+        named = os.stat(destination.parent, follow_symlinks=False)
+        if (anchored.st_dev, anchored.st_ino) != (named.st_dev, named.st_ino):
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory changed during capture"
+            )
+        _fsync_directory(destination.parent)
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if source_parent_fd >= 0:
+            os.close(source_parent_fd)
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        os.close(root_fd)
+    return size, digest.hexdigest()
+
+
+def _snapshot_bytes(data: bytes, destination: Path) -> tuple[int, str]:
+    if not DIR_FD_ANCHORED_WRITES:
+        atomic_write_bytes_confined(destination, data, confine_root=destination.parent)
+        return len(data), hashlib.sha256(data).hexdigest()
+    root_fd = os.open(
+        destination.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".capture-{os.getpid():x}-{os.urandom(6).hex()}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            fd = -1
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temporary, 0o600, dir_fd=root_fd, follow_symlinks=False)
+        os.replace(temporary, destination.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+        anchored = os.fstat(root_fd)
+        named = os.stat(destination.parent, follow_symlinks=False)
+        if (anchored.st_dev, anchored.st_ino) != (named.st_dev, named.st_ino):
+            raise IntegrationEvidenceError(
+                "target integration snapshot directory changed during capture"
+            )
+        _fsync_directory(destination.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        os.close(root_fd)
+    return len(data), hashlib.sha256(data).hexdigest()
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Durably publish a sidecar directory entry where directory fsync exists."""
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        return
+    fd = os.open(directory, os.O_RDONLY | directory_flag)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sidecar_path(run_dir: Path, sidecar: object) -> Path:
+    rel = _portable_integration_path(sidecar)
+    if not rel.startswith(_INTEGRATION_SNAPSHOT_DIR + "/"):
+        raise IntegrationEvidenceError("persisted target snapshot path is malformed")
+    candidate = run_dir / rel
+    try:
+        root = run_dir.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise IntegrationEvidenceError("persisted target snapshot is unavailable") from exc
+    if not resolved.is_relative_to(root) or not resolved.is_file() or candidate.is_symlink():
+        raise IntegrationEvidenceError("persisted target snapshot was redirected")
+    for parent in candidate.parents:
+        if parent == run_dir:
+            break
+        if parent.is_symlink():
+            raise IntegrationEvidenceError("persisted target snapshot was redirected")
+    return resolved
+
+
+def _stream_digest(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(_INTEGRATION_SNAPSHOT_CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _indexed_submodules(repo: Path) -> list[str]:
+    proc = git_bytes(repo, "ls-files", "--stage", "-z")
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("target submodule index evidence is unavailable")
+    paths: list[str] = []
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, _oid, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError("target submodule index evidence is malformed") from exc
+        if mode == b"160000" and stage == b"0":
+            paths.append(_portable_integration_path(os.fsdecode(raw_path)))
+    return paths
+
+
+# `ls-files --debug` flag words a stage-0 index entry the integration writes
+# may carry — a gitlink or a file alike: none; or, on a sparse target only,
+# skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED, `40004000`), which git
+# sets on every entry it writes outside the sparse cone or patterns and
+# which hides nothing from the readings here, a checkout being read from disk
+# rather than through the index (#796 review). Off a sparse target that word
+# is a hook's `update-index --skip-worktree`; on one, git strips a hook's bit
+# from an in-pattern entry to `4000` (probed on git 2.55). Intent-to-add,
+# assume-unchanged, or anything else is not a fresh entry's shape: a hook
+# set it.
+_SPARSE_INDEX_FLAG_WORD = "40004000"
+# The words a captured gitlink may carry: those, or either with the
+# assume-unchanged bit (CE_VALID, `8000`) an operator set before the run —
+# `git update-index --assume-unchanged` on a submodule is released index
+# configuration, and it too hides nothing from a reading taken from disk.
+# The receipt records the word (`flags`) so a reading compares it exactly:
+# an operator's bit is preserved, a hook's flip is drift, and the restore
+# puts the word back where `git restore` cleared it (#796 review).
+_GITLINK_INDEX_FLAGS = frozenset({"0", _SPARSE_INDEX_FLAG_WORD, "8000", "4000c000"})
+
+
+def _fresh_index_flag_words(repo: Path) -> frozenset[str]:
+    """The flag words an index entry the integration wrote may carry on ``repo``."""
+    rc, sparse, _detail = _git_out(repo, "config", "--type=bool", "core.sparseCheckout")
+    if rc == 0 and sparse == "true":
+        return frozenset({"0", _SPARSE_INDEX_FLAG_WORD})
+    return frozenset({"0"})
+
+
+def _gitlink_index_matches(
+    current: dict[str, object], oid: str, *, flags: Collection[object]
+) -> bool:
+    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink
+    ``oid`` carrying one of the ``flags`` words."""
+    entries = current.get("entries")
+    if current.get("intent_to_add") or not isinstance(entries, list) or len(entries) != 1:
+        return False
+    entry = entries[0]
+    return (
+        isinstance(entry, dict)
+        and entry.get("mode") == "160000"
+        and entry.get("oid") == oid
+        and entry.get("stage") == 0
+        and entry.get("flags") in flags
+    )
+
+
+def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
+    """Whether a populated checkout is this repository's own submodule checkout.
+
+    While the index carries the gitlink, git names the superproject from the
+    checkout and it must be ``root``. A checkout whose gitlink an integration
+    deleted has no superproject any more — git leaves the populated directory
+    behind (``warning: unable to rmdir``) — and is this repository's by its git
+    dir living under ``<git-dir>/modules``, where git keeps a submodule's: the
+    git dir git reports for ``root``, which is ``root/.git`` for a main
+    checkout and ``<common>/.git/worktrees/<id>`` for a target that is itself
+    a linked worktree, whose ``.git`` is a file (#796 review). A checkout
+    naming some other superproject, or one carrying its own git dir (a fresh
+    ``git init`` at the path), is not. Ceiling: a legacy submodule with its git
+    dir embedded in the checkout has no orphan proof and reads as foreign once
+    its gitlink is gone.
+    """
+    rc, superproject, _detail = _git_out(checkout, "rev-parse", "--show-superproject-working-tree")
+    if rc != 0:
+        return False
+    if superproject:
+        return Path(superproject).resolve(strict=True) == root
+    return _submodule_git_dir_in_modules(root, checkout)
+
+
+def _submodule_git_dir_in_modules(root: Path, checkout: Path) -> bool:
+    """Whether ``checkout``'s git dir lives under ``root``'s ``<git-dir>/modules``.
+
+    The proof `submodule update --init` leaves and a fresh ``git init`` at the
+    path does not. While the index carries the gitlink git names ``root`` as
+    the superproject of either (#796 review), so a receipt that proved the
+    gitlink unpopulated — nothing there to have been anyone's — reads
+    ownership by this proof alone: only what git cloned as this repository's
+    submodule is the restore's to remove.
+    """
+    rc, git_dir, _detail = _git_out(checkout, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not git_dir:
+        return False
+    rc, root_git_dir, _detail = _git_out(root, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not root_git_dir:
+        return False
+    modules = Path(root_git_dir).resolve(strict=True) / "modules"
+    resolved = Path(git_dir).resolve(strict=True)
+    return resolved != modules and resolved.is_relative_to(modules)
+
+
+def _validated_submodule_checkout(
+    repo: Path,
+    entry: dict[str, object],
+    *,
+    verify_head: bool,
+    revision: str | None = None,
+    allow_missing: bool = False,
+) -> Path:
+    rel, checkout = _confined_repo_operand(repo, entry.get("path"))
+    expected = entry.get("head")
+    gitlink = entry.get("gitlink")
+    if expected is not None and (
+        not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected)
+    ):
+        raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+    if not isinstance(gitlink, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", gitlink):
+        raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+    if revision is not None:
+        proc = git_bytes(repo, "ls-tree", "-z", revision, "--", rel)
+        expected_row = (
+            b"160000 commit " + gitlink.encode("ascii") + b"\t" + os.fsencode(rel) + b"\0"
+        )
+        if proc.returncode != 0 or proc.stdout != expected_row:
+            raise IntegrationEvidenceError(
+                "persisted target submodule is not anchored to the old revision"
+            )
+    else:
+        # the captured word exactly; a receipt without one reads with the
+        # fresh words, as before it was recorded
+        captured_word = entry.get("flags")
+        if not _gitlink_index_matches(
+            _index_state(repo, rel),
+            gitlink,
+            flags=(
+                _fresh_index_flag_words(repo) if captured_word is None else (str(captured_word),)
+            ),
+        ):
+            raise IntegrationEvidenceError(
+                "persisted target submodule is no longer the captured indexed gitlink"
+            )
+    if checkout.is_symlink():
+        raise IntegrationEvidenceError(
+            "persisted target submodule checkout escaped its indexed location"
+        )
+    if expected is None:
+        # captured unpopulated: an empty directory, or none, is the captured
+        # shape; a populated one is attempt-era — owned, it is the restore's
+        # to remove (`allow_missing`, the restore's own reading); a plain
+        # directory, no `.git` entry, is the commit's in the gitlink's place
+        # (a tracked directory replacing it), which `git restore` empties
+        # ahead of the restore's reading, so that reading judges what is
+        # left; a repository of any other kind is foreign; and in any reading
+        # asked to verify, populated is changed receipt-owned state
+        if not checkout.is_dir():
+            return checkout
+        root = repo.resolve(strict=True)
+        if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+            raise IntegrationEvidenceError(
+                "persisted target submodule checkout escaped its indexed location"
+            )
+        if not any(checkout.iterdir()):
+            return checkout
+        if verify_head or not allow_missing:
+            raise IntegrationEvidenceError("target submodule checkout was not restored")
+        if not (checkout / ".git").exists():
+            return checkout
+        # git names the superproject for any repository at an indexed
+        # gitlink, a fresh `git init` included; the clone's git dir under
+        # `.git/modules` is what marks it this repository's submodule
+        if not _submodule_git_dir_in_modules(root, checkout):
+            raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
+        return checkout
+    if allow_missing and not checkout.is_dir():
+        return checkout
+    if not checkout.is_dir():
+        raise IntegrationEvidenceError("persisted target submodule checkout is unavailable")
+    root = repo.resolve(strict=True)
+    resolved = checkout.resolve(strict=True)
+    lexical = root.joinpath(*rel.split("/"))
+    if resolved != lexical:
+        raise IntegrationEvidenceError(
+            "persisted target submodule checkout escaped its indexed location"
+        )
+    if not _submodule_checkout_owned(root, checkout):
+        raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
+    if verify_head and rev_parse_head(checkout) != expected:
+        raise IntegrationEvidenceError("target submodule checkout was not restored")
+    return checkout
+
+
+def _restore_submodule_checkouts(
+    repo: Path,
+    entries: list[dict[str, object]],
+    *,
+    old_revision: str,
+) -> None:
+    for entry in entries:
+        rel = str(entry["path"])
+        if entry.get("head") is None:
+            # captured unpopulated: whatever a hook checked out there is
+            # attempt-era whole (the receipt proved the directory empty), and
+            # git's own shape is the empty directory (#796 review). Ownership
+            # was proved before the first mutation; `.git/modules` keeps the
+            # clone, exactly as `submodule deinit` would leave it. A directory
+            # of any other kind still standing — the commit's own files are
+            # already restored away — is the proved-absent directory's
+            # doctrine: nothing the restore can attribute is removed.
+            checkout = _validated_submodule_checkout(
+                repo, entry, verify_head=False, revision=old_revision, allow_missing=True
+            )
+            if (
+                checkout.is_dir()
+                and any(checkout.iterdir())
+                and not _submodule_git_dir_in_modules(repo.resolve(strict=True), checkout)
+            ):
+                raise IntegrationRestoreError(
+                    f"target submodule directory contains unowned state: {rel}"
+                )
+            _empty_submodule_directory(repo, checkout)
+            _restore_gitlink_index_flags(repo, rel, entry.get("flags"))
+            continue
+        rc, detail = _git(repo, "submodule", "update", "--init", "--checkout", "--", rel)
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target submodule checkout recreation failed for {rel}: {detail}"
+            )
+        checkout = _validated_submodule_checkout(
+            repo, entry, verify_head=False, revision=old_revision
+        )
+        rc, detail = _git(checkout, "checkout", "--detach", str(entry["head"]))
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target submodule checkout restoration failed for {rel}: {detail}"
+            )
+        # The receipt captured this checkout clean under exactly this reading,
+        # so whatever it reports now — a target hook's write into the checkout
+        # (#796 review) — is attempt-era and the receipt's to undo: tracked
+        # content and index back to the captured HEAD, untracked files out.
+        # Ignored files were never read and are never touched.
+        status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+        if status.returncode == 0 and status.stdout:
+            for reset in (("reset", "-q", "--hard"), ("clean", "-q", "-fd")):
+                rc, detail = _git(checkout, *reset)
+                if rc != 0:
+                    raise IntegrationRestoreError(
+                        f"target submodule checkout restoration failed for {rel}: {detail}"
+                    )
+            status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+        if status.returncode != 0 or status.stdout:
+            raise IntegrationRestoreError(
+                f"target submodule checkout restoration is not clean for {rel}"
+            )
+        _restore_gitlink_index_flags(repo, rel, entry.get("flags"))
+
+
+def _restore_gitlink_index_flags(repo: Path, rel: str, flags: object) -> None:
+    """Put a captured gitlink's index flag word back: `git restore` clears it.
+
+    ``flags`` None is a receipt written before the word was recorded, with
+    nothing to put back.
+    """
+    if flags is None:
+        return
+    _apply_index_flags(repo, rel, int(str(flags), 16))
+
+
+def _empty_submodule_directory(repo: Path, checkout: Path) -> None:
+    """Leave exactly an empty directory at a captured-unpopulated gitlink."""
+    if DIR_FD_ANCHORED_WRITES:
+        parent_fd = _open_restore_parent(repo, checkout.parent)
+        try:
+            _remove_tree_at(parent_fd, checkout.name)
+            os.mkdir(checkout.name, 0o755, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return
+    if checkout.is_dir() and not checkout.is_symlink():
+        shutil.rmtree(checkout)
+    checkout.mkdir(parents=True)
+
+
+def _capture_integration_state_into(
+    repo: Path,
+    run_dir: Path,
+    root: Path,
+    paths: Iterable[str],
+    *,
+    payload_max_bytes: int | None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    snapshots: list[dict[str, object]] = []
+    total_bytes = 0
+    indexed_submodules = set(_indexed_submodules(repo))
+    selected = list(dict.fromkeys(paths))
+    incoming = {_portable_integration_path(rel) for rel in selected}
+    for rel in selected:
+        validated, candidate = _confined_repo_operand(repo, rel)
+        tracked = path_tracked(repo, validated)
+        # a symlink on the way: git tracks no path through one, so the leaf
+        # beneath is absent by topology — a dangling link reaches nothing,
+        # and a link that resolves (`a -> dir` with `dir/b` standing where
+        # `a/b` reads) reaches another path's entry, which `lstat` through
+        # the link would have captured as this one and the snapshot stream
+        # refused as redirected (#796 review). The link itself is captured
+        # under its own path, since the commit that adds `a/b` replaces it;
+        # a link the incoming set does not name cannot be the merge's — git
+        # refuses `a/b` against a tracked `a` it keeps — and is refused here
+        # ahead of any mutation rather than read through.
+        link = _symlink_ancestor(repo, candidate)
+        if link is not None:
+            if link.relative_to(repo).as_posix() not in incoming:
+                raise IntegrationEvidenceError(
+                    "target integration path lies beneath a symlink the integration "
+                    "does not replace"
+                )
+            snapshots.append(
+                {
+                    "path": validated,
+                    "state": "absent",
+                    "tracked": tracked,
+                    "index": _index_state(repo, validated),
+                    "absent_parents": [],
+                    "empty_parents": [],
+                }
+            )
+            continue
+        absent_parents: list[str] = []
+        parent = candidate.parent
+        while parent != repo and not parent.exists() and not parent.is_symlink():
+            absent_parents.append(parent.relative_to(repo).as_posix())
+            parent = parent.parent
+        # the first existing ancestor, when it is an empty directory, is
+        # proved empty: git never tracks one, so nothing else reads it, and
+        # everything under it after the hooks is attempt-era exactly as
+        # under a proved-absent directory (#796 review). A populated one
+        # holds what the receipt never read; a file is the entry-type
+        # transition's; an unpopulated gitlink the submodule reading's.
+        empty_parents: list[str] = []
+        if parent != repo and not parent.is_symlink() and parent.is_dir():
+            parent_rel = parent.relative_to(repo).as_posix()
+            if parent_rel not in indexed_submodules and not any(parent.iterdir()):
+                empty_parents.append(parent_rel)
+        try:
+            mode = candidate.lstat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            # `NotADirectoryError`: an ancestor is a file — git names both
+            # sides of a tracked file/directory transition (`a` deleted,
+            # `a/b` added), and the leaf beneath the file is absent (#796
+            # review); the file itself is captured under its own path.
+            index = _index_state(repo, validated)
+            snapshots.append(
+                {
+                    "path": validated,
+                    "state": "absent",
+                    "tracked": tracked,
+                    "index": index,
+                    "absent_parents": absent_parents,
+                    "empty_parents": empty_parents,
+                }
+            )
+            continue
+        if validated in indexed_submodules and candidate.is_dir():
+            # The nested checkout is captured below.  Treating it as an ordinary
+            # directory would either follow it or reject every populated submodule.
+            continue
+        if stat.S_ISDIR(mode):
+            # Git reports both sides' leaf paths for a tracked directory/file
+            # transition.  The leaves carry the reversible bytes and index state;
+            # the directory entry itself has no Git identity to snapshot.
+            proc = git_bytes(repo, "ls-files", "-z", "--", validated)
+            if proc.returncode == 0 and proc.stdout:
+                continue
+            raise IntegrationEvidenceError("target integration snapshot operand is not a file")
+        index = _index_state(repo, validated)
+        name = hashlib.sha256(os.fsencode(validated)).hexdigest() + ".bin"
+        sidecar = root / name
+        if S_ISLNK(mode):
+            target_bytes = os.readlink(os.fsencode(candidate))
+            size, digest = _snapshot_bytes(target_bytes, sidecar)
+            total_bytes += size
+            if payload_max_bytes is not None and total_bytes > payload_max_bytes:
+                raise IntegrationEvidenceError(
+                    "target integration recovery snapshots exceed the aggregate "
+                    f"artifact payload limit ({payload_max_bytes} bytes)"
+                )
+            if not candidate.is_symlink() or os.readlink(os.fsencode(candidate)) != target_bytes:
+                raise IntegrationEvidenceError("target changed during integration snapshot capture")
+            snapshots.append(
+                {
+                    "path": validated,
+                    "state": "symlink",
+                    "tracked": tracked,
+                    "index": index,
+                    "absent_parents": absent_parents,
+                    "empty_parents": empty_parents,
+                    "sidecar": sidecar.relative_to(run_dir).as_posix(),
+                    "size": size,
+                    "sha256": digest,
+                }
+            )
+            continue
+        if not S_ISREG(mode):
+            raise IntegrationEvidenceError("target integration snapshot operand is not a file")
+        remaining = None if payload_max_bytes is None else payload_max_bytes - total_bytes
+        size, digest = _stream_snapshot(
+            candidate,
+            sidecar,
+            max_bytes=remaining,
+            source_root=repo,
+        )
+        total_bytes += size
+        if payload_max_bytes is not None and total_bytes > payload_max_bytes:
+            raise IntegrationEvidenceError(
+                "target integration recovery snapshots exceed the aggregate "
+                f"artifact payload limit ({payload_max_bytes} bytes)"
+            )
+        _observed_rel, observed_candidate = _confined_repo_operand(repo, validated)
+        if _symlink_ancestor(repo, observed_candidate) is not None:
+            raise IntegrationEvidenceError("target changed during integration snapshot capture")
+        try:
+            observed_mode = observed_candidate.lstat().st_mode
+        except FileNotFoundError as exc:
+            raise IntegrationEvidenceError(
+                "target changed during integration snapshot capture"
+            ) from exc
+        if not S_ISREG(observed_mode) or _stream_digest(observed_candidate) != (size, digest):
+            raise IntegrationEvidenceError("target changed during integration snapshot capture")
+        snapshots.append(
+            {
+                "path": validated,
+                "state": "regular",
+                "tracked": tracked,
+                "index": index,
+                "absent_parents": absent_parents,
+                "empty_parents": empty_parents,
+                "sidecar": sidecar.relative_to(run_dir).as_posix(),
+                "size": size,
+                "sha256": digest,
+                "mode": mode & 0o7777,
+            }
+        )
+
+    submodules: list[dict[str, object]] = []
+    for rel in _indexed_submodules(repo):
+        _validated, checkout = _confined_repo_operand(repo, rel)
+        if not checkout.is_dir():
+            continue
+        repo_root = repo.resolve(strict=True)
+        # an unpopulated gitlink — a clone without `--recurse-submodules` —
+        # is an empty directory with no `.git`: git's shape, recorded as such
+        # (`head` None) so a checkout a hook makes there is the receipt's to
+        # remove; a probe from inside it would find the superproject itself
+        # and call the submodule foreign (#796 review)
+        if not any(checkout.iterdir()):
+            if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):
+                raise IntegrationEvidenceError(
+                    "target submodule checkout escaped its indexed location"
+                )
+            submodules.append(
+                {"path": rel, "head": None, **_captured_gitlink_entry(_index_state(repo, rel))}
+            )
+            continue
+        if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):
+            raise IntegrationEvidenceError("target submodule checkout escaped its indexed location")
+        rc, superproject, _detail = _git_out(
+            checkout, "rev-parse", "--show-superproject-working-tree"
+        )
+        if rc != 0 or not superproject or Path(superproject).resolve(strict=True) != repo_root:
+            raise IntegrationEvidenceError("target submodule checkout changed ownership")
+        status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+        if status.returncode != 0 or status.stdout:
+            raise IntegrationEvidenceError(
+                "populated target submodule must be clean before integration"
+            )
+        submodules.append(
+            {
+                "path": rel,
+                "head": rev_parse_head(checkout),
+                **_captured_gitlink_entry(_index_state(repo, rel)),
+            }
+        )
+    return snapshots, submodules
+
+
+def _captured_gitlink_entry(index: dict[str, object]) -> dict[str, object]:
+    """The ``gitlink`` and ``flags`` a submodule receipt entry records from its index reading."""
+    entries = index["entries"]
+    if (
+        index.get("intent_to_add")
+        or not isinstance(entries, list)
+        or len(entries) != 1
+        or entries[0].get("mode") != "160000"
+        or entries[0].get("stage") != 0
+        or entries[0].get("flags") not in _GITLINK_INDEX_FLAGS
+    ):
+        raise IntegrationEvidenceError("target submodule index evidence is malformed")
+    return {"gitlink": entries[0]["oid"], "flags": entries[0]["flags"]}
+
+
+def capture_integration_state(
+    repo: Path,
+    run_dir: Path,
+    operation_identity: str,
+    paths: Iterable[str],
+    *,
+    payload_max_bytes: int | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Capture complete reversible non-ref state into streamed run sidecars."""
+    root = _integration_snapshot_root(run_dir, operation_identity)
+    try:
+        return _capture_integration_state_into(
+            repo,
+            run_dir,
+            root,
+            paths,
+            payload_max_bytes=payload_max_bytes,
+        )
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            _fsync_directory(root.parent)
+        except OSError:
+            pass
+        raise
+
+
+def validate_integration_state_schema(
+    run_dir: Path,
+    snapshots: object,
+    submodules: object,
+    operation_identity: str | None = None,
+    *,
+    payload_max_bytes: int | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Validate every persisted non-ref operand before Git/filesystem mutation."""
+    if not isinstance(snapshots, list) or not isinstance(submodules, list):
+        raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+    validated_snapshots: list[dict[str, object]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    for raw in snapshots:
+        if not isinstance(raw, dict):
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        rel = _portable_integration_path(raw.get("path"))
+        state = raw.get("state")
+        tracked = raw.get("tracked")
+        index = _validated_index_state(raw.get("index"))
+        absent_parents = raw.get("absent_parents")
+        if (
+            rel in seen
+            or state not in {"absent", "regular", "symlink"}
+            or not isinstance(tracked, bool)
+            or not isinstance(absent_parents, list)
+            or any(not isinstance(parent, str) for parent in absent_parents)
+        ):
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        validated_parents = [_portable_integration_path(parent) for parent in absent_parents]
+        if len(set(validated_parents)) != len(validated_parents):
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        # git's slash hierarchy, the one the capture wrote (`Path.parent`
+        # relative to the repository, `as_posix`): under the Windows reading
+        # `a:/file`'s parent is the drive root and `a:` is drive-relative, and
+        # a name holding a backslash is several segments, so on POSIX — where
+        # both are plain names `_portable_integration_path` admits — the
+        # receipt the capture had just written was refused as malformed at
+        # the replay that needed it (#796 review). The Win32 name rules are
+        # that function's, on a Windows host alone.
+        expected_parent = PurePosixPath(rel).parent
+        for parent in validated_parents:
+            if PurePosixPath(parent) != expected_parent:
+                raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+            expected_parent = expected_parent.parent
+        # `empty_parents`: the first existing ancestor, proved an empty
+        # directory at capture — at most one, the one above the topmost
+        # absent parent (or the path); a receipt written before the key
+        # proved nothing there (#796 review)
+        empty_parents = raw.get("empty_parents", [])
+        if (
+            not isinstance(empty_parents, list)
+            or len(empty_parents) > 1
+            or any(not isinstance(parent, str) for parent in empty_parents)
+        ):
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        validated_empty = [_portable_integration_path(parent) for parent in empty_parents]
+        for parent in validated_empty:
+            if PurePosixPath(parent) != expected_parent or expected_parent == PurePosixPath():
+                raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        seen.add(rel)
+        expected_keys = {"path", "state", "tracked", "index", "absent_parents"}
+        if "empty_parents" in raw:
+            expected_keys.add("empty_parents")
+        if state in {"regular", "symlink"}:
+            expected_keys |= {"sidecar", "size", "sha256"}
+            if state == "regular":
+                expected_keys.add("mode")
+            size = raw.get("size")
+            digest = raw.get("sha256")
+            mode = raw.get("mode")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or (
+                    state == "regular"
+                    and (
+                        not isinstance(mode, int)
+                        or isinstance(mode, bool)
+                        or not 0 <= mode <= 0o7777
+                    )
+                )
+            ):
+                raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+            total_bytes += size
+            if payload_max_bytes is not None and total_bytes > payload_max_bytes:
+                raise IntegrationEvidenceError(
+                    "target integration recovery snapshots exceed the aggregate "
+                    f"artifact payload limit ({payload_max_bytes} bytes)"
+                )
+            sidecar = _sidecar_path(run_dir, raw.get("sidecar"))
+            if operation_identity is not None:
+                expected_sidecar = (
+                    Path(_INTEGRATION_SNAPSHOT_DIR)
+                    / operation_identity
+                    / (hashlib.sha256(os.fsencode(rel)).hexdigest() + ".bin")
+                ).as_posix()
+                if raw.get("sidecar") != expected_sidecar:
+                    raise IntegrationEvidenceError(
+                        "persisted target integration snapshot is bound to another operation"
+                    )
+            if _stream_digest(sidecar) != (size, digest):
+                raise IntegrationEvidenceError("persisted target integration snapshot is corrupt")
+        if set(raw) != expected_keys:
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        normalized = dict(raw)
+        normalized["index"] = index
+        normalized["absent_parents"] = validated_parents
+        normalized["empty_parents"] = validated_empty
+        validated_snapshots.append(normalized)
+
+    validated_submodules: list[dict[str, object]] = []
+    seen.clear()
+    for raw in submodules:
+        # `flags`: the gitlink's captured index flag word; a receipt written
+        # before it was recorded reads with the fresh-gitlink words
+        if not isinstance(raw, dict) or set(raw) - {"flags"} != {"path", "head", "gitlink"}:
+            raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+        rel = _portable_integration_path(raw.get("path"))
+        head = raw.get("head")
+        gitlink = raw.get("gitlink")
+        if "flags" in raw and raw["flags"] not in _GITLINK_INDEX_FLAGS:
+            raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+        # `head` None: the gitlink was unpopulated at capture — an empty
+        # directory, git's shape for a clone without `--recurse-submodules`
+        # — and the receipt owns that emptiness (#796 review)
+        if (
+            rel in seen
+            or (head is not None and not isinstance(head, str))
+            or (isinstance(head, str) and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head))
+            or not isinstance(gitlink, str)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", gitlink)
+        ):
+            raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+        seen.add(rel)
+        validated_submodules.append(dict(raw))
+    return validated_snapshots, validated_submodules
+
+
+def discard_integration_state(run_dir: Path, attempt: object) -> None:
+    """Best-effort removal of sidecars after their receipt is durably retired."""
+    if not isinstance(attempt, dict):
+        return
+    operation = attempt.get("operation_identity")
+    if not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]{32}", operation):
+        return
+    root = run_dir / _INTEGRATION_SNAPSHOT_DIR / operation
+    try:
+        run_root = run_dir.resolve(strict=True)
+        parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
+        if parent.is_symlink():
+            return
+        parent_resolved = parent.resolve(strict=True)
+        resolved = root.resolve(strict=True)
+        if (
+            root.is_symlink()
+            or not parent_resolved.is_relative_to(run_root)
+            or not resolved.is_relative_to(run_root)
+            or resolved.parent != parent_resolved
+        ):
+            return
+        shutil.rmtree(resolved)
+    except (FileNotFoundError, OSError):
+        return
+
+
+def reconcile_integration_state_roots(run_dir: Path, attempts: Iterable[object]) -> None:
+    """Best-effort garbage collection of capture roots no live receipt owns."""
+    live = {
+        str(attempt.get("operation_identity"))
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and isinstance(attempt.get("operation_identity"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", str(attempt.get("operation_identity")))
+    }
+    parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
+    try:
+        if parent.is_symlink() or not parent.is_dir():
+            return
+        for child in parent.iterdir():
+            if child.name not in live:
+                discard_integration_state(run_dir, {"operation_identity": child.name})
+    except OSError:
+        return
+
+
 @overload
 def _run_git(
     cmd: list[str],
@@ -330,6 +1493,7 @@ def _run_git(
     env: dict[str, str] | None = ...,
     binary: Literal[False] = ...,
     timeout_s: int | None = ...,
+    input_data: None = ...,
 ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -341,6 +1505,7 @@ def _run_git(
     env: dict[str, str] | None = ...,
     binary: Literal[True],
     timeout_s: int | None = ...,
+    input_data: bytes | None = ...,
 ) -> subprocess.CompletedProcess[bytes]: ...
 
 
@@ -351,6 +1516,7 @@ def _run_git(
     env: dict[str, str] | None = None,
     binary: bool = False,
     timeout_s: int | None = None,
+    input_data: bytes | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Sole spawn point for git subprocesses. Three failures are raised by
     `subprocess.run` *before* any return code exists — a timeout (#156), a
@@ -390,7 +1556,8 @@ def _run_git(
         return subprocess.run(
             cmd,
             capture_output=True,
-            text=not binary,
+            text=not binary and input_data is None,
+            input=input_data,
             timeout=effective_timeout_s,
             env={**(env if env is not None else os.environ), "LC_ALL": "C"},
         )
@@ -615,6 +1782,1825 @@ def rev_parse_revision(repo: Path, revision: str) -> str:
     if rc != 0:
         raise GitError(f"git rev-parse --verify {revision} failed in {repo}: {detail}")
     return out
+
+
+def ref_revision(repo: Path, refname: str) -> str:
+    """Resolve one fully-qualified ref without falling back to another name."""
+    rc, out, detail = _git_out(repo, "rev-parse", "--verify", refname)
+    if rc != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", out):
+        raise IntegrationEvidenceError(f"target ref evidence is unavailable for {refname}")
+    return out
+
+
+def integration_ref_update(
+    repo: Path, refname: str, operation_identity: str
+) -> IntegrationRefUpdate | None:
+    """Read the unique reflog transition coupled to ``operation_identity``.
+
+    Git's reflog supplies the actual old side of the update, unlike a HEAD
+    sample taken before the command.  The next older reflog row is exactly that
+    old value.  Missing evidence returns ``None``; malformed or ambiguous
+    evidence fails closed without exposing object ids.
+    """
+    action = f"bmad-loop-integrate:{operation_identity}"
+    rc, out, _detail = _git_out(repo, "reflog", "show", "--format=%H%x00%gs", refname)
+    if rc != 0:
+        raise IntegrationEvidenceError(f"target reflog evidence is unavailable for {refname}")
+    rows: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        try:
+            revision, subject = line.split("\0", 1)
+        except ValueError as exc:
+            raise IntegrationEvidenceError(
+                f"target reflog evidence is malformed for {refname}"
+            ) from exc
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+            raise IntegrationEvidenceError(f"target reflog evidence is malformed for {refname}")
+        rows.append((revision, subject))
+    matches = [
+        index
+        for index, (_revision, subject) in enumerate(rows)
+        if subject == action or subject.startswith(action + ":")
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1 or matches[0] + 1 >= len(rows):
+        raise IntegrationEvidenceError(f"target reflog evidence is ambiguous for {refname}")
+    index = matches[0]
+    return IntegrationRefUpdate(old_revision=rows[index + 1][0], new_revision=rows[index][0])
+
+
+def require_ref_reflog(repo: Path, refname: str) -> None:
+    """Fail before integration when ``refname`` has no readable reflog."""
+    rc, _out = _git(repo, "reflog", "exists", refname)
+    current = ref_revision(repo, refname)
+    show_rc, latest, _detail = _git_out(repo, "reflog", "show", "-1", "--format=%H", refname)
+    if rc != 0 or show_rc != 0 or latest != current:
+        raise IntegrationEvidenceError(
+            f"target reflog is unavailable for {refname}; integration was not attempted"
+        )
+
+
+def _nul_git_paths(proc: subprocess.CompletedProcess[bytes], *, unavailable: str) -> list[str]:
+    if proc.returncode != 0:
+        raise IntegrationRestoreError(unavailable)
+    return [os.fsdecode(path) for path in proc.stdout.split(b"\0") if path]
+
+
+def _integration_restore_paths(
+    repo: Path,
+    *,
+    old_revision: str,
+    new_revision: str,
+    extra_paths: Iterable[str] = (),
+) -> list[str]:
+    """Complete receipt-attributable commit/index path inventory.
+
+    Binary output plus ``os.fsdecode`` preserves arbitrary POSIX filenames for
+    the literal pathspec round trip.  The index-vs-integrated-tree delta is
+    load-bearing: commit-msg hooks can stage deletions or unrelated paths after
+    Git has already written the commit tree.
+    """
+    changed = _nul_git_paths(
+        git_bytes(
+            repo,
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            old_revision,
+            new_revision,
+        ),
+        unavailable="target integration paths could not be read; no restoration was attempted",
+    )
+    index_delta = _nul_git_paths(
+        git_bytes(
+            repo,
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            new_revision,
+        ),
+        unavailable="target post-hook index paths could not be read; no restoration was attempted",
+    )
+    indexed_extra = [
+        path
+        for path in dict.fromkeys(extra_paths)
+        if path_tracked(repo, _portable_integration_path(path))
+    ]
+    return list(dict.fromkeys([*changed, *index_delta, *indexed_extra]))
+
+
+def _restore_paths_from_stdin(repo: Path, old_revision: str, paths: Iterable[str]) -> None:
+    """Restore ``paths`` — index and worktree — to ``old_revision``.
+
+    A path beneath another listed path is dropped: git names both sides of a
+    tracked file/directory transition (``a`` deleted, ``a/b`` added), and
+    ``restore`` refuses the pair — ``pathspec 'a/b' did not match`` once ``a``
+    is a file in the source — while the pathspec ``a`` alone restores the
+    whole old shape, in either direction, since a pathspec covers its subtree
+    (#796 review). A listed ancestor is always a file, symlink, or gitlink on
+    one side (``diff --name-only`` names leaves, never trees), so nothing
+    beneath it is a separate restore.
+    """
+    ordered = list(dict.fromkeys(_portable_integration_path(path) for path in paths))
+    listed = set(ordered)
+    selected = [
+        path
+        for path in ordered
+        if not any(
+            "/".join(path.split("/")[:depth]) in listed for depth in range(1, path.count("/") + 1)
+        )
+    ]
+    if not selected:
+        return
+    payload = b"".join(os.fsencode(_portable_integration_path(path)) + b"\0" for path in selected)
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "--literal-pathspecs",
+            "restore",
+            f"--source={old_revision}",
+            "--staged",
+            "--worktree",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        repo,
+        binary=True,
+        input_data=payload,
+    )
+    if proc.returncode != 0:
+        detail = os.fsdecode(proc.stdout + proc.stderr).strip()
+        raise IntegrationRestoreError(
+            "target index/worktree restoration failed; the target ref was not moved: " + detail
+        )
+
+
+def _restore_receipt_index(repo: Path, snapshots: list[dict[str, object]]) -> None:
+    """Restore receipt paths' exact pre-attempt index stages and intent state."""
+    for entry in snapshots:
+        rel = _portable_integration_path(entry["path"])
+        rc, detail = _git(repo, "update-index", "--force-remove", "--", rel)
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target index entry restoration failed for {rel}: {detail}"
+            )
+    records = bytearray()
+    intent_paths: list[str] = []
+    extended_flags: list[tuple[str, int]] = []
+    for entry in snapshots:
+        rel = _portable_integration_path(entry["path"])
+        index = _validated_index_state(entry["index"])
+        entries = index["entries"]
+        assert isinstance(entries, list)
+        if index["intent_to_add"]:
+            intent_paths.append(rel)
+            if entries:
+                extended_flags.append((rel, int(str(entries[0]["flags"]), 16)))
+            continue
+        for item in entries:
+            mode = str(item["mode"])
+            oid = str(item["oid"])
+            stage = int(item["stage"])
+            records.extend(f"{mode} {oid} {stage}\t".encode("ascii"))
+            records.extend(os.fsencode(rel))
+            records.append(0)
+            if stage == 0:
+                extended_flags.append((rel, int(str(item["flags"]), 16)))
+    if records:
+        proc = _run_git(
+            ["git", "-C", str(repo), "update-index", "-z", "--index-info"],
+            repo,
+            binary=True,
+            input_data=bytes(records),
+        )
+        if proc.returncode != 0:
+            raise IntegrationRestoreError("target index stage restoration failed")
+    for rel in intent_paths:
+        rc, detail = _git(repo, "add", "-N", "--", rel)
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target intent-to-add restoration failed for {rel}: {detail}"
+            )
+    for rel, flags in extended_flags:
+        _apply_index_flags(repo, rel, flags)
+
+
+def _apply_index_flags(repo: Path, rel: str, flags: int) -> None:
+    """Set or clear the assume-unchanged and skip-worktree bits of ``rel`` to ``flags``."""
+    for enabled, option in (
+        (bool(flags & 0x8000), "assume-unchanged"),
+        (bool(flags & 0x40000000), "skip-worktree"),
+    ):
+        rc, detail = _git(
+            repo,
+            "update-index",
+            f"--{'' if enabled else 'no-'}{option}",
+            "--",
+            rel,
+        )
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target index flag restoration failed for {rel}: {detail}"
+            )
+
+
+def _receipt_index_complete(repo: Path, snapshots: list[dict[str, object]]) -> bool:
+    return all(
+        _index_state(repo, str(entry["path"])) == _validated_index_state(entry["index"])
+        for entry in snapshots
+    )
+
+
+def _copy_sidecar_to_target(
+    sidecar: Path,
+    parent_fd: int,
+    name: str,
+    size: int,
+    digest: str,
+    mode: int,
+) -> None:
+    temporary = f".restore-{os.getpid():x}-{os.urandom(6).hex()}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent_fd)
+    source_fd = os.open(sidecar, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    observed = hashlib.sha256()
+    measured = 0
+    try:
+        with os.fdopen(source_fd, "rb") as source, os.fdopen(fd, "wb") as target:
+            source_fd = -1
+            fd = -1
+            while chunk := source.read(_INTEGRATION_SNAPSHOT_CHUNK):
+                target.write(chunk)
+                observed.update(chunk)
+                measured += len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if measured != size or observed.hexdigest() != digest:
+            raise IntegrationRestoreError("target integration snapshot changed during restoration")
+        os.chmod(temporary, mode, dir_fd=parent_fd, follow_symlinks=False)
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _restore_symlink_from_sidecar(
+    sidecar: Path, parent_fd: int, name: str, size: int, digest: str
+) -> None:
+    fd = os.open(sidecar, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as stream:
+        target_bytes = stream.read()
+    if len(target_bytes) != size or hashlib.sha256(target_bytes).hexdigest() != digest:
+        raise IntegrationRestoreError("target integration snapshot changed during restoration")
+    temporary = f".restore-link-{os.getpid():x}-{os.urandom(6).hex()}"
+    try:
+        os.symlink(os.fsdecode(target_bytes), temporary, dir_fd=parent_fd)
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _open_restore_parent(repo: Path, parent: Path) -> int:
+    """Open/create one target parent beneath a no-follow repository descriptor."""
+    if not DIR_FD_ANCHORED_WRITES:
+        parent.mkdir(parents=True, exist_ok=True)
+        fd = open_dir_confined(repo, parent)
+        if fd is None:
+            raise IntegrationRestoreError("target restoration parent is redirected")
+        return fd
+    try:
+        relative = parent.relative_to(repo)
+    except ValueError as exc:
+        raise IntegrationRestoreError("target restoration parent escaped repository") from exc
+    root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    fd = root_fd
+    try:
+        for part in relative.parts:
+            try:
+                nested = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                os.fsync(fd)
+                nested = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd,
+                )
+            if fd != root_fd:
+                os.close(fd)
+            fd = nested
+        if fd == root_fd:
+            root_fd = -1
+        return fd
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
+    finally:
+        if root_fd >= 0 and root_fd != fd:
+            os.close(root_fd)
+
+
+def _remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove one receipt-owned entry without following a link below it."""
+    try:
+        mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if S_ISREG(mode) or S_ISLNK(mode):
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        return
+    if not stat.S_ISDIR(mode):
+        raise IntegrationRestoreError("target expected-absent path became unsafe")
+    child_fd = os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+    )
+    try:
+        for child in os.listdir(child_fd):
+            _remove_tree_at(child_fd, child)
+    finally:
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _absent_beneath_a_file(repo: Path, target: Path, captured_links: Collection[str] = ()) -> bool:
+    """Whether an expected-absent ``target`` sits beneath an ancestor that is a file.
+
+    The receipt captures the leaf beneath a tracked file/directory transition
+    (``a/b`` while ``a`` is a file) as absent; once the file is back — ``git
+    restore`` put it there ahead of the snapshot writes — the leaf is absent
+    by topology, and there is no parent directory to open, create, or remove
+    (#796 review); so is a proved-absent parent beneath it (``a/b`` for the
+    leaf ``a/b/c``). A symlink on the way is the redirection probe's to
+    refuse, never a file here — unless the receipt captured that very path
+    as a symlink (``captured_links``): then ``git restore`` put it back the
+    same way, the transition was symlink-to-directory, and the leaf beneath
+    it is absent by topology too (#796 review).
+    """
+    # top-down, so the TOPMOST link or file decides and no component beneath
+    # one is ever read through it: `is_symlink()` on `a/b` with `a -> dir`
+    # answers for `dir/b`, another path's entry (#796 review)
+    ancestor = repo
+    for part in target.relative_to(repo).parts[:-1]:
+        ancestor = ancestor / part
+        if ancestor.is_symlink():
+            return ancestor.relative_to(repo).as_posix() in captured_links
+        if not ancestor.exists():
+            return False
+        if not ancestor.is_dir():
+            return True
+    return False
+
+
+def _captured_links(snapshots: Iterable[dict[str, object]]) -> frozenset[str]:
+    """Paths the receipt captured as symlinks: their own restored shape."""
+    return frozenset(str(entry["path"]) for entry in snapshots if entry["state"] == "symlink")
+
+
+def _expected_absent_directory_is_owned(repo: Path, target: Path) -> bool:
+    """Whether a directory at a receipt-proved-absent path is the attempt's to remove.
+
+    The receipt proved nothing was there, so what stands there now arrived
+    during the attempt — but the restore removes only what it can attribute
+    to the attempt: an empty directory, or a submodule checkout of this
+    repository (its git dir under ``.git/modules``, or naming this repository
+    as its superproject), the shape a merge that introduces a gitlink and a
+    target hook's ``submodule update --init`` leave. Whatever such a checkout
+    holds is attempt-era with it — a hook's write into the new checkout (#796
+    review) included — so cleanliness is not required. A directory of any
+    other kind may be fresh operator state and is never removed.
+    """
+    try:
+        if not any(target.iterdir()):
+            return True
+    except OSError:
+        return False
+    try:
+        return _submodule_checkout_owned(repo.resolve(strict=True), target)
+    except OSError:
+        return False
+
+
+def _restore_receipt_snapshots_unanchored(
+    repo: Path, run_dir: Path, snapshots: list[dict[str, object]]
+) -> None:
+    """Checked path fallback for hosts without descriptor-relative syscalls."""
+    prepared = [(entry, _confined_repo_operand(repo, entry["path"])[1]) for entry in snapshots]
+    links = _captured_links(snapshots)
+    # the anchored restore's ancestry preflight, by path: a symlink on the
+    # way to any destination this restore would write or remove through is
+    # refused before the first mutation — the confinement reading never
+    # follows a link, so this is the reading that sees one (#796 review)
+    for entry, target in prepared:
+        if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
+            continue
+        if _symlink_ancestor(repo, target) is not None:
+            raise IntegrationRestoreError("target restoration parent is redirected")
+    for entry, target in prepared:
+        if entry["state"] == "absent":
+            if _absent_beneath_a_file(repo, target, links):
+                continue
+            if target.is_dir() and not target.is_symlink():
+                if not _expected_absent_directory_is_owned(repo, target):
+                    raise IntegrationRestoreError(
+                        "target expected-absent directory contains unowned state"
+                    )
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sidecar = _sidecar_path(run_dir, entry["sidecar"])
+        size = entry["size"]
+        digest = entry["sha256"]
+        assert isinstance(size, int) and isinstance(digest, str)
+        if entry["state"] == "symlink":
+            target_bytes = sidecar.read_bytes()
+            if len(target_bytes) != size or hashlib.sha256(target_bytes).hexdigest() != digest:
+                raise IntegrationRestoreError(
+                    "target integration snapshot changed during restoration"
+                )
+            target.unlink(missing_ok=True)
+            target.symlink_to(os.fsdecode(target_bytes))
+        else:
+            temporary = target.with_name(f".restore-{os.getpid():x}-{os.urandom(6).hex()}")
+            measured, observed = _stream_snapshot(sidecar, temporary)
+            if (measured, observed) != (size, digest):
+                temporary.unlink(missing_ok=True)
+                raise IntegrationRestoreError(
+                    "target integration snapshot changed during restoration"
+                )
+            os.replace(temporary, target)
+            expected_mode = entry["mode"]
+            assert isinstance(expected_mode, int)
+            os.chmod(target, expected_mode)
+    parent_values: list[str] = []
+    for entry in snapshots:
+        raw_parents = entry.get("absent_parents")
+        assert isinstance(raw_parents, list)
+        parent_values.extend(str(parent) for parent in raw_parents)
+    for rel in sorted(
+        set(parent_values),
+        key=lambda value: value.count("/"),
+        reverse=True,
+    ):
+        try:
+            (repo / rel).rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _restore_receipt_snapshots(
+    repo: Path, run_dir: Path, snapshots: list[dict[str, object]]
+) -> None:
+    if not DIR_FD_ANCHORED_WRITES:
+        _restore_receipt_snapshots_unanchored(repo, run_dir, snapshots)
+        return
+    # Retain all destination directory descriptors before the first leaf write.
+    prepared: list[tuple[dict[str, object], Path, int]] = []
+    try:
+        destinations = [
+            (entry, _confined_repo_operand(repo, entry["path"])[1]) for entry in snapshots
+        ]
+        # Validate every lexical destination and its currently existing ancestry
+        # before creating a missing parent for any one destination.
+        links = _captured_links(snapshots)
+        for entry, target in destinations:
+            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
+                continue
+            probe = target.parent
+            while not probe.exists() and not probe.is_symlink() and probe != repo:
+                probe = probe.parent
+            if probe.is_symlink():
+                raise IntegrationRestoreError("target restoration parent is redirected")
+        for entry, target in destinations:
+            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
+                continue
+            prepared.append((entry, target, _open_restore_parent(repo, target.parent)))
+        for entry, target, parent_fd in prepared:
+            state = entry["state"]
+            if state == "absent":
+                try:
+                    current_mode = os.stat(
+                        target.name, dir_fd=parent_fd, follow_symlinks=False
+                    ).st_mode
+                except FileNotFoundError:
+                    current_mode = 0
+                if stat.S_ISDIR(current_mode) and not _expected_absent_directory_is_owned(
+                    repo, target
+                ):
+                    raise IntegrationRestoreError(
+                        "target expected-absent directory contains unowned state"
+                    )
+                _remove_tree_at(parent_fd, target.name)
+                continue
+            sidecar = _sidecar_path(run_dir, entry["sidecar"])
+            size = entry["size"]
+            digest = entry["sha256"]
+            assert isinstance(size, int) and isinstance(digest, str)
+            try:
+                existing = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                existing = 0
+            if existing and not S_ISREG(existing) and not S_ISLNK(existing):
+                raise IntegrationRestoreError(
+                    "target snapshot path became non-file; it was preserved"
+                )
+            if state == "symlink":
+                _restore_symlink_from_sidecar(sidecar, parent_fd, target.name, size, digest)
+                continue
+            expected_mode = entry["mode"]
+            assert isinstance(expected_mode, int)
+            _copy_sidecar_to_target(sidecar, parent_fd, target.name, size, digest, expected_mode)
+        # Remove parent directories proven absent at capture, deepest first.
+        parent_values: list[str] = []
+        for entry in snapshots:
+            raw_parents = entry.get("absent_parents")
+            assert isinstance(raw_parents, list)
+            parent_values.extend(str(parent) for parent in raw_parents)
+        absent_parents = sorted(
+            set(parent_values),
+            key=lambda value: value.count("/"),
+            reverse=True,
+        )
+        for rel in absent_parents:
+            path = repo / rel
+            if _absent_beneath_a_file(repo, path, links):
+                continue  # absent by topology: the file above it is back
+            parent_fd = _open_restore_parent(repo, path.parent)
+            try:
+                try:
+                    os.rmdir(path.name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except (FileNotFoundError, OSError):
+                    # Non-empty means it contains state the receipt does not own.
+                    pass
+            finally:
+                os.close(parent_fd)
+    finally:
+        for _entry, _target, parent_fd in prepared:
+            os.close(parent_fd)
+
+
+def _receipt_snapshots_complete(
+    repo: Path, run_dir: Path, snapshots: list[dict[str, object]]
+) -> bool:
+    links = _captured_links(snapshots)
+    for entry in snapshots:
+        rel, target = _confined_repo_operand(repo, entry["path"])
+        if _index_state(repo, rel) != _validated_index_state(entry["index"]):
+            return False
+        # a symlink on the way is read under its own entry, never through:
+        # beneath a captured one the absent leaf is absent by topology (so
+        # is one beneath a file), and `exists()` or a digest read through a
+        # link that resolves would answer for another path's entry (#796
+        # review); beneath any other link nothing is restored
+        beneath = _absent_beneath_a_file(repo, target, links)
+        if entry["state"] == "absent" and beneath:
+            continue
+        if _symlink_ancestor(repo, target) is not None:
+            return False
+        if entry["state"] == "absent":
+            if target.exists() or target.is_symlink():
+                return False
+            raw_parents = entry.get("absent_parents")
+            assert isinstance(raw_parents, list)
+            for parent in raw_parents:
+                candidate = repo / str(parent)
+                if candidate.exists() or candidate.is_symlink():
+                    return False
+            # a proved-empty parent is restored when it is empty again, or
+            # gone — git removes a directory its restore emptied; residue
+            # there is attempt-era the restore could not attribute
+            raw_empty = entry.get("empty_parents")
+            assert isinstance(raw_empty, list)
+            for parent in raw_empty:
+                candidate = repo / str(parent)
+                if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+                    return False
+                if candidate.is_dir() and any(candidate.iterdir()):
+                    return False
+            continue
+        if entry["state"] == "symlink":
+            if not target.is_symlink():
+                return False
+            sidecar = _sidecar_path(run_dir, entry["sidecar"])
+            expected = sidecar.read_bytes()
+            if os.readlink(os.fsencode(target)) != expected:
+                return False
+            continue
+        try:
+            mode = target.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not S_ISREG(mode):
+            return False
+        expected_mode = entry["mode"]
+        assert isinstance(expected_mode, int)
+        if mode & 0o7777 != expected_mode:
+            return False
+        sidecar = _sidecar_path(run_dir, entry["sidecar"])
+        size = entry["size"]
+        digest = entry["sha256"]
+        assert isinstance(size, int) and isinstance(digest, str)
+        expected = (size, digest)
+        if _stream_digest(sidecar) != expected or _stream_digest(target) != expected:
+            return False
+    return True
+
+
+def integration_nonref_state_unchanged(
+    repo: Path,
+    run_dir: Path,
+    snapshots: object,
+    submodules: object,
+    *,
+    exclude_paths: Iterable[str] = (),
+    operation_identity: str | None = None,
+) -> bool:
+    """Recheck snapshotted state immediately before Git may update the ref."""
+    validated_snapshots, validated_submodules = validate_integration_state_schema(
+        run_dir, snapshots, submodules, operation_identity
+    )
+    excluded = set(exclude_paths)
+    retained = [entry for entry in validated_snapshots if entry["path"] not in excluded]
+    if not _receipt_snapshots_complete(repo, run_dir, retained):
+        return False
+    for entry in validated_submodules:
+        if entry["path"] in excluded:
+            continue
+        try:
+            _validated_submodule_checkout(repo, entry, verify_head=True)
+        except IntegrationEvidenceError:
+            return False
+    return True
+
+
+def _revision_inventory(repo: Path, revision: str) -> dict[str, tuple[bytes, bytes, str]]:
+    """Every blob and gitlink ``revision`` seals, keyed by path: ``(mode, kind, oid)``.
+
+    One whole-tree ``ls-tree -r`` — the shape that keeps a wide incoming set off
+    argv — read by both post-integration readings that need to know what the
+    integrated commit holds at a path. Trees are not rows; a caller asking
+    about a directory asks through its prefix.
+    """
+    proc = git_bytes(repo, "ls-tree", "-r", "-z", revision)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("the integrated commit's path inventory could not be read")
+    inventory: dict[str, tuple[bytes, bytes, str]] = {}
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, kind, oid = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError(
+                "the integrated commit's path inventory is malformed"
+            ) from exc
+        inventory[os.fsdecode(raw_path)] = (mode, kind, os.fsdecode(oid))
+    return inventory
+
+
+def _inventory_held_paths(inventory: dict[str, tuple[bytes, bytes, str]]) -> set[str]:
+    """Every path ``inventory`` holds, directly or as a tree above a held row.
+
+    ``ls-tree -r`` names blobs and gitlinks, never the trees above them, so a
+    path the commit turned into a directory (``a`` deleted, ``a/b`` added; a
+    submodule replaced by a tracked directory) is held through the prefix.
+    """
+    held: set[str] = set()
+    for path in inventory:
+        parts = path.split("/")
+        held.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    return held
+
+
+def integrated_paths_drift(
+    repo: Path,
+    revision: str,
+    paths: Iterable[str],
+    *,
+    retained_checkouts: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Incoming ``paths`` whose post-hook index or worktree differ from ``revision``.
+
+    The receipt's post-integration check excludes the incoming set from its
+    "unchanged since the snapshot" reading — the merge changed those paths by
+    design — so nothing there sees a TARGET hook rewrite or stage one of them
+    after git resolved the merge (#796 review). The integrated commit is the
+    authority for exactly those paths: after every leg the index and the
+    checkout must hold each one as ``revision`` has it. Two whole-tree
+    ``diff --name-only`` readings (worktree and ``--cached``), the same shape
+    as the restore's own inventory, intersected here with the incoming set —
+    ``git diff`` takes no stdin pathspec, and a whole-tree read is what keeps
+    a wide incoming set off argv. Path-only evidence; an unreadable probe
+    raises rather than answering.
+
+    Those readings cover only what the index tracks, so they cannot see an
+    incoming path the integrated commit DELETES and a hook then recreates
+    without staging: ``status`` shows ``?? path``, both diffs stay empty
+    (#796 review). For a deleted incoming path the commit's authority is
+    "absent from the checkout", so that leg is a filesystem probe — any
+    entry at the path, plain, symlink, or gitignored, is drift. The
+    commit's own inventory (``ls-tree -r``, whole-tree for the same argv
+    reason) says which incoming paths it deleted — and since that listing
+    names blobs and gitlinks, never the trees above them, a path the commit
+    turned into a directory (``a`` deleted, ``a/b`` added) counts as held
+    through the prefix, not deleted. One deleted shape is git's own and not
+    a hook's: the populated checkout a merge leaves behind when it deletes
+    a submodule (``warning: unable to rmdir``). `validate_integrated_submodule_state`
+    adjudicates those against the receipt and names the ones it accepted in
+    ``retained_checkouts``; the probe leaves exactly those to it.
+    """
+    selected = {_portable_integration_path(path) for path in paths}
+    if not selected:
+        return ()
+    retained = {_portable_integration_path(path) for path in retained_checkouts}
+    drift: list[str] = []
+    for cached in ((), ("--cached",)):
+        proc = git_bytes(repo, "diff", *cached, "--name-only", "--no-renames", "-z", revision)
+        if proc.returncode != 0:
+            raise IntegrationEvidenceError(
+                "target post-hook state on the incoming paths could not be read"
+            )
+        drift.extend(
+            path
+            for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
+            if path in selected
+        )
+    inventory = _revision_inventory(repo, revision)
+    held = _inventory_held_paths(inventory)
+    for path in sorted(selected - held - retained):
+        _validated, candidate = _confined_repo_operand(repo, path)
+        # beneath a symlink the commit holds (`a/b` deleted, `a -> dir`
+        # added, `dir/b` standing where `a/b` reads) the leaf is absent by
+        # topology: git tracks no path through a link, and `exists()` through
+        # this one reads another path's entry (#796 review). The link is an
+        # incoming path the diff readings above hold to the commit; a link
+        # the commit does not hold is a hook's, and the leaf is drift.
+        link = _symlink_ancestor(repo, candidate)
+        if link is not None:
+            row = inventory.get(link.relative_to(repo).as_posix())
+            if row is not None and row[0] == b"120000":
+                continue
+            drift.append(path)
+            continue
+        if candidate.exists() or candidate.is_symlink():
+            drift.append(path)
+    return tuple(dict.fromkeys(drift))
+
+
+def integrated_index_flags_drift(
+    repo: Path,
+    run_dir: Path,
+    snapshots: object,
+    paths: Iterable[str],
+    *,
+    operation_identity: str | None = None,
+) -> tuple[str, ...]:
+    """Incoming ``paths`` whose post-hook index entry carries a flag word a hook set.
+
+    ``update-index --assume-unchanged`` or ``--skip-worktree`` on an incoming
+    path changes no blob: both diff readings stay empty, ``status`` shows
+    nothing, and the integration retired its receipt over an index that hides
+    later edits from git (#796 review). One whole-tree ``ls-files --stage`` +
+    ``--debug`` reading (the receipt's own index reading, whole-tree for the
+    same argv reason as the diffs) is filtered to the incoming set, and each
+    stage-0 file entry there may carry only what a fresh entry may on this
+    target (`_fresh_index_flag_words`) or the word the receipt captured for
+    the path — a fast-forward or squash keeps an operator's assume-unchanged
+    bit on the entry it updates, where ``git merge`` writes it anew (git
+    2.55). Gitlinks are the submodule reading's, unmerged stages the diff
+    readings'. Path-only evidence, sorted.
+    """
+    selected = {_portable_integration_path(path) for path in paths}
+    if not selected:
+        return ()
+    validated, _submodules = validate_integration_state_schema(
+        run_dir, snapshots, [], operation_identity
+    )
+    captured: dict[str, str] = {}
+    for entry in validated:
+        index = entry["index"]
+        assert isinstance(index, dict)
+        entries = index["entries"]
+        assert isinstance(entries, list)
+        for item in entries:
+            if item["stage"] == 0:
+                captured[str(entry["path"])] = str(item["flags"])
+    fresh = _fresh_index_flag_words(repo)
+    drift: list[str] = []
+    for path, word in _index_file_flag_words(repo):
+        if path not in selected:
+            continue
+        accepted = fresh if path not in captured else fresh | {captured[path]}
+        if word not in accepted:
+            drift.append(path)
+    return tuple(sorted(drift))
+
+
+def _index_file_flag_words(repo: Path) -> list[tuple[str, str]]:
+    """``(path, flag word)`` of every stage-0 file entry in ``repo``'s index.
+
+    One whole-tree ``ls-files --stage`` + ``--debug`` pair — the receipt's own
+    index reading (`_index_state`), whole-tree for the same argv reason as the
+    diff readings. Gitlinks are the submodule reading's, unmerged stages the
+    diff readings'; neither is listed.
+    """
+    staged = git_bytes(repo, "ls-files", "--stage", "-z")
+    debug = git_bytes(repo, "ls-files", "--debug", "-z")
+    if staged.returncode != 0 or debug.returncode != 0:
+        raise IntegrationEvidenceError("target index flag evidence is unavailable")
+    flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
+    records = [record for record in staged.stdout.split(b"\0") if record]
+    if len(flags) != len(records):
+        raise IntegrationEvidenceError("target index flag evidence is malformed")
+    words: list[tuple[str, str]] = []
+    for record, raw_flags in zip(records, flags, strict=True):
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, _oid, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError("target index flag evidence is malformed") from exc
+        if stage != b"0" or mode == b"160000":
+            continue
+        words.append((os.fsdecode(raw_path), os.fsdecode(raw_flags).lower()))
+    return words
+
+
+def _index_flags_digest(words: Iterable[tuple[str, str]]) -> str:
+    digest = hashlib.sha256()
+    for path, word in sorted(words):
+        digest.update(os.fsencode(path))
+        digest.update(b"\0")
+        digest.update(word.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, object]:
+    """The receipt's evidence for the flag words of the index OUTSIDE the snapshot set.
+
+    A target hook's ``update-index --assume-unchanged`` on a clean tracked file
+    outside the incoming set changes no blob and leaves ``status`` empty, so no
+    other reading sees it (#796 review). ``digest`` is over ``(path, word)`` of
+    every stage-0 file entry not in ``exclude`` (the snapshot paths: those are
+    the incoming reading's), which proves the rest of the index unchanged
+    after the hooks without persisting it; ``marked`` maps the entries among
+    them carrying a word no fresh entry may (neither none nor skip-worktree),
+    so a flip can be NAMED — a typical index holds none, and a sparse target's
+    out-of-cone entries, all skip-worktree, stay out of it.
+    """
+    excluded = {_portable_integration_path(path) for path in exclude}
+    words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
+    return {
+        "digest": _index_flags_digest(words),
+        "marked": {
+            path: word for path, word in words if word not in {"0", _SPARSE_INDEX_FLAG_WORD}
+        },
+    }
+
+
+_IGNORED_ENTRIES_SIDECAR = "ignored.lst"
+
+
+def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
+    """The existing capture root of ``operation_identity``, confined to the run."""
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
+        raise IntegrationEvidenceError("persisted target integration operation is malformed")
+    run_root = run_dir.resolve(strict=True)
+    parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
+    root = parent / operation_identity
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as exc:
+        raise IntegrationEvidenceError("target integration snapshot root is missing") from exc
+    if (
+        parent.is_symlink()
+        or root.is_symlink()
+        or not resolved.is_relative_to(run_root)
+        or resolved.parent != parent.resolve(strict=True)
+    ):
+        raise IntegrationEvidenceError("target integration snapshot directory was redirected")
+    return root
+
+
+def ignored_entries(repo: Path) -> dict[str, str]:
+    """Every ignored untracked entry of the whole tree with its ``lstat`` identity.
+
+    One whole-tree ``ls-files --others --ignored --exclude-standard`` (no
+    ``--directory``: a file inside an ignored directory is an entry of its
+    own, so a hook's write there is named too). Submodule checkouts are their
+    own reading's; nested repositories list as one entry. The automator
+    directory's run records — this receipt's own sidecars among them — are
+    left out exactly as `automator_dirty_paths` leaves them. The identity is
+    the entry's ``lstat`` — size, mtime, ctime, inode, device, mode — never
+    its bytes: a hook overwriting or truncating an ignored file that was
+    already there leaves the path set unchanged and ``status`` and ``diff``
+    silent, and the identity is what names it (#796 review). An entry gone
+    between the listing and its ``lstat`` is a removal, not read.
+    """
+    proc = git_bytes(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("target ignored-entry evidence is unavailable")
+    prefix = f"{AUTOMATOR_DIR_REL}/"
+    entries: dict[str, str] = {}
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        if path.startswith(prefix):
+            below = path.removeprefix(prefix)
+            if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
+                continue
+        identity = _lstat_identity(repo, path)
+        if identity is not None:
+            entries[path] = identity
+    return dict(sorted(entries.items()))
+
+
+def _lstat_identity(repo: Path, path: str) -> str | None:
+    """``lstat`` identity of a tree entry — size, mtime, ctime, inode, device,
+    mode — or ``None`` for one that is gone."""
+    try:
+        entry = os.lstat(os.fsencode(repo / path))
+    except FileNotFoundError:
+        return None
+    return ":".join(
+        str(value)
+        for value in (
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+            entry.st_ino,
+            entry.st_dev,
+            entry.st_mode,
+        )
+    )
+
+
+def capture_ignored_entries(
+    repo: Path, run_dir: Path, operation_identity: str
+) -> dict[str, object]:
+    """The receipt's evidence for the ignored entries of the whole tree.
+
+    A target hook's gitignored write beside an incoming path in a directory
+    the target already held populated is listed by no other reading: the diff
+    readings cover tracked paths, the stray reading takes ``status`` without
+    ``--ignored``, and the introduced-directory walk roots only where the
+    receipt proved nothing, an empty directory, or a non-directory stood
+    (#796 review). The whole tree's ignored entries with their identities
+    (`ignored_entries`) are sealed into a NUL-delimited sidecar of
+    ``path, identity`` pairs under the operation's capture root — the listing
+    can be wide, and the receipt in ``state.json`` records only its location,
+    size and digest — so that after the hooks every ignored entry not on it,
+    or on it under another identity, can be NAMED
+    (`integrated_ignored_additions`).
+    """
+    root = _owned_integration_snapshot_root(run_dir, operation_identity)
+    data = b"\0".join(
+        os.fsencode(path) + b"\0" + identity.encode("ascii")
+        for path, identity in ignored_entries(repo).items()
+    )
+    size, digest = _snapshot_bytes(data, root / _IGNORED_ENTRIES_SIDECAR)
+    return {
+        "sidecar": (root / _IGNORED_ENTRIES_SIDECAR).relative_to(run_dir).as_posix(),
+        "size": size,
+        "sha256": digest,
+    }
+
+
+def validate_ignored_entries_evidence(value: object) -> dict[str, object]:
+    """Validate a persisted `capture_ignored_entries` record; the same dict back."""
+    if not isinstance(value, dict) or set(value) != {"sidecar", "size", "sha256"}:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    sidecar, size, digest = value["sidecar"], value["size"], value["sha256"]
+    if (
+        not isinstance(sidecar, str)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    _portable_integration_path(sidecar)
+    return value
+
+
+def _recorded_ignored_entries(run_dir: Path, evidence: dict[str, object]) -> dict[str, str]:
+    sidecar = _sidecar_path(run_dir, evidence["sidecar"])
+    data = sidecar.read_bytes()
+    if len(data) != evidence["size"] or hashlib.sha256(data).hexdigest() != evidence["sha256"]:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence changed")
+    fields = data.split(b"\0") if data else []
+    if len(fields) % 2:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    recorded: dict[str, str] = {}
+    for raw_path, raw_identity in zip(fields[::2], fields[1::2], strict=True):
+        identity = raw_identity.decode("ascii", errors="strict")
+        if not raw_path or not re.fullmatch(r"-?\d+(:-?\d+){5}", identity):
+            raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+        recorded[os.fsdecode(raw_path)] = identity
+    return recorded
+
+
+def integrated_ignored_additions(
+    repo: Path, run_dir: Path, evidence: object, *, tolerated: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """Ignored entries after the hooks the receipt did not record, or recorded otherwise.
+
+    The listing `capture_ignored_entries` sealed, read back against its
+    digest, against the same reading now: an entry it does not hold arrived
+    during the attempt, and one it holds under another identity was written
+    during it — a target hook's write, wherever it stands, an ignored file
+    it overwrote or truncated in place included (#796 review). A
+    ``tolerated`` stray an incoming ``.gitignore`` change turned ignored,
+    which the pre-merge guard already read, is left out. Removals are not
+    read: the receipt never held ignored bytes, and an entry the cleanup
+    removed or the commit now tracks leaves the listing by design. The
+    restore leaves what this names in place, like unstaged and untracked
+    dirt. Path-only evidence, sorted. Ceiling: the identity is ``lstat``'s,
+    so a writer that puts size, times and inode back is not read.
+    """
+    validated = validate_ignored_entries_evidence(evidence)
+    recorded = _recorded_ignored_entries(run_dir, validated)
+    excluded = {_portable_integration_path(path) for path in tolerated}
+    return tuple(
+        sorted(
+            path
+            for path, identity in ignored_entries(repo).items()
+            if path not in excluded and recorded.get(path) != identity
+        )
+    )
+
+
+def validate_index_flags_evidence(value: object) -> dict[str, object]:
+    """Validate a persisted `capture_index_flags` record; the same dict back."""
+    if not isinstance(value, dict) or set(value) != {"digest", "marked"}:
+        raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
+    digest = value["digest"]
+    marked = value["marked"]
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not isinstance(marked, dict)
+        or any(
+            not isinstance(word, str) or not re.fullmatch(r"[0-9a-f]{1,8}", word)
+            for word in marked.values()
+        )
+    ):
+        raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
+    for path in marked:
+        _portable_integration_path(path)
+    return value
+
+
+def integrated_index_flags_outside_drift(
+    repo: Path, evidence: object, *, exclude: Iterable[str]
+) -> tuple[str, ...]:
+    """Paths outside the snapshot set whose index flag word a hook changed.
+
+    The digest of `capture_index_flags`, recomputed over the same set, proves
+    the rest of the index unchanged; on a mismatch each entry is read against
+    its captured word (``marked``) or, unmarked, against what a fresh entry
+    may carry on this target. Read after the stray reading, which owns an
+    entry a hook added or removed, so what is left to a mismatch is a word
+    flip — and a flip no entry can be named for (skip-worktree toggled on a
+    sparse target, where both words are fresh) is reported as such rather
+    than passed. Path-only evidence, sorted.
+    """
+    validated = validate_index_flags_evidence(evidence)
+    marked = validated["marked"]
+    assert isinstance(marked, dict)
+    excluded = {_portable_integration_path(path) for path in exclude}
+    words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
+    if _index_flags_digest(words) == validated["digest"]:
+        return ()
+    fresh = _fresh_index_flag_words(repo)
+    drift = sorted(
+        path for path, word in words if word != marked.get(path, word if word in fresh else None)
+    )
+    if not drift:
+        raise IntegrationEvidenceError(
+            "target hook changed index flag words outside the incoming set; no path named"
+        )
+    return tuple(drift)
+
+
+# The run's own records under `.bmad-loop/`: per-run and archived state,
+# engine plugins' caches, the decision store, operator-action records. Never
+# a hook's to write and never merged content — everything else there (the
+# hook relay script, a committed `policy.toml`, profile overlays, user
+# plugins) is the operator's tracked configuration and is read like any
+# other path (#796 review).
+_AUTOMATOR_RECORD_PREFIXES = ("runs/", "archive/", "cache/", "operator/")
+_AUTOMATOR_RECORD_FILES = frozenset({"decisions.json", "operator-actions.json"})
+
+
+def automator_dirty_paths(repo: Path) -> dict[str, str]:
+    """`dirty_paths` for the automator directory alone, the run's own records left out."""
+    rc, out = _git_raw(repo, "status", "--porcelain", "-z", "-uall", "--", AUTOMATOR_DIR_REL)
+    if rc != 0:
+        raise GitError(f"git status failed in {repo}")
+    prefix = f"{AUTOMATOR_DIR_REL}/"
+    result: dict[str, str] = {}
+    for path, xy in _porcelain_entries(out):
+        below = path.removeprefix(prefix)
+        if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
+            continue
+        result[path] = xy
+    return result
+
+
+def integrated_stray_paths(
+    repo: Path,
+    *,
+    tolerated: Iterable[str],
+    incoming: Iterable[str],
+    retained_checkouts: Iterable[str] = (),
+    run_dir: Path | None = None,
+    ignored: object = None,
+) -> tuple[str, ...]:
+    """Paths dirty after the target's hooks that no receipt reading owns.
+
+    The receipt snapshots the incoming set, the paths that were dirty before
+    the merge (cleaned or tolerated), and the declared artifacts; a clean
+    tracked file outside all of them has no baseline, and the readings above
+    are each scoped to their own set — so a TARGET hook editing, staging,
+    deleting or renaming such a file, or writing a new one beside it, went
+    unseen and the run recorded ``unit-merged`` over it (#796 review). The
+    integrated target may hold exactly one kind of dirt: the strays the guard
+    tolerated before the merge, which the snapshot proves unchanged. This is
+    the whole-tree ``status`` reading (`dirty_paths`: ``-uall``) — with the
+    automator directory read the same way, the run's own records left out
+    (`automator_dirty_paths`; #796 review) — minus what other readings
+    own — the ``tolerated`` set, the ``incoming`` set (the diff readings' and
+    the absent-path probe's), and every ``retained_checkouts`` leftover with
+    everything under it (the submodule reading's) — and minus an untracked
+    entry the receipt's sealed ``ignored`` listing (`capture_ignored_entries`,
+    read from ``run_dir``) recorded at the identity it has now: an ignored
+    file that was already there, which the pre-merge guard never listed
+    because it was ignored, and which an incoming ``.gitignore`` change
+    uncovered, so ``status`` lists it ``??`` after the hooks; it predates
+    the attempt and stays where it is, while one the listing holds under
+    another identity was written during the attempt and is named (#796
+    review). Path-only evidence, in sorted order. Ceilings: ignored entries
+    are not read here either, and the reading cannot tell a hook from a
+    writer that raced the merge — a per-worktree Editor leaking into the
+    main checkout in that window — and names both; the restore reverts what
+    a hook STAGED (the post-hook index delta is in its inventory) and leaves
+    unstaged and untracked entries where they are, for the operator the
+    pause names them to.
+    """
+    excluded = {_portable_integration_path(path) for path in (*tolerated, *incoming)}
+    prefixes = tuple(
+        f"{_portable_integration_path(path)}/" for path in dict.fromkeys(retained_checkouts)
+    )
+    recorded: dict[str, str] = {}
+    if ignored is not None and run_dir is not None:
+        recorded = _recorded_ignored_entries(run_dir, validate_ignored_entries_evidence(ignored))
+    strays: list[str] = []
+    for path, xy in (*dirty_paths(repo).items(), *automator_dirty_paths(repo).items()):
+        if path in excluded or path.rstrip("/") in excluded:
+            continue
+        if any(path == prefix or path.startswith(prefix) for prefix in prefixes):
+            continue
+        if xy == "??" and path in recorded and _lstat_identity(repo, path) == recorded[path]:
+            continue
+        strays.append(path)
+    return tuple(sorted(strays))
+
+
+def integrated_introduced_directories_drift(
+    repo: Path,
+    revision: str,
+    run_dir: Path,
+    snapshots: object,
+    *,
+    submodules: object = None,
+    operation_identity: str | None = None,
+) -> tuple[str, ...]:
+    """Entries under a directory the integrated commit created that it does not hold.
+
+    The receipt proved every ``absent_parents`` directory absent before the
+    attempt, so whatever stands in one after the hooks is attempt-era — and the
+    readings above see only what git lists: the diff readings cover tracked
+    paths, `integrated_stray_paths` takes ``status`` without ``--ignored``,
+    which also never names a ``.git``. So a target hook writing a gitignored
+    file into the new directory, or initialising a repository inside it, went
+    unseen (#796 review). A directory the commit put where a tracked file or
+    symlink stood (``a`` deleted, ``a/b`` added) is the commit's just the
+    same, and ``absent_parents`` never names it — the ancestor existed — but
+    the receipt captured the entry under its own path as ``regular`` or
+    ``symlink``, so a captured non-directory the commit now holds only as a
+    prefix is a root too (#796 review) — as is a gitlink the receipt recorded
+    unpopulated (``submodules``, ``head`` None: an empty directory, nothing
+    snapshotted) that the commit replaced with a tracked directory, which
+    the submodule reading accepts as the commit's own by its lack of a
+    ``.git`` and reads no further (#796 review) — and as is a directory the
+    receipt proved EMPTY (``empty_parents``: the first existing ancestor of
+    an incoming path, which git never tracks and no reading lists), whose
+    every entry after the hooks is attempt-era the same way (#796 review).
+    Each topmost such directory is walked
+    on disk, symlinks never followed, against the commit's inventory: a file or
+    symlink must be a path the commit holds, a directory a prefix it holds —
+    or a gitlink, whose populated checkout is `validate_integrated_submodule_state`'s
+    to read (with ``--ignored``, the path having been proved absent) and is
+    not descended into. Anything else is reported by path, an unheld
+    directory as itself rather than its contents. A directory that is not
+    there is nothing to walk; a symlink in its place is drift. Path-only
+    evidence, sorted.
+    """
+    validated, validated_submodules = validate_integration_state_schema(
+        run_dir, snapshots, [] if submodules is None else submodules, operation_identity
+    )
+    roots: set[str] = set()
+    replaced: set[str] = set()
+    for entry in validated:
+        parents = entry.get("absent_parents")
+        assert isinstance(parents, list)
+        if parents:
+            roots.add(str(parents[-1]))  # captured from the path upward: last is topmost
+        empty = entry.get("empty_parents")
+        assert isinstance(empty, list)
+        roots.update(str(parent) for parent in empty)  # proved empty: the topmost root
+        if entry["state"] in {"regular", "symlink"}:
+            replaced.add(str(entry["path"]))
+    for entry in validated_submodules:
+        if entry.get("head") is None:
+            replaced.add(str(entry["path"]))
+    if not roots and not replaced:
+        return ()
+    inventory = _revision_inventory(repo, revision)
+    held = _inventory_held_paths(inventory)
+    # a captured file, or unpopulated gitlink, the commit holds only as a
+    # prefix stands where the commit made a directory; one it still holds,
+    # or deleted, is no root
+    roots.update(rel for rel in replaced if rel in held and rel not in inventory)
+    if not roots:
+        return ()
+    drift: list[str] = []
+    for root in sorted(roots):
+        if any(root.startswith(f"{other}/") for other in roots):
+            continue
+        _validated, top = _confined_repo_operand(repo, root)
+        if top.is_symlink() or _symlink_ancestor(repo, top) is not None:
+            drift.append(root)
+            continue
+        if not top.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+            base = Path(dirpath).relative_to(repo).as_posix()
+            for name in sorted(dirnames):
+                rel = f"{base}/{name}"
+                child = Path(dirpath) / name
+                if child.is_symlink():
+                    if rel not in inventory:
+                        drift.append(rel)
+                    continue
+                row = inventory.get(rel)
+                if row is not None and row[0] == b"160000":
+                    dirnames.remove(name)
+                    continue
+                if rel not in held:
+                    drift.append(rel)
+                    dirnames.remove(name)
+            for name in filenames:
+                rel = f"{base}/{name}"
+                if rel not in inventory:
+                    drift.append(rel)
+    return tuple(sorted(drift))
+
+
+def revision_tree_oid(repo: Path, revision: str) -> str:
+    """The tree object id ``revision`` seals (``rev-parse <revision>^{tree}``)."""
+    rc, tree, detail = _git_out(repo, "rev-parse", f"{revision}^{{tree}}")
+    if rc != 0:
+        raise IntegrationEvidenceError(
+            f"git rev-parse {revision}^{{tree}} failed in {repo}: {detail}"
+        )
+    return tree
+
+
+def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> tuple[str, ...]:
+    """Paths ``baseline..source`` changed that ``revision``'s tree does not hold as
+    ``source`` has them.
+
+    The reading a consumed integration stands on when ancestry cannot answer:
+    a squash seals a commit of its own, so the unit's commit is never in the
+    target's history, but every change it made over its baseline is in the
+    target's tree — each added or modified path held with ``source``'s mode
+    and object id, each deleted path absent (#796 review). One whole-tree
+    ``diff-tree`` between the unit's own commits and one whole-tree inventory
+    of ``revision``, the shape that keeps a wide change set off argv; renames
+    read as their two sides so a moved path's source is checked absent. Empty
+    when the tree folds the whole change set; an unreadable probe raises.
+    """
+    proc = git_bytes(repo, "diff-tree", "-r", "-z", "--no-renames", baseline, source)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError(
+            f"the unit's change set {baseline[:12]}..{source[:12]} could not be read in {repo}"
+        )
+    held = _revision_inventory(repo, revision)
+    unfolded: list[str] = []
+    fields = proc.stdout.split(b"\0")
+    # ``:<old mode> <new mode> <old oid> <new oid> <status>`` then the path, NUL-separated.
+    for metadata, raw_path in zip(fields[0::2], fields[1::2], strict=False):
+        try:
+            _old_mode, new_mode, _old_oid, new_oid, status = metadata.lstrip(b":").split(b" ", 4)
+        except ValueError as exc:
+            raise IntegrationEvidenceError("the unit's change set is malformed") from exc
+        path = os.fsdecode(raw_path)
+        row = held.get(path)
+        if status.startswith(b"D"):
+            if row is not None:
+                unfolded.append(path)
+            continue
+        if row is None or row[0] != new_mode or row[2] != os.fsdecode(new_oid):
+            unfolded.append(path)
+    return tuple(sorted(unfolded))
+
+
+def integration_cleanup_state_recoverable(
+    repo: Path,
+    run_dir: Path,
+    snapshots: object,
+    *,
+    cleaned: Iterable[str],
+    untracked: Iterable[str],
+    revision: str,
+    operation_identity: str,
+) -> bool:
+    """Prove each cleanup operand is either pre-clean or the planned result.
+
+    Anything else may be fresh operator state and must never be overwritten by a
+    crash replay merely because a ``cleanup-pending`` receipt exists.
+    """
+    validated, _submodules = validate_integration_state_schema(
+        run_dir, snapshots, [], operation_identity
+    )
+    by_path = {str(entry["path"]): entry for entry in validated}
+    untracked_set = set(preflight_integration_paths(untracked))
+    for rel in preflight_integration_paths(cleaned):
+        entry = by_path.get(rel)
+        if entry is None:
+            return False
+        if _receipt_snapshots_complete(repo, run_dir, [entry]):
+            continue
+        if rel in untracked_set:
+            _validated, candidate = _confined_repo_operand(repo, rel)
+            if (
+                _symlink_ancestor(repo, candidate) is not None
+                or candidate.exists()
+                or candidate.is_symlink()
+                or _index_state(repo, rel)["entries"]
+            ):
+                return False
+            continue
+        worktree = git_bytes(repo, "diff", "--quiet", revision, "--", rel)
+        index = git_bytes(repo, "diff", "--cached", "--quiet", revision, "--", rel)
+        if worktree.returncode != 0 or index.returncode != 0:
+            return False
+    return True
+
+
+def _integrated_submodule_checkout_unchanged(
+    repo: Path, rel: str, checkout: Path, *, allowed_heads: set[str], introduced: bool
+) -> None:
+    """A populated checkout at an incoming submodule path, after the target's hooks.
+
+    Owned by this repository at its lexical location, clean, and at a HEAD the
+    integrated commit or the receipt vouches for; anything else is drift. A
+    captured checkout is read as the receipt captured it, ignored files never
+    read; a checkout at a gitlink the commit ``introduced`` stands where the
+    receipt proved nothing was, so everything in it is attempt-era and the
+    reading asks for ignored entries too — a hook's write the submodule's own
+    ``.gitignore`` covers is still its output (#796 review).
+    """
+    root = repo.resolve(strict=True)
+    if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+        raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
+    ignored = ("--ignored",) if introduced else ()
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall", *ignored)
+    if (
+        not _submodule_checkout_owned(root, checkout)
+        or status.returncode != 0
+        or status.stdout
+        or rev_parse_head(checkout) not in allowed_heads
+    ):
+        raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+
+
+def _integrated_replaced_submodule_checkout_unchanged(
+    repo: Path,
+    rel: str,
+    checkout: Path,
+    *,
+    allowed_heads: set[str],
+    held: Iterable[str],
+) -> None:
+    """The leftover checkout inside a tracked directory that replaced its gitlink.
+
+    Owned by this repository at its lexical location (no gitlink names the
+    superproject any more, so ownership is its git dir under ``.git/modules``),
+    at a HEAD the receipt vouches for, and — read as its own repository, the
+    only reading that sees past the superproject's index — reporting no entry
+    but the integrated tree's own writes into it: every status row, joined
+    under ``rel``, must be a path ``held`` names. Anything else is a hook's.
+    """
+    root = repo.resolve(strict=True)
+    if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+        raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+    if (
+        not _submodule_checkout_owned(root, checkout)
+        or status.returncode != 0
+        or rev_parse_head(checkout) not in allowed_heads
+    ):
+        raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+    held_paths = set(held)
+    for nested in _porcelain_paths(os.fsdecode(status.stdout)):
+        if f"{rel}/{nested}" not in held_paths:
+            raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+
+
+def validate_integrated_submodule_state(
+    repo: Path,
+    submodules: object,
+    *,
+    prospective_paths: Iterable[str],
+    revision: str,
+) -> tuple[str, ...]:
+    """Validate legitimate incoming gitlink changes without ignoring checkout drift.
+
+    The integrated commit is the authority for every incoming path it holds
+    as a gitlink, captured by the receipt or introduced by the commit: the
+    post-hook index must carry exactly that gitlink and a populated checkout
+    must be this repository's, clean, and at the gitlink (or, for a captured
+    one, at the captured HEAD). Read here rather than left to the diff
+    readings because an incoming ``.gitmodules`` can set
+    ``submodule.<name>.ignore = all``, under which ``git diff`` — worktree
+    and ``--cached`` alike — reports nothing about that submodule: not a
+    hook's ``submodule update --init`` with files written into the new
+    checkout, not a moved HEAD, not even a rewritten gitlink (#796 review).
+
+    For a captured submodule the commit no longer holds as a gitlink: a blob
+    in its place is the diff readings' business; nothing at all means the
+    incoming commit deleted the submodule, and git itself leaves the
+    populated checkout behind (``warning: unable to rmdir``, then
+    ``?? path/``), so a leftover is not a hook's doing. It is accepted only
+    as the exact captured checkout — owned, clean, at the captured HEAD —
+    and every leftover so accepted is returned for `integrated_paths_drift`
+    and `integrated_stray_paths` to leave to this reading. A checkout git
+    could remove is simply absent; a file or foreign directory in its place
+    is drift. A tree in its place (the path held through a prefix — a
+    submodule replaced by a tracked directory) is the same leftover with the
+    commit's files written INTO it: its ``.git`` and old payload sit beside
+    the new tracked files, which the superproject's diff readings own, so the
+    leftover is read through its own status and may hold nothing but paths
+    the integrated tree holds under it (#796 review). Ceiling, for either
+    leftover: the receipt never read a captured checkout's ignored entries,
+    so a hook's write the leftover's own ``.gitignore`` covers is not seen.
+    """
+    if not isinstance(submodules, list):
+        raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+    prospective = set(preflight_integration_paths(prospective_paths))
+    if not prospective:
+        return ()
+    captured: dict[str, dict[str, object]] = {}
+    unpopulated: set[str] = set()
+    captured_flags: dict[str, object] = {}
+    for raw in submodules:
+        if not isinstance(raw, dict) or raw.get("path") not in prospective:
+            continue
+        rel = _portable_integration_path(raw.get("path"))
+        captured_flags[rel] = raw.get("flags")
+        # captured unpopulated: the receipt proved an empty directory, so a
+        # checkout there after the hooks is attempt-era in full and reads
+        # as one the commit introduced — ignored entries counted, no
+        # captured HEAD to allow; and where the commit holds no gitlink any
+        # more, anything standing there is a hook's (#796 review)
+        if raw.get("head") is None:
+            unpopulated.add(rel)
+            continue
+        captured[rel] = raw
+    inventory = _revision_inventory(repo, revision)
+    held_paths = _inventory_held_paths(inventory)
+    fresh_words = _fresh_index_flag_words(repo)
+    retained: list[str] = []
+    for rel in sorted(prospective):
+        held = inventory.get(rel)
+        raw = captured.get(rel)
+        if held is None:
+            if raw is None:
+                checkout = repo / rel
+                if rel in unpopulated and checkout.is_dir() and any(checkout.iterdir()):
+                    if rel in held_paths and not (checkout / ".git").exists():
+                        # the commit's own directory in its place — walked
+                        # against the commit by the introduced-directory reading
+                        continue
+                    raise IntegrationEvidenceError(
+                        "target hook changed an integrated submodule checkout"
+                    )
+                continue
+            checkout = repo / rel
+            allowed_heads = {str(raw.get("head")), str(raw.get("gitlink"))}
+            if rel in held_paths:
+                # A tracked directory in the submodule's place: git wrote the
+                # commit's files INTO the checkout it could not remove, so a
+                # leftover is one with its `.git` still there. Its descendants
+                # the commit holds are the diff readings'; the reading here is
+                # the leftover's own status, which may name only those.
+                if not checkout.is_dir() or not (checkout / ".git").exists():
+                    continue
+                _integrated_replaced_submodule_checkout_unchanged(
+                    repo,
+                    rel,
+                    checkout,
+                    allowed_heads=allowed_heads,
+                    held=inventory.keys(),
+                )
+                retained.append(rel)
+                continue
+            if not checkout.is_dir():
+                continue
+            _integrated_submodule_checkout_unchanged(
+                repo, rel, checkout, allowed_heads=allowed_heads, introduced=False
+            )
+            retained.append(rel)
+            continue
+        mode, kind, oid = held
+        if mode != b"160000":
+            continue
+        if kind != b"commit":
+            raise IntegrationEvidenceError("integrated target submodule evidence is malformed")
+        # a captured gitlink the commit rewrote may carry its captured word
+        # or a fresh one — `git merge` writes the entry anew, clearing an
+        # assume-unchanged bit that a fast-forward or squash keeps — and a
+        # word that is neither is a hook's (#796 review)
+        captured_word = captured_flags.get(rel)
+        accepted_words = (
+            fresh_words if captured_word is None else fresh_words | {str(captured_word)}
+        )
+        if not _gitlink_index_matches(_index_state(repo, rel), oid, flags=accepted_words):
+            raise IntegrationEvidenceError("target hook changed an integrated submodule gitlink")
+        checkout = repo / rel
+        # an unpopulated gitlink is an empty directory: git's shape, nothing to read
+        if not checkout.is_dir() or not any(checkout.iterdir()):
+            continue
+        allowed_heads = {oid} if raw is None else {str(raw.get("head")), oid}
+        _integrated_submodule_checkout_unchanged(
+            repo, rel, checkout, allowed_heads=allowed_heads, introduced=raw is None
+        )
+    return tuple(retained)
+
+
+def restore_integration_nonref_state(
+    repo: Path,
+    refname: str,
+    *,
+    revision: str,
+    run_dir: Path,
+    snapshots: object,
+    submodules: object,
+    operation_identity: str,
+    include_paths: Iterable[str] | None = None,
+) -> None:
+    """Restore receipt-owned cleanup after a typed operation made no ref update."""
+    validated_snapshots, validated_submodules = validate_integration_state_schema(
+        run_dir, snapshots, submodules, operation_identity
+    )
+    if include_paths is not None:
+        selected = set(preflight_integration_paths(include_paths))
+        validated_snapshots = [entry for entry in validated_snapshots if entry["path"] in selected]
+        validated_submodules = [
+            entry for entry in validated_submodules if entry["path"] in selected
+        ]
+    for entry in validated_submodules:
+        _validated_submodule_checkout(
+            repo,
+            entry,
+            verify_head=False,
+            revision=revision,
+            allow_missing=True,
+        )
+    if ref_revision(repo, refname) != revision:
+        raise IntegrationRestoreError("target moved after typed integration refusal")
+    _restore_receipt_snapshots(repo, run_dir, validated_snapshots)
+    _restore_receipt_index(repo, validated_snapshots)
+    _restore_submodule_checkouts(repo, validated_submodules, old_revision=revision)
+    if not integration_restoration_complete(
+        repo,
+        refname,
+        old_revision=revision,
+        new_revision=revision,
+        run_dir=run_dir,
+        snapshots=validated_snapshots,
+        submodules=validated_submodules,
+        operation_identity=operation_identity,
+    ):
+        raise IntegrationRestoreError("target non-ref restoration is incomplete")
+
+
+def restore_integration_ref(
+    repo: Path,
+    refname: str,
+    *,
+    old_revision: str,
+    new_revision: str,
+    extra_paths: Iterable[str] = (),
+    run_dir: Path | None = None,
+    snapshots: object = (),
+    submodules: object = (),
+    operation_identity: str | None = None,
+) -> None:
+    """Prepare a refused checkout, then CAS its target ref back exactly once.
+
+    The path-scoped ``git restore`` does not move a ref.  It restores every path
+    changed by the receipt-owned commit plus declared artifact paths (the latter
+    catches post-commit index-only hook drift), while leaving unrelated unstaged
+    target dirt alone.  ``update-ref`` is then the sole ref-moving command and
+    atomically checks ownership.  If a concurrent commit wins after checkout
+    preparation, the CAS fails and that later commit remains the target tip;
+    checkout repair is left explicit rather than risking a second ref update.
+    """
+    if run_dir is None:
+        if snapshots not in ((), []) or submodules not in ((), []):
+            raise IntegrationEvidenceError("target integration snapshot root is missing")
+        validated_snapshots: list[dict[str, object]] = []
+        validated_submodules: list[dict[str, object]] = []
+    else:
+        validated_snapshots, validated_submodules = validate_integration_state_schema(
+            run_dir, snapshots, submodules, operation_identity
+        )
+    # Validate every submodule operand and its superproject ownership before the
+    # first restore can mutate either repository.
+    for entry in validated_submodules:
+        _validated_submodule_checkout(
+            repo,
+            entry,
+            verify_head=False,
+            revision=old_revision,
+            allow_missing=True,
+        )
+    rc, symbolic, _detail = _git_out(repo, "symbolic-ref", "-q", "HEAD")
+    if rc != 0 or symbolic != refname:
+        raise IntegrationRestoreError("target checkout no longer owns the integration ref")
+    if ref_revision(repo, refname) != new_revision:
+        raise IntegrationRestoreError(
+            "target ref moved after the refused integration; no restoration was attempted"
+        )
+    restore_paths = _integration_restore_paths(
+        repo,
+        old_revision=old_revision,
+        new_revision=new_revision,
+        extra_paths=extra_paths,
+    )
+    snapshot_paths = [str(entry["path"]) for entry in validated_snapshots]
+    currently_indexed = [path for path in snapshot_paths if path_tracked(repo, path)]
+    _restore_paths_from_stdin(
+        repo,
+        old_revision,
+        [*restore_paths, *currently_indexed],
+    )
+    if run_dir is not None:
+        _restore_receipt_snapshots(repo, run_dir, validated_snapshots)
+        _restore_receipt_index(repo, validated_snapshots)
+    _restore_submodule_checkouts(repo, validated_submodules, old_revision=old_revision)
+    if run_dir is not None and not integration_nonref_state_unchanged(
+        repo,
+        run_dir,
+        validated_snapshots,
+        validated_submodules,
+        operation_identity=operation_identity,
+    ):
+        raise IntegrationRestoreError(
+            "target non-ref restoration changed before the target ref could be restored"
+        )
+    rc, _out = _git(
+        repo,
+        "update-ref",
+        "-m",
+        "bmad-loop integration validation refused",
+        refname,
+        old_revision,
+        new_revision,
+    )
+    if rc != 0:
+        raise IntegrationRestoreError(
+            "target ref moved during integration restoration; its later commit was preserved, "
+            "but the prepared checkout requires manual recovery"
+        )
+    if ref_revision(repo, refname) != old_revision:
+        raise IntegrationRestoreError("target ref changed during integration restoration")
+    if not integration_restoration_complete(
+        repo,
+        refname,
+        old_revision=old_revision,
+        new_revision=new_revision,
+        extra_paths=extra_paths,
+        run_dir=run_dir,
+        snapshots=validated_snapshots,
+        submodules=validated_submodules,
+        operation_identity=operation_identity,
+    ):
+        raise IntegrationRestoreError("target integration restoration is incomplete")
+
+
+def integration_restoration_complete(
+    repo: Path,
+    refname: str,
+    *,
+    old_revision: str,
+    new_revision: str,
+    extra_paths: Iterable[str] = (),
+    run_dir: Path | None = None,
+    snapshots: object = (),
+    submodules: object = (),
+    operation_identity: str | None = None,
+) -> bool:
+    """Whether a persisted refused transition is fully restored and re-armable."""
+    if run_dir is None:
+        if snapshots not in ((), []) or submodules not in ((), []):
+            raise IntegrationEvidenceError("target integration snapshot root is missing")
+        validated_snapshots: list[dict[str, object]] = []
+        validated_submodules: list[dict[str, object]] = []
+    else:
+        validated_snapshots, validated_submodules = validate_integration_state_schema(
+            run_dir, snapshots, submodules, operation_identity
+        )
+    if ref_revision(repo, refname) != old_revision:
+        return False
+    paths = _integration_restore_paths(
+        repo,
+        old_revision=old_revision,
+        new_revision=new_revision,
+        extra_paths=extra_paths,
+    )
+    if run_dir is not None and not _receipt_snapshots_complete(repo, run_dir, validated_snapshots):
+        return False
+    index_delta = _nul_git_paths(
+        git_bytes(repo, "diff", "--cached", "--name-only", "-z", old_revision, "--"),
+        unavailable="restored target index evidence is unavailable",
+    )
+    snapshot_paths = {str(entry["path"]) for entry in validated_snapshots}
+    if set(index_delta) - snapshot_paths:
+        return False
+    for entry in validated_submodules:
+        try:
+            _validated_submodule_checkout(repo, entry, verify_head=True)
+        except IntegrationEvidenceError:
+            return False
+    if not paths:
+        return True
+    # The worktree reading is scoped to the receipt-attributable inventory
+    # (`paths`: commit delta, post-hook index delta, accepted artifact paths)
+    # — on the legacy arm as a pathspec, on the receipt arm as a whole-tree
+    # read filtered here, since `git diff` takes no stdin pathspec and a wide
+    # inventory stays off argv. A tracked file the OPERATOR edited, unstaged,
+    # after the receipt was armed sits outside that inventory: it is theirs,
+    # the restore never touched it, and it must not turn a completed restore
+    # into "incomplete" — at refusal time, and again on every replay until
+    # they clear it (#796 review).
+    path_args = () if run_dir is not None else tuple(_literal_specs(paths))
+    worktree_delta = _nul_git_paths(
+        git_bytes(
+            repo,
+            "diff",
+            "--name-only",
+            "-z",
+            old_revision,
+            "--",
+            *path_args,
+        ),
+        unavailable="restored target worktree evidence is unavailable",
+    )
+    submodule_paths = {str(entry["path"]) for entry in validated_submodules}
+    return not (set(worktree_delta) & set(paths) - snapshot_paths - submodule_paths)
 
 
 def last_commit_for(repo: Path, path: Path) -> str:
@@ -2707,8 +5693,13 @@ def dirty_paths(repo: Path) -> dict[str, str]:
     )
     if rc != 0:
         raise GitError(f"git status failed in {repo}")
+    return dict(_porcelain_entries(out))
+
+
+def _porcelain_entries(out: str) -> list[tuple[str, str]]:
+    """``(path, XY)`` per record of a NUL-delimited ``status --porcelain -z`` read."""
     tokens = out.split("\0")
-    result: dict[str, str] = {}
+    result: list[tuple[str, str]] = []
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -2720,31 +5711,41 @@ def dirty_paths(repo: Path) -> dict[str, str]:
         # destination (`path` above) is what's on disk, so consume and skip it.
         if "R" in xy or "C" in xy:
             i += 1
-        result[path] = xy
+        result.append((path, xy))
         i += 1
     return result
 
 
+def _porcelain_paths(out: str) -> list[str]:
+    """Every path a NUL-delimited ``status --porcelain -z`` read names, on disk."""
+    return [path for path, _xy in _porcelain_entries(out)]
+
+
 def branch_incoming_paths(repo: Path, target: str, branch: str) -> set[str]:
     """The set of repo-relative posix paths a merge of `branch` into `target`
-    would introduce or modify (`git diff --name-only target branch`)."""
-    rc, out = _git_raw(repo, "diff", "--name-only", "-z", target, branch)
+    would introduce, modify or delete (`git diff --name-only target branch`).
+
+    ``--no-renames``: rename detection is on by default and names a rename by
+    its destination alone, and the source — which the merge deletes — is as
+    incoming as anything else: snapshotted by the receipt, cleaned or
+    tolerated by the guard, excluded from the digest of the index outside the
+    incoming set, and read by the restore's own inventory the same way (#796
+    review)."""
+    rc, out = _git_raw(repo, "diff", "--name-only", "--no-renames", "-z", target, branch)
     if rc != 0:
         raise GitError(f"git diff --name-only {target} {branch} failed in {repo}")
     return {p for p in out.split("\0") if p}
 
 
-def clean_incoming_collisions(
+def plan_incoming_collisions(
     repo: Path,
     target: str,
     branch: str,
     *,
     protected: tuple[str, ...] = (),
     on_tolerated: Callable[[list[str]], None] | None = None,
-) -> list[str]:
-    """Reconcile a target checkout dirtied by a per-worktree Unity Editor so the
-    merge of `branch` can proceed, returning the cleaned paths (empty when the
-    tree was already clean).
+) -> IncomingCollisionPlan:
+    """Read and classify target collision cleanup without mutating the checkout.
 
     Background: with engine `editor_mode = "per_worktree"`, a competing Editor
     can leak asset writes (`.cs.meta` GUIDs, asmdef auto-edits) into the *main*
@@ -2786,9 +5787,13 @@ def clean_incoming_collisions(
     proceeded over operator dirt leaves the same kind of trace as one that cleaned a
     leak. Not called when there are no such paths.
     """
-    dirty = dirty_paths(repo)
+    # the automator directory is read too, the run's own records left out:
+    # a stray there is tolerated or blocking on the same terms as any other,
+    # and the tolerated set is what the post-hook stray reading leaves alone
+    # (#796 review)
+    dirty = {**dirty_paths(repo), **automator_dirty_paths(repo)}
     if not dirty:
-        return []
+        return IncomingCollisionPlan((), (), ())
     incoming = branch_incoming_paths(repo, target, branch)
     stray = sorted(p for p in dirty if p not in incoming)
     # Trackedness was the wrong axis (#618). What a merge can write into its commit is
@@ -2835,13 +5840,51 @@ def clean_incoming_collisions(
     tolerated = list(stray)
     if tolerated and on_tolerated is not None:
         on_tolerated(tolerated)
+    cleaned = tuple(sorted(path for path in dirty if path in incoming))
+    return IncomingCollisionPlan(
+        cleaned=cleaned,
+        tolerated=tuple(tolerated),
+        untracked=tuple(path for path in cleaned if dirty[path].startswith("??")),
+    )
+
+
+def apply_incoming_collision_plan(
+    repo: Path,
+    plan: IncomingCollisionPlan,
+    *,
+    before_mutate: Callable[[str], bool] | None = None,
+    progress: list[str] | None = None,
+) -> list[str]:
+    """Apply an already snapshotted collision plan without widening its paths.
+
+    ``progress``, when given, receives each path as it is TAKEN UP — after its
+    ``before_mutate`` reading passed and before its first mutation — so a caller
+    whose restore must reach exactly what this touched reads it after any
+    failure: the paths already cleaned plus the one in flight, never the ones
+    still ahead. Those may carry fresh operator state by the time the failure
+    lands, and restoring them from the snapshot would flatten it (#796 review);
+    the ``cleaned`` an `IntegrationCleanupChangedError` carries is the same
+    inventory minus the in-flight path, which that error proved untouched.
+    """
+    if not plan.cleaned:
+        return []
+    current = dirty_paths(repo)
+    expected_cleaned = set(plan.cleaned)
+    if any(path not in current for path in expected_cleaned):
+        raise IntegrationEvidenceError("target collision classification changed before cleanup")
+    expected_untracked = set(plan.untracked)
+    if any(
+        current[path].startswith("??") != (path in expected_untracked) for path in expected_cleaned
+    ):
+        raise IntegrationEvidenceError("target collision classification changed before cleanup")
     # Resolve every untracked cleanup parent before deleting or checking out any
     # path. A later resolution fault must not leave an earlier collision cleaned
     # and the checkout only partly reconciled.
     repo_res = repo.resolve()
     prune_starts: dict[str, Path] = {}
-    for path, xy in sorted(dirty.items()):
-        if path not in incoming or not xy.startswith("??"):
+    untracked = set(plan.untracked)
+    for path in plan.cleaned:
+        if path not in untracked:
             continue
         parent = (repo / path).parent.resolve()
         if parent != repo_res and not parent.is_relative_to(repo_res):
@@ -2851,10 +5894,12 @@ def clean_incoming_collisions(
             )
         prune_starts[path] = parent
     cleaned: list[str] = []
-    for path, xy in sorted(dirty.items()):
-        if path not in incoming:
-            continue  # tolerated untracked stray — never cleaned, never reported (#460)
-        if xy.startswith("??"):  # untracked: delete it, then prune emptied dirs
+    for path in plan.cleaned:
+        if before_mutate is not None and not before_mutate(path):
+            raise IntegrationCleanupChangedError(cleaned)
+        if progress is not None:
+            progress.append(path)
+        if path in untracked:  # untracked: delete it, then prune emptied dirs
             fp = repo / path
             fp.unlink(missing_ok=True)
             parent = prune_starts[path]
@@ -2867,6 +5912,25 @@ def clean_incoming_collisions(
                 raise GitError(f"git checkout -- {path} failed in {repo}: {out}")
         cleaned.append(path)
     return cleaned
+
+
+def clean_incoming_collisions(
+    repo: Path,
+    target: str,
+    branch: str,
+    *,
+    protected: tuple[str, ...] = (),
+    on_tolerated: Callable[[list[str]], None] | None = None,
+) -> list[str]:
+    """Compatibility wrapper that plans and immediately applies cleanup."""
+    plan = plan_incoming_collisions(
+        repo,
+        target,
+        branch,
+        protected=protected,
+        on_tolerated=on_tolerated,
+    )
+    return apply_incoming_collision_plan(repo, plan)
 
 
 def _merge_in_progress(repo: Path) -> tuple[bool, GitError | None]:
@@ -3141,21 +6205,6 @@ def _reset_hard_head(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def reset_keep(repo: Path, revision: str) -> tuple[bool, str]:
-    """`reset --keep <revision>`: move HEAD and undo exactly the tracked paths that
-    differ between HEAD and `revision`, while a local modification on any such
-    path ABORTS the reset instead of being flattened, and modifications elsewhere
-    are left alone. The rollback shape for a merge commit that LANDED but must
-    not stand (the integrated-tree check in `worktree_flow.merge_local`): unlike
-    `_reset_hard_head` it never flattens an operator edit, at the price of
-    declining when one sits on a merged path. Returns `(restored, note)`; the
-    note is git's own text when the reset declined."""
-    rc, out = _git(repo, "reset", "--keep", revision)
-    if rc != 0:
-        return False, out.strip()
-    return True, ""
-
-
 def _index_unmerged(repo: Path) -> tuple[bool, GitError | None]:
     """`(the index carries unmerged stages — i.e. a merge really ran and left a
     content conflict to resolve, the probe failure when the reading itself
@@ -3202,13 +6251,24 @@ def merge_branch(
     strategy: str = "merge",
     message: str | None = None,
     allow_empty_squash: bool = False,
-) -> None:
+    reflog_action: str | None = None,
+) -> str | None:
     """Merge `branch` into the branch currently checked out in `repo`.
 
     strategy: "ff" (fast-forward only), "merge" (always a merge commit), or
     "squash" (collapse to one commit). Raises MergeConflictError on conflict and
     MergePreflightError when an ff-only merge can't fast-forward, restoring the
     tree to its pre-merge state.
+
+    Returns the tree the squash leg STAGED before its own ``git commit`` sealed
+    it (``write-tree``, read after ``merge --squash`` resolved and before any
+    hook ran) — ``None`` on the other legs and on a no-op replay. That commit
+    re-reads the index after ``pre-commit``, so a target hook can rewrite and
+    re-add an incoming path into the commit itself, where no index or checkout
+    probe can tell hook output from the resolved merge (#796 review); the
+    receipt-owned caller proves the sealed commit's tree against this value
+    instead. The `--no-ff` merge commit is written from the tree git already
+    resolved, and `ff` creates no commit, so neither leg has the exposure.
     Expects the target checkout to be clean; the worktree pipeline reconciles
     Editor-induced dirt first via `clean_incoming_collisions`.
 
@@ -3295,9 +6355,19 @@ def merge_branch(
     tree. That clean result confirms the replay without manufacturing an empty
     commit; ordinary squash calls keep commit failures strict.
     """
+
+    def run_git(*args: str) -> tuple[int, str]:
+        if reflog_action is None:
+            return _git(repo, *args)
+        return _git_env(
+            repo,
+            *args,
+            env={**os.environ, "GIT_REFLOG_ACTION": reflog_action},
+        )
+
     if strategy == "ff":
         pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
-        rc, out = _git(repo, "merge", "--ff-only", branch)
+        rc, out = run_git("merge", "--ff-only", branch)
         if rc != 0:
             # "--ff-only either fast-forwards or declines, so it never touches the
             # tree" was the standing premise here, and it is FALSE: `--ff-only`
@@ -3330,11 +6400,11 @@ def merge_branch(
             if unread is not None:
                 raise MergeResidueUnreadError(f"{detail}; AND the residue probe failed: {unread}")
             raise MergePreflightError(detail)
-        return
+        return None
     if strategy == "merge":
         msg = message or f"Merge branch '{branch}'"
         pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
-        rc, out = _git(repo, "merge", "--no-ff", "-m", msg, branch)
+        rc, out = run_git("merge", "--no-ff", "-m", msg, branch)
         if rc != 0:
             # All three questions BEFORE the abort, which erases the evidence for each.
             # The index stages say whether content collided; MERGE_HEAD says whether
@@ -3421,7 +6491,7 @@ def merge_branch(
             if index_unread is not None or head_unread is not None or unread is not None:
                 raise MergeResidueUnreadError(detail)
             raise MergePreflightError(detail)
-        return
+        return None
     if strategy == "squash":
         # `--squash` has no `--abort`, so the restore is a path-scoped
         # `checkout HEAD --` over whatever the residue deltas attribute to git.
@@ -3435,7 +6505,7 @@ def merge_branch(
         # the index — which is exactly how such a failure came to be labelled
         # "refused before starting".
         pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
-        rc, out = _git(repo, "merge", "--squash", branch)
+        rc, out = run_git("merge", "--squash", branch)
         if rc != 0:
             unmerged, index_unread = _index_unmerged(repo)  # before any restore clears the stages
             materialized, rewritten, unread = _merge_residue(
@@ -3497,9 +6567,20 @@ def merge_branch(
                     f" `git status`: {unread}"
                 ) from unread
             if not staged:
-                return
+                return None
+        rc, staged_tree, detail = _git_out(repo, "write-tree")
+        if rc != 0:
+            # Same window as the no-op reading above: the squash SUCCEEDED and its
+            # result is staged, so the read failing must not be dressed as a commit
+            # refusal by pressing on, nor escape to the unclassified arm.
+            raise MergeResidueUnreadError(
+                f"git merge --squash {branch} succeeded in {repo}, but the staged"
+                f" result's tree could not be read (index state unverified): nothing"
+                f" was committed and nothing was reset — the staged squash result is"
+                f" left in place; run `git status`: {detail}"
+            )
         msg = message or f"Squash-merge branch '{branch}'"
-        rc, out = _git(repo, "commit", "-m", msg)
+        rc, out = run_git("commit", "-m", msg)
         if rc != 0:
             # The leg's own commit — hooks and commit.gpgsign run HERE, not at the
             # `merge --squash` above, so this is where the squash reaches the
@@ -3532,7 +6613,7 @@ def merge_branch(
                 if not restored:
                     detail += "; the squash result is left staged"
             raise MergeCommitRefusedError(detail, restored=restored, staged=not restored)
-        return
+        return staged_tree
     raise GitError(f"unknown merge strategy: {strategy!r}")
 
 
@@ -5341,10 +8422,11 @@ def finalize_commit(
 
     Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
     validator, move HEAD back to `baseline` keeping that same index (`reset
-    --soft`), then commit the accumulated index without restaging. An optional
-    committed-tree validator detects hook or concurrent-index mutation and rolls
-    HEAD back to the original chain before refusing. The working tree is never
-    touched, so a failure leaves the chain intact.
+    --soft`), then commit the accumulated index without restaging. A post-commit
+    HEAD probe and optional committed-tree validator detect an uncertain commit
+    identity, hook mutation, or concurrent-index mutation and roll HEAD back to
+    the original chain before refusing. The rollback leaves working-tree contents
+    untouched, including changes made by hooks before the refusal.
 
     The no-op arm is validated the same way. "Nothing staged" is read off the
     index AFTER the staged validator returned, so an index reset to `baseline`
@@ -5410,22 +8492,26 @@ def finalize_commit(
                 f"to {original_head[:12]}: {restore_out}"
             )
         raise GitError(f"git commit failed: {out}")
-    committed_head = rev_parse_head(repo)
-    if committed_validator is not None:
-        try:
+    try:
+        committed_head = rev_parse_head(repo)
+        if committed_validator is not None:
             committed_validator(committed_head, staged_snapshot)
-        except BaseException as exc:
-            # Restore the accepted skill chain and its index while leaving the
-            # working tree untouched.  A soft reset would retain an ignored path
-            # that a hook force-added, making every replay fail staged validation
-            # even after the accepted bytes were restored.
+    except BaseException as exc:
+        # Restore the accepted skill chain and its index while leaving the
+        # working tree untouched.  A soft reset would retain an ignored path
+        # that a hook force-added, making every replay fail staged validation
+        # even after the accepted bytes were restored.
+        try:
             restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
-            if restore_rc != 0:
-                raise GitError(
-                    "committed tree validation failed; additionally failed to restore "
-                    f"HEAD to {original_head[:12]}: {restore_out}"
-                ) from exc
-            raise
+        except GitError as restore_exc:
+            restore_rc, restore_out = 1, str(restore_exc)
+        if restore_rc != 0:
+            raise GitError(
+                f"post-commit finalization failed ({type(exc).__name__}: {exc}); "
+                "additionally failed to restore "
+                f"HEAD to {original_head[:12]}: {restore_out}"
+            ) from exc
+        raise
     return committed_head
 
 

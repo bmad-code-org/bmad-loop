@@ -1615,6 +1615,35 @@ def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_integration_receipt_identities_are_pseudonymized_in_merge_records():
+    operation = "AcmeSecretOperation"
+    revision = "a" * 40
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+
+    scrubbed = []
+    for kind in ("unit-merge-started", "resume-unit-merge", "unit-merged"):
+        entry = {
+            "ts": 1.0,
+            "kind": kind,
+            "story_key": STORY_KEY,
+            "branch": "unit",
+            "target": "main",
+            "strategy": "merge",
+            "source": revision,
+            "operation_id": operation,
+        }
+        if kind == "unit-merge-started":
+            entry["pre_target_revision"] = revision
+        scrubbed.append(diagnostics._scrub_entry(entry, pseudo, {}, 1.0))
+
+    operation_aliases = [entry["operation_id"] for entry in scrubbed]
+    assert operation_aliases == [operation_aliases[0]] * 3
+    assert operation_aliases[0] != operation
+    assert scrubbed[0]["pre_target_revision"] != revision
+    assert any(ns == "operation" and original == operation for ns, original, _ in pseudo.entries())
+    assert any(ns == "commit" and original == revision for ns, original, _ in pseudo.entries())
+
+
 def test_stranded_bundle_story_keys_are_aliased_element_wise():
     """`sweep-inflight-stranded` carries a LIST of story keys, and a list of
     identifier-shaped strings is the one shape `scrub_json` passes through

@@ -38,7 +38,9 @@ TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     Phase.COMMITTING: frozenset({Phase.DONE, Phase.ESCALATED, Phase.AWAITING_OPERATOR}),
     Phase.TRIAGE_RUNNING: frozenset({Phase.TRIAGE_VERIFY}),
     # TRIAGE_RUNNING: invalid triage output retries with feedback, like DEV_VERIFY
-    Phase.TRIAGE_VERIFY: frozenset({Phase.TRIAGE_RUNNING, Phase.DONE, Phase.ESCALATED}),
+    Phase.TRIAGE_VERIFY: frozenset(
+        {Phase.TRIAGE_RUNNING, Phase.COMMITTING, Phase.DONE, Phase.ESCALATED}
+    ),
     Phase.DONE: frozenset(),
     Phase.DEFERRED: frozenset(),
     Phase.ESCALATED: frozenset(),

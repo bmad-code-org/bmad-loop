@@ -12,6 +12,7 @@ gates on the ones it delegates (verify.verify_review_bundle).
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 import unicodedata
@@ -31,9 +32,12 @@ from .engine import (
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
+    DIR_FD_ANCHORED_WRITES,
     atomic_write_text,
     atomic_write_text_confined,
     neutralize_surrogates,
+    open_dir_confined,
+    path_is_confined,
     safe_segment,
 )
 from .runs import StateRootError, _project_of_run_dir
@@ -62,10 +66,20 @@ class MissingLedgerEntriesError(Exception):
         super().__init__(f"no ledger entry for {', '.join(ids)}")
 
 
+class _MigrationRecordInvalid(Exception):
+    """Internal signal for a recovery record rejected before escalation I/O."""
+
+
 TRIAGE_KEY = "sweep-triage"
 TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
 MIGRATE_WORKFLOW = "deferred-sweep-migrate"
+_MIGRATION_RECOVERY_FORMAT = 1
+_MIGRATE_BASELINE_RECORD = "migrate-baseline.md"
+_MIGRATE_REWRITE_RECORD = "migrate-rewrite.md"
+_MIGRATE_MANIFEST_RECORD = "migrate-manifest.json"
+_MIGRATE_RESULT_RECORD = "migrate-result.json"
+_LedgerCommitOutcome = Literal["committed", "clean", "refused", "unavailable"]
 BUNDLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}\Z")
 _BUNDLE_NAME_MAX_LENGTH = 40
 _BUNDLE_NAME_INITIAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
@@ -1889,6 +1903,25 @@ class SweepEngine(Engine):
             self._check_stop_request()
             self.state.sweep_cycle = cycle
             self._save()
+            migrate_task = self.state.tasks.get(MIGRATE_KEY)
+            if (
+                cycle == 1
+                and migrate_task is not None
+                and (
+                    migrate_task.phase == Phase.COMMITTING
+                    or (
+                        migrate_task.phase == Phase.TRIAGE_VERIFY
+                        and migrate_task.migration_recovery_format != 0
+                    )
+                )
+            ):
+                # Recovery evidence, not the generic cycle reader, owns faults at
+                # these durable boundaries, including unknown marker formats. A
+                # cycle-reader return would let the outer engine stamp the run
+                # finished and make the public resume command refuse it. Format 0
+                # TRIAGE_VERIFY is the one pre-upgrade path that still needs the
+                # cycle reader's live text for its legacy restart.
+                self._ensure_migration("")
             text, ledger_fault = self._read_cycle_ledger(ledger)
             if ledger_fault is not None:
                 # `cycle - 1`: this cycle did no work at all — the read that would
@@ -1897,7 +1930,13 @@ class SweepEngine(Engine):
                 # down, whose cycle COMPLETED.
                 self._stop_on_ledger_fault(ledger_fault, cycles=cycle - 1, ledger=ledger)
                 return
-            if deferredwork.has_legacy(text):
+            migrate_task = self.state.tasks.get(MIGRATE_KEY)
+            migration_resume = (
+                cycle == 1
+                and migrate_task is not None
+                and migrate_task.phase not in (Phase.DONE, Phase.ESCALATED)
+            )
+            if deferredwork.has_legacy(text) or migration_resume:
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
                     # one migration per run, so hand off to a fresh sweep
@@ -3118,6 +3157,250 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------------ migration
 
+    @staticmethod
+    def _migration_manifest(text: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "key": entry.key,
+                "id": entry.id,
+                "title": entry.title,
+                "section": entry.section,
+                "done": entry.done,
+                "severity": entry.severity,
+            }
+            for entry in deferredwork.parse_legacy(text)
+        ]
+
+    def _migration_evidence_failure(self, task: StoryTask, detail: str) -> NoReturn:
+        """Refuse current-format recovery evidence without mutating the ledger."""
+        self.journal.append(
+            "sweep-migration-recovery-invalid",
+            story_key=MIGRATE_KEY,
+            detail=detail,
+        )
+        self._escalate(task, f"migration recovery evidence is invalid: {detail}")
+        raise AssertionError("migration escalation returned")
+
+    def _migration_record_text(
+        self, task: StoryTask, path: Path, label: str, *, optional: bool = False
+    ) -> str | None:
+        root = _project_of_run_dir(self.run_dir)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        parent_fd: int | None = None
+        fd: int | None = None
+        try:
+            if DIR_FD_ANCHORED_WRITES:
+                parent_fd = open_dir_confined(root, path.parent)
+                if parent_fd is None:
+                    raise _MigrationRecordInvalid(f"unconfined {label} record")
+                fd = os.open(path.name, flags, dir_fd=parent_fd)
+            else:
+                try:
+                    path.lstat()
+                except (FileNotFoundError, NotADirectoryError):
+                    if optional:
+                        return None
+                    raise _MigrationRecordInvalid(f"missing {label} record")
+                if not path_is_confined(root, path):
+                    raise _MigrationRecordInvalid(f"unconfined {label} record")
+                fd = os.open(path, flags)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _MigrationRecordInvalid(f"nonregular {label} record")
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                fd = None
+                return stream.read()
+        except _MigrationRecordInvalid as e:
+            # Keep escalation outside the OSError catch below: if its journal,
+            # notification, or state save refuses, that boundary fault must
+            # propagate once rather than be mistaken for another record fault.
+            self._migration_evidence_failure(task, str(e))
+        except (FileNotFoundError, NotADirectoryError):
+            if optional:
+                return None
+            self._migration_evidence_failure(task, f"missing {label} record")
+        except (OSError, UnicodeDecodeError):
+            self._migration_evidence_failure(task, f"unreadable {label} record")
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    def _remove_migration_record(self, path: Path) -> None:
+        """Remove a stale run record without following redirected ancestors."""
+        root = _project_of_run_dir(self.run_dir)
+        if DIR_FD_ANCHORED_WRITES:
+            parent_fd = open_dir_confined(root, path.parent)
+            if parent_fd is None:
+                raise OSError(f"cannot confine stale migration record {path.name}")
+            try:
+                try:
+                    os.unlink(path.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            finally:
+                os.close(parent_fd)
+            return
+        try:
+            path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        if not path_is_confined(root, path):
+            raise OSError(f"cannot confine stale migration record {path.name}")
+        path.unlink()
+
+    def _migration_baseline_and_manifest(self, task: StoryTask) -> tuple[str, list[dict[str, Any]]]:
+        baseline = self._migration_record_text(
+            task, self.run_dir / _MIGRATE_BASELINE_RECORD, "baseline"
+        )
+        assert baseline is not None
+        raw_manifest = self._migration_record_text(
+            task, self.run_dir / _MIGRATE_MANIFEST_RECORD, "manifest"
+        )
+        assert raw_manifest is not None
+        try:
+            manifest = json.loads(raw_manifest)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError):
+            self._migration_evidence_failure(task, "malformed manifest record")
+        if not isinstance(manifest, list) or not all(isinstance(item, dict) for item in manifest):
+            self._migration_evidence_failure(task, "manifest record is not an object list")
+        expected = self._migration_manifest(baseline)
+        if manifest != expected:
+            self._migration_evidence_failure(task, "manifest disagrees with accepted baseline")
+        return baseline, manifest
+
+    def _migration_result_evidence(
+        self,
+        task: StoryTask,
+        baseline: str,
+        manifest: list[dict[str, Any]],
+        rewrite: str,
+    ) -> dict[str, Any]:
+        raw = self._migration_record_text(task, self.run_dir / _MIGRATE_RESULT_RECORD, "result")
+        assert raw is not None
+        try:
+            result = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError):
+            self._migration_evidence_failure(task, "malformed result record")
+        if not isinstance(result, dict):
+            self._migration_evidence_failure(task, "result record is not a JSON object")
+        errors = validate_migration(result, manifest, snapshot_canonical(baseline), rewrite)
+        if errors:
+            self._migration_evidence_failure(
+                task, "result record is inconsistent with accepted migration"
+            )
+        return result
+
+    def _restore_accepted_migration(self, task: StoryTask, baseline: str, rewrite: str) -> None:
+        """Restore a validated rewrite by compare-and-set, never over a rival."""
+        try:
+            current_head = verify.rev_parse_head(self.workspace.root)
+        except verify.GitError:
+            self._migration_evidence_failure(task, "migration baseline cannot be verified")
+        if not task.baseline_commit or current_head != task.baseline_commit:
+            self._migration_evidence_failure(task, "repository advanced beyond migration baseline")
+        try:
+            current = deferredwork.read_for_write(self.workspace.paths.deferred_work)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(
+                task, "live ledger cannot be compared with recovery records"
+            )
+        if current not in (baseline, rewrite):
+            self._migration_evidence_failure(
+                task, "live ledger diverged from migration recovery records"
+            )
+        self._safe_reset(task)
+        diverged = False
+        ledger = self.workspace.paths.deferred_work
+        with deferredwork.ledger_lock(ledger):
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+            if not diverged and current == rewrite:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, baseline)
+            elif not diverged and current == baseline:
+                pass
+            else:
+                diverged = True
+        if diverged:
+            self.journal.append(
+                "sweep-migration-restore-diverged",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+            self._escalate(
+                task,
+                "the ledger changed underneath the failed migration attempt — re-run the sweep",
+            )
+
+    def _finish_migration_commit(
+        self,
+        task: StoryTask,
+        manifest: list[dict[str, Any]],
+        rewrite: str,
+    ) -> bool:
+        """Run the idempotent publication tail; return whether DONE was earned."""
+        ledger = self.workspace.paths.deferred_work
+        try:
+            live = deferredwork.read_for_write(ledger)
+        except (deferredwork.LedgerReadError, OSError):
+            self._migration_evidence_failure(task, "live ledger cannot be verified for publication")
+        if live != rewrite:
+            self._migration_evidence_failure(task, "live ledger differs from accepted rewrite")
+        had_doubt = self.state.sweep_ledger_in_doubt
+        if not had_doubt:
+            # Claim the next doubt before entering the helper: its refusal arm
+            # persists the run flag internally, so a host death immediately
+            # after that save must not strand an apparently inherited doubt.
+            task.migration_ledger_doubt_owned = True
+            self._save()
+        outcome = self._commit_ledger(
+            "chore(sweep): migrate legacy deferred-work entries to DW format",
+            path=self.workspace.paths.deferred_work,
+            family="ledger",
+        )
+        if task.migration_ledger_doubt_owned and not self.state.sweep_ledger_in_doubt:
+            # A Git-only unavailable outcome arms no ledger doubt. Retire the
+            # provisional claim so it can never clear a later phase's evidence.
+            task.migration_ledger_doubt_owned = False
+            self._save()
+        if outcome in ("refused", "unavailable"):
+            # Returning would let Engine._run_inner stamp the whole run finished,
+            # which makes the public resume command refuse the durable COMMITTING
+            # task. Use the existing crash/resume channel; the helper's journal
+            # row retains the specific refusal/unavailable diagnosis.
+            raise RuntimeError(f"migration ledger publication {outcome}")
+        if outcome == "clean":
+            try:
+                confirmed = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                self._migration_evidence_failure(
+                    task, "clean publication cannot confirm the accepted rewrite"
+                )
+            if confirmed != rewrite:
+                self._migration_evidence_failure(
+                    task, "clean publication no longer contains the accepted rewrite"
+                )
+        if task.migration_ledger_doubt_owned:
+            task.migration_ledger_doubt_owned = False
+            self.state.sweep_ledger_in_doubt = False
+            self._ledger_doubt_inherited = False
+        advance(task, Phase.DONE)
+        self._save()
+        post = deferredwork.parse_ledger(rewrite)
+        self.journal.append(
+            "sweep-migrated",
+            converted=len(manifest),
+            entries_now=len(post),
+            open_now=sum(1 for entry in post if entry.open),
+        )
+        self._emit("post_migrate", task)
+        return True
+
     def _ensure_migration(self, text: str) -> None:
         """Pre-DW-format ledger content (older BMAD-method projects) blocks a
         sweep: open_ids() cannot see it and mark_done() cannot flip it. One
@@ -3130,6 +3413,75 @@ class SweepEngine(Engine):
         if task is None:
             task = StoryTask(story_key=MIGRATE_KEY, epic=0)
             self.state.tasks[MIGRATE_KEY] = task
+        elif (
+            task.phase == Phase.PENDING
+            and task.migration_recovery_format == _MIGRATION_RECOVERY_FORMAT
+            and task.baseline_commit is not None
+        ):
+            # A host can die after the recovery marker and baseline are durable
+            # but before the manifest is published or a session is dispatched.
+            # PENDING proves no attempt-owned rewrite exists, so retire that
+            # interrupted attempt's rollback authority before stamping the
+            # current (possibly operator-repaired) HEAD below.
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
+        elif task.phase == Phase.COMMITTING:
+            if task.migration_recovery_format != _MIGRATION_RECOVERY_FORMAT:
+                self._migration_evidence_failure(task, "commit tail has no recovery marker")
+            baseline, manifest = self._migration_baseline_and_manifest(task)
+            rewrite = self._migration_record_text(
+                task, self.run_dir / _MIGRATE_REWRITE_RECORD, "rewrite"
+            )
+            assert rewrite is not None
+            self._migration_result_evidence(task, baseline, manifest, rewrite)
+            self._finish_migration_commit(task, manifest, rewrite)
+            return
+        elif task.phase == Phase.TRIAGE_VERIFY and task.migration_recovery_format not in (
+            0,
+            _MIGRATION_RECOVERY_FORMAT,
+        ):
+            self._migration_evidence_failure(task, "unknown migration recovery marker")
+        elif (
+            task.phase == Phase.TRIAGE_VERIFY
+            and task.migration_recovery_format == _MIGRATION_RECOVERY_FORMAT
+        ):
+            baseline, manifest = self._migration_baseline_and_manifest(task)
+            rewrite = self._migration_record_text(
+                task,
+                self.run_dir / _MIGRATE_REWRITE_RECORD,
+                "rewrite",
+                optional=True,
+            )
+            if rewrite is not None:
+                raw_result = self._migration_record_text(
+                    task,
+                    self.run_dir / _MIGRATE_RESULT_RECORD,
+                    "result",
+                    optional=True,
+                )
+                if raw_result is not None:
+                    self._migration_result_evidence(task, baseline, manifest, rewrite)
+                    advance(task, Phase.COMMITTING)
+                    self._save()
+                    self._finish_migration_commit(task, manifest, rewrite)
+                    return
+                # Validation completed and the accepted rewrite became durable,
+                # but result publication did not. Put the accepted legacy input
+                # back before redispatching; no stale rewrite is ever consumed by
+                # the replacement TRIAGE_RUNNING session.
+                self._restore_accepted_migration(task, baseline, rewrite)
+                text = baseline
+                task.phase = Phase.PENDING
+                task.baseline_commit = None
+                task.baseline_untracked = None
+                self._save()
+            else:
+                # Once a current-format task reaches TRIAGE_VERIFY the accepted
+                # rewrite is required evidence. Treat a publication failure or
+                # crash before that record as corruption; only an unmarked
+                # pre-upgrade task may use reset-and-reread recovery.
+                self._migration_evidence_failure(task, "missing accepted rewrite record")
         elif task.phase != Phase.PENDING:
             # resumed mid-migration or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
@@ -3213,25 +3565,36 @@ class SweepEngine(Engine):
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
-        legacy = deferredwork.parse_legacy(text)
         pre_canonical = snapshot_canonical(text)
-        manifest = [
-            {
-                "key": e.key,
-                "id": e.id,
-                "title": e.title,
-                "section": e.section,
-                "done": e.done,
-                "severity": e.severity,
-            }
-            for e in legacy
-        ]
-        manifest_path = self.run_dir / "migrate-manifest.json"
-        atomic_write_text_confined(
-            manifest_path,
-            json.dumps(manifest, indent=2),
-            confine_root=_project_of_run_dir(self.run_dir),
-        )
+        manifest = self._migration_manifest(text)
+        manifest_path = self.run_dir / _MIGRATE_MANIFEST_RECORD
+        confine_root = _project_of_run_dir(self.run_dir)
+        try:
+            atomic_write_text_confined(
+                self.run_dir / _MIGRATE_BASELINE_RECORD,
+                text,
+                confine_root=confine_root,
+            )
+            task.migration_recovery_format = _MIGRATION_RECOVERY_FORMAT
+            self._save()
+            # A replacement attempt must not inherit validation/result authority
+            # from the attempt it is replacing. Phase alone then makes a stale
+            # rewrite impossible to consume after a TRIAGE_RUNNING crash.
+            self._remove_migration_record(self.run_dir / _MIGRATE_REWRITE_RECORD)
+            self._remove_migration_record(self.run_dir / _MIGRATE_RESULT_RECORD)
+            atomic_write_text_confined(
+                manifest_path,
+                json.dumps(manifest, indent=2),
+                confine_root=confine_root,
+            )
+        except OSError:
+            # No child was dispatched, therefore no attempt-owned work exists.
+            # The next resume must stamp the then-current (possibly repaired)
+            # HEAD instead of retaining authority over the pre-repair tree.
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
+            raise
 
         feedback: Path | None = None
         while True:
@@ -3284,27 +3647,38 @@ class SweepEngine(Engine):
                     env_fault_pause_reason("migration", result),
                 )
             if not errors:
-                advance(task, Phase.DONE)
-                self._save()
+                # This record is the durable proof that validation accepted the
+                # exact ledger text. It precedes result publication so a refused
+                # result write resumes by restoring this known rewrite and
+                # redispatching, never by treating the task as complete.
                 atomic_write_text_confined(
-                    self.run_dir / "migrate-result.json",
+                    self.run_dir / _MIGRATE_REWRITE_RECORD,
+                    new_text,
+                    confine_root=confine_root,
+                )
+                atomic_write_text_confined(
+                    self.run_dir / _MIGRATE_RESULT_RECORD,
                     json.dumps(result.result_json, indent=2),
-                    confine_root=_project_of_run_dir(self.run_dir),
+                    confine_root=confine_root,
                 )
-                # the ledger file: the migration rewrote the ledger
-                self._commit_ledger(
-                    "chore(sweep): migrate legacy deferred-work entries to DW format",
-                    path=self.workspace.paths.deferred_work,
-                    family="ledger",
+                # Re-open the complete durable evidence set before granting the
+                # COMMITTING boundary. The local values above were validated
+                # before publication; only these run-owned records survive a
+                # crash and therefore only they may authorize commit replay.
+                durable_baseline, durable_manifest = self._migration_baseline_and_manifest(task)
+                durable_rewrite = self._migration_record_text(
+                    task, self.run_dir / _MIGRATE_REWRITE_RECORD, "rewrite"
                 )
-                post = deferredwork.parse_ledger(new_text)
-                self.journal.append(
-                    "sweep-migrated",
-                    converted=len(manifest),
-                    entries_now=len(post),
-                    open_now=sum(1 for e in post if e.open),
+                assert durable_rewrite is not None
+                self._migration_result_evidence(
+                    task,
+                    durable_baseline,
+                    durable_manifest,
+                    durable_rewrite,
                 )
-                self._emit("post_migrate", task)
+                advance(task, Phase.COMMITTING)
+                self._save()
+                self._finish_migration_commit(task, durable_manifest, durable_rewrite)
                 return
             # never re-prompt over a half-broken rewrite; the baseline reset
             # covers tracked files, the explicit write covers an untracked
@@ -5049,7 +5423,7 @@ class SweepEngine(Engine):
 
     def _commit_ledger(
         self, message: str, *, path: Path, family: Literal["ledger", "store"]
-    ) -> None:
+    ) -> _LedgerCommitOutcome:
         """Publish the orchestrator bookkeeping FILE a phase just wrote: that one
         file reaches HEAD, and everything else the enclosing repository is
         carrying is left dirty for whoever owns it. No-op when the file already
@@ -5343,7 +5717,7 @@ class SweepEngine(Engine):
             # release contract and why neither cycle latch is touched.
             if family == "ledger":
                 self._record_ledger_doubt()
-            return
+            return "unavailable"
         try:
             root = target.parent
             # THE TARGET VALIDATION (DW-199/203/205), between the resolve and
@@ -5373,7 +5747,7 @@ class SweepEngine(Engine):
                 error=str(e),
                 file=name,
             )
-            return
+            return "unavailable"
         if refusal is not None:
             cause, error = refusal
             # Outside the guarded git block, like every other row here, so a journal
@@ -5423,7 +5797,7 @@ class SweepEngine(Engine):
             # own arms rest on.
             if family == "ledger":
                 self._record_ledger_doubt()
-            return
+            return "refused"
         # Git has now answered for the LEDGER: it is at HEAD, either because this
         # commit put it there or because it already was. That settles any debt a
         # publisher latched (`_owe_ledger_commit`) — and only that answer does:
@@ -5448,8 +5822,9 @@ class SweepEngine(Engine):
             # rels:` arm. A plainly-absent target never gets this far; it took the
             # refusal arm before `path_clean` ran.
             self.journal.append("sweep-ledger-commit-clean", message=message, file=name)
-            return
+            return "clean"
         self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
+        return "committed"
 
     def _withhold_ledger_publish(self, message: str, *, dw_ids: list[str] | None = None) -> None:
         """Journal a ledger publish the RUN declined to attempt because it already

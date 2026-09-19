@@ -25,7 +25,15 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
-from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
+from . import (
+    artifact_publication,
+    deferredwork,
+    devcontract,
+    envvars,
+    gates,
+    operatoractions,
+    verify,
+)
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
@@ -1739,11 +1747,69 @@ class Engine:
                 or publication_pending
             ):
                 continue
-            if merged_key not in merged_units:
+            merged = merged_key in merged_units
+            if task.dw_ids and task.integration_attempt is not None:
+                # A live receipt's completion is never read from the record.
+                # The `unit-merged` row is the session's to append — it holds
+                # the writable run directory, the receipt's operation identity
+                # included — and so is the target's reflog transition under
+                # that identity: `git update-ref -m bmad-loop-integrate:<id>`
+                # writes exactly that row, on a branch checked out elsewhere
+                # too, and a session in a linked worktree shares the
+                # repository. Retiring the receipt on the two skipped the
+                # deterministic target validation over whatever the session
+                # had put there (#796 review). The replay below runs the
+                # merge, which finds the moved ref under the receipt and
+                # validates it (`landed`), or pauses with evidence.
+                merged = False
+            elif task.dw_ids and merged and self._integration_receipt_required(task):
+                # No live receipt: a successful integration retired it, or a
+                # host was lost before one was armed. The row and the reflog
+                # transition are both the session's to write (above), so
+                # neither stands for the completion (#796 review): while the
+                # source is still mounted the replay below runs the merge,
+                # which stages nothing again over a landed result,
+                # re-validates the target's bytes and re-records; once the
+                # completed integration has consumed the source (worktree
+                # torn down, branch gone) there is no merge to replay, and
+                # the completion stands only on the target as it is now —
+                # the unit's commit in its history and every accepted
+                # artifact blob in its tree and index — or pauses. The
+                # released legacy payload integrates without a receipt and
+                # keeps its bare row.
+                merged = self._consumed_source_completion_holds(task)
+            if not merged:
                 source = task.commit_sha or ""
                 started_key = (*merged_key, source)
-                replay_strategy = started_units.get(started_key)
-                if not source or replay_strategy is None:
+                attempt = task.integration_attempt if task.dw_ids else None
+                if attempt is not None:
+                    replay_strategy = (
+                        str(attempt.get("strategy", "")) if isinstance(attempt, dict) else ""
+                    )
+                    self.journal.append(
+                        "resume-unit-merge",
+                        story_key=task.story_key,
+                        branch=task.branch,
+                        target=self.state.target_branch,
+                        strategy=replay_strategy,
+                        source=source,
+                        operation_id=(
+                            str(attempt.get("operation_identity", ""))
+                            if isinstance(attempt, dict)
+                            else ""
+                        ),
+                    )
+                    self._merge_local(
+                        task,
+                        self._reopen_unit(task),
+                        replay=True,
+                        replay_strategy=replay_strategy,
+                    )
+                    merged = True
+                    replay_strategy = None
+                else:
+                    replay_strategy = started_units.get(started_key)
+                if not merged and (not source or replay_strategy is None):
                     if not publication_pending:
                         continue
                     # Terminal bundle persisted before merge intent: integrate it
@@ -1751,11 +1817,11 @@ class Engine:
                     self._merge_local(
                         task, self._reopen_unit(task), replay=True, first_integration=True
                     )
-                    merged_units.add(merged_key)
+                    merged = True
                     replay_strategy = None
                 else:
                     replay_strategy = str(replay_strategy)
-                if merged_key not in merged_units:
+                if not merged:
                     # The write-ahead record is intent, never merge proof. Re-run the
                     # exact merge and latch completion only after git confirms it;
                     # merge/ff are naturally idempotent, while squash enables its
@@ -1775,7 +1841,6 @@ class Engine:
                         replay=True,
                         replay_strategy=replay_strategy,
                     )
-                    merged_units.add(merged_key)
             if publication_pending and not task.artifact_publication_complete:
                 if task.artifact_payload is None:
                     unit = self._reopen_unit(task)
@@ -1796,6 +1861,77 @@ class Engine:
             # The failed integration unwound before _run_story returned, so the
             # loop never reached its normal post-integration continuation.
             self._after_story(task)
+
+    def _integration_receipt_required(self, task: StoryTask) -> bool:
+        """Whether ``task`` integrates under a target receipt (modern authority).
+
+        Malformed authority reads as receipt-required: the replay's merge
+        raises the same refusal and pauses with it.
+        """
+        try:
+            return artifact_publication.requires_target_integration_receipt(task)
+        except artifact_publication.PublicationError:
+            return True
+
+    def _consumed_source_completion_holds(self, task: StoryTask) -> bool:
+        """Whether a modern bundle's recorded integration holds on the target now.
+
+        Read only with no live receipt. ``False`` while the unit's worktree is
+        still mounted: the merge is replayed instead, the stronger reading. With
+        the source consumed, the deterministic target validation the record
+        would otherwise have stood in for (#796 review): the target head holds
+        the unit's integration — ``task.commit_sha`` in its history, or, since
+        a squash seals a commit of its own and never that one (#796 review),
+        every change the unit made over ``task.baseline_commit`` folded into
+        its tree blob for blob — and `validate_integrated` accepts its tree
+        and the index at that head. Neither reading branches on the strategy:
+        both are the target as it is now. Anything else pauses the run naming
+        the reason — there is no source left to replay and no receipt left to
+        restore.
+        """
+        if task.worktree_path and Path(task.worktree_path).is_dir():
+            return False
+        target = self.state.target_branch
+        repo = self.paths.repo_root
+        try:
+            if not target or not task.commit_sha:
+                raise verify.IntegrationEvidenceError(
+                    "the recorded integration names no target branch or source commit"
+                )
+            head = verify.ref_revision(repo, f"refs/heads/{target}")
+            if not verify.is_ancestor(repo, task.commit_sha, head):
+                if not task.baseline_commit:
+                    raise verify.IntegrationEvidenceError(
+                        f"{target} does not hold the unit's commit {task.commit_sha} and "
+                        "the unit names no baseline to read its change set from"
+                    )
+                unfolded = verify.unfolded_changes(
+                    repo, task.baseline_commit, task.commit_sha, head
+                )
+                if unfolded:
+                    raise verify.IntegrationEvidenceError(
+                        f"{target} does not hold the unit's commit {task.commit_sha} nor "
+                        f"its changes over {task.baseline_commit} at " + ", ".join(unfolded)
+                    )
+            artifact_publication.validate_integrated(task, self.paths, head)
+        except (
+            artifact_publication.PublicationError,
+            verify.GitError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            raise RunPaused(
+                f"recorded integration of {task.branch} into {target} does not hold on "
+                f"the target and its source is consumed (worktree gone): {exc}",
+                PAUSE_ESCALATION,
+                task.story_key,
+            ) from exc
+        return True
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""

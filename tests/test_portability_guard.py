@@ -297,6 +297,7 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("workspace.py", "_refuse_foreign_checkout"),
+    ("worktree_flow.py", "_refuse_integrated_artifacts"),
 }
 
 # Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole
@@ -1537,6 +1538,10 @@ JOURNAL_KINDS = frozenset(
         # already a `_JOURNAL_KEYLIST_FIELDS` name.
         "sweep-ledger-commit-withheld",
         "sweep-migrated",
+        # DW-296/DW-297. Current-format migration recovery evidence was absent,
+        # nonregular, unreadable, malformed, or mutually inconsistent. `detail`
+        # is already routed through diagnostics._JOURNAL_DROP_FIELDS.
+        "sweep-migration-recovery-invalid",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
         # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the

@@ -245,9 +245,16 @@ _JOURNAL_ALIAS_FIELDS = {
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
-    "unit-merge-started": {"target": "branch"},
-    "unit-merged": {"target": "branch"},
-    "resume-unit-merge": {"target": "branch"},
+    "unit-merge-started": {
+        "target": "branch",
+        "operation_id": "operation",
+        "pre_target_revision": "commit",
+    },
+    "unit-merged": {
+        "target": "branch",
+        "operation_id": "operation",
+    },
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
     "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be

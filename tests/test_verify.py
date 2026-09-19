@@ -6438,6 +6438,107 @@ def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_ind
     assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
 
 
+def test_finalize_commit_restores_original_chain_when_head_probe_fails(project, monkeypatch):
+    """The squash is not accepted until its HEAD identity is known; a failed
+    post-commit probe restores the skill chain and clean index without discarding
+    the accepted working-tree bytes staged by the one allowed add pass.
+
+    Ablation: move the post-commit ``rev_parse_head`` above the recovery ``try``;
+    the injected fault leaves the squash at HEAD and the accepted bytes staged.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    path = repo / "src.txt"
+    path.write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(repo)
+    path.write_text("accepted bytes\n")
+    marker = repo / "commit-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+    git_calls = []
+
+    def spy_git(git_repo, *args):
+        git_calls.append(args)
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(RuntimeError, match="HEAD identity probe failed"):
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    assert rev_parse_calls == 2
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "diff", "--cached", "--quiet") == ""
+    assert git(repo, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert path.read_text() == "accepted bytes\n"
+    assert marker.read_text() == "ran"
+    assert [args for args in git_calls if args[:1] == ("add",)] == [("add", "-A")]
+
+
+@pytest.mark.parametrize("raised_restore_fault", [False, True], ids=["nonzero", "raised"])
+def test_finalize_commit_reports_head_probe_and_restore_failures(
+    project, monkeypatch, raised_restore_fault
+):
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    (repo / "src.txt").write_text("accepted bytes\n")
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+
+    def refuse_mixed_restore(git_repo, *args):
+        if args[:2] == ("reset", "--mixed"):
+            if raised_restore_fault:
+                raise verify.GitTimeoutError("restore timed out")
+            return 1, "restore refused"
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", refuse_mixed_restore)
+
+    with pytest.raises(
+        verify.GitError,
+        match=(
+            r"post-commit finalization failed \(RuntimeError: HEAD identity probe failed\); "
+            r"additionally failed to restore HEAD"
+        ),
+    ) as caught:
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    expected_restore_diagnostic = "restore timed out" if raised_restore_fault else "restore refused"
+    assert expected_restore_diagnostic in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "HEAD identity probe failed"
+
+
 def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_index_reset(project):
     """The no-op arm sits INSIDE the validated window: "nothing staged" is read
     off the index after the staged validator returned, so an index reset to
@@ -9638,3 +9739,58 @@ def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkey
     # genuinely different directories. Should the fixture ever collapse them, the
     # recorded-root assertion stops separating the two spellings and this reddens.
     assert paths.project != paths.repo_root
+
+
+def test_unfolded_changes_reads_a_squashed_unit_against_the_targets_tree(project):
+    """The reading a consumed squash integration stands on (#796 review): every
+    change the unit made over its baseline — an add, a rewrite, a delete, a
+    mode flip and a rename's two sides — is folded into the target's tree
+    blob for blob after a squash, whose commit is never the unit's descendant;
+    a target that drifted on any of them names exactly those paths.
+
+    Ablation: compare object ids alone and the mode-flip row reads folded;
+    skip the deleted arm and a resurrected path reads folded."""
+    repo = project.repo_root
+    (repo / "kept.txt").write_text("kept\n")
+    (repo / "gone.txt").write_text("gone\n")
+    (repo / "moved.txt").write_text("moved\n")
+    (repo / "flip.sh").write_text("#!/bin/sh\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "baseline")
+    baseline = git(repo, "rev-parse", "HEAD")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / "kept.txt").write_text("rewritten\n")
+    (repo / "added.txt").write_text("added\n")
+    (repo / "gone.txt").unlink()
+    (repo / "moved.txt").rename(repo / "renamed.txt")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=+x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "unit")
+    source = git(repo, "rev-parse", "HEAD")
+    # `-f`: the index seals the chmod, the checkout never did (a filemode=false
+    # host never would), and the mode-only dirt would otherwise refuse the switch.
+    git(repo, "checkout", "-q", "-f", target)
+    git(repo, "merge", "-q", "--squash", "unit")
+    git(repo, "commit", "-q", "-m", "squash")
+    squashed = git(repo, "rev-parse", "HEAD")
+
+    assert not verify.is_ancestor(repo, source, squashed)
+    assert verify.unfolded_changes(repo, baseline, source, squashed) == ()
+    assert verify.unfolded_changes(repo, baseline, source, baseline) == (
+        "added.txt",
+        "flip.sh",
+        "gone.txt",
+        "kept.txt",
+        "moved.txt",
+        "renamed.txt",
+    )
+
+    (repo / "gone.txt").write_text("resurrected\n")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=-x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "drift")
+    drifted = git(repo, "rev-parse", "HEAD")
+    assert verify.unfolded_changes(repo, baseline, source, drifted) == ("flip.sh", "gone.txt")
+    with pytest.raises(verify.IntegrationEvidenceError, match="change set"):
+        verify.unfolded_changes(repo, baseline, "0" * 40, drifted)

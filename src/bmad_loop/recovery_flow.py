@@ -15,12 +15,22 @@ cluster) see an unchanged surface.
 
 from __future__ import annotations
 
+import errno
+import os
+import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
 from .model import Phase
-from .platform_util import atomic_write_bytes, safe_ref_segment
+from .platform_util import (
+    DIR_FD_ANCHORED_WRITES,
+    UnconfinedWriteError,
+    atomic_write_bytes_at,
+    atomic_write_bytes_confined,
+    open_dir_confined,
+    safe_ref_segment,
+)
 from .statemachine import advance
 
 if TYPE_CHECKING:
@@ -286,19 +296,211 @@ class RecoveryFlow:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             ) from exc
-        # `require_writable_target=True` (#597): the spec this puts back is
-        # operator-editable, and a temp-and-replace write needs write permission on
-        # the PARENT DIRECTORY, never on the entry it replaces — so a spec marked
-        # read-only was rewritten anyway. NOT the confined writer: the authority
-        # walk above is stricter than the cohort walk (it demands
-        # `resolve(strict=True)` fixed points for the parent and the target, which
-        # refuses a link ANYWHERE above, inside the checkout as well as out), so a
-        # confined write would relax this site rather than harden it.
-        atomic_write_bytes(spec_path, snapshot, follow_symlinks=False, require_writable_target=True)
-        if spec_path.read_bytes() != snapshot:
-            raise verify.FrontmatterWriteError(
-                f"could not restore pre-attempt contents of owned spec {spec_path}"
+        authority_message = f"attempt-owned spec target became unsafe: {spec_path}"
+        mismatch_message = f"could not restore pre-attempt contents of owned spec {spec_path}"
+
+        def verify_parent_authority(parent_fd: int) -> None:
+            probe_fd = open_dir_confined(Path(spec_path.anchor), parent, search_only=True)
+            if probe_fd is None:
+                raise _OwnedSpecAuthorityError(authority_message)
+            try:
+                if not os.path.samestat(os.fstat(parent_fd), os.fstat(probe_fd)):
+                    raise _OwnedSpecAuthorityError(authority_message)
+            finally:
+                os.close(probe_fd)
+
+        def target_stat_at(parent_fd: int) -> os.stat_result | None:
+            try:
+                observed = os.stat(spec_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(observed.st_mode):
+                raise _OwnedSpecAuthorityError(authority_message)
+            return observed
+
+        def require_same_target_at(parent_fd: int, expected: os.stat_result | None) -> None:
+            observed = target_stat_at(parent_fd)
+            if expected is None:
+                if observed is not None:
+                    raise _OwnedSpecAuthorityError(authority_message)
+                return
+            if observed is None or not os.path.samestat(expected, observed):
+                raise _OwnedSpecAuthorityError(authority_message)
+
+        def verify_published_inode(parent_fd: int, published_fd: int) -> None:
+            # The writer keeps this exact staged inode open across publication.
+            # Opening the live name no-follow/nonblocking proves it still names
+            # that inode without following a link or waiting on a planted FIFO.
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            try:
+                live_fd = os.open(spec_path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in {
+                    errno.ELOOP,
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.ENXIO,
+                    errno.ENODEV,
+                }:
+                    raise _OwnedSpecAuthorityError(authority_message) from exc
+                raise
+            try:
+                before = os.fstat(published_fd)
+                live = os.fstat(live_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or not stat.S_ISREG(live.st_mode)
+                    or not os.path.samestat(before, live)
+                ):
+                    raise _OwnedSpecAuthorityError(authority_message)
+
+                os.lseek(published_fd, 0, os.SEEK_SET)
+                chunks: list[bytes] = []
+                remaining = len(snapshot) + 1
+                while remaining:
+                    chunk = os.read(published_fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+
+                after = os.fstat(published_fd)
+                stable_before = (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                stable_after = (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                if not os.path.samestat(before, after) or stable_before != stable_after:
+                    raise _OwnedSpecAuthorityError(authority_message)
+
+                try:
+                    named = os.stat(spec_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+                        raise _OwnedSpecAuthorityError(authority_message) from exc
+                    raise
+                if not stat.S_ISREG(named.st_mode) or not os.path.samestat(live, named):
+                    raise _OwnedSpecAuthorityError(authority_message)
+            finally:
+                os.close(live_fd)
+
+            if b"".join(chunks) != snapshot:
+                raise verify.FrontmatterWriteError(mismatch_message)
+
+            # This fresh filesystem-root walk is deliberately the last
+            # acceptance action. It observes the canonical spelling without
+            # replacing the retained descriptor as authority.
+            verify_parent_authority(parent_fd)
+
+        def fallback_parent_is_canonical() -> None:
+            try:
+                if (
+                    not parent.is_dir()
+                    or parent.is_symlink()
+                    or parent.resolve(strict=True) != parent
+                ):
+                    raise _OwnedSpecAuthorityError(authority_message)
+            except _OwnedSpecAuthorityError:
+                raise
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise _OwnedSpecAuthorityError(authority_message) from exc
+
+        def fallback_target_stat() -> os.stat_result | None:
+            try:
+                observed = os.lstat(spec_path)
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(observed.st_mode):
+                raise _OwnedSpecAuthorityError(authority_message)
+            return observed
+
+        def require_same_fallback_target(expected: os.stat_result | None) -> None:
+            fallback_parent_is_canonical()
+            observed = fallback_target_stat()
+            if expected is None:
+                if observed is not None:
+                    raise _OwnedSpecAuthorityError(authority_message)
+                return
+            if observed is None or not os.path.samestat(expected, observed):
+                raise _OwnedSpecAuthorityError(authority_message)
+
+        def verify_fallback_bytes(_published_fd: int | None) -> None:
+            before = fallback_target_stat()
+            if before is None:
+                raise _OwnedSpecAuthorityError(authority_message)
+            restored = spec_path.read_bytes()
+            after = fallback_target_stat()
+            if after is None:
+                raise _OwnedSpecAuthorityError(authority_message)
+            before_signature = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
             )
+            after_signature = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_signature != after_signature:
+                raise _OwnedSpecAuthorityError(authority_message)
+            if restored != snapshot:
+                raise verify.FrontmatterWriteError(mismatch_message)
+            fallback_parent_is_canonical()
+
+        # `require_writable_target=True` (#597): the spec this puts back is
+        # operator-editable, and a temp-and-replace write needs write permission
+        # on the parent directory, never on the entry it replaces. Anchor from
+        # the filesystem root rather than the project so configured external
+        # artifact roots remain valid repair targets.
+        if DIR_FD_ANCHORED_WRITES:
+            parent_fd = open_dir_confined(Path(spec_path.anchor), parent, search_only=True)
+            if parent_fd is None:
+                raise _OwnedSpecAuthorityError(
+                    f"attempt-owned spec target could not be revalidated: {spec_path}"
+                )
+            try:
+                expected = target_stat_at(parent_fd)
+
+                def validate_target() -> None:
+                    require_same_target_at(parent_fd, expected)
+
+                def verify_published(published_fd: int) -> None:
+                    verify_published_inode(parent_fd, published_fd)
+
+                atomic_write_bytes_at(
+                    parent_fd,
+                    spec_path.name,
+                    snapshot,
+                    _require_writable_target=True,
+                    _before_staging=validate_target,
+                    _before_replace=validate_target,
+                    _after_replace=verify_published,
+                )
+            finally:
+                os.close(parent_fd)
+            return
+
+        expected = fallback_target_stat()
+
+        def validate_fallback_target() -> None:
+            require_same_fallback_target(expected)
+
+        try:
+            atomic_write_bytes_confined(
+                spec_path,
+                snapshot,
+                confine_root=Path(spec_path.anchor),
+                require_writable_target=True,
+                _before_staging=validate_fallback_target,
+                _before_replace=validate_fallback_target,
+                _after_replace=verify_fallback_bytes,
+            )
+        except UnconfinedWriteError as exc:
+            raise _OwnedSpecAuthorityError(
+                f"attempt-owned spec target could not be revalidated: {spec_path}"
+            ) from exc
 
     @classmethod
     def _restore_attempt_owned_spec(

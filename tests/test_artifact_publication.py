@@ -1637,6 +1637,111 @@ def test_staged_validation_refuses_missing_or_malformed_persisted_maps(project):
         publication.validate_staged(malformed, project)
 
 
+def test_integrated_validation_checks_commit_and_post_hook_index_with_path_only_errors(project):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    spec = root / "spec.md"
+    report = root / "report.bin"
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [report.bin]\n---\n")
+    report.write_bytes(b"accepted\r\n")
+    (project.project / ".gitattributes").write_text("*.bin text eol=lf\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "accepted target")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, project)
+    accepted_oids = set(task.artifact_tracked_source_oids.values())
+
+    assert publication.validate_integrated(task, project, "HEAD") is True
+
+    report.write_bytes(b"hook drift\n")
+    git(project.project, "add", "--", report)
+    with pytest.raises(publication.PublicationError) as raised:
+        publication.validate_integrated(task, project, "HEAD")
+    assert str(raised.value).endswith("report.bin")
+    assert not any(oid in str(raised.value) for oid in accepted_oids)
+
+
+def test_integrated_validation_preserves_legacy_frozen_payload_compatibility(project):
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.artifact_source_digests = {"report.bin": "legacy-digest"}
+    task.artifact_tracked_source_oids = None
+    task.artifact_acceptance_identity = "legacy-owner"
+    task.artifact_payload = {"report.bin": "bGVnYWN5"}
+
+    assert publication.validate_integrated(task, project, "HEAD") is False
+
+
+@pytest.mark.parametrize("payload", [["not-a-map"], {"report.bin": "not base64!"}])
+def test_integrated_validation_refuses_malformed_legacy_payload(project, payload):
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.artifact_payload = payload  # type: ignore[reportAssignmentType]
+
+    with pytest.raises(publication.PublicationError, match="payload"):
+        publication.validate_integrated(task, project, "HEAD")
+
+
+def test_integrated_validation_refuses_partial_modern_authority(project):
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.artifact_payload = {}
+    task.artifact_tracked_source_oids = {}
+    task.artifact_source_digests = None
+    task.artifact_acceptance_identity = "review:dev:0"
+
+    with pytest.raises(publication.PublicationError, match="binding"):
+        publication.validate_integrated(task, project, "HEAD")
+
+
+def test_integrated_validation_binds_modern_payload_to_accepted_ignored_digests(project):
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.artifact_payload = {"report.bin": base64.b64encode(b"changed").decode("ascii")}
+    task.artifact_source_digests = {"report.bin": hashlib.sha256(b"accepted").hexdigest()}
+    task.artifact_tracked_source_oids = {}
+    task.artifact_acceptance_identity = "review:dev:0"
+
+    with pytest.raises(publication.PublicationError, match="differs from accepted"):
+        publication.validate_integrated(task, project, "HEAD")
+
+
+def test_integrated_validation_refuses_commit_drift_even_when_index_is_accepted(project):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    spec = root / "spec.md"
+    report = root / "report.bin"
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [report.bin]\n---\n")
+    report.write_bytes(b"accepted\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "accepted target")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, project)
+    accepted_oids = set(task.artifact_tracked_source_oids.values())
+    report.write_bytes(b"commit drift\n")
+    git(project.project, "add", "--", report)
+    git(project.project, "commit", "-q", "-m", "drifted target")
+    report.write_bytes(b"accepted\n")
+    git(project.project, "add", "--", report)
+
+    with pytest.raises(publication.PublicationError) as raised:
+        publication.validate_integrated(task, project, "HEAD")
+
+    assert str(raised.value).endswith("report.bin")
+    assert not any(oid in str(raised.value) for oid in accepted_oids)
+
+
+def test_integrated_validation_keeps_accepted_ignored_paths_absent(publication_case):
+    task, _paths, source = publication_case
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    report = source.implementation_artifacts / "report.bin"
+    git(source.repo_root, "add", "-f", "--", report)
+
+    with pytest.raises(publication.PublicationError, match=r"report\.bin"):
+        publication.validate_integrated(task, source, "HEAD")
+
+
 def test_unignored_untracked_declaration_must_be_tracked_by_preparation(
     publication_case, monkeypatch
 ):

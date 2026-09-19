@@ -1923,6 +1923,95 @@ def test_open_dir_confined_accepts_a_root_behind_a_link(tmp_path):
         os.close(fd)
 
 
+@DIR_FD
+def test_open_dir_confined_readable_default_supports_scandir(tmp_path):
+    root = tmp_path / "project"
+    nested = root / "artifacts"
+    nested.mkdir(parents=True)
+    (nested / "owned.md").write_bytes(b"x")
+
+    fd = platform_util.open_dir_confined(root, nested)
+
+    assert fd is not None
+    try:
+        with os.scandir(fd) as entries:
+            assert [entry.name for entry in entries] == ["owned.md"]
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_applies_to_root_intermediate_and_final(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "project"
+    final = root / "intermediate" / "artifacts"
+    final.mkdir(parents=True)
+    search_flag = getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        observed_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "open", record_open)
+    fd = platform_util.open_dir_confined(root, final, search_only=True)
+
+    assert fd is not None
+    try:
+        assert os.path.samestat(os.fstat(fd), final.stat())
+    finally:
+        os.close(fd)
+    assert len(observed_flags) == 3
+    assert all(flags & search_flag for flags in observed_flags)
+    assert all(flags & os.O_DIRECTORY for flags in observed_flags)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_accepts_execute_only_final_directory(tmp_path):
+    root = tmp_path / "project"
+    final = root / "artifacts"
+    final.mkdir(parents=True)
+    final.chmod(0o100)
+    try:
+        fd = platform_util.open_dir_confined(root, final, search_only=True)
+        assert fd is not None
+        os.close(fd)
+    finally:
+        final.chmod(0o700)
+
+
+@DIR_FD
+@pytest.mark.skipif(
+    not (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)),
+    reason="host has no search-only directory-open flag",
+)
+def test_open_dir_confined_search_only_crosses_execute_only_intermediate_directory(tmp_path):
+    root = tmp_path / "project"
+    intermediate = root / "execute-only"
+    final = intermediate / "artifacts"
+    final.mkdir(parents=True)
+    intermediate.chmod(0o100)
+    try:
+        fd = platform_util.open_dir_confined(root, final, search_only=True)
+        assert fd is not None
+        try:
+            assert os.path.samestat(os.fstat(fd), final.stat())
+        finally:
+            os.close(fd)
+    finally:
+        intermediate.chmod(0o700)
+
+
 # -------------------------------------------------- anchored atomic writes (#593)
 
 
@@ -2042,6 +2131,64 @@ def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, m
         with pytest.raises(OSError, match="No space left"):
             platform_util.atomic_write_bytes_at(fd, "policy.toml", b"after")
 
+    assert target.read_bytes() == b"before"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@DIR_FD
+def test_atomic_write_bytes_at_writable_refusal_precedes_staging(tmp_path, monkeypatch):
+    target = tmp_path / "owned.md"
+    target.write_bytes(b"before")
+    failure = PermissionError("read only")
+    calls: list[str] = []
+
+    def refuse(_dir_fd: int, _name: str) -> None:
+        calls.append("probe")
+        raise failure
+
+    def unexpected_stage(*_args, **_kwargs):
+        calls.append("stage")
+        raise AssertionError("staged before writable refusal")
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target_at", refuse)
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", unexpected_stage)
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(PermissionError) as excinfo:
+            platform_util.atomic_write_bytes_at(
+                fd, target.name, b"after", _require_writable_target=True
+            )
+
+    assert excinfo.value is failure
+    assert calls == ["probe"]
+    assert target.read_bytes() == b"before"
+
+
+@DIR_FD
+def test_atomic_write_bytes_at_does_not_verify_after_prepublication_failure(tmp_path):
+    target = tmp_path / "owned.md"
+    target.write_bytes(b"before")
+    failure = RuntimeError("target changed before replace")
+    verified = False
+
+    def fail_before_replace() -> None:
+        raise failure
+
+    def verify_after_replace(_published_fd: int) -> None:
+        nonlocal verified
+        verified = True
+
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(RuntimeError) as excinfo:
+            platform_util.atomic_write_bytes_at(
+                fd,
+                target.name,
+                b"after",
+                _before_replace=fail_before_replace,
+                _after_replace=verify_after_replace,
+            )
+
+    assert excinfo.value is failure
+    assert verified is False
     assert target.read_bytes() == b"before"
     assert list(tmp_path.glob("*.tmp")) == []
 
@@ -2431,6 +2578,117 @@ def test_atomic_write_bytes_confined_preserves_crlf_verbatim(tmp_path):
 
 
 @DIR_FD
+def test_atomic_write_bytes_confined_runs_callback_with_live_published_fd(tmp_path):
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    observed: list[tuple[int, bytes]] = []
+
+    def verify_after_publish(published_fd: int | None) -> None:
+        assert published_fd is not None
+        assert stat.S_ISREG(os.fstat(published_fd).st_mode)
+        os.lseek(published_fd, 0, os.SEEK_SET)
+        observed.append((published_fd, os.read(published_fd, 100)))
+
+    platform_util.atomic_write_bytes_confined(
+        target, b"published", confine_root=root, _after_replace=verify_after_publish
+    )
+
+    assert observed and observed[0][1] == b"published"
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(observed[0][0])
+
+
+def test_atomic_write_bytes_confined_fallback_post_callback_receives_no_fd(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    observed: list[int | None] = []
+
+    def verify_after_publish(dir_fd: int | None) -> None:
+        observed.append(dir_fd)
+        assert target.read_bytes() == b"published"
+
+    platform_util.atomic_write_bytes_confined(
+        target, b"published", confine_root=root, _after_replace=verify_after_publish
+    )
+
+    assert observed == [None]
+
+
+def test_confined_fallback_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    reused = parent / "fixed.tmp"
+    failure = RuntimeError("post-publication verification failed")
+
+    def fixed_temp(_target: Path) -> tuple[int, str]:
+        fd = os.open(reused, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return fd, str(reused)
+
+    def fail_after_publish(dir_fd: int | None) -> None:
+        assert dir_fd is None
+        reused.write_bytes(b"another writer")
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_mkstemp_beside", fixed_temp)
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target, b"published", confine_root=root, _after_replace=fail_after_publish
+        )
+
+    assert excinfo.value is failure
+    assert target.read_bytes() == b"published"
+    assert reused.read_bytes() == b"another writer"
+
+
+@DIR_FD
+def test_confined_anchored_callback_failure_does_not_unlink_reused_temp_name(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "story.md"
+    reused = parent / "fixed.tmp"
+    failure = RuntimeError("post-publication verification failed")
+
+    def fixed_temp(dir_fd: int, _prefix: str, _name: str) -> tuple[int, str]:
+        fd = os.open(
+            reused.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        return fd, reused.name
+
+    published_fds: list[int] = []
+
+    def fail_after_publish(published_fd: int | None) -> None:
+        assert published_fd is not None
+        os.fstat(published_fd)
+        published_fds.append(published_fd)
+        reused.write_bytes(b"another writer")
+        raise failure
+
+    monkeypatch.setattr(platform_util, "_open_exclusive_at", fixed_temp)
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target, b"published", confine_root=root, _after_replace=fail_after_publish
+        )
+
+    assert excinfo.value is failure
+    assert target.read_bytes() == b"published"
+    assert reused.read_bytes() == b"another writer"
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(published_fds[0])
+
+
+@DIR_FD
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, monkeypatch):
     """The race a path check cannot close: the session re-plants the parent as a
@@ -2498,6 +2756,44 @@ def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypa
         root / ".bmad-loop" / "policy.toml", "x = 1\n", confine_root=root
     )
     assert (root / ".bmad-loop" / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_confined_fallback_rejects_before_writable_probe_and_staging(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    target = parent / "owned.md"
+    target.write_bytes(b"before")
+    failure = RuntimeError("pre-staging authority loss")
+    calls: list[str] = []
+
+    def refuse_before_staging() -> None:
+        calls.append("predicate")
+        raise failure
+
+    def unexpected_probe(*_args, **_kwargs) -> None:
+        calls.append("writable-probe")
+
+    def unexpected_temp(_target: Path):
+        calls.append("temp")
+        raise AssertionError("staged after pre-staging refusal")
+
+    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", unexpected_probe)
+    monkeypatch.setattr(platform_util, "_mkstemp_beside", unexpected_temp)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        platform_util.atomic_write_bytes_confined(
+            target,
+            b"after",
+            confine_root=root,
+            require_writable_target=True,
+            _before_staging=refuse_before_staging,
+        )
+
+    assert excinfo.value is failure
+    assert calls == ["predicate"]
+    assert target.read_bytes() == b"before"
 
 
 # ------------------------------------------------- require_writable_target (#597)

@@ -1158,6 +1158,7 @@ def test_artifact_publication_state_round_trips_and_releases_with_mount():
     assert old.artifact_tracked_source_oids is None
     assert old.artifact_acceptance_identity is None
     assert old.artifact_publication_complete is False
+    assert old.integration_attempt is None
     task.artifact_baseline = {"report.bin": "before"}
     task.artifact_destination = "/project/artifacts"
     task.artifact_source_digests = {"report.bin": "accepted"}
@@ -1165,6 +1166,15 @@ def test_artifact_publication_state_round_trips_and_releases_with_mount():
     task.artifact_acceptance_identity = "review:2"
     task.artifact_payload = {"report.bin": "AP8="}
     task.artifact_publication_complete = True
+    task.integration_attempt = {
+        "target_ref": "refs/heads/main",
+        "strategy": "merge",
+        "source_revision": "source",
+        "operation_identity": "operation",
+        "pre_target_revision": "before",
+        "old_revision": "actual-before",
+        "new_revision": "integrated",
+    }
     loaded = StoryTask.from_dict(task.to_dict())
     assert loaded.artifact_baseline == task.artifact_baseline
     assert loaded.artifact_payload == task.artifact_payload
@@ -1173,12 +1183,14 @@ def test_artifact_publication_state_round_trips_and_releases_with_mount():
     assert loaded.artifact_tracked_source_oids == task.artifact_tracked_source_oids
     assert loaded.artifact_acceptance_identity == "review:2"
     assert loaded.artifact_publication_complete
+    assert loaded.integration_attempt == task.integration_attempt
     loaded.release_mount_owned_state()
     assert loaded.artifact_baseline is None and loaded.artifact_payload is None
     assert loaded.artifact_source_digests is None
     assert loaded.artifact_tracked_source_oids is None
     assert loaded.artifact_acceptance_identity is None
     assert loaded.artifact_destination is None and not loaded.artifact_publication_complete
+    assert loaded.integration_attempt is None
 
 
 # ------------------------------------ the artifact-only receipt's snapshot (DW-273)

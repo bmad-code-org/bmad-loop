@@ -92,12 +92,14 @@ jobs:
     # which this job installs psmux for and runs in its own serial step.
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
-    # 20, not the 15 the Linux test job uses: the slowest pre-lever Windows run
+    # 30, not the 15 the Linux test job uses: the slowest pre-lever Windows run
     # took 888s against a 900s cap, so one slow runner was a bad minute away from
     # a timeout that reads as a test failure. The levers below cut the measured
-    # mean to ~316s, but the leg still spreads 220-348s run to run; the extra
-    # headroom keeps that tail from failing the build first.
-    timeout-minutes: 20
+    # mean to ~316s at the time, but the wave-5 suite has since tripled it: at
+    # PR #796's tip the py3.14 leg ran the suite green in 1060s and was then
+    # cancelled at 20:11 during pytest's tmp-dir cleanup, py3.11 finishing at
+    # 19:45. The headroom keeps a green suite from reading as a failure.
+    timeout-minutes: 30
     # The suite reads/writes UTF-8 files; Windows' cp1252 default would break plain
     # text I/O. UTF-8 mode (PEP 686's Python 3.15 default) makes the runner match the
     # files under test; the conftest guard enforces the same for local win32 runs.
