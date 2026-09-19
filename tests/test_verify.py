@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -8045,6 +8046,1156 @@ def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path
     # genuinely different directories. Should the fixture ever collapse them, the
     # recorded-root assertion stops separating the two spellings and this reddens.
     assert paths.project != paths.repo_root
+
+
+# ------------------------------------------------ accepted exact-path publication
+
+
+def _bound_publish_inputs(project):
+    repo = project.project
+    path = repo / "src.txt"
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    return repo, path, baseline, accepted
+
+
+def test_commit_path_bound_publishes_only_accepted_path_and_preserves_real_index(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", sha) == "src.txt"
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+@pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
+def test_commit_path_bound_does_not_accept_a_false_clean_index_flag(project, index_flag):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    # Apply the hiding bit after the working-tree edit: both flags can suppress
+    # porcelain even though HEAD still contains the legacy baseline.
+    git(repo, "update-index", index_flag, "--", path.name)
+    assert verify.path_clean(repo, path.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha is not None
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_current_tree_outside_the_bound_baseline(project):
+    repo, path, _baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    wrong_baseline = "different claimed baseline\n"
+
+    with pytest.raises(verify.GitError, match="committed publication target holds rival"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=wrong_baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_mutation_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf 'hook bytes\\n' > src.txt\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="accepted ledger"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_added_paths_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\nprintf 'extra hook path\\n' > hook-extra.txt\ngit add -- hook-extra.txt\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="outside its declared scope"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert not (repo / "hook-extra.txt").exists()
+
+
+def test_bound_candidate_refuses_a_merge_commit_even_with_an_exact_path_delta(project):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    baseline = path.read_text(encoding="utf-8")
+    original_branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "bound-side")
+    accepted = "accepted merge candidate\n"
+    path.write_text(accepted, encoding="utf-8")
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "side ledger change")
+    git(repo, "checkout", "-q", original_branch)
+    git(repo, "merge", "-q", "--no-ff", "bound-side", "-m", "merge ledger candidate")
+    candidate = verify.rev_parse_head(repo)
+    first_parent = git(repo, "rev-parse", "HEAD^1")
+    accepted_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, accepted.encode())
+    baseline_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, baseline.encode())
+
+    with pytest.raises(verify.GitError, match="exactly one parent"):
+        verify._validate_bound_candidate(
+            repo,
+            candidate,
+            first_parent,
+            rel,
+            accepted_oid,
+            baseline_oid,
+        )
+
+
+def test_commit_path_bound_refuses_a_tracked_target_index_deletion(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "--", path.name)
+
+    with pytest.raises(verify.GitError, match="foreign content"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_terminal_ref_cas_preserves_concurrent_head(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    concurrent_head = []
+
+    def advance_before_cas(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None and not concurrent_head:
+            rival = repo / "concurrent.txt"
+            rival.write_text("keep concurrent commit\n", encoding="utf-8")
+            git(repo, "add", "--", rival.name)
+            git(repo, "commit", "-q", "-m", "concurrent commit")
+            concurrent_head.append(verify.rev_parse_head(repo))
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", advance_before_cas)
+
+    with pytest.raises(verify.GitError, match="prepared ref transaction failed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == concurrent_head[0]
+    assert (repo / "concurrent.txt").read_text(encoding="utf-8") == "keep concurrent commit\n"
+
+
+def test_commit_path_bound_replays_accepted_ancestor_beneath_unrelated_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    descendant = repo / "descendant.txt"
+    descendant.write_text("keep descendant\n", encoding="utf-8")
+    git(repo, "add", "--", descendant.name)
+    git(repo, "commit", "-q", "-m", "unrelated descendant")
+    descendant_head = verify.rev_parse_head(repo)
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_skips_newer_invalid_same_ledger_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    extra = repo / "descendant-extra.txt"
+    extra.write_text("wider descendant\n", encoding="utf-8")
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "add", "--", extra.name)
+    git(repo, "commit", "-q", "-m", "multi-path same-ledger descendant")
+    descendant_head = verify.rev_parse_head(repo)
+    assert set(git(repo, "show", "--format=", "--name-only", "HEAD").splitlines()) == {
+        path.name,
+        extra.name,
+    }
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "show", "HEAD:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "newer ledger mode transition")
+    descendant_head = verify.rev_parse_head(repo)
+
+    def unavailable_scope(*_args, **_kwargs):
+        raise verify.GitError("candidate scope unavailable")
+
+    monkeypatch.setattr(verify, "_bound_changed_paths", unavailable_scope)
+
+    with pytest.raises(verify.GitError, match="candidate scope unavailable"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == descendant_head
+
+
+def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+    faulted = []
+
+    def fail_target_sync(git_repo, *args, **kwargs):
+        if args[:1] == ("reset",) and not faulted:
+            faulted.append(True)
+            return 1, "injected sync fault"
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", fail_target_sync)
+    with pytest.raises(verify.GitError, match="index synchronization"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    published = verify.rev_parse_head(repo)
+    assert published != original_head
+    monkeypatch.setattr(verify, "_git", real_git)
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        == published
+    )
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_refuses_foreign_target_index_change_before_sync(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    shadow = repo / "foreign-index.txt"
+    shadow.write_text("foreign staged ledger\n", encoding="utf-8")
+    foreign_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    real_run_git = verify._run_git
+    published = []
+
+    def change_index_after_cas(cmd, git_repo, **kwargs):
+        result = real_run_git(cmd, git_repo, **kwargs)
+        update = kwargs.get("prepared_update")
+        if update is not None and not published:
+            published.append(update.new_oid)
+            git(repo, "update-index", "--cacheinfo", "100644", foreign_oid, path.name)
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", change_index_after_cas)
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == published[0]
+    assert verify.staged_blob_oid(repo, path.name) == foreign_oid
+
+
+def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeypatch):
+    repo = project.project
+    attributes = repo / ".gitattributes"
+    attributes.write_text("src.txt filter=collapse\n", encoding="utf-8")
+    git(repo, "config", "filter.collapse.clean", "sed s/rival/accepted/")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "configure lossy filter")
+    repo, path, baseline, _accepted = _bound_publish_inputs(project)
+    accepted = "accepted\n"
+    path.write_text(accepted, encoding="utf-8")
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+
+    def rival_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.write_text("rival\n", encoding="utf-8")
+        return real_git(git_repo, *args, **kwargs)
+
+    assert verify.git_normalized_blob_oid_for_bytes(
+        repo, "src.txt", accepted.encode()
+    ) == verify.git_normalized_blob_oid_for_bytes(repo, "src.txt", b"rival\n")
+    monkeypatch.setattr(verify, "_git", rival_after_staging)
+
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == "rival\n"
+
+
+def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    replacement = repo / "replacement.txt"
+    replacement.write_text(accepted, encoding="utf-8")
+    real_git = verify._git
+
+    def substitute_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.unlink()
+            path.symlink_to(replacement.name)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", substitute_after_staging)
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.is_symlink()
+
+
+def test_commit_path_bound_refuses_detached_head_before_candidate_hooks(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+    git(repo, "checkout", "-q", "--detach")
+
+    with pytest.raises(verify.GitError, match="attached direct branch"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert not marker.exists()
+
+
+def test_commit_path_bound_refuses_same_oid_checkout_switch_before_hooks(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+    real_identity = verify._bound_checkout_identity
+    captures = []
+
+    def switch_on_revalidation(git_repo):
+        if captures:
+            git(repo, "branch", "same-object-rival", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/same-object-rival")
+        captures.append(True)
+        return real_identity(git_repo)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", switch_on_revalidation)
+
+    with pytest.raises(verify.GitError, match="checkout changed before.*hooks"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert not marker.exists()
+
+
+def test_commit_path_bound_publishes_terminal_branch_through_symbolic_chain(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    terminal = git(repo, "symbolic-ref", "HEAD")
+    alias = "refs/heads/publication-alias"
+    git(repo, "symbolic-ref", alias, terminal)
+    git(repo, "symbolic-ref", "HEAD", alias)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert git(repo, "symbolic-ref", "--no-recurse", "HEAD") == alias
+    assert git(repo, "symbolic-ref", "--no-recurse", alias) == terminal
+    assert git(repo, "rev-parse", terminal) == published
+
+
+def test_commit_path_bound_lock_held_direct_ref_proof_is_load_bearing(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def fail_publication_probe(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            raise verify.GitError("exact-path publication branch changed ref kind")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", fail_publication_probe)
+
+    with pytest.raises(verify.GitError, match="changed ref kind"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_commit_path_bound_refuses_terminal_ref_converted_to_same_oid_symref_before_prepare(
+    project, monkeypatch
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    terminal = git(repo, "symbolic-ref", "HEAD")
+    referent = "refs/heads/publication-referent"
+    git(repo, "branch", referent.removeprefix("refs/heads/"), original)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def convert_terminal_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            terminal_path = repo / ".git" / terminal
+            terminal_path.write_text(f"ref: {referent}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", convert_terminal_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="changed ref kind"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "symbolic-ref", "--no-recurse", terminal) == referent
+    assert git(repo, "rev-parse", terminal) == original
+    assert git(repo, "rev-parse", referent) == original
+
+
+def test_commit_path_bound_does_not_publish_new_head_selected_while_prepared(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    captured_branch = git(repo, "symbolic-ref", "HEAD")
+    rival_branch = "refs/heads/same-object-rival"
+    git(repo, "branch", rival_branch.removeprefix("refs/heads/"), original)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def switch_head_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            (repo / ".git" / "HEAD").write_text(f"ref: {rival_branch}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", switch_head_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "rev-parse", rival_branch) == original
+    assert git(repo, "rev-parse", captured_branch) != original
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_repairs_index_after_detach_during_prepared(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    captured_branch = git(repo, "symbolic-ref", "HEAD")
+    original_index = verify._bound_index_entry(repo, path.name)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def detach_head_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            (repo / ".git" / "HEAD").write_text(f"{original}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", detach_head_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "rev-parse", captured_branch) != original
+    assert verify.rev_parse_head(repo) == original
+    assert verify._bound_index_entry(repo, path.name) == original_index
+
+
+def test_prepared_ref_transaction_redacts_protocol_authority(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    secret_ref = "refs/heads/secret ref"
+    update = verify._PreparedRefUpdate(secret_ref, oid, oid, lambda _remaining: None)
+
+    with pytest.raises(verify.GitError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    evidence = str(raised.value)
+    assert secret_ref not in evidence
+    assert oid not in evidence
+
+
+def test_prepared_ref_transaction_start_failure_changes_no_ref(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    update = verify._PreparedRefUpdate(ref, oid, oid, lambda _remaining: None)
+
+    with pytest.raises(verify.GitError, match="prepared ref transaction failed"):
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin", "--invalid-option"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_prepared_ref_transaction_spawn_failure_is_typed_and_chained(project, monkeypatch):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    cause = OSError(errno.EMFILE, "injected descriptor exhaustion")
+
+    def fail_spawn(*_args, **_kwargs):
+        raise cause
+
+    monkeypatch.setattr(verify.subprocess, "Popen", fail_spawn)
+    update = verify._PreparedRefUpdate(ref, oid, oid, lambda _remaining: None)
+    with pytest.raises(verify.GitSpawnError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert raised.value.__cause__ is cause
+
+
+def test_prepared_ref_transaction_propagates_non_git_validation_fault(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    fault = RuntimeError("non-git validation fault")
+
+    def fail_validation(_remaining):
+        raise fault
+
+    update = verify._PreparedRefUpdate(ref, oid, oid, fail_validation)
+    with pytest.raises(RuntimeError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert raised.value is fault
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_prepared_ref_transaction_abort_failure_changes_no_ref(project, monkeypatch):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    real_popen = subprocess.Popen
+    children = []
+
+    def record_child(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def break_abort(_remaining):
+        children[0].stdin.close()
+        raise verify.GitError("injected prepared validation fault")
+
+    monkeypatch.setattr(verify.subprocess, "Popen", record_child)
+    update = verify._PreparedRefUpdate(ref, oid, oid, break_abort)
+    with pytest.raises(verify.GitError, match="transaction abort failed"):
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_commit_path_bound_recovers_lost_commit_acknowledgement(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    faulted = []
+
+    def lose_ack_after_commit(cmd, git_repo, **kwargs):
+        result = real_run_git(cmd, git_repo, **kwargs)
+        if kwargs.get("prepared_update") is not None and not faulted:
+            faulted.append(True)
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", lose_ack_after_commit)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert faulted == [True]
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_retries_after_lost_ack_with_unchanged_ref(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_run_git = verify._run_git
+
+    def lose_ack_without_commit(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None:
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", lose_ack_without_commit)
+    with pytest.raises(verify.GitError, match="lost before ref movement"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    assert verify.rev_parse_head(repo) == original
+
+    monkeypatch.setattr(verify, "_run_git", real_run_git)
+    assert verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    ) == verify.rev_parse_head(repo)
+
+
+def test_commit_path_bound_refuses_committed_rival_before_candidate_hooks(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    path.write_text("committed rival ledger\n", encoding="utf-8")
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival ledger")
+    rival_head = verify.rev_parse_head(repo)
+    path.write_text(accepted, encoding="utf-8")
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="committed publication target holds rival"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head
+    assert not marker.exists()
+
+
+def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    real_git = verify._git
+    moved = []
+
+    def move_head_during_first_reset(git_repo, *args, **kwargs):
+        result = real_git(git_repo, *args, **kwargs)
+        if args[:1] == ("reset",) and not moved:
+            git(repo, "branch", "index-race", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/index-race")
+            moved.append(True)
+        return result
+
+    monkeypatch.setattr(verify, "_git", move_head_during_first_reset)
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert moved == [True]
+    assert verify.rev_parse_head(repo) == original
+    assert verify.staged_blob_oid(repo, path.name) == git(repo, "rev-parse", f"{original}:src.txt")
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+def test_commit_path_bound_refuses_staged_mode_only_target_change(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+
+    with pytest.raises(verify.GitError, match="real index holds foreign content"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
+
+
+def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "track executable ledger")
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted executable migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
+    assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_rejects_hook_mode_mutation(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit update-index --chmod=+x -- src.txt\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="changed the publication target mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_refuses_committed_symlink_parent_before_candidate_write(project):
+    repo = project.project
+    parent = repo / "ledger-parent"
+    outside = repo / "outside-target"
+    outside.mkdir()
+    parent.symlink_to(outside.name)
+    git(repo, "add", "--", parent.name)
+    git(repo, "commit", "-q", "-m", "track ledger parent symlink")
+    parent.unlink()
+    parent.mkdir()
+    path = parent / "ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="non-directory committed parent"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy migration ledger\n",
+        )
+
+    assert not (outside / "ledger.md").exists()
+
+
+def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+
+    def expire_deadline(_remaining):
+        time.sleep(0.02)
+
+    update = verify._PreparedRefUpdate(ref, oid, oid, expire_deadline)
+    with pytest.raises(verify.GitError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            timeout_s=0.01,
+            prepared_update=update,
+        )
+
+    assert not isinstance(raised.value, verify._GitCommitIndeterminate)
+    assert verify.rev_parse_head(repo) == oid
+
+
+def _bound_transaction_only(monkeypatch, timeout_s: float) -> list[str]:
+    """Bound only the prepared `update-ref --stdin` transaction to `timeout_s`.
+
+    Shrinking `_git_timeout_s` instead would put the same bound on every other
+    git child `commit_path_bound` spawns (`worktree add`, the candidate commit,
+    the index reconciliation), and a loaded runner — Windows CI in particular —
+    turned that into `git worktree timed out after 1s` before the transaction
+    under test ever started. Returns the log of how each bounded transaction
+    ended: `"ok"`, or the name of the `GitError` it raised."""
+    real_run_git = verify._run_git
+    outcomes: list[str] = []
+
+    def bounded(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is None:
+            return real_run_git(cmd, git_repo, **kwargs)
+        try:
+            result = real_run_git(cmd, git_repo, timeout_s=timeout_s, **kwargs)
+        except verify.GitError as exc:
+            outcomes.append(type(exc).__name__)
+            raise
+        outcomes.append("ok")
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", bounded)
+    return outcomes
+
+
+def test_commit_path_bound_recovers_post_commit_timeout(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
+        "  sleep 4\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    outcomes = _bound_transaction_only(monkeypatch, 2)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    # premise: the acknowledgement really was lost, and recovery observed the
+    # moved ref rather than retrying the transaction
+    assert outcomes == ["_GitCommitIndeterminate"]
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_hands_the_prepared_probe_its_fractional_remaining(project, monkeypatch):
+    """The lock-held probe gets what is LEFT of the transaction's budget, as a
+    float. A `prepared` hook that sleeps makes that remainder non-integral, so an
+    `int(...)` anywhere between the deadline and the probe's `timeout_s` shows up
+    as a whole number here — the shape that once truncated a sub-second remainder
+    to `0` and timed the probe out on the spot. Observed at the probe rather than
+    provoked with a one-second budget: the provoked form raced the runner's load
+    (the probe, commit and exit all had to fit in what the sleep left of 1s) and
+    reddened on healthy trees."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = prepared ] && grep -q ' refs/heads/'; then\n"
+        "  sleep 0.2\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    budget = 5
+    _bound_transaction_only(monkeypatch, budget)
+    real_probe = verify._bound_direct_ref_probe
+    handed = []
+
+    def record_prepared_probe(git_repo, ref, *, timeout_s=None):
+        if timeout_s is not None:  # only the lock-held call carries a remainder
+            handed.append(timeout_s)
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", record_prepared_probe)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    [remaining] = handed
+    assert isinstance(remaining, float)
+    assert 0 < remaining < budget - 0.2  # the sleep came off the budget...
+    assert remaining != int(remaining)  # ...and nothing rounded what was left
+
+
+def test_commit_path_bound_recovers_real_git_commit_ack_loss(project):
+    if sys.platform == "win32":
+        pytest.skip("POSIX signal injection")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
+        '  kill -KILL "$PPID"\n'
+        "fi\n"
+    )
+    hook.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_rival_after_lost_commit_acknowledgement(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    rival_head = []
+
+    def replace_transaction_with_rival(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None and not rival_head:
+            rival = repo / "rival.txt"
+            rival.write_text("rival branch commit\n", encoding="utf-8")
+            git(repo, "add", "--", rival.name)
+            git(repo, "commit", "-q", "-m", "rival branch commit")
+            rival_head.append(verify.rev_parse_head(repo))
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", replace_transaction_with_rival)
+    with pytest.raises(verify.GitError, match="captured branch changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head[0]
+
+
+def test_bound_index_reconciliation_is_bounded_and_repairs_latest_observation(project, monkeypatch):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    observed_index = verify._bound_index_entry(repo, rel)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    expected = verify._BoundCheckoutIdentity(branch, branch, commits[0])
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert observations == []
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, commits[-1], rel)
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+def test_bound_index_reconciliation_can_align_a_moved_symlink_entry(project, monkeypatch):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    original = verify.rev_parse_head(repo)
+    original_index = verify._bound_index_entry(repo, rel)
+    target = repo / "symlink-target.txt"
+    target.write_text("target\n", encoding="utf-8")
+    path.unlink()
+    path.symlink_to(target.name)
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "move target to symlink")
+    symlink_commit = verify.rev_parse_head(repo)
+    git(repo, "reset", "--hard", original)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    moved = verify._BoundCheckoutIdentity(branch, branch, symlink_commit)
+    observations = [moved, moved]
+
+    def observe_moved(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", observe_moved)
+    expected = verify._BoundCheckoutIdentity(branch, branch, original)
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify._synchronize_bound_index(repo, expected, rel, original_index)
+
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.mode == "120000"
+    assert entry == verify._bound_tree_entry(repo, symlink_commit, rel)
 
 
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):

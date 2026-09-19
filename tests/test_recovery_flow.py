@@ -33,6 +33,10 @@ from bmad_loop.verify import GitError, rev_parse_head
 from bmad_loop.workspace import Workspace
 
 QUIET = NotifyPolicy(desktop=False, file=True)
+requires_descriptor_restoration = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES,
+    reason="automatic restore requires descriptor-relative writes",
+)
 
 
 def _policy(**scm) -> Policy:
@@ -87,6 +91,7 @@ def _fake_workspace(root: Path, *, output=None, impl=None, plan=None):
     return SimpleNamespace(root=root, paths=paths)
 
 
+@requires_descriptor_restoration
 def test_owned_spec_restore_recreates_missing_canonical_parents(tmp_path):
     spec = tmp_path.resolve() / "new" / "deep" / "owned.md"
     snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
@@ -94,6 +99,94 @@ def test_owned_spec_restore_recreates_missing_canonical_parents(tmp_path):
     RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
 
     assert spec.read_bytes() == snapshot
+
+
+def test_owned_spec_restore_forced_fallback_refuses_before_path_writer(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes\n"
+    spec.write_bytes(original)
+    snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
+    path_writer_calls: list[Path] = []
+
+    def path_writer_is_forbidden(path, *_args, **_kwargs):
+        path_writer_calls.append(path)
+        raise AssertionError("generic confined writer was called")
+
+    monkeypatch.setattr(platform_util, "_atomic_write_confined", path_writer_is_forbidden)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable") as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert excinfo.value.safe_restoration_unavailable is True
+    assert path_writer_calls == []
+    assert spec.read_bytes() == original
+
+
+def test_owned_spec_restore_forced_fallback_does_not_create_missing_parents(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    first_missing_parent = tmp_path.resolve() / "new"
+    spec = first_missing_parent / "deep" / "owned.md"
+
+    def path_writer_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("generic confined writer was called")
+
+    monkeypatch.setattr(platform_util, "_atomic_write_confined", path_writer_is_forbidden)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert not first_missing_parent.exists()
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"---\nstatus: in-progress\n---\n\noperator bytes\n"
+    spec.write_bytes(original)
+    writer_calls: list[tuple] = []
+    monkeypatch.setattr(
+        verify,
+        "set_frontmatter_status",
+        lambda *args, **kwargs: writer_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable") as excinfo:
+        RecoveryFlow._normalize_attempt_owned_spec(
+            spec,
+            "ready-for-dev",
+            confine_root=tmp_path,
+        )
+
+    assert excinfo.value.safe_restoration_unavailable is True
+    assert writer_calls == []
+    assert spec.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows coverage")
+def test_owned_spec_restore_native_windows_refuses_before_path_writer(tmp_path, monkeypatch):
+    assert not recovery_flow.DIR_FD_ANCHORED_WRITES
+    assert not platform_util.DIR_FD_ANCHORED_WRITES
+    spec = tmp_path.resolve() / "owned.md"
+    original = b"operator bytes\n"
+    spec.write_bytes(original)
+    path_writer_calls: list[Path] = []
+
+    def path_writer_is_forbidden(path, *_args, **_kwargs):
+        path_writer_calls.append(path)
+        raise AssertionError("generic confined writer was called")
+
+    monkeypatch.setattr(platform_util, "_atomic_write_confined", path_writer_is_forbidden)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
+
+    assert path_writer_calls == []
+    assert spec.read_bytes() == original
 
 
 @pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
@@ -157,6 +250,7 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
         recovery_flow,
         "atomic_write_bytes_confined",
         lambda path, *_args, **_kwargs: writes.append(path),
+        raising=False,
     )
     monkeypatch.setattr(
         recovery_flow,
@@ -174,6 +268,7 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
 
 
 @pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
+@requires_descriptor_restoration
 def test_owned_spec_restore_does_not_translate_parent_mkdir_value_error(
     tmp_path, monkeypatch, failure
 ):
@@ -203,6 +298,7 @@ def test_owned_spec_restore_does_not_translate_parent_mkdir_value_error(
         *NUL_PATH_RESOLVE_FAULTS,
     ],
 )
+@requires_descriptor_restoration
 def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
     tmp_path, monkeypatch, failure
 ):
@@ -213,7 +309,6 @@ def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
     def fail_write(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", fail_write)
     monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", fail_write)
 
     with pytest.raises(type(failure)) as excinfo:
@@ -227,7 +322,9 @@ def test_owned_spec_restore_does_not_translate_atomic_repair_write_failure(
 @pytest.mark.skipif(
     not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
 )
-def test_owned_spec_restore_does_not_translate_readback_value_error(tmp_path, monkeypatch, failure):
+def test_owned_spec_restore_does_not_translate_content_read_value_error(
+    tmp_path, monkeypatch, failure
+):
     spec = tmp_path.resolve() / "owned.md"
     spec.write_bytes(b"operator bytes\n")
 
@@ -240,34 +337,10 @@ def test_owned_spec_restore_does_not_translate_readback_value_error(tmp_path, mo
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
 
     assert excinfo.value is failure
-    assert spec.read_bytes() == b"snapshot bytes\n"
+    assert spec.read_bytes() == b"operator bytes\n"
 
 
-@pytest.mark.parametrize("failure", NUL_PATH_RESOLVE_FAULTS)
-def test_owned_spec_restore_fallback_preserves_raw_readback_value_error(
-    tmp_path, monkeypatch, failure
-):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    spec = tmp_path.resolve() / "owned.md"
-    spec.write_bytes(b"operator bytes\n")
-    real_read_bytes = Path.read_bytes
-
-    def fail_readback(path: Path) -> bytes:
-        if path == spec:
-            raise failure
-        return real_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", fail_readback)
-
-    with pytest.raises(type(failure)) as excinfo:
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes\n")
-
-    assert excinfo.value is failure
-    with spec.open("rb") as fh:
-        assert fh.read() == b"snapshot bytes\n"
-
-
+@requires_descriptor_restoration
 def test_owned_spec_restore_preserves_byte_hostile_snapshot(tmp_path):
     spec = tmp_path.resolve() / "owned.md"
     spec.write_bytes(b"old")
@@ -509,47 +582,7 @@ def test_owned_spec_restore_anchored_snapshot_plus_suffix_is_a_genuine_mismatch(
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
 
     assert spec.read_bytes() == snapshot + b"x"
-    assert requested == [len(snapshot) + 1]
-
-
-def test_owned_spec_restore_fallback_snapshot_plus_suffix_is_a_genuine_mismatch(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    spec = tmp_path.resolve() / "owned.md"
-    spec.write_bytes(b"operator bytes")
-    snapshot = b"snapshot bytes"
-    real_write = recovery_flow.atomic_write_bytes_confined
-
-    def write_suffix(path, data, **kwargs):
-        return real_write(path, data + b"x", **kwargs)
-
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", write_suffix)
-
-    with pytest.raises(verify.FrontmatterWriteError):
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
-
-    assert spec.read_bytes() == snapshot + b"x"
-
-
-def test_owned_spec_restore_translates_only_confined_writer_refusal(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    spec = tmp_path.resolve() / "owned.md"
-    original = b"operator bytes"
-    spec.write_bytes(original)
-    refusal = UnconfinedWriteError("refused filesystem walk")
-
-    def refuse(*_args, **_kwargs):
-        raise refusal
-
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", refuse)
-
-    with pytest.raises(_OwnedSpecAuthorityError) as excinfo:
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
-
-    assert excinfo.value.__cause__ is refusal
-    assert spec.read_bytes() == original
+    assert requested[-1:] == [len(snapshot) + 1]
 
 
 @pytest.mark.skipif(
@@ -569,30 +602,45 @@ def test_owned_spec_restore_preserves_raw_anchored_os_read_failure(tmp_path, mon
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
 
     assert excinfo.value is failure
-    assert spec.read_bytes() == b"snapshot bytes"
+    assert spec.read_bytes() == b"operator bytes"
 
 
-def test_owned_spec_restore_preserves_raw_fallback_read_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_preserves_raw_postpublication_os_read_failure(tmp_path, monkeypatch):
     spec = tmp_path.resolve() / "owned.md"
     spec.write_bytes(b"operator bytes")
-    failure = OSError("ordinary read failed")
-    real_read_bytes = Path.read_bytes
+    snapshot = b"snapshot bytes"
+    failure = OSError("ordinary postpublication read failed")
+    real_read = os.read
+    real_write = recovery_flow.atomic_write_bytes_at
+    published = False
 
-    def fail_read(path: Path) -> bytes:
-        if path == spec:
+    def mark_published(dir_fd, name, data, **kwargs):
+        verify_after = kwargs["_after_replace"]
+
+        def mark_then_verify(published_fd: int) -> None:
+            nonlocal published
+            published = True
+            verify_after(published_fd)
+
+        kwargs["_after_replace"] = mark_then_verify
+        return real_write(dir_fd, name, data, **kwargs)
+
+    def fail_after_publish(fd: int, size: int) -> bytes:
+        if published:
             raise failure
-        return real_read_bytes(path)
+        return real_read(fd, size)
 
-    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", mark_published)
+    monkeypatch.setattr(recovery_flow.os, "read", fail_after_publish)
 
     with pytest.raises(OSError) as excinfo:
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
 
     assert excinfo.value is failure
-    with spec.open("rb") as fh:
-        assert fh.read() == b"snapshot bytes"
+    assert spec.read_bytes() == snapshot
 
 
 @pytest.mark.skipif(
@@ -620,28 +668,6 @@ def test_owned_spec_restore_anchored_uses_filesystem_anchor_for_external_target(
     assert spec.read_bytes() == snapshot
 
 
-def test_owned_spec_restore_fallback_supports_external_target(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    external = tmp_path.resolve() / "trusted-external-artifacts"
-    external.mkdir()
-    spec = external / "owned.md"
-    snapshot = b"snapshot bytes"
-    roots: list[Path] = []
-    real_write = recovery_flow.atomic_write_bytes_confined
-
-    def record_root(path, data, **kwargs):
-        roots.append(kwargs["confine_root"])
-        return real_write(path, data, **kwargs)
-
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", record_root)
-
-    RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
-
-    assert roots == [Path(spec.anchor)]
-    assert spec.read_bytes() == snapshot
-
-
 @pytest.mark.skipif(
     not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
 )
@@ -655,26 +681,6 @@ def test_owned_spec_restore_preserves_anchored_writable_target_refusal(tmp_path,
         raise failure
 
     monkeypatch.setattr(platform_util, "_refuse_unwritable_target_at", refuse)
-
-    with pytest.raises(PermissionError) as excinfo:
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
-
-    assert excinfo.value is failure
-    assert spec.read_bytes() == original
-
-
-def test_owned_spec_restore_preserves_fallback_writable_target_refusal(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    spec = tmp_path.resolve() / "owned.md"
-    original = b"operator bytes"
-    spec.write_bytes(original)
-    failure = PermissionError("target is read-only")
-
-    def refuse(_target, *, follow_symlinks):
-        raise failure
-
-    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", refuse)
 
     with pytest.raises(PermissionError) as excinfo:
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
@@ -714,41 +720,6 @@ def test_owned_spec_restore_anchored_refuses_missing_target_appearing_before_sta
 
     # This simultaneously pins recovery's initially-missing target authority
     # and `_before_staging` ordering ahead of the probe and temp creation.
-    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
-
-    assert later_calls == []
-    assert spec.read_bytes() == appeared
-
-
-def test_owned_spec_restore_fallback_refuses_missing_target_appearing_before_staging(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    parent = tmp_path.resolve() / "artifacts"
-    parent.mkdir()
-    spec = parent / "owned.md"
-    appeared = b"new owner bytes"
-    real_write = recovery_flow.atomic_write_bytes_confined
-    later_calls: list[str] = []
-
-    def appear_before_writer(path, data, **kwargs):
-        spec.write_bytes(appeared)
-        return real_write(path, data, **kwargs)
-
-    def unexpected_probe(*_args, **_kwargs):
-        later_calls.append("writable-probe")
-        raise AssertionError("writable probe ran after authority loss")
-
-    def unexpected_stage(*_args, **_kwargs):
-        later_calls.append("temp")
-        raise AssertionError("temp creation ran after authority loss")
-
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", appear_before_writer)
-    monkeypatch.setattr(platform_util, "_refuse_unwritable_target", unexpected_probe)
-    monkeypatch.setattr(platform_util, "_mkstemp_beside", unexpected_stage)
-
     with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
 
@@ -806,33 +777,218 @@ def test_owned_spec_restore_refuses_target_replacement_after_staging(tmp_path, m
     assert list(parent.glob("*.tmp")) == []
 
 
-def test_owned_spec_restore_fallback_refuses_target_replacement_after_staging(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_in_place_target_edit_after_staging(tmp_path, monkeypatch):
     parent = tmp_path.resolve() / "artifacts"
     parent.mkdir()
     spec = parent / "owned.md"
     spec.write_bytes(b"operator bytes")
-    real_write = recovery_flow.atomic_write_bytes_confined
+    original_inode = spec.stat().st_ino
+    competing = b"competing data"
+    real_write = recovery_flow.atomic_write_bytes_at
+    monkeypatch.setattr(recovery_flow, "_target_stat_version", lambda _observed: (0, 0, 0))
 
-    def replace_before_publish(path, data, **kwargs):
+    def edit_before_publish(dir_fd, name, data, **kwargs):
         validate = kwargs["_before_replace"]
 
-        def replace_then_validate() -> None:
-            _replace_target(spec, b"replacement")
+        def edit_then_validate() -> None:
+            with spec.open("r+b") as fh:
+                fh.write(competing)
+                fh.truncate()
+            assert spec.stat().st_ino == original_inode
             validate()
 
-        kwargs["_before_replace"] = replace_then_validate
-        return real_write(path, data, **kwargs)
+        kwargs["_before_replace"] = edit_then_validate
+        return real_write(dir_fd, name, data, **kwargs)
 
-    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_confined", replace_before_publish)
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", edit_before_publish)
 
     with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
         RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
 
-    assert spec.read_bytes() == b"replacement"
+    assert spec.read_bytes() == competing
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_in_place_edit_during_initial_content_read(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    original = b"operator bytes"
+    competing = original + b"x"
+    spec.write_bytes(original)
+    real_read = os.read
+    mutated = False
+
+    def mutate_then_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            with spec.open("ab") as fh:
+                fh.write(b"x")
+        return real_read(fd, size)
+
+    monkeypatch.setattr(recovery_flow.os, "read", mutate_then_read)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert mutated is True
+    assert spec.read_bytes() == competing
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_short_initial_content_sample(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    monkeypatch.setattr(recovery_flow.os, "read", lambda _fd, _size: b"")
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert spec.read_bytes() == original
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_compares_bounded_multichunk_content_after_staging(
+    tmp_path, monkeypatch
+):
+    chunk_size = 1024 * 1024
+    prefix = b"a" * chunk_size
+    original = prefix + b"operator bytes"
+    competing = prefix + b"competing data"
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    spec.write_bytes(original)
+    original_inode = spec.stat().st_ino
+    real_read = os.read
+    real_write = recovery_flow.atomic_write_bytes_at
+    requests: list[int] = []
+    monkeypatch.setattr(recovery_flow, "_target_stat_version", lambda _observed: (0, 0, 0))
+
+    def bounded_read(fd: int, size: int) -> bytes:
+        requests.append(size)
+        return real_read(fd, size)
+
+    def edit_suffix_before_publish(dir_fd, name, data, **kwargs):
+        validate = kwargs["_before_replace"]
+
+        def edit_then_validate() -> None:
+            with spec.open("r+b") as fh:
+                fh.seek(chunk_size)
+                fh.write(b"competing data")
+                fh.truncate()
+            assert spec.stat().st_ino == original_inode
+            validate()
+
+        kwargs["_before_replace"] = edit_then_validate
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow.os, "read", bounded_read)
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", edit_suffix_before_publish)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert requests == [chunk_size, 15, 1] * 3
+    assert max(requests) == chunk_size
+    assert spec.read_bytes() == competing
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_refuses_name_replacement_during_prepublication_read(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    original = b"operator bytes"
+    competing = b"replacement"
+    spec.write_bytes(original)
+    real_write = recovery_flow.atomic_write_bytes_at
+    real_read = os.read
+
+    def replace_during_validation(dir_fd, name, data, **kwargs):
+        validate = kwargs["_before_replace"]
+
+        def replace_then_validate() -> None:
+            replaced = False
+
+            def replace_then_read(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    spec.unlink()
+                    spec.write_bytes(competing)
+                return real_read(fd, size)
+
+            monkeypatch.setattr(recovery_flow.os, "read", replace_then_read)
+            validate()
+
+        kwargs["_before_replace"] = replace_then_validate
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", replace_during_validation)
+
+    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert spec.read_bytes() == competing
+    assert list(parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+def test_owned_spec_restore_preserves_raw_content_comparison_failure(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "artifacts"
+    parent.mkdir()
+    spec = parent / "owned.md"
+    original = b"operator bytes"
+    spec.write_bytes(original)
+    failure = OSError("ordinary comparison read failed")
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def fail_before_publish(dir_fd, name, data, **kwargs):
+        validate = kwargs["_before_replace"]
+
+        def fail_then_validate() -> None:
+            def fail_read(_fd: int, _size: int) -> bytes:
+                raise failure
+
+            monkeypatch.setattr(recovery_flow.os, "read", fail_read)
+            validate()
+
+        kwargs["_before_replace"] = fail_then_validate
+        return real_write(dir_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", fail_before_publish)
+
+    with pytest.raises(OSError) as excinfo:
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot")
+
+    assert excinfo.value is failure
+    assert spec.read_bytes() == original
     assert list(parent.glob("*.tmp")) == []
 
 
@@ -874,16 +1030,30 @@ def test_owned_spec_restore_rejects_live_name_replacement_during_readback(tmp_pa
     spec.write_bytes(b"operator bytes")
     snapshot = b"snapshot bytes"
     real_read = os.read
+    real_write = recovery_flow.atomic_write_bytes_at
     replaced = False
+    published = False
+
+    def mark_published(dir_fd, name, data, **kwargs):
+        verify_after = kwargs["_after_replace"]
+
+        def mark_then_verify(published_fd: int) -> None:
+            nonlocal published
+            published = True
+            verify_after(published_fd)
+
+        kwargs["_after_replace"] = mark_then_verify
+        return real_write(dir_fd, name, data, **kwargs)
 
     def replace_name_then_read(fd: int, size: int) -> bytes:
         nonlocal replaced
-        if not replaced:
+        if not replaced and published:
             replaced = True
             spec.unlink()
             spec.write_bytes(snapshot)
         return real_read(fd, size)
 
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", mark_published)
     monkeypatch.setattr(recovery_flow.os, "read", replace_name_then_read)
 
     with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
@@ -902,15 +1072,29 @@ def test_owned_spec_restore_rejects_in_place_mutation_during_readback(tmp_path, 
     snapshot = b"snapshot bytes"
     real_read = os.read
     mutated = False
+    published = False
+    real_write = recovery_flow.atomic_write_bytes_at
+
+    def mark_published(dir_fd, name, data, **kwargs):
+        verify_after = kwargs["_after_replace"]
+
+        def mark_then_verify(published_fd: int) -> None:
+            nonlocal published
+            published = True
+            verify_after(published_fd)
+
+        kwargs["_after_replace"] = mark_then_verify
+        return real_write(dir_fd, name, data, **kwargs)
 
     def mutate_then_read(fd: int, size: int) -> bytes:
         nonlocal mutated
-        if not mutated:
+        if not mutated and published:
             mutated = True
             with spec.open("ab") as fh:
                 fh.write(b"x")
         return real_read(fd, size)
 
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", mark_published)
     monkeypatch.setattr(recovery_flow.os, "read", mutate_then_read)
 
     # Ablation: removing the before/after metadata comparison turns this into a
@@ -920,32 +1104,6 @@ def test_owned_spec_restore_rejects_in_place_mutation_during_readback(tmp_path, 
 
     assert mutated is True
     assert spec.read_bytes() == snapshot + b"x"
-
-
-def test_owned_spec_restore_fallback_rejects_in_place_mutation(tmp_path, monkeypatch):
-    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
-    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
-    spec = tmp_path.resolve() / "owned.md"
-    spec.write_bytes(b"operator bytes")
-    snapshot = b"snapshot bytes"
-    real_read_bytes = Path.read_bytes
-    mutated = False
-
-    def mutate_then_read(path: Path) -> bytes:
-        nonlocal mutated
-        if path == spec and not mutated:
-            mutated = True
-            with spec.open("ab") as fh:
-                fh.write(b"x")
-        return real_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", mutate_then_read)
-
-    with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
-        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
-
-    assert mutated is True
-    assert real_read_bytes(spec) == snapshot + b"x"
 
 
 @pytest.mark.skipif(
@@ -1106,6 +1264,36 @@ def _status(spec: Path) -> str:
     return verify.status_of(verify.read_frontmatter(spec))
 
 
+def _assert_owned_spec_manual_adoption_pause(
+    flow: RecoveryFlow,
+    task: StoryTask,
+    spec: Path,
+    *,
+    stage: str,
+    expected_status: str | None = None,
+) -> None:
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert flow.calls.saves == 1
+    assert len(flow.calls.pauses) == 1
+    assert "manual adoption is required" in flow.calls.pauses[0][0]
+    assert flow.journal.events().count("rollback-owned-spec-manual-required") == 1
+    status_guidance = (
+        f"; the adopted spec must have lifecycle status {expected_status!r}"
+        if expected_status is not None
+        else ""
+    )
+    assert flow.journal.fields("rollback-owned-spec-manual-required") == {
+        "story_key": task.story_key,
+        "spec": str(spec.resolve()),
+        "problem": (
+            f"safe automatic restoration is unavailable {stage} because "
+            "this platform lacks descriptor-relative writes"
+            f"{status_guidance}; manual adoption is required"
+        ),
+    }
+
+
 # --------------------------------------------------------------- protected paths
 
 
@@ -1261,6 +1449,7 @@ def test_rollback_dirty_check_oserror_degrades_to_dirty(project, monkeypatch):
     assert "rollback-skipped-clean" not in flow.journal.events()
 
 
+@requires_descriptor_restoration
 def test_bound_lifecycle_only_spec_is_normalized_and_reads_git_clean(project):
     """T8: the one-file attempt binding recognizes only its own lifecycle delta.
 
@@ -1318,6 +1507,7 @@ def test_bound_unchanged_resumable_spec_is_never_normalized(project, status, mon
     ("baseline_status", "attempt_status"),
     [("draft", "in-progress"), ("in-progress", "in-review"), ("in-review", "done")],
 )
+@requires_descriptor_restoration
 def test_plain_bound_lifecycle_change_restores_baseline_status(
     project, baseline_status, attempt_status
 ):
@@ -1344,6 +1534,7 @@ def test_plain_bound_lifecycle_change_restores_baseline_status(
     assert flow.calls.pauses == []
 
 
+@requires_descriptor_restoration
 def test_plain_bound_lifecycle_commit_is_parked_and_reset_before_retry(project):
     """A baseline-shaped checkout is not clean while attempt commits remain.
 
@@ -1402,6 +1593,36 @@ def test_plain_owned_spec_with_substantive_residue_still_pauses(project):
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
     assert "rollback-skipped-clean" not in flow.journal.events()
     assert flow.calls.emits == []
+
+
+def test_plain_owned_spec_forced_fallback_pauses_while_undoing_lifecycle_repair(
+    project, monkeypatch
+):
+    repo = project.project
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    child = b"---\nstatus: in-progress\n---\n\nfailed child body\n"
+    spec.write_bytes(child)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="attempt-owned lifecycle status"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == child
+    assert "rollback-manual-required" not in flow.journal.events()
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="while restoring the attempt-owned lifecycle status",
+        expected_status="ready-for-dev",
+    )
 
 
 def test_bound_spec_exclusion_does_not_hide_sibling_source_residue(project):
@@ -1499,6 +1720,7 @@ def test_unbound_spec_flip_retains_existing_dirty_policy(project):
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
 
 
+@requires_descriptor_restoration
 def test_plain_tracked_snapshot_restores_operator_bytes_child_reverted_to_baseline(project):
     """Git-clean child output cannot erase dirty input present before launch."""
     repo = project.project
@@ -1530,6 +1752,38 @@ def test_plain_tracked_snapshot_restores_operator_bytes_child_reverted_to_baseli
     assert flow.calls.pauses == []
 
 
+def test_plain_tracked_snapshot_forced_fallback_pauses_before_write(project, monkeypatch):
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    spec.write_bytes(operator)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    spec.write_bytes(baseline)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="manual adoption is required"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == baseline
+    assert "rollback-owned-spec-restored" not in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="while restoring the attempt-owned lifecycle status",
+        expected_status="ready-for-dev",
+    )
+
+
+@requires_descriptor_restoration
 def test_plain_auto_reset_restores_unchanged_prelaunch_operator_spec(project):
     """Sibling rollback cannot erase tracked operator input the child inherited.
 
@@ -1563,6 +1817,39 @@ def test_plain_auto_reset_restores_unchanged_prelaunch_operator_spec(project):
     }
 
 
+def test_plain_forced_fallback_pauses_after_completed_baseline_reset(project, monkeypatch):
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    spec.write_bytes(operator)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    source = repo / "src.txt"
+    source.write_text("failed child sibling\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="after the baseline reset"):
+        flow.rollback_or_pause(task)
+
+    assert source.read_text() == "original\n"
+    assert spec.read_bytes() == baseline
+    assert "rollback-auto" in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback"]
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="after the baseline reset",
+    )
+
+
+@requires_descriptor_restoration
 def test_plain_manual_pause_restores_operator_spec_child_put_at_baseline_with_sibling(project):
     """A sibling does not hide a provably baseline-shaped child spec deletion.
 
@@ -1605,6 +1892,39 @@ def test_plain_manual_pause_restores_operator_spec_child_put_at_baseline_with_si
     assert task.preserve_ref is None
 
 
+def test_plain_sibling_residue_forced_fallback_preempts_generic_manual_pause(project, monkeypatch):
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    spec.write_bytes(baseline)
+    source = repo / "src.txt"
+    source.write_text("failed child sibling\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="before the ordinary manual-recovery pause"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == baseline
+    assert source.read_text() == "failed child sibling\n"
+    assert "rollback-owned-spec-restored" not in flow.journal.events()
+    assert "rollback-manual-required" not in flow.journal.events()
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="before the ordinary manual-recovery pause",
+    )
+
+
+@requires_descriptor_restoration
 def test_latched_redrive_reports_owned_corrected_spec_as_still_dirty(project):
     """T12: failed child body edits restore the pre-attempt human correction.
 
@@ -1643,6 +1963,41 @@ def test_latched_redrive_reports_owned_corrected_spec_as_still_dirty(project):
     assert flow.calls.emits == ["pre_rollback", "post_rollback"]
 
 
+def test_latched_redrive_snapshot_equal_forced_fallback_pauses_for_retry_input(
+    project, monkeypatch
+):
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    corrected = baseline.replace(b"baseline intent", b"human corrected intent")
+    spec.write_bytes(corrected)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = True
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="pre-attempt retry input"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == corrected
+    assert task.preserve_ref is None
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert "rollback-skipped-clean" not in flow.journal.events()
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="while restoring the pre-attempt retry input",
+        expected_status="ready-for-dev",
+    )
+
+
+@requires_descriptor_restoration
 def test_latched_redrive_restores_preexisting_untracked_spec_by_snapshot(project):
     """Git's baseline-untracked name set cannot hide child edits to its contents.
 
@@ -1678,6 +2033,86 @@ def test_latched_redrive_restores_preexisting_untracked_spec_by_snapshot(project
     assert flow.calls.pauses == []
 
 
+def test_latched_redrive_forced_fallback_pauses_after_preservation(project, monkeypatch):
+    repo = project.project
+    spec = project.implementation_artifacts / "untracked-redrive-fallback.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected input\n"
+    child = b"---\nstatus: done\n---\n\nfailed child input\n"
+    spec.write_bytes(corrected)
+    task = _task(repo)
+    rel = spec.relative_to(repo).as_posix()
+    task.baseline_untracked = [rel]
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = True
+    spec.write_bytes(child)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="manual adoption is required"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == child
+    assert task.preserve_ref is not None
+    assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
+    assert "attempt-worktree-preserved" in flow.journal.events()
+    assert "rollback-owned-spec-restored" not in flow.journal.events()
+    assert "post_rollback" not in flow.calls.emits
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="before the baseline reset",
+        expected_status="ready-for-dev",
+    )
+
+
+def test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset(
+    project, monkeypatch
+):
+    repo = project.project
+    source = repo / "redrive-source.txt"
+    source.write_text("baseline source\n")
+    spec = _tracked_spec(project)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n"
+    spec.write_bytes(corrected)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = True
+    source.write_text("failed child sibling\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="after the baseline reset"):
+        flow.rollback_or_pause(task)
+
+    assert source.read_text() == "baseline source\n"
+    # The reset's `preserve` round-trips the artifact folder through
+    # `git stash create` + `git checkout`, which under Git-for-Windows'
+    # `core.autocrlf=true` re-materializes this LF content as CRLF. What is
+    # asserted is the content the refused restoration left alone, so compare
+    # newline-normalized rather than raw.
+    assert spec.read_bytes().replace(b"\r\n", b"\n") == corrected
+    assert "rollback-auto" in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback"]
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="after the baseline reset",
+        expected_status="ready-for-dev",
+    )
+
+
+@requires_descriptor_restoration
 def test_latched_redrive_restores_ignored_spec_as_untracked_after_child_commit(project):
     """A failed child cannot turn restored ignored input into a staged addition."""
     repo = project.project
@@ -1713,6 +2148,7 @@ def test_latched_redrive_restores_ignored_spec_as_untracked_after_child_commit(p
 
 @pytest.mark.parametrize("git_invisible", ["baseline-untracked", "ignored"])
 @pytest.mark.parametrize("child_index", ["staged", "committed"])
+@requires_descriptor_restoration
 def test_plain_reset_recreates_force_added_git_invisible_snapshot(
     project, git_invisible, child_index
 ):
@@ -1750,7 +2186,52 @@ def test_plain_reset_recreates_force_added_git_invisible_snapshot(
     assert "rollback-owned-spec-restored" in flow.journal.events()
 
 
+@pytest.mark.parametrize("git_invisible", ["baseline-untracked", "ignored"])
+def test_plain_git_invisible_snapshot_forced_fallback_pauses_before_reset(
+    project, monkeypatch, git_invisible
+):
+    repo = project.project
+    spec = project.implementation_artifacts / f"fallback-{git_invisible}.md"
+    rel = spec.relative_to(repo).as_posix()
+    if git_invisible == "ignored":
+        (repo / ".gitignore").write_text(f"/{rel}\n")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-q", "-m", "ignore fallback owned spec")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    original = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
+    child = b"---\nstatus: done\n---\n\nfailed child input\n"
+    spec.write_bytes(original)
+    task = _task(repo)
+    task.baseline_untracked = [rel] if git_invisible == "baseline-untracked" else []
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = original
+    spec.write_bytes(child)
+    git(repo, "add", "-f", rel)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="manual adoption is required"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == child
+    assert verify.index_path_changed_since(repo, task.baseline_commit, rel)
+    assert task.preserve_ref is not None
+    assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
+    assert "rollback-owned-spec-restored" not in flow.journal.events()
+    assert "post_rollback" not in flow.calls.emits
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="before the baseline reset",
+    )
+
+
 @pytest.mark.parametrize("baseline_present", [False, True], ids=["force-add", "cached-remove"])
+@requires_descriptor_restoration
 def test_latched_redrive_resets_index_only_owned_spec_mutation(project, baseline_present):
     """Snapshot-equal bytes cannot hide a child-authored index ownership change."""
     repo = project.project
@@ -1767,7 +2248,8 @@ def test_latched_redrive_resets_index_only_owned_spec_mutation(project, baseline
     rel = spec.relative_to(repo).as_posix()
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    task.dispatched_spec_snapshot = spec.read_bytes()
+    snapshot = spec.read_bytes()
+    task.dispatched_spec_snapshot = snapshot
     task.resolved_redrive = True
     if baseline_present:
         git(repo, "rm", "--cached", rel)
@@ -1780,11 +2262,64 @@ def test_latched_redrive_resets_index_only_owned_spec_mutation(project, baseline
 
     flow.rollback_or_pause(task)
 
-    assert spec.read_bytes() == task.dispatched_spec_snapshot
+    assert spec.read_bytes() == snapshot
     assert verify.path_tracked(repo, rel) is baseline_present
     assert not verify.index_path_changed_since(repo, task.baseline_commit, rel)
     assert "rollback-auto" in flow.journal.events()
     assert "rollback-owned-spec-restored" in flow.journal.events()
+
+
+@pytest.mark.parametrize("baseline_present", [False, True], ids=["force-add", "cached-remove"])
+def test_latched_redrive_index_only_forced_fallback_pauses_after_preservation(
+    project, monkeypatch, baseline_present
+):
+    repo = project.project
+    if baseline_present:
+        spec = _tracked_spec(project, name="tracked-index-only-fallback.md")
+    else:
+        spec = project.implementation_artifacts / "ignored-index-only-fallback.md"
+        rel = spec.relative_to(repo).as_posix()
+        (repo / ".gitignore").write_text(f"/{rel}\n")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-q", "-m", "ignore fallback index-only spec")
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("---\nstatus: ready-for-dev\n---\n\noperator input\n")
+    rel = spec.relative_to(repo).as_posix()
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    snapshot = spec.read_bytes()
+    task.dispatched_spec_snapshot = snapshot
+    task.resolved_redrive = True
+    if baseline_present:
+        git(repo, "rm", "--cached", rel)
+    else:
+        git(repo, "add", "-f", rel)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="before the baseline reset"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_bytes() == snapshot
+    assert verify.index_path_changed_since(repo, task.baseline_commit, rel)
+    if baseline_present:
+        assert task.preserve_ref is None  # cached removal has no child bytes to park
+        assert "attempt-worktree-preserved" not in flow.journal.events()
+    else:
+        assert task.preserve_ref is not None
+        assert "attempt-worktree-preserved" in flow.journal.events()
+    assert "rollback-owned-spec-restored" not in flow.journal.events()
+    assert "post_rollback" not in flow.calls.emits
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="before the baseline reset",
+        expected_status="ready-for-dev",
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="directory symlinks may need elevation")
@@ -2025,7 +2560,44 @@ def test_resolved_redrive_normalization_confines_to_the_project_not_workspace_ro
     assert (victim_parent / "owned.md").read_bytes() == decoy  # nothing escaped
 
 
+def test_resolved_cause_forced_fallback_pauses_after_completed_reset(project, monkeypatch):
+    repo = project.project
+    spec = _tracked_spec(project)
+    remaining = b"---\nstatus: done\n---\n\nhuman corrected intent\n"
+    spec.write_bytes(remaining)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = b"stale bytes from the abandoned attempt"
+    source = repo / "src.txt"
+    source.write_text("failed attempt residue\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="after the baseline reset"):
+        flow.rollback_or_pause(task, cause="resolved")
+
+    assert source.read_text() == "original\n"
+    # Same `git stash create` + `git checkout` preserve round trip as
+    # `test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset`:
+    # the refused restoration left the operator's `done` content in place, and
+    # only its line endings may differ under `core.autocrlf=true`.
+    assert spec.read_bytes().replace(b"\r\n", b"\n") == remaining
+    assert "rollback-auto" in flow.journal.events()
+    assert flow.calls.emits == ["pre_rollback"]
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="after the baseline reset",
+        expected_status="ready-for-dev",
+    )
+
+
 @pytest.mark.parametrize("git_invisible", ["baseline-untracked", "ignored"])
+@requires_descriptor_restoration
 def test_plain_attempt_restores_and_parks_git_invisible_owned_spec(project, git_invisible):
     """A plain child cannot hide body edits in Git's untracked blind spots.
 
@@ -2092,6 +2664,7 @@ def test_unchanged_ignored_owned_spec_with_snapshot_is_a_clean_noop(project):
     assert task.preserve_ref is None
 
 
+@requires_descriptor_restoration
 def test_latched_redrive_reset_normalizes_preserved_spec_after_sibling_residue(project):
     """A non-fixable retry re-establishes the route its next prompt declares.
 
@@ -2332,6 +2905,7 @@ def test_plain_attempt_refuses_to_overwrite_changed_external_spec(project, tmp_p
     assert task.dispatched_spec_snapshot is None
 
 
+@requires_descriptor_restoration
 def test_latched_redrive_parks_child_commit_and_restores_operator_snapshot(project):
     """Committed child body edits cannot hide behind the retained correction.
 
@@ -2393,6 +2967,7 @@ def test_latched_redrive_refuses_restore_when_child_commit_cannot_be_parked(proj
     assert "attempt-worktree-preserved" not in flow.journal.events()
 
 
+@requires_descriptor_restoration
 def test_latched_redrive_preserves_uncommitted_child_bytes_above_child_commit(project):
     """The dirty preserve ref retains the child's latest uncommitted spec body.
 
@@ -2424,6 +2999,7 @@ def test_latched_redrive_preserves_uncommitted_child_bytes_above_child_commit(pr
     assert "failed child committed body A" not in preserved
 
 
+@requires_descriptor_restoration
 def test_post_normalization_probe_fault_cannot_authorize_owned_dirty(project, monkeypatch):
     """A failed pre-reset re-probe cannot bypass the resolved reset.
 
@@ -2466,6 +3042,7 @@ def test_post_normalization_probe_fault_cannot_authorize_owned_dirty(project, mo
     assert b"stale bytes" not in spec.read_bytes()
 
 
+@requires_descriptor_restoration
 def test_patch_restore_redrive_normalizes_owned_spec_to_in_review(project):
     """T13: the restore latch selects `in-review`, never from-scratch readiness.
 
@@ -2495,6 +3072,38 @@ def test_patch_restore_redrive_normalizes_owned_spec_to_in_review(project):
     assert flow.calls.emits == ["pre_rollback", "post_rollback"]
 
 
+def test_patch_restore_redrive_forced_fallback_requires_in_review_adoption(project, monkeypatch):
+    repo = project.project
+    spec = _tracked_spec(project, status="in-review")
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.restore_patch = "intent-gap.patch"
+    task.resolved_redrive = True
+    restored = b"---\nstatus: in-review\n---\n\nrestored human correction\n"
+    task.dispatched_spec_snapshot = restored
+    spec.write_text("---\nstatus: in-progress\n---\n\nrestored human correction\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
+    )
+    monkeypatch.setattr(recovery_flow, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="lifecycle status 'in-review'"):
+        flow.rollback_or_pause(task)
+
+    assert spec.read_text() == "---\nstatus: in-progress\n---\n\nrestored human correction\n"
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+    assert "post_rollback" not in flow.calls.emits
+    _assert_owned_spec_manual_adoption_pause(
+        flow,
+        task,
+        spec,
+        stage="before the baseline reset",
+        expected_status="in-review",
+    )
+
+
+@requires_descriptor_restoration
 def test_owned_spec_without_visible_status_fails_the_post_write_oracle(project):
     """T14/False: a writer no-op is not repair success without the target oracle.
 
@@ -2519,6 +3128,7 @@ def test_owned_spec_without_visible_status_fails_the_post_write_oracle(project):
     assert flow.calls.pauses == []
 
 
+@requires_descriptor_restoration
 def test_owned_spec_with_unsafe_status_shape_propagates_writer_error(project):
     """T14/write: repair-write refusal is never caught as failed observation.
 

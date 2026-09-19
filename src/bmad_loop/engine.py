@@ -6507,6 +6507,7 @@ class Engine:
         label: str | None = None,
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
+        prelaunch_validator: Callable[[], None] | None = None,
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
@@ -6572,6 +6573,12 @@ class Engine:
         if sctx is not None:
             veto = sctx.resolved_veto()
             if veto is not None:
+                # A veto prevents adapter launch but does not undo executable
+                # hook side effects. Callers whose durable launch authority is
+                # bound to mutable input must validate that input before the
+                # early return just as they do on the normal launch path.
+                if prelaunch_validator is not None:
+                    prelaunch_validator()
                 self.journal.append(
                     "plugin-veto",
                     stage=sctx.stage,
@@ -6655,6 +6662,13 @@ class Engine:
                 / f"{self._dev_skill(role)}-result-{task_id}.md"
             )
             prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
+        # Optional transaction boundary for callers whose durable launch
+        # authority is tied to mutable workspace input.  It deliberately runs
+        # after every executable session hook and every prompt/snapshot repair,
+        # but before either the session-start record or adapter launch.  The
+        # default keeps all existing callers byte-for-byte inert.
+        if prelaunch_validator is not None:
+            prelaunch_validator()
         spec = SessionSpec(
             task_id=task_id,
             role=role,

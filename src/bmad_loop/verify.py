@@ -8,8 +8,10 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import hashlib
+import io
 import locale
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -17,6 +19,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -132,6 +136,20 @@ class GitTimeoutError(GitError):
     all over again. `cmd_validate` is that caller: three probes in a row against
     one hung binary cost three deadlines, and only the first one told the
     operator anything."""
+
+
+class _GitCommitIndeterminate(GitError):
+    """A prepared ref transaction may have committed but lost its acknowledgement."""
+
+
+@dataclass(frozen=True)
+class _PreparedRefUpdate:
+    """One direct-ref CAS executed through ``git update-ref --stdin``."""
+
+    ref: str
+    new_oid: str
+    old_oid: str
+    validate_while_prepared: Callable[[float], None]
 
 
 class RollbackPreflightError(GitError):
@@ -1492,8 +1510,9 @@ def _run_git(
     *,
     env: dict[str, str] | None = ...,
     binary: Literal[False] = ...,
-    timeout_s: int | None = ...,
+    timeout_s: float | None = ...,
     input_data: None = ...,
+    prepared_update: None = ...,
 ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -1504,9 +1523,23 @@ def _run_git(
     *,
     env: dict[str, str] | None = ...,
     binary: Literal[True],
-    timeout_s: int | None = ...,
+    timeout_s: float | None = ...,
     input_data: bytes | None = ...,
+    prepared_update: None = ...,
 ) -> subprocess.CompletedProcess[bytes]: ...
+
+
+@overload
+def _run_git(
+    cmd: list[str],
+    repo: Path,
+    *,
+    env: dict[str, str] | None = ...,
+    binary: Literal[False] = ...,
+    timeout_s: float | None = ...,
+    input_data: None = ...,
+    prepared_update: _PreparedRefUpdate,
+) -> subprocess.CompletedProcess[str]: ...
 
 
 def _run_git(
@@ -1515,8 +1548,9 @@ def _run_git(
     *,
     env: dict[str, str] | None = None,
     binary: bool = False,
-    timeout_s: int | None = None,
+    timeout_s: float | None = None,
     input_data: bytes | None = None,
+    prepared_update: _PreparedRefUpdate | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Sole spawn point for git subprocesses. Three failures are raised by
     `subprocess.run` *before* any return code exists — a timeout (#156), a
@@ -1548,10 +1582,178 @@ def _run_git(
     inherited environment and any explicit `env` (the `_git_env` callers' throwaway
     `GIT_INDEX_FILE` / synthetic identity vars are preserved by the spread).
 
+    `prepared_update` is the one interactive mode.  It owns the complete
+    ``update-ref --stdin`` process lifecycle: start, queue, prepare, the caller's
+    lock-held validation, commit/abort, bounded pipe reads, and termination.  It
+    never returns or embeds the child's output, because ref names and object IDs
+    in that protocol are migration authority rather than operator diagnostics.
+
     `timeout_s` overrides the module bound for this one call — the interactive
     callers' seam (#390): a TUI render or install's best-effort probe keeps its
     own short deadline while standing inside the chokepoint."""
     effective_timeout_s = _git_timeout_s if timeout_s is None else timeout_s
+    child_env = {**(env if env is not None else os.environ), "LC_ALL": "C"}
+
+    if prepared_update is not None:
+        if binary or input_data is not None:
+            raise ValueError("prepared git execution is text-only")
+        deadline = time.monotonic() + effective_timeout_s
+        proc: subprocess.Popen[str] | None = None
+        prepared = False
+        commit_attempted = False
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def stop_child() -> bool:
+            if proc is None:
+                return True
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=min(1.0, remaining()))
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            return proc.poll() is not None
+
+        try:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors="replace",
+                    env=child_env,
+                )
+            except OSError as exc:
+                raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}") from exc
+            # `text=True` wraps every pipe in a `TextIOWrapper(newline=None)`,
+            # whose WRITE side translates "\n" to `os.linesep` — "\r\n" on
+            # Windows — so `update-ref --stdin` would read `start\r` and die with
+            # `unknown command` before acknowledging. The protocol's terminator is
+            # LF on every host, so pin it on the command stream only: the reply
+            # stream keeps universal-newline reading, which folds either ending
+            # into the `"<label>: ok\n"` the `expect` below compares against.
+            assert isinstance(proc.stdin, io.TextIOWrapper)
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+            proc.stdin.reconfigure(newline="\n")
+            child_stdin = proc.stdin
+            child_stdout = proc.stdout
+            child_stderr = proc.stderr
+
+            responses: queue.Queue[str | None] = queue.Queue()
+
+            def read_responses() -> None:
+                try:
+                    for line in child_stdout:
+                        responses.put(line)
+                finally:
+                    responses.put(None)
+
+            def discard_stderr() -> None:
+                try:
+                    while child_stderr.read(8192):
+                        pass
+                except (OSError, ValueError):
+                    pass
+
+            threading.Thread(target=read_responses, daemon=True).start()
+            threading.Thread(target=discard_stderr, daemon=True).start()
+
+            def send(line: str, *, begins_commit: bool = False) -> None:
+                nonlocal commit_attempted
+                if remaining() <= 0:
+                    raise GitTimeoutError(
+                        f"git update-ref timed out after {effective_timeout_s}s in {repo}"
+                    )
+                if begins_commit:
+                    # A broken pipe after this point cannot prove whether Git read
+                    # the command.  Observation/replay, never rollback, decides.
+                    commit_attempted = True
+                child_stdin.write(line)
+                child_stdin.flush()
+
+            def expect(label: str) -> None:
+                try:
+                    response = responses.get(timeout=remaining())
+                except queue.Empty as exc:
+                    raise GitTimeoutError(
+                        f"git update-ref timed out after {effective_timeout_s}s in {repo}"
+                    ) from exc
+                if response != f"{label}: ok\n":
+                    raise GitError(f"git prepared ref transaction failed in {repo}")
+
+            send("start\n")
+            expect("start")
+            send("option no-deref\n")
+            send(
+                f"update {prepared_update.ref} {prepared_update.new_oid} "
+                f"{prepared_update.old_oid}\n"
+            )
+            send("prepare\n")
+            expect("prepare")
+            prepared = True
+            prepared_update.validate_while_prepared(remaining())
+            send("commit\n", begins_commit=True)
+            expect("commit")
+            child_stdin.close()
+            try:
+                proc.wait(timeout=remaining())
+            except subprocess.TimeoutExpired as exc:
+                raise GitTimeoutError(
+                    f"git update-ref timed out after {effective_timeout_s}s in {repo}"
+                ) from exc
+            if proc.returncode != 0:
+                raise GitError(f"git prepared ref transaction failed in {repo}")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        except BaseException as exc:
+            if prepared and not commit_attempted and proc is not None and proc.poll() is None:
+                try:
+                    send("abort\n")
+                    expect("abort")
+                    child_stdin.close()
+                    proc.wait(timeout=remaining())
+                except BaseException as abort_exc:
+                    stop_child()
+                    if not isinstance(exc, GitError):
+                        raise exc
+                    raise GitError(
+                        f"git prepared ref transaction abort failed in {repo}"
+                    ) from abort_exc
+            stopped = stop_child()
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if not stopped:
+                if not isinstance(
+                    exc, (GitError, BrokenPipeError, OSError, UnicodeError, ValueError)
+                ):
+                    raise
+                raise GitError(
+                    f"git prepared ref transaction process did not terminate in {repo}"
+                ) from exc
+            if commit_attempted:
+                raise _GitCommitIndeterminate(
+                    f"git prepared ref transaction acknowledgement was lost in {repo}"
+                ) from exc
+            if isinstance(exc, (BrokenPipeError, OSError, UnicodeError, ValueError)):
+                raise GitError(f"git prepared ref transaction failed in {repo}") from exc
+            raise
+        finally:
+            stop_child()
+
     try:
         return subprocess.run(
             cmd,
@@ -1559,7 +1761,7 @@ def _run_git(
             text=not binary and input_data is None,
             input=input_data,
             timeout=effective_timeout_s,
-            env={**(env if env is not None else os.environ), "LC_ALL": "C"},
+            env=child_env,
         )
     except subprocess.TimeoutExpired as exc:
         raise GitTimeoutError(
@@ -8969,3 +9171,541 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)
+
+
+def _bound_live_ledger_identity(
+    live_path: Path,
+    target: Path,
+    accepted_text: str,
+    *,
+    identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Prove the live ledger is the accepted regular target without disclosing it."""
+    try:
+        resolved = live_path.resolve(strict=True)
+        before = target.lstat()
+        if resolved != target or not S_ISREG(before.st_mode):
+            raise GitError("accepted publication target changed shape")
+        observed = live_path.read_text(encoding="utf-8")
+        after = target.lstat()
+        if (
+            not S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or live_path.resolve(strict=True) != target
+            or observed != accepted_text
+        ):
+            raise GitError("accepted publication target changed during validation")
+    except GitError:
+        raise
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
+        raise GitError("accepted publication target could not be validated") from exc
+    current = (after.st_dev, after.st_ino)
+    if identity is not None and current != identity:
+        raise GitError("accepted publication target identity changed")
+    return current
+
+
+@dataclass(frozen=True)
+class _BoundCheckoutIdentity:
+    immediate_ref: str | None
+    terminal_ref: str | None
+    oid: str
+
+
+_BOUND_IDENTITY_PROBE_LIMIT = 3
+_BOUND_INDEX_RECONCILE_LIMIT = 3
+
+
+def _bound_symbolic_ref(
+    repo: Path, ref: str, *, recurse: bool, required: bool = True
+) -> str | None:
+    args = ["symbolic-ref", "--quiet"]
+    if not recurse:
+        args.append("--no-recurse")
+    args.append(ref)
+    rc, value, _detail = _git_out(repo, *args)
+    if rc == 1:
+        if required:
+            raise GitError("exact-path publication requires an attached direct branch")
+        return None
+    if rc != 0 or not value:
+        raise GitError("exact-path publication branch identity could not be validated")
+    return value
+
+
+def _bound_direct_ref_probe(repo: Path, ref: str, *, timeout_s: float | None = None) -> None:
+    proc = _run_git(
+        ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--no-recurse", ref],
+        repo,
+        timeout_s=timeout_s,
+    )
+    rc = proc.returncode
+    if rc == 0:
+        raise GitError("exact-path publication branch changed ref kind")
+    if rc != 1:
+        raise GitError("exact-path publication branch kind could not be validated")
+
+
+def _bound_head_oid(repo: Path) -> str:
+    try:
+        return rev_parse_head(repo)
+    except GitError as exc:
+        raise GitError("exact-path publication branch value could not be validated") from exc
+
+
+def _bound_checkout_identity(repo: Path, *, require_branch: bool = True) -> _BoundCheckoutIdentity:
+    """Capture one stable checkout identity without disclosing its ref names."""
+    for _attempt in range(_BOUND_IDENTITY_PROBE_LIMIT):
+        immediate = _bound_symbolic_ref(repo, "HEAD", recurse=False, required=require_branch)
+        terminal = _bound_symbolic_ref(repo, "HEAD", recurse=True, required=require_branch)
+        if (immediate is None) != (terminal is None):
+            continue
+        if terminal is not None and not terminal.startswith("refs/heads/"):
+            raise GitError("exact-path publication requires a terminal branch")
+        if terminal is not None:
+            _bound_direct_ref_probe(repo, terminal)
+        oid = _bound_head_oid(repo)
+        if (
+            _bound_symbolic_ref(repo, "HEAD", recurse=False, required=require_branch) == immediate
+            and _bound_symbolic_ref(repo, "HEAD", recurse=True, required=require_branch) == terminal
+            and _bound_head_oid(repo) == oid
+        ):
+            return _BoundCheckoutIdentity(immediate, terminal, oid)
+    raise GitError("exact-path publication checkout changed during identity capture")
+
+
+def _bound_ref_oid(repo: Path, ref: str) -> str:
+    _bound_direct_ref_probe(repo, ref)
+    rc, oid, _detail = _git_out(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if rc != 0 or not oid:
+        raise GitError("exact-path publication branch value could not be validated")
+    _bound_direct_ref_probe(repo, ref)
+    return oid
+
+
+@dataclass(frozen=True)
+class _BoundGitEntry:
+    mode: str
+    kind: str
+    oid: str
+
+
+def _bound_tree_entry(repo: Path, revision: str, rel: str) -> _BoundGitEntry | None:
+    try:
+        entry = _entry_at_revision(repo, revision, rel)
+    except GitError as exc:
+        raise GitError(f"committed publication target could not be observed in {repo}") from exc
+    if entry is None:
+        return None
+    return _BoundGitEntry(*entry)
+
+
+def _bound_tree_blob(repo: Path, revision: str, rel: str) -> str | None:
+    entry = _bound_tree_entry(repo, revision, rel)
+    if entry is None:
+        return None
+    if entry.kind != "blob" or entry.mode not in {"100644", "100755"}:
+        raise GitError("committed publication target is not a regular file")
+    return entry.oid
+
+
+def _preflight_bound_tree_blob(
+    current_oid: str | None, baseline_oid: str, accepted_oid: str
+) -> None:
+    if current_oid not in (None, baseline_oid, accepted_oid):
+        raise GitError("committed publication target holds rival content")
+
+
+def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
+    proc = git_bytes(
+        repo,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-z",
+        "-r",
+        parent,
+        revision,
+        "--",
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git candidate scope probe failed in {repo}")
+    return {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
+
+
+class _BoundCandidateMismatch(GitError):
+    """A candidate was fully observed and structurally rejected."""
+
+
+def _bound_parent(repo: Path, revision: str) -> str:
+    rc, lineage, _detail = _git_out(repo, "rev-list", "--parents", "--max-count=1", revision)
+    if rc != 0:
+        raise GitError(f"git candidate parent probe failed in {repo}")
+    parts = lineage.split()
+    if not parts:
+        raise GitError(f"git candidate parent probe returned no evidence in {repo}")
+    if parts[0] != revision:
+        raise GitError(f"git candidate parent probe returned malformed evidence in {repo}")
+    if len(parts) != 2:
+        raise _BoundCandidateMismatch("exact-path candidate does not have exactly one parent")
+    return parts[1]
+
+
+def _validate_bound_candidate(
+    repo: Path,
+    revision: str,
+    parent: str,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> None:
+    if _bound_parent(repo, revision) != parent:
+        raise _BoundCandidateMismatch("exact-path candidate has an unexpected parent")
+    if _bound_changed_paths(repo, parent, revision) != {rel}:
+        raise _BoundCandidateMismatch(
+            "exact-path candidate changed paths outside its declared scope"
+        )
+    committed = _bound_tree_entry(repo, revision, rel)
+    if committed is None or committed.kind != "blob" or committed.oid != accepted_oid:
+        raise _BoundCandidateMismatch("exact-path candidate does not contain the accepted ledger")
+    parent_entry = _bound_tree_entry(repo, parent, rel)
+    if parent_entry is not None and (
+        parent_entry.kind != "blob"
+        or parent_entry.mode not in {"100644", "100755"}
+        or parent_entry.oid != baseline_oid
+    ):
+        raise _BoundCandidateMismatch(
+            "exact-path candidate parent does not contain the accepted baseline"
+        )
+    expected_mode = "100644" if parent_entry is None else parent_entry.mode
+    if committed.mode != expected_mode:
+        raise _BoundCandidateMismatch("exact-path candidate changed the publication target mode")
+
+
+def _accepted_bound_transition(
+    repo: Path,
+    head: str,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> str | None:
+    """Find the newest accepted ledger transition in first-parent ancestry."""
+    rc, out, _detail = _git_out(
+        repo,
+        "rev-list",
+        "--first-parent",
+        head,
+        "--",
+        *_literal_specs([rel]),
+    )
+    if rc != 0:
+        raise GitError(f"git accepted-transition probe failed in {repo}")
+    if not out:
+        return None
+    # `rev-list` is newest-first. A later commit may touch the ledger as part of
+    # a wider change (for example a mode-only edit beside an unrelated file)
+    # without invalidating the earlier exact one-path migration transition.
+    for candidate in out.splitlines():
+        try:
+            parent = _bound_parent(repo, candidate)
+            _validate_bound_candidate(repo, candidate, parent, rel, accepted_oid, baseline_oid)
+        except _BoundCandidateMismatch:
+            continue
+        return candidate
+    return None
+
+
+def _bound_index_entry(repo: Path, rel: str) -> _BoundGitEntry | None:
+    try:
+        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
+    except GitError as exc:
+        raise GitError(f"publication target index could not be observed in {repo}") from exc
+    if proc.returncode != 0:
+        raise GitError(f"publication target index could not be observed in {repo}")
+    records = [record for record in proc.stdout.split(b"\0") if record]
+    if not records:
+        return None
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise GitError("publication target index is not one exact entry")
+    header, actual_path = records[0].split(b"\t", 1)
+    if actual_path != os.fsencode(rel):
+        raise GitError("publication target index is not one exact entry")
+    try:
+        mode, oid, stage = header.decode("ascii", "strict").split()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise GitError("publication target index evidence is malformed") from exc
+    if stage != "0" or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+        raise GitError("publication target index is not an unambiguous stage-zero entry")
+    kind = "commit" if mode == "160000" else "blob"
+    return _BoundGitEntry(mode, kind, oid)
+
+
+def _synchronize_bound_index(
+    repo: Path,
+    expected_checkout: _BoundCheckoutIdentity,
+    rel: str,
+    observed_index_entry: _BoundGitEntry | None,
+) -> None:
+    """Align only the target entry to a stably observed checkout tree.
+
+    A checkout can move independently of the captured publication branch.  Each
+    reset is therefore bracketed by a complete object-plus-ref observation.  A
+    move is repaired toward the newest observation but still refuses the attempt,
+    leaving commit-only replay to decide authority.  The explicit bound prevents
+    a hostile ref mover from turning housekeeping into a livelock.
+    """
+    expected_index_entry = observed_index_entry
+    moved = False
+    newest = _bound_checkout_identity(repo, require_branch=False)
+    if newest != expected_checkout:
+        moved = True
+
+    for _attempt in range(_BOUND_INDEX_RECONCILE_LIMIT):
+        if _bound_index_entry(repo, rel) != expected_index_entry:
+            raise GitError("real index target changed during exact-path publication")
+        target = newest
+        target_entry = _bound_tree_entry(repo, target.oid, rel)
+        if target_entry is not None and target_entry.kind == "tree":
+            raise GitError("committed publication target became a directory")
+        rc, _out = _git(repo, "reset", target.oid, "--", *_literal_specs([rel]))
+        if rc != 0:
+            raise GitError(f"git target-local index synchronization failed in {repo}")
+        expected_index_entry = target_entry
+        if _bound_index_entry(repo, rel) != target_entry:
+            raise GitError("real index target synchronization did not match committed content")
+        newest = _bound_checkout_identity(repo, require_branch=False)
+        if newest == target:
+            if moved:
+                raise GitError("checkout changed during target index reconciliation")
+            return
+        moved = True
+
+    # One final target-local repair makes the index correspond to the latest
+    # observation even when the movement never settled inside the retry bound.
+    if _bound_index_entry(repo, rel) != expected_index_entry:
+        raise GitError("real index target changed during exact-path publication")
+    newest_entry = _bound_tree_entry(repo, newest.oid, rel)
+    if newest_entry is not None and newest_entry.kind == "tree":
+        raise GitError("committed publication target became a directory")
+    rc, _out = _git(repo, "reset", newest.oid, "--", *_literal_specs([rel]))
+    if rc != 0:
+        raise GitError(f"git target-local index synchronization failed in {repo}")
+    if _bound_index_entry(repo, rel) != newest_entry:
+        raise GitError("real index target synchronization did not match committed content")
+    raise GitError("checkout did not stabilize during target index reconciliation")
+
+
+def _publish_bound_candidate(
+    repo: Path,
+    captured: _BoundCheckoutIdentity,
+    candidate: str,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> None:
+    terminal_ref = captured.terminal_ref
+    assert terminal_ref is not None
+
+    def validate_terminal_kind(remaining_s: float) -> None:
+        _bound_direct_ref_probe(
+            repo,
+            terminal_ref,
+            timeout_s=remaining_s,
+        )
+
+    update = _PreparedRefUpdate(
+        ref=terminal_ref,
+        new_oid=candidate,
+        old_oid=captured.oid,
+        validate_while_prepared=validate_terminal_kind,
+    )
+    try:
+        _run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+    except _GitCommitIndeterminate as exc:
+        observed = _bound_ref_oid(repo, terminal_ref)
+        if observed == candidate:
+            _validate_bound_candidate(
+                repo,
+                candidate,
+                captured.oid,
+                rel,
+                accepted_oid,
+                baseline_oid,
+            )
+            return
+        if observed == captured.oid:
+            raise GitError(
+                "exact-path publication acknowledgement was lost before ref movement"
+            ) from exc
+        raise GitError("captured branch changed during exact-path publication") from exc
+
+
+def commit_path_bound(
+    repo: Path,
+    message: str,
+    path: Path,
+    *,
+    accepted_text: str,
+    baseline_text: str,
+    live_path: Path | None = None,
+) -> str | None:
+    """Publish one accepted ledger transition through a validated candidate.
+
+    The candidate is committed in a detached temporary worktree, so ordinary Git
+    hooks run without moving the authoritative checkout.  Its parent, exact path
+    delta, Git-clean-filtered blob, live decoded text, and path identity are all
+    validated before a prepared transaction publishes it to the originally
+    captured terminal direct branch.  Once that transaction commits, target-only
+    real-index reconciliation is replayable housekeeping: no later fault rolls the
+    truthful commit back.
+    """
+    try:
+        rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
+        if rc != 0:
+            raise GitError(f"git repository root probe failed in {repo}")
+        repo_root = Path(top).resolve()
+        target = path.resolve(strict=True)
+        rel = target.relative_to(repo_root).as_posix()
+    except GitError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise GitError("exact-path publication target could not be resolved safely") from exc
+
+    lexical = live_path if live_path is not None else path
+    accepted_bytes = accepted_text.encode("utf-8")
+    baseline_bytes = baseline_text.encode("utf-8")
+    try:
+        accepted_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, accepted_bytes)
+        baseline_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, baseline_bytes)
+    except GitError as exc:
+        raise GitError("publication target content could not be normalized by Git") from exc
+    identity = _bound_live_ledger_identity(lexical, target, accepted_text)
+    captured = _bound_checkout_identity(repo_root)
+
+    head_entry = _bound_tree_entry(repo_root, captured.oid, rel)
+    head_blob = _bound_tree_blob(repo_root, captured.oid, rel)
+    _preflight_bound_tree_blob(head_blob, baseline_oid, accepted_oid)
+    accepted = (
+        _accepted_bound_transition(repo_root, captured.oid, rel, accepted_oid, baseline_oid)
+        if head_blob == accepted_oid
+        else None
+    )
+    authority_parent = _bound_parent(repo_root, accepted) if accepted is not None else captured.oid
+    parent_has_target = _bound_tree_entry(repo_root, authority_parent, rel) is not None
+    observed_index_entry = _bound_index_entry(repo_root, rel)
+    expected_mode = "100644" if head_entry is None else head_entry.mode
+    allowed_index_entries: set[_BoundGitEntry | None] = {
+        _BoundGitEntry(expected_mode, "blob", accepted_oid),
+        _BoundGitEntry(expected_mode, "blob", baseline_oid),
+    }
+    if not parent_has_target:
+        # Original absence is the one accepted no-entry shape.  A tracked
+        # parent's absent real-index entry is a foreign staged deletion and is
+        # refused rather than silently re-added.
+        allowed_index_entries.add(None)
+    if observed_index_entry not in allowed_index_entries:
+        raise GitError("real index holds foreign content at the publication target")
+
+    if accepted is not None:
+        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        _synchronize_bound_index(repo_root, captured, rel, observed_index_entry)
+        return accepted
+
+    # Preserve generic clean/ignored behavior when no migration transition needs
+    # replay.  In particular, an ignored ledger never earns a synthetic commit.
+    try:
+        clean = path_clean(repo_root, rel)
+        ignored_untracked = clean and head_blob is None and path_ignored(repo_root, target)
+    except GitError as exc:
+        raise GitError("publication target cleanliness could not be validated") from exc
+    if clean and (head_blob == accepted_oid or ignored_untracked):
+        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        return None
+
+    active_error: BaseException | None = None
+    candidate: str | None = None
+    try:
+        has_non_tree_parent = path_has_non_tree_ancestor_at_revision(repo_root, captured.oid, rel)
+    except GitError as exc:
+        raise GitError("candidate publication parent shape could not be validated") from exc
+    if has_non_tree_parent:
+        raise GitError("candidate publication path has a non-directory committed parent")
+    with tempfile.TemporaryDirectory() as td:
+        candidate_root = Path(td) / "candidate"
+        rc, _out = _git(
+            repo_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(candidate_root),
+            captured.oid,
+        )
+        if rc != 0:
+            raise GitError(f"git detached candidate checkout failed in {repo_root}")
+        try:
+            candidate_path = candidate_root / rel
+            try:
+                candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                candidate_path.write_bytes(accepted_bytes)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise GitError("exact-path candidate content could not be written") from exc
+            rc, _out = _git(candidate_root, "add", "--", *_literal_specs([rel]))
+            if rc != 0:
+                raise GitError(f"git exact-path candidate staging failed in {repo_root}")
+            staged_entry = _bound_index_entry(candidate_root, rel)
+            if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
+                raise GitError("exact-path candidate staging changed accepted content")
+            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            if _bound_checkout_identity(repo_root) != captured:
+                raise GitError("checkout changed before exact-path candidate hooks")
+            rc, _out = _git(candidate_root, "commit", "-m", message)
+            if rc != 0:
+                raise GitError(f"git exact-path candidate commit failed in {repo_root}")
+            try:
+                candidate = rev_parse_head(candidate_root)
+            except GitError as exc:
+                raise GitError("exact-path candidate identity could not be validated") from exc
+            _validate_bound_candidate(
+                repo_root,
+                candidate,
+                captured.oid,
+                rel,
+                accepted_oid,
+                baseline_oid,
+            )
+            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            _publish_bound_candidate(
+                repo_root,
+                captured,
+                candidate,
+                rel,
+                accepted_oid,
+                baseline_oid,
+            )
+        except BaseException as exc:
+            active_error = exc
+            raise
+        finally:
+            rc, _out = _git(
+                repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(candidate_root),
+            )
+            if rc != 0 and active_error is None:
+                raise GitError(f"git detached candidate cleanup failed in {repo_root}")
+
+    assert candidate is not None
+    _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+    expected_checkout = _BoundCheckoutIdentity(
+        captured.immediate_ref,
+        captured.terminal_ref,
+        candidate,
+    )
+    _synchronize_bound_index(repo_root, expected_checkout, rel, observed_index_entry)
+    return candidate

@@ -468,6 +468,23 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind legacy migration dispatch and publication to the ledger bytes actually accepted
+  (DW-311, DW-316). Retire stale recovery authority when the ledger changes before
+  the true post-hook adapter-launch boundary, then publish a validated one-path,
+  clean-filter-normalized candidate through a prepared expected-old transaction on
+  the captured terminal direct branch. Resolve lost commit acknowledgements by
+  deterministic replay, and reconcile the target index against bounded stable checkout
+  observations while preserving unrelated stages.
+
+- Refuse no-descriptor attempt-owned spec restoration before staging or lifecycle
+  normalization, preserving the existing target bytes for manual recovery (DW-310).
+
+- Fail closed after no-descriptor attempt-owned spec publication and pause for
+  manual adoption instead of trusting a path-based readback (DW-309).
+
+- Refuse attempt-owned spec recovery when final prepublication validation observes an
+  existing target was edited in place, preserving the competing bytes (DW-308).
+
 - Restore the accepted commit chain and index when the post-squash HEAD identity
   probe fails, retaining the probe fault if rollback also fails (DW-305).
 
