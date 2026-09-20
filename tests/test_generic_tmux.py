@@ -5904,6 +5904,9 @@ def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "no-artifact"
     assert str(ours) in crumb["detail"]
+    assert "at:" in crumb["detail"]
+    assert "directly under" not in crumb["detail"]
+    assert "subdirectories are not searched" not in crumb["detail"]
     assert "someone-elses" not in crumb["detail"]
 
 
