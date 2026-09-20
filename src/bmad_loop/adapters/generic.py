@@ -1850,7 +1850,9 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 self._note_resultless_stop(
                     task_id,
                     "no-artifact",
-                    "no result artifact newer than session launch under: " + where,
+                    "no result artifact newer than session launch directly under: "
+                    + where
+                    + " (subdirectories are not searched)",
                 )
             return None
         if len(candidates) > 1:
