@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Explain that unpinned result-artifact scans search only the configured artifact
+  directories themselves, so a nested story spec no longer produces an opaque
+  `no-artifact` breadcrumb (#780).
+
 ## [0.12.0] — 2026-09-20
 
 ### Added
