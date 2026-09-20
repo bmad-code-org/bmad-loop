@@ -5827,11 +5827,13 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     # which is the exact verb (`unlink`) this guard performs on incoming strays.
     assert "Unity" not in reason
     assert "clean them" not in reason
+    assert "could commit under the story's name" in reason
+    assert "would fold them" not in reason
     assert "Commit, stash or revert" in reason  # the two SAFE resolutions, named
     assert ".gitignore" in reason  # the inner GitError still names the exact path
     # The composed message says which half of the dirt actually blocks a merge. Note
     # the inner GitError carries "tracked" too, so this one does not by itself pin the
-    # OUTER wording — "Commit, stash or revert" above is the assertion that does.
+    # OUTER wording — the hazard-first assertion above is the one that does.
     assert "tracked" in reason
     # branch kept for manual merge; the operator's edit was left untouched
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
