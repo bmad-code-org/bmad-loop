@@ -9,7 +9,9 @@ parser. Your job is a one-time rewrite of every legacy item into a canonical
 `### DW-<n>:` entry, after which the normal triage flow takes over.
 
 This is the ONE workflow mode that edits a file: exactly the ledger at
-`{implementation_artifacts}/deferred-work.md`. Never any other file, never
+`{implementation_artifacts}/deferred-work.md` — the path in `$BMAD_LOOP_LEDGER`,
+which the orchestrator resolved and which wins over any path you would derive
+yourself. Never any other file, never
 code, never specs, never sprint-status. Never commit — the orchestrator
 commits the migrated ledger after validating it.
 

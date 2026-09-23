@@ -233,6 +233,23 @@ def test_invalid_toml_rejected(tmp_path):
         load_plugins(tmp_path)
 
 
+def test_load_plugins_never_imports_a_python_module(tmp_path):
+    """Manifest discovery reads `[python]` as data and nothing more — the property
+    `validate`'s plugin-manifest check (#765) rests on. Import happens only in
+    `PluginRegistry.build`, behind the trust gate."""
+    marker = tmp_path / "IMPORTED"
+    write_plugin(
+        tmp_path,
+        "evil",
+        '[plugin]\nname = "evil"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n',
+        files={"hooks.py": f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"},
+    )
+
+    plugins = load_plugins(tmp_path)
+    assert plugins["evil"].python is not None
+    assert not marker.exists()
+
+
 # The one substring every #480 refusal shares, across all seven guarded config
 # sites — a single matcher for the whole family.
 _WIN32_ALIAS_MATCH = "must not name a Windows device or end a component in a period or space"
@@ -367,6 +384,62 @@ def test_unreadable_builtin_plugin_manifest_raises_plugin_error(monkeypatch):
     with pytest.raises(PluginError, match="unreadable") as excinfo:
         load_plugins()
     assert f"{names[0]}/{PLUGIN_FILE}" in str(excinfo.value)
+
+
+def _fault_path_method(monkeypatch, method: str, target: Path) -> None:
+    """Make ``Path.<method>`` raise EACCES for ``target`` alone. Targeted because
+    the packaged built-ins are a real `Path` in a source install: a blanket patch
+    would fire in the builtin loop and redden with the project site untouched."""
+    real = getattr(Path, method)
+
+    def faulted(self, *a, **kw):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, method, faulted)
+
+
+@pytest.mark.parametrize(
+    ("method", "rel"),
+    [
+        ("iterdir", USER_PLUGINS_REL),
+        # On the 3.11 floor is_dir/is_file swallow only absence errnos: EACCES on
+        # the stat escapes, e.g. under an unsearchable `.bmad-loop`.
+        ("is_dir", USER_PLUGINS_REL),
+        ("is_file", USER_PLUGINS_REL / "proj" / PLUGIN_FILE),
+    ],
+    ids=["list-root", "probe-root", "probe-manifest"],
+)
+def test_unreadable_project_plugin_discovery_raises_plugin_error(
+    tmp_path, monkeypatch, method, rel
+):
+    """Every filesystem probe discovery makes, not only the manifest read, is
+    converted: a bare OSError escapes validate's `plugins.manifests` boundary (and
+    `PluginRegistry.build`'s callers), which all key on PluginError.
+
+    ABLATION: drop the try in `_plugin_dirs` and every row raises PermissionError."""
+    write_plugin(tmp_path, "proj", MINIMAL.format(name="proj"))
+    assert load_plugins(tmp_path)["proj"].source == "project"  # healthy first
+    target = tmp_path / rel
+    _fault_path_method(monkeypatch, method, target)
+    with pytest.raises(PluginError, match="unreadable") as excinfo:
+        load_plugins(tmp_path)
+    assert str(tmp_path / USER_PLUGINS_REL) in str(excinfo.value)
+
+
+def test_unlistable_builtin_plugins_dir_raises_plugin_error(monkeypatch):
+    """The packaged side of the same conversion: a corrupt or unreadable install
+    is a packaging bug, and the loader owes its callers the typed error
+    (`test_unreadable_builtin_plugin_manifest_raises_plugin_error` makes the same
+    case for the manifest read)."""
+    packaged = Path(str(resources.files("bmad_loop.data").joinpath("plugins")))
+    # Real path, not a zip member, or the Path-level fault would be unarmed.
+    assert packaged.is_dir()
+    _fault_path_method(monkeypatch, "iterdir", packaged)
+    with pytest.raises(PluginError, match="unreadable") as excinfo:
+        load_plugins()
+    assert str(packaged) in str(excinfo.value)
 
 
 # ----------------------------------------------------- discovery / overlay

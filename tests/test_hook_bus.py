@@ -288,6 +288,67 @@ def test_declarative_error_fail_open_vs_closed():
     assert closed_ctx.resolved_veto().action == "defer"
 
 
+def _cwd_runner(seen):
+    def runner(cmd, *, cwd, env, timeout):
+        seen["cwd"] = cwd
+        seen["worktree_env"] = env.get("BMAD_LOOP_WORKTREE")
+        return 0, ""
+
+    return runner
+
+
+def test_post_story_with_removed_worktree_runs_from_repo_root(tmp_path):
+    """#779: post_story fires after the isolated unit's worktree was torn down;
+    the hook runs from the project root instead of a deleted cwd, while the
+    context and BMAD_LOOP_WORKTREE still name the original worktree."""
+    gone = str(tmp_path / "wt-gone")
+    root = str(tmp_path)
+    seen = {}
+    c = ctx("post_story", worktree=gone, repo_root=root)
+    HookBus(registry_of(declarative("post_story")), runner=_cwd_runner(seen)).emit("post_story", c)
+    assert seen == {"cwd": root, "worktree_env": gone}
+    assert c.worktree == gone
+
+
+def test_post_story_with_live_worktree_runs_in_the_worktree(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    seen = {}
+    c = ctx("post_story", worktree=str(wt), repo_root=str(tmp_path))
+    HookBus(registry_of(declarative("post_story")), runner=_cwd_runner(seen)).emit("post_story", c)
+    assert seen == {"cwd": str(wt), "worktree_env": str(wt)}
+
+
+@pytest.mark.parametrize("stage", ["pre_commit_gate", "post_dev_phase"])
+def test_other_stages_never_fall_back_to_repo_root(tmp_path, stage):
+    """The #779 fallback is post_story's alone: mid-story the project root is
+    the wrong tree, so a missing worktree keeps its cwd (and its error)."""
+    gone = str(tmp_path / "wt-gone")
+    seen = {}
+    c = ctx(stage, worktree=gone, repo_root=str(tmp_path))
+    HookBus(registry_of(declarative(stage)), runner=_cwd_runner(seen)).emit(stage, c)
+    assert seen["cwd"] == gone
+
+
+def test_real_runner_executes_post_story_after_worktree_removal(tmp_path):
+    """Through the real subprocess transport, the post_story hook runs: before
+    #779 `subprocess.run(cwd=<removed>)` raised and only plugin-hook-error was
+    journalled."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    wt.rmdir()
+    marker = tmp_path / "ran"
+    m = manifest(
+        "d",
+        hooks=(HookSpec(stage="post_story", cmd=f"\"{sys.executable}\" -c \"open('ran', 'w')\""),),
+    )
+    journal = _FakeJournal()
+    c = ctx("post_story", worktree=str(wt), repo_root=str(tmp_path))
+    HookBus(registry_of(LoadedPlugin(manifest=m)), journal).emit("post_story", c)
+    assert marker.is_file()
+    assert "plugin-hook-error" not in journal.kinds()
+
+
 def test_real_subprocess_runner_reports_exit_code(tmp_path):
     # _run_subprocess runs via the host shell (cmd on Windows, sh on POSIX); use a
     # command that prints "hi" and exits 7 on each.

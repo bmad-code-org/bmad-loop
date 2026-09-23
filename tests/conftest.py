@@ -427,6 +427,52 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     return launcher
 
 
+class _WindowsLauncher:
+    """``Path(sys.argv[0]).absolute()`` as a Windows install presents it, on any
+    test host: ``str`` is the Windows path the relay registration quotes, while
+    ``is_file``/``os.access`` consult a real launcher file."""
+
+    def __init__(self, windows_path: str, real: Path) -> None:
+        self._windows, self._real = windows_path, real
+        self.name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
+
+    def absolute(self) -> _WindowsLauncher:
+        return self
+
+    def is_file(self) -> bool:
+        return self._real.is_file()
+
+    def __fspath__(self) -> str:
+        return os.fspath(self._real)
+
+    def __str__(self) -> str:
+        return self._windows
+
+
+def windows_relay_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, windows_path: str):
+    """The real `install._hook_command`, run as a Windows install at
+    ``windows_path`` would run it (WindowsProcessHost quoting), on any test host.
+    The Windows identity is patched in only for the duration of each call, so the
+    result can stand in for `_hook_command` wherever a caller imported it."""
+    import bmad_loop.install as install_mod
+    from bmad_loop.process_host import WindowsProcessHost
+
+    launcher = tmp_path / "windows-launcher" / "bmad-loop"
+    launcher.parent.mkdir(exist_ok=True)
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    real = install_mod._hook_command
+
+    def build(project, profile, canonical_event):
+        with monkeypatch.context() as m:
+            m.setattr(install_mod.sys, "argv", [windows_path])
+            m.setattr(install_mod, "Path", lambda raw: _WindowsLauncher(raw, launcher))
+            m.setattr(install_mod, "get_process_host", WindowsProcessHost)
+            return real(project, profile, canonical_event)
+
+    return build
+
+
 # ---- host-shell verify/lifecycle stub commands (single platform-detection spot) ----
 # The engine runs verify/plugin-lifecycle commands via the host shell (`sh -c` on
 # POSIX, `cmd /c` on Windows), so tests that assert on that machinery need commands
@@ -1199,6 +1245,53 @@ def install_bmad_config(paths: ProjectPaths) -> None:
     cfg = paths.project / BMAD_CONFIG_REL
     cfg.parent.mkdir(parents=True)
     cfg.write_text(_ARTIFACT_PATH_KEYS)
+
+
+# The #769 layout: what BMAD-METHOD v6.12.0's installer writes with no legacy
+# `_bmad/bmm/config.yaml` beside it. Derived from the source at tag v6.12.0 —
+# `tools/installer/core/manifest-generator.js` `writeCentralConfig` (team-scope
+# answers to `[core]` / `[modules.<code>]` in config.toml, user-scope ones to
+# config.user.toml, `[agents.<code>]` always team) and `ensureCustomConfigStubs`
+# (comment-only custom layers); keys and `{project-root}/{value}` results from
+# `src/core-skills/module.yaml` and `src/bmm-skills/module.yaml` at their defaults.
+# Not captured from a live `bmad setup` — none can run here.
+CENTRAL_TEAM_CONFIG = """\
+[core]
+project_name = "sandbox"
+document_output_language = "English"
+output_folder = "{project-root}/_bmad-output"
+
+[modules.bmm]
+planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"
+implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"
+project_knowledge = "{project-root}/docs"
+
+[agents.bmad-agent-dev]
+module = "bmm"
+team = "software-development"
+name = "Amelia"
+title = "Senior Software Engineer"
+"""
+CENTRAL_USER_CONFIG = """\
+[core]
+user_name = "BMad"
+communication_language = "English"
+
+[modules.bmm]
+user_skill_level = "intermediate"
+"""
+CENTRAL_CUSTOM_STUB = "# Team / enterprise overrides for _bmad/config.toml.\n"
+CENTRAL_CUSTOM_USER_STUB = "# Personal overrides for _bmad/config.toml.\n"
+
+
+def install_bmad_central_config(paths: ProjectPaths) -> None:
+    """Write the TOML-only four-layer layout (#769) and no `_bmad/bmm/config.yaml`."""
+    bmad = paths.project / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    (bmad / "config.toml").write_text(CENTRAL_TEAM_CONFIG, encoding="utf-8")
+    (bmad / "config.user.toml").write_text(CENTRAL_USER_CONFIG, encoding="utf-8")
+    (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
+    (bmad / "custom" / "config.user.toml").write_text(CENTRAL_CUSTOM_USER_STUB, encoding="utf-8")
 
 
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:

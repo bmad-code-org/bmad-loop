@@ -374,6 +374,13 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # and spec filename. Drop rather than create a second spec correlation;
         # the fallback redacts it only by virtue of its current separators.
         "stashed_to",
+        # A non-completed sweep triage/migration session's post-mortem (#752):
+        # a nested mapping carrying the session task id, validation errors that
+        # quote ledger ids and titles, and exception text naming host paths. The
+        # verdicts are read from the operator's own journal; nothing in it is
+        # needed in a shared dump that `session_status` and `errors` do not
+        # already say, so presence-only rather than a nested routing table.
+        "diagnostic",
         # An overloaded path spelling used for a generated sweep intent and for
         # isolated worktrees. None of those host/customer paths adds useful
         # correlation beyond the record's story key, so every kind gets the same
@@ -1110,7 +1117,7 @@ def summarize_journal(
         ),
         escalation_count=kinds.get("story-escalated", 0) + kinds.get("preference-escalation", 0),
         defer_count=kinds.get("story-deferred", 0),
-        plugin_error_count=kinds.get("plugin-error", 0),
+        plugin_error_count=kinds.get("plugin-error", 0) + kinds.get("plugin-hook-error", 0),
         per_alias_event_counts={a: dict(c) for a, c in per_alias.items()},
         entries=scrubbed,
     )

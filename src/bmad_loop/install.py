@@ -1,6 +1,6 @@
 """`bmad-loop init`: make a target project orchestratable.
 
-- copies the hook relay script to <project>/.bmad-loop/bmad_loop_hook.py
+- registers the installed bmad-loop relay console script by absolute path
 - idempotently merges hook registrations into each selected CLI's hook config
   (dialect + native->canonical event map come from the CLI profile)
 - installs the bundled bmad-loop-* skills into each selected CLI's skill tree
@@ -9,8 +9,8 @@
 - gitignores generated dirs: .bmad-loop/runs/ (per-run state) and
   .bmad-loop/cache/ (engine plugins' rebuildable caches, e.g. the Unity Library)
 
-Every dialect registers the same relay script under the CLI's native event
-names while passing the canonical event name as the script argument, so the
+Every dialect registers the same installed relay under the CLI's native event
+names while passing the canonical event name as an argument, so the
 orchestrator's signal watcher is CLI-agnostic.
 """
 
@@ -20,13 +20,15 @@ import errno
 import json
 import os
 import re
+import shlex
 import shutil
+import sys
 import tomllib
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
@@ -36,17 +38,9 @@ from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
-HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
-# Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
-# merge_hooks' dedup and validate/probe detection (via relay_registered) so init
-# and the preflight can never disagree about whether the relay is installed. It
-# matches the relay script name specifically: a hook command whose path merely
-# contains "bmad_loop" can't read as a registration — or suppress one.
-RELAY_MARKER = "bmad_loop_hook"
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
 # probe re-merge must stay idempotent) and never counts as a relay
-# registration. Disjoint from RELAY_MARKER: "bmad_loop_probe_hook" does not
-# contain the substring "bmad_loop_hook".
+# registration. Probe capture has a separate command shape.
 PROBE_MARKER = "bmad_loop_probe_hook"
 GEMINI_HOOK_TIMEOUT_MS = 60_000
 COPILOT_HOOK_TIMEOUT_SEC = 60
@@ -1016,52 +1010,96 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
-def hook_script_current(project: Path) -> bool | None:
-    """Does the project's installed relay match the one this wheel would write?
-
-    ``True`` yes, ``False`` stale (or otherwise divergent), ``None`` unknowable —
-    the installed copy or the packaged source could not be read as text. The
-    unknown arm is a third state and not a coerced ``False`` on purpose: the sole
-    caller (``cmd_validate``'s ``hooks.relay-stale``) reports what it knows, and
-    "I could not look" is not "your relay is out of date".
-
-    Lives here, beside :func:`install_into`'s write of the same two paths, so the
-    reader and the writer of the relay stay in one module and one reviewer's view
-    — a comparison that resolved the source differently from the writer would
-    answer a different question.
-
-    Compared as TEXT read with universal newlines, not as raw bytes. That is
-    precisely the round trip ``install_into`` performs (``read_text`` then
-    ``write_text``), and ``write_text`` translates ``\\n`` to ``os.linesep`` — so
-    on Windows every freshly-installed relay differs from the packaged source
-    byte-for-byte while being exactly what ``init`` writes. A byte compare would
-    call those installs permanently stale.
-    """
-    try:
-        installed = (project / HOOK_SCRIPT_REL).read_text(encoding="utf-8")
-        packaged = (
-            resources.files("bmad_loop.data")
-            .joinpath("bmad_loop_hook.py")
-            .read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        # ValueError covers UnicodeDecodeError (a relay overwritten with non-UTF-8
-        # bytes); OSError covers missing/unreadable on either side. Observation
-        # degrades — the missing and unreadable cases already have their own
-        # finding (`hooks.relay-present`), and a packaged source this process
-        # cannot read is a broken wheel, not a stale project.
-        return None
-    return installed == packaged
-
-
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
-    host = get_process_host()
-    interp = host.hook_interpreter()
-    if profile.hooks.dialect == "claude-settings-json":
-        return f'{interp} "$CLAUDE_PROJECT_DIR"/{HOOK_SCRIPT_REL} {canonical_event}'
-    # Codex/Gemini expose no $CLAUDE_PROJECT_DIR equivalent to hook commands;
-    # bake the absolute path at init time.
-    return f"{interp} {host.shell_quote(str(project / HOOK_SCRIPT_REL))} {canonical_event}"
+    """Command for this installation's console entry point, independent of PATH."""
+    del project, profile
+    name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
+    invoked = Path(sys.argv[0]).absolute()
+    executable = invoked if invoked.name == name else Path(sys.executable).absolute().parent / name
+    if not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
+        raise ProfileError(f"installed bmad-loop command is unavailable: {executable}")
+    return f"{get_process_host().shell_quote(str(executable))} relay {canonical_event}"
+
+
+def relay_executable(command: str) -> Path | None:
+    """Return the executable in an absolute POSIX or Windows relay command.
+
+    A foreign path remains unusable on this host, but must still be recognized
+    as managed so init and worktree provisioning replace its stale hook.
+    """
+    text = relay_executable_text(command)
+    return Path(text) if text is not None else None
+
+
+def relay_executable_text(command: str) -> str | None:
+    """Return a relay command's executable exactly as registered.
+
+    `Path` normalizes the spelling (on Windows it treats `\\` and `/` alike), so
+    callers asking "would init write something different" compare this text.
+    """
+    for posix in (os.name != "nt", os.name == "nt"):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if (
+            len(parts) != 3
+            or parts[1] != "relay"
+            or parts[2] not in {"SessionStart", "Stop", "SessionEnd", "Notification", "PreCompact"}
+        ):
+            continue
+        raw = parts[0].strip('"')
+        for flavor in (PurePosixPath, PureWindowsPath):
+            executable = flavor(raw)
+            if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
+                return raw
+    return None
+
+
+def _legacy_relay_script(command: str) -> str | None:
+    """Recognize only the Python command that old init actually registered."""
+    for posix in (True, False):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if len(parts) < 3 or not parts[-1].isidentifier():
+            continue
+        script = parts[-2].strip('"')
+        prefix = parts[:-2]
+        # Non-POSIX shlex splits the historical Claude variable from its suffix.
+        if script.startswith("/.bmad-loop/") and prefix[-1:] == ['"$CLAUDE_PROJECT_DIR"']:
+            script = "$CLAUDE_PROJECT_DIR" + script
+            prefix = prefix[:-1]
+        if not prefix:
+            continue
+        normalized = script.replace("\\", "/")
+        if PurePosixPath(normalized).parts[-2:] != (".bmad-loop", "bmad_loop_hook.py"):
+            continue
+        interpreter = PurePosixPath(prefix[0].strip('"').replace("\\", "/")).name.lower()
+        if interpreter.startswith("python") and len(prefix) == 1:
+            return script
+        if interpreter in {"uv", "uv.exe"} and prefix[1:] == ["run", "--no-project", "python"]:
+            return script
+    return None
+
+
+def _relay_command(command: object) -> bool:
+    return isinstance(command, str) and (
+        relay_executable(command) is not None or _legacy_relay_script(command) is not None
+    )
+
+
+def _commands_in_handler(handler: object) -> Iterator[str]:
+    if not isinstance(handler, dict):
+        return
+    nested = handler.get("hooks")
+    if isinstance(nested, list):
+        for item in nested:
+            if isinstance(item, dict) and isinstance(item.get("command"), str):
+                yield item["command"]
+    elif isinstance(handler.get("command"), str):
+        yield handler["command"]
 
 
 def _hook_entry(dialect: str, command: str) -> dict:
@@ -1099,27 +1137,24 @@ def hook_event_container(config: dict, dialect: str) -> dict:
 
 def _relay_in_handlers(handlers) -> bool:
     """True if any handler in a native-event list carries the relay command."""
-    return RELAY_MARKER in json.dumps(handlers)
+    return isinstance(handlers, list) and any(
+        _relay_command(command) for handler in handlers for command in _commands_in_handler(handler)
+    )
 
 
 def _managed_hook_in_handlers(handlers) -> bool:
     """merge_hooks' dedup: a relay OR probe-capture command is already present."""
-    dumped = json.dumps(handlers)
-    return RELAY_MARKER in dumped or PROBE_MARKER in dumped
+    return _relay_in_handlers(handlers) or PROBE_MARKER in json.dumps(handlers)
 
 
 def strip_relay_hooks(config: dict, dialect: str) -> bool:
     """Drop every relay registration from a parsed hook config. True if any went.
 
-    The inverse of :func:`merge_hooks`, for the one caller that needs its own
-    registration to be authoritative rather than additive: a worktree seeded with
-    the main repo's hook config (``provision_worktree``). That config already
-    carries a relay command written for the main repo — `$CLAUDE_PROJECT_DIR`-relative
-    for the claude dialect, which resolves inside the worktree, where no relay
-    exists. `merge_hooks` will not replace it, since `_managed_hook_in_handlers`
-    reports the event as already registered, so the stale command has to go first.
+    Worktree provisioning uses this on its first encounter with a config file.
+    It removes both legacy copied-script commands and installed relay commands
+    while preserving user handlers and temporary probe handlers.
 
-    Only RELAY_MARKER commands are removed, at command granularity: a matcher
+    Only managed relay commands are removed, at command granularity: a matcher
     entry whose nested list holds a project command beside the relay keeps the
     entry and loses only the relay command. A probe-capture hook is a deliberate,
     temporary registration that no worktree seeding produces, and is left alone.
@@ -1134,7 +1169,7 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
             continue
         kept = []
         for handler in handlers:
-            if RELAY_MARKER not in json.dumps(handler):
+            if not any(_relay_command(c) for c in _commands_in_handler(handler)):
                 kept.append(handler)
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
@@ -1144,7 +1179,11 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
             # match means the entry IS the relay and it drops whole.
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
-                surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
+                surviving = [
+                    c
+                    for c in nested
+                    if not (isinstance(c, dict) and _relay_command(c.get("command")))
+                ]
                 if surviving:
                     if len(surviving) != len(nested):
                         handler["hooks"] = surviving
@@ -1164,6 +1203,35 @@ def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
     """True if the bmad-loop relay is registered for any of `events`."""
     container = hook_event_container(config, dialect)
     return any(_relay_in_handlers(container.get(event, [])) for event in events)
+
+
+def registered_relay_paths(
+    config: dict, dialect: str, events: Iterable[str], project: Path
+) -> list[tuple[Path, str]]:
+    """Paths invoked by the actual managed commands in a hook config.
+
+    Each path is paired with its registered spelling: the console relay's
+    executable text as written in the command, or the legacy script path with
+    the project directory substituted. The `Path` answers presence questions;
+    the spelling answers whether init would now write something different.
+    """
+    container = hook_event_container(config, dialect)
+    paths: list[tuple[Path, str]] = []
+    for event in events:
+        handlers = container.get(event)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _commands_in_handler(handler):
+                executable = relay_executable_text(command)
+                if executable is not None:
+                    paths.append((Path(executable), executable))
+                else:
+                    script = _legacy_relay_script(command)
+                    if script is not None:
+                        path = Path(script.replace("$CLAUDE_PROJECT_DIR", str(project)))
+                        paths.append((path, str(path)))
+    return paths
 
 
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
@@ -1186,6 +1254,18 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
                     f"hook event {native_event!r} under {ANTIGRAVITY_HOOK_GROUP!r} "
                     "is not a list; fix the hooks file before re-running init"
                 )
+            if any(
+                _relay_command(existing) and command != existing
+                for h in handlers
+                for existing in _commands_in_handler(h)
+            ):
+                scoped = {ANTIGRAVITY_HOOK_GROUP: {native_event: handlers}}
+                changed |= strip_relay_hooks(scoped, dialect)
+                if native_event in scoped[ANTIGRAVITY_HOOK_GROUP]:
+                    group[native_event] = scoped[ANTIGRAVITY_HOOK_GROUP][native_event]
+                else:
+                    del group[native_event]
+                handlers = group.setdefault(native_event, [])
             if not _managed_hook_in_handlers(handlers):
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
@@ -1195,6 +1275,20 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
     hooks = config.setdefault("hooks", {})
     for native_event, command in registrations.items():
         matchers = hooks.setdefault(native_event, [])
+        if any(
+            _relay_command(existing) and command != existing
+            for h in matchers
+            for existing in _commands_in_handler(h)
+        ):
+            # Scope the strip to this event. Profiles may share a config file;
+            # their disjoint events must survive later registrations.
+            scoped = {"hooks": {native_event: matchers}}
+            changed |= strip_relay_hooks(scoped, dialect)
+            if native_event in scoped["hooks"]:
+                hooks[native_event] = scoped["hooks"][native_event]
+            else:
+                del hooks[native_event]
+            matchers = hooks.setdefault(native_event, [])
         # claude/codex/gemini nest handlers under "hooks"; copilot stores the
         # handler dict directly in the event list — the serialized scan covers
         # both shapes so a re-run stays idempotent for every dialect.
@@ -1246,10 +1340,14 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
-    registrations = {
-        native: _hook_command(project, profile, canonical)
-        for native, canonical in profile.hooks.events.items()
-    }
+    try:
+        registrations = {
+            native: _hook_command(project, profile, canonical)
+            for native, canonical in profile.hooks.events.items()
+        }
+    except ProfileError as e:
+        print(f"FAIL: {e}")
+        return 1
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     if changed:
         # atomic_write_text, never write_text (#379), the same rule
@@ -2850,15 +2948,25 @@ def install_into(
         return 1
 
     bmad_loop_dir = project / ".bmad-loop"
+    policy_path = bmad_loop_dir / "policy.toml"
+    gitignore = project / ".gitignore"
+    # 0. confinement, before the FIRST write (#771). `_register_hooks` and
+    # `_copy_skills` guard their own destinations, but these three were written
+    # through whatever link sat at the name — a `.bmad-loop` or `.gitignore`
+    # symlink (a junction on Windows) out of the tree, or a dangling `policy.toml`
+    # link that fails `is_file()` below and is then written through. Checked up
+    # front, not at each write, so a refusal leaves no hook config or skills behind
+    # either. Strictly-below is right for all three: none may BE the project root —
+    # a `.bmad-loop` resolving to the root would drop policy.toml at top level, and
+    # the other two are files, which the root never is. An in-project link still
+    # passes and is written through, as before.
+    for target in (bmad_loop_dir, policy_path, gitignore):
+        if not _confined_to(target, project):
+            print(f"FAIL: init target escapes the project: {target}")
+            return 1
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
-
-    # 2. per-CLI hook registration
+    # 1. per-CLI hook registration
     for profile in profiles:
         if _register_hooks(project, profile) != 0:
             return 1
@@ -2875,10 +2983,15 @@ def install_into(
             return 1
 
     # 4. policy template
-    policy_path = bmad_loop_dir / "policy.toml"
     if policy_path.is_file():
         print("  policy exists, leaving untouched")
     else:
+        # write_text, not atomic_write_text: #379 is about a truncating REWRITE of
+        # contents someone owns, and this branch only runs when no regular file is
+        # there — a short write loses nothing but our own template, and the torn
+        # TOML fails loudly at the next policy load. atomic_write_text would also
+        # mint the new file mkstemp's 0600 instead of the umask default, a mode
+        # change nothing asked for.
         policy_path.write_text(POLICY_TEMPLATE, encoding="utf-8")
         print(f"  policy written: {policy_path}")
 
@@ -2887,7 +3000,6 @@ def install_into(
     # Library (.bmad-loop/cache/), and the policy file itself — policy.toml is
     # per-machine-per-repo (it carries this machine's [mux] backend choice, and
     # the TUI settings editor rewrites it), so it must never travel to teammates.
-    gitignore = project / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     have = set(existing.splitlines())
     to_add = [
@@ -2901,7 +3013,9 @@ def install_into(
         if line not in have
     ]
     if to_add:
-        with gitignore.open("a", encoding="utf-8") as f:
+        # An append, never a replace: it keeps the operator's file mode and an
+        # in-project link a link. Opened by its resolved name, the one step 0 confined.
+        with gitignore.resolve().open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(to_add) + "\n")

@@ -103,9 +103,16 @@ Transport shape (the settled design drivers):
   ``opencode.json``): a blanket permission allow (the bypass-flags
   analogue), the hermetic-skills recipe above (project ``.claude/skills``
   only — without it every session sees the operator's personal skills), and
-  the policy model when set. A per-session ``OPENCODE_SERVER_PASSWORD`` makes
-  the health poll self-discriminating against a foreign server on a reused
-  port and keeps other local processes from driving an allow-all server.
+  the policy model when set. Reasoning effort (``SessionSpec.effort``, #643)
+  deliberately does NOT ride the config: the config schema has no top-level
+  ``variant``, and its only effort key (``agent.<name>.variant``) applies solely
+  when that agent table also pins its own ``model`` — inert otherwise, which is
+  the measured negative result in #643. It is sent instead as the per-call
+  ``variant`` in every ``prompt_async`` body (``_prompt``), initial prompt and
+  nudges alike, and omitted entirely when empty. A per-session
+  ``OPENCODE_SERVER_PASSWORD`` makes the health poll self-discriminating against
+  a foreign server on a reused port and keeps other local processes from
+  driving an allow-all server.
 - **SSE ``session.idle`` ≙ the Stop hook**, filtered to this session's id —
   child/subagent sessions share the stream and emit their own idles. SSE is
   lossy upstream, so a silent or reconnecting stream degrades to an HTTP poll
@@ -370,6 +377,12 @@ class _ServerSession:
     msg_roles: dict = field(default_factory=dict)
     client: Any = None  # control httpx.Client — main thread only
     session_id: str = ""
+    # `SessionSpec.effort`, stashed once at session construction and sent as the
+    # per-call `variant` on EVERY prompt_async body this session issues (initial
+    # prompt and nudges — a nudge dropping back to the provider default mid-session
+    # would be silent drift). "" = omit the key, so the body is byte-identical to
+    # an effort-less session's.
+    variant: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
     sse_thread: threading.Thread | None = None
     sse_stop: threading.Event = field(default_factory=threading.Event)
@@ -686,6 +699,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
         launched_ns = time.time_ns()
         sess = self._spawn_server(spec)
+        sess.variant = spec.effort
         # Registered before the API handshake so the atexit sweep (and kill())
         # covers a crash mid-setup; run()'s finally-kill only exists once
         # start_session has returned a handle.
@@ -722,10 +736,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         starts no new turn, and consuming the floor for it would discard
         still-valid completion evidence of the previous turn."""
         sent_ms = _now_ms()  # sampled before the POST: it precedes the new turn
-        resp = sess.client.post(
-            f"/session/{sess.session_id}/prompt_async",
-            json={"parts": [{"type": "text", "text": text}]},
-        )
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        # Reasoning effort is a per-call PromptInput key (#643); the key is
+        # omitted, not sent empty, so an effort-less session's body is unchanged.
+        if sess.variant:
+            body["variant"] = sess.variant
+        resp = sess.client.post(f"/session/{sess.session_id}/prompt_async", json=body)
         if resp.status_code != 204:
             raise OpencodeServerError(f"prompt_async failed: {resp.status_code} {resp.text[:200]}")
         sess.floor_ms = max(sess.floor_ms, sent_ms)

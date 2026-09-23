@@ -53,10 +53,14 @@ field-by-field, and will kill this session after your final turn.
 
 - Validation rules the orchestrator enforces (a violation fails the whole
   result and burns a retry):
-  - `open_ids` must list exactly the ledger's `status: open` entries — the
-    orchestrator parses the ledger itself and compares.
-  - Every open id appears in exactly ONE of already_resolved / bundles /
-    blocked / skip / decisions. No misses, no duplicates, no invented ids.
+  - `open_ids` must list exactly this session's triage universe: every
+    `status: open` entry in the ledger or, when the invocation carries
+    `--only DW-1,DW-2,...`, exactly those named ids — the orchestrator
+    parses the ledger itself, applies the same selection, and compares.
+  - Every id in the triage universe appears in exactly ONE of
+    already_resolved / bundles / blocked / skip / decisions. No misses, no
+    duplicates, no invented ids — an open entry outside the `--only`
+    selection counts as invented.
   - Bundle names: `^[a-z0-9][a-z0-9-]{1,39}\Z`, unique, non-empty `dw_ids`,
     non-empty `intent`. An otherwise-valid overlong bundle name or decision
     option `bundle_name` is truncated to 40 characters and journaled before

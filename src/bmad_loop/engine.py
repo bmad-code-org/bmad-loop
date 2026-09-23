@@ -770,6 +770,17 @@ class Engine:
         }
         self.run_dir = run_dir
         self.journal = journal
+        # Hand the run's journal to every adapter this engine owns, so an adapter
+        # can record what only it sees — the #680 `session-idle`/`session-active`
+        # pair rides it. Deduplicated by identity: dev and review commonly share
+        # one adapter object. Attached, never wrapped: the adapter appends on the
+        # engine thread while the engine's own journal is quiescent, so this is
+        # one writer with one set of `log_task`/`log_pos` stamps, not two.
+        seen_adapters: list[CodingCLIAdapter] = []
+        for owned in self.adapters.values():
+            if not any(owned is done for done in seen_adapters):
+                owned.journal = journal
+                seen_adapters.append(owned)
         self.state = state
         self.max_stories = max_stories
         self.epic_filter = epic_filter
@@ -857,7 +868,8 @@ class Engine:
         # active workspace; `escalate` routes an intent-gap restore failure through
         # the engine's escalation; `escalation_pause` raises RunPaused for it
         # (injected so recovery_flow need not import engine — that would reintroduce
-        # a runtime<->engine cycle).
+        # a runtime<->engine cycle); `dev_attempt_dispatched` is the preserve-ref
+        # provenance probe (#777).
         self._recovery_flow = RecoveryFlow(
             paths=self.paths,
             policy=self.policy,
@@ -869,6 +881,7 @@ class Engine:
             save=self._save,
             escalate=self._escalate,
             escalation_pause=self._escalation_pause,
+            dev_attempt_dispatched=self._dev_attempt_dispatched,
         )
 
     def _escalation_pause(
@@ -1537,6 +1550,9 @@ class Engine:
     def _protected_relpaths(self) -> tuple[str, ...]:
         return self._recovery_flow.protected_relpaths()
 
+    def _retry_preserve_notice(self, task: StoryTask) -> str:
+        return self._recovery_flow.retry_preserve_notice(task)
+
     def _rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
         self._recovery_flow.rollback_or_pause(task, cause=cause)
 
@@ -2160,6 +2176,18 @@ class Engine:
             if task.sessions[index].task_id == task_id:
                 return index
         return None
+
+    def _dev_attempt_dispatched(self, task: StoryTask) -> bool:
+        """Whether a dev session of the task's current attempt was dispatched —
+        the provenance a rollback stamps on the ref it parks (#777,
+        ``StoryTask.preserve_from_attempt``). A recorded session proves it, but a
+        session is recorded only once it returns: a hard stop or host death
+        mid-session leaves none, and the restart arm then parks that session's
+        tree. A durable ``DEV_RUNNING`` covers that case — it is saved after
+        ``attempt`` is bumped and before the launch, and a resolve re-drive's
+        reset runs from the ``PENDING`` that ``runs.rearm_escalation`` leaves
+        (under a bumped ``generation``, so no current-attempt record either)."""
+        return task.phase == Phase.DEV_RUNNING or self._current_dev_session_index(task) is not None
 
     def _current_review_session_index(self, task: StoryTask) -> int | None:
         """Index of the newest review record for the current cycle."""
@@ -2908,6 +2936,9 @@ class Engine:
                 # `_session_end_extras` (#489); here the flag pairs the
                 # diagnosis with the decision it fed.
                 session_vanished=result.session_vanished,
+                # Whether the session did anything before it ended (#727); False
+                # is what routed a non-completed result to the no-work PAUSE.
+                produced_work=result.produced_work,
             )
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -5388,7 +5419,8 @@ class Engine:
     ) -> dict[str, str]:
         """Engine-variant additions to a session's environment. Base: none.
         StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
-        adapter's deterministic id-keyed read-back. ``label`` is None for the
+        adapter's deterministic id-keyed read-back; SweepEngine exports
+        BMAD_LOOP_LEDGER to its triage sessions. ``label`` is None for the
         primary dev/review session and set for an injected plugin-workflow session,
         so a variant can scope its env to primary sessions only."""
         return {}
@@ -6485,6 +6517,11 @@ class Engine:
         # healthy moments before the probe asked.
         if result.session_vanished:
             extras["session_vanished"] = True
+        # no-work diagnosis (#727): same convention — present only when the
+        # session ended non-completed without ever changing its pane after the
+        # first frame, so a grep for the field finds exactly the parked sessions.
+        if not result.produced_work:
+            extras["produced_work"] = False
         return extras
 
     @staticmethod
@@ -6679,6 +6716,7 @@ class Engine:
             cwd=self.workspace.root,
             env=env,
             model=cfg.model,
+            effort=cfg.effort,
             timeout_s=self._session_timeout_s(self.policy.limits.session_timeout_min * 60),
             stall_nudges_cap=(
                 self.policy.limits.workflow_stall_nudges_cap
@@ -7063,6 +7101,13 @@ class Engine:
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 ) + after_sentence
+            # The two fresh-baseline legs below may follow a rolled-back attempt:
+            # point at its parked work in a paragraph of its own (#777). It sits
+            # after the park clause, which stays last on the invocation line; these
+            # legs carry no feedback-file pointer for its backticks to be read as.
+            preserved = self._retry_preserve_notice(task)
+            after_sentence += f"\n\n{preserved}" if preserved else ""
+            after_key += f"\n\n{preserved}" if preserved else ""
             # The attempt binding was resolved in the active workspace immediately
             # before DEV_RUNNING became durable. A retained `spec_file` alone may
             # name a discarded unit worktree, so it cannot authorize this route or

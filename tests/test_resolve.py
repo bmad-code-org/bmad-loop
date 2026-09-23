@@ -3684,6 +3684,28 @@ def _minted_id(tmp_path, monkeypatch, story_key, generation) -> str:
     return adapter.specs[0].task_id
 
 
+def test_run_session_threads_model_and_effort_onto_the_spec(tmp_path, monkeypatch):
+    """`cmd_resolve` reads both from `pol.adapter.resolved("dev")`; `run_session`
+    must hand both to the adapter on the spec (#643 for effort), and default both
+    to "" so every existing caller stays byte-identical."""
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
+    adapter = _SpecCapture()
+    resolve.run_session(
+        adapter,
+        tmp_path,
+        tmp_path / "run",
+        "6-4-cli-list-command",
+        generation=0,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    assert adapter.specs[0].model == "anthropic/claude-x"
+    assert adapter.specs[0].effort == "max"
+    plain = _SpecCapture()
+    resolve.run_session(plain, tmp_path, tmp_path / "run", "6-4-cli-list-command", generation=0)
+    assert plain.specs[0].model == "" and plain.specs[0].effort == ""
+
+
 def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(
     tmp_path, monkeypatch
 ):

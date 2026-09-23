@@ -384,6 +384,11 @@ there.
 | `pre_integrate`                                    | before integrating a finished unit                                                | —                                                     |
 | `pre_merge` / `post_merge`                         | around the local branch merge                                                     | —                                                     |
 
+`post_story` fires after an isolated unit's worktree teardown. If the worktree was
+removed, a declarative `post_story` hook runs from the repo root and
+`BMAD_LOOP_WORKTREE` still names the removed worktree; if it was kept (a deferred
+unit under `keep_failed`), the hook runs from that worktree.
+
 ### Dev
 
 | Stage                              | When                             | Mutable surface                                                                      |

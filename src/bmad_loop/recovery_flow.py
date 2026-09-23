@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
@@ -58,6 +59,85 @@ def attempt_preserve_ref_name(run_id: str, tip: str) -> str:
     return f"attempt-preserve/{safe_ref_segment(run_id)}-{tip[:8]}"
 
 
+def retry_preserve_paragraph(repo: Path, task: StoryTask, run_id: str) -> str:
+    """The retry dev prompt's pointer at an earlier attempt's parked work (#777),
+    or "" when the evidence does not support one. Informational only: the
+    orchestrator never replays, merges or cherry-picks the ref, and the paragraph
+    never asks the session to.
+
+    Shared by every dev-prompt builder (``Engine._generic_dev_prompt``,
+    ``StoriesEngine._stories_dev_prompt``, ``SweepEngine._generic_bundle_prompt``)
+    through ``Engine._retry_preserve_notice``; each appends it, as its own
+    paragraph, to its fresh-baseline legs only — a repair leg keeps the rejected
+    attempt's tree, and a patch-restore leg has already laid that attempt back
+    onto it. ``task.preserve_ref`` is set only by an auto-rollback of this task,
+    so a set ref already means this dispatch follows a rolled-back attempt.
+
+    Offered only when git confirms the claim, through the verify chokepoint:
+
+    - the name is one this run's rollback mints — ``refs/attempt-preserve-dirty/
+      <run>-<baseline8>-<attempt>[-rN]`` with ``<baseline8>`` this task's baseline,
+      or the ``attempt-preserve/<run>-<tip8>`` commits branch whose ``<tip8>`` is
+      the commit it still resolves to;
+    - it resolves to a commit (``rev-parse --verify <ref>^{commit}``) — a ref the
+      run-start retention pruned before a resume does not;
+    - that commit descends from, and differs from, ``task.baseline_commit`` — so
+      the offered ``git diff`` is this task's work over this task's tree. A
+      baseline re-stamped past the work (another unit merged first) fails it.
+
+    ``preserve_from_attempt`` must be set: git can show that the ref is this
+    run's and sits on this baseline, but not that a dispatched attempt produced
+    it. A resolve re-drive parks a tree no attempt wrote, and a sweep bundle
+    replacement keeps the superseded bundle's ref on the same key and baseline;
+    both leave the flag False.
+
+    Says "an earlier attempt", never "the previous" one: a clean rollback keeps
+    an older attempt's ref (see ``rollback_or_pause``), and ``task.attempt`` is
+    re-armed to 0 by a resolve, so neither the ref nor the counter proves the
+    work is the immediately preceding attempt's. ``preserve_partial`` narrows the
+    claim to the commits alone. A failed check omits the paragraph and leaves the
+    ref and task untouched: the ref may still be the only copy of that work."""
+    ref = task.preserve_ref
+    baseline = task.baseline_commit
+    if not ref or not baseline or not task.preserve_from_attempt:
+        return ""
+    slug = re.escape(safe_ref_segment(run_id))
+    dirty = re.fullmatch(rf"refs/attempt-preserve-dirty/{slug}-([0-9a-f]{{8}})-\d+(?:-r\d+)?", ref)
+    commits = re.fullmatch(rf"attempt-preserve/{slug}-([0-9a-f]{{8}})", ref)
+    if dirty is not None:
+        if dirty.group(1) != baseline[:8]:
+            return ""
+        refname = ref
+    elif commits is not None:
+        # Fully qualified so neither the check nor the offered commands can fall
+        # back to a same-named tag or remote ref.
+        refname = f"refs/heads/{ref}"
+    else:
+        return ""
+    try:
+        tip = verify.rev_parse_revision(repo, refname)
+    except (verify.GitError, OSError):
+        return ""
+    if commits is not None and tip[:8] != commits.group(1):
+        return ""
+    if tip == baseline or not verify.is_ancestor(repo, baseline, tip):
+        return ""
+    if task.preserve_partial:
+        held = (
+            f"only its commits were preserved, at `{refname}` — its uncommitted "
+            f"changes were not captured there"
+        )
+    else:
+        held = f"its work is preserved at `{refname}`"
+    return (
+        f"An earlier attempt at this work was rolled back; {held}. Inspect it with "
+        f"`git log --oneline {baseline}..{refname}` and `git diff {baseline} {refname}`. "
+        f"That work is unverified and has not been applied to this working tree: "
+        f"judge anything you take from it against the spec, and every gate must "
+        f"pass fresh on this attempt."
+    )
+
+
 class _OwnedSpecAuthorityError(RuntimeError):
     """A previously canonical owned spec lost trustworthy restore authority."""
 
@@ -89,7 +169,9 @@ class RecoveryFlow:
     ``escalation_pause`` raises the engine's ``RunPaused`` (injected so this
     module need not import ``engine`` — that would reintroduce a runtime<->engine
     import cycle). ``workspace_get`` reads the engine's live (worktree-swappable)
-    active workspace."""
+    active workspace. ``dev_attempt_dispatched`` answers whether a dev session of
+    the task's current attempt was dispatched — the provenance a rollback stamps
+    on the ref it parks (``StoryTask.preserve_from_attempt``)."""
 
     def __init__(
         self,
@@ -104,6 +186,7 @@ class RecoveryFlow:
         save: Callable[[], None],
         escalate: Callable[[StoryTask, str], None],
         escalation_pause: Callable[..., NoReturn],
+        dev_attempt_dispatched: Callable[[StoryTask], bool],
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -119,6 +202,7 @@ class RecoveryFlow:
         self._save = save
         self._escalate = escalate
         self._pause = escalation_pause
+        self._dev_attempt_dispatched = dev_attempt_dispatched
 
     def protected_relpaths(self) -> tuple[str, ...]:
         """Repo-relative posix paths of the BMAD artifact folders. These are
@@ -1207,6 +1291,9 @@ class RecoveryFlow:
             # ref is then the only place the story's work survives.
             task.preserve_ref = None
             task.preserve_partial = False
+            # Provenance for whatever this rollback parks (#777): the retry
+            # prompt names the ref only when a dev session of this attempt ran.
+            task.preserve_from_attempt = self._dev_attempt_dispatched(task)
             self.journal.append(
                 "rollback-auto",
                 story_key=task.story_key,
@@ -1480,6 +1567,11 @@ class RecoveryFlow:
             advance(task, Phase.DEV_VERIFY)
             self._escalate(task, f"intent-gap restore patch failed to apply: {e}")
         self.journal.append("attempt-restored", story_key=task.story_key, patch=task.restore_patch)
+
+    def retry_preserve_notice(self, task: StoryTask) -> str:
+        """:func:`retry_preserve_paragraph` against the active workspace — recovery
+        refs are shared by every worktree of the repository — and this run."""
+        return retry_preserve_paragraph(self._workspace_get().root, task, self.state.run_id)
 
     def prune_preserve_refs(self) -> None:
         """Bounded retention for both recovery-ref families at run start — the

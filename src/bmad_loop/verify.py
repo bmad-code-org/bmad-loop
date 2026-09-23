@@ -4979,7 +4979,7 @@ def attempt_dirty(
         return True
     if baseline_untracked is None:
         return False
-    created = untracked_files(repo) - set(baseline_untracked)
+    created = _created_untracked(repo, baseline_untracked)
     created = {p for p in created if not _path_under_any(p, exclude)}
     return bool(created)
 
@@ -5237,15 +5237,115 @@ def untracked_files(repo: Path) -> set[str]:
     plain `git clean -fd` (no -x) treats as removable. Ignored files are
     excluded, so they are never rollback candidates.
 
-    Reads stdout ALONE (`_git_out`): `ls-files` exits 0 while still writing to
-    stderr, and against `_git`'s merged stream that chatter splits into a phantom
-    untracked path — a PRISTINE tree answers with one, and because this function's
-    contract is what `git clean -fd` would remove, the phantom is a rollback
-    candidate. Silent, on every host whose git config warns (#442)."""
-    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
-    if rc != 0:
+    NUL-delimited and read VERBATIM (#783), because these names are operands:
+    `snapshot_worktree` hands them to `git add --` and the rollback cleanup
+    deletes them. The line-based read this replaces got `core.quotePath`'s
+    C-quoted spelling of every non-ASCII name — not a path, so the snapshot's
+    `add` failed and the rollback refused — and `.strip()` ate edge spaces.
+    Bytes rather than text mode, whose universal-newline read turns a `\\r` in a
+    name into `\\n`; each record is decoded strictly with the filesystem codec,
+    so it names the file `Path` and argv will reach.
+
+    A record that codec cannot decode keeps its pre-#783 answer, the quoted
+    spelling (`_c_quote_path`): an inert token that matches itself across the
+    baseline and later reads, rather than a GitError that would fail every
+    baseline capture in a repo holding one such stray, or surrogates that would
+    leak into the state and journal JSON (see `_run_git`).
+
+    stdout ALONE, as before (#442): `ls-files` exits 0 while still writing to
+    stderr, and a merged stream would turn that chatter into a phantom path."""
+    proc = git_bytes(repo, "ls-files", "-z", "--others", "--exclude-standard")
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
         raise GitError(f"git ls-files --others failed in {repo}: {detail}")
-    return {line.strip() for line in out.splitlines() if line.strip()}
+    return {_decode_git_path(rel) for rel in proc.stdout.split(b"\0") if rel}
+
+
+# quote.c `cq_lookup`: the bytes git escapes by letter; every other byte it must
+# quote is written as a three-digit octal escape.
+_CQ_LETTER_ESCAPES = {
+    0x07: b"a",
+    0x08: b"b",
+    0x09: b"t",
+    0x0A: b"n",
+    0x0B: b"v",
+    0x0C: b"f",
+    0x0D: b"r",
+    0x22: b'"',
+    0x5C: b"\\",
+}
+
+
+def _c_quote_path(raw: bytes, *, quote_fully: bool) -> bytes:
+    """git's `quote_c_style` of one path, as non-`-z` porcelain prints it.
+
+    Control bytes, DEL, `"` and `\\` always force quoting; bytes >= 0x80 do only
+    under ``quote_fully`` (`core.quotePath`, default true). A name needing none
+    comes back unchanged, otherwise double-quoted with every such byte escaped."""
+
+    def must_quote(b: int) -> bool:
+        return b < 0x20 or b == 0x7F or b in (0x22, 0x5C) or (quote_fully and b >= 0x80)
+
+    if not any(must_quote(b) for b in raw):
+        return raw
+    out = bytearray(b'"')
+    for b in raw:
+        if not must_quote(b):
+            out.append(b)
+        elif b in _CQ_LETTER_ESCAPES:
+            out += b"\\" + _CQ_LETTER_ESCAPES[b]
+        else:
+            out += b"\\%03o" % b
+    out += b'"'
+    return bytes(out)
+
+
+def _decode_git_path(raw: bytes) -> str:
+    """One `-z` path record as `untracked_files` answers it — see there."""
+    try:
+        return raw.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        return _c_quote_path(raw, quote_fully=True).decode("ascii")
+
+
+def _pre_783_spellings(name: str) -> set[str]:
+    """Every record the pre-#783 line-based `untracked_files` could have
+    persisted for the file ``name``, under either `core.quotePath` setting: the
+    C-quoted rendering, split on lines and stripped as that reader did."""
+    raw = name.encode(sys.getfilesystemencoding(), "surrogateescape")
+    spellings: set[str] = set()
+    for quote_fully in (True, False):
+        try:
+            rendered = _c_quote_path(raw, quote_fully=quote_fully).decode(
+                sys.getfilesystemencoding()
+            )
+        except UnicodeDecodeError:
+            continue  # that reader raised on this name, so persisted nothing for it
+        spellings.update(r.strip() for r in rendered.splitlines() if r.strip())
+    return spellings
+
+
+def _created_untracked(repo: Path, baseline_untracked: list[str]) -> set[str]:
+    """The untracked files this attempt created, for the ROLLBACK side —
+    `snapshot_worktree`, `_rollback_cleanup_plan` and the `attempt_dirty` gate
+    that mirrors them.
+
+    A path counts only when neither its exact name nor any `_pre_783_spellings`
+    of it is in the baseline. A baseline persisted before #783 holds the quoted
+    or stripped records of the old reader, so an exact difference alone would
+    turn every pre-existing non-ASCII or space-edged file of a resumed run into
+    a deletion target. Matching the old spellings is exact where it matters:
+    each file's old records ARE its spellings, so every file a legacy baseline
+    listed stays protected. The only cost is spurious matches (a new ` a` beside
+    a baseline `a`), and those fail toward leaving a file alone, the direction
+    the rollback gates fail in. The proof-of-work gate (`_changes_since`) keeps
+    the exact difference: it fails open toward "work happened" instead."""
+    baseline = set(baseline_untracked)
+    return {
+        path
+        for path in untracked_files(repo) - baseline
+        if baseline.isdisjoint(_pre_783_spellings(path))
+    }
 
 
 def path_tracked(repo: Path, rel: str) -> bool:
@@ -5877,7 +5977,7 @@ def snapshot_worktree(
     are left untouched: seed the temp index from HEAD, ``add -u`` the tracked
     edits/deletions, then stage only the untracked files *this run* created —
     ``untracked_files(repo)`` minus ``baseline_untracked`` (the snapshot taken
-    when the baseline was captured). This mirrors :func:`safe_rollback`'s scope
+    when the baseline was captured; :func:`_created_untracked`). This mirrors :func:`safe_rollback`'s scope
     exactly: the snapshot holds precisely what the reset would destroy and never
     a pre-existing user untracked file. When ``baseline_untracked`` is ``None`` (a
     pre-upgrade/resumed run with no snapshot) no untracked file is staged — matching
@@ -5931,7 +6031,7 @@ def snapshot_worktree(
         if baseline_untracked is None:
             new: list[str] = []
         else:
-            new = sorted(untracked_files(repo) - set(baseline_untracked))
+            new = sorted(_created_untracked(repo, baseline_untracked))
         if new:
             rc, out = _git_env(repo, "add", "--", *new, env=env)
             if rc != 0:
@@ -6033,7 +6133,7 @@ def _rollback_cleanup_plan(
     if baseline_untracked is None:
         return _RollbackCleanupPlan(repo_root=None, keep_roots=(), targets=())
 
-    created = untracked_files(repo) - set(baseline_untracked)
+    created = _created_untracked(repo, baseline_untracked)
     try:
         repo_root = repo.resolve()
         keep_roots = tuple((repo_root / rel).resolve() for rel in keep)
@@ -7525,13 +7625,15 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
 
     Unlike `_git`, the tracked diff is read from stdout alone and left verbatim
     (no strip, no stderr merge) so the patch stays applyable, as is the
-    `--no-index` spawn below it. The untracked leg now matches those two
-    (`_git_out`, #442): its `ls-files` exits 0 while still
-    warning on stderr, so against the merged stream the warning splits off as a
-    phantom rel. Measured, that phantom is inert here — `diff --no-index` cannot
-    access it and exits 1, exactly the code the loop below already tolerates as
-    "the files differ", with empty stdout — so this leg is converted for the same
-    reason its two neighbours read stdout alone, not on a demonstrated corruption.
+    `--no-index` spawn below it. The untracked names come from `untracked_files`,
+    which inherits the same stdout-alone read (#442) and returns each name
+    verbatim (#783). The line-based read it replaces got `core.quotePath`'s
+    C-quoted spelling of a non-ASCII name; `--no-index` cannot open that
+    spelling and exits 1 with empty stdout, the code the loop tolerates as "the
+    files differ", so the file silently dropped out of the patch. Residual: a
+    name the filesystem codec cannot decode still arrives as `untracked_files`'
+    quoted token, `--no-index` cannot open it, and it stays omitted — the same
+    residual #783 left.
 
     max_file_bytes caps the size of each *untracked* file included: a file larger
     than the cap is skipped and replaced with a one-line marker naming it and its
@@ -7543,13 +7645,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
         raise GitError(f"git diff {baseline} failed in {repo}: {proc.stderr.strip()}")
     parts = [proc.stdout]
 
-    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
-    if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
-    for rel in out.splitlines():
-        rel = rel.strip()
-        if not rel:
-            continue
+    for rel in sorted(untracked_files(repo)):
         if max_file_bytes is not None:
             try:
                 size = (repo / rel).stat().st_size

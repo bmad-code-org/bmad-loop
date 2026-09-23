@@ -1,18 +1,23 @@
 """ProjectPaths.repo_root / rebased and load_paths(repo_root) — the Phase 1
 Workspace-seam foundation. repo_root defaults to project (today's behavior);
 rebased re-roots artifacts onto a worktree-style checkout. Plus
-worktree_isolation_conflict, the #414 refusal predicate built on the same pair."""
+worktree_isolation_conflict, the #414 refusal predicate built on the same pair, and
+load_paths' two sources: the four-layer central TOML and the legacy YAML (#769)."""
 
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 
 import pytest
 from conftest import (
+    CENTRAL_TEAM_CONFIG,
+    CENTRAL_USER_CONFIG,
     NUL_PATH_RESOLVE_FAULTS,
     UNRESOLVABLE,
+    install_bmad_central_config,
     install_bmad_config,
     refuse_to_resolve,
 )
@@ -396,3 +401,486 @@ def test_load_paths_refuses_a_degraded_root_beside_canonically_spelled_config_pa
     # the full prefix: this row pins the ROOT refusing, not a member's shared stem
     with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize the project root"):
         bmadconfig.load_paths(root)
+
+
+# ------------- the four-layer central TOML config (#769, #154) -------------
+#
+# Fixtures follow BMAD-METHOD v6.12.0 (see `CENTRAL_TEAM_CONFIG` in conftest for the
+# installer source they are derived from); resolution follows that tag's
+# `src/scripts/config_utils.py` (layers, structural merge) and
+# `src/scripts/render_skill.py` `_resolve_short_config` (short-key lookup).
+
+_LAYERS = [str(rel) for rel in bmadconfig.CENTRAL_LAYERS_REL]
+_DEFAULT_IMPL = "_bmad-output/implementation-artifacts"
+
+
+def _write_layer(root: Path, index: int, text: str | bytes) -> Path:
+    path = root / bmadconfig.CENTRAL_LAYERS_REL[index]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(text, bytes):
+        path.write_bytes(text)
+    else:
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _toml_only(tmp_path: Path) -> Path:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    _write_layer(root, 1, CENTRAL_USER_CONFIG)
+    return root
+
+
+def test_load_paths_reads_the_769_toml_only_layout(project) -> None:
+    """The reported install: `_bmad/config.toml` and friends, no `_bmad/bmm/`."""
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
+
+    loaded = bmadconfig.load_paths(project.project)
+
+    assert loaded.implementation_artifacts == root / _DEFAULT_IMPL
+    assert loaded.planning_artifacts == root / "_bmad-output" / "planning-artifacts"
+    assert loaded.output_folder == root / "_bmad-output"
+    assert loaded.repo_root == root
+
+
+def test_toml_only_and_yaml_only_installs_resolve_identically(project, tmp_path) -> None:
+    """The same install answers through either source give the same snapshot."""
+    install_bmad_central_config(project)
+    from_toml = bmadconfig.load_paths(project.project)
+    (project.project / "_bmad" / "config.toml").unlink()
+    (project.project / "_bmad" / "config.user.toml").unlink()
+    (project.project / "_bmad" / "custom" / "config.toml").unlink()
+    (project.project / "_bmad" / "custom" / "config.user.toml").unlink()
+    install_bmad_config(project)
+    assert bmadconfig.load_paths(project.project) == from_toml
+
+
+@pytest.mark.parametrize("upper", [1, 2, 3])
+def test_each_layer_overrides_the_one_below(tmp_path: Path, upper: int) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    if upper > 1:
+        _write_layer(
+            root, upper - 1, '[modules.bmm]\nimplementation_artifacts = "{project-root}/lower"\n'
+        )
+    _write_layer(root, upper, '[modules.bmm]\nimplementation_artifacts = "{project-root}/upper"\n')
+
+    loaded = bmadconfig.load_paths(root)
+
+    assert loaded.implementation_artifacts == root.resolve() / "upper"
+    # tables merge rather than replace: the base layer's sibling key survives
+    assert loaded.planning_artifacts == root.resolve() / "_bmad-output" / "planning-artifacts"
+
+
+def test_a_lower_layer_does_not_beat_a_higher_one(tmp_path: Path) -> None:
+    """Order, not presence: the base layer's value loses to the custom user layer's
+    even with the layers between them silent."""
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    _write_layer(root, 3, '[core]\noutput_folder = "{project-root}/mine"\n')
+    assert bmadconfig.load_paths(root).output_folder == root.resolve() / "mine"
+
+
+@pytest.mark.parametrize(
+    ("layer", "text", "expected"),
+    [
+        # the #154 shape: the same key under [core] and [modules.bmm]
+        (
+            0,
+            '[core]\nimplementation_artifacts = "{project-root}/core"\n',
+            "core.implementation_artifacts",
+        ),
+        # an override layer adding the key in a section of its own
+        (
+            2,
+            '[core]\nimplementation_artifacts = "{project-root}/core"\n',
+            "core.implementation_artifacts",
+        ),
+        # arbitrarily deep, as the renderer searches the whole tree
+        (
+            3,
+            '[agents.bmad-agent-dev]\nimplementation_artifacts = "x"\n',
+            "agents.bmad-agent-dev.implementation_artifacts",
+        ),
+    ],
+)
+def test_a_key_in_two_sections_is_ambiguous(
+    tmp_path: Path, layer: int, text: str, expected: str
+) -> None:
+    """The renderer refuses a short key matched more than once, and so does this —
+    no "`[modules.bmm]` beats `[core]`" tie-break (#154's obsolete proposal), and no
+    falling back to the YAML, which is present here and would resolve cleanly."""
+    root = _toml_only(tmp_path)
+    _write_config(root)  # a valid legacy YAML beside it must not rescue the load
+    base = (root / bmadconfig.CENTRAL_LAYERS_REL[0]).read_text(encoding="utf-8")
+    if layer == 0:
+        _write_layer(root, 0, base.replace("[core]\n", text, 1))
+    else:
+        _write_layer(root, layer, text)
+
+    with pytest.raises(bmadconfig.BmadConfigError) as excinfo:
+        bmadconfig.load_paths(root)
+
+    message = str(excinfo.value)
+    assert "ambiguous config value `implementation_artifacts` found at:" in message
+    assert "modules.bmm.implementation_artifacts" in message
+    assert expected in message
+    # every location names the layer it came from
+    assert str(root.resolve() / _LAYERS[0]) in message
+    assert str(root.resolve() / _LAYERS[layer]) in message
+
+
+def test_the_same_path_in_two_layers_is_an_override_not_an_ambiguity(tmp_path: Path) -> None:
+    root = _toml_only(tmp_path)
+    _write_layer(root, 2, '[core]\noutput_folder = "{project-root}/team-out"\n')
+    assert bmadconfig.load_paths(root).output_folder == root.resolve() / "team-out"
+
+
+@pytest.mark.parametrize("key", ["implementation_artifacts", "planning_artifacts"])
+def test_a_required_key_absent_from_both_sources_fails(tmp_path: Path, key: str) -> None:
+    root = _toml_only(tmp_path)
+    kept = CENTRAL_TEAM_CONFIG.replace(f"{key} = ", f"unused_{key} = ")
+    _write_layer(root, 0, kept)
+
+    with pytest.raises(bmadconfig.BmadConfigError, match=f"missing `{key}`") as excinfo:
+        bmadconfig.load_paths(root)
+    assert str(root.resolve() / bmadconfig.LEGACY_CONFIG_REL) in str(excinfo.value)
+
+
+def test_optional_keys_absent_from_both_sources_keep_their_defaults(tmp_path: Path) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_layer(
+        root,
+        0,
+        '[modules.bmm]\nimplementation_artifacts = "{project-root}/i"\n'
+        'planning_artifacts = "{project-root}/pl"\n',
+    )
+    loaded = bmadconfig.load_paths(root)
+    assert loaded.output_folder == root.resolve() / "_bmad-output"
+    assert loaded.repo_root == root.resolve()
+
+
+@pytest.mark.parametrize(
+    ("value", "complaint"),
+    [
+        ('""', "must not be empty"),
+        ('"   "', "must not be empty"),
+        ("42", "must be a string, got int"),
+        ("true", "must be a string, got bool"),
+        ('["{project-root}/a"]', "must be a string, got list"),
+        ('{ path = "{project-root}/a" }', "must be a string, got table"),
+    ],
+)
+@pytest.mark.parametrize("key", ["implementation_artifacts", "output_folder", "repo_root"])
+def test_a_blank_or_wrong_typed_toml_value_refuses_instead_of_falling_back(
+    tmp_path: Path, key: str, value: str, complaint: str
+) -> None:
+    """Present-but-unusable is an error, not an absence: the legacy YAML beside it
+    carries a perfectly good value for every key and must not be consulted."""
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(
+        root,
+        output_folder="{project-root}/yaml-out",
+        repo_root="{project-root}",
+    )
+    body = (
+        CENTRAL_TEAM_CONFIG.replace(f"{key} = ", f"unused_{key} = ")
+        + f"\n[custom]\n{key} = {value}\n"
+    )
+    _write_layer(root, 0, body)
+
+    with pytest.raises(bmadconfig.BmadConfigError, match=complaint) as excinfo:
+        bmadconfig.load_paths(root)
+    message = str(excinfo.value)
+    assert f"custom.{key}" in message, "the error names the key"
+    assert str(root.resolve() / _LAYERS[0]) in message, "the error names the file"
+
+
+def test_an_array_of_tables_is_opaque_to_the_lookup(tmp_path: Path) -> None:
+    """The renderer never descends into arrays, so a same-named key inside an array
+    of tables is neither a match nor an ambiguity — and neither is it here."""
+    root = _toml_only(tmp_path)
+    _write_layer(
+        root,
+        2,
+        '[[extras]]\nid = "a"\nimplementation_artifacts = "{project-root}/nope"\n',
+    )
+    loaded = bmadconfig.load_paths(root)
+    assert loaded.implementation_artifacts == root.resolve() / _DEFAULT_IMPL
+
+
+def test_a_higher_layer_scalar_replaces_a_lower_table(tmp_path: Path) -> None:
+    """`structural_merge` replaces unless both sides are tables: a scalar `modules`
+    in an override layer removes `[modules.bmm]` wholesale, so its keys are gone."""
+    root = _toml_only(tmp_path)
+    _write_layer(root, 3, 'modules = "gone"\n')
+    with pytest.raises(bmadconfig.BmadConfigError, match="missing `implementation_artifacts`"):
+        bmadconfig.load_paths(root)
+
+
+# --- mixed installs: TOML wins per key, YAML fills only what TOML lacks ---
+
+
+@pytest.mark.parametrize(
+    "key", ["implementation_artifacts", "planning_artifacts", "output_folder", "repo_root"]
+)
+def test_mixed_install_toml_value_wins_over_yaml(tmp_path: Path, key: str) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root, **{key: "{project-root}/from-yaml"})
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    _write_layer(root, 2, f'[custom]\n{key} = "{{project-root}}/from-toml"\n')
+    if key != "repo_root":
+        # move the base layer's own entry aside so the custom one is the only match
+        base = CENTRAL_TEAM_CONFIG.replace(f"{key} = ", f"unused_{key} = ")
+        _write_layer(root, 0, base)
+
+    loaded = bmadconfig.load_paths(root)
+    assert getattr(loaded, key) == root.resolve() / "from-toml"
+
+
+@pytest.mark.parametrize(
+    "key", ["implementation_artifacts", "planning_artifacts", "output_folder", "repo_root"]
+)
+def test_mixed_install_yaml_fills_a_key_absent_from_toml(tmp_path: Path, key: str) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root, **{key: "{project-root}/from-yaml"})
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG.replace(f"{key} = ", f"unused_{key} = "))
+
+    loaded = bmadconfig.load_paths(root)
+    assert getattr(loaded, key) == root.resolve() / "from-yaml"
+    if key != "implementation_artifacts":
+        # and the keys TOML does carry are still TOML's
+        assert loaded.implementation_artifacts == root.resolve() / _DEFAULT_IMPL
+
+
+def test_mixed_install_reports_a_yaml_filled_key_by_its_yaml_origin(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    target = tmp_path / "elsewhere"
+    _write_config(root, repo_root=str(target))
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    refuse_to_resolve(monkeypatch, target)
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot canonicalize") as excinfo:
+        bmadconfig.load_paths(root)
+    assert f"`repo_root` in {root.resolve() / bmadconfig.LEGACY_CONFIG_REL}" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2, 3])
+def test_malformed_toml_in_any_layer_refuses_instead_of_falling_back(
+    tmp_path: Path, layer: int
+) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root)  # a valid legacy YAML must not rescue the load
+    for index in range(4):
+        _write_layer(root, index, CENTRAL_TEAM_CONFIG if index == 0 else "")
+    _write_layer(root, layer, "[core\nbroken = \n")
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="invalid TOML in") as excinfo:
+        bmadconfig.load_paths(root)
+    assert str(root.resolve() / _LAYERS[layer]) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2, 3])
+def test_undecodable_toml_in_any_layer_refuses_instead_of_falling_back(
+    tmp_path: Path, layer: int
+) -> None:
+    """tomllib raises UnicodeDecodeError — a ValueError, not TOMLDecodeError — so it
+    needs its own conversion or it escapes every `except BmadConfigError`."""
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root)
+    _write_layer(root, 0, CENTRAL_TEAM_CONFIG)
+    _write_layer(root, layer, b'[core]\nuser_name = "\xff\xfe"\n')
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="not valid UTF-8") as excinfo:
+        bmadconfig.load_paths(root)
+    assert str(root.resolve() / _LAYERS[layer]) in str(excinfo.value)
+
+
+def test_a_layer_that_is_not_a_file_refuses(tmp_path: Path) -> None:
+    root = _toml_only(tmp_path)
+    (root / bmadconfig.CENTRAL_LAYERS_REL[2]).mkdir(parents=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="not a file"):
+        bmadconfig.load_paths(root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("target", ["missing.toml", "config.toml"], ids=["dangling", "loop"])
+def test_a_layer_symlink_that_resolves_to_no_file_refuses(tmp_path: Path, target: str) -> None:
+    """`exists()` follows the link and reads a dangling (or self-looping) one as
+    absent, which would let the YAML fill the key: present-but-unreadable must
+    refuse, like a directory at the layer path does.
+
+    Ablation: gate on `exists()` alone and the load succeeds off the YAML."""
+    root = _toml_only(tmp_path)
+    _write_config(root)  # a valid legacy YAML must not rescue the load
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[2]
+    layer.parent.mkdir(parents=True, exist_ok=True)
+    layer.symlink_to(target)  # relative to custom/: nothing there, or itself
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="resolves to no file") as excinfo:
+        bmadconfig.load_paths(root)
+    assert str(root.resolve() / _LAYERS[2]) in str(excinfo.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_a_layer_symlink_to_a_real_file_is_read(tmp_path: Path) -> None:
+    root = _toml_only(tmp_path)
+    shared = root / "shared-override.toml"
+    shared.write_text(
+        '[modules.bmm]\nimplementation_artifacts = "{project-root}/linked-impl"\n',
+        encoding="utf-8",
+    )
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
+    layer.parent.mkdir(parents=True, exist_ok=True)
+    layer.symlink_to(shared)
+
+    assert bmadconfig.load_paths(root).implementation_artifacts == root.resolve() / "linked-impl"
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_a_layer_behind_an_unreadable_directory_refuses_typed(tmp_path: Path) -> None:
+    """An unreadable layer directory is neither absent nor an untyped crash: through
+    3.13 `exists()` raises PermissionError past every `except BmadConfigError`, and
+    on 3.14+ it reads the layer as absent so the YAML fills the key.
+
+    Ablation: probe with `exists()` again and this raises PermissionError (<=3.13) or
+    loads off the YAML (3.14+)."""
+    root = _toml_only(tmp_path)
+    _write_config(root)  # a valid legacy YAML must not rescue the load
+    custom = root / bmadconfig.CENTRAL_LAYERS_REL[2].parent
+    custom.mkdir(parents=True)
+    custom.chmod(0)
+    try:
+        with pytest.raises(bmadconfig.BmadConfigError, match="cannot read") as excinfo:
+            bmadconfig.load_paths(root)
+    finally:
+        custom.chmod(0o755)
+    assert str(root.resolve() / _LAYERS[2]) in str(excinfo.value)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+@pytest.mark.parametrize("central", [True, False], ids=["mixed", "yaml-only"])
+def test_an_unreadable_legacy_directory_refuses_typed(tmp_path: Path, central: bool) -> None:
+    """The legacy YAML probe gets the layers' typing: through 3.13 `is_file()` raises
+    PermissionError past every `except BmadConfigError`, and on 3.14+ it reads the
+    YAML as absent, misreporting an unreadable fallback as a missing key.
+
+    Ablation: probe with `config_path.is_file()` again and this raises
+    PermissionError (<=3.13) or the wrong BmadConfigError (3.14+)."""
+    root = tmp_path / "p"
+    root.mkdir()
+    if central:  # a TOML that omits the path keys, so the lookup falls to the YAML
+        _write_layer(root, 0, b'[core]\nuser_name = "me"\n')
+    _write_config(root)
+    legacy_dir = root / bmadconfig.LEGACY_CONFIG_REL.parent
+    legacy_dir.chmod(0)
+    try:
+        with pytest.raises(bmadconfig.BmadConfigError, match="cannot read") as excinfo:
+            bmadconfig.load_paths(root)
+    finally:
+        legacy_dir.chmod(0o755)
+    assert str(root.resolve() / bmadconfig.LEGACY_CONFIG_REL) in str(excinfo.value)
+
+
+def test_no_toml_and_no_yaml_names_both_expected_locations(tmp_path: Path) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    with pytest.raises(bmadconfig.BmadConfigError, match="BMAD config not found") as excinfo:
+        bmadconfig.load_paths(root)
+    message = str(excinfo.value)
+    assert str(root.resolve() / _LAYERS[0]) in message
+    assert str(root.resolve() / bmadconfig.LEGACY_CONFIG_REL) in message
+
+
+def test_yaml_only_keeps_its_falsy_means_absent_semantics(tmp_path: Path) -> None:
+    """With no TOML layer the legacy reading is untouched: a blank YAML value is an
+    absent key, not the refusal a blank TOML value gets."""
+    root = tmp_path / "p"
+    root.mkdir()
+    _write_config(root, output_folder="")
+    assert bmadconfig.load_paths(root).output_folder == root.resolve() / "_bmad-output"
+
+
+# --- the #552 / worktree guarantees hold for a TOML-sourced path ---
+
+
+def test_a_toml_path_that_cannot_canonicalize_refuses_naming_file_and_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _toml_only(tmp_path)
+    target = root.resolve() / "_bmad-output" / "implementation-artifacts"
+    refuse_to_resolve(monkeypatch, target)
+
+    with pytest.raises(
+        bmadconfig.BmadConfigError, match="cannot canonicalize the configured path"
+    ) as excinfo:
+        bmadconfig.load_paths(root)
+    message = str(excinfo.value)
+    assert "`modules.bmm.implementation_artifacts`" in message
+    assert str(root.resolve() / _LAYERS[0]) in message
+
+
+def test_a_toml_path_escaping_the_project_is_canonical_and_stays_put_on_rebase(
+    tmp_path: Path,
+) -> None:
+    """`{project-root}/../shared` escapes the tree: it canonicalizes to the shared
+    directory, and `rebased` leaves it where it is as for any external path."""
+    root = _toml_only(tmp_path)
+    _write_layer(
+        root, 2, '[modules.bmm]\nimplementation_artifacts = "{project-root}/../shared/impl"\n'
+    )
+    loaded = bmadconfig.load_paths(root)
+    assert loaded.implementation_artifacts == (tmp_path / "shared" / "impl").resolve()
+
+    wt = tmp_path / "wt"
+    rebased = loaded.rebased(wt)
+    assert rebased.implementation_artifacts == (tmp_path / "shared" / "impl").resolve()
+    assert rebased.planning_artifacts == (wt / "_bmad-output" / "planning-artifacts").resolve()
+
+
+def test_a_symlinked_toml_path_is_classified_by_its_target(tmp_path: Path) -> None:
+    """Spelled inside the project, pointing outside: canonicalization follows the
+    link, so `rebased` files it as external rather than per-checkout."""
+    root = _toml_only(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
+        pytest.skip(f"cannot create a symlink here: {e}")
+    _write_layer(root, 3, '[modules.bmm]\nimplementation_artifacts = "{project-root}/linked"\n')
+
+    loaded = bmadconfig.load_paths(root)
+    assert loaded.implementation_artifacts == outside.resolve()
+    assert loaded.rebased(tmp_path / "wt").implementation_artifacts == outside.resolve()
+
+
+def test_rebased_reroots_a_toml_sourced_config(tmp_path: Path) -> None:
+    root = _toml_only(tmp_path)
+    loaded = bmadconfig.load_paths(root)
+    wt = tmp_path / "worktree"
+
+    rebased = loaded.rebased(wt)
+
+    assert rebased.project == rebased.repo_root == wt.resolve()
+    assert rebased.implementation_artifacts == (wt / _DEFAULT_IMPL).resolve()
+    assert rebased.output_folder == (wt / "_bmad-output").resolve()
+    assert rebased.sprint_status == (wt / _DEFAULT_IMPL / "sprint-status.yaml").resolve()

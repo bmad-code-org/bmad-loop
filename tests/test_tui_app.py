@@ -3154,8 +3154,11 @@ async def test_attach_uses_the_recorded_ctl_window(project, monkeypatch):
     # The one attach test that does NOT replace ctl_window_id, so it pins the
     # seam every other one stubs out: that the TUI hands it the same project root
     # the launch recorded the window under (#482). Point app.py at anything else
-    # — the run dir, an unresolved path — and the record is unfindable, the scan
-    # answers the parked `run-` corpse, and attach + return-stamp both go there.
+    # — the run dir, an unresolved path — and the record is unfindable under that
+    # root, so these untagged rows prove nothing and the lookup answers None
+    # (#531). session_exists is stubbed True here, so `a` then takes the live
+    # agent session instead of the ctl window: nothing is selected and nothing is
+    # stamped, and both assertions below fail.
     import subprocess as _subprocess
 
     from bmad_loop.adapters import tmux_base
@@ -5222,6 +5225,52 @@ async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
         )
 
 
+async def test_header_agent_line_shows_open_idle_stretch(project, monkeypatch):
+    """#680: with a `session-idle` open for the live session the agent line ends
+    `· idle <age>`; after the matching `session-active` the text is gone. Drives
+    `show_run` with an `ActiveAgent` directly (the derivation is
+    `test_tui_data`'s) and pins the age formatter's two shapes.
+
+    ABLATION E: drop the `idle_since` branch in `show_run` and the first
+    assertion reddens; the negative rows hold on their own only because the
+    positive one passes."""
+    monkeypatch.setattr(widgets.time, "time", lambda: 10_000.0)
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        tasks={"1-1-alpha": StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)},
+    )
+    working = data.ActiveAgent(
+        task_id="1-1-alpha-dev-1", story_key="1-1-alpha", role="dev", name="claude", model="opus"
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.RUNNING, state, agent=working)
+        assert "claude · opus · dev" in str(header.content)
+        assert "idle" not in str(header.content)
+
+        idle = dataclasses.replace(working, idle_since=10_000.0 - 12 * 60 - 5)
+        header.show_run("r1", data.RUNNING, state, agent=idle)
+        assert "claude · opus · dev · idle 12m" in str(header.content)
+
+        long_idle = dataclasses.replace(working, idle_since=10_000.0 - 65 * 60)
+        header.show_run("r1", data.RUNNING, state, agent=long_idle)
+        assert "· idle 1h05m" in str(header.content)
+
+        # a stamp from the future (a clock stepped back between the adapter's
+        # stamp and this render) clamps to 0m rather than rendering a minus sign
+        future = dataclasses.replace(working, idle_since=10_000.0 + 5)
+        header.show_run("r1", data.RUNNING, state, agent=future)
+        assert "· idle 0m" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=working)  # session-active
+        assert "idle" not in str(header.content)
+        header.show_run("r1", data.RUNNING, state, agent=None)  # session-end
+        assert "idle" not in str(header.content)
+
+
 async def test_idle_run_shows_configured_agents_and_cell_falls_back(project, monkeypatch):
     # No session open (session-start then a matching session-end): the header shows
     # the configured adapters from the snapshot (dev/review differ, so the full
@@ -5729,7 +5778,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
     assert seen == [moved.resolve()]
-    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+    assert any("the code root in the BMAD config has changed" in n for n in notes)
 
 
 def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypatch):

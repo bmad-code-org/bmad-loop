@@ -1970,6 +1970,23 @@ def test_unreadable_line_is_counted_but_does_not_move_the_clock(tmp_path):
     assert scrubbed["bytes"] == len("not json at all")
 
 
+def test_summarize_journal_counts_plugin_hook_errors(tmp_path):
+    """The plugin-errors total counts both failure kinds the plugin layer journals:
+    `plugin-error` and the hook bus's `plugin-hook-error` (#779). Counting only the
+    first read 0 plugin errors beside a histogram showing plugin-hook-error=1."""
+    (tmp_path / "journal.jsonl").write_text(
+        '{"ts": 100.0, "kind": "plugin-error"}\n'
+        '{"ts": 110.0, "kind": "plugin-hook-error"}\n'
+        '{"ts": 120.0, "kind": "plugin-hook-error"}\n',
+        encoding="utf-8",
+    )
+    entries = Journal(tmp_path).entries()
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    summary = diagnostics.summarize_journal(entries, pseudo, {}, cap=10)
+
+    assert summary.plugin_error_count == 3
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

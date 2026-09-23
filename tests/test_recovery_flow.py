@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import subprocess
 import sys
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -1262,6 +1263,7 @@ def _make_flow(
     state=None,
     journal: _RecordingJournal | None = None,
     run_dir: Path | None = None,
+    dev_attempt_dispatched: bool = True,
 ):
     """Build a RecoveryFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions. ``paths``
@@ -1295,6 +1297,7 @@ def _make_flow(
         save=_save,
         escalate=_escalate,
         escalation_pause=_pause,
+        dev_attempt_dispatched=lambda task: dev_attempt_dispatched,
     )
     flow.calls = calls
     return flow
@@ -4328,3 +4331,225 @@ def test_restore_patch_escalates_on_apply_oserror(project, monkeypatch):
     assert task.phase == Phase.DEV_VERIFY
     assert flow.calls.escalates
     assert "attempt-restore-failed" in flow.journal.events()
+
+
+# ---------------------------------------------------------------------------
+# retry dev prompt: the pointer at an earlier attempt's parked work (#777)
+
+
+def _dirty_rollback(flow: RecoveryFlow, task: StoryTask, repo: Path, text: str) -> str:
+    """Leave one tracked edit on the tree and roll it back; return the snapshot ref."""
+    (repo / "src.txt").write_text(text)
+    flow.rollback_or_pause(task)
+    assert git(repo, "status", "--porcelain") == ""
+    return flow.journal.entries[-1][1]["ref"]
+
+
+def test_retry_preserve_notice_names_a_verified_worktree_snapshot(project):
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    ref = _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+
+    assert ref.startswith("refs/attempt-preserve-dirty/run-1-") and task.preserve_ref == ref
+    notice = flow.retry_preserve_notice(task)
+    base = task.baseline_commit
+    assert notice.startswith("An earlier attempt at this work was rolled back; its work is ")
+    assert f"preserved at `{ref}`" in notice
+    assert f"`git log --oneline {base}..{ref}`" in notice
+    assert f"`git diff {base} {ref}`" in notice
+    assert "unverified and has not been applied to this working tree" in notice
+    assert "every gate must pass fresh on this attempt" in notice
+    # informational only: never a replay instruction, never a provenance overclaim
+    for word in ("cherry-pick", "merge", "previous attempt", "only its commits"):
+        assert word not in notice
+    # the offered command really shows the parked attempt against this baseline
+    assert "attempt 1 edit" in git(repo, "diff", base, ref)
+
+
+def test_retry_preserve_notice_absent_without_a_preserved_ref(project):
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    flow.rollback_or_pause(task)  # nothing to park: the attempt left no trace
+
+    assert flow.journal.events() == ["rollback-skipped-clean"]
+    assert task.preserve_ref is None
+    assert flow.retry_preserve_notice(task) == ""
+
+
+def test_retry_preserve_notice_labels_commits_only_preservation(project, monkeypatch):
+    """The worktree snapshot failed, so `preserve_ref` names the commits branch
+    alone (`preserve_partial`). The notice must narrow its claim to the commits.
+
+    Ablation: drop the `preserve_partial` branch of the wording and this reddens
+    on both the label and the absent whole-attempt claim."""
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    (repo / "src.txt").write_text("committed attempt work\n")
+    git(repo, "commit", "-qam", "attempt commit")
+    head = rev_parse_head(repo)
+
+    def snapshot_fails(*args, **kwargs):
+        raise GitError("commit-tree failed")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", snapshot_fails)
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    flow.rollback_or_pause(task)
+
+    assert rev_parse_head(repo) == task.baseline_commit
+    assert task.preserve_partial is True
+    assert task.preserve_ref == recovery_flow.attempt_preserve_ref_name("run-1", head)
+    notice = flow.retry_preserve_notice(task)
+    qualified = f"refs/heads/{task.preserve_ref}"
+    assert (
+        f"only its commits were preserved, at `{qualified}` — its uncommitted "
+        "changes were not captured there" in notice
+    )
+    assert "its work is preserved" not in notice
+    assert f"`git diff {task.baseline_commit} {qualified}`" in notice
+
+
+def test_retry_preserve_notice_clean_rollback_keeps_the_earlier_attempts_ref(project):
+    """A later attempt that leaves a clean tree parks nothing, so its rollback
+    keeps the older attempt's ref — the notice must call that work an EARLIER
+    attempt's, never the previous one's."""
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    first = _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+
+    task.attempt = 2
+    flow.rollback_or_pause(task)  # attempt 2 left the tree clean
+
+    assert flow.journal.events()[-1] == "rollback-skipped-clean"
+    assert task.preserve_ref == first
+    notice = flow.retry_preserve_notice(task)
+    assert notice.startswith("An earlier attempt at this work was rolled back")
+    assert f"`{first}`" in notice
+    assert "previous attempt" not in notice
+
+
+def test_retry_preserve_notice_follows_the_ref_a_later_rollback_parks(project):
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    first = _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+
+    task.attempt = 2
+    second = _dirty_rollback(flow, task, repo, "attempt 2 edit\n")
+
+    assert second != first and task.preserve_ref == second
+    notice = flow.retry_preserve_notice(task)
+    assert f"`{second}`" in notice
+    assert first not in notice.replace(second, "")  # the replaced ref is not offered
+
+
+def test_retry_preserve_notice_withheld_when_no_dev_session_produced_the_ref(project):
+    """A rollback with no dispatched dev session for the current attempt (a
+    resolve re-drive's reset) still parks the tree — but nothing proves an
+    attempt wrote it, so the notice must not claim one did. The rollback replaces
+    the earlier, attributable ref's provenance along with the ref."""
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+    assert flow.retry_preserve_notice(task)
+
+    unattributed = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        dev_attempt_dispatched=False,
+    )
+    ref = _dirty_rollback(unattributed, task, repo, "re-drive residue\n")
+
+    assert task.preserve_ref == ref and task.preserve_from_attempt is False
+    assert unattributed.retry_preserve_notice(task) == ""
+    assert git(repo, "rev-parse", "--verify", ref)  # suppressed, not deleted
+
+
+def test_retry_preserve_notice_omitted_when_retention_pruned_the_ref(project):
+    """Run-start retention (`scm.preserve_keep`) can delete the task's ref before
+    a resume re-dispatches it. The stale name must yield no notice and no crash,
+    and the task record keeps the name — nothing is cleared to hide guidance.
+
+    Ablation: skip the resolve/ancestry probes and this reddens by offering a
+    `git diff` against a ref that no longer exists."""
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True, preserve_keep=1),
+    )
+    ref = _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+    # a newer snapshot (another story's rollback) outranks it under keep=1
+    newer = subprocess.run(
+        ["git", "-C", str(repo), "commit-tree", "-p", "HEAD", "-m", "newer", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": "@4102444800 +0000"},
+    ).stdout.strip()
+    git(repo, "update-ref", "refs/attempt-preserve-dirty/run-1-other-1", newer)
+
+    flow.prune_preserve_refs()
+
+    assert "attempt-preserve-dirty-pruned" in flow.journal.events()
+    assert not verify.ref_exists(repo, ref)
+    assert flow.retry_preserve_notice(task) == ""
+    assert task.preserve_ref == ref
+
+
+@pytest.mark.parametrize("stale", ["baseline-moved", "foreign-run", "tip-moved"])
+def test_retry_preserve_notice_refuses_a_ref_this_task_cannot_own(project, stale):
+    """The ref must be this run's, on this task's baseline, and still where the
+    rollback parked it; otherwise `git diff <baseline> <ref>` would show something
+    other than this task's earlier attempt."""
+    repo = project.project
+    task = _task(repo)
+    task.attempt = 1
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    if stale == "tip-moved":
+        (repo / "src.txt").write_text("committed attempt work\n")
+        git(repo, "commit", "-qam", "attempt commit")
+        flow.rollback_or_pause(task)
+        assert task.preserve_ref and task.preserve_ref.startswith("attempt-preserve/")
+        assert flow.retry_preserve_notice(task)
+        git(repo, "branch", "-f", task.preserve_ref, task.baseline_commit)
+    else:
+        _dirty_rollback(flow, task, repo, "attempt 1 edit\n")
+        assert flow.retry_preserve_notice(task)
+        if stale == "baseline-moved":
+            # another unit merged first: the re-stamped baseline is past the work
+            (repo / "other.txt").write_text("someone else's merge\n")
+            git(repo, "add", "other.txt")
+            git(repo, "commit", "-qm", "unrelated merge")
+            task.baseline_commit = rev_parse_head(repo)
+        else:
+            flow.state = SimpleNamespace(run_id="run-2")
+
+    assert flow.retry_preserve_notice(task) == ""

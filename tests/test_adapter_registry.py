@@ -1141,6 +1141,27 @@ def test_validate_model_format_check_keys_on_the_adapter_kind_not_hooklessness(
     assert any(f["check"] == "adapter.hookless" for f in findings)
 
 
+def test_validate_effort_silent_on_an_out_of_tree_kind(fresh_adapter_registry, project, capsys):
+    """`policy.effort-unsupported` is a fact about the bundled tmux GENERIC family
+    ("no channel for effort"); whether an out-of-tree kind can carry it is not
+    knowable here, so the check must stay silent for one rather than assert a
+    capability it cannot see.
+
+    The `adapter.kind == "ok"` assert is the control: the profile loaded and its
+    kind resolved, so the absent warning is the predicate, not a failed load.
+
+    ABLATION: flip the predicate to `prof.adapter != adapter_registry.OPENCODE_HTTP`
+    and this reddens."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    install_bmad_config(project)
+    _write_profile(project.project, "hermes", adapter="hermes")
+    _write_policy(project.project, '[adapter]\nname = "hermes"\neffort = "max"\n')
+
+    findings = _validate_findings(project.project, capsys)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in findings)
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
 def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect(
     fresh_adapter_registry, project, capsys
 ):
@@ -1163,6 +1184,49 @@ def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect
     assert findings, "a bare model on the opencode-http kind must warn"
     assert {f["severity"] for f in findings} == {"warning"}
     assert all("haiku" in f["message"] for f in findings)
+
+
+def _dry_run_dev_line(project, capsys) -> str:
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    return next(line for line in out.splitlines() if "dev:" in line)
+
+
+def test_dry_run_previews_the_http_sequence_for_an_opencode_kind_with_a_hook_dialect(
+    fresh_adapter_registry, project, capsys
+):
+    """`_render_invocation` follows the adapter KIND, as `make_adapters` does. An
+    `opencode-http` profile carrying a hook dialect is a legal profile that still
+    launches the HTTP adapter — and sends `effort` as `variant` — so its preview
+    is the server/prompt_async line with the effort, not a tmux argv.
+
+    ABLATION: key the branch on `profile.hookless` and this reddens (argv render,
+    no effort)."""
+    _write_profile(project.project, "ochooked", adapter="opencode-http", hookless=False)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "ochooked"\nmodel = "anthropic/claude-x"\neffort = "max"\n',
+    )
+    line = _dry_run_dev_line(project, capsys)
+    assert "ochooked serve --hostname 127.0.0.1 --port <auto>" in line
+    assert line.endswith("model=anthropic/claude-x effort=max")
+
+
+def test_dry_run_previews_argv_for_a_hookless_profile_of_another_kind(
+    fresh_adapter_registry, project, capsys
+):
+    """The other direction: a hookless profile owned by an out-of-tree kind must
+    not draw the OpenCode server line (its transport is unknown here, so the
+    fallback is the profile's own binary/argv shape, as for every non-HTTP kind)."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    _write_profile(project.project, "hermes", adapter="hermes")  # hookless=True
+    _write_policy(project.project, '[adapter]\nname = "hermes"\nmodel = "m1"\n')
+    line = _dry_run_dev_line(project, capsys)
+    assert "serve --hostname" not in line and "prompt_async" not in line
+    assert "hermes" in line and "--model m1" in line
 
 
 def test_validate_flags_an_unregistered_adapter_kind(fresh_adapter_registry, project, capsys):

@@ -388,6 +388,8 @@ class StoriesEngine(Engine):
               (the primitive is disk-resolved — see ``Engine._dev_skill``)
             + (plan-halt leg) `` Halt after planning.``
             + (when ``invoke_dev_with`` non-empty) a newline then its verbatim text.
+            + (on a retry with verified parked work) a blank line then
+              ``recovery_flow.retry_preserve_paragraph`` (#777).
 
         The folder is always project-relative (kills the absolute-path concern;
         the contract allows an absolute one but we never emit it). ``invoke_dev_with``
@@ -415,6 +417,11 @@ class StoriesEngine(Engine):
             prompt += " Halt after planning."
         if entry is not None and entry.invoke_dev_with:
             prompt += "\n" + entry.invoke_dev_with
+        # A retry after a rolled-back attempt names its verified parked work (#777),
+        # after the planner's verbatim text so that channel stays untouched.
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            prompt += "\n\n" + preserved
         return prompt
 
     def _entry_for(self, task: StoryTask) -> stories.StoryEntry | None:

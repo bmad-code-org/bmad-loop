@@ -47,6 +47,7 @@ from ..platform_util import (
     names_tree_root,
     names_win32_alias,
 )
+from ..policy import PROFILE_ALIASES
 from .entrypoints import record_load_error
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
@@ -63,8 +64,10 @@ HOOK_DIALECTS = {
 CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
-# legacy adapter names from older policy.toml files, plus friendly short names
-ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
+# Legacy adapter names from older policy.toml files, plus friendly short names.
+# The table itself lives in `policy` (see `PROFILE_ALIASES` there for why) and
+# is re-exported here under the name `get_profile` and `install` always used.
+ALIASES = PROFILE_ALIASES
 
 
 class ProfileError(Exception):

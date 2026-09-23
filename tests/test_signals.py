@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from bmad_loop.signals import SignalWatcher
+from bmad_loop.signals import SignalWatcher, is_session_event, session_events
 
 
 def write_event(events_dir, ts, task_id, event, **extra):
@@ -179,3 +179,56 @@ def test_poll_still_raises_when_the_primary_dir_is_gone(tmp_path):
 
     with pytest.raises(OSError):
         watcher.poll()
+
+
+def test_session_events_keeps_only_this_attempt_across_both_channels(tmp_path):
+    """The #752 diagnostic's read: one attempt's events from the primary AND legacy
+    channels, oldest first, excluding another attempt's id and anything stamped
+    before this attempt's launch floor (a resumed run's same-id leftovers).
+
+    Ablation guard: drop the task-id or the floor term from `is_session_event`, or
+    the legacy dir from the scan, and this fails."""
+    primary, legacy = tmp_path / "state" / "events", tmp_path / "run" / "events"
+    write_event(primary, 50, "t-2", "SessionStart")
+    write_event(legacy, 60, "t-2", "Stop")
+    write_event(primary, 55, "t-1", "Stop")  # another attempt, inside the window
+    write_event(legacy, 5, "t-2", "Stop")  # this id, but before the launch floor
+
+    events = session_events(primary, legacy, "t-2", since_ns=10)
+
+    assert [(e.ts, e.event) for e in events] == [(50, "SessionStart"), (60, "Stop")]
+
+
+def test_session_events_is_read_only_and_tolerates_missing_dirs(tmp_path):
+    """A post-mortem read neither creates a channel nor consumes from one: a relay
+    that never fired may have left no directory at all, and a live watcher must
+    still see every event the diagnostic looked at."""
+    primary, legacy = tmp_path / "state" / "events", tmp_path / "run" / "events"
+    assert session_events(primary, legacy, "t1") == []
+    assert not primary.exists() and not legacy.exists()
+
+    watcher = SignalWatcher(primary, legacy)
+    write_event(primary, 1, "t1", "Stop")
+    assert len(session_events(primary, legacy, "t1")) == 1
+    assert watcher.wait_for("t1", {"Stop"}, timeout_s=1) is not None
+
+
+def test_session_events_raises_on_an_unreadable_channel(tmp_path):
+    """Only absence reads as empty; any other fault surfaces for the caller to
+    report as unreadable rather than pass as "no events"."""
+    primary = tmp_path / "events"
+    primary.write_text("not a directory")
+
+    with pytest.raises(OSError):
+        session_events(primary, None, "t1")
+
+
+def test_is_session_event_is_the_rule_wait_for_matches_on(tmp_path):
+    """One correlation rule, shared by the completion wait and the diagnostic."""
+    write_event(tmp_path, 7, "t1", "Stop")
+    (event,) = SignalWatcher(tmp_path).poll()
+
+    assert is_session_event(event, "t1")
+    assert is_session_event(event, "t1", since_ns=7)
+    assert not is_session_event(event, "t1", since_ns=8)
+    assert not is_session_event(event, "t2")

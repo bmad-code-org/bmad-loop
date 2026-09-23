@@ -2377,3 +2377,32 @@ def test_stories_harvest_alone_is_not_proof_of_work(project):
     assert "no changes" in decisions[0]["reason"]
     assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
     assert summary.done == 1
+
+
+# ------------------------------------ retry prompt names parked work (#777)
+
+
+def test_stories_retry_prompt_names_the_earlier_attempts_parked_work(project):
+    """Stories mode builds its own dev prompt, and gets the same shared paragraph
+    on a retry after a parking rollback — appended after the planner's verbatim
+    `invoke_dev_with` text, which stays untouched. The first dispatch carries none."""
+
+    def dirty_timeout(spec) -> SessionResult:
+        (Path(spec.cwd) / "src.txt").write_text("half-built attempt 1\n")
+        return SessionResult(status="timeout")
+
+    setup_stories(project, [entry("1", invoke_dev_with="Planner note.")])
+    engine, adapter = make_engine(project, [dirty_timeout, stories_dev_effect()])
+
+    assert engine.run().done == 1
+
+    (parked,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    first, second = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    lead = "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.\nPlanner note."
+    assert first == lead
+    base = engine.state.tasks["1"].baseline_commit
+    assert second.startswith(
+        f"{lead}\n\nAn earlier attempt at this work was rolled back; its work is "
+        f"preserved at `{parked['ref']}`."
+    )
+    assert f"`git diff {base} {parked['ref']}`" in second

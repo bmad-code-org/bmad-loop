@@ -416,7 +416,8 @@ class StoryTask:
     # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
     # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
     # of every auto-rollback so it can never name a *previous* attempt's ref; read
-    # by `_defer` (notification) and projected into `status`. None = the last
+    # by `_defer` (notification), projected into `status`, and — once verified
+    # against git — named in the retry dev prompt (#777). None = the last
     # auto-rollback parked nothing (no commits above baseline and a clean or
     # uncapturable tree, or the ref failed to take). Isolation-INDEPENDENT: a unit
     # worktree's own dev-retry rollback parks on the same shared refs, so a
@@ -435,6 +436,21 @@ class StoryTask:
     # cannot tell those apart, which is why this is recorded rather than derived.
     # Cleared with `preserve_ref`. Survives the resume serialization round-trip.
     preserve_partial: bool = False
+    # provenance of `preserve_ref`, the one input the retry dev prompt's pointer
+    # at it cannot get from git (#777, `recovery_flow.retry_preserve_paragraph`):
+    # True when the auto-rollback that cleared the previous ref ran after a dev
+    # session of the current attempt was dispatched — a recorded session, or a
+    # durable DEV_RUNNING that a hard stop or crash mid-session left without one
+    # (`Engine._dev_attempt_dispatched`) — so whatever it parks is that attempt's
+    # work. False when neither holds — a resolve re-drive resets a tree no
+    # dispatched attempt produced — and set back to False by `SweepEngine.
+    # _reset_superseded_bundle_state`, which keeps a superseded bundle's ref
+    # (clearing the name would orphan the work) that shares this task's run, key
+    # and baseline. Positive evidence
+    # only: a state.json written before this field loads False, so an unproven ref
+    # is never offered. Reset with `preserve_ref`. Survives the resume
+    # serialization round-trip.
+    preserve_from_attempt: bool = False
     # set by runs.rearm_escalation: this task was re-armed out of ESCALATED for a
     # clean rebuild against the corrected spec (not a failed attempt). Lets the
     # resume-time manual-recovery notice describe the real cause; cleared once the
@@ -571,6 +587,7 @@ class StoryTask:
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
+            "preserve_from_attempt": self.preserve_from_attempt,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
@@ -814,6 +831,7 @@ class StoryTask:
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
+            preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),

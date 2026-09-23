@@ -196,6 +196,13 @@ class HookBus:
         cmd = lp.manifest.render(hook.cmd)
         env = _hook_env(ctx, lp)
         cwd = ctx.worktree or ctx.repo_root or None
+        # post_story fires after an isolated unit merged and its worktree was
+        # removed, so that path no longer exists and subprocess would raise
+        # before the shell starts (#779). Only there does the project root stand
+        # in; any other stage keeps the error — the root is the wrong tree for a
+        # hook mid-story. ctx and BMAD_LOOP_WORKTREE keep the original path.
+        if hook.stage == "post_story" and ctx.worktree and not os.path.isdir(ctx.worktree):
+            cwd = ctx.repo_root or None
         try:
             rc, output = self._runner(cmd, cwd=cwd, env=env, timeout=hook.timeout_sec)
         except _HookError as e:

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 import yaml
@@ -29,6 +29,7 @@ from conftest import (
     fault_read_text,
     git,
     ignore_before_commit,
+    install_bmad_central_config,
     install_bmad_config,
     install_build_auto_skill,
     install_dev_base_skills,
@@ -46,7 +47,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli, deferredwork, envvars, platform_util
+from bmad_loop import bmadconfig, cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -1697,6 +1698,225 @@ def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
     _make_stories_run(project)
     assert cli.main(["status", "--project", str(project.project)]) == 0
     assert "no stories.yaml found" in capsys.readouterr().out
+
+
+# ------------------------------------------- status: a sweep's effective options
+
+# `sweep.json` holds a sweep run's nullable launch overrides; `policy_snapshot`
+# holds `[sweep]` from policy.toml. The engine enforces `override ?? snapshot`, so
+# the snapshot alone misreports an overridden cap (#815). These rows compose the
+# run through the same `runsetup.compose_sweep` `cmd_sweep` uses.
+
+SWEEP_STATUS_POLICY = "[sweep]\nmax_bundles = 5\nrepeat = true\nmax_cycles = 3\n"
+
+
+class _ComposedSweepEngine:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _compose_sweep_run(project, policy_text=SWEEP_STATUS_POLICY, **overrides):
+    """A sweep run composed from the sandbox's real policy.toml. The pid file
+    `compose_sweep` publishes names this test process, so it is removed: the run
+    reads as interrupted, which is what `status` and `resume` expect of it."""
+    _write_policy(project.project, policy_text)
+    options = {"max_bundles": None, "repeat": None, "max_cycles": None} | overrides
+    composed = runsetup.compose_sweep(
+        project=project.project,
+        paths=bmadconfig.ProjectPaths(
+            project=project.project,
+            implementation_artifacts=project.project / "impl",
+            planning_artifacts=project.project / "plan",
+        ),
+        policy=policy_mod.load(cli._policy_path(project.project)),
+        run_id="20260101-000000-sw01",
+        prompting=False,
+        decisions_only=False,
+        trigger="cli",
+        make_adapters=lambda *a, **k: {role: None for role in runsetup.ROLES},
+        sweep_engine_cls=_ComposedSweepEngine,
+        trusted_config_digest="deadbeef",
+        **options,
+    )
+    (composed.run_dir / runs.PID_FILE).unlink()
+    return composed.run_dir
+
+
+def _status_sweep_options(project, capsys) -> str:
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err
+    (line,) = [ln for ln in out.splitlines() if ln.startswith("sweep options:")]
+    return line
+
+
+def test_status_sweep_shows_an_override_as_effective(project, capsys):
+    _compose_sweep_run(project, max_bundles=15)
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 5)" in line
+
+
+def test_status_sweep_omitted_override_shows_the_snapshot_value(project, capsys):
+    _compose_sweep_run(project, max_bundles=15)
+    line = _status_sweep_options(project, capsys)
+    assert "repeat true (policy)" in line
+    assert "max_cycles 3 (policy)" in line
+
+
+def test_status_sweep_explicit_false_override_is_an_override(project, capsys):
+    """ABLATION: resolve the override by truthiness and this fails — `repeat=False`
+    against policy `repeat = true` would read as the policy's `true`."""
+    _compose_sweep_run(project, repeat=False, max_cycles=0)
+    line = _status_sweep_options(project, capsys)
+    assert "repeat false (override; policy true)" in line
+    assert "max_cycles 0 (override; policy 3)" in line
+
+
+def test_status_sweep_reads_the_snapshot_not_live_policy(project, capsys):
+    """The engine loaded policy once, at launch; a later policy.toml edit does not
+    reach it, so it must not reach status either.
+
+    ABLATION: resolve against live policy.toml instead of `policy_snapshot` and
+    this fails on the edited `9`."""
+    _compose_sweep_run(project)
+    _write_policy(project.project, "[sweep]\nmax_bundles = 9\nrepeat = false\nmax_cycles = 3\n")
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 5 (policy)" in line
+    assert "repeat true (policy)" in line
+
+
+def test_status_sweep_after_resume_reports_the_restamped_policy(project, monkeypatch, capsys):
+    """Resume reloads policy.toml, hands it to the rebuilt SweepEngine and re-stamps
+    `policy_snapshot` to match (#189) — while `sweep.json` is left byte-identical,
+    so the launch override survives and its digest still binds."""
+    from conftest import install_base_skills
+
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {})
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    _write_policy(project.project, "[sweep]\nmax_bundles = 6\nrepeat = true\nmax_cycles = 4\n")
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    capsys.readouterr()
+
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 6)" in line
+    assert "max_cycles 4 (policy)" in line
+
+
+def test_status_sweep_shows_the_selector(project, capsys):
+    _compose_sweep_run(project, only_ids=("DW-3", "DW-1"))
+    assert _status_sweep_options(project, capsys).endswith(", only DW-3,DW-1")
+
+
+def test_status_sweep_shows_the_severity_selector(project, capsys):
+    _compose_sweep_run(project, min_severity="high")
+    assert _status_sweep_options(project, capsys).endswith(", min_severity high")
+
+
+def _mark_legacy(run_dir) -> None:
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    state.sweep_options_version, state.sweep_options_digest = 0, ""
+    save_state(run_dir, state)
+
+
+def test_status_sweep_legacy_run_reports_its_recorded_options(project, capsys):
+    """A pre-marker run resumes on its sweep.json limits but never its selectors
+    (`load_sweep_resume_options(required=False)`), so status reports the same."""
+    run_dir = _compose_sweep_run(project, max_bundles=15, only_ids=("DW-1",))
+    _mark_legacy(run_dir)
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 5)" in line
+    assert "only" not in line
+    assert line.endswith("[legacy options format]")
+
+
+def test_status_sweep_legacy_run_without_options_says_so(project, capsys):
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    _mark_legacy(run_dir)
+    (run_dir / "sweep.json").unlink()
+    line = _status_sweep_options(project, capsys)
+    assert line == "sweep options: unknown — legacy run with no readable sweep.json"
+
+
+@pytest.mark.parametrize("fault", ["corrupt", "digest-mismatch", "missing"])
+def test_status_sweep_unverifiable_options_degrade(project, capsys, fault):
+    """Status observes; resume would refuse this run, status reports why and still
+    exits 0 — and prints no policy value, which would read as the enforced one."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    options = run_dir / "sweep.json"
+    if fault == "corrupt":
+        options.write_bytes(b"{not json")
+        # Re-bind the digest so the parse, not the binding, is what refuses.
+        state = load_state(run_dir)
+        state.sweep_options_digest = hashlib.sha256(options.read_bytes()).hexdigest()
+        save_state(run_dir, state)
+        reason = "not valid JSON"
+    elif fault == "digest-mismatch":
+        # The widening swap the digest exists to catch: valid, but not launch's.
+        options.write_text(json.dumps({"only": None, "min_severity": None}), encoding="utf-8")
+        reason = "no longer matches the options bound at launch"
+    else:
+        options.unlink()
+        reason = "sweep.json is missing"
+
+    line = _status_sweep_options(project, capsys)
+    assert line.startswith("sweep options: unverifiable — ")
+    assert reason in line
+    assert "policy" not in line
+
+
+def test_status_json_for_a_sweep_run_is_unchanged(project, capsys):
+    """#815 is text-only: `status --json` stays the pure `status_document` projection
+    of state.json, with its keys exactly as before — no sweep-options key."""
+    from bmad_loop.documents import status_document
+    from bmad_loop.journal import load_state
+
+    run_dir = _compose_sweep_run(project, max_bundles=15, only_ids=("DW-1",))
+    assert cli.main(["status", "--json", "--project", str(project.project)]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document == status_document(load_state(run_dir))
+    assert set(document) == {
+        "schema_version",
+        "run_id",
+        "run_type",
+        "source",
+        "started_at",
+        "status",
+        "finished",
+        "stopped",
+        "graceful_stop_pending",
+        "crashed",
+        "crash_error",
+        "paused_stage",
+        "paused_reason",
+        "paused_story_key",
+        "cache_read_weight",
+        "tokens",
+        "adapters",
+        "sweeps_refused",
+        "tasks",
+    }
+
+
+def test_status_story_run_prints_no_sweep_options(project, capsys):
+    _make_run_with_tokens(project, {}, weight=0.1)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "sweep options" not in capsys.readouterr().out
 
 
 def test_emit_document_verifies_without_altering_the_bytes(capsys):
@@ -4040,7 +4260,7 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
 
     assert seen == [moved.resolve()]
     err = capsys.readouterr().err
-    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert "the code root in the BMAD config has changed" in err
     assert str(moved) not in err  # the warning names neither tree, matching resume's
 
 
@@ -5011,7 +5231,7 @@ def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkey
     save_state(run_dir, state)
     seen: list[int] = []
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         seen.append(generation)
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -5026,6 +5246,35 @@ def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkey
 
     assert seen == [2]  # the task's own generation, not a constant
     assert load_state(run_dir).tasks["s1"].generation == 3  # the re-arm bumped past it
+
+
+def test_resolve_hands_the_dev_stage_model_and_effort_to_the_session(tmp_path, monkeypatch):
+    """`cmd_resolve` launches the resolve agent as the DEV stage's client, so it
+    passes that stage's resolved `model` and (#643) `effort` — a stage override,
+    not the base value, proving the read goes through `resolved("dev")`."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    _write_policy(
+        tmp_path,
+        '[adapter]\nname = "claude"\nmodel = "opus"\neffort = "low"\n'
+        '[adapter.dev]\nmodel = "sonnet"\neffort = "max"\n',
+    )
+    seen: dict[str, str] = {}
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
+        seen.update(model=model, effort=effort)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == {"model": "sonnet", "effort": "max"}
 
 
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
@@ -5207,7 +5456,7 @@ def _redrive_escalates(run_dir, detail):
 def _marker_writing_session(run_dir_marker=True):
     from bmad_loop import resolve
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         if run_dir_marker:
@@ -5708,7 +5957,7 @@ def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
     ran: list = []
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the resolve agent records a restore_patch in its output marker
         ran.append(story_key)
         marker = resolve.resolution_path(rd, story_key)
@@ -5893,7 +6142,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     patch.write_text("diff", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the resolve agent records a restore_patch in its output marker
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -5949,7 +6198,7 @@ def test_resolve_rereads_isolation_after_the_agent_session(
     _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
     _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the human and the agent conclude the story needs isolation, and the operator
         # edits policy.toml from another terminal while the session is still open
         if flipped_mid_session:
@@ -6000,7 +6249,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
@@ -6031,7 +6280,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
@@ -7006,7 +7255,7 @@ def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatc
     # unlanded `restamp_code_root` row, never for this resume's own re-stamp.
     assert _restamp_records(run_dir) == []
     err = capsys.readouterr().err
-    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert "the code root in the BMAD config has changed" in err
     # the warning names neither tree: a journalled scalar, an operator-facing sentence
     assert str(moved) not in err
 
@@ -7110,7 +7359,7 @@ def test_resume_discharges_the_owed_record_under_the_root_the_marker_names(
     assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
     # The config really did move away from the mirror, so THIS resume is a move too.
     assert _resume_entry(run_dir)["code_root_changed"] is True
-    assert "the code root in _bmad/bmm/config.yaml has changed" in capsys.readouterr().err
+    assert "the code root in the BMAD config has changed" in capsys.readouterr().err
     persisted = load_state(run_dir)
     assert persisted.repo_root == str(again.resolve())
     assert persisted.code_root_restamp_pending is False
@@ -9505,6 +9754,27 @@ def test_dry_run_renders_hookless_http_line(project, capsys):
     # the profile's codex-style template is rendered into the prompt_async body
     assert "Use the bmad-dev-auto skill now:" in dev_line
     assert "model=anthropic/claude-haiku-4-5" in dev_line
+    assert "effort=" not in dev_line  # unset → absent, like model
+
+
+def test_dry_run_hookless_line_shows_the_stage_effort(project, capsys):
+    """#643: the real session sends the stage's effort as `variant`, so the launch
+    plan names it (under the policy key) beside the model — a preview that read
+    the same with and without it could not confirm the per-stage configuration."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(
+        project.project,
+        OPENCODE_QUALIFIED_POLICY + 'effort = "low"\n[adapter.dev]\neffort = "max"\n',
+    )
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    dev_line = next(line for line in out.splitlines() if "dev:" in line)
+    review_line = next(line for line in out.splitlines() if "review:" in line)
+    assert dev_line.endswith("model=anthropic/claude-haiku-4-5 effort=max")
+    assert review_line.endswith("model=anthropic/claude-haiku-4-5 effort=low")
 
 
 def test_validate_warns_on_bare_opencode_model(project, capsys):
@@ -9540,6 +9810,63 @@ def test_validate_model_warning_ignores_tmux_profiles(project, capsys):
     assert "is not 'provider/model'" not in _validate_output(capsys)
 
 
+def test_validate_warns_when_effort_is_set_on_a_tmux_profile(project, capsys):
+    """#643: only the opencode-http adapter carries a reasoning-effort value. A
+    stage that sets `effort` on the tmux generic family runs at the provider
+    default with nothing to show for it, so validate says so — advisory, naming
+    the role, profile and value."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "claude"\n[adapter.dev]\neffort = "high"\n')
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    findings = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
+    assert [f["severity"] for f in findings] == ["warning"]  # dev only: review/triage unset
+    assert findings[0]["detail"] == {"role": "dev", "effort": "high", "profile": "claude"}
+    assert "dev effort 'high' is ignored by claude" in findings[0]["message"]
+
+
+def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, monkeypatch):
+    """The warning is advisory: an otherwise-clean project with effort on a tmux
+    stage still exits 0 (the same rc as `test_validate_json_clean_project_is_a_
+    pure_document_at_rc_0`, whose fixture this shares minus the key)."""
+    _make_validate_pass(
+        project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + 'effort = "high"\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    warned = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
+    # base effort inherits into every stage that keeps the client, so all three warn
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+    assert {f["severity"] for f in warned} == {"warning"}
+
+
+def test_validate_effort_silent_on_the_opencode_kind(project, capsys):
+    """The carrier: effort on an opencode-http stage draws no warning.
+
+    ABLATION: drop the `prof.adapter == GENERIC` predicate and this reddens (the
+    check would fire for the one family that actually sends the value)."""
+    install_bmad_config(project)
+    _write_policy(project.project, OPENCODE_QUALIFIED_POLICY + 'effort = "max"\n')
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
+    # control: the policy loaded with the value in it (not silent for lack of a key)
+    assert policy_mod.load(project.project / ".bmad-loop" / "policy.toml").adapter.effort == "max"
+
+
+def test_validate_effort_silent_when_unset(project, capsys):
+    """No effort anywhere → no finding, on the very profile that would warn."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # DUAL_CLIENT_POLICY: claude + codex, no effort
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
+
+
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):
     """Item 8: a stories-mode project (no sprint-status.yaml) validates its
     stories.yaml manifest instead of failing on the missing sprint gate."""
@@ -9567,190 +9894,280 @@ def test_validate_stories_mode_reports_missing_manifest(project, capsys):
     assert "sprint status" not in text
 
 
-def test_validate_flags_registered_hooks_with_missing_relay_script(project, capsys):
-    """#461 papercut: `hooks.registered` is a substring match on the hook config —
-    it stays green after the relay script itself is gone (branch switch, deleted
-    `.bmad-loop/`), while every hook event silently no-ops and the run stalls to
-    session_timeout_min. A distinct finding stats the artifact.
+def _validate_json(project_dir, capsys):
+    rc = cli.main(["validate", "--project", str(project_dir), "--json"])
+    out, err = capsys.readouterr()
+    assert err == ""
+    return rc, json.loads(out)
 
-    Ablation guard: deleting the `hooks.relay-present` block in cmd_validate makes
-    this FAIL on the first assertion."""
-    from bmad_loop import install as install_mod
+
+def test_validate_flags_registered_hooks_with_missing_relay_executable(project, capsys):
+    from bmad_loop.install import install_into
 
     install_bmad_config(project)
     _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    missing = project.project / "missing" / "bmad-loop"
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{missing} relay Stop"
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
 
-    cli.cmd_validate(args)
-    assert "hook relay script present" in _validate_output(capsys)
+    _rc, doc = _validate_json(project.project, capsys)
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-present"]
+    assert any(
+        f["severity"] == "problem" and str(missing) in f["message"] and "is missing" in f["message"]
+        for f in findings
+    )
+    assert any(f["check"] == "hooks.registered" and f["severity"] == "ok" for f in doc["findings"])
 
-    (project.project / install_mod.HOOK_SCRIPT_REL).unlink()
 
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    # The registration check is untouched — it still reads green, which is exactly
-    # the blind spot the new finding covers.
-    assert "hooks registered" in text
-    assert "relay script" in text and "missing" in text
-    assert "bmad-loop init" in text
+def test_validate_warns_when_registered_relay_uses_another_installation(
+    project, capsys, monkeypatch
+):
+    """An old but runnable console script must not make validation look current."""
+    from bmad_loop import install as install_mod
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    current_command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    # The registered text: on Windows str(Path) would respell init's forward slashes.
+    current = install_mod.relay_executable_text(current_command)
+    assert current is not None
+
+    previous = project.project / "previous-install" / "bmad-loop"
+    previous.parent.mkdir()
+    previous.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    previous.chmod(0o755)
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{previous} relay Stop"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "keep earlier hook registration")
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0  # stale registration is advisory while the relay remains usable
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert findings == [
+        {
+            "check": "hooks.relay-stale",
+            "severity": "warning",
+            "message": (
+                f"registered hook executable {previous} differs from this "
+                f"installation's {current} — re-run `bmad-loop init` "
+                "to update the hook registration"
+            ),
+            "detail": {"path": str(previous), "expected_path": current},
+        }
+    ]
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "ok"
+        and f["detail"]["path"] == str(previous)
+        for f in doc["findings"]
+    )
+
+
+def _respell_registered_relay(project, respell) -> tuple[str, str]:
+    """Rewrite the committed Stop relay's executable text; return (old, new) spellings."""
+    from bmad_loop import install as install_mod
+
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    current = install_mod.relay_executable_text(command)
+    assert current is not None
+    respelled = respell(current)
+    assert respelled != current
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = command.replace(current, respelled, 1)
+    config.write_text(json.dumps(data), encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "respell hook registration")
+    return current, respelled
+
+
+def _single_relay_stale(doc) -> dict:
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert len(findings) == 1, findings
+    return findings[0]
+
+
+def test_validate_warns_when_relay_spelling_differs_but_path_is_equal(project, capsys, monkeypatch):
+    """`Path` equality normalizes the spelling; init's merge_hooks compares text and
+    would rewrite this registration, so validate must call it stale (#773)."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    def respell(current: str) -> str:
+        head, _, name = current.rpartition("/")
+        return f"{head}/./{name}"
+
+    current, respelled = _respell_registered_relay(project, respell)
+    assert Path(respelled) == Path(current)  # the premise: a Path comparison sees no change
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0  # advisory: the relay still runs
+    assert _single_relay_stale(doc) == {
+        "check": "hooks.relay-stale",
+        "severity": "warning",
+        "message": (
+            f"registered hook executable {respelled} differs from this "
+            f"installation's {current} — re-run `bmad-loop init` "
+            "to update the hook registration"
+        ),
+        "detail": {"path": respelled, "expected_path": current},
+    }
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Windows path spelling; runs on the Windows leg"
+)
+def test_validate_warns_on_backslash_windows_relay_registration(project, capsys, monkeypatch):
+    """A pre-#773 backslash registration stalls sessions under Git Bash; `Path` and
+    `str(Path)` both hide it on Windows, so only the registered text flags it."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    current, backslashed = _respell_registered_relay(
+        project, lambda current: str(PureWindowsPath(current))
+    )
+    assert "\\" in backslashed
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0
+    finding = _single_relay_stale(doc)
+    assert finding["severity"] == "warning"
+    assert finding["detail"] == {"path": backslashed, "expected_path": current}
+    assert backslashed in finding["message"] and current in finding["message"]
+
+
+def test_validate_json_reports_null_hook_handlers_without_crashing(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"] = None
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        finding["check"] == "hooks.config-parse"
+        and finding["severity"] == "problem"
+        and "Stop" in finding["message"]
+        for finding in doc["findings"]
+    )
+
+
+def test_validate_checks_valid_relay_when_another_event_is_malformed(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    missing = project.project / "missing" / "bmad-loop"
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{missing} relay Stop"
+    data["hooks"]["SessionStart"] = None
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        finding["check"] == "hooks.config-parse" and finding["severity"] == "problem"
+        for finding in doc["findings"]
+    )
+    assert any(
+        finding["check"] == "hooks.relay-present"
+        and finding["severity"] == "problem"
+        and str(missing) in finding["message"]
+        for finding in doc["findings"]
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
 @pytest.mark.skipif(
-    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root reads a 000 file"
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root executes mode-000 files"
 )
-def test_validate_flags_registered_hooks_with_an_unreadable_relay_script(project, capsys):
-    """A relay that exists but cannot be READ is the same stall as a missing one:
-    the registered command is `<interpreter> <relay> <Event>`, which exits 2
-    ("can't open file") and never writes the event, so the run waits out
-    session_timeout_min. `Path.is_file()` is True for a mode-000 file, so
-    existence alone left that green — the blind spot this check exists to remove.
-
-    The remediation differs from the missing case and is asserted here: `init`
-    writes the relay with `write_text()`, which needs write access to the same
-    file, so it raises PermissionError rather than repairing it.
-
-    Ablation guard: dropping the `os.access` branch makes this FAIL — validate
-    reports the relay present."""
-    from bmad_loop import install as install_mod
+def test_validate_flags_registered_hooks_with_unusable_relay_executable(project, capsys):
+    from bmad_loop.install import install_into
 
     install_bmad_config(project)
     _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
-
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    cli.cmd_validate(args)
-    assert "hook relay script present" in _validate_output(capsys)
-
-    relay.chmod(0o000)
-    # The premise, asserted rather than assumed: existence still reads True, which
-    # is the whole reason readability needs its own check.
-    assert relay.is_file() and not os.access(relay, os.R_OK)
-
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    assert "hooks registered" in text  # registration is untouched, still green
-    assert "relay script" in text and "not readable" in text
-    # It must NOT tell the operator to run a command that also fails.
-    assert "chmod" in text
-
-    relay.chmod(0o644)  # so the sandbox tears down cleanly
-
-
-def _validate_json(project_dir, capsys):
-    """`validate --json` as (rc, document). Not `machine_json`: that helper takes
-    the expected rc as an input, and these tests are ABOUT the rc — the sandbox's
-    baseline verdict comes from findings that have nothing to do with the relay,
-    so it must be observed, never asserted."""
-    rc = cli.main(["validate", "--project", str(project_dir), "--json"])
-    out, err = capsys.readouterr()
-    assert err == ""  # the machine.py purity contract still holds
-    return rc, json.loads(out)
-
-
-def test_validate_reports_a_fresh_relay_as_up_to_date(project, capsys):
-    """#494 Phase 4: a relay `init` just wrote matches the packaged source.
-
-    Pinned separately from the stale case because the two arms fail for opposite
-    reasons — a comparison wrong in the *other* direction (a raw byte compare
-    against a `write_text`-translated file, which on Windows calls every fresh
-    install stale) reddens here and nowhere else."""
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
-
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    assert "hook relay script up to date" in text
-    assert "differs from this bmad-loop" not in text
-
-
-def test_validate_warns_when_the_installed_relay_is_stale(project, capsys):
-    """#494 Phase 4: the relay is COPIED into the project by `init`, so an
-    upgraded orchestrator drives sessions through whatever version the project
-    happens to hold — and a pre-#494 relay still writes its events INSIDE the
-    project tree. `hooks.relay-present` cannot see that: the file is there and
-    readable, so it reads green.
-
-    The verdict must not move — the dual-poll fallback keeps a stale relay
-    working, so this reports a lost property, not a broken run. Asserted as
-    "unchanged from the same project one edit earlier" rather than a literal 0:
-    the sandbox's baseline comes from unrelated findings, and hardcoding it would
-    pin this test to those instead of to the relay.
-
-    Ablation guard: deleting the `hook_script_current` block in cmd_validate (or
-    forcing it to `True`) makes this FAIL on the `hooks.relay-stale` lookup."""
-    from bmad_loop import install as install_mod
-
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    capsys.readouterr()  # drop init's chatter; _validate_json parses the WHOLE stream
-
-    baseline_rc, baseline = _validate_json(project.project, capsys)
-
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    relay.write_text(
-        relay.read_text(encoding="utf-8") + "\n# an older wheel wrote this\n", encoding="utf-8"
-    )
-    rc, doc = _validate_json(project.project, capsys)
-
-    # The id is the matchable identity (checks.py) — match on it, not the prose.
-    stale = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
-    assert len(stale) == 1
-    assert stale[0]["severity"] == "warning"
-    assert stale[0]["detail"]["path"] == str(relay)
-    assert "bmad-loop init" in stale[0]["message"]
-
-    # The verdict and exit code are untouched by a warning.
-    assert (rc, doc["ok"]) == (baseline_rc, baseline["ok"])
-    # And the two checks it must not be confused with still read exactly as before.
-    by_id = {f["check"]: f["severity"] for f in doc["findings"]}
-    assert by_id["hooks.registered"] == "ok"
-    assert by_id["hooks.relay-present"] == "ok"
-
-
-def test_validate_is_silent_about_relay_staleness_when_hooks_are_unregistered(project, capsys):
-    """The check hangs off `any_hooks_registered`, like `hooks.relay-present`: a
-    project not routing events through any relay is not owed a note about which
-    version of one it holds — it is owed the registration FAIL, and nothing on
-    top of it.
-
-    The relay is left INSTALLED and STALE on purpose. A test that simply skips
-    `init` proves nothing: with no relay on disk the comparison degrades to
-    "unknowable" and emits no finding whether it is gated or not, so the gate
-    could be deleted outright and such a test would stay green (it was, and it
-    did). This shape is the one that separates them.
-
-    Ablation guard: hoisting the `hooks.relay-stale` block out of the
-    `if any_hooks_registered:` block makes this FAIL."""
-    from bmad_loop import install as install_mod
-    from bmad_loop.adapters.profile import load_profiles
-
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-
-    # Unregister: keep the relay, drop every registration that points at it.
-    for profile in load_profiles(project.project).values():
-        config = project.project / profile.hooks.config_path
-        if config.is_file():
-            config.write_text("{}\n", encoding="utf-8")
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    relay.write_text(relay.read_text(encoding="utf-8") + "\n# stale\n", encoding="utf-8")
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    unusable = project.project / "bmad-loop"
+    unusable.write_text("#!/bin/sh\nexit 0\n")
+    unusable.chmod(0o000)
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{unusable} relay Stop"
+    config.write_text(json.dumps(data))
     capsys.readouterr()
 
     _rc, doc = _validate_json(project.project, capsys)
-    # The premise, asserted rather than assumed — a still-registered project would
-    # make the absence below prove nothing.
     assert any(
-        f["check"] == "hooks.registered" and f["severity"] == "problem" for f in doc["findings"]
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and str(unusable) in f["message"]
+        for f in doc["findings"]
     )
-    assert relay.is_file()  # and the stale artifact really is still there
+    unusable.chmod(0o644)
+
+
+def test_validate_inspects_old_registered_script_before_migration(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    legacy = str(project.project / ".bmad-loop/bmad_loop_hook.py")
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and legacy in f["message"]
+        for f in doc["findings"]
+    )
+    legacy_path = Path(legacy)
+    legacy_path.write_text("# readable legacy script\n")
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" and legacy in f["message"]
+        for f in doc["findings"]
+    )
+    assert any(
+        f["check"] == "hooks.relay-stale"
+        and f["severity"] == "warning"
+        and f["detail"]["path"] == legacy
+        for f in doc["findings"]
+    )
+
+
+def test_validate_ignores_unused_legacy_copy(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    legacy = project.project / ".bmad-loop/bmad_loop_hook.py"
+    legacy.write_text("stale")
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
     assert not [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" for f in doc["findings"]
+    )
 
 
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
@@ -9795,8 +10212,16 @@ def test_validate_stories_folder_known_selector_ok(project):
 CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
-def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
-    """Set a project up so every validate gate passes, and pin the three gates whose
+def _make_validate_pass(
+    project,
+    monkeypatch,
+    capsys,
+    *,
+    policy=CLAUDE_ONLY_POLICY,
+    skills=None,
+    bmad_config=install_bmad_config,
+):
+    """Set a project up so every validate gate passes, and pin the gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH, whether it actually runs, and whether a multiplexer is
     installed. Without those pins the rc-0 leg would pass or fail by machine, which
@@ -9813,8 +10238,9 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     tree) while keeping every other gate green — an rc-0 assertion about one check is
     worthless if some unrelated gate is what is actually failing. ``skills`` is called
     with the project root BEFORE the commit, so whatever it lays down is committed and
-    the worktree-clean gate still passes."""
-    install_bmad_config(project)
+    the worktree-clean gate still passes. ``bmad_config`` lays down the BMAD config
+    source — the legacy YAML by default, or the central TOML layout (#769)."""
+    bmad_config(project)
     _write_policy(project.project, policy)
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     if skills is None:
@@ -9826,6 +10252,15 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
     monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    # A sandbox created during the test has no Codex trust grant, even when its
+    # registration is valid. Trust classification itself is tested separately.
+    from bmad_loop import codex_trust
+
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_kw: codex_trust.TrustResult("trusted", "fixture trust grant"),
+    )
     monkeypatch.setattr(
         cli,
         "_platform_preflight",
@@ -9917,6 +10352,38 @@ def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project
     finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_passes_bmad_config_on_a_toml_only_project(project, capsys, monkeypatch):
+    """#769: a v6.12 install with only the central `_bmad/config.toml` layers (no
+    `_bmad/bmm/config.yaml`) used to FAIL `bmad-config` and block every run."""
+    _make_validate_pass(project, monkeypatch, capsys, bmad_config=install_bmad_central_config)
+    assert not (project.project / "_bmad" / "bmm" / "config.yaml").exists()
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
+    assert finding["severity"] == "ok"
+    expected = project.project.resolve() / "_bmad-output" / "implementation-artifacts"
+    assert finding["detail"]["implementation_artifacts"] == str(expected)
+    assert doc["ok"] is True
+
+
+def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):
+    """The renderer's refusal, surfaced where validate reports config faults: the
+    same short key under two tables is a `bmad-config` problem naming both, not a
+    silent pick of either."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    install_bmad_central_config(project)
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        '[core]\nimplementation_artifacts = "{project-root}/elsewhere"\n', encoding="utf-8"
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
+    assert finding["severity"] == "problem"
+    assert "ambiguous config value `implementation_artifacts`" in finding["message"]
+    assert "modules.bmm.implementation_artifacts" in finding["message"]
+    assert "core.implementation_artifacts" in finding["message"]
 
 
 def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(project, capsys):
@@ -10371,6 +10838,203 @@ def test_validate_without_a_json_attribute_still_renders_text(project, capsys):
     out = capsys.readouterr().out
     assert "  ok: BMAD config OK:" in out  # the text form, not a document
     assert not out.lstrip().startswith("{")
+
+
+# ----------------------- #765: plugin manifests ------------------------------
+
+
+def _validate_with_plugin(project, monkeypatch, capsys, name, manifest, *, files=None, policy=None):
+    """A passing project plus one committed project-local plugin, so any verdict
+    change is the plugin's alone. Committed because an untracked plugin dir would
+    fail `git.worktree-clean` and make every rc assertion here meaningless."""
+    _make_validate_pass(project, monkeypatch, capsys, **({"policy": policy} if policy else {}))
+    pdir = project.project / ".bmad-loop" / "plugins" / name
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(manifest)
+    for rel, text in (files or {}).items():
+        (pdir / rel).write_text(text)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", f"plugin {name}")
+    return pdir / "plugin.toml"
+
+
+def _plugin_findings(doc):
+    return [f for f in doc["findings"] if f["check"] == "plugins.manifests"]
+
+
+def test_plugin_manifest_check_is_registered():
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "plugins.manifests" in VALIDATE_CHECKS
+
+
+def test_validate_fails_a_malformed_toml_plugin_manifest(project, capsys, monkeypatch):
+    """#765: before this, the first reader of a broken project `plugin.toml` was
+    `PluginRegistry.build` in `Engine.__init__`, after the run was published. The
+    pass fixture makes the plugin the ONLY problem, so rc 1 is its verdict alone."""
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "broken", "[plugin]\nname = \n")
+
+    rc = cli.main(["validate", "--project", str(project.project)])
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert f"FAIL: plugin {toml}: invalid TOML" in err  # names the manifest path
+    assert "plugin manifests ok" not in out.lower()
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("[other]\nx = 1\n", "missing [plugin] table"),
+        ('[plugin]\nname = "bad"\napi_version = "x"\n', "api_version must be an integer"),
+    ],
+    ids=["missing-plugin-table", "invalid-field"],
+)
+def test_validate_json_reports_an_invalid_plugin_manifest(
+    project, capsys, monkeypatch, body, match
+):
+    """The `--json` leg: one whole document at rc 1 with the FAIL inside it, and
+    nothing on stderr (`machine_json` parses ALL of stdout and asserts stderr empty)."""
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "bad", body)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert doc["ok"] is False
+    assert doc["counts"]["problem"] == 1
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "problem"
+    assert str(toml) in finding["message"] and match in finding["message"]
+    # A failed manifest check must not cost the gates after it their findings.
+    checks = {f["check"] for f in doc["findings"]}
+    assert {"git.worktree-clean", "hooks.registered", "skills.base"} <= checks
+
+
+def test_validate_passes_a_valid_project_plugin(project, capsys, monkeypatch):
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "fine", '[plugin]\nname = "fine"\napi_version = 1\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "ok"
+    assert "fine" in finding["detail"]["plugins"]
+
+
+def test_validate_warns_on_an_api_mismatched_plugin_without_leaking_the_warning(
+    project, capsys, monkeypatch
+):
+    """`load_plugins` skips a third-party manifest on an unsupported api_version via
+    `warnings.warn`. Validate reports it as a warning finding instead — rc stays 0 —
+    and the Python warning itself must not reach stderr, in either output mode."""
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "future", '[plugin]\nname = "future"\napi_version = 999\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    warned = [f for f in _plugin_findings(doc) if f["severity"] == "warning"]
+    assert len(warned) == 1
+    assert "'future'" in warned[0]["message"] and "api_version 999" in warned[0]["message"]
+    assert (
+        "future"
+        not in next(f for f in _plugin_findings(doc) if f["severity"] == "ok")["detail"]["plugins"]
+    )
+
+    assert cli.main(["validate", "--project", str(project.project)]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "warning: plugin 'future' declares api_version 999" in out
+
+
+def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypatch, tmp_path):
+    """Validate is the command a user runs to decide whether a checkout is safe to
+    run, so it reads manifests only. The plugin is even allowlisted in `[plugins]
+    enabled`, the one state in which `PluginRegistry.build` WOULD exec it — so a
+    regression to building the registry here writes the marker.
+
+    The marker is the observable, and it is checked before the verdict: an import
+    also drops `__pycache__` into the plugin dir, so the rc would redden too, but
+    on `git.worktree-clean` — a symptom, not the cause. The `sys.modules` check
+    is a backstop only: the registry execs through `module_from_spec` without
+    registering the module there, so that line alone cannot see a regression."""
+    marker = tmp_path / "IMPORTED"
+    module = (
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"
+        "raise RuntimeError('imported')\n"
+    )
+    _validate_with_plugin(
+        project,
+        monkeypatch,
+        capsys,
+        "evil",
+        '[plugin]\nname = "evil"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n',
+        files={"hooks.py": module},
+        policy=CLAUDE_ONLY_POLICY + '[plugins]\nenabled = ["evil"]\n',
+    )
+
+    rc = cli.main(["validate", "--project", str(project.project), "--json"])
+    out, err = capsys.readouterr()
+    assert not marker.exists()
+    assert "bmad_loop_plugin_evil" not in sys.modules and "hooks" not in sys.modules
+    assert (rc, err) == (0, "")
+    [finding] = _plugin_findings(json.loads(out))
+    assert "evil" in finding["detail"]["plugins"]
+
+
+def test_validate_json_reports_an_unlistable_plugins_dir(project, capsys, monkeypatch):
+    """A plugins dir that cannot be enumerated is a `plugins.manifests` problem
+    inside the one `--json` document, not an escaped OSError that empties stdout
+    and prints prose to stderr (`machine_json` asserts both)."""
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "fine", '[plugin]\nname = "fine"\napi_version = 1\n'
+    )
+    user_dir = project.project / ".bmad-loop" / "plugins"
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == user_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "problem"
+    assert str(user_dir) in finding["message"] and "unreadable" in finding["message"]
+
+
+def test_validate_reads_plugin_manifests_from_the_configured_repo_root(
+    project, capsys, monkeypatch, tmp_path
+):
+    """The engine builds its registry from `paths.repo_root`, and a `repo_root:`
+    override under isolation = "none" points that at another checkout. Validate
+    must parse the manifests that tree holds, not the project dir's: a broken one
+    in the code root fails here, and a broken one only the project holds is not
+    what the run loads. Ablation: pass `project` back to `_validate_plugin_manifests`
+    and both legs flip."""
+    _validate_with_plugin(
+        project,
+        monkeypatch,
+        capsys,
+        "ignored",
+        "[plugin]\nname = \n",
+        policy=CLAUDE_ONLY_POLICY + '[scm]\nisolation = "none"\n',
+    )
+    code_root = tmp_path / "code"
+    pdir = code_root / ".bmad-loop" / "plugins" / "loaded"
+    pdir.mkdir(parents=True)
+    toml = pdir / "plugin.toml"
+    toml.write_text('[plugin]\nname = "loaded"\napi_version = 1\n')
+    _configure_repo_root(project, code_root)
+    argv = ["validate", "--project", str(project.project), "--json"]
+
+    cli.main(argv)  # rc is not this check's: the config.yaml edit dirties the tree
+    [finding] = _plugin_findings(json.loads(capsys.readouterr().out))
+    assert finding["severity"] == "ok", finding
+    assert "loaded" in finding["detail"]["plugins"]
+
+    toml.write_text("[plugin]\nname = \n")
+    cli.main(argv)
+    [finding] = _plugin_findings(json.loads(capsys.readouterr().out))
+    assert finding["severity"] == "problem"
+    assert str(toml) in finding["message"]
 
 
 def test_validation_report_renders_each_severity_verbatim(capsys):

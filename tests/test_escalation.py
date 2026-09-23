@@ -191,6 +191,77 @@ def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
     assert "environment fault" in decision.reason
 
 
+def test_dev_no_work_session_pauses_even_with_budget_left():
+    """A dev session with no qualifying work evidence (#727), such as a CLI
+    parked on a permission dialog,
+    PAUSEs for a human instead of RETRYing into the identical wall. The reason
+    names the measurement, not the verdict alone.
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    parked = SessionResult(status="stalled", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session stalled")
+    assert "no completed turn or qualifying activity was observed" in decision.reason
+    assert "permission prompt" in decision.reason
+    assert "the attempt is not charged" in decision.reason
+
+
+def test_dev_no_work_session_pauses_even_when_budget_exhausted():
+    """The no-work pause outranks budget exhaustion like the env-fault pause does:
+    a spent budget must not file a CLI waiting on a human as deferred work."""
+    task = _task(attempt=2)  # 2 == max_dev_attempts -> budget spent
+    parked = SessionResult(status="crashed", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed")
+
+
+def test_dev_produced_work_default_keeps_todays_routing():
+    """`produced_work` defaults True — "unknown never blocks" — so every positional
+    construction (the engine's hand-built results, opencode-http, every fixture)
+    keeps RETRY-with-budget / DEFER-without. Pinned on both arms so the default
+    cannot silently flip."""
+    plain = SessionResult(status="timeout")
+    assert plain.produced_work is True
+    assert decide_dev(_task(attempt=1), plain, None, POLICY).action == Action.RETRY
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    assert "no work produced" not in decide_dev(_task(attempt=1), plain, None, POLICY).reason
+
+
+def test_dev_env_fault_outranks_no_work():
+    """Both flags set: the env-fault arm is checked first, so the reason blames
+    the transport, not the silence — a lost API connection explains a still
+    pane better than the still pane explains itself."""
+    task = _task(attempt=1)
+    both = SessionResult(
+        status="timeout",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        produced_work=False,
+    )
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session timeout")
+    assert "no work produced" not in decision.reason
+
+
+def test_no_work_reason_keeps_the_lost_session_suffix():
+    """#727 x #489: the no-work reason is composed over `session_failure_reason`,
+    so a session the multiplexer destroyed before it painted a second frame
+    carries both facts instead of one cancelling the other."""
+    task = _task(attempt=1)
+    both = SessionResult(status="crashed", session_vanished=True, produced_work=False)
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed:")
+    assert "multiplexer no longer reports the session" in decision.reason
+    # the review decider does not carry the arm (a named follow-up, not this wave)
+    review = decide_review_session(task, both, POLICY)
+    assert "no work produced" not in review.reason
+
+
 def test_dev_plain_noncompleted_still_retries_with_budget():
     """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
     env-fault branch must not swallow ordinary transient failures."""

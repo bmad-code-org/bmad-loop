@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -574,17 +575,57 @@ def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any]
     session-start with no later matching session-end. None when every started
     session has ended (or none started). The task_id is tracked as a string so
     the session-end match is byte-identical to what active_task_id compared."""
+    entry, _ = _open_session_start_indexed(journal_entries)
+    return entry
+
+
+def _open_session_start_indexed(
+    journal_entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, int]:
+    """`_open_session_start` plus the entry's index in `journal_entries` (-1 when
+    None), so a caller can scan the entries that FOLLOW the open start — the
+    #680 idle events belong to a session only from its start onward, and a
+    `session-idle` left behind by an earlier session with a reused task id must
+    not be read as this one's."""
     open_entry: dict[str, Any] | None = None
+    open_index = -1
     active: str | None = None
-    for entry in journal_entries:
+    for index, entry in enumerate(journal_entries):
         kind = entry.get("kind")
         if kind == "session-start" and entry.get("task_id") is not None:
             active = str(entry["task_id"])
             open_entry = entry
+            open_index = index
         elif kind == "session-end" and str(entry.get("task_id")) == active:
             active = None
             open_entry = None
-    return open_entry
+            open_index = -1
+    return open_entry, open_index
+
+
+def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> float | None:
+    """Wall timestamp the open session's current idle stretch began (#680), or
+    None when it is not idle: the `since_ts` of the last `session-idle` for
+    `task_id` after index `start`, unless a later `session-active` for the same
+    task closed it. Malformed or non-finite timestamps are ignored without
+    erasing an earlier valid stretch. Never raises on a malformed entry."""
+    since: float | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "session-idle":
+            raw = entry.get("since_ts")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
+        elif kind == "session-active":
+            since = None
+    return since
 
 
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
@@ -615,6 +656,11 @@ class ActiveAgent:
     role: str
     name: str
     model: str
+    # Wall timestamp the session's open idle stretch began (#680) — the `since_ts`
+    # of the last `session-idle` not closed by a later `session-active` — or None
+    # while the transcript is moving. The header renders `· idle <age>` from it
+    # only when set. APPENDED, so every positional construction stays valid.
+    idle_since: float | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -651,7 +697,7 @@ def active_agent(
     yields nothing trustworthy (no/empty snapshot) the agent is unknown -> None.
     Never raises on a malformed entry."""
     try:
-        entry = _open_session_start(journal_entries)
+        entry, start_index = _open_session_start_indexed(journal_entries)
         if entry is None:
             return None
         task_id = str(entry.get("task_id", ""))
@@ -667,7 +713,14 @@ def active_agent(
             name, model = resolved.name, resolved.model
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
-        return ActiveAgent(task_id=task_id, story_key=story_key, role=role, name=name, model=model)
+        return ActiveAgent(
+            task_id=task_id,
+            story_key=story_key,
+            role=role,
+            name=name,
+            model=model,
+            idle_since=_idle_since(journal_entries, start_index, task_id),
+        )
     except Exception:
         return None
 
@@ -687,8 +740,8 @@ def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] |
 
 # --------------------------------------------- project-level artifact readers
 
-# project root -> (config.yaml sig, ProjectPaths)
-_paths_cache: dict[Path, tuple[_StatSig, bmadconfig.ProjectPaths]] = {}
+# project root -> (sigs of every BMAD config source, ProjectPaths)
+_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
 # sprint-status.yaml path -> (sig or None for missing, parse or None)
 _sprint_cache: dict[Path, tuple[_StatSig | None, sprintstatus.SprintStatus | None]] = {}
 # deferred-work.md path -> (sig or None for missing, items or None)
@@ -698,26 +751,42 @@ _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] =
 _missed_cache: dict[Path, tuple[Any, list]] = {}
 
 
+def _config_source_sig(path: Path) -> object:
+    """A config source's cache signature, distinguishing what `_stat_sig` folds into
+    one `None`: absent, present but failing (an unreadable directory), and a link
+    whose target is gone or loops. `load_paths` refuses the last two where it reads
+    the first as "no layer", so appearing at an absent path must invalidate."""
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        return ("error", e.errno)
+    return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
+
+
 def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
-    """BMAD artifact paths, stat-gated on config.yaml; None when the project
-    is not initialized (or the config is unreadable)."""
+    """BMAD artifact paths, stat-gated on every config source `load_paths` reads
+    (the four central TOML layers and the legacy config.yaml), so an edit to any
+    of them is seen on the next call; None when the project is not initialized
+    (or the config is unreadable)."""
     project = resolve_or_lexical(project)
-    config_sig = _stat_sig(project / "_bmad" / "bmm" / "config.yaml")
+    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
     cached_paths = _paths_cache.get(project)
-    if config_sig is not None and cached_paths is not None and cached_paths[0] == config_sig:
+    if cached_paths is not None and cached_paths[0] == config_sigs:
         return cached_paths[1]
     try:
         paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError):
         return None
-    if config_sig is not None:
-        _paths_cache[project] = (config_sig, paths)
+    _paths_cache[project] = (config_sigs, paths)
     return paths
 
 
 def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
     """Parsed sprint-status.yaml, or None when unavailable (uninitialized
-    project, missing file, bad YAML). Stat-gated on both config.yaml and the
+    project, missing file, bad YAML). Stat-gated on both the BMAD config and the
     sprint file; the same object is returned while the file is unchanged."""
     paths = _project_paths(project)
     if paths is None:

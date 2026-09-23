@@ -98,9 +98,11 @@ from .stories_engine import StoriesEngine
 from .sweep import (
     DW_ID_RE,
     SEVERITY_ORDER,
+    SWEEP_OVERRIDE_KEYS,
     SweepEngine,
     decimal_digits_key,
     increment_decimal_digits,
+    resolve_sweep_override,
     select_entries,
 )
 
@@ -490,6 +492,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
 
+    # The engine builds its registry from `paths.repo_root` (a `repo_root:` override
+    # under isolation = "none" points it at another checkout), so read the manifests
+    # that run will load. A failed BMAD config already failed above; fall back to
+    # the project dir so the manifest check still reports something.
+    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
+
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
     # in profiles]`: that carries triage's tree, and every skills check below asks a
@@ -679,7 +687,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"binary": tool, "path": resolved, "returncode": rc},
         )
 
-    any_hooks_registered = False
+    registered_relays: set[tuple[Path, str]] = set()
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -714,20 +722,40 @@ def cmd_validate(args: argparse.Namespace) -> int:
             continue
         hook_config = project / profile.hooks.config_path
         hooks_ok = False
+        parsed: dict = {}
         if hook_config.is_file():
             try:
                 parsed = json.loads(hook_config.read_text(encoding="utf-8"))
                 hooks_ok = isinstance(parsed, dict) and relay_registered(
                     parsed, profile.hooks.dialect, profile.hooks.events
                 )
+                if isinstance(parsed, dict):
+                    container = install.hook_event_container(parsed, profile.hooks.dialect)
+                    malformed = [
+                        event
+                        for event in profile.hooks.events
+                        if event in container and not isinstance(container[event], list)
+                    ]
+                    if malformed:
+                        hooks_ok = False
+                        report.fail(
+                            "hooks.config-parse",
+                            f"{hook_config} has malformed handlers for {', '.join(malformed)}",
+                            {"profile": profile.name, "config_path": str(hook_config)},
+                        )
             except json.JSONDecodeError:
                 report.fail(
                     "hooks.config-parse",
                     f"{hook_config} is not valid JSON",
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
+        if isinstance(parsed, dict):
+            registered_relays.update(
+                install.registered_relay_paths(
+                    parsed, profile.hooks.dialect, profile.hooks.events, project
+                )
+            )
         if hooks_ok:
-            any_hooks_registered = True
             report.ok(
                 "hooks.registered",
                 f"bmad-loop hooks registered for {profile.name}",
@@ -741,91 +769,97 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
-    # #461: `hooks.registered` above is a substring match on the config JSON — it
-    # never touches the artifact the registered command points AT. A branch switch
-    # (or a deleted .bmad-loop/) leaves the registration green while every hook
-    # event is a silent no-op and the run stalls to session_timeout_min, so stat
-    # the relay itself. Outside the per-profile loop on purpose: the relay is one
-    # shared artifact, and per-profile reporting would print the same line N times.
-    # A distinct id, not a repurposed `hooks.registered` — the two answer different
-    # questions and an operator needs to see which one failed.
-    #
-    # COUPLING (#461 Phase 2): Phase 2 moves the relay to the installed console
-    # script — `bmad-loop relay <Event>` (cmd_relay / events.py), NOT the
-    # `<abs-python> -m bmad_loop.hookrelay` spelling this once anticipated — and
-    # retires HOOK_SCRIPT_REL. It must RETARGET this check to stat what the
-    # registration actually points at (the resolved `bmad-loop` executable), not
-    # drop it — the stall it guards against survives the move: an entry point that
-    # is gone or unreadable strands every hook event exactly like a missing script.
-    if any_hooks_registered:
-        relay = project / install.HOOK_SCRIPT_REL
-        # Existence is not enough: `is_file()` stays True for a mode-000 file, and
-        # the registered command is `<interpreter> <relay> <Event>`, which has to
-        # READ the script — an unreadable relay exits 2 ("can't open file") and the
-        # run stalls exactly as if the relay were gone, which is the blind spot
-        # this whole check exists to remove. `os.access` uses the REAL uid/gid,
-        # which is what the operator's own `bmad-loop` invocation runs as, and it
-        # stays correct under root (who can read a 000 file) where a mode-bit test
-        # would false-fail. On Windows `chmod` can only toggle the read-only flag,
-        # so this arm is POSIX-effective and never makes the Windows path stricter.
+        if profile.hooks.dialect == "codex-hooks-json":
+            from .codex_trust import hook_discovery_args_safe, project_hook_trust
+
+            unsafe_roles = []
+            if pol is not None:
+                for role in ROLES:
+                    cfg = pol.adapter.resolved(role)
+                    if cfg.name == profile.name and not hook_discovery_args_safe(cfg.extra_args):
+                        unsafe_roles.append(role)
+
+            if not profile.packaged:
+                trust_message = (
+                    "hook trust unverifiable: project-owned Codex profile may name an "
+                    "untrusted executable; validation will not launch it"
+                )
+            elif pol is not None and pol.scm.isolation == "worktree":
+                trust_message = (
+                    "hook trust unverifiable for future worktree sessions: each isolated "
+                    "directory needs its own Codex trust grant"
+                )
+            elif not hooks_ok:
+                trust_message = "hook trust cannot pass: Codex relay hooks are not registered"
+            elif unsafe_roles:
+                trust_message = (
+                    "hook trust unverifiable: adapter.extra_args may change Codex hook "
+                    f"discovery for {', '.join(unsafe_roles)}"
+                )
+            else:
+                trust = project_hook_trust(project, profile)
+                trust_message = None if trust.status == "trusted" else trust.reason
+            if trust_message is None:
+                report.ok(
+                    "hooks.trust",
+                    f"Codex hook trust current for {profile.name} in {project}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+            else:
+                report.fail(
+                    "hooks.trust",
+                    f"{profile.name}: {trust_message}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+
+    # Inspect the executable each managed registration actually names. A new
+    # installation in this process cannot repair an older path in a hook config.
+    # Compare with the command init would write now: an old executable can remain
+    # usable after switching installations, while still running an outdated relay.
+    # The comparison is on the registered TEXT, the same test init's merge_hooks
+    # applies: on Windows both `Path` equality and `str(Path)` normalize
+    # separators, so a pre-#773 backslash registration (which Git Bash mangles,
+    # stalling every session) would otherwise never be flagged.
+    expected_text = None
+    if registered_relays:
+        hook_profile = next(profile for profile in profiles if not profile.hookless)
+        try:
+            expected_text = install.relay_executable_text(
+                install._hook_command(project, hook_profile, "Stop")
+            )
+        except ProfileError:
+            # No current executable to compare. The registered path still gets
+            # its own presence check below; do not call it stale by inference.
+            pass
+    for relay, spelling in sorted(registered_relays):
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
-                f"hooks are registered but the relay script {relay} is missing — "
-                f"run `bmad-loop init`",
+                f"registered hook executable {relay} is missing — re-run `bmad-loop init`",
                 {"path": str(relay)},
             )
-        elif not os.access(relay, os.R_OK):
-            # Deliberately NOT "run `bmad-loop init`": install_into writes this path
-            # with write_text(), which needs write access to the same file, so init
-            # raises PermissionError instead of repairing it. Sending the operator
-            # to a command that also fails is worse than saying nothing.
+        elif not os.access(
+            relay, os.R_OK if relay.name == "bmad_loop_hook.py" else os.R_OK | os.X_OK
+        ):
             report.fail(
                 "hooks.relay-present",
-                f"hooks are registered but the relay script {relay} is not readable — "
-                f"the registered hook command cannot run it, so every hook event "
-                f"no-ops. Restore read permission (`chmod u+r`) or delete it and "
-                f"re-run `bmad-loop init`",
+                f"registered hook executable {relay} is not usable — repair its permissions or re-run `bmad-loop init`",
                 {"path": str(relay)},
             )
         else:
             report.ok(
                 "hooks.relay-present",
-                f"hook relay script present: {relay}",
+                f"registered hook executable available: {relay}",
                 {"path": str(relay)},
             )
-
-        # #494 Phase 4: present-and-readable is not current. The relay is COPIED
-        # into the project by `init`, so an upgraded orchestrator routinely drives
-        # sessions through a relay written by an older wheel — and the #494 move
-        # is exactly the kind of change that skew hides: a pre-move relay writes
-        # its events to the in-tree `<run-dir>/events` while the operator believes
-        # the channel left the project tree, so a branch switch can still take the
-        # control plane away mid-run.
-        #
-        # A WARNING, never a problem, and validate's exit code must not move:
-        # Phase 3's fallback pair keeps a stale relay FUNCTIONAL (it writes the
-        # legacy directory, which SignalWatcher still polls), so the run completes
-        # — the operator is losing the property, not the loop. `passed` counts
-        # only problems, so `warn` is what says "degraded but working".
-        stale = install.hook_script_current(project)
-        if stale is False:
-            report.warn(
-                "hooks.relay-stale",
-                f"the installed hook relay {relay} differs from this bmad-loop's "
-                f"— it is from another version, or was edited. Events may still be "
-                f"written inside the project tree; run `bmad-loop init` to refresh it",
-                {"path": str(relay)},
-            )
-        elif stale is True:
-            report.ok(
-                "hooks.relay-stale",
-                f"hook relay script up to date: {relay}",
-                {"path": str(relay)},
-            )
-        # `None` (unreadable/undecodable on either side) reports nothing: the
-        # relay-present block above already spoke for the cases an operator can
-        # act on, and "I could not compare" is not a finding about their project.
+            if expected_text is not None and spelling != expected_text:
+                report.warn(
+                    "hooks.relay-stale",
+                    f"registered hook executable {spelling} differs from this "
+                    f"installation's {expected_text} — re-run `bmad-loop init` "
+                    "to update the hook registration",
+                    {"path": spelling, "expected_path": expected_text},
+                )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error
@@ -889,6 +923,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{role} model {cfg.model!r} is not 'provider/model' — "
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
+                )
+            # Reasoning effort (#643) has exactly one carrier: the opencode-http
+            # kind sends it as the per-prompt `variant`. The tmux generic family
+            # has no channel for it — no profile flag, no hook field — so a stage
+            # that sets it there runs at the provider default with nothing to show
+            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
+            # because "cannot carry effort" is a fact about that family; an
+            # out-of-tree kind's capability is not knowable here, so it stays
+            # silent rather than assert one. Advisory: severity `problem` is
+            # validate's exit code, and an ignored knob does not make a run unrunnable.
+            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+                report.warn(
+                    "policy.effort-unsupported",
+                    f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
+                    f"only the opencode-http adapter carries a reasoning-effort value",
+                    {"role": role, "effort": cfg.effort, "profile": prof.name},
                 )
 
     base_findings = install.missing_base_skills(project, dev_trees)
@@ -1473,6 +1523,48 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
     except (OSError, UnicodeDecodeError):
         return (), None
     return deferredwork.parse_declaration(raw)
+
+
+def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
+    """Parse every discovered plugin manifest the way a run will (#765).
+
+    `root` is the code root the engine hands `PluginRegistry.build` —
+    `paths.repo_root`, not necessarily the project dir.
+
+    Without this the first reader of a malformed project `plugin.toml` was
+    `PluginRegistry.build` inside `Engine.__init__` — after the run's directory,
+    state and journal were already published. `load_plugins` is manifest-only
+    discovery: it never imports a `[python]` module, which matters here because
+    validate is the command a user runs to decide whether a checkout is safe to
+    run at all. `PluginRegistry.build` would exec every allowlisted module.
+
+    A PluginError is the whole message: every manifest fault names its source
+    (the manifest path, for a project plugin). `load_plugins` stops at the first
+    bad manifest, so one fault is reported per pass. A third-party manifest on an
+    unsupported api_version is skipped with `warnings.warn`, which a run keeps;
+    here it is captured and reported as a warning finding instead, so it neither
+    leaks to stderr nor breaks the `--json` stream contract.
+    """
+    import warnings
+
+    from .plugins import PluginError, load_plugins
+
+    with warnings.catch_warnings(record=True) as skipped:
+        warnings.simplefilter("always")  # the once-per-location default would drop a repeat
+        try:
+            manifests = load_plugins(root)
+        except PluginError as e:
+            manifests = None
+            report.fail("plugins.manifests", str(e))
+    for w in skipped:
+        report.warn("plugins.manifests", f"{w.message} — skipped; a run will not load it")
+    if manifests is not None:
+        names = sorted(manifests)
+        report.ok(
+            "plugins.manifests",
+            f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
+            {"plugins": names},
+        )
 
 
 def _validate_operator_registry(
@@ -2105,19 +2197,27 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry as adapter_registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
-    if profile.hookless:
+    # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
+    # axes, so an `opencode-http` profile carrying a hook dialect still launches
+    # the HTTP adapter (and sends effort), while a hookless profile of another
+    # kind never does. The preview must follow the adapter `make_adapters` builds.
+    if profile.adapter == adapter_registry.OPENCODE_HTTP:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
+        # effort rides the prompt_async body as `variant` (#643); shown under the
+        # policy's own key so the preview distinguishes the configurations.
+        effort = f" effort={cfg.effort}" if cfg.effort else ""
         return (
             f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
             f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
-            f"{model}"
+            f"{model}{effort}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args
     argv = [
@@ -2998,11 +3098,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
         # tree the run is in from here on; whether the new tree can honor those shas
         # is the operator's call, and this is the moment they can still make it.
         print(
-            f"warning: run {run_dir.name}: the code root in _bmad/bmm/config.yaml has"
+            f"warning: run {run_dir.name}: the code root in the BMAD config has"
             " changed since this run started — the resumed engine works in the tree"
             " configured now, while the baselines, preserve refs and branches this run"
             " already recorded name objects in the previous one. Restore the previous"
-            " `repo_root:` value if you did not intend the move.",
+            " `repo_root` value if you did not intend the move.",
             file=sys.stderr,
         )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for
@@ -3082,8 +3182,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         # instead of reloading the predecessor's old paused state and double-driving.
         if runs.engine_liveness(run_dir) == "alive":
             print(
-                f"run {run_dir.name} is still live — resuming would double-drive it; "
-                "stop it first",
+                f"run {run_dir.name} is still live — resuming would double-drive it; stop it first",
                 file=sys.stderr,
             )
             return 1
@@ -3470,7 +3569,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
                 return rc
         adapters = _make_adapters(project, run_dir, pol)
-        model = pol.adapter.resolved("dev").model
+        dev_cfg = pol.adapter.resolved("dev")
+        model = dev_cfg.model
+        effort = dev_cfg.effort
         _ctx_path, withheld, unreadable = resolve.build_context(
             state,
             run_dir,
@@ -3499,6 +3600,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 # this `task` object reads the same either way.
                 generation=task.generation,
                 model=model,
+                effort=effort,
             )
         except NotImplementedError:
             print(
@@ -4275,6 +4377,57 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sweep_options_line(run_dir: Path, state: RunState) -> str:
+    """The text-status line naming a sweep run's effective options (#815).
+
+    `policy_snapshot` alone reads as the enforced cap, but a launch override in
+    `sweep.json` wins over it (`resolve_sweep_override`, as `SweepEngine.__init__`
+    applies it). The policy half comes from the run's snapshot, never live
+    policy.toml: the engine loads policy once, and resume re-stamps the snapshot
+    to the policy it reloads. `sweep.json` is read the way resume reads it —
+    bounded, version-checked and digest-bound — but status only observes, so a
+    refusal degrades to "unverifiable" rather than failing the command."""
+    version = state.sweep_options_version
+    try:
+        runsetup.validate_sweep_options_version(version)
+        current = version == runsetup.SWEEP_OPTIONS_VERSION
+        options = runsetup.load_sweep_resume_options(
+            run_dir,
+            required=version >= runsetup.SWEEP_OPTIONS_VERSION,
+            expected_digest=state.sweep_options_digest if current else None,
+        )
+        runsetup.validate_sweep_options_binding(version, state.sweep_options_digest, options)
+    except runsetup.SweepOptionsError as exc:
+        return f"sweep options: unverifiable — {exc}"
+    if options.digest is None:
+        # The legacy loader's tolerant empty shape: no readable sweep.json, so the
+        # launch overrides were never recorded (resume would run on policy alone).
+        return "sweep options: unknown — legacy run with no readable sweep.json"
+    raw_policy = state.policy_snapshot.get("sweep")
+    snapshot: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+    parts: list[str] = []
+    for key in SWEEP_OVERRIDE_KEYS:
+        override = options.values.get(key)
+        from_policy = snapshot.get(key)
+        if override is None and from_policy is None:
+            parts.append(f"{key} unknown (no override; not in the policy snapshot)")
+            continue
+        value = json.dumps(resolve_sweep_override(override, from_policy))
+        if override is None:
+            source = "policy"
+        elif from_policy is None:
+            source = "override"
+        else:
+            source = f"override; policy {json.dumps(from_policy)}"
+        parts.append(f"{key} {value} ({source})")
+    if options.only_ids is not None:
+        parts.append(f"only {','.join(options.only_ids)}")
+    if options.min_severity is not None:
+        parts.append(f"min_severity {options.min_severity}")
+    legacy = " [legacy options format]" if version == 0 else ""
+    return f"sweep options: {', '.join(parts)}{legacy}"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = _project(args)
     if args.run_id:
@@ -4314,6 +4467,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    if state.run_type == "sweep":
+        print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:
         detail = ", ".join(f"{trigger} ({why})" for trigger, why in state.sweeps_refused.items())
         print(f"auto-sweep not run: {detail} — deferred work is untouched")
@@ -4983,17 +5138,22 @@ def cmd_probe(args: argparse.Namespace) -> int:
     )
 
     profile = None
+    codex_profile_error = False
     try:
         profile = get_profile(args.cli, project)
     except ProfileError as e:
+        if args.cli == "codex":
+            codex_profile_error = True
         if not args.binary:
-            print(f"FAIL: {e}", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(f"FAIL: {prefix}{e}", file=sys.stderr)
             return 1
         # Human-facing notice — stderr in JSON mode, where stdout is the document.
-        print(
-            f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
-            file=sys.stderr if args.json else sys.stdout,
-        )
+        if not codex_profile_error:
+            print(
+                f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
+                file=sys.stderr if args.json else sys.stdout,
+            )
 
     if profile is not None and profile.hookless:
         print(
@@ -5021,7 +5181,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     if args.probe:
         if profile is None:
-            print("FAIL: --probe needs a known profile (its hook dialect/events)", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(
+                f"FAIL: {prefix}--probe needs a known profile (its hook dialect/events)",
+                file=sys.stderr,
+            )
             return 1
         finding = probe_mod.probe(
             cli=args.cli,
@@ -5036,6 +5200,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         finding = probe_mod.scan(
             cli=args.cli, profile=profile, project=project, hints=hints, pseudo=pseudo
         )
+    if codex_profile_error:
+        finding.hook_trust = "unverifiable"
+        finding.warnings.append("Codex hook trust unverifiable: profile cannot be loaded")
+        finding.next_steps.append("Repair the Codex profile, then re-run the probe")
 
     # One or the other, never both: --json selects the pure JSON document
     # (machine.py contract), otherwise the human-readable markdown report.
@@ -5077,6 +5245,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
     # Every `ok:` trailer is human-facing chatter, so in JSON mode it goes to
     # stderr — stdout is the document alone, or empty when --out took it.
     trailers = sys.stderr if args.json else sys.stdout
+    trust_ok = finding.hook_trust is None or finding.hook_trust == "trusted"
+    trailer_prefix = "ok" if trust_ok else "FAIL"
     if args.out:
         out_path = Path(args.out)
         if args.json:
@@ -5084,7 +5254,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             out_path.write_text(report, encoding="utf-8")
         print(
-            f"  ok: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
             file=trailers,
         )
     else:
@@ -5093,10 +5263,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             print(report)
         print(
-            f"  ok: {finding.mode} {noun} for {args.cli} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {finding.mode} {noun} for {args.cli} "
+            f"({len(finding.warnings)} warning(s))",
             file=trailers,
         )
-    return 0
+    return 0 if trust_ok else 1
 
 
 def cmd_diagnose(args: argparse.Namespace) -> int:
@@ -5227,14 +5398,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_relay(args: argparse.Namespace) -> int:
     """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
 
-    **Nothing points at it yet.** ``init`` still registers the copied workspace
-    relay (``install._hook_command`` emits ``<interpreter> <project>/.bmad-loop/
-    bmad_loop_hook.py <Event>``), so no installed hook reaches this handler today;
-    it is the target #461 Phase 2 retargets those registrations to, and that move
-    carries its own obligation — see the COUPLING note on ``hooks.relay-present``,
-    which must be retargeted rather than dropped in the same change. Said here
-    because a console script that exists and is documented reads as the live path,
-    and an operator debugging a lost Stop needs to know which relay actually ran.
+    ``init`` registers the absolute entry point belonging to this installation.
+    ``hooks.relay-present`` checks the path each registration actually names.
 
     Total by contract, unlike every other handler: a coding CLI runs this INSIDE
     the session whose completion it reports, and several of them surface a

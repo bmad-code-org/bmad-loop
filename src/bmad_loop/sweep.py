@@ -11,16 +11,19 @@ gates on the ones it delegates (verify.verify_review_bundle).
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import stat
+import time
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, NoReturn, assert_never
+from typing import Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
 from . import deferredwork, gates, verify
+from .adapters.generic import load_result_document
 from .engine import (
     Engine,
     RunPaused,
@@ -28,6 +31,7 @@ from .engine import (
     _ledger_fault_text,
     _LedgerAnchor,
     _publication_refusal,
+    _session_task_id,
 )
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
@@ -40,7 +44,8 @@ from .platform_util import (
     path_is_confined,
     safe_segment,
 )
-from .runs import StateRootError, _project_of_run_dir
+from .runs import StateRootError, _project_of_run_dir, events_dir_for
+from .signals import session_events
 from .statemachine import advance
 
 
@@ -1300,6 +1305,62 @@ def _rearm_generation(task: StoryTask) -> None:
     task.generation += 1
 
 
+# The launch overrides a sweep run resolves against `[sweep]` policy. `sweep.json`
+# persists each as nullable (None = "not given"); `SweepEngine.__init__` and
+# `bmad-loop status` both resolve through `resolve_sweep_override`.
+SWEEP_OVERRIDE_KEYS = ("max_bundles", "repeat", "max_cycles")
+
+_T = TypeVar("_T")
+
+
+def resolve_sweep_override(override: _T | None, policy_value: _T) -> _T:
+    """The value a sweep run enforces for one of `SWEEP_OVERRIDE_KEYS`: its own
+    override when one was given, else the policy's. Tested with `is not None`,
+    never truthiness — an explicit `repeat=False` or `max_bundles=0` is an
+    override, not an absence."""
+    return override if override is not None else policy_value
+
+
+# Bound on any artifact-derived text a session-failure diagnostic carries (#752):
+# the journal records an error summary, never the document itself.
+_DIAGNOSTIC_TEXT_LIMIT = 400
+
+
+def _bounded(text: str, limit: int = _DIAGNOSTIC_TEXT_LIMIT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _triage_verdict(doc: dict[str, Any], open_now: set[str] | None) -> list[str]:
+    """`validate_triage`'s errors for ``doc`` as the completed path would grade it —
+    bundle names normalized first — on a private copy, so a diagnostic read never
+    repairs the artifact it inspects."""
+    graded = copy.deepcopy(doc)
+    _normalize_bundle_names(graded)
+    return validate_triage(graded, open_now)[1]
+
+
+def _hook_verdict(kinds: set[str]) -> str:
+    if not kinds:
+        return "none"
+    if "Stop" in kinds:
+        return "stop"
+    if "SessionStart" in kinds:
+        return "session-start-without-stop"
+    return "no-session-start-or-stop"
+
+
+def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
+    """The escalation-text tail for a non-completed session's diagnostic (#752):
+    what was on disk and which hook events arrived, so an operator whose event
+    channel is miswired debugs the channel, not the agent's output."""
+    if diagnostic is None:
+        return ""
+    artifact = str(diagnostic["artifact"])
+    if diagnostic.get("artifact_error"):
+        artifact += f" ({diagnostic['artifact_error']})"
+    return f" [result.json: {artifact}; hook events: {diagnostic['hook_events']}]"
+
+
 class SweepEngine(Engine):
     """Engine variant whose loop processes the deferred-work ledger instead
     of sprint-status. Bundles reuse the inherited story pipeline through the
@@ -1323,11 +1384,15 @@ class SweepEngine(Engine):
         self.adapters["triage"] = (
             triage_adapter if triage_adapter is not None else self.adapters["dev"]
         )
+        # `Engine.__init__` attached the journal to the adapters it knew about; a
+        # distinct triage adapter arrives after that, so attach it here too or every
+        # sweep triage session would emit no `session-idle`/`session-active` (#680).
+        self.adapters["triage"].journal = self.journal
         self.prompting = prompting
         self.decisions_only = decisions_only
-        self.max_bundles = max_bundles if max_bundles is not None else self.policy.sweep.max_bundles
-        self.repeat = repeat if repeat is not None else self.policy.sweep.repeat
-        self.max_cycles = max_cycles if max_cycles is not None else self.policy.sweep.max_cycles
+        self.max_bundles = resolve_sweep_override(max_bundles, self.policy.sweep.max_bundles)
+        self.repeat = resolve_sweep_override(repeat, self.policy.sweep.repeat)
+        self.max_cycles = resolve_sweep_override(max_cycles, self.policy.sweep.max_cycles)
         self.only_ids = only_ids
         self.min_severity = min_severity
         self._selection_started = self.state.sweep_cycle > 1 or any(
@@ -2893,6 +2958,10 @@ class SweepEngine(Engine):
           no-op once set, so a survivor would also refuse the replacement bundle's
           own spec on escalation.
         - ``restore_patch`` -- the diff of the superseded bundle's attempt.
+        - ``preserve_from_attempt`` -- the claim that ``preserve_ref`` holds THIS
+          task's attempt. The ref itself stays (below); the flag goes so the retry
+          dev prompt does not offer the superseded bundle's work as this one's
+          (#777). Git cannot tell the two apart: same run, key and baseline.
         - ``attempt`` + ``review_cycle`` + ``followup_reviews_spent`` -- reset the
           retry and review counters; clear the associated ``defer_reason`` and
           advance ``generation`` for fresh session ids. These operations follow
@@ -2927,7 +2996,7 @@ class SweepEngine(Engine):
           reset that got us here.
         - ``preserve_ref`` / ``preserve_partial`` -- a ref to a rolled-back
           worktree that still exists on disk; clearing the name would orphan it
-          rather than release it.
+          rather than release it. Its provenance flag is cleared instead (above).
         - the ``baseline_*`` pair and ``worktree_path`` / ``branch`` -- mount and
           rollback anchors owned by the reset, not by either bundle.
         - ``dispatched_spec_file`` / ``dispatched_spec_snapshot`` -- ``Sweep``
@@ -2970,6 +3039,7 @@ class SweepEngine(Engine):
         task.artifact_publication_complete = False
         task.spec_file = None
         task.restore_patch = None
+        task.preserve_from_attempt = False
         task.attempt = 0
         task.review_cycle = 0
         task.followup_reviews_spent = 0
@@ -3652,6 +3722,7 @@ class SweepEngine(Engine):
             task.attempt += 1
             advance(task, Phase.TRIAGE_RUNNING)
             self._save()
+            launch_floor_ns = time.time_ns()
             result = self._run_session(
                 task,
                 role="triage",
@@ -3680,8 +3751,14 @@ class SweepEngine(Engine):
             # anchor's "the session deleted it", distinct from an empty write.
             rewrite = deferredwork.read_for_write(ledger)
             new_text = rewrite if rewrite is not None else ""
+            diagnostic: dict[str, Any] | None = None
             if result.status != "completed":
                 errors = [session_failure_reason("migration", result)]
+                diagnostic = self._session_failure_diagnostic(
+                    task,
+                    launch_floor_ns,
+                    lambda doc: validate_migration(doc, manifest, pre_canonical, new_text),
+                )
             else:
                 errors = validate_migration(result.result_json, manifest, pre_canonical, new_text)
             self.journal.append(
@@ -3691,6 +3768,7 @@ class SweepEngine(Engine):
                 ok=not errors,
                 errors=errors,
                 env_fault=result.env_fault,
+                diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
                 # The migration session's CLI lost its API connection (#194): it did
@@ -3700,7 +3778,7 @@ class SweepEngine(Engine):
                 # resume also restores the ledger if the worktree is dirty.
                 self._escalate(
                     task,
-                    env_fault_pause_reason("migration", result),
+                    env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -3818,13 +3896,94 @@ class SweepEngine(Engine):
                 )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
-                    task, "migration failed deterministic validation: " + "; ".join(errors)
+                    task,
+                    "migration failed deterministic validation: "
+                    + "; ".join(errors)
+                    + _diagnostic_suffix(diagnostic),
                 )
             feedback = self._write_feedback(
                 task,
                 "The legacy-ledger migration failed deterministic validation:\n- "
                 + "\n- ".join(errors),
             )
+
+    def _session_failure_diagnostic(
+        self,
+        task: StoryTask,
+        launch_floor_ns: int,
+        validate: Callable[[dict[str, Any]], list[str]],
+    ) -> dict[str, Any]:
+        """Observe what a NON-completed triage/migration session left behind (#752):
+        its ``result.json`` and the hook events of THIS attempt. Diagnosis only —
+        a valid artifact here is never a completion (sessions complete on Stop or
+        window death alone), and nothing in it changes the attempt's routing.
+
+        ``artifact``: ``missing`` | ``malformed`` (``artifact_error`` names the parse
+        or validation failure, bounded) | ``valid`` | ``unreadable: <reason>``.
+        ``validate`` is the leg's own completed-path validator, handed the parsed
+        document read-only.
+
+        ``hook_events``: ``none`` | ``session-start-without-stop`` | ``stop`` |
+        ``no-session-start-or-stop`` | ``unreadable: <reason>`` |
+        ``n/a (<observation> observation)`` for a triage adapter that does not
+        observe through hooks and so writes no events to count. Counted over both
+        the out-of-tree channel and the legacy in-tree ``<run_dir>/events`` through
+        ``signals.is_session_event`` — this attempt's session id and launch floor,
+        so an earlier healthy attempt's events cannot mask this failure.
+
+        Observation degrades, never raises: this runs on a failure path that must
+        still reach its retry/escalation decision."""
+        # The id `_run_session` just minted for this attempt: the sweep dispatches
+        # both legs as role "triage" with no label.
+        task_id = _session_task_id(task.story_key, "triage", task.attempt, task.generation)
+        diagnostic: dict[str, Any] = {"task_id": task_id}
+        # The adapter's own read-back location, which it clears at launch, so a
+        # document there was written during this attempt.
+        try:
+            doc = load_result_document(self.run_dir / "tasks", task_id)
+        except OSError as exc:
+            diagnostic["artifact"] = f"unreadable: {_bounded(str(exc))}"
+        except (ValueError, RecursionError) as exc:
+            diagnostic["artifact"] = "malformed"
+            diagnostic["artifact_error"] = _bounded(f"{type(exc).__name__}: {exc}")
+        else:
+            if doc is None:
+                diagnostic["artifact"] = "missing"
+            else:
+                try:
+                    errors = validate(doc)
+                except Exception as exc:  # observation degrades; see docstring
+                    diagnostic["artifact"] = (
+                        f"unreadable: validator raised {_bounded(f'{type(exc).__name__}: {exc}')}"
+                    )
+                else:
+                    if errors:
+                        diagnostic["artifact"] = "malformed"
+                        diagnostic["artifact_error"] = _bounded("; ".join(errors))
+                    else:
+                        diagnostic["artifact"] = "valid"
+        # An adapter that does not observe through hooks (opencode-http's SSE)
+        # never writes either event channel, so an empty scan is no evidence about
+        # it; `none` would send its operator debugging a relay it does not use.
+        observation = self.adapters["triage"].observation
+        if observation != "hook-signal":
+            diagnostic["hook_events"] = f"n/a ({observation or 'unknown'} observation)"
+            return diagnostic
+        try:
+            events = session_events(
+                events_dir_for(self.paths.project, self.run_dir.name),
+                self.run_dir / "events",
+                task_id,
+                launch_floor_ns,
+            )
+        except Exception as exc:  # observation degrades; see docstring
+            diagnostic["hook_events"] = f"unreadable: {_bounded(f'{type(exc).__name__}: {exc}')}"
+        else:
+            kinds = {event.event for event in events}
+            diagnostic["hook_events"] = _hook_verdict(kinds)
+            diagnostic["hook_event_kinds"] = sorted(kinds)
+            diagnostic["hook_event_count"] = len(events)
+        return diagnostic
 
     def _migrate_prompt(self, manifest: Path, feedback: Path | None) -> str:
         prompt = f"/bmad-loop-sweep --migrate {manifest}"
@@ -3922,6 +4081,7 @@ class SweepEngine(Engine):
             task.attempt += 1
             advance(task, Phase.TRIAGE_RUNNING)
             self._save()
+            launch_floor_ns = time.time_ns()
             result = self._run_session(
                 task,
                 role="triage",
@@ -3933,8 +4093,12 @@ class SweepEngine(Engine):
             critical_reason = critical_session_reason("triage", result.result_json)
             if critical_reason is not None:
                 self._escalate(task, critical_reason)
+            diagnostic: dict[str, Any] | None = None
             if result.status != "completed":
                 plan, errors = None, [session_failure_reason("triage", result)]
+                diagnostic = self._session_failure_diagnostic(
+                    task, launch_floor_ns, lambda doc: _triage_verdict(doc, open_now)
+                )
             else:
                 repairs = _normalize_bundle_names(result.result_json)
                 plan, errors = validate_triage(result.result_json, open_now)
@@ -3952,6 +4116,7 @@ class SweepEngine(Engine):
                 ok=plan is not None,
                 errors=errors,
                 env_fault=result.env_fault,
+                diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
                 # transport/API failure (#194): pause rather than charge a triage
@@ -3959,7 +4124,7 @@ class SweepEngine(Engine):
                 # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
                 self._escalate(
                     task,
-                    env_fault_pause_reason("triage", result),
+                    env_fault_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)
@@ -4012,11 +4177,28 @@ class SweepEngine(Engine):
                 self._emit("post_triage", task)
                 return plan
             if task.attempt >= self.policy.sweep.max_triage_attempts:
-                self._escalate(task, "triage output failed validation: " + "; ".join(errors))
+                self._escalate(
+                    task,
+                    "triage output failed validation: "
+                    + "; ".join(errors)
+                    + _diagnostic_suffix(diagnostic),
+                )
             feedback = self._write_feedback(
                 task,
                 "The triage result.json failed deterministic validation:\n- " + "\n- ".join(errors),
             )
+
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        # Triage and migration sessions read the ledger the orchestrator resolved,
+        # not one they re-derive: `load_paths` layers the central TOML over the
+        # legacy YAML, and a skill reading the YAML alone would triage a stale
+        # ledger — or find none on a TOML-only install (#769). Bundle sessions
+        # never read the ledger, so they stay byte-identical.
+        if role != "triage" or label is not None:
+            return {}
+        return {"BMAD_LOOP_LEDGER": str(self.workspace.paths.deferred_work)}
 
     def _triage_prompt(self, feedback: Path | None, open_now: set[str] | None = None) -> str:
         prompt = "/bmad-loop-sweep"
@@ -7249,12 +7431,15 @@ class SweepEngine(Engine):
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
                     f"resolution.{artifact_only_guidance}"
                 )
+            # A retry after a rolled-back attempt names its verified parked work
+            # (#777); a superseded bundle's ref is suppressed by the shared builder.
+            preserved = self._retry_preserve_notice(task)
             return (
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
                 f"orchestrator records resolution.{artifact_only_guidance}"
-            )
+            ) + (f"\n\n{preserved}" if preserved else "")
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
         return (

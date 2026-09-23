@@ -137,7 +137,7 @@ key = "dev_stall_grace_s"
 kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.dev_stall_grace_s"
-description = "silence grace for a dev/review session, armed at launch and re-armed by transport activity or fresh Stop/idle evidence, before bounded nudges/stalled classification · 0 = no launch timer, but a result-less turn end still fails fast"
+description = "silence grace for a dev/review session, armed at launch and re-armed by transport activity or fresh Stop/idle evidence, before bounded nudges/stalled classification · also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age) · 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast"
 [[section.field]]
 key = "dev_stall_nudges"
 kind = "int"
@@ -234,6 +234,11 @@ key = "model"
 kind = "str"
 placeholder = "CLI default model"
 [[section.field]]
+key = "effort"
+kind = "str"
+placeholder = "provider default"
+description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the per-prompt variant, ignored by the tmux CLIs"
+[[section.field]]
 key = "extra_args"
 kind = "args"
 [[section.field]]
@@ -269,6 +274,10 @@ placeholder = "inherit from [adapter]"
 key = "model"
 kind = "str"
 placeholder = "inherit / client default"
+[[section.field]]
+key = "effort"
+kind = "str"
+placeholder = "inherit / provider default"
 [[section.field]]
 key = "extra_args"
 kind = "args"

@@ -21,8 +21,9 @@ stale drop-in can never take a run down.
 
 from __future__ import annotations
 
+import os
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
@@ -65,20 +66,44 @@ def _read_manifest_text(toml: Traversable | Path, source: str) -> str:
         raise PluginError(f"plugin {source}: unreadable: {e}") from e
 
 
+def _plugin_dirs(
+    root: Traversable, sort_key: Callable[[Traversable], str]
+) -> list[tuple[Traversable, Traversable]]:
+    """Every ``(plugin dir, plugin.toml)`` pair under a plugins root, or ``[]``
+    when the root is absent — with any filesystem fault converted to PluginError.
+
+    The whole enumeration sits behind one conversion, not just the listing: on the
+    3.11 floor `Path.is_dir()`/`is_file()` swallow only absence errnos (ENOENT,
+    ENOTDIR, EBADF, ELOOP) and RAISE on EACCES, so a root whose parent is not
+    searchable faults on the existence probe, and an unsearchable entry on its
+    `is_file()`. Every consumer keys on PluginError (validate --json reports it as
+    a finding; `PluginRegistry.build` and the TUI settings screen degrade on it),
+    and the manifest read itself is already converted by `_read_manifest_text`.
+    Collected eagerly so no fault can surface mid-yield from a later probe.
+    """
+    try:
+        if not root.is_dir():
+            return []
+        found: list[tuple[Traversable, Traversable]] = []
+        for entry in sorted(root.iterdir(), key=sort_key):
+            toml = entry.joinpath(PLUGIN_FILE)
+            if entry.is_dir() and toml.is_file():
+                found.append((entry, toml))
+        return found
+    except OSError as e:
+        raise PluginError(f"plugin dir {root}: unreadable: {e}") from e
+
+
 def _discover_builtin() -> Iterator[PluginManifest]:
     packaged = resources.files("bmad_loop.data").joinpath("plugins")
-    if not packaged.is_dir():
-        return
-    for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
-        toml = entry.joinpath(PLUGIN_FILE)
-        if entry.is_dir() and toml.is_file():
-            source = f"{entry.name}/{PLUGIN_FILE}"
-            yield load_manifest(
-                _read_manifest_text(toml, source),
-                source,
-                str(entry),
-                origin="builtin",
-            )
+    for entry, toml in _plugin_dirs(packaged, lambda e: e.name):
+        source = f"{entry.name}/{PLUGIN_FILE}"
+        yield load_manifest(
+            _read_manifest_text(toml, source),
+            source,
+            str(entry),
+            origin="builtin",
+        )
 
 
 def _discover_entry_points() -> Iterator[PluginManifest]:
@@ -93,15 +118,12 @@ def _discover_entry_points() -> Iterator[PluginManifest]:
 
 
 def _discover_project(project: Path) -> Iterator[PluginManifest]:
-    user_dir = project / USER_PLUGINS_REL
-    if not user_dir.is_dir():
-        return
-    for entry in sorted(user_dir.iterdir()):
-        toml = entry / PLUGIN_FILE
-        if entry.is_dir() and toml.is_file():
-            yield load_manifest(
-                _read_manifest_text(toml, str(toml)), str(toml), str(entry), origin="project"
-            )
+    # normcase: the order `sorted(Path.iterdir())` gave siblings — case-folded on
+    # Windows — so which of two same-named manifests wins the overlay is unchanged.
+    for entry, toml in _plugin_dirs(project / USER_PLUGINS_REL, lambda e: os.path.normcase(e.name)):
+        yield load_manifest(
+            _read_manifest_text(toml, str(toml)), str(toml), str(entry), origin="project"
+        )
 
 
 def discover(project: Path | None = None) -> Iterator[PluginManifest]:

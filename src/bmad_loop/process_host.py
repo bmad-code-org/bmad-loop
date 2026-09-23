@@ -67,9 +67,8 @@ class ProcessHost(ABC):
     def hook_interpreter(self) -> str:
         """The command prefix that runs a bmad-loop python hook script on this
         host, interpolated into the hook registrations `install`/`probe` write
-        (the script path + canonical event are appended by the caller). POSIX runs
-        the ``python3`` on PATH; a Windows host overrides it (no ``python3`` there)
-        so hook registration never branches on ``sys.platform`` at the call site."""
+        (the script path + canonical event are appended by the caller). The
+        prefix is an absolute interpreter path, quoted for the host shell."""
 
     def alive_and_ours(self, pid: int, identity: float | None) -> bool:
         """Identity-aware liveness: True only when ``pid`` is alive **and** still the
@@ -184,7 +183,7 @@ class PosixProcessHost(ProcessHost):
         return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
 
     def hook_interpreter(self) -> str:
-        return "python3"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
 
 
 class WindowsProcessHost(ProcessHost):
@@ -221,14 +220,23 @@ class WindowsProcessHost(ProcessHost):
             return None
 
     def hook_interpreter(self) -> str:
-        # Windows ships no `python3` launcher; `uv run --no-project python` resolves
-        # an interpreter without activating a project venv (hooks fire detached).
-        return "uv run --no-project python"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
 
     def shell_quote(self, arg: str) -> str:
-        # POSIX single-quoting breaks Windows paths; list2cmdline is the stdlib's
-        # Windows argument quoter (the inverse of how CreateProcess parses argv).
-        return subprocess.list2cmdline([arg])
+        # Hook runners hand these commands to a shell, not CreateProcess: Claude
+        # Code uses Git Bash on Windows (PowerShell without it), and Git Bash eats
+        # an unquoted backslash — `C:\Users\me\bmad-loop.exe` runs as
+        # `C:Usersmebmad-loop.exe` and every session stalls to timeout (#773). So
+        # separators become forward slashes, which Windows and Python accept and
+        # sh, PowerShell and cmd.exe pass through unchanged; list2cmdline then
+        # double-quotes a path with spaces as before. Every caller passes a path
+        # (interpreter, relay executable, hook script), so no backslash here is an
+        # escape. Known gap: on the PowerShell fallback a double-quoted executable
+        # followed by arguments is a parse error without `&` (which would break
+        # sh), so paths WITH spaces stay unsupported there. Claude's exec-form
+        # `args` would avoid shells entirely but is Claude-only and changes the
+        # registered JSON shape older versions mis-run.
+        return subprocess.list2cmdline([arg.replace("\\", "/")])
 
 
 def _proc_starttime(pid: int) -> float | None:

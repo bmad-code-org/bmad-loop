@@ -112,6 +112,19 @@ def agent_label(name: str, model: str) -> str:
     return f"{name}·{model}" if model else name
 
 
+def _format_age(seconds: float) -> str:
+    """Coarse age for the header's `· idle <age>` text (#680): whole minutes
+    below an hour (`12m`), hours and minutes above (`1h05m`), never seconds — the
+    threshold is the stall grace (minutes), so finer resolution would only make
+    the line flicker on every poll. A negative age (a clock stepped backward
+    between the adapter's stamp and this render) reads as `0m` rather than a
+    minus sign."""
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
 class RunHeader(Static):
     """One-glance summary of the selected run, or the empty-state hint."""
 
@@ -193,6 +206,15 @@ class RunHeader(Static):
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
+            if agent.idle_since is not None:
+                # The transcript has sat still past the stall grace (#680): the
+                # pane may still be repainting a spinner, so this is the one
+                # surface that separates a session working from one parked in a
+                # tool call. Yellow, not red — it is a notice, not a verdict, and
+                # nothing bounds the stretch.
+                text.append(
+                    f" · idle {_format_age(time.time() - agent.idle_since)}", style="yellow"
+                )
         else:
             # No session open: show the configured adapters from the run's policy
             # snapshot. Skip the line entirely when the snapshot can't be rebuilt

@@ -401,31 +401,115 @@ def test_ctl_window_id_accepts_a_legacy_path_tag(monkeypatch, tmp_path: Path):
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
-def test_ctl_window_id_admits_an_untagged_window_with_a_local_run(monkeypatch, tmp_path: Path):
+def test_ctl_window_id_admits_an_untagged_window_the_record_names(monkeypatch, tmp_path: Path):
     # The tag is written by a best-effort set_window_option that can fail, and a
     # window whose tag never landed must stay reachable by its own project
-    # rather than by nobody. Same rule as _ctl_window_candidates: untagged is
-    # admitted exactly when this project holds the run dir.
+    # rather than by nobody. start_detached records BEFORE it tags, so the
+    # record still names the window — and a record is a claim this project
+    # wrote, where a run dir is only a coincidence of the id.
     _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
-    _make_run(tmp_path)
+    _make_run(tmp_path)  # _record_ctl_window refuses to write without one
+    _write_record(tmp_path, "RID", "@4")
     assert launch.ctl_window_id(tmp_path, "RID") == "@4"
 
 
-def test_ctl_window_id_refuses_an_untagged_window_without_a_local_run(monkeypatch, tmp_path: Path):
-    # The other half: untagged and no run dir here means ownership is
-    # unprovable, so the window is not claimed. Delete the `elif` and this
-    # returns "@4" — a window that may belong to any project on the box.
+def test_ctl_window_id_reads_the_record_after_the_listing(monkeypatch, tmp_path: Path):
+    # Listing and record are two reads of a state a concurrent relaunch moves
+    # between them — it mints its window, records it, then tags it — so their
+    # order is load-bearing. Read the record FIRST and this call holds the id the
+    # relaunch just superseded while the listing already carries both rows, and
+    # `recorded in matches` replays the corpse. Hoist the read above the
+    # list_windows call and this answers "@1".
+    tag = runs.project_tag(tmp_path)
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@1")
+
+    def fake(argv, **kwargs):
+        out = ""
+        if argv[1] == "list-windows":
+            # the relaunch lands here: its window is listed and its record written
+            _write_record(tmp_path, "RID", "@2")
+            out = f"@1\trun-RID\t{tag}\n@2\tresume-RID\t{tag}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@2"
+
+
+def test_ctl_window_id_refuses_an_untagged_window_without_a_record(monkeypatch, tmp_path: Path):
+    # A fresh `run`: the run dir exists but _record_ctl_window skipped it, so
+    # nothing proves the untagged window is ours. Fail closed — restore the old
+    # gate (`runs.is_run(run_dir_for(...))`) and this answers "@4", a window
+    # that may belong to any project on the box.
     _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    _make_run(tmp_path)
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
+def test_ctl_window_id_refuses_untagged_windows_the_record_does_not_name(
+    monkeypatch, tmp_path: Path
+):
+    # A record that resolves to nothing must not license the *other* untagged
+    # rows: drop the per-row equality and the bucket fills by listing order, so
+    # `a` and `x` land on whatever sorted first.
+    _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\tresume-RID\t\n", tmp_path)
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@9")  # killed, pruned, or never in this listing
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
+def test_ctl_window_id_refuses_an_untagged_neighbour_on_a_run_id_collision(
+    monkeypatch, tmp_path: Path
+):
+    # #531: `--run-id` is caller-supplied, so two projects can hold a run dir
+    # for the same id, and the control session is shared across them. Ownership
+    # inferred from that collision let this project attach to, return-stamp and
+    # kill the neighbour's LIVE orchestrator window.
+    mine, theirs = tmp_path / "mine", tmp_path / "theirs"
+    mine.mkdir()
+    theirs.mkdir()
+    _make_run(mine)  # the collision: both projects hold a run dir for RID
+    _make_run(theirs)
+    _write_record(theirs, "RID", "@4")  # theirs minted it; its tag write failed
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")
+
+    assert launch.ctl_window_id(mine, "RID") is None
+
+    # Positive control: the same row, resolved by the project that recorded it,
+    # so the None above is the record gate refusing rather than a listing that
+    # parsed to nothing or a run id that never matched.
+    assert launch.ctl_window_id(theirs, "RID") == "@4"
+
+
+def test_ctl_window_id_admits_a_record_naming_a_window_it_never_minted(monkeypatch, tmp_path: Path):
+    # Characterization (#750), not an endorsement: the record is a claim, and it
+    # sits under the project root every coding session can write (see
+    # _read_ctl_window), so its content proves the mint only as far as it is
+    # unforgeable — which it is not. A record naming an untagged window this
+    # project never minted is admitted here, and `x` resolves through here.
+    #
+    # Not a regression, which is the whole reason it is pinned rather than
+    # fixed: the gate this replaced was `runs.is_run(run_dir_for(...))`, and
+    # anything that can write the record can equally mint the run dir — which
+    # admitted EVERY untagged row under the name, with no id to guess. Closing
+    # it needs an identity channel the session does not own (the window's pane
+    # pid, recorded at mint and re-proven here), so this test is the state that
+    # fix has to change.
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")  # untagged, and not ours
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@4")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+
+
 def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
-    # Untagged is a fallback, not a peer. Merged into one listing-ordered list,
-    # a neighbour's untagged window listed first beats this project's correctly
-    # tagged one — and for `x` that closes next door's orchestrator. The record
-    # cannot break the tie for a fresh `run`, where recording is skipped.
+    # Untagged is a fallback, not a peer, even now that it takes a record to get
+    # in. Merged into one listing-ordered list the recorded untagged row beats
+    # this project's correctly tagged one on index — and for `x` that
+    # closes the wrong window. The tag is the stronger of the two proofs, so it
+    # wins.
     _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\trun-RID\n", tmp_path)
-    _make_run(tmp_path)  # local run dir: the untagged row is otherwise admitted
+    _write_record(tmp_path, "RID", "@1")  # recorded: the untagged row is otherwise admitted
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
@@ -788,6 +872,11 @@ def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
 
     # The launch still succeeds, and the lookup is not warned about: only one
     # window carries the run id, so the scan answers it correctly with no record.
+    # Tagged as start_detached leaves it, which FakeRun does not fold into its
+    # scripted listing: the record write is the thing refused here, so since #531
+    # the tag is the only proof of ownership left and an untagged row would
+    # answer None for that reason rather than for the confinement this is about.
+    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     assert launch.resume_detached(tmp_path, "RID") == "@7"
     assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
 
@@ -840,6 +929,9 @@ def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp
     run_dir.parent.mkdir(parents=True)
     run_dir.symlink_to(outside)
 
+    # Tagged for the same reason as the dir-fd sibling above: the refused write
+    # leaves the tag as the only ownership proof this listing can carry.
+    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     assert launch.resume_detached(tmp_path, "RID") == "@7"
     assert not (outside / launch._CTL_WINDOW_FILE).exists()
 
@@ -1012,7 +1104,7 @@ def test_a_separator_in_the_project_path_does_not_admit_a_foreign_window(
     theirs = tmp_path / "theirproj"
     mine.mkdir()
     theirs.mkdir()
-    _make_run(mine)  # so `local` is True — ownership-by-run-dir would say yes
+    _make_run(mine)  # a run dir here, which the pre-#531 untagged gate accepted
 
     _ctl_listing(monkeypatch, f"@9\trun-RID\t{runs.project_tag(theirs)}\n")
     assert launch.ctl_window_id(mine, "RID") is None
@@ -1185,7 +1277,13 @@ def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, 
     # #482's actual shape, not a bare fake: the parked `run-RID` is still listed
     # in front of the live `resume-RID`, so without the record the scan answers
     # the corpse (`@1`) and the degradation is real rather than notional.
-    fake_run.windows = "@1\trun-RID\n@7\tresume-RID\n"
+    #
+    # Tagged as start_detached leaves them, which FakeRun does not fold into its
+    # scripted listing: untagged rows have needed the record to be candidates at
+    # all since #531, so they would answer None here for the wrong reason — the
+    # bucket being empty rather than the scan preferring the corpse.
+    tag = runs.project_tag(tmp_path)
+    fake_run.windows = f"@1\trun-RID\t{tag}\n@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
 
     _fail_the_record(monkeypatch, OSError("read-only file system"))
@@ -1196,7 +1294,8 @@ def test_resume_returns_the_id_when_the_record_survives(fake_run, tmp_path: Path
     # The other half of the signal: over the same two-window listing, a landed
     # record makes the lookup answer the live window, so the launch is reported
     # plainly and the warning stays specific to real degradation.
-    fake_run.windows = "@1\trun-RID\n@7\tresume-RID\n"
+    tag = runs.project_tag(tmp_path)  # the same listing, tagged for the same reason
+    fake_run.windows = f"@1\trun-RID\t{tag}\n@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
     assert launch.resume_detached(tmp_path, "RID") == "@7"
 
@@ -1206,13 +1305,15 @@ def test_resume_does_not_warn_when_the_scan_is_unambiguous(fake_run, tmp_path: P
     # right one anyway. The question is whether targeting is sound, not whether
     # a file was written — warning here would cry wolf on every launch that has
     # nothing to disambiguate.
-    fake_run.windows = "@7\tresume-RID\n"
+    #
+    # Carrying the tag start_detached stamps, which FakeRun does not fold into
+    # its scripted listing: with the record write failing, the tag is the only
+    # proof of ownership left, and an untagged row would answer None for that
+    # reason rather than for the unambiguous scan this is about.
+    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     _make_run(tmp_path)
 
-    def boom(*_a, **_k):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(launch, "atomic_write_text", boom)
+    _fail_the_record(monkeypatch, OSError("read-only file system"))
     assert launch.resume_detached(tmp_path, "RID") == "@7"
 
 
@@ -1234,7 +1335,12 @@ def test_resume_reports_a_record_the_listing_does_not_carry(fake_run, tmp_path: 
     # round-trips intact, so file equality would call this sound — but
     # ctl_window_id rejects it against the listing and falls through to the
     # first match, which is the ambiguity the warning exists for.
-    fake_run.windows = "@1\trun-RID\nctl:@7\tresume-RID\n"
+    # Tagged, so the fallthrough this is about has candidates: an untagged row
+    # is admitted only by an id-equal record, which is the very thing diverging
+    # here, so both rows would drop out and the None would be about the empty
+    # bucket rather than about the shape.
+    tag = runs.project_tag(tmp_path)
+    fake_run.windows = f"@1\trun-RID\t{tag}\nctl:@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
     assert launch.resume_detached(tmp_path, "RID") is None
     # The record itself landed — the divergence is in the id's shape, not the write.
@@ -1378,21 +1484,36 @@ def _ctl_prune_fake(
         if verb == "list-windows":
             if argv[-1] == "#{window_id}":  # the post-kill liveness probe
                 # The session it asks about is half the verdict: tmux exits
-                # nonzero on a session it cannot find, which list_window_ids
-                # folds to [] — so a probe aimed at the wrong session reads every
-                # candidate as removed, the pre-#435 optimism restored silently.
+                # nonzero with proved-gone stderr on a session it cannot find,
+                # which list_window_ids folds to [] — so a probe aimed at the
+                # wrong session reads every candidate as removed, the pre-#435
+                # optimism restored silently.
                 assert argv[argv.index("-t") + 1] == f"={launch.CTL_SESSION}"
                 probes.append(len(killed))
                 if kill == "unknowable":
                     raise OSError("server gone")
                 if kill == "undecodable":
                     raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+                if kill == "unproven-nonzero":
+                    # A server that errored while its windows are alive: rc 1,
+                    # and a stderr that proves nothing about the session. psmux
+                    # 3.3.8's verbatim answer to a listing whose auth the live
+                    # server rejected — the shape #525 is about.
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr="psmux: Invalid session key"
+                    )
                 if kill == "session-gone":
                     # rc 1, not rc 0 with empty stdout: real tmux answers a
                     # vanished session with a nonzero exit and list_window_ids
                     # folds it to [] — same verdict, and the path the transport
-                    # actually takes.
-                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+                    # actually takes. The stderr is tmux 3.4's verbatim wording
+                    # and is load-bearing since #525: it is what makes this a
+                    # PROVED vanish rather than a listing that merely failed,
+                    # and an rc 1 without it now lands in `unverifiable`
+                    # instead (test_prune_ctl_windows_..._unproven_nonzero).
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout="", stderr=f"can't find session: {launch.CTL_SESSION}"
+                    )
                 gone = {a[-1] for a in killed} if kill == "lands" else set()
                 return subprocess.CompletedProcess(
                     argv, 0, stdout="\n".join(r[0] for r in rows if r[0] not in gone), stderr=""
@@ -1490,15 +1611,45 @@ def test_prune_ctl_windows_undecodable_liveness_is_a_transport_fault(monkeypatch
 def test_prune_ctl_windows_reads_an_empty_listing_as_the_session_going_with_it(
     monkeypatch, tmp_path: Path
 ):
-    """`[]` is the seam's "no windows", not a failed probe (only a transport fault
-    raises) — a ctl session that died with its last window really did take the
-    candidate, so pessimism here would report a phantom survivor forever."""
+    """`[]` is the seam's "no windows", not a failed probe — a ctl session that
+    died with its last window really did take the candidate, so pessimism here
+    would report a phantom survivor forever.
+
+    The other half of #525's discrimination, and the reason narrowing the
+    sentinel could not simply be "raise on rc != 0": a vanished session exits
+    non-zero too, and turning THAT into `unverifiable` is the same dishonest
+    report from the other side — one that every subsequent cleanup re-reports
+    and nothing ever clears."""
     _ctl_prune_fake(monkeypatch, tmp_path, kill="session-gone")
 
     assert launch.prune_ctl_windows(tmp_path) == (
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
         [],
         [],
+    )
+
+
+def test_prune_ctl_windows_unproven_nonzero_listing_claims_nothing(monkeypatch, tmp_path: Path):
+    """A listing that exits non-zero WITHOUT proving the session gone is a failed
+    probe, and the kills it was meant to verify stay unverifiable (#525).
+
+    This is the exact over-optimistic report #435 exists to eliminate, reached
+    by the one route it left open: the backend folded every non-zero exit to
+    `[]`, so a server erroring while its windows are alive answered "this
+    session has no windows" and every candidate was classified verifiably
+    removed — with no error anywhere and nothing to re-try.
+
+    Ablation: drop the `_session_proved_gone` guard in
+    `BaseTmuxBackend.list_window_ids` (return `[]` on any non-zero exit) and
+    this fails on `removed` carrying both windows, while its `session-gone`
+    sibling above still passes — the two together pin the discrimination
+    rather than either direction alone."""
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="unproven-nonzero")
+
+    assert launch.prune_ctl_windows(tmp_path) == (
+        [],
+        [],
+        ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
     )
 
 

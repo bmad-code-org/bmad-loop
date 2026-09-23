@@ -457,6 +457,21 @@ def test_config_content_shapes(tmp_path):
     config = json.loads(adapter._config_content(spec_model))
     assert config["model"] == "anthropic/claude-x"
 
+    # Reasoning effort never lands in the config blob (#643): the config schema
+    # has no top-level `variant`, and `agent.<name>.variant` is inert unless that
+    # agent also pins a model — it rides the prompt_async body instead.
+    spec_effort = SessionSpec(
+        task_id="t",
+        role="triage",
+        prompt="p",
+        cwd=tmp_path,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    config = json.loads(adapter._config_content(spec_effort))
+    assert config == json.loads(adapter._config_content(spec_model))
+    assert "variant" not in json.dumps(config) and "effort" not in json.dumps(config)
+
 
 def test_session_env_carries_contract(tmp_path):
     adapter = make_adapter(tmp_path)
@@ -2141,6 +2156,49 @@ def test_e2e_result_less_stop_nudges_then_completes(tmp_path, fake_opencode):
     texts = prompt_texts(rec)
     assert len(texts) == 2
     assert texts[1] == NUDGE_TEXT  # the wake-up carried the result-contract nudge
+    assert_server_gone(rec)
+
+
+def test_e2e_effort_rides_every_prompt_body_as_variant(tmp_path, fake_opencode):
+    """#643: `SessionSpec.effort` is sent as the per-call `variant` on EVERY
+    prompt_async body — the initial prompt AND the wake-up nudge. A nudge that
+    dropped back to the provider default would be silent mid-session drift, so
+    the value is stashed once on the server session and emitted by the single
+    `_prompt` primitive both paths share."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "nudge-then-complete", effort="max")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    bodies = read_jsonl(rec / "prompts.jsonl")
+    assert len(bodies) == 2  # initial prompt + one nudge
+    assert bodies[1]["parts"][0]["text"] == NUDGE_TEXT
+    assert [b["variant"] for b in bodies] == ["max", "max"]
+    assert_server_gone(rec)
+
+
+def test_e2e_effort_unset_omits_variant_from_every_prompt_body(tmp_path, fake_opencode):
+    """The inverse: with no effort the key is OMITTED, not sent empty, so the body
+    of an effort-less session is byte-identical to the pre-#643 shape
+    (`{"parts": [...]}` and nothing else) on the initial prompt and the nudge.
+
+    ABLATION: drop the `if sess.variant` guard in `_prompt` (always send the key)
+    and this reddens."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "nudge-then-complete")
+    assert spec.effort == ""
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    bodies = read_jsonl(rec / "prompts.jsonl")
+    assert len(bodies) == 2
+    for body in bodies:
+        assert "variant" not in body
+        assert set(body) == {"parts"}
     assert_server_gone(rec)
 
 

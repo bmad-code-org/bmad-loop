@@ -564,6 +564,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "harvest_attempt",
         "head",
         "id_collisions",
+        # `session-idle` / `session-active` (#680): seconds the live transcript has
+        # sat still — a float the adapter measured from two stats, no identifier.
+        "idle_s",
         "items",
         "kept",
         "key",
@@ -635,6 +638,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
+        # `dev-decision` and `session-end` (#727): whether the session changed its
+        # pane after the first frame or ended a turn. A bare boolean about the
+        # verdict — it names no story, no path and no text, and `False` is what
+        # routed the result to the no-work PAUSE.
+        "produced_work",
         # A closed two-value enum (`file-limit` | `payload-limit`) emitted only
         # for measured artifact publication admission refusals. The arbitrary
         # path and exception prose ride `error`, which diagnostics drops.
@@ -698,6 +706,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "session_status",
         "session_vanished",
         "signum",
+        # `session-idle` (#680): the wall timestamp the idle stretch began — the
+        # `ts`-shaped float the TUI ages the `· idle <age>` text from.
+        "since_ts",
         "site",
         "skip",
         "source",
@@ -724,6 +735,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "stop_cause",
         "strategy",
         "teardown_s",
+        # `session-idle` (#680): the grace the crossing was judged against —
+        # `limits.dev_stall_grace_s` as a float, so the record is comparable to a
+        # stall without the policy snapshot in hand.
+        "threshold_s",
         "to",
         "tokens",
         "tokens_weighted",
@@ -1039,6 +1054,15 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
 # the scan's, not the tree's.
 JOURNAL_KINDS = frozenset(
     {
+        # adapters/generic.py — the only adapter-side writer. The engine hands its
+        # `Journal` to every adapter it owns (`CodingCLIAdapter.journal`, #680) so
+        # the wait loop can record what only it sees: the live transcript's idle
+        # stretches, one `session-idle` at the crossing of `dev_stall_grace_s` and
+        # one `session-active` when the transcript moves again. Both carry only
+        # `task_id` (routed) and measured floats (`idle_s`, `since_ts`,
+        # `threshold_s`, declared benign).
+        "session-active",
+        "session-idle",
         # cli.py
         "run-resume",
         # cli.py + runs.py

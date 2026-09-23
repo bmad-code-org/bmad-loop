@@ -105,8 +105,7 @@ partial — the tail after the last `-` (e.g. `a1b2`), shortened to any prefix t
 > One subcommand is deliberately left out of the table: `bmad-loop relay <Event>` writes a single
 > session event file from a coding-CLI hook payload on stdin. Its own help calls it "a hook target
 > for machines, not a command to run by hand" — it takes no `--project`, and `bmad-loop init`
-> currently registers the copied workspace relay (`.bmad-loop/bmad_loop_hook.py`) instead, so no
-> installed hook reaches the console script today. Never invoke it yourself.
+> registers this installed command with an absolute path. Never invoke it yourself.
 
 ## The TUI
 
@@ -423,7 +422,7 @@ session_timeout_min = 90
 git_timeout_s = 120              # bound on any single git subprocess; exceeding it pauses/degrades, never crashes the run
 teardown_grace_s = 20            # verified session teardown: poll a killed session up to this long, then force-kill its pane pids and re-kill; 0 = one best-effort kill
 stop_without_result_nudges = 1   # times to re-prompt a session that stopped with no result.json
-dev_stall_grace_s = 600          # silence grace armed at dev/review launch; transport activity or fresh Stop/idle evidence re-arms it; 0 = no launch timer, but a result-less turn end still fails fast
+dev_stall_grace_s = 600          # silence grace armed at dev/review launch; transport activity or fresh Stop/idle evidence re-arms it; 0 = no launch timer, but a result-less turn end still fails fast. Also the transcript-idle notice threshold (journal session-idle/session-active, TUI `idle <age>`); 0 disables the notice
 dev_stall_nudges = 2             # best-effort wake nudges per silent grace; fresh Stop/idle evidence restores this budget; 0 = stall on grace expiry
 dev_stall_nudges_cap = 6         # total never-restored nudge bound per dev/review session; an accepted nudge does not guarantee a wake; 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3    # same monotonic cap for an injected plugin-workflow session that finished but never wrote its completion marker
@@ -462,14 +461,17 @@ skill = "bmad-dev-auto"    # the only supported value — the generic upstream d
 [adapter]
 name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | custom
 model = ""                 # empty = CLI default (opencode-http wants "provider/model")
+effort = ""                # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
+                           # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs have no
+                           # channel for it and ignore it (`bmad-loop validate` warns)
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
 
 # Optional per-stage overrides — run the review pass on a different CLI/model
 # than the dev pass. Unset keys inherit from [adapter] when the stage runs the
-# same client; switching client falls back to that profile's defaults (model
-# and extra_args are client-specific).
+# same client; switching client falls back to that profile's defaults (model,
+# effort and extra_args are client-specific).
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -477,6 +479,12 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # model = "gpt-5-codex"
 # [adapter.triage]            # sweep triage stage
 # model = "opus"
+# With an opencode-http base, effort tunes reasoning per stage (opencode-http
+# only — a tmux CLI ignores it and `bmad-loop validate` warns). An unrecognized
+# name is not rejected: the session silently runs at the provider default, so
+# spell it exactly as the model's variant list names it.
+# [adapter.review]
+# effort = "max"              # e.g. a deeper review pass than dev
 
 [sweep]
 auto = "never"             # never | per-epic | run-end (auto sweeps never prompt)

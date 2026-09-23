@@ -38,7 +38,7 @@ from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
@@ -170,8 +170,9 @@ def test_build_command_claude(tmp_path):
 def test_build_command_codex_renders_skill_mention(tmp_path):
     adapter = make_adapter(tmp_path, profile_name="codex")
     cmd = adapter.build_command(make_spec(tmp_path))
+    binary = shutil.which("codex") or "codex"
     assert cmd.startswith(
-        "codex 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
+        f"{binary} 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
     )
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd.endswith("--model sonnet")
@@ -182,6 +183,21 @@ def test_build_command_gemini_uses_interactive_flag(tmp_path):
     cmd = adapter.build_command(make_spec(tmp_path))
     assert cmd.startswith("gemini -i '/bmad-dev-auto 1-1-a' --approval-mode=yolo")
     assert cmd.endswith("--model sonnet")
+
+
+@pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
+def test_effort_never_reaches_the_generic_argv_or_env(tmp_path, profile_name):
+    """#643: the tmux generic family has no channel for a reasoning-effort value,
+    so `SessionSpec.effort` is ignored — argv and env are byte-identical to an
+    effort-less spec's (and `config_digest` therefore stays untouched). The
+    carrier is the opencode-http adapter; validate warns about this family."""
+    adapter = make_adapter(tmp_path, profile_name=profile_name)
+    plain = make_spec(tmp_path)
+    with_effort = dataclasses.replace(plain, effort="max")
+    assert with_effort.effort == "max"  # the field landed (kept LAST on SessionSpec)
+    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain)
+    assert adapter.interactive_env(with_effort) == adapter.interactive_env(plain)
+    assert "max" not in adapter.build_command(with_effort)
 
 
 def test_extra_args_replace_profile_bypass(tmp_path):
@@ -243,19 +259,52 @@ def test_read_result_degrades_a_decoder_recursion_error(tmp_path):
     assert adapter._read_result("t1") is None
 
 
+def _refuse_result_metadata(monkeypatch, path):
+    """Refuse `stat()` on ``path`` and pin `Path.is_file` False for it — 3.14's
+    answer to that refusal — so a reader that went back to `is_file()` would see
+    "absent" on every runtime, not only on 3.14."""
+    real_stat, real_is_file = Path.stat, Path.is_file
+
+    def refused_stat(candidate, *args, **kwargs):
+        if candidate == path:
+            raise PermissionError(13, "task directory is not searchable", str(candidate))
+        return real_stat(candidate, *args, **kwargs)
+
+    def swallowed_is_file(candidate, *args, **kwargs):
+        return False if candidate == path else real_is_file(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+    monkeypatch.setattr(Path, "is_file", swallowed_is_file)
+
+
 def test_read_result_degrades_an_unreadable_existence_probe(tmp_path, monkeypatch):
     adapter = make_adapter(tmp_path)
-    path = adapter._result_path("t1")
-    real_is_file = Path.is_file
-
-    def is_file_with_permission_error(candidate):
-        if candidate == path:
-            raise PermissionError("task directory is not searchable")
-        return real_is_file(candidate)
-
-    monkeypatch.setattr(Path, "is_file", is_file_with_permission_error)
+    _refuse_result_metadata(monkeypatch, adapter._result_path("t1"))
 
     assert adapter._read_result("t1") is None
+
+
+def test_load_result_document_raises_a_refused_probe_instead_of_reporting_absence(
+    tmp_path, monkeypatch
+):
+    """`None` is absence alone (#752): the sweep diagnostic reports it as `missing`,
+    so a metadata refusal must raise and read as `unreadable` on every runtime.
+
+    Ablation: restore `if not path.is_file(): return None` and this fails."""
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    assert generic.load_result_document(adapter.tasks_dir, "t1") is None  # absent
+    (task_dir / "result.json").mkdir()
+    assert generic.load_result_document(adapter.tasks_dir, "t1") is None  # not a regular file
+    (task_dir / "result.json").rmdir()
+    (tmp_path / "plain").write_text("x")
+    assert generic.load_result_document(tmp_path / "plain", "t1") is None  # non-dir component
+
+    (task_dir / "result.json").write_text('{"clean": true}')
+    _refuse_result_metadata(monkeypatch, adapter._result_path("t1"))
+    with pytest.raises(PermissionError):
+        generic.load_result_document(adapter.tasks_dir, "t1")
 
 
 def test_read_result_rejects_data_that_plugin_deepcopy_cannot_handle(tmp_path):
@@ -2007,6 +2056,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "remaining_s": 100.0,
         "stall_armed": True,
         "stall_nudges_sent": 0,
+        "transcript_idle_s": None,  # no hook event has named a transcript (#680)
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -6324,3 +6374,1278 @@ def test_classify_env_fault_scans_a_single_oversized_terminated_line(tmp_path, t
     assert result.env_fault is True
     assert result.env_fault_evidence.startswith("…")
     assert "API Error: Connection closed mid-response" in result.env_fault_evidence
+
+
+# ------------------------------- no-work verdict (#727)
+#
+# `SessionResult.produced_work`: did the session do ANYTHING before it ended on a
+# non-completed verdict? The hook half is a `Stop`; the timeline half is pane-log
+# growth on a tick later than FIRST_FRAME_S after the loop started and before the
+# first stall wake nudge. The #261 byte floor is deliberately NOT the predicate: the
+# #727 capture is a 1,930-byte permission dialog rendered once, which clears it.
+# The stall re-arm, the nudge arm and `_log_activity_key` are untouched — the stall
+# suite above is the byte-for-byte guard.
+
+
+def _steerable_clock(monkeypatch):
+    """Frozen monotonic + wall clocks the test advances together, so a
+    `since_ts` is a real (moving) wall timestamp rather than `_frozen_stall_clock`'s
+    constant 0.0."""
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 5000.0 + (clock["t"] - 1000.0))
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    return clock
+
+
+def _grow(path: Path, payload: bytes) -> None:
+    with path.open("ab") as stream:
+        stream.write(payload)
+
+
+def test_no_work_menu_paint_then_nudge_echo_then_death(tmp_path, monkeypatch):
+    """The #727 capture, tick by tick: the CLI paints its permission dialog once
+    (1,930 B — over the #261 floor), sits still through the grace, the wake nudge
+    confirms the dialog's default and the pane grows with the echo, then the window
+    dies. `crashed`, and `produced_work` is False — neither the first frame nor the
+    post-nudge echo counts as work.
+
+    ABLATION B: drop the `> FIRST_FRAME_S` guard and the first paint counts (True).
+    ABLATION C: drop the `stall_nudges_sent == 0` guard and the echo counts (True)."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    # The grace must outlast FIRST_FRAME_S, as the 600 s default does by an order
+    # of magnitude: otherwise the echo lands inside the startup window and the
+    # FIRST_FRAME_S guard masks the nudge guard (ABLATION C then stays green).
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 1
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+    log = _pane_log(adapter, "3-1-dev-1", 0)  # start_session creates it empty
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += 1.0  # t≈1 s: the dialog paints, once
+            _grow(log, b"Do you trust the files in this folder? [Yes/No, exit]\n" * 35)
+        elif call_n == 2:
+            clock["t"] += 41.0  # grace elapses in silence -> nudge (t≈42 > FIRST_FRAME_S)
+        elif call_n == 3:
+            clock["t"] += 1.0  # the nudge's Enter confirmed "No, exit": echo + exit text
+            _grow(log, b"\n> \nNo, exit\nGoodbye.\n")
+        else:
+            alive["v"] = False  # window dead next tick
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "crashed"
+    assert [text for _, text in mux.sent] == [generic.STALL_NUDGE_TEXT]
+    assert log.stat().st_size > generic.PROOF_OF_WORK_MIN_LOG_BYTES  # floor cleared…
+    assert adapter._produced_work(_dev_handle(), False) is True  # …so #261 says "work"
+    assert result.produced_work is False  # …and the timeline says otherwise
+    assert result.stop_seen is False
+
+
+def test_no_work_session_end_after_nudge_echo(tmp_path, monkeypatch):
+    """The same capture ending through the CLI announcing its own exit — a
+    `SessionEnd` hook after the nudge's echo — takes the SessionEnd `_final`
+    arm, which must thread the verdict like the window-death arm does.
+
+    ABLATION: drop `produced_work=produced_work()` from that one `_final` call and
+    this reads True (the default)."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 1
+    adapter._window_alive = lambda handle: True
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += 1.0
+            _grow(log, b"Do you trust the files in this folder? [Yes/No, exit]\n" * 35)
+        elif call_n == 2:
+            clock["t"] += 41.0  # grace elapses -> nudge, past FIRST_FRAME_S
+        elif call_n == 3:
+            clock["t"] += 1.0
+            _grow(log, b"\n> \nNo, exit\nGoodbye.\n")  # the echo, then SessionEnd
+
+    session_end = HookEvent(
+        ts=1,
+        event="SessionEnd",
+        task_id="3-1-dev-1",
+        session_id="sess",
+        transcript_path=None,
+        path=Path("x"),
+    )
+    adapter.watcher = _ScriptedWatcher([None, None, None, session_end], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert [text for _, text in mux.sent] == [generic.STALL_NUDGE_TEXT]
+    assert (result.status, result.produced_work) == ("crashed", False)
+
+
+def test_no_work_dead_on_arrival_window(tmp_path):
+    """A 0-byte log and a window dead on the first tick: `crashed`, no work."""
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._window_alive = lambda handle: False
+    _pane_log(adapter, "3-1-dev-1", 0)
+    adapter.watcher = _ScriptedWatcher([None])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.produced_work) == ("crashed", False)
+
+
+def test_working_session_that_later_stalls_produced_work(tmp_path, monkeypatch):
+    """The pane grows on a tick past FIRST_FRAME_S with no nudge sent, then falls
+    silent through the grace and both nudges: `stalled`, but the session worked,
+    so `produced_work` is True and the decision RETRYs as it does today."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += generic.FIRST_FRAME_S + 1.0  # past the startup window
+            _grow(log, b"Reading src/bmad_loop/engine.py ...\n")
+        else:
+            clock["t"] += 41.0  # each further grace elapses in silence
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=1000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "stalled"
+    assert [text for _, text in mux.sent] == [generic.STALL_NUDGE_TEXT] * 2
+    assert result.produced_work is True
+
+
+def test_growth_during_the_final_wait_then_death_in_the_same_tick_is_work(tmp_path, monkeypatch):
+    """Output that lands during `watcher.wait_for` and is followed by window death
+    in the SAME iteration: the top-of-tick sample predates the growth, so the exit
+    verdict must re-sample the pane before judging. Past FIRST_FRAME_S, no nudge
+    sent — `crashed`, but the session worked (`produced_work=True`).
+
+    ABLATION: drop the `sample_frame()` call inside `produced_work()` and the exit
+    judges the previous tick's key — False."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        # inside wait_for: the CLI prints its last output and exits before the
+        # liveness probe that follows this very call
+        clock["t"] += generic.FIRST_FRAME_S + 1.0
+        _grow(log, b"Wrote src/bmad_loop/engine.py\nTraceback (most recent call last):\n")
+        alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.produced_work) == ("crashed", True)
+
+
+def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
+    """A misbound pane sink (#254/#217): the pane log exists at 0 bytes forever,
+    but the transcript a `SessionStart` named keeps growing — the CLI is writing
+    its own record. No `Stop` before the deadline: `timeout`, but the session
+    worked, so `produced_work=True` and the decision keeps today's routing.
+
+    ABLATION: drop the transcript evidence latch from `produced_work()` and this reads False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0  # only the deadline can end this
+    # the pane never grows: `_idle_adapter`'s script is replaced below, and the log
+    # stays the 0-byte file `_pane_log` created
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 4:
+            _grow(transcript, b'{"type":"assistant"}\n')  # the CLI's own write
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (adapter.logs_dir / "3-1-dev-1.log").stat().st_size == 0  # pane said nothing
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_unchanged_transcript_rewrite_is_not_new_work(tmp_path, monkeypatch):
+    """An old assistant record cannot become proof merely because mtime moves.
+
+    ABLATION: scan from byte zero on a same-size stat change and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            old = transcript.stat().st_mtime_ns
+            os.utime(transcript, ns=(old + 1_000_000_000, old + 1_000_000_000))
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes unavailable")
+def test_transcript_scan_skips_fifo(tmp_path, monkeypatch):
+    """A hook-named FIFO must not block the adapter's wait loop on open.
+
+    ABLATION: remove the regular-file guard and the stubbed open fails.
+    """
+    fifo = tmp_path / "transcript.jsonl"
+    os.mkfifo(fifo)
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == fifo:
+            raise AssertionError("transcript FIFO would block on open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    assert generic.GenericAdapter._transcript_has_assistant_activity(str(fifo), 0) is False
+
+
+@pytest.mark.parametrize(
+    "setup_record",
+    [
+        {"type": "user", "message": "setup"},
+        {"$set": {"messages": [{"id": "u1", "type": "user", "content": []}]}},
+    ],
+)
+def test_setup_only_transcript_growth_is_not_work(tmp_path, monkeypatch, setup_record):
+    """A prompt echo or metadata append before any nudge is not model output.
+
+    ABLATION: treat any transcript stat change as work and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            _grow(transcript, (json.dumps(setup_record) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_old_assistant_record_is_not_credited_to_a_new_user_append(tmp_path, monkeypatch):
+    """Only records crossing the sampled EOF can prove post-baseline work."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    _grow(transcript, b'{"type":"assistant","message":"old"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            _grow(transcript, b'{"type":"user","message":"new prompt"}\n')
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+@pytest.mark.parametrize(
+    ("reply_content", "produced_work"),
+    [("earlier reply", False), ("continued reply", True)],
+)
+def test_gemini_snapshot_only_counts_new_model_content(
+    tmp_path, monkeypatch, reply_content, produced_work
+):
+    """A `$set.messages` snapshot can replay or update a model message.
+
+    ABLATION: credit any Gemini record in the appended snapshot and the replay
+    reads True; compare IDs alone and the update reads False.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    old_reply = {"id": "g1", "type": "gemini", "content": "earlier reply"}
+    _grow(transcript, (json.dumps(old_reply) + "\n").encode())
+
+    def script(call_n):
+        if call_n == 2:
+            patch = {
+                "$set": {
+                    "messages": [
+                        {**old_reply, "content": reply_content},
+                        {"id": "u2", "type": "user", "content": "retry"},
+                    ]
+                }
+            }
+            _grow(transcript, (json.dumps(patch) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
+
+
+def test_empty_transcript_creation_is_not_work(tmp_path, monkeypatch):
+    """Creating a named path with zero bytes is setup, not a model turn."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.unlink()
+
+    def script(call_n):
+        if call_n == 2:
+            transcript.touch()
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_post_nudge_transcript_growth_is_not_work(tmp_path, monkeypatch):
+    """Even an assistant-shaped append after the loop's wake nudge needs Stop.
+
+    ABLATION: drop the `stall_nudges_sent == 0` guard on transcript evidence
+    and this becomes produced_work=True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_nudges = 1
+    sent: list[str] = []
+    adapter.send_text = lambda handle, value: sent.append(value)
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 61.0  # cross grace; the adapter sends its wake nudge
+        elif call_n == 3:
+            _grow(transcript, b'{"type":"assistant","message":"late"}\n')
+            alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert sent == [generic.STALL_NUDGE_TEXT]
+    assert (result.status, result.produced_work) == ("crashed", False)
+
+
+def test_post_nudge_usage_sample_is_not_work(tmp_path, monkeypatch):
+    """A spend first observed after the wake nudge cannot override no-work.
+
+    ABLATION: drop the nudge guard on `usage_seen` and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_nudges = 1
+    sent: list[str] = []
+    adapter.send_text = lambda handle, value: sent.append(value)
+    adapter._sample_weighted_usage = lambda path, spec: 100 if sent else 0
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 61.0
+        elif call_n == 3:
+            alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), token_budget=1000, token_budget_mode="warn")
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert sent == [generic.STALL_NUDGE_TEXT]
+    assert (result.status, result.produced_work) == ("crashed", False)
+
+
+def test_transcript_write_inside_the_first_heartbeat_interval_is_work(tmp_path, monkeypatch):
+    """The transcript is written between the `SessionStart` that names it and the
+    next heartbeat. The idle baseline is taken the moment the transcript is named,
+    so that write is a CHANGE at the first heartbeat sample — not absorbed into
+    the baseline. Static pane, no Stop, then timeout: `produced_work=True`.
+
+    ABLATION: drop the `_sample_transcript_idle` call at first observation and the
+    heartbeat sample becomes the baseline — False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0  # inside the first heartbeat interval
+            _grow(transcript, b'{"type":"assistant"}\n')
+        elif call_n == 3:
+            clock["t"] += 20.0  # heartbeat 2 fires at +30 and samples the change
+        elif call_n == 4:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+@pytest.mark.parametrize(
+    "model_record",
+    [
+        {"type": "assistant"},
+        {"id": "g1", "type": "gemini", "content": "reply"},
+        {"$set": {"messages": [{"id": "g1", "type": "gemini", "content": "reply"}]}},
+        {"$set": {"messages": [{"id": "g1", "role": "model", "content": "reply"}]}},
+    ],
+)
+def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch, model_record):
+    """The transcript's only write lands after the last heartbeat sample and the
+    deadline elapses before another: the exit verdict compares the transcript
+    against the tracker's baseline itself. `timeout`, `produced_work=True`.
+
+    Includes Gemini's bare and `$set.messages` records. ABLATION: drop the
+    transcript sample inside `produced_work()` or the model-record predicate — False."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            _grow(transcript, (json.dumps(model_record) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0  # no heartbeat fires before the deadline check
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]  # never re-sampled
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+@pytest.mark.parametrize(
+    ("usage", "produced_work"),
+    [
+        ({"inputTokens": 20, "outputTokens": 3}, True),
+        ({"inputTokens": 20, "reasoningTokens": 3}, True),
+        ({"inputTokens": 20, "outputTokens": 0, "reasoningTokens": 0}, False),
+    ],
+)
+def test_copilot_metrics_in_final_interval_prove_model_work(
+    tmp_path, monkeypatch, usage, produced_work
+):
+    """Copilot's shutdown metrics can be the first model evidence after the last
+    heartbeat. Input tokens alone can come from setup and must not prove work.
+
+    ABLATION: ignore Copilot metrics and the positive rows fail; accept any
+    modelMetrics record and the input-only row fails.
+    """
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False, profile_name="copilot"
+    )
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            record = {
+                "id": "metrics-1",
+                "type": "metrics",
+                "data": {"modelMetrics": {"gpt-5-mini": {"usage": usage}}},
+            }
+            _grow(transcript, (json.dumps(record) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
+
+
+@pytest.mark.parametrize(
+    ("baseline_output", "final_output", "produced_work"),
+    [
+        (None, 3, True),
+        (None, 0, False),
+        (10, 11, True),
+        (10, 10, False),
+    ],
+)
+def test_codex_token_count_in_final_interval_proves_new_model_work(
+    tmp_path, monkeypatch, baseline_output, final_output, produced_work
+):
+    """Codex can write cumulative token totals before its agent_message. A final
+    output increase proves work even when the pane stays static and no heartbeat
+    follows; input-only growth or an unchanged prior output total does not.
+
+    ABLATION: ignore token_count and the positive rows fail; accept any positive
+    appended total and the unchanged-output row fails.
+    """
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False, profile_name="codex"
+    )
+    adapter._stall_grace_s = 0.0
+
+    def token_count(output_tokens, input_tokens):
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                },
+            },
+        }
+
+    if baseline_output is not None:
+        _grow(transcript, (json.dumps(token_count(baseline_output, 20)) + "\n").encode())
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            _grow(transcript, (json.dumps(token_count(final_output, 30)) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
+
+
+def test_transcript_created_after_being_named_is_work(tmp_path, monkeypatch):
+    """`SessionStart` names a transcript that does not exist yet; the CLI creates
+    and writes it later and then times out with no further write and a static
+    pane. Creation after an absent sample is the CLI's first write, so the
+    populated file is movement, not the baseline: `produced_work=True`.
+
+    ABLATION: drop the `seen_absent` arm and the exit-time sample baselines the
+    populated file — False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.unlink()
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            transcript.write_bytes(b'{"type":"user"}\n{"type":"assistant"}\n')  # created
+        elif call_n == 3:
+            clock["t"] += 10_000.0  # deadline; only the exit-time sample sees the file
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_repointed_transcript_rebaselines_instead_of_reading_as_movement(tmp_path, monkeypatch):
+    """A later hook event names a DIFFERENT transcript. Its key is compared to
+    nothing the tracker measured before: the new file is a fresh baseline, so a
+    static second transcript under a static pane is still no work, and the age
+    restarts from the re-pointing.
+
+    ABLATION: drop the `idle.path` rebaseline and the second file's key differs
+    from the first file's, reading as movement — True."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')  # exists, differs, never changes
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 5:
+            clock["t"] += 10_000.0
+
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        _session_start("3-1-dev-1", str(other)),  # re-pointed on tick 3
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    # ages: none before naming; tick 2's heartbeat is throttled (the clock moves
+    # inside wait_for); 30 on the first file; then the re-pointed file's own
+    # clock — 0 at the heartbeat that first sampled it, 30 on the next
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 30.0, 0.0, 30.0]
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_repointed_transcript_write_in_final_interval_is_work(tmp_path, monkeypatch):
+    """A new SessionStart names another transcript, which receives model output
+    before the next heartbeat. Exit-time sampling must see that write as movement.
+
+    ABLATION: sample only the first named path and the exit sample baselines the
+    already populated replacement transcript, leaving produced_work False."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0  # the new path is named between heartbeats
+        elif call_n == 3:
+            _grow(other, b'{"type":"assistant","content":"reply"}\n')
+            clock["t"] += 10_000.0  # exit before another heartbeat
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript)), _session_start("3-1-dev-1", str(other))],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
+    """The complement: a named transcript that never changes after its first
+    sample is not activity — the first sample alone must not prove work."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_nonzero_usage_under_a_static_pane_is_work(tmp_path, monkeypatch):
+    """The budget sampler read a nonzero spend from the transcript: the model
+    produced tokens, which is work whatever the (misbound, 0-byte) pane says.
+    Enforce mode trips and the grace expires: `over_budget`, `produced_work=True`.
+
+    ABLATION: drop the `usage_seen` latch and this reads False."""
+    adapter, clock, _sent = _budget_adapter(tmp_path, monkeypatch)
+    _pane_log(adapter, "b-1", 0)  # present and empty: `_log_evidence` is False, not None
+    transcript = tmp_path / "t.jsonl"
+    _write_claude_transcript(transcript, input_tokens=5000)
+    adapter.watcher = _ScriptedWatcher([_start_event(transcript)], on_call=_advance_31(clock))
+    result = adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="enforce", grace_s=50.0)
+    )
+    assert result.status == "over_budget"
+    assert result.stop_seen is False
+    assert result.produced_work is True
+
+
+def test_growth_inside_first_frame_window_alone_is_not_work(tmp_path, monkeypatch):
+    """The complement of the row above, isolating ABLATION B from the nudge arm:
+    the same growth landing INSIDE FIRST_FRAME_S (no nudge ever sent — the
+    session stalls with the nudge budget at zero) is the startup paint and does
+    not count."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += generic.FIRST_FRAME_S - 1.0  # inside the startup window
+            _grow(log, b"Reading src/bmad_loop/engine.py ...\n")
+        else:
+            clock["t"] += 41.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=1000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("stalled", False)
+
+
+def test_turn_ended_with_empty_log_is_work(tmp_path, monkeypatch):
+    """The hook half: a result-less `Stop` on a session whose pane log never grew
+    (a misbound pane sink, #254/#217) still counts — a turn ENDED. The grace then
+    expires and the session stalls, carrying `produced_work=True`."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", str(tmp_path / "t.jsonl"))], on_call=script
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.stop_seen is True
+    assert result.produced_work is True
+
+
+def test_no_pane_log_means_unknown_never_blocks(tmp_path):
+    """A handle this adapter never launched (every unit fixture; the opencode-http
+    transport has no pane at all): `_log_evidence` is None, so the verdict is
+    True — exactly `_produced_work`'s "unknown never blocks"."""
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    adapter._window_alive = lambda handle: False
+    assert not (adapter.logs_dir / "3-1-dev-1.log").exists()
+    adapter.watcher = _ScriptedWatcher([None])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.produced_work) == ("crashed", True)
+
+
+def test_timeout_with_static_log_is_no_work(tmp_path, monkeypatch):
+    """The session clock elapses with the pane unchanged since its first frame:
+    `timeout`, `produced_work=False` — the same wall as #727 on a profile whose
+    grace is disabled."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0  # no grace: only the deadline can end this
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+
+    def script(call_n):
+        if call_n == 1:
+            clock["mono"] += 1.0
+            _grow(log, b"Do you trust the files in this folder?\n" * 50)
+        else:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_readback_upgrade_to_completed_resets_produced_work(tmp_path, monkeypatch):
+    """The flag is scoped to non-completed exits: a dead window whose artifact
+    upgrades the crash to `completed` (log over the #261 floor, no Stop, the
+    loop's timeline verdict False) carries `produced_work=True`, so a completed
+    session-end never gets a no-work stamp.
+
+    ABLATION: pass the loop's verdict through unconditionally and this reads False."""
+    adapter, impl = make_dev_adapter(tmp_path, mux=_UnitMux())
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n"
+    )
+    _pane_log(adapter, "3-1-dev-1", 5000)
+    res = adapter._final(
+        _dev_handle(), _dev_spec(tmp_path), "crashed", None, None, produced_work=False
+    )
+    assert res.status == "completed"
+    assert res.produced_work is True
+    # the non-completed path keeps the loop's verdict
+    kept = adapter._final(
+        _dev_handle(),
+        _dev_spec(tmp_path),
+        "stalled",
+        None,
+        None,
+        accept_result=False,
+        produced_work=False,
+    )
+    assert (kept.status, kept.produced_work) == ("stalled", False)
+
+
+def test_work_verdict_arms(tmp_path):
+    """The predicate in isolation: Stop OR no-log OR activity; a present, static
+    log with neither signal is the only False."""
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    handle = _dev_handle()
+    assert adapter._work_verdict(handle, stop_seen=False, activity_seen=False) is True  # no log
+    _pane_log(adapter, "3-1-dev-1", 5000)  # present, and well over the #261 floor
+    assert adapter._work_verdict(handle, stop_seen=False, activity_seen=False) is False
+    assert adapter._work_verdict(handle, stop_seen=True, activity_seen=False) is True
+    assert adapter._work_verdict(handle, stop_seen=False, activity_seen=True) is True
+
+
+# ------------------------------- transcript idle detection (#680)
+#
+# Observability only. The live transcript's (mtime_ns, size) is sampled on the
+# heartbeat cadence; `heartbeat.json` carries the age; the journal gets one
+# `session-idle` per stretch at the stall-grace crossing and one `session-active`
+# when the key moves again. Nothing here nudges, stalls or kills.
+
+
+class _FakeJournal:
+    def __init__(self):
+        self.entries: list[dict] = []
+
+    def append(self, kind, **fields):
+        self.entries.append({"kind": kind, **fields})
+
+
+def _session_start(task_id, transcript_path):
+    return HookEvent(
+        ts=1,
+        event="SessionStart",
+        task_id=task_id,
+        session_id="sess",
+        transcript_path=transcript_path,
+        path=Path("x"),
+    )
+
+
+def _idle_adapter(tmp_path, monkeypatch, *, grace=60.0, journal=True, profile_name="claude"):
+    """Dev adapter with a live pane log that the script keeps repainting (the #680
+    spinner: the stall re-arm never fires) and a transcript file the script
+    advances on cue. Heartbeats are captured in order."""
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, profile_name=profile_name, mux=mux)
+    adapter._stall_grace_s = grace
+    adapter._idle_threshold_s = grace  # the same knob, read from policy in production
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    if journal:
+        adapter.journal = _FakeJournal()
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    clock = _steerable_clock(monkeypatch)
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+    return adapter, mux, log, transcript, clock, heartbeats
+
+
+def test_idle_stretch_journals_one_pair_and_stamps_heartbeat(tmp_path, monkeypatch):
+    """A transcript still for >= the grace while the pane keeps repainting: exactly
+    one `session-idle` at the crossing (age >= threshold, `since_ts` = the wall
+    time of the last change), `transcript_idle_s` climbing on every heartbeat, one
+    `session-active` with the stretch's length when the transcript moves, and a
+    fresh pair for a later stretch. The session is neither nudged nor stalled.
+
+    ABLATION D: drop the `open_since` latch and tick 6 emits a second
+    `session-idle` for the same stretch."""
+    adapter, mux, log, transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch)
+    # A REAL journal here (the other idle rows use `_FakeJournal`), so the
+    # `append(kind, **fields)` signature the adapter relies on is pinned against
+    # `bmad_loop.journal.Journal` itself, read back through `entries()`.
+    adapter.journal = Journal(tmp_path / "journal-run")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # one heartbeat per tick
+            _grow(log, "\r⠋ Thinking…".encode())  # the spinner keeps the pane alive
+        if call_n == 6:
+            _grow(transcript, b'{"type":"assistant"}\n')  # the stretch ends
+        if call_n == 10:
+            clock["t"] += 10_000.0  # past spec.timeout_s: end the loop
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "timeout"  # the idle stretch itself ended nothing
+    assert mux.sent == []  # never nudged
+    # heartbeat 1 predates the transcript; the baseline is taken the moment the
+    # SessionStart names it (mono 1000, inside tick 1), so heartbeat 2 already
+    # reads 30 s; the age climbs; the move resets it; the second stretch climbs
+    # to its own crossing
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [
+        None,
+        30.0,
+        60.0,
+        90.0,
+        120.0,
+        0.0,
+        30.0,
+        60.0,
+        90.0,
+    ]
+    entries = adapter.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert kinds == ["session-idle", "session-active", "session-idle"]
+    first, active, second = entries
+    assert all(isinstance(e.pop("ts"), float) for e in entries)  # Journal's own stamp
+    assert first == {
+        "kind": "session-idle",
+        "task_id": "3-1-dev-1",
+        "idle_s": 60.0,
+        "since_ts": 5000.0,  # wall time the transcript was first named (mono 1000)
+        "threshold_s": 60.0,
+    }
+    assert active == {"kind": "session-active", "task_id": "3-1-dev-1", "idle_s": 150.0}
+    assert second["since_ts"] == 5150.0  # the move at mono 1150 started the new stretch
+    assert second["idle_s"] == 60.0
+
+
+def test_idle_stretch_ending_in_the_final_interval_is_closed_at_exit(tmp_path, monkeypatch):
+    """An open idle stretch whose transcript moves after the last heartbeat, with
+    the deadline elapsing before another: the exit-time sample closes it, so the
+    journal reads `session-idle` then `session-active` ahead of the engine's
+    `session-end` rather than a stretch that never recovered.
+
+    ABLATION: replace the exit-time `_sample_transcript_idle` with a bare key
+    compare and the `session-active` is missing."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(log, "\r⠋".encode())  # the spinner keeps the pane alive throughout
+        if 2 <= call_n <= 4:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+        if call_n == 5:
+            clock["t"] += 10.0  # inside the final interval: no heartbeat fires
+            _grow(transcript, b'{"type":"assistant"}\n')
+        if call_n == 6:
+            clock["t"] += 10_000.0  # deadline next tick, still no heartbeat first
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
+    assert result.produced_work is True  # the same write is the #727 latch
+
+
+def test_plain_adapter_honours_the_idle_threshold_from_policy(tmp_path, monkeypatch):
+    """The plain `GenericAdapter` — what `runsetup.make_adapters` builds for the
+    sweep's triage role — arms no stall timer (`_stall_grace_s` stays 0), yet the
+    idle notice must still fire at `limits.dev_stall_grace_s` (600 by default):
+    the threshold is read from policy, not from the stall knob.
+
+    ABLATION: gate the notice on `_stall_grace_s` instead and this emits nothing."""
+    adapter, clock, _sent = _budget_adapter(tmp_path, monkeypatch)
+    assert adapter._stall_grace_s == 0.0 and adapter._idle_threshold_s == 600.0
+    adapter.journal = _FakeJournal()
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += 300.0  # heartbeats at ages 300 and 600 (the crossing)
+            clock["wall"] += 300.0
+        if call_n == 4:
+            clock["t"] += 100_000.0  # past the deadline
+
+    adapter.watcher = _ScriptedWatcher([_start_event(transcript)], on_call=script)
+    result = adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="off", timeout_s=5000.0)
+    )
+    assert result.status == "timeout"
+    kinds = [e["kind"] for e in adapter.journal.entries]
+    assert kinds == ["session-idle"]
+    assert adapter.journal.entries[0]["threshold_s"] == 600.0
+
+
+def test_idle_stretch_is_closed_on_a_completing_stop(tmp_path, monkeypatch):
+    """The successful Stop is the one exit that bypasses `produced_work()`: an
+    open idle stretch whose transcript moved inside the final interval is still
+    closed before the `completed` return, so the journal reads
+    `session-idle`, `session-active` ahead of `session-end`.
+
+    ABLATION: drop the sample before the `completed` return — the
+    `session-active` is missing."""
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    impl = tmp_path / "impl"  # `make_dev_adapter`'s implementation-artifacts dir
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(log, "\r⠋".encode())
+        if 2 <= call_n <= 4:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+        if call_n == 5:
+            clock["t"] += 10.0  # inside the final interval: no heartbeat fires
+            _grow(transcript, b'{"type":"assistant"}\n')
+            # the turn ends with its spec flipped to done: the dev adapter
+            # synthesizes the result from it
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\nbaseline_revision: abc123\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _session_start("3-1-dev-1", str(transcript)),
+            None,
+            None,
+            None,
+            _stop_event("3-1-dev-1", "sess", str(transcript)),
+        ],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "completed"
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
+
+
+def test_repointing_the_transcript_closes_an_open_idle_stretch(tmp_path, monkeypatch):
+    """A hook event re-points the transcript while a stretch is open on the old
+    one: the rebaseline closes that stretch with a `session-active`, since the
+    new file can never close it and the TUI would otherwise keep reading the old
+    `session-idle`.
+
+    ABLATION: drop the `session-active` inside the rebaseline — the journal ends
+    on an open `session-idle`."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    # tick 1 names the transcript; the stretch opens at age 60; tick 4's event
+    # re-points to `other`
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        None,
+        _session_start("3-1-dev-1", str(other)),
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    entries = adapter.journal.entries
+    # the old file's stretch is closed at the re-point; the new file then runs its
+    # own clock from a fresh baseline and crosses on the final (jumped) sample
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active", "session-idle"]
+    assert entries[2]["since_ts"] > entries[0]["since_ts"]
+
+
+def test_idle_events_need_a_positive_grace(tmp_path, monkeypatch):
+    """`dev_stall_grace_s = 0` disables the events (no new knob); the heartbeat
+    still stamps the age.
+
+    ABLATION D: drop the `_stall_grace_s > 0` guard and `idle_s >= 0` fires on the
+    first sample."""
+    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch, grace=0.0)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert adapter.journal.entries == []
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 30.0, 60.0, 90.0, 120.0, 150.0]
+
+
+def test_idle_events_need_an_attached_journal(tmp_path, monkeypatch):
+    """No journal attached (`resolve.run_session`, `probe`, fixtures): no events,
+    no error; the heartbeat still carries the age.
+
+    ABLATION D: drop the `journal is None` guard and this raises on `None.append`."""
+    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    assert adapter.journal is None
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert heartbeats[-1]["transcript_idle_s"] == 150.0
+
+
+def test_idle_age_is_null_without_a_transcript(tmp_path, monkeypatch):
+    """No hook event ever names a transcript: nothing to sample, `null` on every
+    heartbeat, no events."""
+    adapter, _, log, _transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        _grow(log, "\r⠋".encode())
+        if call_n == 4:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert heartbeats and all(hb["transcript_idle_s"] is None for hb in heartbeats)
+    assert adapter.journal.entries == []
+
+
+def test_unreadable_transcript_stat_skips_the_sample(tmp_path, monkeypatch):
+    """A transcript the hook named but that does not exist yet (or is mid-rename):
+    the stat raises, the key is None, the tick is skipped and the loop goes on.
+    When the file appears the clock starts from THAT sample."""
+    # grace far above the timeline, so the exit-time sample after the final clock
+    # jump cannot open a stretch: this row is about the None-key skip only
+    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, grace=100_000.0
+    )
+    transcript.unlink()
+    assert generic.GenericAdapter._transcript_activity_key(str(transcript)) is None
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 4:
+            transcript.write_bytes(b"{}\n")  # appears before heartbeat 4
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, None, None, 0.0, 30.0]
+    assert adapter.journal.entries == []
+
+
+def test_idle_journal_write_failure_is_swallowed(tmp_path, monkeypatch):
+    """An unwritable journal is observability, never a reason to end a session
+    that is, by this very evidence, alive."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+
+    class _Broken:
+        def append(self, kind, **fields):
+            raise OSError("disk full")
+
+    adapter.journal = _Broken()
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 6:
+            _grow(transcript, b"{}\n")
+        if call_n == 8:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+
+
+def test_idle_journal_retries_transient_event_failures(tmp_path, monkeypatch):
+    """A failed append cannot consume either boundary of an idle stretch.
+
+    ABLATION: latch open_since before the idle append, or clear the active
+    pending state after its failed append, and one of the two events is lost.
+    """
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    adapter._idle_threshold_s = 60.0
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    idle = generic._IdleTracker()
+
+    class _FailOncePerKind:
+        def __init__(self):
+            self.entries: list[dict] = []
+            self.failed: set[str] = set()
+
+        def append(self, kind, **fields):
+            if kind not in self.failed:
+                self.failed.add(kind)
+                raise OSError("temporary journal failure")
+            self.entries.append({"kind": kind, **fields})
+
+    journal = _FailOncePerKind()
+    adapter.journal = journal
+    clock = _steerable_clock(monkeypatch)
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    clock["t"] += 60.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert journal.entries == []
+    clock["t"] += 30.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle"]
+    _grow(transcript, b'{"type":"assistant"}\n')
+    clock["t"] += 10.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle"]
+    clock["t"] += 30.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle", "session-active"]

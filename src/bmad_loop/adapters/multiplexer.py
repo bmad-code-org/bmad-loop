@@ -216,17 +216,30 @@ class TerminalMultiplexer(ABC):
         that diverges remains usable, but falls back to the ambiguous by-name
         lookup whenever several kinds share a run id.
 
-        Raises :class:`MultiplexerError` if the transport itself fails (timeout /
-        missing binary): an empty list means "no windows" and must not be
-        conflated with "couldn't ask" — this op backs the engine's liveness
-        probe (:meth:`window_alive`)."""
+        Raises :class:`MultiplexerError` whenever the listing could not be TAKEN
+        — a transport failure (timeout / missing binary) or a query that failed
+        without proving the session gone: an empty list means "no windows" and
+        must not be conflated with "couldn't ask", because this op backs the
+        engine's liveness probe (:meth:`window_alive`).
+
+        So ``[]`` carries a positive claim, not a shrug: the backend either
+        listed the session's windows and found none, or established that the
+        session no longer exists. A backend answering over a server therefore
+        owes callers a discrimination — a server that errors while its windows
+        are alive must not answer ``[]`` (#525). Which conditions PROVE absence
+        is the backend's own question: the exit code alone does not decide it,
+        and neither does a confirming :meth:`has_session`, whose False is
+        weaker than it looks (see its note)."""
 
     @abstractmethod
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
         """One tuple per window in ``session``, each holding the requested
         backend fields in order. Best-effort: returns ``[]`` on a transport
-        failure (unlike :meth:`list_window_ids`, this is metadata, not a liveness
-        probe, so a sentinel is safe).
+        failure OR a failed query (unlike :meth:`list_window_ids`, this is
+        metadata, not a liveness probe, so a sentinel is safe — the answer
+        degrades toward doing nothing, never toward claiming a death or a
+        kill). A backend SHOULD still say on stderr when the failure did not
+        prove the session gone, so an every-call failure is not silent (#525).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
         AND :meth:`list_window_ids` return; core compares all three directly. The
@@ -241,10 +254,13 @@ class TerminalMultiplexer(ABC):
     def window_alive(self, session: str, window_id: str) -> bool:
         """True iff ``window_id`` is still a window of ``session``.
 
-        May raise :class:`MultiplexerError` when liveness is unknowable (a
-        transport timeout / missing binary) — callers must treat that as "don't
-        know", not "dead", and must not tear down a possibly-working session on
-        it."""
+        May raise :class:`MultiplexerError` when liveness is unknowable — a
+        transport timeout / missing binary, or any other failure to take the
+        listing this membership test reads (see :meth:`list_window_ids`).
+        Callers must treat that as "don't know", not "dead", and must not tear
+        down a possibly-working session on it. Reachable in ordinary operation,
+        not only under a hung binary: a live server that refuses or drops the
+        query answers here (#525)."""
 
     @abstractmethod
     def kill_window(self, target: str) -> None:

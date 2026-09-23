@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     _OK,
+    _RUN,
     NUL_PATH_RESOLVE_FAULTS,
     UNDECODABLE_LEDGER,
     _exists_run,
@@ -5536,7 +5537,9 @@ def test_story_label_stripped_matches_the_task_id(raw, story_key, expected):
 # ------------------------------------------------ per_worktree engine plugin
 
 
-def _write_stub_plugin(project, name, *, ready=_OK, setup=_OK, teardown=_OK, seed_globs=None):
+def _write_stub_plugin(
+    project, name, *, ready=_OK, setup=_OK, teardown=_OK, seed_globs=None, post_story=None
+):
     """A project-local *declarative* plugin whose lifecycle hooks are shell stubs
     (no real Unity) — proving a generic data-only plugin can gate the engine's
     per_worktree flow. A blocking hook's non-zero exit vetoes (defers) the unit.
@@ -5558,6 +5561,8 @@ def _write_stub_plugin(project, name, *, ready=_OK, setup=_OK, teardown=_OK, see
         "[hooks.pre_worktree_teardown]",
         f"cmd = '{teardown}'",
     ]
+    if post_story is not None:
+        lines += ["[hooks.post_story]", f"cmd = '{post_story}'"]
     (plug_dir / "plugin.toml").write_text("\n".join(lines) + "\n")
 
 
@@ -5702,6 +5707,29 @@ def test_per_worktree_teardown_runs_on_pause(project):
     assert len(worktree_list(project.project)) == 2
     assert (engine.run_dir / "teardown-done").is_file()
     assert "pre_worktree_teardown" in _hook_stages(engine)
+
+
+def test_post_story_hook_runs_from_repo_root_after_worktree_teardown(project):
+    """#779: post_story fires after the unit merged and its worktree was removed.
+    The declarative hook used to get that deleted path as cwd, so subprocess
+    raised before the shell started and only `plugin-hook-error` was journalled.
+    It now runs from the project root; the marker records the cwd it ran in."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = "post-story-cwd"
+    record = f'cd > "{_RUN}\\{marker}"' if sys.platform == "win32" else f'pwd > "{_RUN}/{marker}"'
+    _write_stub_plugin(project, "stub", post_story=record)
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=_pw_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(worktree_list(project.project)) == 1  # the unit's worktree is gone
+    assert "plugin-hook-error" not in journal_kinds(engine)
+    ran_in = (engine.run_dir / marker).read_text().strip()
+    assert Path(ran_in).samefile(project.repo_root)
 
 
 def _leaking_dev_effect(project, story_key, *, leak_name, in_branch_set):

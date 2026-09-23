@@ -7536,7 +7536,8 @@ def test_per_stage_adapter_and_model_dispatch(project):
         adapter=AdapterPolicy(
             name="claude",
             model="opus",
-            review=StageAdapterPolicy(name="codex", model="gpt-5-codex"),
+            effort="high",
+            review=StageAdapterPolicy(name="codex", model="gpt-5-codex", effort="max"),
         ),
     )
     engine = Engine(
@@ -7555,6 +7556,9 @@ def test_per_stage_adapter_and_model_dispatch(project):
     assert [s.role for s in review_mock.sessions] == ["review"]
     assert dev_mock.sessions[0].model == "opus"
     assert review_mock.sessions[0].model == "gpt-5-codex"
+    # #643: the resolved per-stage effort rides the SessionSpec the same way
+    assert dev_mock.sessions[0].effort == "high"
+    assert review_mock.sessions[0].effort == "max"
 
 
 def test_review_loop_converges_within_budget(project):
@@ -9318,6 +9322,91 @@ def test_rollback_preserves_uncommitted_attempt_worktree(project):
     # (conftest `git` strips, so compare against the newline-free blob content)
     assert git(repo, "show", f"{ref}:src.txt") == "uncommitted tracked edit"
     assert git(repo, "show", f"{ref}:new_test.txt") == "uncommitted new file"
+
+
+def _dirty_timeout_effect(paths, text: str):
+    """A dev session that times out mid-work, leaving an uncommitted edit that
+    the non-fixable retry's rollback parks under a worktree snapshot."""
+
+    def effect(spec):
+        (paths.project / "src.txt").write_text(text)
+        return SessionResult(status="timeout")
+
+    return effect
+
+
+def test_retry_dev_prompt_names_the_earlier_attempts_parked_work(project):
+    """#777: attempt 1 times out with work on the tree; the retry rolls it back
+    and parks it. Attempt 2's prompt names that verified snapshot — and only
+    attempt 2's: the first dispatch has nothing earlier to point at."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            _dirty_timeout_effect(project, "half-built attempt 1\n"),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+    )
+
+    assert engine.run().done == 1
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    first, second = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert "earlier attempt" not in first
+    base = engine.state.tasks["1-1-a"].baseline_commit
+    assert (
+        "\n\nAn earlier attempt at this work was rolled back; its work is preserved at " in second
+    )
+    assert f"`git diff {base} {ref}`" in second
+    assert "every gate must pass fresh on this attempt" in second
+    assert "half-built attempt 1" in git(project.project, "show", f"{ref}:src.txt")
+
+
+def test_retry_dev_prompt_names_work_parked_after_a_mid_session_crash(project):
+    """#777: a host death mid-session records no session, so the resume's restart
+    arm parks the dirty tree with only the durable DEV_RUNNING to attribute it.
+    The re-dispatched attempt's prompt still names that work.
+
+    Ablation: drop the DEV_RUNNING arm of `Engine._dev_attempt_dispatched` and
+    the paragraph disappears from the resumed prompt."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def crash_mid_session(spec):
+        (project.project / "src.txt").write_text("half-built before the crash\n")
+        raise RuntimeError("host died mid-session")
+
+    engine, _ = make_engine(project, [crash_mid_session])
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DEV_RUNNING and crashed.sessions == []
+
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    assert resumed.run().done == 1
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" in kinds
+    (entry,) = [e for e in resumed.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    (prompt,) = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert f"its work is preserved at `{ref}`" in prompt
+    assert "half-built before the crash" in git(project.project, "show", f"{ref}:src.txt")
+
+
+def test_retry_dev_prompt_has_no_preserve_paragraph_when_nothing_was_parked(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), dev_effect(project, "1-1-a", followup_review=False)],
+    )
+
+    assert engine.run().done == 1
+
+    assert engine.state.tasks["1-1-a"].preserve_ref is None
+    second = [s.prompt for s in adapter.sessions if s.role == "dev"][1]
+    assert "earlier attempt" not in second
 
 
 def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(project):
@@ -11934,6 +12023,64 @@ def test_session_env_fault_pauses_dev_without_burning_budget(project):
     # the resolve workflow's re-arm step restores the attempt budget
     rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_session_with_no_work_pauses_dev_without_burning_budget(project):
+    """A dev session that produced nothing (#727 — a CLI parked on a permission
+    dialog until the grace, the nudge and window death) pauses the run at the
+    first story rather than charging the attempt and launching a second session
+    into the same wall; `dev-decision` and `session-end` both carry the flag, and
+    re-arm restores the budget (attempt -> 0).
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs — a
+    second dev session is launched and the story ends deferred, not paused."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="stalled", produced_work=False)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # the one real session, not a spent budget
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("no work produced: dev session stalled")
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["produced_work"] is False
+    assert dec["env_fault"] is False
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["produced_work"] is False
+
+    # the resolve workflow's re-arm step is what makes "not charged" true
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_engine_attaches_its_journal_to_every_adapter(project):
+    """The engine hands its `Journal` to the adapters it owns (#680), so an
+    adapter-side `session-idle` lands in the same file with the same
+    `log_task`/`log_pos` stamps; a session that worked leaves no `produced_work`
+    key on `session-end` (the field is present only when False, like
+    `session_vanished`) and `dev-decision` records it True."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    review_adapter = MockAdapter([])
+    engine, adapter = make_engine(
+        project, [SessionResult(status="timeout")], review_adapter=review_adapter
+    )
+    assert adapter.journal is engine.journal
+    assert review_adapter is not adapter
+    assert engine.adapters["review"] is review_adapter
+    assert review_adapter.journal is engine.journal
+    engine.run()
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["produced_work"] is True for d in dec)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("produced_work" not in e for e in ends)
 
 
 def test_two_plain_timeouts_still_defer(project):

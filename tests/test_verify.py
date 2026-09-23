@@ -4480,6 +4480,173 @@ def test_safe_rollback_keep_dir_protects_run_created(project):
     assert (out / "fresh-artifact.md").exists()  # protected by keep even though new
 
 
+# Names the pre-#783 line-based `untracked_files` did not answer verbatim: git
+# C-quotes a non-ASCII or newline-bearing name, and `.strip()` ate edge spaces.
+# Windows forbids a newline in a name and silently drops a trailing space.
+_POSIX_NAME = pytest.mark.skipif(sys.platform == "win32", reason="illegal Windows filename")
+_VERBATIM_NAMES = [
+    pytest.param("spec-能力.md", id="unicode"),
+    pytest.param(" lead.txt", id="leading-space"),
+    pytest.param("trail.txt ", id="trailing-space", marks=_POSIX_NAME),
+    pytest.param("new\nline.txt", id="newline", marks=_POSIX_NAME),
+]
+
+
+def _quote_path_default(repo):
+    """Pin `core.quotePath` to git's default, whatever the host's global config says."""
+    git(repo, "config", "core.quotePath", "true")
+
+
+def _tree_names(repo, ref):
+    """Every path in ``ref``'s tree, verbatim (NUL-delimited, undecoded by git)."""
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", ref],
+        capture_output=True,
+        check=True,
+    ).stdout
+    return {os.fsdecode(rel) for rel in out.split(b"\0") if rel}
+
+
+def _pre_783_listing(repo):
+    """What the pre-#783 reader persisted: git's line-based listing, lines stripped."""
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+@pytest.mark.parametrize("name", _VERBATIM_NAMES)
+def test_untracked_files_answers_exact_on_disk_names(project, name):
+    """#783: the answer is the file's own name — not its C-quoted spelling, not
+    split at a newline, not stripped of an edge space."""
+    repo = project.project
+    _quote_path_default(repo)
+    (repo / name).write_text("x\n")
+    assert name in verify.untracked_files(repo)
+
+
+@pytest.mark.parametrize("name", _VERBATIM_NAMES)
+def test_snapshot_worktree_parks_verbatim_named_untracked(project, name):
+    """The snapshot's `git add --` is handed the real name, so it succeeds and
+    parks the file; the quoted spelling made `add` fail and the rollback refuse."""
+    repo = project.project
+    _quote_path_default(repo)
+    baseline_untracked = sorted(verify.untracked_files(repo))
+    (repo / name).write_text("x\n")
+
+    ref = verify.snapshot_worktree(
+        repo, "refs/attempt-preserve-dirty/verbatim", baseline_untracked=baseline_untracked
+    )
+    assert ref is not None
+    assert name in _tree_names(repo, ref)
+
+
+@pytest.mark.parametrize("name", _VERBATIM_NAMES)
+def test_safe_rollback_removes_only_run_created_verbatim_names(project, name):
+    """A run-created file of that name is deleted; the operator's pre-existing one
+    in the baseline and a keep-dir-protected one both survive."""
+    repo = project.project
+    _quote_path_default(repo)
+    (repo / "pre").mkdir()
+    (repo / "pre" / name).write_text("operator's\n")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    (repo / name).write_text("run-created\n")
+    (repo / "_bmad-output").mkdir(exist_ok=True)
+    (repo / "_bmad-output" / name).write_text("kept\n")
+
+    verify.safe_rollback(
+        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop", "_bmad-output")
+    )
+    assert not (repo / name).exists()
+    assert (repo / "pre" / name).read_text() == "operator's\n"
+    assert (repo / "_bmad-output" / name).read_text() == "kept\n"
+
+
+def test_safe_rollback_legacy_quoted_baseline_protects_preexisting(project):
+    """A run persisted before #783 holds the old reader's quoted/stripped records.
+    Resumed after the fix, those must still protect the files they listed: an exact
+    difference would make each one a run-created deletion target (and park it, and
+    read the tree dirty).
+
+    Ablation target: make `_created_untracked` an exact difference and the operator's
+    files are deleted."""
+    repo = project.project
+    _quote_path_default(repo)
+    names = ["spec-能力.md", " lead.txt"]
+    if sys.platform != "win32":
+        names += ["trail.txt ", "new\nline.txt"]
+    for name in names:
+        (repo / name).write_text("operator's\n")
+    baseline = verify.rev_parse_head(repo)
+    legacy = _pre_783_listing(repo)
+    assert not set(names) & set(legacy)  # the old spellings, not the names
+
+    (repo / "junk.txt").write_text("run-created\n")
+    verify.safe_rollback(repo, baseline, baseline_untracked=legacy, keep=(".bmad-loop",))
+    assert not (repo / "junk.txt").exists()
+    for name in names:
+        assert (repo / name).read_text() == "operator's\n"
+    assert not verify.attempt_dirty(repo, baseline, legacy)  # the gate agrees
+
+
+@pytest.mark.parametrize("name", _VERBATIM_NAMES)
+def test_capture_diff_includes_verbatim_named_untracked(project, name):
+    """The failed-unit patch includes the file: `--no-index` is handed the real
+    name. The quoted spelling made it exit 1 with empty stdout, the code the loop
+    tolerates as "the files differ", so the file silently dropped out."""
+    repo = project.project
+    _quote_path_default(repo)
+    base = verify.rev_parse_head(repo)
+    (repo / name).write_text("verbatim content\n")
+
+    assert "+verbatim content" in verify.capture_diff(repo, base)
+
+
+def _touch_bytes_name(repo, raw):
+    """Create an empty file whose name is the raw bytes ``raw`` (`Path` takes str only)."""
+    with open(os.path.join(os.fsencode(repo), raw), "wb"):
+        pass
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs arbitrary-byte filenames")
+@pytest.mark.parametrize("quote_path", ["true", "false"])
+def test_c_quote_path_matches_git_for_every_byte(project, quote_path):
+    """`_c_quote_path` is the legacy-baseline oracle, so pin it to git itself: one
+    file per byte a name can hold, compared with git's line-based listing."""
+    repo = project.project
+    git(repo, "config", "core.quotePath", quote_path)
+    before = set(os.listdir(os.fsencode(repo)))
+    for b in range(1, 256):
+        if b != ord("/"):
+            _touch_bytes_name(repo, bytes([b, ord("x")]))
+    raws = set(os.listdir(os.fsencode(repo))) - before
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    want = {line for line in out.split(b"\n") if line}
+    got = {verify._c_quote_path(raw, quote_fully=quote_path == "true") for raw in raws}
+    assert got <= want and len(got) == len(raws)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs a non-UTF-8 filename")
+def test_untracked_files_keeps_quoted_token_for_undecodable_name(project):
+    """A name the filesystem codec cannot decode keeps the pre-#783 answer (git's
+    quoted spelling) instead of raising — so a stray latin-1 file cannot fail every
+    baseline capture — and that token still matches itself across two reads."""
+    repo = project.project
+    _quote_path_default(repo)
+    _touch_bytes_name(repo, b"lat\xff.txt")
+    assert verify.untracked_files(repo) >= {'"lat\\377.txt"'}
+    baseline = verify.rev_parse_head(repo)
+    assert not verify.attempt_dirty(repo, baseline, sorted(verify.untracked_files(repo)))
+
+
 def test_safe_rollback_none_snapshot_removes_nothing(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)

@@ -743,7 +743,12 @@ def test_e2e_two_story_happy_path_build_auto(tmp_path):
     assert _status(root, "2") == "done"
     assert _commit_count(root) == base + 2
 
-    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    run_id = _run_id(root)
+    run_dir = root / ".bmad-loop" / "runs" / run_id
+    # A FINISHED run tears down its mux session (`cleanup_session_on_finish`); the
+    # suite's one real-tmux pin of that — the timeout row now pauses (#727) and a
+    # pause keeps the session for resume by design.
+    assert not _tmux_has_session(f"bmad-loop-{run_id}")
     dispatched = [
         p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")
     ]
@@ -1708,6 +1713,15 @@ def _tmux_has_session(name: str) -> bool:
     return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
 
 
+def _tmux_window_names(session: str) -> list[str]:
+    out = subprocess.run(
+        ["tmux", "list-windows", "-t", f"={session}", "-F", "#{window_name}"],
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.split()
+
+
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
@@ -1716,7 +1730,15 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
     session timeout, and the fix makes that firing timely and observable. The
     1-minute policy floor is too coarse for a fast test, so the engine's
-    BMAD_LOOP_SESSION_TIMEOUT_S seam drives a 3-second budget."""
+    BMAD_LOOP_SESSION_TIMEOUT_S seam drives a 3-second budget.
+
+    Since #727 the same session is also the no-work shape — it painted once and
+    never changed its pane before the deadline — so the run PAUSES at escalation
+    (`no work produced: dev session timeout`) instead of deferring, and a pause
+    deliberately leaves the run's mux SESSION for `resume` to reuse. The teardown
+    under test is the agent window's: it and its process tree must be gone, and the
+    session must hold nothing but its root shell window. The session itself is
+    killed on the way out so the host is not left with an orphan."""
     root = tmp_path / "sbx"
     story = "1-1-timeout"
     _scaffold_sprint(
@@ -1736,6 +1758,7 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
     injected_child: subprocess.Popen | None = None
     poll_failure: AssertionError | None = None
     injected_exit: int | None = None
+    run_id: str | None = None
     try:
         # Everything up to the bind is the pre-bind window: the fake CLI's child is
         # already running but no fd names it yet, so a `_run` timeout or any assertion
@@ -1810,8 +1833,19 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
         hb = json.loads((tdir / "heartbeat.json").read_text(encoding="utf-8"))
         assert time.time() - hb["ts"] < 120, hb
 
-        # (4) teardown actually reaped the session — no orphan tmux session/process
-        assert not _tmux_has_session(f"bmad-loop-{run_id}")
+        # (4) teardown actually reaped the agent window and its process tree. The
+        # run is paused (see the docstring), so the session survives by design —
+        # with only its root shell window left, never the task's.
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        assert str(state.get("paused_reason", "")).startswith(
+            "no work produced: dev session timeout"
+        ), state
+        assert end.get("produced_work") is False, end
+        session_name = f"bmad-loop-{run_id}"
+        assert _tmux_has_session(session_name)
+        windows = _tmux_window_names(session_name)
+        assert task_id[-40:] not in windows and len(windows) == 1, windows
         if shutil.which("pgrep"):
             pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
             assert not [ln for ln in pg.stdout.splitlines() if str(root) in ln], pg.stdout
@@ -1850,6 +1884,11 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
         finally:
             if injected_child is not None and injected_child.poll() is None:
                 _reap(injected_child)
+            # The paused run left its session for a resume that never comes.
+            if run_id is not None:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", f"=bmad-loop-{run_id}"], capture_output=True
+                )
 
     if force_live_reap_assertion:
         assert str(poll_failure).splitlines()[0] == f"sleep child {poll_pid} survived teardown"

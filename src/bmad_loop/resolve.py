@@ -517,6 +517,7 @@ def run_session(
     *,
     generation: int,
     model: str = "",
+    effort: str = "",
 ) -> bool:
     """Launch the interactive resolve agent attached to the caller's terminal.
 
@@ -555,6 +556,7 @@ def run_session(
             "BMAD_LOOP_RESOLVE_CONTEXT": str(context_path(run_dir, story_key)),
         },
         model=model,
+        effort=effort,
     )
     # Drop any marker from a previous resolve of this story: otherwise the agent
     # sees it and reports "already resolved", and a session that records nothing

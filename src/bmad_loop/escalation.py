@@ -199,6 +199,24 @@ def env_fault_pause_reason(role: str, result: SessionResult) -> str:
     return f"environment fault: {session_failure_reason(role, result)} ({env_fault_detail(result)})"
 
 
+def no_work_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a non-completed session that never did anything (#727):
+    ``no work produced: <role> session <status> (...)``.
+
+    Composed over `session_failure_reason`, like `env_fault_pause_reason`, so the
+    #489 lost-session suffix survives: a session the multiplexer destroyed before
+    it painted a second frame carries both facts, and the operator needs both. The
+    parenthetical names what the adapter measured — no completed turn or qualifying
+    activity — and what that most often means, because the
+    verdict alone (`crashed` / `stalled` / `timeout`) reads as an agent that ran and
+    failed, when the CLI in fact sat at a prompt only a human can answer."""
+    return (
+        f"no work produced: {session_failure_reason(role, result)} (no completed turn "
+        "or qualifying activity was observed — the CLI may be waiting on a "
+        "human: a permission prompt, a login, a confirmation; the attempt is not charged)"
+    )
+
+
 def session_failure_reason(role: str, result: SessionResult) -> str:
     """The reason text for a non-completed session: ``<role> session <status>``,
     plus the lost-session diagnosis (#489).
@@ -250,6 +268,21 @@ def decide_dev(
             return Decision(
                 Action.PAUSE,
                 env_fault_pause_reason("dev", result),
+            )
+        if not result.produced_work:
+            # The session never did anything (#727): no turn ended and the pane
+            # never changed after its first frame — a CLI parked on a permission
+            # dialog, a login, a dead-on-arrival window. A RETRY would launch a
+            # fresh session into the identical wall and burn `max_dev_attempts`
+            # without a line of work, so pause for a human instead, ahead of the
+            # budget like the env-fault arm above: a spent budget must not file
+            # it as deferred work. Re-arm resets the attempt. After `env_fault`
+            # because a transport failure explains the silence better than the
+            # silence explains itself. Default `True` keeps every adapter that
+            # cannot measure this (opencode-http, unit fixtures) on today's path.
+            return Decision(
+                Action.PAUSE,
+                no_work_pause_reason("dev", result),
             )
         reason = session_failure_reason("dev", result)
         if budget_left:

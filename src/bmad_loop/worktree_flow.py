@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
 from . import artifact_publication, gates, verify
+from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
@@ -39,7 +40,6 @@ from .install import (
     CENTRAL_CONFIG_REL,
     DEV_PRIMITIVE_MARKERS,
     DEV_PRIMITIVE_ROLES,
-    HOOK_SCRIPT_REL,
     MERGED_REVIEW_SKILL,
     MODULE_SKILLS,
     RENDER_DIR_REL,
@@ -48,6 +48,7 @@ from .install import (
     RENDERER_SEED_SENTINELS,
     _absent_renderer_sources,
     _copy_traversable,
+    _hook_command,
     _is_dir,
     _is_file,
     _occupied,
@@ -63,7 +64,6 @@ from .install import (
 )
 from .model import Phase
 from .platform_util import atomic_write_text
-from .process_host import get_process_host
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -793,9 +793,9 @@ def provision_worktree(
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content rather than being created empty. Its relay entry is replaced, not
-    kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
-    command, which resolves to the worktree, so the hook step strips it and registers
-    its own absolute command in its place (#352). A config that is already there but
+    kept: a seeded copy can carry a legacy workspace relay or stale installed
+    command, so the hook step replaces it with this installation's absolute
+    command. A config that is already there but
     cannot be parsed refuses provisioning outright — `verify.GitError`, which the
     caller escalates as CRITICAL and pauses the run — rather than being replaced by
     a hooks-only file: an unparseable config is evidence of an earlier fault, and the
@@ -825,7 +825,6 @@ def provision_worktree(
             "cannot resolve worktree provisioning roots safely "
             f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
         ) from e
-    relay = repo_root / HOOK_SCRIPT_REL
     skills_root = resources.files("bmad_loop.data").joinpath("skills")
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
@@ -1142,18 +1141,17 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
-        host = get_process_host()
-        interp = host.hook_interpreter()
-        registrations = {
-            native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
-            for native, canonical in profile.hooks.events.items()
-        }
+        try:
+            registrations = {
+                native: _hook_command(repo_root, profile, canonical)
+                for native, canonical in profile.hooks.events.items()
+            }
+        except ProfileError as e:
+            raise verify.GitError(f"cannot register worktree relay: {e}") from e
         # A seeded config_path (.claude/settings.json is both a seeded file and the
-        # hook config) arrives carrying the MAIN repo's relay command, which for the
-        # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
-        # does not exist inside the worktree. merge_hooks will not replace an
-        # already-registered relay, so strip it first and let this registration —
-        # baked to the main repo's relay, absolute — be authoritative. Strip only on
+        # hook config) may carry a legacy workspace relay or a stale installed
+        # command. Strip it first and register this installation's entry point.
+        # Strip only on
         # FIRST encounter per config file: profiles can share a config_path
         # (user-overlay aliases of one CLI), and a later profile's pass must not
         # tear out the relay events an earlier one just registered — merge_hooks
@@ -1164,9 +1162,8 @@ def provision_worktree(
             stripped_paths.add(config_path)
         config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
         # Write — and pin — only when the strip+merge actually changed the parsed
-        # config. Non-claude dialects bake the absolute main-repo relay at init
-        # (_hook_command), so a tracked codex/gemini config often arrives already
-        # carrying exactly the command registered here: strip-then-merge nets to
+        # config. A tracked config may already carry exactly the installed command,
+        # so strip-then-merge nets to
         # zero, and a pin would claim orchestrator ownership of a file this run
         # never modified, hiding a story's own edit to it for no benefit.
         if config != baseline_config:

@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -49,13 +50,14 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import RunPaused
+from bmad_loop.engine import RunPaused, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_STORY_GATE,
     Phase,
     RunState,
+    SessionRecord,
     StoryTask,
     TokenUsage,
     VerifyOutcome,
@@ -139,6 +141,20 @@ def make_sweep(
         **kwargs,
     )
     return engine, adapter
+
+
+def test_sweep_attaches_journal_to_a_distinct_triage_adapter(project):
+    """#680: `Engine.__init__` attaches its journal to the adapters it knows; the
+    triage adapter is assigned AFTER that, so a distinct one would otherwise keep
+    `journal = None` and every sweep triage session would emit no idle events.
+
+    ABLATION: drop the `self.adapters["triage"].journal = self.journal` line and
+    the distinct-adapter assertion reddens."""
+    triage = MockAdapter([])
+    engine, dev = make_sweep(project, [], triage_adapter=triage)
+    assert engine.adapters["triage"] is triage
+    assert engine.adapters["triage"].journal is engine.journal
+    assert dev.journal is engine.journal
 
 
 def test_remaining_estimate_is_none_for_an_undecodable_ledger(project):
@@ -5090,6 +5106,9 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     assert task.attempt == 1  # only the one session — no retry budget spent
     assert "environment fault: triage session timeout" in engine.state.paused_reason
     assert evidence in engine.state.paused_reason
+    # #752: the env-fault escalation carries the attempt's diagnostic too
+    # (ablation: drop `_diagnostic_suffix` from the env-fault `_escalate`).
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason
     assert len(adapter.sessions) == 1  # no feedback-retry session
     dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
     assert dec["env_fault"] is True
@@ -5232,6 +5251,282 @@ def test_migration_lost_session_names_the_mux_in_its_errors(project):
     assert any("multiplexer no longer reports the session" in e for e in dec["errors"])
 
 
+# --- #752: a non-completed triage/migration session is diagnosed, never accepted ---
+
+
+def failed_session_effect(
+    status="timeout",
+    artifact=None,
+    primary_events=(),
+    legacy_events=(),
+    ledger=None,
+    result=None,
+):
+    """A scripted session that ends NON-completed after leaving, where a real one
+    would, the evidence the #752 diagnostic reads: `artifact` (a dict, or raw text
+    for a malformed document) at `<run_dir>/tasks/<task_id>/result.json`, and hook
+    events on the out-of-tree channel (`BMAD_LOOP_EVENTS_DIR`) and/or the legacy
+    in-tree `<run_dir>/events`, correlated exactly as the relay stamps them.
+    `ledger` rewrites the deferred-work ledger first (a migration's work)."""
+
+    def effect(spec):
+        run_dir = Path(spec.env["BMAD_LOOP_RUN_DIR"])
+        task_id = spec.env["BMAD_LOOP_TASK_ID"]
+        if ledger is not None:
+            ledger[0].write_text(ledger[1], encoding="utf-8")
+        if artifact is not None:
+            task_dir = run_dir / "tasks" / task_id
+            task_dir.mkdir(parents=True, exist_ok=True)
+            text = artifact if isinstance(artifact, str) else json.dumps(artifact)
+            (task_dir / "result.json").write_text(text, encoding="utf-8")
+        channels = (
+            (Path(spec.env["BMAD_LOOP_EVENTS_DIR"]), primary_events),
+            (run_dir / "events", legacy_events),
+        )
+        for directory, kinds in channels:
+            for kind in kinds:
+                directory.mkdir(parents=True, exist_ok=True)
+                ts = time.time_ns()
+                payload = {"ts": ts, "event": kind, "task_id": task_id, "session_id": "s"}
+                (directory / f"{ts}-{task_id}-{kind}.json").write_text(json.dumps(payload))
+        return result if result is not None else SessionResult(status=status)
+
+    return effect
+
+
+def _decisions(engine, kind):
+    return [e for e in engine.journal.entries() if e["kind"] == kind]
+
+
+VALID_TRIAGE = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+
+
+@pytest.mark.parametrize(
+    ("artifact", "verdict", "error_fragment"),
+    [
+        (None, "missing", None),
+        ("{not json", "malformed", "JSONDecodeError"),
+        ({"workflow": "something-else"}, "malformed", "workflow"),
+        (VALID_TRIAGE, "valid", None),
+    ],
+)
+def test_non_completed_triage_diagnoses_its_artifact_without_changing_the_outcome(
+    project, artifact, verdict, error_fragment
+):
+    """#752: a timed-out triage whose result.json is missing, malformed, or even fully
+    valid is diagnosed in `triage-decision` and in the escalation text — and routed
+    exactly as today: both attempts spent, then ESCALATED, never accepted.
+
+    Ablation guard (valid row): route a `valid` diagnostic to completion and this
+    fails — the run finishes instead of escalating."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            failed_session_effect(artifact=artifact, primary_events=["SessionStart"]),
+            failed_session_effect(artifact=artifact, primary_events=["SessionStart"]),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 2
+    assert len(adapter.sessions) == 2
+    assert not (engine.run_dir / "triage.json").exists()  # no plan was cached
+    decisions = _decisions(engine, "triage-decision")
+    assert [d["ok"] for d in decisions] == [False, False]
+    assert all(d["errors"] == ["triage session timeout"] for d in decisions)
+    diag = decisions[-1]["diagnostic"]
+    assert diag["task_id"] == "sweep-triage-triage-2"
+    assert diag["artifact"] == verdict
+    if error_fragment is None:
+        assert "artifact_error" not in diag
+    else:
+        assert error_fragment in diag["artifact_error"]
+    assert f"[result.json: {verdict}" in engine.state.paused_reason
+    assert "hook events: session-start-without-stop]" in engine.state.paused_reason
+
+
+@pytest.mark.parametrize(
+    ("artifact", "verdict", "error_fragment"),
+    [
+        (None, "missing", None),
+        ("[1, 2", "malformed", "JSONDecodeError"),
+        ({"workflow": "deferred-sweep-migrate", "mapping": []}, "malformed", "not mapped"),
+        ("valid", "valid", None),
+    ],
+)
+def test_non_completed_migration_diagnoses_its_artifact_without_changing_the_outcome(
+    project, artifact, verdict, error_fragment
+):
+    """The migration twin: a timed-out session that rewrote the ledger correctly and
+    wrote a validating result.json is still a failed attempt — the rewrite is
+    reset, both attempts spent, ESCALATED — with the diagnostic saying the artifact
+    validated against the very ledger text this attempt left.
+
+    Ablation guard (valid row): route a `valid` diagnostic to completion and this
+    fails."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    doc = migrate_result(mapping) if artifact == "valid" else artifact
+    rewrite = (project.deferred_work, migrated_ledger())
+    engine, adapter = make_sweep(
+        project,
+        [
+            failed_session_effect(artifact=doc, ledger=rewrite),
+            failed_session_effect(artifact=doc, ledger=rewrite),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 2
+    assert len(adapter.sessions) == 2
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER  # reset
+    decisions = _decisions(engine, "migrate-decision")
+    assert [d["ok"] for d in decisions] == [False, False]
+    assert all(d["errors"] == ["migration session timeout"] for d in decisions)
+    diag = decisions[-1]["diagnostic"]
+    assert diag["task_id"] == "sweep-migrate-triage-2"
+    assert diag["artifact"] == verdict
+    if error_fragment is None:
+        assert "artifact_error" not in diag
+    else:
+        assert error_fragment in diag["artifact_error"]
+    assert diag["hook_events"] == "none"
+    assert f"[result.json: {verdict}" in engine.state.paused_reason
+
+
+@pytest.mark.parametrize(
+    ("primary", "verdict", "kinds"),
+    [
+        ((), "none", []),
+        (("SessionStart",), "session-start-without-stop", ["SessionStart"]),
+        (("SessionStart", "Stop"), "stop", ["SessionStart", "Stop"]),
+        (("SessionEnd",), "no-session-start-or-stop", ["SessionEnd"]),
+    ],
+)
+def test_non_completed_triage_reports_hook_evidence_distinctly(project, primary, verdict, kinds):
+    """No events at all (a relay that never fired — #752's incident) and a
+    SessionStart that never reached Stop (a session that wedged) are different
+    faults and are journaled as different verdicts."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [failed_session_effect(primary_events=primary)] * 2,
+    )
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == verdict
+    assert diag["hook_event_kinds"] == kinds
+    assert diag["hook_event_count"] == len(primary)
+
+
+def test_non_completed_triage_on_a_hookless_adapter_reports_hooks_not_applicable(project):
+    """opencode-http observes over SSE and never writes an event channel, so an
+    empty scan says nothing about its session: the diagnostic reports hooks as not
+    applicable instead of `none`, which would blame a relay it does not use.
+
+    Ablation guard: drop the observation gate and this fails on `hook_events`."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [failed_session_effect()] * 2)
+    adapter.observation = "sse"
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "n/a (sse observation)"
+    assert "hook_event_count" not in diag
+    assert diag["artifact"] == "missing"
+    assert "hook events: n/a (sse observation)]" in engine.state.paused_reason
+
+
+def test_failed_triage_after_a_healthy_attempt_reports_only_its_own_evidence(project):
+    """Attempt 1 ran cleanly — SessionStart, Stop, a result.json on disk — but its
+    plan failed validation; attempt 2 then timed out having left nothing. The
+    diagnostic must describe attempt 2 alone: no events, no artifact. Attempt 1's
+    evidence sits in the same channels and must not mask the failure.
+
+    Ablation guard: make `signals.session_events` keep every event regardless of
+    session id and launch floor and this fails on `hook_events`."""
+    write_ledger(project, {"DW-1": "open"})
+    bad_plan = {"workflow": "deferred-sweep-triage"}
+    healthy = failed_session_effect(
+        artifact=VALID_TRIAGE,
+        primary_events=["SessionStart", "Stop"],
+        result=SessionResult(status="completed", result_json=bad_plan),
+    )
+    engine, _ = make_sweep(project, [healthy, failed_session_effect()])
+    engine.run()
+
+    first, second = _decisions(engine, "triage-decision")
+    assert first["diagnostic"] is None  # a completed session is graded, not diagnosed
+    diag = second["diagnostic"]
+    assert diag["task_id"] == "sweep-triage-triage-2"
+    assert diag["hook_events"] == "none"
+    assert diag["hook_event_count"] == 0
+    assert diag["artifact"] == "missing"
+
+
+def test_non_completed_triage_counts_legacy_channel_events_for_the_attempt(project):
+    """A project on an older installed relay writes to the legacy in-tree
+    `<run_dir>/events` (see `signals`). Its events belong to the attempt as much as
+    the primary channel's do: SessionStart on the primary and Stop on the legacy
+    channel is one attempt that DID end its turn.
+
+    Ablation guard: drop the legacy dir from the diagnostic scan and this fails."""
+    write_ledger(project, {"DW-1": "open"})
+    effect = failed_session_effect(primary_events=["SessionStart"], legacy_events=["Stop"])
+    engine, _ = make_sweep(project, [effect, effect])
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "stop"
+    assert diag["hook_event_count"] == 2
+
+
+def test_session_failure_diagnostic_degrades_to_unreadable_and_keeps_routing(project, monkeypatch):
+    """Observation may degrade, never raise: an artifact read and an event scan that
+    both fail still land a journaled decision and the ordinary escalation."""
+
+    def refuse(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(sweep_mod, "load_result_document", refuse)
+    monkeypatch.setattr(sweep_mod, "session_events", refuse)
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [SessionResult(status="timeout")] * 2)
+    engine.run()
+
+    assert engine.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert len(adapter.sessions) == 2
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["artifact"] == "unreadable: denied"
+    assert diag["hook_events"].startswith("unreadable: PermissionError")
+
+
+def test_session_failure_diagnostic_bounds_the_artifact_error(project):
+    """The journal carries an error summary, never the document: a malformed
+    artifact whose validation errors run long is cut to the diagnostic bound."""
+    write_ledger(project, {"DW-1": "open"})
+    huge = triage_result(["DW-1"], skip=[{"id": f"DW-{n}", "reason": "x"} for n in range(2, 400)])
+    engine, _ = make_sweep(project, [failed_session_effect(artifact=huge)] * 2)
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["artifact"] == "malformed"
+    assert len(diag["artifact_error"]) <= sweep_mod._DIAGNOSTIC_TEXT_LIMIT
+    assert diag["artifact_error"].endswith("…")
+
+
 def test_migration_session_env_fault_escalates_without_consuming_attempts(project):
     """A migration session whose CLI lost its API connection (#194) escalates on the
     first attempt instead of charging a migration retry; migrate-decision carries
@@ -5250,6 +5545,7 @@ def test_migration_session_env_fault_escalates_without_consuming_attempts(projec
     assert task.attempt == 1  # only the one session — no migration retry spent
     assert "environment fault: migration session timeout" in engine.state.paused_reason
     assert evidence in engine.state.paused_reason
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason  # #752
     assert len(adapter.sessions) == 1
     dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
     assert dec["env_fault"] is True
@@ -25660,6 +25956,50 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     assert "spec-superseded-dw-1.md" not in prompt
 
 
+@pytest.mark.parametrize("adopted", [["DW-1"], ["DW-2"]], ids=["same-bundle", "replacement"])
+def test_bundle_retry_prompt_never_offers_a_superseded_bundles_parked_work(
+    project, monkeypatch, adopted
+):
+    """#777: a bundle retry names the earlier attempt's verified parked work. A
+    divergent adoption keeps the superseded bundle's ref (it is still that work's
+    only copy) on the same key and baseline, so git cannot tell the bundles apart —
+    the reset's provenance clear is what stops the replacement's prompt claiming it.
+    The same bundle re-dispatched keeps its pointer.
+
+    Ablation: delete `task.preserve_from_attempt = False` from
+    `_reset_superseded_bundle_state` and the replacement case reddens."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    repo = project.project
+    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.DEV_RUNNING)
+    task.baseline_commit = verify.rev_parse_head(repo)
+    task.baseline_untracked = []
+    task.attempt = 1
+    task.record_session(
+        SessionRecord(
+            task_id=_session_task_id(task.story_key, "dev", task.attempt, task.generation),
+            role="dev",
+            status="timeout",
+        )
+    )
+    (repo / "src.txt").write_text("bundle DW-1 attempt\n")
+    engine._rollback_or_pause(task)
+    ref = task.preserve_ref
+    assert ref and ref.startswith("refs/attempt-preserve-dirty/")
+    assert f"preserved at `{ref}`" in engine._generic_bundle_prompt(task, None)
+    _stub_run_story(engine, monkeypatch)
+
+    engine._run_bundle(Bundle(name="fix", dw_ids=tuple(adopted), intent="next"), 1)
+
+    prompt = engine._generic_bundle_prompt(task, None)
+    assert task.preserve_ref == ref  # the ref itself is never cleared...
+    assert verify.ref_exists(repo, ref)  # ...nor deleted
+    if adopted == ["DW-1"]:
+        assert f"preserved at `{ref}`" in prompt
+    else:
+        assert "earlier attempt" not in prompt and ref not in prompt
+
+
 @pytest.mark.parametrize(
     "persisted", [["DW-1", "DW-2"], ["DW-2", "DW-1"]], ids=["same-order", "reordered"]
 )
@@ -32153,3 +32493,22 @@ def test_migration_forwards_lexical_symlink_identity_to_bound_publisher(project,
     assert seen == [(target.resolve(), ledger)]
     assert ledger.is_symlink()
     assert target.read_text(encoding="utf-8") == migrated_ledger()
+
+
+def test_triage_session_reads_the_ledger_load_paths_resolved(project):
+    """#769: the central TOML can move `implementation_artifacts` away from what the
+    legacy YAML still names. Triage must read the ledger the orchestrator resolved,
+    so the engine exports it; a bundle (dev) session never reads the ledger and
+    stays byte-identical.
+
+    Ablation: drop `SweepEngine._extra_session_env` and the env key is absent."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "leave it"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+
+    engine.run()
+
+    assert adapter.sessions[0].env["BMAD_LOOP_LEDGER"] == str(engine.workspace.paths.deferred_work)
+    task = next(iter(engine.state.tasks.values()))
+    assert engine._extra_session_env(task, "dev") == {}
+    assert engine._extra_session_env(task, "triage", label="wf") == {}

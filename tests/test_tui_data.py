@@ -7,11 +7,18 @@ import importlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from conftest import install_bmad_config, refuse_to_resolve, write_sprint
+import pytest
+from conftest import (
+    install_bmad_central_config,
+    install_bmad_config,
+    refuse_to_resolve,
+    write_sprint,
+)
 
-from bmad_loop import bmadconfig, deferredwork, policy
+from bmad_loop import bmadconfig, deferredwork, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
@@ -30,10 +37,19 @@ def make_run(root: Path, run_id: str, **state_kwargs) -> Path:
     return run_dir
 
 
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def dead_pid() -> int:
-    """Pid guaranteed (modulo astronomically unlikely reuse) to be dead."""
+    """Return an exited child's PID, retaining its handle to prevent Windows reuse."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
@@ -935,6 +951,90 @@ def test_active_agent_labeled_session_peels_story_key():
     assert (agent.name, agent.model) == ("codex", "gpt-5")
 
 
+def _stamped_start(task_id="1-1-alpha-dev-3"):
+    return {
+        "kind": "session-start",
+        "task_id": task_id,
+        "role": "dev",
+        "adapter": "claude",
+        "model": "opus",
+        "story_key": "1-1-alpha",
+    }
+
+
+def test_active_agent_idle_since_from_open_idle_stretch():
+    """#680: the last `session-idle` for the open session's task, not closed by a
+    later `session-active`, sets `idle_since` to its `since_ts`; the default is
+    None, so every existing construction and comparison stands.
+
+    ABLATION E: drop the `_idle_since` derivation and the first assertion reddens."""
+    entries = [
+        _stamped_start(),
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0, "idle_s": 60.0},
+    ]
+    agent = data.active_agent(entries, None)
+    assert agent is not None and agent.idle_since == 5030.0
+    assert data.active_agent([_stamped_start()], None).idle_since is None
+
+
+def test_active_agent_idle_since_cleared_by_session_active_and_session_end():
+    idle = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0}
+    active = {"kind": "session-active", "task_id": "1-1-alpha-dev-3", "idle_s": 120.0}
+    agent = data.active_agent([_stamped_start(), idle, active], None)
+    assert agent is not None and agent.idle_since is None
+    # a later stretch reopens it with its own since_ts
+    later = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5150.0}
+    agent = data.active_agent([_stamped_start(), idle, active, later], None)
+    assert agent is not None and agent.idle_since == 5150.0
+    # session-end closes the session: no agent at all
+    ended = {"kind": "session-end", "task_id": "1-1-alpha-dev-3"}
+    assert data.active_agent([_stamped_start(), idle, ended], None) is None
+
+
+def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
+    """A `session-idle` for another task, or one left behind by an EARLIER session
+    (before this session-start), is not this session's."""
+    stale = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 4000.0}
+    other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "since_ts": 5030.0}
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert agent is not None and agent.idle_since is None
+
+
+def test_active_agent_idle_since_never_raises_on_malformed_entry():
+    """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
+    text from it); the agent itself is still derived."""
+    for bad in (
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": "soon"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": None},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": True},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("nan")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("-inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 10**1000},
+    ):
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert agent is not None and agent.idle_since is None
+        agent = data.active_agent(
+            [
+                _stamped_start(),
+                {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0},
+                bad,
+            ],
+            None,
+        )
+        assert agent is not None and agent.idle_since == 5030.0
+    # an int since_ts is a number too
+    agent = data.active_agent(
+        [
+            _stamped_start(),
+            {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030},
+        ],
+        None,
+    )
+    assert agent is not None and agent.idle_since == 5030.0
+
+
 def test_active_agent_none_without_resolvable_snapshot():
     # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
     # would mislabel a run that predates stamping, so the agent is unknown.
@@ -1011,6 +1111,55 @@ def test_project_paths_uses_one_canonical_cache_key(project):
     assert data._project_paths(root) is paths
     assert root in data._paths_cache
     assert alternate_spelling not in data._paths_cache
+
+
+def _override_implementation_artifacts(project, rel: str) -> None:
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        f'[modules.bmm]\nimplementation_artifacts = "{{project-root}}/{rel}"\n',
+        encoding="utf-8",
+    )
+
+
+def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project):
+    """#769: the TOML layers outrank the legacy YAML the v6.12 installer still writes
+    beside them, so an override-layer edit must invalidate the cached snapshot.
+
+    Ablation: stat-gate on config.yaml alone and the second call serves the stale
+    artifact dir from cache.
+    """
+    install_bmad_config(project)
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    before = data._project_paths(root)
+    assert before is not None
+    assert data._project_paths(root) is before
+
+    _override_implementation_artifacts(project, "moved-impl")
+
+    after = data._project_paths(root)
+    assert after is not None
+    assert after.implementation_artifacts == root / "moved-impl"
+
+
+def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
+    """With no config.yaml there is still a source to stat-gate on: the snapshot is
+    cached (it used to be reloaded on every call) and a layer edit invalidates it."""
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
+
+    first = data._project_paths(root)
+    assert first is not None
+    assert data._paths_cache[root][1] is first
+    assert data._project_paths(root) is first
+
+    _override_implementation_artifacts(project, "moved-impl")
+
+    second = data._project_paths(root)
+    assert second is not None
+    assert second is not first
+    assert second.implementation_artifacts == root / "moved-impl"
+    assert data._paths_cache[root][1] is second
 
 
 def test_sprint_overview(project):
@@ -1318,3 +1467,22 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
     assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
     assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
     assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+    """`_stat_sig` follows links and folds every OSError into None, so a dangling
+    link created at a layer path that was absent signs exactly like the absence and
+    the cache served stale paths. `load_paths` refuses that link, so must the TUI.
+
+    Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
+    install_bmad_config(project)
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
+    layer.unlink()  # an optional layer the operator never wrote
+    assert data._project_paths(root) is not None
+    assert root in data._paths_cache
+    layer.symlink_to("missing.toml")
+
+    assert data._project_paths(root) is None

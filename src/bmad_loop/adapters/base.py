@@ -18,10 +18,16 @@ import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..model import TokenUsage
 from ..platform_util import is_link_like, safe_segment
+
+if TYPE_CHECKING:
+    # `journal.py` imports nothing from `adapters/`, so the runtime import would be
+    # cycle-free too; TYPE_CHECKING keeps the adapter seam's import graph as thin as
+    # it was (journal pulls in model + platform_util) for the annotation alone.
+    from ..journal import Journal
 
 
 class AdapterTaskDirectoryError(ValueError):
@@ -198,6 +204,14 @@ class SessionSpec:
     # resumed run is protected too — always an absolute path by the time it lands
     # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
     expected_spec: str | None = None
+    # Reasoning effort (#643), free-form because the legal names are provider- and
+    # model-specific; "" = provider default. Resolved per stage by
+    # `AdapterPolicy.resolved()` with the same client-specific inheritance as
+    # `model`. Only the opencode-http adapter has a channel for it — it rides every
+    # `prompt_async` body as `variant` — and the tmux generic family ignores it
+    # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
+    # untouched. Kept LAST so positional SessionSpec constructions stay valid.
+    effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -250,6 +264,23 @@ class SessionResult:
     # stalled/timeout/over_budget, which this flag can never accompany; add it
     # there if `crashed` ever joins that rescue set.
     session_vanished: bool = False
+    # Whether the session showed ANY sign of working before it ended on a
+    # non-completed verdict (#727). `True` when a `Stop` arrived, when the adapter
+    # has no pane log to read (opencode-http, unit fixtures — "unknown never
+    # blocks"), when the pane log changed on a tick later than
+    # `generic.FIRST_FRAME_S` after the wait loop started and before the first
+    # stall wake nudge was sent, or when the CLI's own transcript changed after
+    # its first sample / the usage sampler read a nonzero spend from it (writes a
+    # misbound pane sink cannot hide). `False` means the CLI painted at most its
+    # first frame and then sat still until the grace, the nudge and the exit: a
+    # permission dialog, a login prompt, a dead-on-arrival window. `decide_dev`
+    # PAUSEs such a session ahead of the attempt budget, the way an environment
+    # fault does, so re-arm restores the attempt instead of a fresh session being
+    # launched into the identical wall. Distinct from `stop_seen` (the hook half
+    # alone) and from `_ResultFileMixin._produced_work` (the #261 read-back gate's
+    # byte floor, which a rendered dialog clears). Default `True` so every
+    # positional construction keeps today's routing. APPENDED, never inserted.
+    produced_work: bool = True
 
 
 class CodingCLIAdapter(ABC):
@@ -257,6 +288,14 @@ class CodingCLIAdapter(ABC):
     injection: str = ""
     observation: str = ""
     state: str = ""
+    # The run's journal, attached by the engine to every adapter it owns so the
+    # adapter can record what only it can see (the #680 `session-idle` /
+    # `session-active` pair). None outside an engine — `resolve.run_session`,
+    # `probe`, unit fixtures — and every adapter-side emit is gated on it: no
+    # journal, no entry. The wait loop runs on the engine thread while the
+    # engine's own journal is quiescent, so this adds no second writer, and
+    # entries keep the engine's `log_task`/`log_pos` stamps.
+    journal: Journal | None = None
 
     @abstractmethod
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...

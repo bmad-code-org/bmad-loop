@@ -7,11 +7,107 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
+  inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
+  every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
+  sets it (#643).
+- Journal a session's idle stretches (#680). The tmux adapter stats the live transcript
+  on the heartbeat cadence, stamps `transcript_idle_s` on `heartbeat.json`, and — with
+  the engine's journal attached (`CodingCLIAdapter.journal`) — writes one `session-idle`
+  when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
+  transcript moves again; `0` disables the pair. The TUI agent line shows the open
+  stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
+
+### Changed
+
+- Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
+  invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
+  do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
+  managed registrations. `validate` warns when a hook still points to another installation.
+- Name an earlier attempt's parked work in the retry dev prompt (sprint, stories, sweep)
+  once Git confirms the ref still resolves on this task's baseline and a dev session
+  produced it; commits-only preservation is labelled, and nothing is replayed (#777).
+- Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
+
 ### Fixed
 
-- Explain that unpinned result-artifact scans search only the configured artifact
-  directories themselves, so a nested story spec no longer produces an opaque
-  `no-artifact` breadcrumb (#780).
+- Explain that unpinned result-artifact scans search only the configured artifact\n  directories themselves, so a nested story spec no longer produces an opaque\n  `no-artifact` breadcrumb (#780).
+
+- Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
+  and space-edged filenames; a resumed run's pre-fix baseline still protects the
+  files it listed; failed-unit diff capture includes them too (#783).
+
+- Run a declarative `post_story` hook from the repo root once the unit's worktree
+  is torn down, instead of failing on the removed cwd (#779).
+
+- Count `plugin-hook-error` entries in `diagnose`'s plugin-errors total (#779).
+
+- Register Windows hook commands with forward-slash paths so Git Bash no longer strips
+  their separators and stalls every session (#773); re-run `bmad-loop init` to migrate.
+  `validate` warns (`hooks.relay-stale`) while a backslash registration remains. Paths
+  with spaces remain unsupported under the PowerShell fallback.
+
+- Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling
+  back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a project whose paths
+  live only in the central TOML resolves them; refuse ambiguous, blank, non-string or
+  malformed TOML values instead of falling back; sweep triage reads the ledger the
+  orchestrator resolved (`BMAD_LOOP_LEDGER`) rather than re-deriving it from the YAML
+  (#154, #769).
+
+- Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside the
+  project, before any setup write (#771).
+
+- Parse plugin manifests in `validate` (`plugins.manifests`) without importing
+  plugin code; a malformed `plugin.toml` fails validate instead of engine start (#765).
+
+- Scope the sweep skill's `open_ids` and partition validation rules to the session's
+  triage universe, so a `--only` or `--min-severity` triage no longer lists every open
+  entry and burns a retry (#824).
+
+- Show a sweep run's effective `max_bundles`, `repeat` and `max_cycles` in text `status`,
+  labelled launch override or policy snapshot, plus its selector; unreadable or
+  tampered `sweep.json` reports `unverifiable` (#815).
+
+- Diagnose non-completed sweep triage and migration sessions: journal and escalate
+  whether `result.json` is missing, malformed or valid, and which of the attempt's
+  hook events arrived on either channel (not applicable for a hookless adapter
+  such as opencode-http); routing is unchanged (#752).
+
+- Replace stale installed relay hooks when a project moves between Windows and POSIX.
+
+- Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
+  before a live probe launches; check both relay events against Codex's read-only
+  hook discovery for the operation's directory and executable (#461).
+
+- Distinguish confirmed missing tmux-family sessions from failed window listings;
+  raise on unproven liveness failures and warn when metadata uses a sentinel (#525).
+
+- Prove ownership of an untagged control window before targeting it (#531). `ctl_window_id`
+  admitted an untagged row whenever this project merely held a run dir for the run id, and
+  `--run-id` is caller-supplied, so two projects scripting the same id each admitted the
+  _other's_ window — `a` attached to it, the return stamp landed on it, and `x` killed a live
+  orchestrator next door. An untagged row now needs the record this project's own launch
+  wrote for that exact window; with no record the lookup answers nothing rather than guessing
+  by listing order. A window minted before its record exists (a fresh `run`/`sweep`) is
+  unreachable by `a`/`x` until a relaunch records one.
+
+- Count Copilot shutdown metrics and increased Codex output-token totals as work
+  when a dev session exits before the next transcript heartbeat (#822).
+
+- Pause a dev session with no confirmed work instead of retrying into the same wall
+  (#727). `SessionResult.produced_work` is `false` when no turn ended and no
+  qualifying pane, transcript, or usage activity was observed (a permission
+  dialog, a login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
+  environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
+  resets the attempt.
+- Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias
+  of the base client (`opencode` / `opencode-http`, `claude-code-tmux` / `claude`)
+  instead of treating it as a client switch.
+- Key the `run --dry-run` launch preview on the adapter kind, not `profile.hookless`:
+  an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
+  a hookless profile of another kind shows the argv line.
 
 ## [0.12.0] — 2026-09-20
 
