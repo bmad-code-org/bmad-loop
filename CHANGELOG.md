@@ -9,6 +9,8 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- The TEA plugin now prints an operator-visible notice when a gate's artifacts can't be found or parsed and the gate fails open.
+
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
