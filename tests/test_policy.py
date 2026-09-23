@@ -76,7 +76,7 @@ def test_review_on_status_contradiction_invalid():
 
 def test_review_on_status_contradiction_retry_warns_escalate_does_not():
     # "retry" is legacy (superseded by "escalate" per #334) and slated for
-    # removal in 0.12.0 (#813); loading it must warn. The "escalate" default
+    # removal in 0.13.0 (#813); loading it must warn. The "escalate" default
     # must stay silent.
     with pytest.warns(DeprecationWarning, match="retry"):
         policy.loads('[review]\non_status_contradiction = "retry"\n')

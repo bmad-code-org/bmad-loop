@@ -252,7 +252,7 @@ class ReviewPolicy:
     #       down onto a rollback.
     #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
     #       review cycles to limits.max_review_cycles, then defer. Slated for
-    #       removal in 0.12.0 (#813); loading it now emits a DeprecationWarning.
+    #       removal in 0.13.0 (#813); loading it now emits a DeprecationWarning.
     # Keys on sprint-status only: the spec's own frontmatter status legitimately
     # cycles (in-review/in-progress) while a review patches, and `status: blocked`
     # remains the sanctioned way for a review to hand a story back to a human.
@@ -1051,7 +1051,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     if review.on_status_contradiction == "retry":
         warnings.warn(
             'review.on_status_contradiction = "retry" is legacy (superseded by '
-            '"escalate" per #334) and will be removed in 0.12.0 (#813). Switch to '
+            '"escalate" per #334) and will be removed in 0.13.0 (#813). Switch to '
             '"escalate" (the default).',
             DeprecationWarning,
             stacklevel=3,

@@ -22,6 +22,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Warn when the legacy `review.on_status_contradiction = "retry"` mode is
+  configured (#813).
 - Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
@@ -393,8 +395,6 @@ breaking changes may land in a minor release.
   per-decision toast instead of taking the dashboard down. And a sweep whose ledger
   cannot be read at a graceful stop journals `sweep-remaining-estimate-unreadable`
   next to the `run-stop` row, so a withheld estimate says why it was withheld.
-
-- bmad-loop now warns when the legacy `review.on_status_contradiction = "retry"` mode is configured.
 
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
