@@ -394,6 +394,9 @@ breaking changes may land in a minor release.
   cannot be read at a graceful stop journals `sweep-remaining-estimate-unreadable`
   next to the `run-stop` row, so a withheld estimate says why it was withheld.
 
+- bmad-loop now warns when scm.max_parallel > 1 is configured, since parallel fan-out
+  is not yet built and the value is clamped to 1.
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 
