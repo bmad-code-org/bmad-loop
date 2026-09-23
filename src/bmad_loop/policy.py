@@ -59,8 +59,8 @@ _TOML_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
 _MUX_KEY_RE = re.compile(r"^\s*#?\s*backend\s*=")
 
 # Deprecated [engine] keys, folded into [plugins.unity] at load time. The
-# game-engine layer is now a plugin; [engine] is a one-release compatibility
-# alias (see _fold_deprecated_engine).
+# game-engine layer is now a plugin; [engine] is a compatibility alias slated
+# for removal in 0.13.0 (see _fold_deprecated_engine, tracked in #810).
 _ENGINE_SETTING_KEYS = ("editor_mode", "mcp", "unity_path", "ready_timeout_sec", "ready_grace_sec")
 
 
@@ -1322,7 +1322,7 @@ def _fold_deprecated_engine(
     warnings.warn(
         "[engine] in policy.toml is deprecated; the game-engine layer is now a "
         'plugin. Use [plugins] enabled = ["unity"] with a [plugins.unity] table. '
-        "[engine] will be removed in a future release.",
+        "[engine] will be removed in 0.13.0 (tracked in #810).",
         DeprecationWarning,
         stacklevel=3,
     )

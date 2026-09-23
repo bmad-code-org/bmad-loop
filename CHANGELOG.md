@@ -22,6 +22,7 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Pinned a target version for the deprecated `[engine]` settings block (#810).
 - Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
