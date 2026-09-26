@@ -1096,6 +1096,25 @@ def test_resultless_stop_breadcrumb_scan_no_artifact(tmp_path, monkeypatch):
     assert str(impl) in crumb["detail"]  # names the searched dirs
 
 
+def test_resultless_stop_breadcrumb_explains_non_recursive_artifact_scan(tmp_path, monkeypatch):
+    """A nested result is outside the legacy scan, so the breadcrumb must say so."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+        encoding="utf-8",
+    )
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(impl) in crumb["detail"]
+    assert "subdirectories are not searched" in crumb["detail"]
+
+
 def test_resultless_stop_breadcrumb_stories_pending(tmp_path, monkeypatch):
     adapter, _ = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -5935,6 +5954,9 @@ def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "no-artifact"
     assert str(ours) in crumb["detail"]
+    assert "at:" in crumb["detail"]
+    assert "directly under" not in crumb["detail"]
+    assert "subdirectories are not searched" not in crumb["detail"]
     assert "someone-elses" not in crumb["detail"]
 
 

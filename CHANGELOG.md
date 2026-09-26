@@ -33,6 +33,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Explain that unpinned result-artifact scans search only the configured artifact\n  directories themselves, so a nested story spec no longer produces an opaque\n  `no-artifact` breadcrumb (#780).
+
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).
