@@ -1277,6 +1277,24 @@ def test_scm_max_parallel_clamped_to_one(tmp_path):
         policy.load(p)
 
 
+def test_scm_max_parallel_above_one_warns():
+    """Phase 5 parallel fan-out (#229) is unbuilt, so a configured value > 1 is
+    still silently inert without this warning -- an operator setting
+    ``max_parallel = 4`` would otherwise get no signal that it has no effect.
+
+    Ablation: delete the ``requested_parallel > 1`` warning block in ``loads()``;
+    this test fails because no warning fires while the clamp still applies."""
+    with pytest.warns(UserWarning, match=r"scm\.max_parallel"):
+        loaded = policy.loads("[scm]\nmax_parallel = 4\n")
+    assert loaded.scm.max_parallel == 1
+
+
+def test_scm_max_parallel_equal_to_one_does_not_warn(recwarn):
+    loaded = policy.loads("[scm]\nmax_parallel = 1\n")
+    assert loaded.scm.max_parallel == 1
+    assert len(recwarn) == 0
+
+
 def test_scm_preserve_keep_settings(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[scm]\npreserve_keep = 5\n")

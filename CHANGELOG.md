@@ -22,6 +22,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Warn when `scm.max_parallel > 1` is configured; keep the value clamped to 1
+  until parallel fan-out is built (#229).
 - Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
