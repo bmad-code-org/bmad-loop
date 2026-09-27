@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+import warnings
 
 import pytest
 
@@ -71,6 +72,18 @@ def test_review_on_status_contradiction_default_parse_and_template():
 def test_review_on_status_contradiction_invalid():
     with pytest.raises(policy.PolicyError, match=r"review\.on_status_contradiction"):
         policy.loads('[review]\non_status_contradiction = "defer"\n')
+
+
+def test_review_on_status_contradiction_retry_warns_escalate_does_not():
+    # "retry" is legacy (superseded by "escalate" per #334) and slated for
+    # removal in 0.13.0 (#813); loading it must warn. The "escalate" default
+    # must stay silent.
+    with pytest.warns(DeprecationWarning, match="retry"):
+        policy.loads('[review]\non_status_contradiction = "retry"\n')
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        policy.loads('[review]\non_status_contradiction = "escalate"\n')
+        policy.loads("")
 
 
 def test_stories_defaults():

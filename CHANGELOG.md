@@ -22,6 +22,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Warn when the legacy `review.on_status_contradiction = "retry"` mode is
+  configured (#813).
 - Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
