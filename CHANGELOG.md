@@ -80,6 +80,12 @@ breaking changes may land in a minor release.
 - Surface why a sprint-mode dev session found no result: `session-end` carries
   the last resultless verdict, the `no-artifact` crumb names specs found one level
   down, and `validate` warns `queue.nested-specs` on a nested spec layout (#780).
+- Resolve the Linux-only `os.setxattr`/`os.getxattr` and the POSIX-only
+  `os.O_DIRECTORY` through `getattr` after the capability gates that already
+  guard them, so pyright checking `platform_util` against the native Windows
+  type surface (`--pythonplatform Windows`, or a plain `uv run pyright` on a
+  Windows host) no longer reports them as unknown `os` attributes; a test
+  runs that check.
 
 ## [0.13.1] — 2026-10-01
 
