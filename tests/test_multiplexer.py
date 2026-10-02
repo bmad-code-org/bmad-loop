@@ -16,10 +16,10 @@ import sys
 import pytest
 from conftest import needs_strict_codec
 
+from bmad_loop import envvars
 from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.generic import GenericAdapter
-from bmad_loop import envvars
 from bmad_loop.adapters.multiplexer import (
     UNSET,
     MultiplexerError,
