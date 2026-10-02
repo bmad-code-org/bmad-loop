@@ -38,6 +38,9 @@ breaking changes may land in a minor release.
 
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
+- Prove an untagged control-session window by the pane pid recorded at launch,
+  not its reusable window id, so `a`/`x` never reach a neighbour's window after
+  an id reuse or a forged `ctl-window` record (#750).
 
 ## [0.13.1] — 2026-10-01
 

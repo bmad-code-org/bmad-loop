@@ -24,6 +24,7 @@ from pathlib import Path
 from .. import runs
 from ..adapters.multiplexer import (
     MultiplexerError,
+    TerminalMultiplexer,
     get_multiplexer,
     mux_usable,
 )
@@ -75,12 +76,25 @@ _CTL_WINDOW_FILE = "ctl-window"
 
 
 # Generous ceiling on the hint: the value is a window id (`@7`, or a
-# session-qualified `bmad-loop-ctl:@7`), and anything longer is already not one.
+# session-qualified `bmad-loop-ctl:@7`) plus, on its own line, the window's pane
+# pid (#750), and anything longer is already not one.
 _MAX_RECORD_BYTES = 256
 
 
+def _parse_ctl_record(record: str | None) -> tuple[str | None, str | None]:
+    """Split a record into `(window id, pane pid)`. The pid line is optional — a
+    record written before #750 carries the id alone — and anything that is not
+    plain ASCII digits reads as absent rather than as a pid."""
+    if record is None:
+        return None, None
+    win_id, _, pid = record.partition("\n")
+    pid = pid.strip()
+    return win_id.strip() or None, pid if pid.isascii() and pid.isdigit() else None
+
+
 def _read_ctl_window(project: Path, run_id: str) -> str | None:
-    """The window id recorded by the run's last launch, or None when there is
+    """The raw record the run's last launch wrote (window id, optionally a pane
+    pid on a second line — see _parse_ctl_record), or None when there is
     none / it cannot be read. Never raises, and that includes decoding: a torn
     record can raise UnicodeDecodeError, a ValueError rather than an OSError,
     which action_attach (no covering except at all) and _stop_run_worker (whose
@@ -251,9 +265,11 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
     return True
 
 
-def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
+def _record_ctl_window(project: Path, run_id: str, win_id: str, pane_pid: str | None) -> None:
     """Record the window a launch just minted, so ctl_window_id can prefer it
-    over an older window sharing the run id.
+    over an older window sharing the run id. The payload is `<win_id>`, plus
+    `\\n<pane_pid>` when the mint's pane pid could be read — the pid is what lets
+    ctl_window_id admit the window even if its tag write fails (#750).
 
     Best-effort on purpose. The window is already running by the time this
     writes, so a failed write must not fail the launch — the lookup degrades to
@@ -334,19 +350,20 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
     if not runs.is_run(run_dir):
         _forget_ctl_window(project, run_id)
         return
+    payload = f"{win_id}\n{pane_pid}" if pane_pid else win_id
     try:
         if DIR_FD_ANCHORED_WRITES:
             dir_fd = open_dir_confined(project, run_dir)
             if dir_fd is None:
                 return  # unconfined, or a component we cannot vouch for
             try:
-                atomic_write_text_at(dir_fd, _CTL_WINDOW_FILE, win_id)
+                atomic_write_text_at(dir_fd, _CTL_WINDOW_FILE, payload)
             finally:
                 os.close(dir_fd)
         else:
             if not _run_dir_is_confined(project, run_dir):
                 return
-            atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
+            atomic_write_text(run_dir / _CTL_WINDOW_FILE, payload, follow_symlinks=False)
     except Exception:
         _forget_ctl_window(project, run_id)
 
@@ -387,16 +404,38 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     run dir this one stopped trusting, because the pruning consumer of that
     shape is #419's and the fix is partitioned there.
 
-    An untagged row is admitted only when the record names that exact window.
-    Holding the run dir was the earlier gate, and a run dir is a coincidence
-    rather than a claim: `--run-id` is caller-supplied and deterministic, so two
-    projects scripting the same id both hold one, and each then admitted the
-    *other's* untagged window — machine-wide on tmux, where the control session
-    carries a fixed name (#531). The record is the opposite kind of fact: this
-    project wrote it, about the window its own launch minted. It survives the
-    failure this fallback exists for because start_detached records *before* it
-    tags, so a window whose (best-effort) set_window_option never landed still
-    has one.
+    An untagged row is admitted only when the record names that exact window
+    AND the pane pid recorded at mint matches the pid the listing shows for it
+    (#750). Holding the run dir was the earlier gate, and a run dir is a
+    coincidence rather than a claim: `--run-id` is caller-supplied and
+    deterministic, so two projects scripting the same id both hold one, and each
+    then admitted the *other's* untagged window — machine-wide on tmux, where the
+    control session carries a fixed name (#531). The window id alone was the
+    next gate, and an id is a reusable handle: tmux 3.4 and psmux 3.3.8 both
+    restart at `@0`/`@1` after a server restart, so a neighbour's untagged
+    window could inherit the id this project recorded — and the record sits
+    under the project root, so a session could equally write any id there. The
+    pid is the process the mint actually started, and start_detached records it
+    *before* it tags, so a window whose (best-effort) set_window_option never
+    landed is still reachable. A record without a pid (written before #750, or
+    by a mint whose pid read failed) still breaks ties among tagged rows but
+    never admits an untagged one.
+
+    The honest limit: this proves the record was written by something that saw
+    the window's pid, not that this project minted it. Anything with access to
+    the control session's multiplexer can list `pane_pid` and write a matching
+    record — and that same access lets it set the PROJECT_OPTION tag directly,
+    so the pid raises the bar to exactly the tag's and no further. What it does
+    close is the id-reuse case and a forged record that merely guesses an id.
+
+    Two residuals, both stated rather than handled. The pid is a reusable
+    handle too: after a server restart, an untagged neighbour under this run's
+    name could inherit both the recorded id AND, from the OS, the recorded pid —
+    a conjunction of two recycles that closing would need a process creation
+    identity the seam does not carry. And `pane_pid` answers the window's
+    *active* pane, so a window someone splits by hand and re-focuses fails the
+    compare; that fails closed (the untagged fallback answers None, exactly as a
+    recordless window does) and bmad-loop itself never splits the ctl window.
 
     What the proof costs is reach for a window minted before any record exists —
     a fresh `run`/`sweep`, where _record_ctl_window deliberately skips because
@@ -416,36 +455,18 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     one, and the tag is the stronger proof of the two, so untagged is consulted
     only when nothing carries this project's tag.
 
-    One residual survives, and it is a conjunction rather than a case: a backend
-    that reuses a freed window id (a supported divergence — see the id-reuse row
-    in the tests) hands the neighbour the id this project recorded, while both
-    projects script the same run id AND the neighbour's own tag write failed AND
-    the window this record named is already gone. Name and id then both match and
-    the neighbour is admitted. Closing it needs a channel that says *this window
-    is mine* rather than *an id I once minted*, and the only one available is the
-    tag — which this function must read, never write: re-tagging on read is
-    claiming, not proving, and would hand a neighbour's window this project's
-    tag. So it is left open, deliberately and visibly. Wherever `runs.is_run` still
-    holds, every condition in that conjunction was already satisfied by the gate
-    this replaces — which admitted the neighbour on the run-id collision alone,
-    with no id reuse and no dead window required — so over those states this is a
-    strict narrowing. It is not a narrowing everywhere, and the exception is the
-    residual reached from the other side: _read_ctl_window asks nothing about the
-    run dir, so an untagged row named by a readable record whose run `runs.is_run`
-    now rejects (a partial prune is one route there, not the only one) is admitted
-    here and would have been refused by the old gate — and if that recorded id has
-    since been reused by an untagged neighbour under this run's name, the row
-    admitted is the neighbour's. That is the whole of what this gate trades away.
-    Narrowing it is a mechanism question
-    — an identity channel written at mint time and read here — and this function
-    is the wrong place to decide it."""
+    Read-only throughout: this never writes the record and never touches the
+    tag — re-tagging on read is claiming, not proving, and would hand a
+    neighbour's window this project's tag."""
     if not mux_available():
         return None
     mine = runs.accepted_tags(project)
     tagged: list[str] = []
     untagged: list[str] = []
+    # pane_pid last: the base's bounded split leaves any stray tab in the final
+    # field, and a pid that does not read as digits simply fails the compare.
     rows = get_multiplexer().list_windows(
-        ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
+        ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION, "pane_pid"]
     )
     # Below the listing, above the loop. The loop needs it — it is what admits an
     # untagged row — but listing and record are two reads of a state a concurrent
@@ -458,13 +479,13 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     # carry yet — so it fails the re-prove and the answer falls back to a match
     # that was at least live when the listing was taken. `rows` is materialized
     # (list_windows returns a list), so the loop pays nothing for the move.
-    recorded = _read_ctl_window(project, run_id)
-    for win_id, name, tag in rows:
+    recorded, recorded_pid = _parse_ctl_record(_read_ctl_window(project, run_id))
+    for win_id, name, tag, pane_pid in rows:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
         # the *current* window. (The base's short-row padding CAN produce an
-        # empty *tag* — it fills trailing fields — which is exactly the untagged
-        # case below; window_id stays field 0 of 3.)
+        # empty *tag* or pid — it fills trailing fields — which is the untagged
+        # case below; window_id stays field 0 of 4.)
         if not win_id:
             continue
         # The whole run id, not a suffix of the name: RUN_ID_RE admits `-`, so
@@ -488,10 +509,15 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # unreachable by `a` and `x`, which resolve through here.
         if tag in mine:
             tagged.append(win_id)
-        elif not tag and win_id == recorded:
-            # untagged, but this project's own launch recorded this window —
-            # proof of the mint, not of the tag, so it only counts if nothing
-            # is tagged
+        elif (
+            not tag
+            and win_id == recorded
+            and recorded_pid is not None
+            and pane_pid.strip() == recorded_pid
+        ):
+            # untagged, but the record names this window and the pid its mint
+            # read — proof of the mint, not of the tag, so it only counts if
+            # nothing is tagged. A pid-less record never gets here (#750).
             untagged.append(win_id)
     matches = tagged or untagged
     if not matches:
@@ -499,10 +525,10 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     # Membership in `matches`, not mere presence in the listing: it re-checks the
     # name and the project-scoping predicates, so a record whose id is absent from
     # the scoped matches — killed, pruned, renamed onto another run, or naming a
-    # row this project cannot claim — is not replayed. Not a proof of identity: a
-    # reused id under this run's name still passes, which is the residual the
-    # docstring names. But it is what turns a stale id from a replayed target
-    # into a fallthrough.
+    # row this project cannot claim — is not replayed. Among tagged rows this is a
+    # tie-break only (the tag already proved ownership), so a pid-less record
+    # still counts here. It is what turns a stale id from a replayed target into
+    # a fallthrough.
     return recorded if recorded in matches else matches[0]
 
 
@@ -880,6 +906,22 @@ def cli_argv(*tail: str) -> list[str]:
     return [sys.executable, "-m", "bmad_loop.cli", *tail]
 
 
+def _minted_pane_pid(mux: TerminalMultiplexer, ctl: str, win_id: str) -> str | None:
+    """The pane pid of the window just minted, for the ctl-window record (#750),
+    or None when the listing does not show it or the pid is not plain digits.
+    Best-effort: the window is already running, so a failed read only costs the
+    untagged fallback in ctl_window_id, never the launch."""
+    try:
+        rows = mux.list_windows(ctl, ["window_id", "pane_pid"])
+    except MultiplexerError:
+        return None
+    for row_id, pid in rows:
+        pid = pid.strip()
+        if row_id == win_id and pid.isascii() and pid.isdigit():
+            return pid
+    return None
+
+
 def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) -> str | None:
     """Run a bmad-loop command in a new window of the control session.
 
@@ -933,7 +975,7 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
         # documented fallback in _ctl_window_candidates — so even a
         # non-conforming backend raising from the (contractually best-effort)
         # set_window_option must not cost the record.
-        _record_ctl_window(project, run_id, win_id)
+        _record_ctl_window(project, run_id, win_id, _minted_pane_pid(mux, ctl, win_id))
         # Tag the window with its project so a cleanup in another project never
         # closes it (the ctl session is shared across projects).
         mux.set_window_option(win_id, runs.PROJECT_OPTION, runs.project_tag(project))

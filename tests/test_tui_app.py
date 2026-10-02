@@ -3896,11 +3896,15 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
     rid = "20260611-100000-aaaa"
     run_dir = make_run(project_tree.project, rid, run_type="sweep", alive=True)
     Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
-    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    # id + the pane pid its mint read: an untagged row needs both (#750)
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2\n4242", encoding="utf-8")
     selected: list[str] = []
 
     def fake(argv, **kwargs):
-        out = f"@1\trun-{rid}\n@2\tresume-{rid}\n" if argv[1] == "list-windows" else ""
+        # rows as `window_id, window_name, tag, pane_pid` — the lookup's fields
+        out = (
+            f"@1\trun-{rid}\t\t11\n@2\tresume-{rid}\t\t4242\n" if argv[1] == "list-windows" else ""
+        )
         return _subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)

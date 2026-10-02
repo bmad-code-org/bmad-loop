@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import stat
@@ -31,6 +32,26 @@ from bmad_loop.tui import launch
 # tmux — so pin tmux by name (a no-op on a stock POSIX box).
 pytestmark = pytest.mark.usefixtures("force_tmux_backend")
 
+# Scripted listing rows are written positionally in this order; fakes project
+# them onto whatever fields the caller's `-F` format (or `fields`) asks for, so a
+# lookup asking for `pane_pid` sees the pid and the mint's own `window_id,
+# pane_pid` read sees it too, rather than the name in the pid slot.
+_ROW_FIELDS = ["window_id", "window_name", runs.PROJECT_OPTION, "pane_pid"]
+
+
+def _project_row(row: tuple[str, ...] | list[str], fields: list[str]) -> tuple[str, ...]:
+    cols = list(row) + [""] * (len(_ROW_FIELDS) - len(row))
+    return tuple(cols[_ROW_FIELDS.index(f)] for f in fields)
+
+
+def _project_listing(rows: str, argv: list[str]) -> str:
+    """`rows` reshaped to the fields a `list-windows -F` argv requests."""
+    fields = re.findall(r"#\{([^}]*)\}", argv[argv.index("-F") + 1])
+    return "".join(
+        "\t".join(_project_row(line.split("\t", len(_ROW_FIELDS) - 1), fields)) + "\n"
+        for line in rows.splitlines()
+    )
+
 
 class FakeRun:
     """Records argv; scripts the returncode of `tmux has-session` and the rows
@@ -50,7 +71,7 @@ class FakeRun:
         if argv[1] == "new-window":
             out = "@7\n"
         elif argv[1] == "list-windows":
-            out = self.windows
+            out = _project_listing(self.windows, argv)
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
 
     def by_verb(self, verb: str) -> list[list[str]]:
@@ -80,13 +101,14 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     nw0 = fake_run.by_verb("new-window")[0]
     assert nw0[nw0.index("-F") + 1] == "#{window_id}"
 
-    # control session was missing: has-session, new-session, new-window, then
-    # the project tag is stamped on the new window so cross-project cleanup
-    # never closes it
+    # control session was missing: has-session, new-session, new-window, the
+    # pane-pid read for the ctl-window record (#750), then the project tag is
+    # stamped on the new window so cross-project cleanup never closes it
     assert [c[1] for c in fake_run.calls] == [
         "has-session",
         "new-session",
         "new-window",
+        "list-windows",
         "set-option",
     ]
     from bmad_loop import runs
@@ -208,13 +230,15 @@ def test_existing_ctl_session_reused(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
     launch.resume_detached(tmp_path, "RID")
-    # No new-session: the ctl session already answered has-session. The trailing
-    # list-windows is resume's own check that the lookup now names the window it
+    # No new-session: the ctl session already answered has-session. The first
+    # list-windows reads the minted pane's pid for the record (#750); the
+    # trailing one is resume's own check that the lookup now names the window it
     # minted — the one launch that mints a second window under a run id pays for
     # the answer it warns on.
     assert [c[1] for c in fake.calls] == [
         "has-session",
         "new-window",
+        "list-windows",
         "set-option",
         "list-windows",
     ]
@@ -303,7 +327,7 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
-        out = rows if argv[1] == "list-windows" else ""
+        out = _project_listing(rows, argv) if argv[1] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -311,12 +335,13 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
     return calls
 
 
-def _write_record(project: Path, run_id: str, win_id: str) -> Path:
-    """Stand in for a launch having minted `win_id` for this run."""
+def _write_record(project: Path, run_id: str, win_id: str, pane_pid: str | None = None) -> Path:
+    """Stand in for a launch having minted `win_id` (with `pane_pid`, when the
+    mint could read one) for this run. No pid is the pre-#750 record shape."""
     run_dir = runs.run_dir_for(project, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     record = run_dir / launch._CTL_WINDOW_FILE
-    record.write_text(win_id, encoding="utf-8")
+    record.write_text(f"{win_id}\n{pane_pid}" if pane_pid else win_id, encoding="utf-8")
     return record
 
 
@@ -345,7 +370,8 @@ def test_ctl_window_id_requires_the_whole_run_id(monkeypatch, tmp_path: Path):
 def test_ctl_window_id_prefers_the_window_the_last_launch_minted(monkeypatch, tmp_path: Path):
     # #482: `e` over a parked run leaves `run-RID` in front of the live
     # `resume-RID`, and the scan alone answers the parked corpse. The recorded
-    # id names the window we actually created.
+    # id names the window we actually created. A pid-less (pre-#750) record on
+    # purpose: among tagged rows the record is only a tie-break, and that stays.
     _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
@@ -409,11 +435,37 @@ def test_ctl_window_id_admits_an_untagged_window_the_record_names(monkeypatch, t
     # The tag is written by a best-effort set_window_option that can fail, and a
     # window whose tag never landed must stay reachable by its own project
     # rather than by nobody. start_detached records BEFORE it tags, so the
-    # record still names the window — and a record is a claim this project
-    # wrote, where a run dir is only a coincidence of the id.
-    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    # record still names the window and the pane pid its mint read (#750).
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\t111\n", tmp_path)
     _make_run(tmp_path)  # _record_ctl_window refuses to write without one
+    _write_record(tmp_path, "RID", "@4", "111")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+
+
+def test_ctl_window_id_refuses_an_untagged_window_on_a_pidless_record(monkeypatch, tmp_path: Path):
+    # A record written before #750 (or by a mint whose pid read failed) carries
+    # the id alone, which is exactly the reusable handle — never enough to admit
+    # an untagged row. The row's own pid is present, so the refusal is about the
+    # record, not an empty listing column.
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\t111\n", tmp_path)
+    _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@4")
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
+@pytest.mark.parametrize(
+    "pid_line", ["abc", "-111", "١١١", " "], ids=["word", "sign", "arabic", "blank"]
+)
+def test_ctl_window_id_treats_a_malformed_pid_as_pidless(monkeypatch, tmp_path: Path, pid_line):
+    # A pid line that is not plain ASCII digits reads as no pid: it can still
+    # break a tie among tagged rows, but never admits an untagged one — even
+    # when the listing's pid column carries the very same malformed text.
+    _ctl_listing(monkeypatch, f"@4\tresume-RID\t\t{pid_line}\n", tmp_path)
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@4", pid_line)
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+    # Tie-break among tagged rows still honours the id.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@4\tresume-RID\n", tmp_path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@4"
 
 
@@ -456,10 +508,12 @@ def test_ctl_window_id_refuses_untagged_windows_the_record_does_not_name(
 ):
     # A record that resolves to nothing must not license the *other* untagged
     # rows: drop the per-row equality and the bucket fills by listing order, so
-    # `a` and `x` land on whatever sorted first.
-    _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\tresume-RID\t\n", tmp_path)
+    # `a` and `x` land on whatever sorted first. The recorded pid matches @1's
+    # on purpose, so the pid gate cannot mask a dropped id comparison: the id
+    # and the pid must both match the same row.
+    _ctl_listing(monkeypatch, "@1\trun-RID\t\t111\n@2\tresume-RID\t\t222\n", tmp_path)
     _make_run(tmp_path)
-    _write_record(tmp_path, "RID", "@9")  # killed, pruned, or never in this listing
+    _write_record(tmp_path, "RID", "@9", "111")  # killed, pruned, or never listed
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
@@ -475,8 +529,8 @@ def test_ctl_window_id_refuses_an_untagged_neighbour_on_a_run_id_collision(
     theirs.mkdir()
     _make_run(mine)  # the collision: both projects hold a run dir for RID
     _make_run(theirs)
-    _write_record(theirs, "RID", "@4")  # theirs minted it; its tag write failed
-    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")
+    _write_record(theirs, "RID", "@4", "111")  # theirs minted it; its tag write failed
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\t111\n")
 
     assert launch.ctl_window_id(mine, "RID") is None
 
@@ -486,24 +540,19 @@ def test_ctl_window_id_refuses_an_untagged_neighbour_on_a_run_id_collision(
     assert launch.ctl_window_id(theirs, "RID") == "@4"
 
 
-def test_ctl_window_id_admits_a_record_naming_a_window_it_never_minted(monkeypatch, tmp_path: Path):
-    # Characterization (#750), not an endorsement: the record is a claim, and it
-    # sits under the project root every coding session can write (see
-    # _read_ctl_window), so its content proves the mint only as far as it is
-    # unforgeable — which it is not. A record naming an untagged window this
-    # project never minted is admitted here, and `x` resolves through here.
-    #
-    # Not a regression, which is the whole reason it is pinned rather than
-    # fixed: the gate this replaced was `runs.is_run(run_dir_for(...))`, and
-    # anything that can write the record can equally mint the run dir — which
-    # admitted EVERY untagged row under the name, with no id to guess. Closing
-    # it needs an identity channel the session does not own (the window's pane
-    # pid, recorded at mint and re-proven here), so this test is the state that
-    # fix has to change.
-    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")  # untagged, and not ours
+def test_ctl_window_id_refuses_a_record_naming_a_window_it_never_minted(
+    monkeypatch, tmp_path: Path
+):
+    # #750: the record sits under the project root every coding session can
+    # write (see _read_ctl_window), so an id in it is a claim anyone can make —
+    # and window ids are reused after a server restart. A record naming an
+    # untagged window this project never minted carries a pid that window does
+    # not have, and `x` resolves through here, so it must answer None.
+    # Ablate the pid comparison in ctl_window_id and this answers "@4".
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\t222\n")  # untagged, and not ours
     _make_run(tmp_path)
-    _write_record(tmp_path, "RID", "@4")
-    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+    _write_record(tmp_path, "RID", "@4", "111")
+    assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
 def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
@@ -512,8 +561,8 @@ def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch,
     # this project's correctly tagged one on index — and for `x` that
     # closes the wrong window. The tag is the stronger of the two proofs, so it
     # wins.
-    _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\trun-RID\n", tmp_path)
-    _write_record(tmp_path, "RID", "@1")  # recorded: the untagged row is otherwise admitted
+    _ctl_listing(monkeypatch, "@1\trun-RID\t\t111\n@2\trun-RID\n", tmp_path)
+    _write_record(tmp_path, "RID", "@1", "111")  # recorded: the untagged row is otherwise admitted
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
@@ -758,6 +807,7 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
         def __init__(self):
             self.created = []
             self.parked = []
+            self.listed = []
 
         def has_registry_namespace(self):
             return True
@@ -772,6 +822,10 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
             self.parked.append((session, name))
             return "@7"
 
+        def list_windows(self, session, fields):
+            self.listed.append(session)  # the mint's pane-pid read (#750)
+            return []
+
         def set_window_option(self, window, option, value):
             pass
 
@@ -784,6 +838,7 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
     assert expected.startswith(runs.CTL_SESSION + "-")
     assert stub.created == [expected]
     assert stub.parked == [(expected, "run-RID")]
+    assert stub.listed == [expected]
 
 
 @pytest.mark.parametrize(
@@ -821,8 +876,39 @@ def _make_run(project: Path, run_id: str = "RID") -> Path:
 
 
 def test_start_detached_records_the_window_it_minted(fake_run, tmp_path: Path):
+    # The id and, on its own line, the pane pid the mint's listing shows for it
+    # (#750) — the pid is what later admits the window if its tag never lands.
+    fake_run.windows = "@3\trun-RID\t\t999\n@7\tresume-RID\t\t4242\n"
     run_dir = _make_run(tmp_path)
     launch.resume_detached(tmp_path, "RID")
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7\n4242"
+    # And the record it wrote admits the still-untagged window on lookup.
+    assert launch.ctl_window_id(tmp_path, "RID") == "@7"
+
+
+@pytest.mark.parametrize(
+    "windows", ["@3\tresume-RID\t\t999\n", "@7\tresume-RID\t\tnope\n"], ids=["absent", "non-digit"]
+)
+def test_start_detached_records_the_id_alone_without_a_readable_pid(
+    fake_run, tmp_path: Path, windows: str
+):
+    # Best-effort: a listing that does not show the minted window, or shows a
+    # pid that is not digits, costs the pid line — never the record or launch.
+    fake_run.windows = windows
+    run_dir = _make_run(tmp_path)
+    launch.start_resolve_detached(tmp_path, "RID")
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
+
+
+def test_start_detached_survives_a_raising_pid_read(fake_run, tmp_path: Path, monkeypatch):
+    # A backend that raises from the (best-effort) listing still gets its
+    # window recorded, id alone, and the launch still returns the id.
+    def boom(*_a, **_k):
+        raise MultiplexerError("listing unreachable")
+
+    monkeypatch.setattr(type(get_multiplexer()), "list_windows", boom)
+    run_dir = _make_run(tmp_path)
+    assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
     assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
 
 
@@ -1240,13 +1326,15 @@ def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     outside.write_text("[project]\n", encoding="utf-8")
     record = run_dir / launch._CTL_WINDOW_FILE
     record.symlink_to(outside)
+    # Untagged, so the lookup below admits @7 only through the record's pid (#750).
+    fake_run.windows = "@7\tresume-RID\t\t4242\n"
 
     assert launch.resume_detached(tmp_path, "RID") == "@7"  # the launch still succeeds
     assert outside.read_text(encoding="utf-8") == "[project]\n"  # not redirected
     # Clobbered, not refused: the record self-heals into a plain file, so the
     # next launch does not trip over a link left in place.
     assert not record.is_symlink()
-    assert record.read_text(encoding="utf-8") == "@7"
+    assert record.read_text(encoding="utf-8") == "@7\n4242"
 
 
 def _fail_the_record(monkeypatch, exc: BaseException) -> None:
@@ -1836,7 +1924,7 @@ class _NamespacedMux:
 
     def list_windows(self, session, fields):
         self.sessions.append(session)
-        return list(self._rows)
+        return [_project_row(row, fields) for row in self._rows]
 
     def list_window_ids(self, session):
         self.sessions.append(session)
