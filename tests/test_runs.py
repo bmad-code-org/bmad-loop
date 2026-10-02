@@ -2155,6 +2155,157 @@ def test_state_root_refuses_a_home_that_cannot_root_a_control_plane(monkeypatch,
         runs.state_root()
 
 
+_CASCADE_ARMS = [
+    # (platform, env spec, expected root under tmp_path or None for a refusal)
+    pytest.param(
+        "linux", {"override": "o", "XDG_STATE_HOME": "x", "HOME": "h"}, "o", id="posix-override"
+    ),
+    pytest.param("linux", {"XDG_STATE_HOME": "x", "HOME": "h"}, "x/bmad-loop", id="posix-xdg"),
+    pytest.param(
+        "linux",
+        {"XDG_STATE_HOME": "rel", "HOME": "h"},
+        "h/.local/state/bmad-loop",
+        id="posix-relative-xdg",
+    ),
+    pytest.param("linux", {"HOME": "h"}, "h/.local/state/bmad-loop", id="posix-home"),
+    pytest.param(
+        "linux", {"HOME": "h/"}, "h/.local/state/bmad-loop", id="posix-home-trailing-slash"
+    ),
+    pytest.param("linux", {"HOME": "rel"}, None, id="posix-relative-home"),
+    pytest.param("linux", {"override": "rel", "HOME": "h"}, None, id="posix-relative-override"),
+    pytest.param(
+        "win32",
+        {"override": "o", "LOCALAPPDATA": "l", "USERPROFILE": "p"},
+        "o",
+        id="win-override",
+    ),
+    pytest.param(
+        "win32", {"LOCALAPPDATA": "l", "USERPROFILE": "p"}, "l/bmad-loop/state", id="win-local"
+    ),
+    pytest.param(
+        "win32",
+        {"USERPROFILE": "p", "XDG_STATE_HOME": "x"},
+        "p/AppData/Local/bmad-loop/state",
+        id="win-profile",
+    ),
+    pytest.param("win32", {"XDG_STATE_HOME": "x", "HOME": "h"}, None, id="win-none"),
+]
+
+
+@pytest.mark.parametrize(("platform", "spec", "expected"), _CASCADE_ARMS)
+def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
+    tmp_path, monkeypatch, platform, spec, expected
+):
+    """`state_root()` is `resolve_state_root` over this process's environment
+    (#731), so on every cascade arm both must give the same, literal answer —
+    the root or the refusal. A spec value `rel` is written relative; every other
+    one is an absolute path under `tmp_path` (a trailing `/` kept as spelled).
+
+    `USERPROFILE` mirrors `HOME` on the POSIX rows, as `_fake_home` does, so a
+    faked-POSIX row means the same thing on a Windows host. HOME stays set on
+    every POSIX row, so the passwd lookup never runs and `passwd_home=None` is
+    the faithful argument."""
+    monkeypatch.setattr(runs.sys, "platform", platform)
+    for name in (envvars.STATE_DIR, "XDG_STATE_HOME", "LOCALAPPDATA", "USERPROFILE", "HOME"):
+        monkeypatch.delenv(name, raising=False)
+    env: dict[str, str] = {}
+    for key, value in spec.items():
+        name = envvars.STATE_DIR if key == "override" else key
+        if value == "rel":
+            env[name] = value
+        else:
+            env[name] = str(tmp_path / value.rstrip("/")) + ("/" if value.endswith("/") else "")
+    if platform == "linux":
+        env["USERPROFILE"] = env["HOME"]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    if expected is None:
+        with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+            runs.state_root()
+        with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+            runs.resolve_state_root(env, None)
+    else:
+        assert runs.state_root() == tmp_path / expected
+        assert runs.resolve_state_root(env, None) == tmp_path / expected
+
+
+def test_resolve_state_root_reads_the_passwd_home_only_when_home_is_absent(tmp_path, monkeypatch):
+    """The one cascade input that is not an environment variable: with `HOME`
+    absent, `expanduser("~")` falls back to the passwd entry, so the resolver
+    takes that home as an explicit argument (#731) and uses it on that arm only.
+
+    - absent HOME + a passwd home: that home's root
+    - absent HOME + no passwd entry (`None`): refused, which is what
+      `state_root()` does today when `expanduser` hands back `"~"`
+    - `HOME=""` with a passwd home given: still refused — a present HOME is used
+      as given, and an empty one folds to `/`
+
+    Ablation target: use `passwd_home` whenever HOME is falsy (`env.get("HOME")
+    or passwd_home`) and the `HOME=""` row fails, resolving the passwd root."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    passwd = str(tmp_path / "pw")
+    unusable = {"XDG_STATE_HOME": "relative"}
+
+    assert runs.resolve_state_root(unusable, passwd) == (
+        tmp_path / "pw" / ".local" / "state" / "bmad-loop"
+    )
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.resolve_state_root(unusable, None)
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.resolve_state_root({**unusable, "HOME": ""}, passwd)
+
+
+@pytest.mark.parametrize("answering", ["override", "xdg"])
+def test_state_root_skips_the_passwd_lookup_when_an_earlier_arm_answers(
+    tmp_path, monkeypatch, answering
+):
+    """With HOME absent, `expanduser` would consult passwd only once the cascade
+    reached the HOME arm; an override or a usable XDG_STATE_HOME answers first,
+    and the lookup (an NSS query, possibly a network directory) never runs.
+
+    Ablation: pass `passwd_home()` whenever HOME is absent, without
+    `needs_passwd_home`, and both rows fail on the raising stub."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "unused")
+    monkeypatch.delenv("HOME")
+    if answering == "override":
+        monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "o"))
+        expected = tmp_path / "o"
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "x"))
+        expected = tmp_path / "x" / "bmad-loop"
+
+    def no_lookup() -> str:
+        raise AssertionError("passwd consulted although an earlier arm answers")
+
+    monkeypatch.setattr(runs, "passwd_home", no_lookup)
+    assert runs.state_root() == expected
+
+
+def test_state_root_without_home_consults_the_passwd_home(tmp_path, monkeypatch):
+    """`state_root()` hands the resolver the passwd home only on the arm that
+    reads it — a POSIX env with no HOME — so the extraction keeps today's
+    `expanduser` fallback. Graded through a faked `passwd_home`, since the real
+    lookup cannot be steered from a test."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "unused")
+    monkeypatch.delenv("HOME")
+    asked: list[str] = []
+
+    def fake_passwd_home() -> str:
+        asked.append("passwd")
+        return str(tmp_path / "pw")
+
+    monkeypatch.setattr(runs, "passwd_home", fake_passwd_home)
+    assert runs.state_root() == tmp_path / "pw" / ".local" / "state" / "bmad-loop"
+    assert asked == ["passwd"]
+
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    assert runs.state_root() == tmp_path / "h" / ".local" / "state" / "bmad-loop"
+    assert asked == ["passwd"]  # HOME present: the lookup never runs
+
+
 def test_state_dir_for_is_keyed_on_project_identity_not_spelling(tmp_path, monkeypatch):
     """One project reached by two spellings must key to ONE control plane.
 

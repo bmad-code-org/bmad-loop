@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import runs
+from bmad_loop import envvars, runs
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.tui import launch
@@ -38,13 +38,31 @@ class FakeRun:
     `new-window` just minted, which is what a real backend does — and what
     ctl_window_recorded re-proves the record against."""
 
-    def __init__(self, has_session_rc: int = 1, windows: str = "@7\tresume-RID\n"):
+    def __init__(
+        self,
+        has_session_rc: int = 1,
+        windows: str = "@7\tresume-RID\n",
+        pane_env: dict[str, str] | None = None,
+        env_stderr: str | None = None,
+    ):
         self.calls: list[list[str]] = []
         self.has_session_rc = has_session_rc
         self.windows = windows
+        # What `show-environment` reports a new pane inherits (#731): this
+        # process's own env unless scripted (a server this launcher started
+        # itself); `env_stderr` fails every such query instead.
+        self.pane_env = pane_env
+        self.env_stderr = env_stderr
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if argv[1] == "show-environment":
+            if self.env_stderr is not None:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr=self.env_stderr)
+            name = argv[-1]
+            env = os.environ if self.pane_env is None else self.pane_env
+            out = f"{name}={env[name]}\n" if name in env else f"-{name}\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
         rc = self.has_session_rc if argv[1] == "has-session" else 0
         out = ""
         if argv[1] == "new-window":
@@ -55,6 +73,14 @@ class FakeRun:
 
     def by_verb(self, verb: str) -> list[list[str]]:
         return [c for c in self.calls if c[1] == verb]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_launch_warnings(monkeypatch):
+    """Launch warnings are once per process: give every test a fresh latch and
+    the default (stderr) sink, so no test's warning is consumed by another."""
+    monkeypatch.setattr(launch, "_WARNED", set())
+    monkeypatch.setattr(launch, "warn_sink", None)
 
 
 @pytest.fixture
@@ -80,17 +106,17 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     nw0 = fake_run.by_verb("new-window")[0]
     assert nw0[nw0.index("-F") + 1] == "#{window_id}"
 
-    # control session was missing: has-session, new-session, new-window, then
-    # the project tag is stamped on the new window so cross-project cleanup
-    # never closes it
+    # control session was missing: has-session, new-session, the state-root
+    # check asks what a new pane inherits for each cascade input (#731),
+    # new-window, then the project tag is stamped on the new window so
+    # cross-project cleanup never closes it
     assert [c[1] for c in fake_run.calls] == [
         "has-session",
         "new-session",
+        *["show-environment"] * len(runs.state_root_inputs()),
         "new-window",
         "set-option",
     ]
-    from bmad_loop import runs
-
     assert fake_run.by_verb("set-option")[0] == [
         "tmux",
         "set-option",
@@ -208,12 +234,14 @@ def test_existing_ctl_session_reused(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
     launch.resume_detached(tmp_path, "RID")
-    # No new-session: the ctl session already answered has-session. The trailing
+    # No new-session: the ctl session already answered has-session. A reused
+    # session is still asked what its new panes inherit (#731). The trailing
     # list-windows is resume's own check that the lookup now names the window it
     # minted — the one launch that mints a second window under a run id pays for
     # the answer it warns on.
     assert [c[1] for c in fake.calls] == [
         "has-session",
+        *["show-environment"] * len(runs.state_root_inputs()),
         "new-window",
         "set-option",
         "list-windows",
@@ -2244,3 +2272,199 @@ def test_run_captured_streams_real_subprocess():
     assert rc == 0
     assert "bmad-loop" in out
     assert err == ""
+
+
+# ------------------------------------------- stale state-root warning (#731)
+
+
+def _posix_env(monkeypatch, **env: str) -> dict[str, str]:
+    """Fake the POSIX cascade and set exactly ``env`` among its inputs for this
+    process, the launcher. Returns ``env`` for scripting a pane alike."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    for name in runs.state_root_inputs():
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return env
+
+
+def _launch_against(monkeypatch, tmp_path: Path, fake: FakeRun) -> list[str]:
+    """Launch a run against ``fake``; returns what reached the warn sink."""
+    warned: list[str] = []
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(launch, "warn_sink", warned.append)
+    launch.start_run_detached(tmp_path, "RID")
+    assert fake.by_verb("new-window"), "the warning must never block the launch"
+    return warned
+
+
+@pytest.mark.parametrize("reuse", [True, False], ids=["reused", "created"])
+def test_stale_server_root_warns_once_after_either_arm(monkeypatch, tmp_path: Path, reuse):
+    """A server started under another root hands every new pane that root —
+    on a reused control session AND on one created just now, since a new
+    session on a stale server inherits its global env too. One warning names
+    both roots and the remedy, through the sink, once per process; the launch
+    goes ahead.
+
+    Ablation: drop the `_warn_if_stale_state_root` call from
+    `_ensure_ctl_session` and both rows fail on the empty sink."""
+    home = str(tmp_path / "home")
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2"), "HOME": home})
+    pane = {envvars.STATE_DIR: str(tmp_path / "s1"), "HOME": home}
+    fake = FakeRun(has_session_rc=0 if reuse else 1, pane_env=pane)
+
+    warned = _launch_against(monkeypatch, tmp_path, fake)
+    assert len(warned) == 1
+    assert str(tmp_path / "s1") in warned[0] and str(tmp_path / "s2") in warned[0]
+    assert f"tmux set-environment -t ={runs.CTL_SESSION} BMAD_LOOP_STATE_DIR" in warned[0]
+
+    queries = len(fake.by_verb("show-environment"))
+    launch.start_run_detached(tmp_path, "RID2")
+    assert len(warned) == 1  # once per process
+    assert len(fake.by_verb("show-environment")) == queries  # and no re-asking
+
+
+def test_warns_when_only_xdg_state_home_differs(monkeypatch, tmp_path: Path):
+    """Neither side sets the override, but the pane's default cascade still
+    lands elsewhere: the comparison is of resolved roots, from every input."""
+    home = str(tmp_path / "home")
+    _posix_env(monkeypatch, XDG_STATE_HOME=str(tmp_path / "x2"), HOME=home)
+    pane = {"XDG_STATE_HOME": str(tmp_path / "x1"), "HOME": home}
+
+    warned = _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane))
+    assert len(warned) == 1 and str(tmp_path / "x1" / "bmad-loop") in warned[0]
+
+
+def test_silent_when_an_override_names_the_default_root(monkeypatch, tmp_path: Path):
+    """An override that names exactly the root the pane's default reaches is
+    the same root: equal resolutions never warn, whichever inputs made them.
+
+    Ablation: compare the raw override values instead of resolved roots and
+    this warns."""
+    xdg = str(tmp_path / "xdg")
+    _posix_env(
+        monkeypatch,
+        **{envvars.STATE_DIR: str(tmp_path / "xdg" / "bmad-loop"), "XDG_STATE_HOME": xdg},
+    )
+    pane = {"XDG_STATE_HOME": xdg}
+
+    assert _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane)) == []
+
+
+def test_warns_when_the_pane_value_is_relative(monkeypatch, tmp_path: Path):
+    """A relative inherited override is refused by the pane's own resolution,
+    so the pane cannot land on the launcher's root: a mismatch, not a crash."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2")})
+    pane = {envvars.STATE_DIR: "relative/state"}
+
+    warned = _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane))
+    assert len(warned) == 1 and "no usable state root" in warned[0]
+
+
+def test_unknown_is_silent_but_a_query_fault_is_reported(monkeypatch, tmp_path: Path):
+    """A failed query makes the comparison unknown: no mismatch is claimed,
+    but the fault itself reaches the sink rather than vanishing into silence.
+
+    Ablation: drop the `on_fault=fault` argument in `_warn_if_stale_state_root`
+    and the sink is empty."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2")})
+    fake = FakeRun(env_stderr="no server running on /tmp/tmux-1000/default\n")
+
+    warned = _launch_against(monkeypatch, tmp_path, fake)
+    assert len(warned) == 1
+    assert "no server running" in warned[0] and "would resolve" not in warned[0]
+
+
+def test_an_underivable_launcher_root_is_reported_and_still_launches(monkeypatch, tmp_path: Path):
+    """With no root of its own there is nothing to compare: say so through the
+    sink, raise nothing, and launch anyway — refusing is not this check's job."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: "relative/state"})
+
+    warned = _launch_against(monkeypatch, tmp_path, FakeRun())
+    assert len(warned) == 1 and envvars.STATE_DIR in warned[0]
+
+
+def test_without_a_sink_the_warning_goes_to_stderr(monkeypatch, tmp_path: Path, capsys):
+    """The CLI-side default: no sink installed means a `warning:` line."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2")})
+    pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
+    monkeypatch.setattr(tmux_base.subprocess, "run", FakeRun(pane_env=pane))
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    launch.start_run_detached(tmp_path, "RID")
+    assert "warning: new windows in" in capsys.readouterr().err
+
+
+def test_an_out_of_tree_backend_goes_through_both_arms_silently(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """A backend implementing only the released abstract set inherits the
+    Unknown default: `_ensure_ctl_session` completes on the create arm and on
+    the reuse arm, and nothing is warned on either channel."""
+    from test_multiplexer import StubMux
+
+    stub = StubMux()
+    warned: list[str] = []
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: stub)
+    monkeypatch.setattr(launch, "warn_sink", warned.append)
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2")})
+
+    name = launch._ensure_ctl_session(tmp_path)  # create
+    assert launch._ensure_ctl_session(tmp_path) == name  # reuse
+    assert stub.calls == ["has_session", "new_session", "has_session"]
+    assert stub.inherited_env(name, "HOME") is None
+    assert warned == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("pane_home", "warns"),
+    [pytest.param(None, False, id="unset-takes-passwd"), pytest.param("", True, id="empty")],
+)
+def test_pane_home_unset_and_empty_are_different_inputs(
+    monkeypatch, tmp_path: Path, pane_home, warns
+):
+    """An inherited HOME confirmed absent takes the passwd fallback, exactly as
+    the launcher's own absent HOME does — the same root, silent. An inherited
+    `HOME=""` is present and folds to `/`, which no cascade accepts — a mismatch.
+    Folding the two would hide the second.
+
+    Ablation: keep only truthy answers in the pane mapping (`if value:`) and the
+    `empty` row stops warning."""
+    _posix_env(monkeypatch)  # the launcher: no override, no XDG, no HOME
+    monkeypatch.setattr(runs, "passwd_home", lambda: str(tmp_path / "pw"))
+    pane = {} if pane_home is None else {"HOME": pane_home}
+
+    warned = _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane))
+    assert len(warned) == int(warns)
+    if warns:
+        assert "no usable state root" in warned[0]
+
+
+def test_the_comparison_skips_the_passwd_lookup_it_does_not_need(monkeypatch, tmp_path: Path):
+    """Both sides resolve from an override, so neither needs the passwd entry,
+    and the comparison does not look it up."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s")})
+
+    def no_lookup() -> str:
+        raise AssertionError("passwd consulted although no side needs it")
+
+    monkeypatch.setattr(runs, "passwd_home", no_lookup)
+    assert _launch_against(monkeypatch, tmp_path, FakeRun()) == []
+
+
+def test_the_remedy_commands_carry_the_root_through_a_shell_intact(monkeypatch, tmp_path: Path):
+    """The remedy is meant to be pasted into a shell, so a root with a space and
+    an apostrophe must survive as one word in both commands.
+
+    Ablation: interpolate `own` unquoted and both splits break the root apart."""
+    own = str(tmp_path / "o'brien state")
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: own})
+    pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
+
+    (warning,) = _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane))
+    set_env = warning[warning.index("tmux set-environment") : warning.index(" (add -g")]
+    assert shlex.split(set_env)[-2:] == [envvars.STATE_DIR, own]
+    export = warning[warning.index("export ") : warning.index(", or recreating")]
+    assert shlex.split(export) == ["export", f"{envvars.STATE_DIR}={own}"]

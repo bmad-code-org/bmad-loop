@@ -36,6 +36,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Warn once in the TUI when its tmux control session would hand new windows a
+  different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
+  `tmux set-environment` remedy, instead of letting the run read as gone (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 
