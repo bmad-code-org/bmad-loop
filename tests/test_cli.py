@@ -17501,6 +17501,56 @@ def test_main_stays_quiet_when_it_overrode_nothing(
     assert capsys.readouterr().err == ""
 
 
+def test_main_honours_an_operators_registry_on_the_policy_opt_in(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
+    """The seam half of #729: `_configure_mux` reads `[mux]
+    honor_ambient_psmux_data_dir` from the project's policy.toml and hands it to
+    the export, so the handler runs in the operator's registry — and says
+    nothing, because that is what the operator asked for.
+
+    Ablate the `honor_ambient=` argument in `_configure_mux` and the handler
+    sees the derived root."""
+    theirs = str(tmp_path / "their-own-registry")
+    (tmp_path / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / cli.POLICY_FILE).write_text(
+        "[mux]\nhonor_ambient_psmux_data_dir = true\n", encoding="utf-8"
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    seen = {}
+
+    def handler(args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == theirs
+    assert capsys.readouterr().err == ""
+
+
+def test_mux_says_when_the_registry_was_honoured(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
+    """`bmad-loop mux` names which source won, and on the opt-in that is the
+    operator's own value — with the derived root beside it, so turning the flag
+    off is not a guess about where sessions will go.
+
+    Ablate the honoured arm in `_print_registry` and this reads as the degrade
+    message instead."""
+    theirs = str(tmp_path / "their-own-registry")
+    (tmp_path / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / cli.POLICY_FILE).write_text(
+        "[mux]\nhonor_ambient_psmux_data_dir = true\n", encoding="utf-8"
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"registry: {theirs} (your own ${runs.PSMUX_DATA_DIR}, honoured" in out
+    assert str(runs.mux_registry_root(tmp_path)) in out
+
+
 def test_main_warns_when_it_has_no_registry_of_its_own(
     force_psmux_backend, tmp_path, capsys, monkeypatch
 ):

@@ -7144,6 +7144,165 @@ def test_export_psmux_registry_root_converges_a_pane_child_that_moves_the_state_
     assert child == clean == clean_pinned == str(runs.mux_registry_root(tmp_path))
 
 
+# An absolute path that is not a derived root, spelled for the host OS.
+_PIN = os.path.abspath(os.path.join(os.sep, "operator", "pin"))
+
+
+@pytest.mark.parametrize(
+    ("ambient", "honor", "expected"),
+    [
+        (None, False, "derived"),
+        (None, True, "derived"),
+        (_PIN, False, "derived"),
+        (_PIN, True, "ambient"),
+        ("", True, "derived"),
+        ("relative/root", True, "derived"),
+        (".", True, "derived"),
+        (
+            os.path.join(os.path.dirname(_PIN), "0123456789abcdef", runs.MUX_REGISTRY_DIR),
+            True,
+            "derived",
+        ),
+        (os.path.join(os.path.dirname(_PIN), runs.MUX_REGISTRY_DIR), True, "ambient"),
+        ("\\registry", True, "derived"),  # rooted but drive-relative on Windows
+    ],
+)
+def test_resolve_psmux_registry_root(ambient, honor, expected):
+    """The whole decision, as a table. Honoured only on the opt-in AND an
+    absolute value that is not shaped like a derived root
+    (`<16-hex project tag>/_mux`); everything else derives. An operator's own
+    directory merely named `_mux` is still theirs.
+
+    Ablate any one conjunct in `resolve_psmux_registry_root` and a row fails:
+    the flag (row 3), absoluteness (rows 5-7, and on Windows the
+    drive-relative row 10, which `os.path.isabs` accepts below 3.13), the
+    derived-root exclusion (row 8), its tag-shape narrowing (row 9)."""
+    derived = os.path.abspath(os.path.join(os.sep, "state", "proj", runs.MUX_REGISTRY_DIR))
+    got = runs.resolve_psmux_registry_root(derived, ambient, honor_ambient=honor)
+    assert got == (ambient if expected == "ambient" else derived)
+
+
+@pytest.mark.parametrize("honor", [False, True])
+def test_the_policy_flag_closes_the_horn_it_names(tmp_path, monkeypatch, honor):
+    """#729's measured table, one row per process, for both settings of the flag.
+
+    The outer process runs under S1 with the pin R in its environment; the pane
+    child inherits what the outer exported and moves to S2. The flag is the
+    operator saying which kind of pin R is, so it names the clean process the
+    child has to agree with:
+
+    - off — a *transient* pin, typed into one shell: a clean S2 process has no
+      pin and derives D2;
+    - on — a *persistent* pin, exported by the profile: a clean S2 process
+      carries R and honours it.
+
+    Ablate the flag (always derive, or always honour) and one parametrization
+    fails."""
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    d1 = str(runs.mux_registry_root(tmp_path))
+    outer = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    # the pane child: carries whatever the outer exported, now under S2
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    child = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    monkeypatch.delenv("TMUX", raising=False)
+    if honor:  # persistent horn: a clean S2 process WITH the profile pin
+        monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    else:  # transient horn: a clean S2 process with NO pin
+        monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    clean = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    d2 = str(runs.mux_registry_root(tmp_path))
+    assert outer == (pinned if honor else d1)
+    assert child == clean == (pinned if honor else d2)
+
+
+def test_honouring_never_adopts_an_inherited_derived_root(tmp_path, monkeypatch):
+    """With the flag on and no pin at all, the outer process derives D1 and
+    exports it, so every pane child inherits D1 — which is not the operator's
+    pin and must not be honoured as one. A child moved to S2, or one run for
+    another project, re-derives exactly as a clean process does.
+
+    Ablate the derived-root exclusion in `resolve_psmux_registry_root` and both
+    asserts fail."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    d1 = runs.export_psmux_registry_root(tmp_path, honor_ambient=True)
+    assert d1 == str(runs.mux_registry_root(tmp_path))
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == str(
+        runs.mux_registry_root(tmp_path)
+    )
+
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, d1)
+    assert runs.export_psmux_registry_root(other, honor_ambient=True) == str(
+        runs.mux_registry_root(other)
+    )
+
+
+@pytest.mark.parametrize("ambient", ["", "relative/root", "."])
+def test_honouring_still_overrides_a_value_psmux_would_panic_on(tmp_path, monkeypatch, ambient):
+    """The flag honours a pin, not a typo: a relative or empty value is replaced
+    by the derived root exactly as with the flag off, so `PsmuxMultiplexer._run`'s
+    refusal stays reserved for the degrade arm it was written for.
+
+    Ablate the `os.path.isabs` conjunct in `resolve_psmux_registry_root` and
+    this fails."""
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
+    derived = str(runs.mux_registry_root(tmp_path))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == derived
+    assert os.environ[runs.PSMUX_DATA_DIR] == derived
+
+
+def test_ctl_session_for_follows_an_honoured_registry(tmp_path, monkeypatch):
+    """psmux's duplicate-server mutex is keyed on the session name alone, so the
+    control session in an honoured registry must not reuse the name the derived
+    registry's one holds: turning the opt-in on while the old control session
+    lives would otherwise make every TUI launch fail. With the derived root
+    settled, the name is unchanged.
+
+    Ablate the honoured-root arm in `ctl_session_for` and the first assert
+    fails."""
+    derived = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
+    as_derived = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "pinned"))
+    as_honoured = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, os.path.join(derived, "..", runs.MUX_REGISTRY_DIR))
+    respelled = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR)
+    unset = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+
+    assert as_honoured != as_derived
+    assert as_derived == unset == respelled
+    assert runs.is_ctl_session_name(as_honoured)
+
+
+def test_honouring_hands_the_derived_root_to_the_sweep(tmp_path, monkeypatch):
+    """Turning the flag on moves the registry from the derived root to the pin,
+    and sessions started before the switch are still in the derived one. It is
+    the displaced root now, so cleanup's tag-scoped legacy pass reaches it.
+
+    Ablate the `displaced = derived` arm in `export_psmux_registry_root` and
+    nothing is recorded."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == pinned
+    assert os.environ[runs.PSMUX_DATA_DIR] == pinned
+    assert psmux_backend._DISPLACED_ROOT == str(runs.mux_registry_root(tmp_path))
+
+
 def test_pinned_state_env_resolves_rather_than_forwards(tmp_path, monkeypatch):
     """What travels is the answer this process reached, not the override it was
     handed. Forwarding only when the operator set something leaves the common case

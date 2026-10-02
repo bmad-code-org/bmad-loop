@@ -88,6 +88,9 @@ MUX_REGISTRY_DIR = "_mux"
 # selection, which probes a subprocess, so it cannot be routed through a backend
 # instance. See `export_psmux_registry_root`.
 PSMUX_DATA_DIR = "PSMUX_DATA_DIR"
+# What `project_tag` returns: the parent directory name of every derived
+# registry root. See `resolve_psmux_registry_root`.
+_PROJECT_TAG_RE = re.compile(r"[0-9a-f]{16}")
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
 PID_FILE = "engine.pid"
@@ -603,7 +606,48 @@ def mux_registry_root(project: Path) -> Path:
     return project_state_root(project) / MUX_REGISTRY_DIR
 
 
-def export_psmux_registry_root(project: Path) -> str | None:
+def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambient: bool) -> str:
+    """The registry root a process settles on: ``derived`` unless the operator
+    opted in (``[mux] honor_ambient_psmux_data_dir``) AND ``ambient`` is a value
+    worth honouring. Pure, so every process given one project, one policy file
+    and one environment reaches one answer — the outer process and a pane child
+    alike, which is what closes both horns of #729:
+
+    - **Transient pin** (typed into one shell): leave the flag off. Everything
+      derives, a pane child included, so a clean process without the pin finds
+      the session.
+    - **Persistent pin** (a profile exports it into every shell): turn it on.
+      The outer process honours the pin and exports it, a pane child inherits
+      and honours it, and a clean process carrying the profile pin honours it
+      too.
+
+    Whether the pin is persistent is not in the environment; the flag is the
+    operator saying so, from a per-project file both processes read. It is a
+    *whether* and never a *where*: ``policy.toml`` is written by the sessions
+    this orchestrator drives, so a policy-sourced path would let a driven
+    session aim the cleanup path's kills at a registry of its choosing.
+
+    Not honoured, even with the flag on:
+
+    - an empty or relative value — psmux panics on it, and no shell-relative
+      path can be one registry for two processes. ``Path.is_absolute`` and not
+      ``os.path.isabs``: below 3.13 the latter accepts a drive-relative
+      ``\\registry`` on Windows, which psmux rejects;
+    - a value shaped like a bmad-loop-derived root,
+      ``<project tag>/``:data:`MUX_REGISTRY_DIR`. That is what an outer process
+      exports when it derived, and a pane child inheriting it must not mistake
+      it for a pin: a child moved to another state root or another
+      ``--project`` re-derives, exactly as a clean process with no pin does.
+    """
+    if not (honor_ambient and ambient and Path(ambient).is_absolute()):
+        return derived
+    pin = Path(ambient)
+    if pin.name == MUX_REGISTRY_DIR and _PROJECT_TAG_RE.fullmatch(pin.parent.name):
+        return derived
+    return ambient
+
+
+def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) -> str | None:
     """Point this process — and everything it spawns — at ``project``'s registry
     by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or
     ``None`` when no root could be derived.
@@ -616,17 +660,19 @@ def export_psmux_registry_root(project: Path) -> str | None:
     unreadable registry as ``False`` / ``[]`` — a live run reading itself as gone.
     One export ahead of dispatch covers every verb in-process.
 
-    **The root is always derived, and an ambient value never changes it.** That
-    is the whole rule, and the absence of an exception is the point:
-    :func:`mux_registry_root` is a pure function of (project, state root), so any
-    two bmad-loop processes given the same project and the same state root agree
-    — which is the entire property #537 exists to establish. A value already in
-    the environment is *overridden*, and the caller says so
+    **The root is derived, and an ambient value does not change it by
+    default.** :func:`mux_registry_root` is a pure function of (project, state
+    root), so any two bmad-loop processes given the same project and the same
+    state root agree — which is the entire property #537 exists to establish. A
+    value already in the environment is *overridden*, and the caller says so
     (:func:`cli._configure_mux` reports it once on stderr; ``bmad-loop mux``
-    discloses it).
+    discloses it). The one exception is an operator's stated preference,
+    ``honor_ambient`` (policy ``[mux] honor_ambient_psmux_data_dir``), decided
+    by :func:`resolve_psmux_registry_root` — see there for why a boolean and
+    not a path, and which values it still refuses to honour.
 
-    **Why an operator's own ``PSMUX_DATA_DIR`` is not honoured**, since honouring
-    it is the obvious kindness and it was tried:
+    **Why an operator's own ``PSMUX_DATA_DIR`` is not honoured by default**,
+    since honouring it is the obvious kindness and it was tried:
 
     - It would make the registry a function of the launch *shell*. A TUI started
       from the Start menu carries no profile environment and derives; a run
@@ -665,11 +711,10 @@ def export_psmux_registry_root(project: Path) -> str | None:
     Without that the override would strand exactly the sessions it displaced,
     with cleanup reporting a clean machine.
 
-    Wanting one registry to serve both is a real request and is deliberately not
-    answered here. It needs a stated operator preference rather than a guess at
-    one — and it must be a policy *whether*, never a *where*: ``policy.toml`` is
-    written by the sessions this orchestrator drives, so a policy-sourced root
-    would let a driven session choose which registry the cleanup path kills in.
+    Wanting one registry to serve both is answered by that stated preference
+    rather than a guess at one (#729). Honouring displaces the derived root
+    instead, and it is handed to the same sweep: sessions started before the
+    flag was turned on live there.
 
     **No ``BMAD_LOOP_*`` knob for the root either.** It is derived state, not
     configuration; ``BMAD_LOOP_STATE_DIR`` already relocates it transitively —
@@ -702,6 +747,13 @@ def export_psmux_registry_root(project: Path) -> str | None:
         # value psmux would panic on.
         return None
     displaced = os.environ.get(PSMUX_DATA_DIR)
+    derived = root
+    root = resolve_psmux_registry_root(derived, displaced, honor_ambient=honor_ambient)
+    if root != derived:
+        # Honoured: what is displaced now is the derived root, which holds any
+        # session started before the operator turned the flag on. Same sweep,
+        # same reason as the override arm below.
+        displaced = derived
     os.environ[PSMUX_DATA_DIR] = root
     if displaced is not None and displaced != root:
         # The variable is now gone, and it was the only record of where a
@@ -1413,6 +1465,11 @@ def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> st
     state root spelled in two such casings of the same non-ASCII name stays
     split, as it is for every other digest of an operator-supplied path.
 
+    When the operator's own root is honoured (``[mux]
+    honor_ambient_psmux_data_dir``), that settled root is digested alongside
+    the derived one: the name stays per project, and changes with the
+    registry it lives in.
+
     The degrade arm (namespaced transport, underivable state root) answers
     the fixed name: that arm runs on the transport's shared default registry,
     where a shared session scoped by per-window project tags is the correct,
@@ -1423,7 +1480,20 @@ def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> st
     if not mux.has_registry_namespace():
         return CTL_SESSION
     try:
-        scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+        derived = mux_registry_root(project)
+        scope = os.path.normcase(str(derived.resolve()))
+        # An honoured operator root (#729) is a different physical registry, so
+        # it gets a different name — or turning the opt-in on would mint the
+        # same name in the new registry while the old one's control session
+        # still holds psmux's mutex. Not honoured, the export settled the
+        # derived root and the name is byte-identical to before. Compared as
+        # identities, resolved and case-folded like `scope`, so another spelling
+        # of the derived registry is still that registry.
+        settled = os.environ.get(PSMUX_DATA_DIR)
+        if settled and Path(settled).is_absolute():
+            pinned = os.path.normcase(str(Path(settled).resolve()))
+            if pinned != scope:
+                scope += "\0" + pinned
     except (StateRootError, OSError, RuntimeError):
         return CTL_SESSION
     return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
@@ -1670,7 +1740,10 @@ def _registry_proves_ownership(project: Path) -> bool:
     ``PSMUX_DATA_DIR`` it found in force, and psmux honours any absolute value
     (``src/paths.rs``, source-read at v3.3.8) — so on that arm every verb,
     including the kill, addresses the operator's own registry while this project's
-    run dirs go on looking like ownership.
+    run dirs go on looking like ownership. The operator's opt-in
+    (``[mux] honor_ambient_psmux_data_dir``) puts every verb in their registry
+    on purpose, and it is just as shared: it misses the derived root, so the tag
+    is demanded there too.
 
     ``registry_root()`` answering ``None`` covers two cases, and they get
     **opposite** answers — conflating them was a defect, not caution. A backend
@@ -1734,8 +1807,8 @@ def prune_sessions(
     :func:`prunable_sessions`' untagged run-dir fallback is evidence only where
     the registry has already restricted the listing to this project. A legacy
     registry is shared by every project by definition; the primary one is shared
-    whenever the derivation failed — an ambient ``PSMUX_DATA_DIR`` left in
-    force, or nothing in force at all, where a namespacing backend runs on its
+    whenever the derivation failed or the operator opted into their own root — an
+    ambient ``PSMUX_DATA_DIR`` left or honoured in force, or nothing in force at all, where a namespacing backend runs on its
     own shared default registry. What that strictness leaves standing in a
     legacy registry is reported
     by :func:`legacy_registry_leftovers`, which the cleanup frontends print: a
