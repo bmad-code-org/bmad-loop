@@ -527,7 +527,69 @@ def state_root() -> Path:
     silent — a control plane at the cwd, or at ``/``, that the *next* process to
     ask resolves somewhere else.
     """
-    override = envvars.state_dir()
+    return resolve_state_root(os.environ, passwd_home() if needs_passwd_home(os.environ) else None)
+
+
+def needs_passwd_home(env: Mapping[str, str]) -> bool:
+    """Whether :func:`resolve_state_root` over ``env`` reaches the passwd
+    fallback: the POSIX cascade with no override, no usable
+    ``XDG_STATE_HOME`` and no ``HOME`` — the one arm where
+    ``os.path.expanduser("~")`` consults the passwd database. Callers ask before
+    looking it up, so the lookup (an NSS query, possibly a network directory)
+    runs exactly where it did before the cascade was extracted, and nowhere
+    else."""
+    return (
+        sys.platform != "win32"
+        and not envvars.state_dir(env)
+        and _state_base(env.get("XDG_STATE_HOME")) is None
+        and "HOME" not in env
+    )
+
+
+def state_root_inputs() -> tuple[str, ...]:
+    """The environment variables :func:`resolve_state_root` reads on this
+    platform, in cascade order. A process that wants to know which root
+    *another* process would resolve (a multiplexer pane, #731) asks for exactly
+    these and nothing else."""
+    if sys.platform == "win32":
+        return (envvars.STATE_DIR, "LOCALAPPDATA", "USERPROFILE")
+    return (envvars.STATE_DIR, "XDG_STATE_HOME", "HOME")
+
+
+def passwd_home() -> str | None:
+    """The current user's passwd home directory, or ``None`` when there is no
+    passwd database (Windows) or no entry for this uid. It is the one input of
+    the POSIX cascade that is not in the environment: ``os.path.expanduser``
+    falls back to it when ``HOME`` is absent."""
+    if sys.platform == "win32":
+        return None
+    try:
+        import pwd
+    except ImportError:  # posixpath.expanduser's own guard: no passwd database
+        return None
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:  # no entry for this uid (bpo-10496)
+        return None
+
+
+def resolve_state_root(env: Mapping[str, str], passwd_home: str | None) -> Path:
+    """The state root a process with environment ``env`` resolves: the
+    :func:`state_root` cascade over an explicit mapping, so the answer can be
+    computed for an environment other than this process's (a multiplexer pane
+    inheriting a server's env, #731). :func:`state_root` is this function over
+    ``os.environ``; the rules and their reasons are documented there.
+
+    ``passwd_home`` is the passwd entry's home directory, the one cascade input
+    that is not an environment variable, and ``None`` when there is no entry.
+    It is used only when ``HOME`` is **absent** from ``env``, which is
+    ``posixpath.expanduser``'s rule: a present ``HOME``, empty included, is
+    taken as given (an empty one folds to ``/``, which :func:`_state_base`
+    rejects), and an absent one with no passwd entry leaves ``~`` unexpanded,
+    which is relative and rejected the same way. The win32 arm never reads it.
+
+    Raises :class:`StateRootError` when no candidate answers."""
+    override = envvars.state_dir(env)
     if override:
         # `os.path.isabs` on the raw string, matching `_state_base` exactly rather
         # than `Path.is_absolute` — the rule and its reason are stated there.
@@ -541,17 +603,20 @@ def state_root() -> Path:
             )
         return Path(override)
     if sys.platform == "win32":
-        local = _state_base(os.environ.get("LOCALAPPDATA"))
+        local = _state_base(env.get("LOCALAPPDATA"))
         if local:
             return local / "bmad-loop" / "state"
-        profile = _state_base(os.environ.get("USERPROFILE"))
+        profile = _state_base(env.get("USERPROFILE"))
         if profile:
             return profile / "AppData" / "Local" / "bmad-loop" / "state"
     else:
-        xdg = _state_base(os.environ.get("XDG_STATE_HOME"))
+        xdg = _state_base(env.get("XDG_STATE_HOME"))
         if xdg:
             return xdg / "bmad-loop"
-        home = _state_base(os.path.expanduser("~"))
+        raw = env["HOME"] if "HOME" in env else passwd_home
+        # posixpath.expanduser's fold: trailing separators stripped, and an
+        # empty result is the root. No home at all leaves "~", which is relative.
+        home = _state_base("~" if raw is None else raw.rstrip("/") or "/")
         if home:
             return home / ".local" / "state" / "bmad-loop"
     raise StateRootError(
@@ -6788,7 +6853,7 @@ def rearm_event_notice(
                 f"the recorded spec for this story ({spec}) could not be re-opened to "
                 f"`{status}` — it is not a readable file from here{mount}, so the "
                 "re-drive reads that same path and finds no spec there to route on",
-                f"Restore the recorded spec path{_redrive_status_clause(entry)} before " "resuming",
+                f"Restore the recorded spec path{_redrive_status_clause(entry)} before resuming",
             )
         # No next_step, and deliberately: on this leg there is nothing to do to THIS
         # file. Whether anything is left to do at all is decided by the committed spec,

@@ -38,6 +38,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final, final
 
 from .. import envvars
 from .entrypoints import record_load_error
@@ -65,6 +66,24 @@ def parse_target(target: str) -> tuple[str, str | None] | None:
         return None
     session, _, window = target[1:].partition(":")
     return (session, window or None)
+
+
+@final
+class Unset:
+    """The type of :data:`UNSET`: a variable confirmed absent for new panes, as
+    answered by :meth:`TerminalMultiplexer.inherited_env`. Its own type rather
+    than ``""`` because absent and set-to-empty are different inputs to the
+    state-root cascade (an absent ``HOME`` takes the passwd fallback, an empty
+    one names ``/``). Compare with ``is UNSET``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+#: The one :class:`Unset` instance.
+UNSET: Final = Unset()
 
 
 class TerminalMultiplexer(ABC):
@@ -545,6 +564,32 @@ class TerminalMultiplexer(ABC):
         the run or the shell) and the sweep here — see
         ``docs/porting-to-a-new-os.md``."""
         return []
+
+    def inherited_env(
+        self,
+        session: str,
+        name: str,
+        *,
+        on_fault: Callable[[str], None] | None = None,
+    ) -> str | Unset | None:
+        """What a new pane in ``session`` will inherit for the environment
+        variable ``name``: its value (``""`` included), :data:`UNSET` when it is
+        confirmed absent, or ``None`` when this transport cannot tell.
+
+        A multiplexer server is long-lived, and its panes inherit the
+        environment the server started with rather than the one of the client
+        asking for the pane, so a launcher cannot read the answer off its own
+        environment (#731). Must not raise. A query the backend supports but
+        could not complete (timeout, missing binary, an unexpected reply)
+        answers ``None`` **and** hands ``on_fault`` a one-line description, so a
+        caller can tell "tried and failed" from "cannot tell"; with no sink the
+        backend says nothing.
+
+        Non-abstract, defaulting to ``None`` with nothing reported, so released
+        out-of-tree backends keep working unchanged. psmux keeps this default:
+        its ``show-environment`` reports only values set through psmux itself,
+        never inherited ones."""
+        return None
 
     def window_pane_pids(self, target: str) -> list[int]:
         """Best-effort OS pids of ``target``'s pane root processes, for the kill

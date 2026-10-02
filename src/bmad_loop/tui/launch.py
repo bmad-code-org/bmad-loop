@@ -15,15 +15,19 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
-from .. import runs
+from .. import envvars, runs
 from ..adapters.multiplexer import (
     MultiplexerError,
+    TerminalMultiplexer,
+    Unset,
     get_multiplexer,
     mux_usable,
 )
@@ -871,7 +875,94 @@ def _ensure_ctl_session(project: Path) -> str:
             mux.new_session(name, project)
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
+    # After both arms: a session created just now on a stale server inherits
+    # that server's env as surely as a reused one does.
+    _warn_if_stale_state_root(mux, name)
     return name
+
+
+# Where launch-time warnings go: a callable taking the operator-facing line, or
+# None for stderr. `run_tui` installs a toast here for the app's run, because
+# Textual captures stderr for that whole run and a print would reach nobody.
+warn_sink: Callable[[str], None] | None = None
+
+# Keys of the warnings already given: each is said once per process, since the
+# condition it names outlives any one launch.
+_WARNED: set[str] = set()
+_STALE_ROOT = "stale-state-root"
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    if warn_sink is None:
+        print(f"warning: {message}", file=sys.stderr)
+    else:
+        warn_sink(message)
+
+
+def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
+    """Warn once when a new pane in ``session`` would resolve a different state
+    root than this process (#731): a multiplexer server hands its panes the env
+    it started with, so a server started under another root runs every parked
+    window there, and a live run reads as gone.
+
+    Compares resolved roots, not raw values: each input the platform's cascade
+    reads is asked of the transport (``inherited_env``), the pane's root is
+    resolved from the answers with this process's passwd home (a server this
+    process can reach runs as the same user), and only a different root — or
+    none at all — warns. Any unknown answer makes the comparison unknown and
+    silent, while a query fault is reported in its own words. Never raises and
+    never blocks the launch: the warning detects, it does not refuse."""
+    if _STALE_ROOT in _WARNED:
+        return
+    try:
+        own = runs.state_root()
+    except runs.StateRootError as exc:
+        _warn_once(
+            f"own-root:{exc}",
+            f"cannot check which state root {session} windows resolve: {exc}",
+        )
+        return
+
+    def fault(detail: str) -> None:
+        _warn_once(
+            f"fault:{detail}",
+            f"cannot check which state root {session} windows resolve: {detail}",
+        )
+
+    pane_env: dict[str, str] = {}
+    for name in runs.state_root_inputs():
+        try:
+            value = mux.inherited_env(session, name, on_fault=fault)
+        except Exception as exc:  # the seam says must-not-raise; a backend may still
+            fault(f"{type(mux).__name__}.inherited_env raised {exc!r}")
+            return
+        if value is None:
+            return
+        if not isinstance(value, Unset):
+            pane_env[name] = value
+    try:
+        passwd = runs.passwd_home() if runs.needs_passwd_home(pane_env) else None
+        pane: Path | None = runs.resolve_state_root(pane_env, passwd)
+    except runs.StateRootError:
+        pane = None
+    if pane == own:
+        return
+    resolved = str(pane) if pane is not None else "no usable state root"
+    # Quoted for the POSIX shell the operator pastes them into.
+    root = shlex.quote(str(own))
+    _warn_once(
+        _STALE_ROOT,
+        f"new windows in {session} would resolve {resolved}, not this process's "
+        f"state root {own}: its multiplexer server was started under a different "
+        "environment, so runs launched there can read as gone (#731). For new "
+        f"windows: tmux set-environment -t {shlex.quote('=' + session)} "
+        f"{envvars.STATE_DIR} {root} "
+        "(add -g for new sessions, or tmux kill-server to restart clean). Shells "
+        f"already open there need export {envvars.STATE_DIR}={root}, or recreating.",
+    )
 
 
 def cli_argv(*tail: str) -> list[str]:
