@@ -54,6 +54,10 @@ breaking changes may land in a minor release.
   cannot be listed, or a session left standing, is journalled and warned about.
   A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
   child), except a share-root shape older PowerShell would corrupt.
+- Warn once in the TUI when its tmux control session would hand new windows a
+  different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
+  `tmux set-environment` remedy, instead of letting the run read as gone (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 - Explain that unpinned result-artifact scans search only the configured artifact

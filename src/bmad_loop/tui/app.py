@@ -1973,5 +1973,12 @@ def run_tui(project: Path) -> int:
         mux_usable()
     except MultiplexerError:
         pass
-    BmadLoopApp(project).run()
+    app = BmadLoopApp(project)
+    # Launch warnings (the #731 state-root check) would print into the stderr
+    # Textual captures, so they toast instead — for the app's run only.
+    launch.warn_sink = lambda message: app.notify(message, severity="warning", markup=False)
+    try:
+        app.run()
+    finally:
+        launch.warn_sink = None
     return 0
