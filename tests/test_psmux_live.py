@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -598,6 +599,184 @@ def test_premise_target_less_display_message_ignores_tmux_pane(probe):
         "TMUX_PANE instead of the active window — the `-t $TMUX_PANE` pin in "
         "psmux_backend._display_message (gh-669) has become droppable"
     )
+
+
+def test_premise_a_dash_leading_option_value_unsets_the_key(probe):
+    """`set-option -t S @k -u` reads the value as the unset flag: rc 0, and the
+    key is gone. That silent data loss is why `_transportable` refuses every
+    `-`-leading value (psmux/psmux#583).
+
+    Red means the installed psmux stores the value verbatim, and that refusal is
+    droppable — but only behind the `_LAST_UNSUPPORTED` gate, set to the last
+    release WITHOUT the fix (the gate is exclusive: ``available()`` admits only
+    versions above it), since an older admitted build still unsets.
+    """
+    mux, session, _ = probe
+    seeded = mux._run(["set-option", "-t", session, "@k", "v"], check=False)
+    assert seeded.returncode == 0, f"probe setup: seeding @k failed: {seeded.stderr.strip()!r}"
+    seen = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
+    assert seen.stdout.strip() == "v", f"probe setup: @k did not read back: {seen.stdout!r}"
+    written = mux._run(["set-option", "-t", session, "@k", "-u"], check=False)
+    assert written.returncode == 0, (
+        "psmux now refuses a `-`-leading option value outright instead of silently "
+        f"unsetting the key (psmux/psmux#583): {written.stderr.strip()!r}"
+    )
+    got = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
+    assert got.returncode == 0, f"probe setup: reading @k back failed: {got.stderr.strip()!r}"
+    assert got.stdout.strip() == "", (
+        "psmux now stores a `-`-leading option value verbatim (psmux/psmux#583, read "
+        f"back {got.stdout.strip()!r}) — the `-` refusal in psmux_backend._transportable "
+        "is droppable once _LAST_UNSUPPORTED is the last release without the fix"
+    )
+
+
+def test_premise_one_session_name_is_held_across_registries(tmp_path):
+    """psmux's one-server-per-name guard is keyed on the session name alone, not
+    the registry root, so while root A holds a session a second root cannot
+    create one of the same name. That collision is why `runs.ctl_session_for`
+    suffixes the control-session name per registry (psmux/psmux#599).
+
+    Red means the guard follows `PSMUX_DATA_DIR` and the per-registry suffix is
+    no longer forced by psmux — droppable only behind the `_LAST_UNSUPPORTED`
+    gate, set to the last release WITHOUT the fix (the gate is exclusive).
+
+    Only a refusal with nothing registered in B counts as the collision. A
+    failed create whose server registers anyway is the client's readiness
+    deadline under load, not the guard, and a fixed build can produce it too.
+    Ceiling: B is read once, so a server registering after that read passes
+    as the collision. That errs green, never red: on a fixed release it delays
+    the flip to the next unloaded run instead of inventing one.
+
+    Root A is torn down before root B, and that order is load-bearing: B's
+    never-seen teardown ends in a process-table kill by session token, which
+    would take A's live server of the same name if A were still standing.
+    """
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    session = f"bmad-loop-dup-probe-{uuid.uuid4().hex[:8]}"
+    envs = []
+    for name in ("root-a", "root-b"):
+        root = tmp_path / name
+        root.mkdir()  # pre-created: see psmux_data_root for the measured cost
+        env = _new_session_env()
+        env["PSMUX_DATA_DIR"] = str(root)
+        envs.append(env)
+    env_a, env_b = envs
+    a_seen = b_seen = False
+    try:
+        try:
+            created_a = mux._run(
+                ["new-session", "-d", "-s", session, "-c", str(tmp_path)], check=False, env=env_a
+            )
+            assert (
+                created_a.returncode == 0
+            ), f"probe setup: root A's session creation failed: {created_a.stderr.strip()!r}"
+            a_seen = _plain_has_session(mux, session, env=env_a)
+            assert a_seen, "probe setup: root A's session was not observable"
+            created_b = mux._run(
+                ["new-session", "-d", "-s", session, "-c", str(tmp_path)], check=False, env=env_b
+            )
+            b_seen = _plain_has_session(mux, session, env=env_b)
+            # A dead A would let B's create succeed on any build: not a flip.
+            assert _plain_has_session(
+                mux, session, env=env_a
+            ), "probe setup: root A's session died while root B created its own"
+        finally:
+            _teardown_probe_session(mux, session, env_a, known_created=a_seen)
+    finally:
+        _teardown_probe_session(mux, session, env_b, known_created=b_seen)
+    assert created_b.returncode == 0 or not b_seen, (
+        "probe setup: root B's create reported failure but its session registered "
+        f"anyway — a readiness timeout, not the name guard: {created_b.stderr.strip()!r}"
+    )
+    assert created_b.returncode != 0, (
+        "psmux now lets a second registry hold a session name another registry's live "
+        "server owns (psmux/psmux#599) — the per-registry control-session suffix in "
+        "runs.ctl_session_for (#733) retires, but only through a _LAST_UNSUPPORTED bump "
+        "to the last release without the fix, never a deletion: an older admitted build "
+        "still collides"
+    )
+
+
+def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(
+    probe, psmux_data_root
+):
+    """A `has-session` whose 500 ms connect times out deletes the session's
+    `.port` even though its server is alive — the reap window the accepted
+    ceiling in `runs.live_session_may_be_ours` documents (psmux/psmux#622).
+
+    Red means a timeout no longer reaps, and that ceiling's psmux half retires —
+    only behind the `_LAST_UNSUPPORTED` gate, set to the last release WITHOUT
+    the fix (the gate is exclusive), since an older admitted build still reaps.
+
+    Determinism: the forged port is one this process has bound but never
+    listens on, which on Windows times out rather than refuses (checked first:
+    a refusal is reaped on every build and would prove nothing). The server's
+    registry tick rewrites a differing `.port` at most every 5 s, so the probe
+    forges once, waits for the tick to restore the real port, then forges again
+    and asks `has-session` well inside that interval.
+    """
+    mux, session, _ = probe
+    port_file = Path(psmux_data_root) / f"{session}.port"
+    real = port_file.read_text(encoding="utf-8").strip()
+    assert real.isdigit(), f"probe setup: unexpected .port contents {real!r}"
+    dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        dead.bind(("127.0.0.1", 0))  # bound, never listening
+        forged = str(dead.getsockname()[1])
+        try:
+            socket.create_connection(("127.0.0.1", int(forged)), timeout=0.5).close()
+            outcome = "connected"
+        except TimeoutError:
+            outcome = "timeout"
+        except OSError as exc:
+            outcome = type(exc).__name__
+        assert outcome == "timeout", (
+            f"probe setup: a bound-but-unlistened loopback port answered {outcome}, "
+            "not a timeout — a refusal is reaped on every build"
+        )
+        port_file.write_text(forged, encoding="utf-8")
+        deadline = time.monotonic() + 15
+        restored = False
+        while time.monotonic() < deadline:
+            try:
+                restored = port_file.read_text(encoding="utf-8").strip() == real
+            except OSError:
+                restored = False
+            if restored:
+                break
+            time.sleep(0.05)
+        assert restored, "probe setup: the server's registry tick never restored .port"
+        ticked = time.monotonic()
+        port_file.write_text(forged, encoding="utf-8")
+        asked = mux._run(["has-session", "-t", session], check=False)
+        reaped = not port_file.exists()
+        left = "" if reaped else port_file.read_text(encoding="utf-8").strip()
+        elapsed = time.monotonic() - ticked
+        assert elapsed < 4.0, (
+            f"probe setup: has-session landed {elapsed:.1f}s after the registry tick, "
+            "close enough to the next one that it may have rewritten .port"
+        )
+        # The tick restores the REAL port, which reads as neither outcome.
+        assert reaped or left == forged, (
+            f"probe setup: .port reads {left!r}, neither reaped nor the forged "
+            f"{forged!r} — a registry tick raced the observation"
+        )
+        assert (
+            asked.returncode != 0
+        ), "probe setup: has-session answered through a port nothing listens on"
+        assert reaped, (
+            "psmux has-session no longer reaps a live session's .port on a connect "
+            f"timeout (psmux/psmux#622, .port kept as {left!r}) — the reap-window ceiling "
+            "prose in runs.live_session_may_be_ours (#754) narrows once _LAST_UNSUPPORTED "
+            "is the last release without the fix"
+        )
+    finally:
+        dead.close()
+        # Re-publish the real port: the teardown addresses the server through it,
+        # and an absent .port would read as a dead session until the next tick.
+        port_file.write_text(real, encoding="utf-8")
 
 
 # ------------------------------------------------- adopted-behavior probes
