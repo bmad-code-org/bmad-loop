@@ -63,15 +63,21 @@ def mux_available() -> bool:
 
 
 def session_exists(session: str) -> bool:
-    mux = get_multiplexer()
-    if not mux.has_session(session):
+    return get_multiplexer().has_session(session)
+
+
+def agent_session_exists(session: str) -> bool:
+    """:func:`session_exists` for a run's AGENT session, the one an attach lands
+    on: in a registry shared with other projects (#729) a same-named session
+    may be another project's, and it does not exist as far as this project is
+    concerned. Saying why is the difference between that and "no session".
+
+    Kept off :func:`session_exists` itself, which also answers for the control
+    session — a per-project name already (`runs.ctl_session_for`), whose
+    session carries no project tag at all."""
+    if not session_exists(session):
         return False
-    if runs.is_ctl_session_name(session):
-        return True  # per-project name already (`runs.ctl_session_for`)
-    # An agent session in a shared registry may be another project's (#729):
-    # it does not exist as far as this project is concerned, and saying why is
-    # the difference between that and "no session".
-    refusal = runs.foreign_session_refusal(session, mux)
+    refusal = runs.foreign_session_refusal(session, get_multiplexer())
     if refusal is not None:
         print(f"warning: treating {session} as absent — {refusal}", file=sys.stderr)
         return False
@@ -729,7 +735,7 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     nothing to attach to."""
     session = runs.session_name(run_id)
     win_id = ctl_window_id(project, run_id)
-    agent_live = session_exists(session)
+    agent_live = agent_session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):

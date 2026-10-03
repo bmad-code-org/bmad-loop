@@ -2215,10 +2215,10 @@ class _SharedRegistryWithForeignSession:
 def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tmp_path, capsys):
     """In a registry shared with another project, `bmad-loop-RID` may be that
     project's live coding session; attaching the operator to it is the by-name
-    hazard. `session_exists` reads it as absent and says why, so with no ctl
-    window there is nothing to attach.
+    hazard. `agent_session_exists` reads it as absent and says why, so with no
+    ctl window there is nothing to attach.
 
-    Ablate the gate in `session_exists` and the plan attaches to it."""
+    Ablate the gate in `agent_session_exists` and the plan attaches to it."""
     monkeypatch.setattr(launch, "get_multiplexer", lambda: _SharedRegistryWithForeignSession())
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
     monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
@@ -2226,6 +2226,31 @@ def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tm
 
     assert launch.attach_plan(tmp_path, "RID") is None
     assert "treating bmad-loop-RID as absent" in capsys.readouterr().err
+
+
+def test_session_exists_stays_a_plain_existence_check_in_a_shared_registry(monkeypatch, tmp_path):
+    """`session_exists` also answers for the control session, which carries no
+    project tag (its name is already per project), so the shared-registry
+    ownership gate must not reach it: gated, a prune in an operator's honoured
+    root read its own ctl session as absent and swept nothing.
+
+    Ablate by moving the gate back into `session_exists` and this fails."""
+
+    class _UntaggedCtl(_SharedRegistryWithForeignSession):
+        def has_session(self, name):
+            return name == "ctl-under-test"
+
+        def list_sessions_reporting(self, *, on_fault=None):
+            return ["ctl-under-test"]
+
+        def session_options(self, _option):
+            return {}
+
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _UntaggedCtl())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    assert launch.session_exists("ctl-under-test") is True
+    assert launch.agent_session_exists("ctl-under-test") is False
 
 
 def test_run_captured_merges_streams(monkeypatch):

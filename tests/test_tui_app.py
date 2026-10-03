@@ -3780,23 +3780,26 @@ async def test_attach_without_agent_session_notifies(project, monkeypatch):
 
 
 async def test_attach_to_another_projects_session_says_why(project, monkeypatch):
-    """Textual captures stderr, so `session_exists`' own warning about a
-    same-named session of another project's never reaches the screen: the
-    attach handler says it in a toast instead of "no live agent session".
+    """The session EXISTS, and is another project's: the attach must not land on
+    it, and since Textual captures stderr, `agent_session_exists`' warning never
+    reaches the screen — the handler says it in a toast instead of "no live
+    agent session".
 
     Ablate the refusal toast in `action_attach` and only the generic message
-    appears."""
+    appears; regress the handler to plain `session_exists` and it attaches."""
+    attached: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(launch, "session_exists", lambda session: False)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
     monkeypatch.setattr(
         "bmad_loop.tui.app.runs.foreign_session_refusal",
-        lambda session: (
+        lambda session, *_mux: (
             f"{session} in the shared registry C:\\[red]\\shared is tagged for another project"
         ),
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))
     # notifications=True mounts the toast rack, so what is asserted is what the
     # operator sees: with markup on, `[red]` would be eaten as a style tag.
     async with app.run_test(notifications=True) as pilot:
@@ -3810,6 +3813,7 @@ async def test_attach_to_another_projects_session_says_why(project, monkeypatch)
                 for text, _severity in rendered_toasts(app)
             ),
         )
+    assert attached == []
 
 
 async def test_attach_multiplexer_error_notifies(project, monkeypatch):

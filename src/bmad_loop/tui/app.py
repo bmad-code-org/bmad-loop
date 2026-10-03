@@ -550,7 +550,7 @@ class BmadLoopApp(App[None]):
             return
         session = runs.session_name(run_id)
         win_id = launch.ctl_window_id(self.project, run_id)
-        ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
+        ok, agent_live = self._mux_guarded(lambda: launch.agent_session_exists(session))
         if not ok:
             return
         # A sweep blocked on a decision prompt has no agent session — the
@@ -563,7 +563,7 @@ class BmadLoopApp(App[None]):
         elif agent_live:
             target = runs.session_target(run_id)
         else:
-            # Textual captures stderr, so session_exists' own warning about a
+            # Textual captures stderr, so agent_session_exists' warning about a
             # same-named session of another project's never reaches the screen.
             ok, refusal = self._mux_guarded(lambda: runs.foreign_session_refusal(session))
             if not ok:
