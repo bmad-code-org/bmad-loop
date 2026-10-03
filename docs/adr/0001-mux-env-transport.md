@@ -287,7 +287,8 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 - Add a hidden top-level `--state-root` option, applied in `cli.main` before `relay` dispatch and `_configure_mux`.
 - It must be absolute. Otherwise `main` exits `USAGE` with one message, the same rule as `BMAD_LOOP_STATE_DIR`'s own validation.
 - `tui.launch.start_detached` inserts it from `runs.state_root()`, and raises `LaunchError` on `StateRootError` (see Option D). The other `cli_argv` caller is a captured `subprocess.run` that inherits the launcher's own env directly, so it needs no flag.
-- The bare-env warning's text, and Stage 1's, narrow to window-0 and other already-running shells. Per Stage 1, the wording says that a matching query cannot vouch for a shell that is already running.
+- Stage 1's stale-root warning narrows to window-0 and other already-running shells, since the parked engine now receives the root explicitly. Per Stage 1, the wording says that a matching query cannot vouch for a shell that is already running.
+- The bare-env warning (`PsmuxMultiplexer._warn_if_bare_env`) is **not** narrowed. Stage 2 carries only the state root, so a coding-CLI pane in bare mode can still miss credentials or configuration its env dict does not name (Option D, Cons). Its text drops parked-window shells from the list of shells that lose `BMAD_LOOP_STATE_DIR`, and keeps the warning itself.
 
 **Files:**
 
