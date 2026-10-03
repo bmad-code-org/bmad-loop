@@ -507,6 +507,43 @@ def test_ctl_window_id_refuses_a_record_naming_a_window_it_never_minted(
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
+def test_ctl_window_lookup_counts_the_untagged_rows_it_refuses(monkeypatch, tmp_path: Path):
+    # An empty tag is unset OR unreadable — psmux folds a failed option probe to
+    # "" for every row — so the refusal must be countable, or a caller reads it
+    # as "no window" and `x` reports a clean stop over a live one. Counted:
+    # same-run untagged rows only; another run's, or another project's tagged
+    # row, is an absence, not a refusal.
+    other = runs.project_tag(tmp_path / "elsewhere")
+    _ctl_listing(
+        monkeypatch,
+        f"@1\tresume-RID\t\n@2\trun-RID\t\n@3\trun-OTHER\t\n@4\tresume-RID\t{other}\n",
+        tmp_path,
+    )
+    assert launch.ctl_window_lookup(tmp_path, "RID") == (None, 2)
+    # A tagged match answers, and the refusal beside it is still counted: the
+    # untagged row may be a relaunch whose tag write failed — the live
+    # orchestrator — next to its parked, tagged predecessor.
+    _ctl_listing(monkeypatch, "@1\tresume-RID\t\n@2\trun-RID\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == ("@2", 1)
+    _ctl_listing(monkeypatch, "@2\trun-RID\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == ("@2", 0)
+    # A genuine absence stays a plain None.
+    _ctl_listing(monkeypatch, "@3\trun-OTHER\t\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == (None, 0)
+
+
+def test_kill_ctl_window_reports_an_unproven_window_it_left(monkeypatch, tmp_path: Path):
+    # The stop path's half of the same rule: nothing is killed — the window
+    # cannot be proven ours — but the count comes back for the TUI to report.
+    calls = _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    assert launch.kill_ctl_window(tmp_path, "RID") == 1
+    assert not any(c[1] == "kill-window" for c in calls)
+    # And a clean kill reports nothing left.
+    calls = _ctl_listing(monkeypatch, "@4\tresume-RID\n", tmp_path)
+    assert launch.kill_ctl_window(tmp_path, "RID") == 0
+    assert ["tmux", "kill-window", "-t", "@4"] in calls
+
+
 def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
     # The record is a tie-break among tagged rows, never a route to an untagged
     # one: naming the untagged row that sorts first must not steer `x` off this

@@ -549,20 +549,37 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        win_id = launch.ctl_window_id(self.project, run_id)
+        win_id, unproven = launch.ctl_window_lookup(self.project, run_id)
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
         # A sweep blocked on a decision prompt has no agent session — the
         # human answers in the orchestrator's ctl window. Otherwise prefer the
         # live agent session, falling back to the ctl window between sessions.
-        if win_id is not None and (self._dashboard.decision_pending is not None or not agent_live):
+        wants_ctl = self._dashboard.decision_pending is not None or not agent_live
+        if unproven:
+            # A window under this run's name was refused because its tag could
+            # not be read as ours (#750) — possibly the live orchestrator, even
+            # beside a tagged window answered here. Say so whatever is attached.
+            lead = (
+                "cannot attach to the run window"
+                if win_id is None and wants_ctl
+                else "attaching without a window it could not prove"
+            )
+            self.notify(
+                f"{lead}: {launch.unproven_ctl_window_notice(self.project, run_id, unproven)}",
+                severity="warning",
+                timeout=15,
+            )
+        if win_id is not None and wants_ctl:
             launch.select_ctl_window_id(win_id)
             self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
             return
-        elif agent_live:
+        if agent_live:
             target = runs.session_target(run_id)
         else:
+            if unproven:
+                return  # the warning above already said why
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
                 f"{launch.ctl_session(self.project)} window for this run (runs started outside "
@@ -1556,9 +1573,21 @@ class BmadLoopApp(App[None]):
     def _stop_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.stop_run(run_dir)
-            launch.kill_ctl_window(self.project, run_id)
+            left = launch.kill_ctl_window(self.project, run_id)
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
+            return
+        if left:
+            # The engine stopped, but a ctl window under its name may still be
+            # running — even when another one was closed: a plain "stopped"
+            # would hide that (#750).
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id} stopped, but a control window under its name was not closed: "
+                f"{launch.unproven_ctl_window_notice(self.project, run_id, left)}",
+                severity="warning",
+                timeout=15,
+            )
             return
         self.call_from_thread(self.notify, f"run {run_id} stopped")
 

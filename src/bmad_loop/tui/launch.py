@@ -402,23 +402,43 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     find the socket, which the pane environment hands out; the gate is only as
     strong as the session's isolation from the multiplexer.
 
-    What it costs is reach for a window whose best-effort tag write failed:
-    start_detached records before it tags, but the record no longer admits
-    anything on its own, so that window answers None until a relaunch tags one.
-    The two consumers wear that differently: `a` falls through to the live agent
-    session, or says "nothing to attach" when there is none, while `x` kills
-    nothing — kill_ctl_window no-ops on None — and still reports the run
-    stopped, so the orchestrator window is left running with no notice. Fail
-    closed is right here because the alternative is not "reach my window" but
-    "reach *a* window" — possibly a neighbour's live orchestrator.
+    What it costs is reach for a window whose tag cannot be read as ours: one
+    whose best-effort tag write failed at launch (start_detached records before
+    it tags, but the record admits nothing on its own), and — every window at
+    once — a listing whose option column could not be read at all, which psmux
+    folds to "" rather than failing (PsmuxMultiplexer.list_windows). The seam
+    hands both back as the same empty tag, so neither this function nor its
+    callers can tell them apart. Fail closed is still right — the alternative
+    is not "reach my window" but "reach *a* window", possibly a neighbour's live
+    orchestrator — but it must not be silent: a None here reads as "no window",
+    and `x` would then report the run stopped while its window keeps running.
+    So ctl_window_lookup also counts the same-run rows it refused for want of a
+    readable tag, and `x` and `a` say so (see kill_ctl_window and the TUI's
+    attach) instead of passing the refusal off as an absence.
 
     Read-only throughout: this never writes the record and never touches the
     tag — re-tagging on read is claiming, not proving, and would hand a
     neighbour's window this project's tag."""
+    return ctl_window_lookup(project, run_id)[0]
+
+
+def ctl_window_lookup(project: Path, run_id: str) -> tuple[str | None, int]:
+    """ctl_window_id's answer, plus how many windows carrying this run's name
+    it refused because their tag read empty — unset, or unreadable (see
+    ctl_window_id).
+
+    A nonzero count is a degraded answer a caller must surface, with or
+    without a window: no window is not "no window", and a window beside a
+    refused row may be the parked predecessor of a relaunch whose own tag
+    write failed — so the live orchestrator is the one refused, and a stop
+    that closes the predecessor has still left it running. A refused row may
+    equally be a neighbour's untagged window under the same caller-supplied
+    run id, so the count is a notice, never a target."""
     if not mux_available():
-        return None
+        return None, 0
     mine = runs.accepted_tags(project)
     tagged: list[str] = []
+    unproven = 0
     rows = get_multiplexer().list_windows(
         ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
     )
@@ -460,18 +480,33 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # digest alone would strand this project's own orchestrator — prunable
         # by _ctl_window_candidates, which accepts the legacy tag, yet
         # unreachable by `a` and `x`, which resolve through here.
-        # An empty tag is refused the same way (#750): see the docstring.
+        # An empty tag is refused the same way (#750), but counted: it is unset
+        # or unreadable, and the caller must be able to say so (see docstrings).
         if tag in mine:
             tagged.append(win_id)
+        elif not tag:
+            unproven += 1
     if not tagged:
-        return None
+        return None, unproven
     # Membership in `tagged`, not mere presence in the listing: it re-checks the
     # name and the project-scoping predicates, so a record whose id is absent from
     # the scoped matches — killed, pruned, renamed onto another run, or naming a
     # row this project cannot claim — is not replayed. A tie-break among rows the
     # tag already proved, never a proof on its own: it is what turns a stale id
     # from a replayed target into a fallthrough.
-    return recorded if recorded in tagged else tagged[0]
+    return (recorded if recorded in tagged else tagged[0]), unproven
+
+
+def unproven_ctl_window_notice(project: Path, run_id: str, count: int) -> str:
+    """Operator wording for a nonzero ctl_window_lookup count: what was refused,
+    the two causes the seam cannot tell apart, and what to do about it."""
+    windows = "window" if count == 1 else f"{count} windows"
+    return (
+        f"{windows} in {ctl_session(project)} named for run {run_id} carry no readable "
+        "project tag, so none can be proven this project's: its tag could not be read "
+        "or was never written. Left untouched — check it in the multiplexer and close "
+        "it by hand if it is this run's"
+    )
 
 
 def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
@@ -696,12 +731,18 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     return None
 
 
-def kill_ctl_window(project: Path, run_id: str) -> None:
+def kill_ctl_window(project: Path, run_id: str) -> int:
     """Kill the control-session window hosting this run's orchestrator process,
-    if any. A no-op when the run was not launched from the TUI or tmux is gone."""
-    win_id = ctl_window_id(project, run_id)
+    if any. A no-op when the run was not launched from the TUI or tmux is gone.
+
+    Returns how many same-run windows were left alive because none could be
+    proven this project's (ctl_window_lookup's count): 0 means the kill went
+    through or there was nothing to kill, and anything else is a window the
+    caller must report as possibly still running rather than as stopped."""
+    win_id, unproven = ctl_window_lookup(project, run_id)
     if win_id is not None:
         get_multiplexer().kill_window(win_id)
+    return unproven
 
 
 def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:

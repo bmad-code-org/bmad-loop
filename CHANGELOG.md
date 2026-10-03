@@ -42,7 +42,10 @@ breaking changes may land in a minor release.
   so a reused window id or a forged `ctl-window` record can no longer steer
   them onto a neighbour's window; the record now only breaks ties among tagged
   windows, and a window whose tag write failed is left alone until relaunched
-  (#750).
+  (#750). When a window under the run's name is left alone because its tag reads
+  empty (never written, or unreadable — psmux's option probe can fail), `x`
+  warns that the control window was not closed instead of reporting a clean
+  stop, and `a` says why it cannot reach it.
 
 ## [0.13.1] — 2026-10-01
 

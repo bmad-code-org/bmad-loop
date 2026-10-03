@@ -91,7 +91,9 @@ The TUI never runs an engine in-process. The two halves:
   while an older same-run-id window is still parked (#482). Attach/stop only
   ever reach a window carrying this project's tag: the record breaks ties
   among tagged windows but never vouches for an untagged one, so a window
-  whose tag write failed is left alone until a relaunch tags one (#750).
+  whose tag write failed is left alone until a relaunch tags one (#750). The
+  same holds when the tag cannot be read at all, and in both cases `x` warns
+  that the control window was not closed and `a` says why it cannot reach it.
 - **Observer** — the dashboard reads only the artifacts the engine writes
   atomically into `.bmad-loop/runs/<run-id>/`: `state.json`, `journal.jsonl`,
   `logs/<task-id>.log`, `ATTENTION`, `engine.pid`. It polls the selected run
