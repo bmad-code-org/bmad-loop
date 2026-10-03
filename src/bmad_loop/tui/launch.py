@@ -711,24 +711,28 @@ def decision_pending(run_dir: Path) -> bool:
     return bool(entries) and entries[-1].get("kind") == "decision-pending"
 
 
-def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | None:
+def attach_plan(project: Path, run_id: str) -> tuple[tuple[list[str], str | None] | None, int]:
     """Pick where an interactive attach should land for this run and which window
     (if any) to record a return target on. Shared by the CLI `attach` command and
     mirroring the TUI's action_attach logic: prefer the orchestrator's ctl window
     when a sweep is blocked on a decision or no agent session is live, else the
-    live agent session. Returns (tmux argv, return_window) or None when there is
-    nothing to attach to."""
+    live agent session. Returns ((tmux argv, return_window) or None when there
+    is nothing to attach to, unproven) — `unproven` is ctl_window_lookup's count
+    of same-run windows refused for an empty tag, carried out with the plan
+    because a None plan is not "no window" when it is nonzero, and an agent
+    plan may have bypassed the very window a pending decision is waiting in
+    (#750). The caller must say so; see unproven_ctl_window_notice."""
     session = runs.session_name(run_id)
-    win_id = ctl_window_id(project, run_id)
+    win_id, unproven = ctl_window_lookup(project, run_id)
     agent_live = session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):
         select_ctl_window_id(win_id)
-        return runs.attach_target_argv(ctl_target(project)), win_id
+        return (runs.attach_target_argv(ctl_target(project)), win_id), unproven
     if agent_live:
-        return runs.attach_target_argv(runs.session_target(run_id)), None
-    return None
+        return (runs.attach_target_argv(runs.session_target(run_id)), None), unproven
+    return None, unproven
 
 
 def kill_ctl_window(project: Path, run_id: str) -> int:

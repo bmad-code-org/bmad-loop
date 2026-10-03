@@ -696,8 +696,8 @@ def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_pa
     _write_record(tmp_path, "RID", "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
-    plan = launch.attach_plan(tmp_path, "RID")
-    assert plan is not None
+    plan, unproven = launch.attach_plan(tmp_path, "RID")
+    assert plan is not None and unproven == 0
     _argv, return_window = plan
     assert return_window == "@2"
     assert ["tmux", "select-window", "-t", "@2"] in calls
@@ -2183,44 +2183,61 @@ def test_decision_pending_false_once_an_unreadable_line_follows(tmp_path: Path):
 
 def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: ("@2", 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
     selected: list[str] = []
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
-    argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "@2"
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
+    assert unproven == 0
     assert selected == ["@2"]
 
 
 def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: ("@2", 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
-    argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "@2"
+    plan, _unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
 
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") == (
-        ["tmux", "attach", "-t", "=bmad-loop-RID"],
-        None,
+        (["tmux", "attach", "-t", "=bmad-loop-RID"], None),
+        0,
     )
 
 
 def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
-    assert launch.attach_plan(Path("/proj"), "RID") is None
+    assert launch.attach_plan(Path("/proj"), "RID") == (None, 0)
+
+
+@pytest.mark.parametrize("agent_live", [True, False], ids=["agent-fallback", "nothing"])
+def test_attach_plan_carries_the_unproven_count(monkeypatch, agent_live: bool):
+    # #750: a decision is waiting in a window whose tag reads empty, so the
+    # lookup refuses it. The plan must carry that refusal out - whether it then
+    # falls back to the agent session (bypassing the waiting decision) or has
+    # nothing at all - or the CLI reads it as an ordinary absence.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 1))
+    monkeypatch.setattr(launch, "session_exists", lambda s: agent_live)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert unproven == 1
+    if agent_live:
+        assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    else:
+        assert plan is None
 
 
 def test_run_captured_merges_streams(monkeypatch):
