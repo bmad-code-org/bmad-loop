@@ -74,27 +74,33 @@ def session_exists(session: str) -> bool:
 # target on its own: ctl_window_id re-proves it against the live listing.
 _CTL_WINDOW_FILE = "ctl-window"
 
+# Its sibling: the pane pid of that same window, read at mint (#750). A file of
+# its own rather than a second line in the record, because the record's format
+# is a compatibility contract: a release before #750 reads `ctl-window` whole as
+# the id, so an `@7` + pid payload would match no row there and its tie-break
+# would fall back to the first window, the parked corpse (#482). Written BEFORE
+# the record and read AFTER it, so no interleaving pairs a newer id with an
+# older pid — see _record_ctl_window.
+_CTL_PID_FILE = "ctl-window-pid"
 
-# Generous ceiling on the hint: the value is a window id (`@7`, or a
-# session-qualified `bmad-loop-ctl:@7`) plus, on its own line, the window's pane
-# pid (#750), and anything longer is already not one.
+
+# Generous ceiling on either hint: the record is a window id (`@7`, or a
+# session-qualified `bmad-loop-ctl:@7`) and its sibling a decimal pid, and
+# anything longer is already not one.
 _MAX_RECORD_BYTES = 256
 
 
-def _parse_ctl_record(record: str | None) -> tuple[str | None, str | None]:
-    """Split a record into `(window id, pane pid)`. The pid line is optional — a
-    record written before #750 carries the id alone — and anything that is not
-    plain ASCII digits reads as absent rather than as a pid."""
-    if record is None:
-        return None, None
-    win_id, _, pid = record.partition("\n")
-    pid = pid.strip()
-    return win_id.strip() or None, pid if pid.isascii() and pid.isdigit() else None
+def _read_ctl_pid(project: Path, run_id: str) -> str | None:
+    """The pane pid the run's last launch recorded, or None when there is none —
+    including a file that is not plain ASCII digits, which reads as absent
+    rather than as a pid. The same hardened read as the record."""
+    pid = _read_ctl_window(project, run_id, _CTL_PID_FILE)
+    return pid if pid is not None and pid.isascii() and pid.isdigit() else None
 
 
-def _read_ctl_window(project: Path, run_id: str) -> str | None:
-    """The raw record the run's last launch wrote (window id, optionally a pane
-    pid on a second line — see _parse_ctl_record), or None when there is
+def _read_ctl_window(project: Path, run_id: str, name: str = _CTL_WINDOW_FILE) -> str | None:
+    """The window id recorded by the run's last launch (or, with `name`, the
+    content of its pid sibling — see _read_ctl_pid), or None when there is
     none / it cannot be read. Never raises, and that includes decoding: a torn
     record can raise UnicodeDecodeError, a ValueError rather than an OSError,
     which action_attach (no covering except at all) and _stop_run_worker (whose
@@ -124,7 +130,7 @@ def _read_ctl_window(project: Path, run_id: str) -> str | None:
     describes the object actually opened. The POSIX-only flags degrade to 0 on
     win32, which has neither FIFOs at these paths nor O_NOFOLLOW; the size cap
     and the regular-file check carry there on their own."""
-    record = runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE
+    record = runs.run_dir_for(project, run_id) / name
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
     try:
@@ -146,7 +152,7 @@ def _read_ctl_window(project: Path, run_id: str) -> str | None:
 
 
 def _forget_ctl_window(project: Path, run_id: str) -> None:
-    """Drop the record. A launch that cannot name the window it just minted must
+    """Drop the record and its pid sibling, record first. A launch that cannot name the window it just minted must
     not leave the *previous* launch's id authoritative — that id now names a
     superseded window, and the honest answer is no record at all, which puts the
     lookup back on the name scan.
@@ -179,17 +185,25 @@ def _forget_ctl_window(project: Path, run_id: str) -> None:
             if dir_fd is None:
                 return  # a component we cannot vouch for — see the ceiling
             try:
-                os.unlink(_CTL_WINDOW_FILE, dir_fd=dir_fd)
-            except FileNotFoundError:
-                pass  # already gone: missing_ok, by hand
+                for name in (_CTL_WINDOW_FILE, _CTL_PID_FILE):
+                    _unlink_at(dir_fd, name)
             finally:
                 os.close(dir_fd)
         else:
             if not _run_dir_is_confined(project, run_dir):
                 return  # see the ceiling
-            (run_dir / _CTL_WINDOW_FILE).unlink(missing_ok=True)
+            for name in (_CTL_WINDOW_FILE, _CTL_PID_FILE):
+                (run_dir / name).unlink(missing_ok=True)
     except OSError:
         pass  # a removal we cannot force — see the ceiling
+
+
+def _unlink_at(dir_fd: int, name: str) -> None:
+    """`unlink` relative to an anchored directory descriptor; missing_ok by hand."""
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
 
 
 def _is_link_of_any_kind(path: Path) -> bool:
@@ -267,9 +281,29 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
 
 def _record_ctl_window(project: Path, run_id: str, win_id: str, pane_pid: str | None) -> None:
     """Record the window a launch just minted, so ctl_window_id can prefer it
-    over an older window sharing the run id. The payload is `<win_id>`, plus
-    `\\n<pane_pid>` when the mint's pane pid could be read — the pid is what lets
-    ctl_window_id admit the window even if its tag write fails (#750).
+    over an older window sharing the run id. The record holds `<win_id>` alone,
+    byte-identical to what releases before #750 read; the mint's pane pid goes
+    to the `_CTL_PID_FILE` sibling, and is what lets ctl_window_id admit the
+    window even if its tag write fails (#750).
+
+    Two files are never written as one, so the order is the consistency rule:
+    pid first, record second, and ctl_window_id reads them the other way round.
+    A crash or failure between the two writes leaves a newer pid beside the
+    older id — the old window's pid is not that one, so the pair admits nothing
+    untagged and the lookup fails closed. A lookup racing a relaunch sees either
+    a matching pair or that same unsatisfiable one, never a newer id with an
+    older pid: it reads the pid after the record, and the pid was written
+    before it. A mint whose pid could not be read removes the sibling, so an
+    older pid never stands beside the newer id.
+
+    What the order does not serialize is two launches for the same run racing
+    each other: pid(A), pid(B), id(B), id(A) leaves A's id beside B's pid with
+    both writes succeeding. That pair also admits nothing untagged, so it fails
+    closed exactly like a crash between the writes, and the next launch repairs
+    it; a tagged window is unaffected. A single file kept the pair coherent by
+    construction, but older releases read that file whole as the id, so the
+    trade is deliberate. A cross-process lock per run would close it, and is
+    not worth taking on the launch path for an untagged-only, fail-closed race.
 
     Best-effort on purpose. The window is already running by the time this
     writes, so a failed write must not fail the launch — the lookup degrades to
@@ -350,20 +384,29 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str, pane_pid: str | 
     if not runs.is_run(run_dir):
         _forget_ctl_window(project, run_id)
         return
-    payload = f"{win_id}\n{pane_pid}" if pane_pid else win_id
     try:
         if DIR_FD_ANCHORED_WRITES:
             dir_fd = open_dir_confined(project, run_dir)
             if dir_fd is None:
                 return  # unconfined, or a component we cannot vouch for
             try:
-                atomic_write_text_at(dir_fd, _CTL_WINDOW_FILE, payload)
+                # pid first, so a failure between the two leaves a newer pid
+                # beside the older id — a pair no listed window can satisfy
+                if pane_pid:
+                    atomic_write_text_at(dir_fd, _CTL_PID_FILE, pane_pid)
+                else:
+                    _unlink_at(dir_fd, _CTL_PID_FILE)
+                atomic_write_text_at(dir_fd, _CTL_WINDOW_FILE, win_id)
             finally:
                 os.close(dir_fd)
         else:
             if not _run_dir_is_confined(project, run_dir):
                 return
-            atomic_write_text(run_dir / _CTL_WINDOW_FILE, payload, follow_symlinks=False)
+            if pane_pid:
+                atomic_write_text(run_dir / _CTL_PID_FILE, pane_pid, follow_symlinks=False)
+            else:
+                (run_dir / _CTL_PID_FILE).unlink(missing_ok=True)
+            atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
     except Exception:
         _forget_ctl_window(project, run_id)
 
@@ -417,9 +460,11 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     under the project root, so a session could equally write any id there. The
     pid is the process the mint actually started, and start_detached records it
     *before* it tags, so a window whose (best-effort) set_window_option never
-    landed is still reachable. A record without a pid (written before #750, or
-    by a mint whose pid read failed) still breaks ties among tagged rows but
-    never admits an untagged one.
+    landed is still reachable. The pid lives in a sibling file, not in the
+    record, so the record stays the id alone that releases before #750 read. A
+    record with no readable pid beside it (written before #750, by a mint whose
+    pid read failed, or a malformed sibling) still breaks ties among tagged rows
+    but never admits an untagged one.
 
     The honest limit: this proves the record was written by something that saw
     the window's pid, not that this project minted it. Anything with access to
@@ -478,8 +523,12 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     # leaves a record newer than the listing, naming a window the listing does not
     # carry yet — so it fails the re-prove and the answer falls back to a match
     # that was at least live when the listing was taken. `rows` is materialized
-    # (list_windows returns a list), so the loop pays nothing for the move.
-    recorded, recorded_pid = _parse_ctl_record(_read_ctl_window(project, run_id))
+    # (list_windows returns a list), so the loop pays nothing for the move. The
+    # pid sibling is read after the record, the reverse of the write order, so a
+    # relaunch in between yields a matching pair or an unsatisfiable one, never a
+    # newer id beside an older pid (see _record_ctl_window).
+    recorded = _read_ctl_window(project, run_id)
+    recorded_pid = _read_ctl_pid(project, run_id)
     for win_id, name, tag, pane_pid in rows:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
@@ -517,7 +566,7 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         ):
             # untagged, but the record names this window and the pid its mint
             # read — proof of the mint, not of the tag, so it only counts if
-            # nothing is tagged. A pid-less record never gets here (#750).
+            # nothing is tagged. A record with no pid never gets here (#750).
             untagged.append(win_id)
     matches = tagged or untagged
     if not matches:

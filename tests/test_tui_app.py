@@ -3896,8 +3896,10 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
     rid = "20260611-100000-aaaa"
     run_dir = make_run(project_tree.project, rid, run_type="sweep", alive=True)
     Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
-    # id + the pane pid its mint read: an untagged row needs both (#750)
-    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2\n4242", encoding="utf-8")
+    # the id + the pane pid its mint read, in the sibling: an untagged row
+    # needs both (#750)
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    (run_dir / launch._CTL_PID_FILE).write_text("4242", encoding="utf-8")
     selected: list[str] = []
 
     def fake(argv, **kwargs):

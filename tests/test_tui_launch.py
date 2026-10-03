@@ -337,11 +337,13 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
 
 def _write_record(project: Path, run_id: str, win_id: str, pane_pid: str | None = None) -> Path:
     """Stand in for a launch having minted `win_id` (with `pane_pid`, when the
-    mint could read one) for this run. No pid is the pre-#750 record shape."""
+    mint could read one) for this run. No pid sibling is the pre-#750 shape."""
     run_dir = runs.run_dir_for(project, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     record = run_dir / launch._CTL_WINDOW_FILE
-    record.write_text(f"{win_id}\n{pane_pid}" if pane_pid else win_id, encoding="utf-8")
+    record.write_text(win_id, encoding="utf-8")
+    if pane_pid is not None:
+        (run_dir / launch._CTL_PID_FILE).write_text(pane_pid, encoding="utf-8")
     return record
 
 
@@ -457,7 +459,7 @@ def test_ctl_window_id_refuses_an_untagged_window_on_a_pidless_record(monkeypatc
     "pid_line", ["abc", "-111", "١١١", " "], ids=["word", "sign", "arabic", "blank"]
 )
 def test_ctl_window_id_treats_a_malformed_pid_as_pidless(monkeypatch, tmp_path: Path, pid_line):
-    # A pid line that is not plain ASCII digits reads as no pid: it can still
+    # A pid file that is not plain ASCII digits reads as no pid: it can still
     # break a tie among tagged rows, but never admits an untagged one — even
     # when the listing's pid column carries the very same malformed text.
     _ctl_listing(monkeypatch, f"@4\tresume-RID\t\t{pid_line}\n", tmp_path)
@@ -467,6 +469,18 @@ def test_ctl_window_id_treats_a_malformed_pid_as_pidless(monkeypatch, tmp_path: 
     # Tie-break among tagged rows still honours the id.
     _ctl_listing(monkeypatch, "@1\trun-RID\n@4\tresume-RID\n", tmp_path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+
+
+def test_ctl_window_id_refuses_a_newer_pid_beside_an_older_record(monkeypatch, tmp_path: Path):
+    # The pid sibling is written BEFORE the record, so a launch that dies
+    # between the two writes leaves the newer mint's pid (4242, window @7)
+    # beside the older id (@3, whose pane pid is 999). No row satisfies that
+    # pair — @3 has the wrong pid and @7 is not the window the record names —
+    # so it admits nothing untagged and the lookup fails closed.
+    _ctl_listing(monkeypatch, "@3\trun-RID\t\t999\n@7\tresume-RID\t\t4242\n", tmp_path)
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@3", "4242")
+    assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
 def test_ctl_window_id_reads_the_record_after_the_listing(monkeypatch, tmp_path: Path):
@@ -876,12 +890,14 @@ def _make_run(project: Path, run_id: str = "RID") -> Path:
 
 
 def test_start_detached_records_the_window_it_minted(fake_run, tmp_path: Path):
-    # The id and, on its own line, the pane pid the mint's listing shows for it
-    # (#750) — the pid is what later admits the window if its tag never lands.
+    # The id, byte-identical to the pre-#750 record that older releases read
+    # whole, and the pane pid the mint's listing shows for it in the sibling
+    # file — the pid is what later admits the window if its tag never lands.
     fake_run.windows = "@3\trun-RID\t\t999\n@7\tresume-RID\t\t4242\n"
     run_dir = _make_run(tmp_path)
     launch.resume_detached(tmp_path, "RID")
-    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7\n4242"
+    assert (run_dir / launch._CTL_WINDOW_FILE).read_bytes() == b"@7"
+    assert (run_dir / launch._CTL_PID_FILE).read_text(encoding="utf-8") == "4242"
     # And the record it wrote admits the still-untagged window on lookup.
     assert launch.ctl_window_id(tmp_path, "RID") == "@7"
 
@@ -893,11 +909,14 @@ def test_start_detached_records_the_id_alone_without_a_readable_pid(
     fake_run, tmp_path: Path, windows: str
 ):
     # Best-effort: a listing that does not show the minted window, or shows a
-    # pid that is not digits, costs the pid line — never the record or launch.
+    # pid that is not digits, costs the pid — never the record or launch. And
+    # an older mint's pid must not survive beside the newer id: it is removed.
     fake_run.windows = windows
     run_dir = _make_run(tmp_path)
+    (run_dir / launch._CTL_PID_FILE).write_text("999", encoding="utf-8")
     launch.start_resolve_detached(tmp_path, "RID")
     assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
+    assert not (run_dir / launch._CTL_PID_FILE).exists()
 
 
 def test_start_detached_survives_a_raising_pid_read(fake_run, tmp_path: Path, monkeypatch):
@@ -1070,8 +1089,10 @@ def test_forget_refuses_a_linked_run_dir(tmp_path: Path):
     run_dir.unlink()
     run_dir.mkdir()
     (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    (run_dir / launch._CTL_PID_FILE).write_text("999", encoding="utf-8")
     launch._forget_ctl_window(project, "RID")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+    assert not (run_dir / launch._CTL_PID_FILE).exists()  # the pid sibling goes too
 
 
 @pytest.mark.skipif(not launch.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
@@ -1138,8 +1159,10 @@ def test_forget_falls_back_to_the_confinement_check_without_dir_fd(tmp_path: Pat
     run_dir.unlink()
     run_dir.mkdir()
     (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    (run_dir / launch._CTL_PID_FILE).write_text("999", encoding="utf-8")
     launch._forget_ctl_window(project, "RID")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+    assert not (run_dir / launch._CTL_PID_FILE).exists()  # the pid sibling goes too
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="tab/newline are legal POSIX name bytes")
@@ -1334,7 +1357,29 @@ def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     # Clobbered, not refused: the record self-heals into a plain file, so the
     # next launch does not trip over a link left in place.
     assert not record.is_symlink()
-    assert record.read_text(encoding="utf-8") == "@7\n4242"
+    assert record.read_text(encoding="utf-8") == "@7"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("anchored", [True, False], ids=["dir-fd", "path-fallback"])
+def test_symlinked_pid_sibling_is_replaced_not_followed(
+    fake_run, tmp_path: Path, monkeypatch, anchored: bool
+):
+    # The pid sibling is the same kind of host-side write as the record, so it
+    # carries the same rule on both writers: the write lands on the name, never
+    # on a link a session planted there.
+    monkeypatch.setattr(launch, "DIR_FD_ANCHORED_WRITES", anchored)
+    run_dir = _make_run(tmp_path)
+    outside = tmp_path / "pyproject.toml"
+    outside.write_text("[project]\n", encoding="utf-8")
+    sibling = run_dir / launch._CTL_PID_FILE
+    sibling.symlink_to(outside)
+    fake_run.windows = "@7\tresume-RID\t\t4242\n"
+
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert outside.read_text(encoding="utf-8") == "[project]\n"  # not redirected
+    assert not sibling.is_symlink()
+    assert sibling.read_text(encoding="utf-8") == "4242"
 
 
 def _fail_the_record(monkeypatch, exc: BaseException) -> None:
@@ -1444,11 +1489,12 @@ def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkey
     # *previous* launch's id authoritative — that id names a window this launch
     # just superseded, so the honest state is no record at all.
     run_dir = _make_run(tmp_path)
-    _write_record(tmp_path, "RID", "@2")
+    _write_record(tmp_path, "RID", "@2", "999")
 
     _fail_the_record(monkeypatch, OSError("disk full"))
     launch.resume_detached(tmp_path, "RID")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
+    assert not (run_dir / launch._CTL_PID_FILE).exists()
 
 
 def test_failed_record_survives_a_non_oserror(fake_run, tmp_path: Path, monkeypatch):
