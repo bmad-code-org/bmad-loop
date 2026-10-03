@@ -1407,7 +1407,8 @@ def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
     deliberately so: a by-name kill in a shared registry without tag proof
     could take another project's same-named session (run ids are unique per
     project only). The legacy sweep in :func:`prune_sessions`, which does
-    demand the tag, is the path that reaches it."""
+    demand the tag, is the path that reaches it — and, for one run's session
+    on a resume, :func:`kill_displaced_session`."""
     if run_id_aliases_control_session(run_id):
         return
     (mux or get_multiplexer()).kill_session(session_name(run_id))
@@ -1836,6 +1837,83 @@ def prune_sessions(
         live += [i for i in extra_live if i not in live]
         unknown |= extra_unknown
     return prunable, live, unknown
+
+
+def kill_displaced_session(project: Path, run_id: str) -> list[str]:
+    """Kill ``run_id``'s agent session in every legacy registry where its
+    ownership tag proves it this project's, and return one line per thing that
+    still stands in the resume's way: a registry that could not be listed, or a
+    same-named session left standing because nothing proves it ours. ``[]``
+    means every registry answered and none holds a blocker.
+
+    For a resume: :func:`kill_session` reaches only the registry this process
+    addresses, and psmux's duplicate-server guard is a mutex keyed on the
+    session name across every registry (psmux/psmux#599), so a same-named
+    session left standing in a registry this process no longer addresses — the
+    one it displaced (#537), psmux's default from before the per-project root,
+    or the derived one an opt-in to the operator's own root moved away from
+    (#729) — makes the resumed session's create fail.
+
+    **Tag-proven, never by name.** A legacy registry is shared and run ids are
+    unique per project only, so the rule is the one :func:`prune_sessions`'
+    legacy pass applies (``require_tag=True``): the session's
+    :data:`PROJECT_OPTION` tag must be one of :func:`accepted_tags`. The
+    partition's *liveness* arm is deliberately not reused: by the time a resume
+    gets here it has refused a live engine and published its own pid, so the
+    run reads alive and every stale session would be spared. The session is
+    this run's, and this process is its engine.
+
+    Listed through ``list_sessions_reporting`` so a failed listing reaches the
+    returned lines instead of folding into "no session". A failed tag read
+    still warns on the backend's own channel and proves nothing, so the session
+    is left standing and named here. The kill itself is best-effort and silent,
+    so the registry is re-listed after it and a survivor is named too.
+    """
+    if run_id_aliases_control_session(run_id):
+        return []
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        return [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    blockers: list[str] = []
+    mine = accepted_tags(project)
+    for legacy in legacies:
+        label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
+        listing_faults: list[str] = []
+        # Through the registry's own name key: on psmux `bmad-loop-R1` IS
+        # `bmad-loop-r1`, and the mutex folds the same way.
+        target = legacy.session_name_key(session_name(run_id))
+        try:
+            names = legacy.list_sessions_reporting(on_fault=listing_faults.append)
+            ours = [n for n in names if legacy.session_name_key(n) == target]
+            tags = legacy.session_options(PROJECT_OPTION) if ours else {}
+            killed = False
+            for name in ours:
+                if tags.get(name, "") in mine:
+                    kill_session(run_id, legacy)
+                    killed = True
+                else:
+                    blockers.append(
+                        f"{label}: {name} left standing — its ownership tag does not "
+                        "prove it this project's"
+                    )
+            # The kill is best-effort and silent by contract, so whether it
+            # landed is read back rather than assumed.
+            survivors = (
+                [
+                    n
+                    for n in legacy.list_sessions_reporting(on_fault=listing_faults.append)
+                    if legacy.session_name_key(n) == target
+                ]
+                if killed
+                else []
+            )
+        except MultiplexerError as exc:
+            blockers.append(f"{label}: could not be listed: {exc}")
+            continue
+        blockers += [f"{label}: could not be listed: {fault}" for fault in listing_faults]
+        blockers += [f"{label}: {name} still standing after the kill" for name in survivors]
+    return blockers
 
 
 #: How a frontend names psmux's OWN default registry, the one root

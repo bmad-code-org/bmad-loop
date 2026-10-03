@@ -40,6 +40,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Kill a resumed run's stale psmux session in the registry it predates (the
+  displaced or pre-#537 default root, or the derived one after opting in to
+  your own), tag-proven only; a same-named survivor there made the resumed
+  session's create fail on psmux's cross-registry name mutex. A registry that
+  cannot be listed, or a session left standing, is journalled and warned about.
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 

@@ -7873,6 +7873,9 @@ class _RegistryMux:
     def list_sessions(self):
         return list(self._sessions)
 
+    def list_sessions_reporting(self, *, on_fault=None):
+        return self.list_sessions()
+
     def session_options(self, _option):
         return dict(self._tags)
 
@@ -8061,6 +8064,131 @@ def test_prune_sessions_refuses_an_untagged_legacy_session_claimed_only_by_a_run
 
     assert runs.prune_sessions(ours) == ([], [], set())
     assert legacy.killed == []
+
+
+class _RemovingMux(_RegistryMux):
+    """A registry whose kill lands: the session leaves the listing."""
+
+    def kill_session(self, name):
+        super().kill_session(name)
+        key = self.session_name_key(name)
+        self._sessions = [s for s in self._sessions if self.session_name_key(s) != key]
+
+
+def test_kill_displaced_session_kills_only_this_runs_tag_proven_session(tmp_path, monkeypatch):
+    """A resume must clear a same-named session in a registry this process no
+    longer addresses, or psmux's name mutex (it spans registries) rejects the
+    resumed session's create. Exactly that one session, and only on its tag:
+    another run of ours stays, and a neighbour's same-named session and an
+    untagged one stay too, even though this project holds a dead `r1` run dir
+    the primary pass's untagged fallback would accept as proof.
+
+    Each one left standing is named, because it will still block the resume.
+    Ablate the `kill_session(run_id, legacy)` call and `mine.killed` is empty;
+    ablate the tag check and the other two are killed."""
+    ours = runs.project_tag(tmp_path)
+    (_make_state_run(tmp_path, "r1") / "engine.pid").write_text(str(_dead_pid()))
+    mine = _RemovingMux(
+        ["bmad-loop-r1", "bmad-loop-r2"], {"bmad-loop-r1": ours, "bmad-loop-r2": ours}
+    )
+    neighbour = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": "0123456789abcdef"}, root=str(tmp_path / "n")
+    )
+    untagged = _RegistryMux(["bmad-loop-r1"], {}, root=str(tmp_path / "u"))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [mine, neighbour, untagged])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert mine.killed == ["bmad-loop-r1"]
+    assert neighbour.killed == untagged.killed == []
+    assert len(blockers) == 2
+    assert str(tmp_path / "n") in blockers[0] and str(tmp_path / "u") in blockers[1]
+    assert all("bmad-loop-r1 left standing" in b for b in blockers)
+
+
+def test_kill_displaced_session_kills_even_though_the_resumed_run_reads_alive(
+    tmp_path, monkeypatch
+):
+    """By the time a resume sweeps, it has refused a live engine and published
+    its own pid, so the run reads alive. Reusing the prune partition's liveness
+    arm would spare every stale session — the one case this exists for.
+
+    Ablate by routing the claim back through `prunable_sessions` and this
+    fails."""
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
+    legacy = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert legacy.killed == ["bmad-loop-r1"]
+
+
+def test_kill_displaced_session_reports_a_registry_it_could_not_ask(tmp_path, monkeypatch):
+    """Could not ask is not "nothing there". A listing the backend folds into
+    `[]` reaches the sink, one that raises is caught, and a backend that cannot
+    be selected is a line of its own; registries that did answer are still
+    swept.
+
+    Ablate the `on_fault` sink (call `list_sessions()`) and the first line is
+    lost; ablate either `except MultiplexerError` arm and this raises."""
+
+    class _Folding(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            assert on_fault is not None
+            on_fault("list-sessions failed: rc 1")
+            return []
+
+    class _Raising(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            raise MultiplexerError("registry unreadable")
+
+    folding = _Folding([], {}, root=str(tmp_path / "fold"))
+    raising = _Raising([], {}, root=str(tmp_path / "raise"))
+    fine = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding, raising, fine])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert len(blockers) == 2
+    assert str(tmp_path / "fold") in blockers[0] and "rc 1" in blockers[0]
+    assert str(tmp_path / "raise") in blockers[1] and "registry unreadable" in blockers[1]
+    assert fine.killed == ["bmad-loop-r1"]
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    assert [
+        "backend selection failed: no backend" in f
+        for f in runs.kill_displaced_session(tmp_path, "r1")
+    ] == [True]
+
+
+def test_kill_displaced_session_names_a_session_its_kill_did_not_remove(tmp_path, monkeypatch):
+    """The kill is best-effort and silent, and a survivor still holds psmux's
+    name mutex, so it is read back and named rather than reported as cleared.
+
+    Ablate the re-listing and this returns `[]`."""
+    stuck = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)}, root=str(tmp_path / "s")
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [stuck])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert stuck.killed == ["bmad-loop-r1"]
+    assert blockers == [f"{tmp_path / 's'}: bmad-loop-r1 still standing after the kill"]
+
+
+def test_kill_displaced_session_matches_through_the_registrys_name_key(tmp_path, monkeypatch):
+    """psmux folds session-name case, so a resume of `r1` must find a stale
+    `bmad-loop-R1` — its mutex blocks `bmad-loop-r1` all the same.
+
+    Ablate the `session_name_key` comparison (match names exactly) and nothing
+    is killed."""
+    tag = runs.project_tag(tmp_path)
+    folding = _RemovingMux(["bmad-loop-R1"], {"bmad-loop-R1": tag}, fold=True)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert folding.killed == ["bmad-loop-r1"]
 
 
 def test_prune_sessions_still_claims_an_untagged_session_in_the_primary_registry(
