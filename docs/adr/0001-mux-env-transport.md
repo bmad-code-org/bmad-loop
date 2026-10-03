@@ -245,6 +245,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 
 - For **future panes**: `tmux set-environment -t =<ctl> BMAD_LOOP_STATE_DIR <root>`. The session scope matters, because a session value overrides the global one (§3.2), so a global-only fix can leave a stale session value in force. Add `-g` as well to cover new sessions, or use `tmux kill-server` to restart clean.
 - For **already-running shells**, including window 0: no query can see them, and `set-environment` cannot change them. They need an in-shell `export BMAD_LOOP_STATE_DIR=<root>` or recreating.
+- Both commands render `<root>` (and `<ctl>`) **shell-quoted** (`shlex.quote`), never interpolated verbatim: a valid root such as `/home/me/state dir` would otherwise split into extra arguments (`set-environment` takes a single value), and shell metacharacters would change what a copied command runs. Stage 1's tests assert the quoting with a root that contains a space and a metacharacter.
 
 **Files:**
 
