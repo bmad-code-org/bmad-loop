@@ -45,7 +45,11 @@ breaking changes may land in a minor release.
   (#750). When a window under the run's name is left alone because its tag reads
   empty (never written, or unreadable — psmux's option probe can fail), `x`
   warns that the control window was not closed instead of reporting a clean
-  stop, and `a` and `bmad-loop attach` say why they cannot reach it.
+  stop, and `a` and `bmad-loop attach` say why they cannot reach it. A control
+  listing that fails outright is reported as such instead of reading as "no
+  window" (by `x`, `a`, `bmad-loop attach` and the window prune), `x` checks
+  that the window it killed is gone, and a TUI run or sweep launch warns when
+  its new window cannot be confirmed as this project's.
 
 ## [0.13.1] — 2026-10-01
 

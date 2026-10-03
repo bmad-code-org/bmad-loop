@@ -2703,6 +2703,47 @@ async def test_long_docked_title_keeps_its_markers(project_tree):
 # ------------------------------------------------------------- run control
 
 
+@pytest.mark.parametrize("minted", [None, "@7"], ids=["unreachable", "reachable"])
+async def test_start_run_warns_when_its_window_is_unreachable(project, monkeypatch, minted):
+    # #750: start_run_detached returns None when the lookup `a`/`x` use cannot
+    # reach the window it just minted (its tag write did not land). The launch
+    # is still reported, with a warning beside it — and only then.
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a) or minted)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        await until(pilot, lambda: any(" launched " in m for m in notifications(app)))
+        warned = any("could not be confirmed" in m for m in notifications(app))
+        assert warned is (minted is None)
+
+
+@pytest.mark.parametrize("minted", [None, "@7"], ids=["unreachable", "reachable"])
+async def test_start_sweep_warns_when_its_window_is_unreachable(project, monkeypatch, minted):
+    # The sweep twin of the run-launch warning (#750): None from the launcher
+    # means `a`/`x` cannot reach the window it just minted.
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_sweep_detached", lambda *a, **kw: calls.append(a) or minted)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("s")
+        await until(pilot, lambda: isinstance(app.screen, StartSweepModal))
+        await ready(pilot, "#ok")
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        await until(pilot, lambda: any(" launched " in m for m in notifications(app)))
+        warned = any("could not be confirmed" in m for m in notifications(app))
+        assert warned is (minted is None)
+
+
 async def test_start_run_modal_escape_cancels(project_tree, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -3922,7 +3963,7 @@ async def test_attach_warns_about_an_unproven_window_beside_a_proven_one(project
         await until(pilot, lambda: dashboard(app).decision_pending is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
-        assert any("carry no readable project tag" in m for m in notifications(app))
+        assert any("no readable project tag" in m for m in notifications(app))
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
 
 
@@ -5764,6 +5805,53 @@ async def test_stop_run_warns_when_the_ctl_window_is_left_running(project_tree, 
         needle = "was not closed"
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
         assert "run 20260611-100000-aaaa stopped" not in notifications(app)
+
+
+async def test_stop_run_warns_when_the_ctl_listing_cannot_be_read(project_tree, monkeypatch):
+    # #750: the ctl listing itself failed, so the lookup raises rather than
+    # answering "no window". The engine stop already went through; the toast
+    # must say the window could not be checked instead of a clean "stopped".
+    from bmad_loop import runs
+
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "stop_run", lambda rd: True)
+    monkeypatch.setattr(launch, "kill_ctl_window", boom)
+    make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        needle = "may still be running"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert "run 20260611-100000-aaaa stopped" not in notifications(app)
+        assert not any("stop failed" in m for m in notifications(app))
+
+
+async def test_attach_toasts_a_ctl_listing_it_could_not_read(project, monkeypatch):
+    # The attach half: a raise from the lookup is toasted by the guard, and
+    # nothing is attached — never the plain "nothing to attach" absence.
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        needle = "could not list the windows"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert not any("nothing to attach" in m for m in notifications(app))
+        assert isinstance(app.screen, DashboardScreen)
 
 
 async def test_attach_says_why_an_unproven_ctl_window_is_out_of_reach(project, monkeypatch):

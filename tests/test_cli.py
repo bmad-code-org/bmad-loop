@@ -2875,7 +2875,7 @@ def test_attach_nothing_to_attach(project, monkeypatch, capsys):
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
     err = capsys.readouterr().err
     assert "nothing to attach" in err
-    assert "carry no readable project tag" not in err
+    assert "no readable project tag" not in err
 
 
 def test_attach_explains_an_unproven_ctl_window(project, monkeypatch, capsys):
@@ -2890,7 +2890,7 @@ def test_attach_explains_an_unproven_ctl_window(project, monkeypatch, capsys):
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
     err = capsys.readouterr().err
-    assert "carry no readable project tag" in err
+    assert "no readable project tag" in err
     assert "nothing to attach" in err
 
 
@@ -2914,7 +2914,7 @@ def test_attach_warns_before_falling_back_past_an_unproven_window(project, monke
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
     assert len(seen_at_attach) == 1
-    assert "carry no readable project tag" in seen_at_attach[0]
+    assert "no readable project tag" in seen_at_attach[0]
 
 
 def test_attach_multiplexer_error_surfaces_clean_error(project, monkeypatch, capsys):
