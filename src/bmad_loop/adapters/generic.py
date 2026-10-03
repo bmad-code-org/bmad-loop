@@ -803,7 +803,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------- multiplexer
 
     def _ensure_session(self, cwd: Path) -> None:
-        if not self.mux.has_session(self.session_name):
+        if self.mux.has_session(self.session_name):
+            # Reusing it is right for this run's own session (a resume), and
+            # wrong for a same-named one of another project's in a shared
+            # registry (#729): every window would open inside it, under its tag.
+            refusal = runs.foreign_session_refusal(
+                self.session_name, self.mux, self.run_dir.parents[2]
+            )
+            if refusal is not None:
+                raise MultiplexerError(
+                    f"refusing to launch into the existing session {self.session_name}: "
+                    f"{refusal} — stop or rename that run, or turn off "
+                    "[mux] honor_ambient_psmux_data_dir"
+                )
+        else:
             self.mux.new_session(self.session_name, cwd, PANE_COLUMNS, PANE_LINES)
             # Tag the session with its project so a cleanup in another project
             # never prunes this run (run_dir = <project>/.bmad-loop/runs/<id>).

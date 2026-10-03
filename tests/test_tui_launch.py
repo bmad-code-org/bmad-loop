@@ -2189,6 +2189,45 @@ def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
     assert launch.attach_plan(Path("/proj"), "RID") is None
 
 
+class _SharedRegistryWithForeignSession:
+    """A shared (honoured, #729) registry where `bmad-loop-RID` is another
+    project's tagged session."""
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return "/shared-registry"
+
+    def session_name_key(self, name):
+        return name
+
+    def has_session(self, name):
+        return name == "bmad-loop-RID"
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return ["bmad-loop-RID"]
+
+    def session_options(self, _option):
+        return {"bmad-loop-RID": "0123456789abcdef"}
+
+
+def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tmp_path, capsys):
+    """In a registry shared with another project, `bmad-loop-RID` may be that
+    project's live coding session; attaching the operator to it is the by-name
+    hazard. `session_exists` reads it as absent and says why, so with no ctl
+    window there is nothing to attach.
+
+    Ablate the gate in `session_exists` and the plan attaches to it."""
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _SharedRegistryWithForeignSession())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+
+    assert launch.attach_plan(tmp_path, "RID") is None
+    assert "treating bmad-loop-RID as absent" in capsys.readouterr().err
+
+
 def test_run_captured_merges_streams(monkeypatch):
     def fake(argv, **kwargs):
         assert argv[:3] == [sys.executable, "-m", "bmad_loop.cli"]

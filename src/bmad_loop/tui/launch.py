@@ -63,7 +63,19 @@ def mux_available() -> bool:
 
 
 def session_exists(session: str) -> bool:
-    return get_multiplexer().has_session(session)
+    mux = get_multiplexer()
+    if not mux.has_session(session):
+        return False
+    if runs.is_ctl_session_name(session):
+        return True  # per-project name already (`runs.ctl_session_for`)
+    # An agent session in a shared registry may be another project's (#729):
+    # it does not exist as far as this project is concerned, and saying why is
+    # the difference between that and "no session".
+    refusal = runs.foreign_session_refusal(session, mux)
+    if refusal is not None:
+        print(f"warning: treating {session} as absent — {refusal}", file=sys.stderr)
+        return False
+    return True
 
 
 # Run-dir sidecar naming the ctl-session window start_detached minted last for

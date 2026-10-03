@@ -12,7 +12,10 @@ breaking changes may land in a minor release.
 - Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
   absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
   session registry instead of the derived per-project root; `bmad-loop mux`
-  says which source won (#729).
+  says which source won (#729). Such a root can be shared by several projects,
+  so there a same-named session is killed, attached, read as live or adopted
+  by a launch only when its project tag proves it this project's; a refusal is
+  warned about, and a launch that would adopt one fails with the reason.
 - Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
   before `[verify]` commands, before each dev and review session launch, and
   before a failed attempt is charged; a failing, hanging or unrunnable probe

@@ -157,6 +157,72 @@ def test_ensure_session_tags_project(tmp_path, monkeypatch, force_tmux_backend):
     ]
 
 
+class _SharedRegistryMux:
+    """A shared (honoured, #729) registry already holding `name`, tagged `tag`."""
+
+    def __init__(self, name, tag):
+        self._name, self._tag = name, tag
+        self.created: list[str] = []
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return "/shared-registry"
+
+    def session_name_key(self, name):
+        return name
+
+    def has_session(self, name):
+        return name == self._name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return [self._name]
+
+    def session_options(self, _option):
+        return {self._name: self._tag} if self._tag else {}
+
+    def new_session(self, name, *_args):
+        self.created.append(name)
+
+
+@pytest.mark.parametrize("tag", ["0123456789abcdef", ""], ids=["foreign", "untagged"])
+def test_ensure_session_refuses_to_adopt_another_projects_session(tmp_path, tag):
+    """In a registry shared with another project, an existing same-named
+    session may be that project's: adopting it would open this run's windows
+    inside it, under its tag. The launch fails with a clear error instead.
+
+    Ablate the gate in `_ensure_session` and it returns as if the session were
+    this run's own."""
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "RID"  # parents[2] == project
+    mux = _SharedRegistryMux("bmad-loop-RID", tag)
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir,
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+    with pytest.raises(MultiplexerError, match="refusing to launch into the existing session"):
+        adapter._ensure_session(tmp_path)
+    assert mux.created == []
+
+
+def test_ensure_session_reuses_its_own_session_in_a_shared_registry(tmp_path):
+    """The other half: this run's own tagged session (a resume) is reused."""
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "RID"
+    mux = _SharedRegistryMux("bmad-loop-RID", runs.project_tag(tmp_path))
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir,
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+    adapter._ensure_session(tmp_path)
+    assert mux.created == []
+
+
 def make_spec(tmp_path, task_id="1-1-a-dev-1", timeout_s=30.0, model="sonnet") -> SessionSpec:
     return SessionSpec(
         task_id=task_id,
@@ -726,6 +792,10 @@ class _UnitMux:
 
     def has_session(self, name):
         return True
+
+    def has_registry_namespace(self):
+        # tmux-shaped: the shared-registry ownership gate (#729) stays out.
+        return False
 
     def send_text(self, window_id, text):
         # The contract/stall nudges reach the mux too; recording them keeps that
@@ -4604,6 +4674,10 @@ class _StartSessionMux:
         # The crash-path diagnosis probe (#489) asks this; these tests are about a
         # window that died under a session that is still very much there.
         return True
+
+    def has_registry_namespace(self):
+        # tmux-shaped: the shared-registry ownership gate (#729) stays out.
+        return False
 
 
 @pytest.mark.parametrize(

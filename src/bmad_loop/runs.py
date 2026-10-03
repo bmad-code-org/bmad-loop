@@ -647,6 +647,14 @@ def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambi
     return ambient
 
 
+# The project this process configured its registry for
+# (`export_psmux_registry_root`), or None before that ran. Process-local, set
+# once ahead of dispatch like the backend's displaced-root record; it is what
+# lets the by-name session operations prove ownership without a project
+# parameter (see `foreign_session_refusal`).
+_SETTLED_PROJECT: Path | None = None
+
+
 def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) -> str | None:
     """Point this process — and everything it spawns — at ``project``'s registry
     by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or
@@ -737,6 +745,11 @@ def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) ->
     diagnostics down with it. ``None`` means "no root established": psmux keeps
     whatever it had, which is also the root cleanup sweeps as the legacy one.
     """
+    global _SETTLED_PROJECT
+    # Recorded before anything can fail: the ownership gate needs the project
+    # on the degrade arm too, where the registry in force is not one derived
+    # for it (see `foreign_session_refusal`).
+    _SETTLED_PROJECT = project
     try:
         root = str(mux_registry_root(project))
     except (StateRootError, OSError, RuntimeError):
@@ -1283,7 +1296,15 @@ def _session_liveness(run_id: str) -> str:
     if not mux_usable(mux):  # forced-aware, like every other observer gate
         return "unknown"
     try:
-        return "alive" if mux.has_session(session_name(run_id)) else "unknown"
+        if not mux.has_session(session_name(run_id)):
+            return "unknown"
+        # A same-named session in a shared registry may be another project's:
+        # it proves nothing about this run, which is exactly 'unknown'.
+        refusal = foreign_session_refusal(session_name(run_id), mux)
+        if refusal is not None:
+            _warn_foreign_session(f"reading {session_name(run_id)} as this run's", refusal)
+            return "unknown"
+        return "alive"
     except (OSError, MultiplexerError):
         # The seam raises MultiplexerError (not OSError) on a backend failure; a
         # dead query proves nothing about a legacy run, so degrade to 'unknown'
@@ -1381,7 +1402,101 @@ def discover_runs(project: Path) -> tuple[list[RunInfo], str | None]:
 # ----------------------------------------------------------- stop / delete / archive
 
 
-def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
+def foreign_session_refusal(
+    name: str, mux: TerminalMultiplexer | None = None, project: Path | None = None
+) -> str | None:
+    """Why the session called ``name`` may NOT be treated as ``project``'s, or
+    ``None`` when it may (or does not exist).
+
+    A by-name operation — a kill, an attach, a liveness read, an adapter adopting
+    a session it finds already there — is sound only where the registry itself
+    proves ownership: the derived per-project root, whose every session is this
+    project's. An operator's honoured root (#729) is shared by every project that
+    honours it, and run ids are unique per project only, so there
+    ``bmad-loop-<id>`` may be a neighbour's. In such a registry the session must
+    carry this project's tag (:data:`PROJECT_OPTION` in :func:`accepted_tags`) —
+    the proof the cleanup sweep already demands (``require_tag``).
+
+    Gated: a namespacing backend whose root in force is set and is not the
+    derived one. Ungated: tmux (no namespace), the derived root, and psmux's own
+    default registry (``registry_root()`` ``None`` — the underivable-state-root
+    degrade arm, which predates #729 and is warned about at startup).
+
+    ``project`` defaults to the one this process configured
+    (``export_psmux_registry_root``); with neither, ownership cannot be proven
+    and the answer is a refusal. A listing that faults is a refusal too: "could
+    not ask" never reads as "absent".
+    """
+    mux = mux or get_multiplexer()
+    try:
+        if not mux.has_registry_namespace():
+            return None
+        root = mux.registry_root()
+    except MultiplexerError as exc:
+        return f"the multiplexer could not be asked which registry is in force: {exc}"
+    if root is None:
+        return None
+    project = project or _SETTLED_PROJECT
+    if project is None:
+        return (
+            f"the registry {root} is not one derived for a known project, so "
+            f"ownership of {name} cannot be proven"
+        )
+    try:
+        if root == str(mux_registry_root(project)):
+            return None
+    except (StateRootError, OSError, RuntimeError):
+        pass  # no derived root: the one in force proves nothing, so ask the tag
+    key = mux.session_name_key(name)
+    faults: list[str] = []
+    present: list[str] = []
+    tags: dict[str, str] = {}
+    try:
+        listed = mux.list_sessions_reporting(on_fault=faults.append)
+        present = [n for n in listed if mux.session_name_key(n) == key]
+        tags = mux.session_options(PROJECT_OPTION) if present and not faults else {}
+    except MultiplexerError as exc:
+        faults.append(str(exc))
+    if faults:
+        return (
+            f"the shared registry {root} could not be listed ({faults[0]}), so "
+            f"ownership of {name} cannot be proven"
+        )
+    if not present:
+        return None
+    tag = next((v for s, v in tags.items() if mux.session_name_key(s) == key), "")
+    try:
+        mine = accepted_tags(project)
+    except (OSError, RuntimeError) as exc:
+        return (
+            f"this project's tag could not be computed ({exc}), so ownership of "
+            f"{name} cannot be proven"
+        )
+    if tag in mine:
+        return None
+    whose = "untagged" if not tag else "tagged for another project"
+    return f"{name} in the shared registry {root} is {whose}, so it is not this project's"
+
+
+def _warn_foreign_session(what: str, refusal: str) -> None:
+    print(f"warning: {what} refused — {refusal}", file=sys.stderr)
+
+
+# Kills `kill_session` refused since the last `drain_refused_kills`, one line
+# each. stderr is the CLI's channel; the TUI cannot read it (Textual captures
+# it for the app's whole run), so its cleanup worker drains this instead.
+_REFUSED_KILLS: list[str] = []
+
+
+def drain_refused_kills() -> list[str]:
+    """The kills :func:`kill_session` refused since the last call, oldest
+    first, and forget them — for a frontend whose stderr nobody reads."""
+    drained = list(_REFUSED_KILLS)
+    del _REFUSED_KILLS[: len(drained)]
+    return drained
+
+
+def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> bool:
     """Kill a run's agent session (bmad-loop-<id>); a no-op when it is already
     gone or the multiplexer is unavailable.
 
@@ -1408,10 +1523,27 @@ def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
     could take another project's same-named session (run ids are unique per
     project only). The legacy sweep in :func:`prune_sessions`, which does
     demand the tag, is the path that reaches it — and, for one run's session
-    on a resume, :func:`kill_displaced_session`."""
+    on a resume, :func:`kill_displaced_session`.
+
+    In the primary registry the kill is also refused, with a warning, when that
+    registry is shared (an operator's honoured root, #729) and the session's
+    tag does not prove it this project's — :func:`foreign_session_refusal`.
+
+    Returns ``False`` when the kill was refused (either rule above), ``True``
+    when it was sent — sent, not landed: the backend kill is best-effort."""
     if run_id_aliases_control_session(run_id):
-        return
+        return False
+    if mux is None:
+        # The primary registry: a by-name kill there needs ownership proof when
+        # it is shared (`foreign_session_refusal`). An explicit `mux` is a legacy
+        # registry whose callers judged the tag already.
+        refusal = foreign_session_refusal(session_name(run_id))
+        if refusal is not None:
+            _warn_foreign_session(f"killing {session_name(run_id)}", refusal)
+            _REFUSED_KILLS.append(refusal)
+            return False
     (mux or get_multiplexer()).kill_session(session_name(run_id))
+    return True
 
 
 CTL_SESSION = "bmad-loop-ctl"
@@ -1819,8 +1951,10 @@ def prune_sessions(
         project, require_tag=not _registry_proves_ownership(project)
     )
     if not dry_run:
-        for run_id in prunable:
-            kill_session(run_id)
+        # A kill the ownership gate refuses (a listing that faulted between the
+        # partition and the kill) is not reported as removed; it warned.
+        prunable = [run_id for run_id in prunable if kill_session(run_id) is not False]
+        unknown &= set(prunable)  # the killed subset, by contract
     try:
         legacies = _legacy_registries()
     except MultiplexerError:
