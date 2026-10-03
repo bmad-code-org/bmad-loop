@@ -824,7 +824,11 @@ def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
 
 def test_ctl_window_id_no_session_or_tmux(monkeypatch, tmp_path: Path):
     def fake(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no session")
+        # A wording _SESSION_GONE_STDERR recognises: an empty listing is only
+        # trusted as "no window" when the confirming probe proves the session gone.
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="can't find session: bmad-loop-ctl"
+        )
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
