@@ -2703,6 +2703,47 @@ async def test_long_docked_title_keeps_its_markers(project_tree):
 # ------------------------------------------------------------- run control
 
 
+@pytest.mark.parametrize("minted", [None, "@7"], ids=["unreachable", "reachable"])
+async def test_start_run_warns_when_its_window_is_unreachable(project, monkeypatch, minted):
+    # #750: start_run_detached returns None when the lookup `a`/`x` use cannot
+    # reach the window it just minted (its tag write did not land). The launch
+    # is still reported, with a warning beside it — and only then.
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a) or minted)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        await until(pilot, lambda: any(" launched " in m for m in notifications(app)))
+        warned = any("could not be confirmed" in m for m in notifications(app))
+        assert warned is (minted is None)
+
+
+@pytest.mark.parametrize("minted", [None, "@7"], ids=["unreachable", "reachable"])
+async def test_start_sweep_warns_when_its_window_is_unreachable(project, monkeypatch, minted):
+    # The sweep twin of the run-launch warning (#750): None from the launcher
+    # means `a`/`x` cannot reach the window it just minted.
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_sweep_detached", lambda *a, **kw: calls.append(a) or minted)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("s")
+        await until(pilot, lambda: isinstance(app.screen, StartSweepModal))
+        await ready(pilot, "#ok")
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        await until(pilot, lambda: any(" launched " in m for m in notifications(app)))
+        warned = any("could not be confirmed" in m for m in notifications(app))
+        assert warned is (minted is None)
+
+
 async def test_start_run_modal_escape_cancels(project_tree, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -3732,7 +3773,7 @@ async def test_attach_without_mux_notifies(project, monkeypatch):
 async def test_attach_without_agent_session_notifies(project, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 0))
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -3749,7 +3790,7 @@ async def test_attach_multiplexer_error_notifies(project, monkeypatch):
     # TUI must surface the error as a toast, not crash the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 0))
 
     def boom(_target):
         raise MultiplexerError("backend server not reachable")
@@ -3773,7 +3814,7 @@ async def test_attach_session_probe_error_notifies(project, monkeypatch):
     # torn down in between). action_attach routes it through _mux_guarded, so the
     # TUI toasts the error and aborts the attach instead of crashing the app.
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 0))
 
     def boom(_session):
         raise MultiplexerError("session probe unreachable")
@@ -3864,7 +3905,7 @@ async def test_attach_targets_ctl_window_when_decision_pending(project_tree, mon
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)  # agent up too
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
@@ -3880,15 +3921,61 @@ async def test_attach_targets_ctl_window_when_decision_pending(project_tree, mon
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_attach_warns_then_falls_back_to_the_agent_past_an_unproven_window(
+    project_tree, monkeypatch
+):
+    # #750: the decision prompt's ctl window cannot be proven ours (its tag reads
+    # empty), so it is out of reach — say so, then still take the live agent
+    # session. A return after the warning would strand the operator: this pins
+    # both halves.
+    run_dir = make_run(project_tree.project, "20260611-100000-aaaa", run_type="sweep", alive=True)
+    Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 1))
+    calls, stamps = _patch_attach_exec(monkeypatch)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).decision_pending is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: bool(calls))
+        assert any("cannot attach to the run window" in m for m in notifications(app))
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-20260611-100000-aaaa"]]
+    assert stamps == []
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_attach_warns_about_an_unproven_window_beside_a_proven_one(project_tree, monkeypatch):
+    # A tagged predecessor is answered, but an untagged window under the same
+    # run name (a relaunch whose tag write failed) was passed over: the attach
+    # goes ahead, and the operator still hears about the one left out.
+    run_dir = make_run(project_tree.project, "20260611-100000-aaaa", run_type="sweep", alive=True)
+    Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 1))
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).decision_pending is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: bool(calls))
+        assert any("no readable project tag" in m for m in notifications(app))
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
 async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
-    # The one attach test that does NOT replace ctl_window_id, so it pins the
+    # The one attach test that does NOT replace ctl_window_lookup, so it pins the
     # seam every other one stubs out: that the TUI hands it the same project root
     # the launch recorded the window under (#482). Point app.py at anything else
     # — the run dir, an unresolved path — and the record is unfindable under that
-    # root, so these untagged rows prove nothing and the lookup answers None
-    # (#531). session_exists is stubbed True here, so `a` then takes the live
-    # agent session instead of the ctl window: nothing is selected and nothing is
-    # stamped, and both assertions below fail.
+    # root, so the tie-break among these tagged rows falls back to the parked
+    # `@1` and both assertions below fail. Tagged as start_detached leaves them:
+    # an untagged row is never a candidate (#750), whatever the record says.
     import subprocess as _subprocess
 
     from bmad_loop.adapters import tmux_base
@@ -3897,10 +3984,12 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
     run_dir = make_run(project_tree.project, rid, run_type="sweep", alive=True)
     Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
     (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    tag = runs_mod.project_tag(project_tree.project)
     selected: list[str] = []
 
     def fake(argv, **kwargs):
-        out = f"@1\trun-{rid}\n@2\tresume-{rid}\n" if argv[1] == "list-windows" else ""
+        rows = f"@1\trun-{rid}\t{tag}\n@2\tresume-{rid}\t{tag}\n"
+        out = rows if argv[1] == "list-windows" else ""
         return _subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -3929,7 +4018,7 @@ async def test_attach_outside_tmux_stamps_detach(project_tree, monkeypatch):
     stamps: list[tuple[str, str]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: stamps.append((w, p)))
     app = BmadLoopApp(project_tree.project)
@@ -3946,7 +4035,7 @@ async def test_attach_prefers_agent_session_without_decision(project_tree, monke
     make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -3965,7 +4054,7 @@ async def test_attach_falls_back_to_ctl_window(project_tree, monkeypatch):
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: "@5")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
@@ -5693,6 +5782,93 @@ async def test_stop_run_stops_and_kills_ctl_window(project_tree, monkeypatch):
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
     assert stops == [project_tree.project / RUNS_DIR / "20260611-100000-aaaa"]
     assert kills == [(project_tree.project, "20260611-100000-aaaa")]
+
+
+async def test_stop_run_warns_when_the_ctl_window_is_left_running(project_tree, monkeypatch):
+    # #750: a window under this run's name whose tag reads empty — unset, or
+    # unreadable (psmux folds a failed option probe to "") — is never killed.
+    # Reporting a plain "stopped" then hides a control window still running,
+    # so the stop must say it left one, and must not also claim a clean stop.
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "stop_run", lambda rd: True)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda proj, rid: 1)
+    make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        needle = "was not closed"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert "run 20260611-100000-aaaa stopped" not in notifications(app)
+
+
+async def test_stop_run_warns_when_the_ctl_listing_cannot_be_read(project_tree, monkeypatch):
+    # #750: the ctl listing itself failed, so the lookup raises rather than
+    # answering "no window". The engine stop already went through; the toast
+    # must say the window could not be checked instead of a clean "stopped".
+    from bmad_loop import runs
+
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "stop_run", lambda rd: True)
+    monkeypatch.setattr(launch, "kill_ctl_window", boom)
+    make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        needle = "may still be running"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert "run 20260611-100000-aaaa stopped" not in notifications(app)
+        assert not any("stop failed" in m for m in notifications(app))
+
+
+async def test_attach_toasts_a_ctl_listing_it_could_not_read(project, monkeypatch):
+    # The attach half: a raise from the lookup is toasted by the guard, and
+    # nothing is attached — never the plain "nothing to attach" absence.
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        needle = "could not list the windows"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert not any("nothing to attach" in m for m in notifications(app))
+        assert isinstance(app.screen, DashboardScreen)
+
+
+async def test_attach_says_why_an_unproven_ctl_window_is_out_of_reach(project, monkeypatch):
+    # #750: no window answered, but one carries this run's name with an empty
+    # tag. "nothing to attach" would pass that refusal off as an absence.
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 1))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        needle = "cannot attach to the run window"
+        await until(pilot, lambda: any(needle in m for m in notifications(app)))
+        assert not any("nothing to attach" in m for m in notifications(app))
 
 
 @pytest.mark.parametrize("live", ["dead", "unknown"])

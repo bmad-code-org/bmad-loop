@@ -5354,7 +5354,14 @@ def cmd_attach(args: argparse.Namespace) -> int:
     if run_dir is None:
         print("no runs found", file=sys.stderr)
         return 1
-    plan = launch.attach_plan(project, run_dir.name)
+    plan, unproven = launch.attach_plan(project, run_dir.name)
+    if unproven:
+        # A window under this run's name was refused for an empty tag (#750):
+        # say so before attaching elsewhere — or reporting nothing — so the
+        # refusal is not mistaken for an absence. Before the attach, which takes
+        # over the terminal.
+        notice = launch.unproven_ctl_window_notice(project, run_dir.name, unproven)
+        print(f"warning: {notice}", file=sys.stderr)
     if plan is None:
         print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
         return 1

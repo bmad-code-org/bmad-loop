@@ -338,7 +338,7 @@ class BmadLoopApp(App[None]):
         def go() -> None:
             run_id = runs.new_run_id()
             try:
-                launch.start_run_detached(
+                win_id = launch.start_run_detached(
                     self.project,
                     run_id,
                     spec=spec_folder or None,
@@ -349,12 +349,28 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
+            if not win_id:
+                self._warn_unreachable_launch("run", run_id)
             self.notify(
                 f"run {run_id} launched (control session {launch.ctl_session(self.project)})"
             )
             self._dashboard.expect_run(run_id)
 
         self._guarded(go)
+
+    def _warn_unreachable_launch(self, kind: str, run_id: str) -> None:
+        """The launch is running, but its ctl window could not be confirmed
+        reachable by the lookup `a`/`x` use — its best-effort tag write did not
+        land (#750), its id was not captured, or the listing could not be read.
+        Say so beside the success toast instead of letting it imply the
+        targeting is sound."""
+        self.notify(
+            f"{kind} {run_id} launched, but its control window could not be confirmed "
+            "as this project's — attach/stop may not reach it; check "
+            f"{launch.ctl_session(self.project)} and close it by hand when done",
+            severity="warning",
+            timeout=15,
+        )
 
     def action_start_sweep(self) -> None:
         if self._mux_missing():
@@ -374,7 +390,7 @@ class BmadLoopApp(App[None]):
         def go() -> None:
             run_id = runs.new_run_id()
             try:
-                launch.start_sweep_detached(
+                win_id = launch.start_sweep_detached(
                     self.project,
                     run_id,
                     no_prompt=result["no_prompt"],
@@ -384,6 +400,8 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
+            if not win_id:
+                self._warn_unreachable_launch("sweep", run_id)
             self.notify(
                 f"sweep {run_id} launched (control session {launch.ctl_session(self.project)})"
             )
@@ -549,20 +567,42 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        win_id = launch.ctl_window_id(self.project, run_id)
+        # Guarded: a ctl listing that failed raises rather than reading as "no
+        # window" (#750), and the toast is the honest answer to `a` then.
+        ok, lookup = self._mux_guarded(lambda: launch.ctl_window_lookup(self.project, run_id))
+        if not ok or lookup is None:
+            return
+        win_id, unproven = lookup
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
         # A sweep blocked on a decision prompt has no agent session — the
         # human answers in the orchestrator's ctl window. Otherwise prefer the
         # live agent session, falling back to the ctl window between sessions.
-        if win_id is not None and (self._dashboard.decision_pending is not None or not agent_live):
+        wants_ctl = self._dashboard.decision_pending is not None or not agent_live
+        if unproven:
+            # A window under this run's name was refused because its tag could
+            # not be read as ours (#750) — possibly the live orchestrator, even
+            # beside a tagged window answered here. Say so whatever is attached.
+            lead = (
+                "cannot attach to the run window"
+                if win_id is None and wants_ctl
+                else "attaching without a window it could not prove"
+            )
+            self.notify(
+                f"{lead}: {launch.unproven_ctl_window_notice(self.project, run_id, unproven)}",
+                severity="warning",
+                timeout=15,
+            )
+        if win_id is not None and wants_ctl:
             launch.select_ctl_window_id(win_id)
             self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
             return
-        elif agent_live:
+        if agent_live:
             target = runs.session_target(run_id)
         else:
+            if unproven:
+                return  # the warning above already said why
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
                 f"{launch.ctl_session(self.project)} window for this run (runs started outside "
@@ -690,8 +730,9 @@ class BmadLoopApp(App[None]):
             # is lost is the record *later* verbs read, so `a`/`x` after this
             # window is minted may answer an older one (#482's symptom).
             self.notify(
-                "resolve launched but its window id was not recorded — "
-                "later attach/stop may target an older window for this run",
+                "resolve launched but its window id was not recorded or its tag did "
+                "not land — later attach/stop may miss it or target an older window "
+                "for this run",
                 severity="warning",
             )
         launch.select_ctl_window_id(win_id)
@@ -961,8 +1002,9 @@ class BmadLoopApp(App[None]):
             # uncaptured id and the unwritten record through this one signal
             # because they leave the operator in the same place.
             self.notify(
-                "resume launched but its window id was not recorded — "
-                "attach/stop may target an older window for this run",
+                "resume launched but its window id was not recorded or its tag did "
+                "not land — attach/stop may miss it or target an older window for "
+                "this run",
                 severity="warning",
             )
         self.notify(
@@ -1556,9 +1598,33 @@ class BmadLoopApp(App[None]):
     def _stop_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.stop_run(run_dir)
-            launch.kill_ctl_window(self.project, run_id)
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
+            return
+        try:
+            left = launch.kill_ctl_window(self.project, run_id)
+        except (OSError, MultiplexerError, UnicodeError) as e:
+            # The engine is stopped; only the ctl-window half failed — its listing
+            # could not be read, or the window survived the kill (#750). A plain
+            # "stopped" would claim that window is gone.
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id} stopped, but its control window may still be running: {e}",
+                severity="warning",
+                timeout=15,
+            )
+            return
+        if left:
+            # The engine stopped, but a ctl window under its name may still be
+            # running — even when another one was closed: a plain "stopped"
+            # would hide that (#750).
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id} stopped, but a control window under its name was not closed: "
+                f"{launch.unproven_ctl_window_notice(self.project, run_id, left)}",
+                severity="warning",
+                timeout=15,
+            )
             return
         self.call_from_thread(self.notify, f"run {run_id} stopped")
 
