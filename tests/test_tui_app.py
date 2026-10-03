@@ -3885,10 +3885,9 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
     # seam every other one stubs out: that the TUI hands it the same project root
     # the launch recorded the window under (#482). Point app.py at anything else
     # — the run dir, an unresolved path — and the record is unfindable under that
-    # root, so these untagged rows prove nothing and the lookup answers None
-    # (#531). session_exists is stubbed True here, so `a` then takes the live
-    # agent session instead of the ctl window: nothing is selected and nothing is
-    # stamped, and both assertions below fail.
+    # root, so the tie-break among these tagged rows falls back to the parked
+    # `@1` and both assertions below fail. Tagged as start_detached leaves them:
+    # an untagged row is never a candidate (#750), whatever the record says.
     import subprocess as _subprocess
 
     from bmad_loop.adapters import tmux_base
@@ -3896,17 +3895,13 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
     rid = "20260611-100000-aaaa"
     run_dir = make_run(project_tree.project, rid, run_type="sweep", alive=True)
     Journal(run_dir).append("decision-pending", dw_id="DW-7", question="q?")
-    # the id + the pane pid its mint read, in the sibling: an untagged row
-    # needs both (#750)
     (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
-    (run_dir / launch._CTL_PID_FILE).write_text("4242", encoding="utf-8")
+    tag = runs_mod.project_tag(project_tree.project)
     selected: list[str] = []
 
     def fake(argv, **kwargs):
-        # rows as `window_id, window_name, tag, pane_pid` — the lookup's fields
-        out = (
-            f"@1\trun-{rid}\t\t11\n@2\tresume-{rid}\t\t4242\n" if argv[1] == "list-windows" else ""
-        )
+        rows = f"@1\trun-{rid}\t{tag}\n@2\tresume-{rid}\t{tag}\n"
+        out = rows if argv[1] == "list-windows" else ""
         return _subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
