@@ -163,6 +163,7 @@ class _SharedRegistryMux:
     def __init__(self, name, tag):
         self._name, self._tag = name, tag
         self.created: list[str] = []
+        self.killed: list[str] = []
 
     def has_registry_namespace(self):
         return True
@@ -185,6 +186,9 @@ class _SharedRegistryMux:
     def new_session(self, name, *_args):
         self.created.append(name)
 
+    def kill_session(self, name):
+        self.killed.append(name)
+
 
 @pytest.mark.parametrize("tag", ["0123456789abcdef", ""], ids=["foreign", "untagged"])
 def test_ensure_session_refuses_to_adopt_another_projects_session(tmp_path, tag):
@@ -206,6 +210,144 @@ def test_ensure_session_refuses_to_adopt_another_projects_session(tmp_path, tag)
     with pytest.raises(MultiplexerError, match="refusing to launch into the existing session"):
         adapter._ensure_session(tmp_path)
     assert mux.created == []
+    assert mux.killed == []  # a session it FOUND is never torn down
+
+
+class _TagFailingMux:
+    """No session exists yet; minting one works, tagging it raises. Records the
+    session lifecycle so a teardown is observable, and models the backend kill
+    as what it is by contract: best-effort, so it can fail silently (`stuck`),
+    raise (`kill_fault`), or leave a registry that cannot be read back
+    (`list_fault`)."""
+
+    def __init__(self, *, kill_fault=None, stuck=False, list_fault=None):
+        self.sessions: list[str] = []
+        self.created: list[str] = []
+        self.killed: list[str] = []
+        self.tag_fault = MultiplexerError("set-option failed: transient")
+        self._kill_fault = kill_fault
+        self._stuck = stuck
+        self._list_fault = list_fault
+
+    def has_session(self, name):
+        return name in self.sessions
+
+    def session_name_key(self, name):
+        return name
+
+    def new_session(self, name, *_args):
+        self.created.append(name)
+        self.sessions.append(name)
+
+    def set_session_option(self, name, option, value):
+        raise self.tag_fault
+
+    def kill_session(self, name):
+        self.killed.append(name)
+        if self._kill_fault is not None:
+            raise self._kill_fault
+        if not self._stuck:
+            self.sessions.remove(name)
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        if self._list_fault is not None:
+            assert on_fault is not None
+            on_fault(self._list_fault)
+            return []
+        return list(self.sessions)
+
+
+def _tag_failing_adapter(tmp_path, mux):
+    return GenericTmuxAdapter(
+        run_dir=tmp_path / ".bmad-loop" / "runs" / "RID",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+
+def test_ensure_session_tears_down_a_session_it_could_not_tag(tmp_path):
+    """Left standing, an untagged session blocks its run id for good in a shared
+    registry (#729): the ownership gate reads it as foreign and the kill and
+    cleanup paths refuse it. The session this call just minted is torn down by
+    that exact name, confirmed gone, and the ORIGINAL error propagates.
+
+    Ablate the teardown and `mux.killed` is empty."""
+    mux = _TagFailingMux()
+    adapter = _tag_failing_adapter(tmp_path, mux)
+
+    with pytest.raises(MultiplexerError) as caught:
+        adapter._ensure_session(tmp_path)
+
+    assert caught.value is mux.tag_fault
+    assert mux.created == mux.killed == ["bmad-loop-RID"]
+    assert mux.sessions == []
+
+
+@pytest.mark.parametrize(
+    ("teardown", "said"),
+    [
+        ("raises", "could not be confirmed gone (kill-session failed: gone wrong)"),
+        ("silent", "is still there after tearing it down"),
+        ("unlistable", "could not be confirmed gone (list-sessions failed: rc 1)"),
+    ],
+)
+def test_ensure_session_says_so_when_the_teardown_did_not_land(tmp_path, teardown, said):
+    """The backend kill is best-effort and silent by contract, so a teardown is
+    read back, not assumed: a kill that raised, one that silently left the
+    session, and a registry that cannot be listed each raise one error naming
+    the tag fault and the leftover, chained from the tag fault.
+
+    Ablate the read-back (trust the kill) and the `silent` and `unlistable` rows
+    re-raise the bare tag fault instead."""
+    kill_fault = MultiplexerError("kill-session failed: gone wrong")
+    mux = _TagFailingMux(
+        kill_fault=kill_fault if teardown == "raises" else None,
+        stuck=teardown == "silent",
+        list_fault="list-sessions failed: rc 1" if teardown == "unlistable" else None,
+    )
+    adapter = _tag_failing_adapter(tmp_path, mux)
+
+    with pytest.raises(MultiplexerError) as caught:
+        adapter._ensure_session(tmp_path)
+
+    assert caught.value is not mux.tag_fault
+    assert caught.value.__cause__ is mux.tag_fault
+    assert said in str(caught.value)
+    assert "transient" in str(caught.value) and "remove it by hand" in str(caught.value)
+
+
+def test_ensure_session_reports_a_silent_teardown_failure_on_the_real_backend(
+    tmp_path, monkeypatch, force_tmux_backend
+):
+    """The bundled backend, not a double: `set-option` fails, `kill-session` fails
+    silently (the seam's `check=False`), and the listing still names the session.
+    The operator is told it is still there.
+
+    Ablate the read-back and the bare tag fault surfaces instead."""
+    project = tmp_path
+    run_dir = project / ".bmad-loop" / "runs" / "RID"
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir, policy=Policy(limits=LimitsPolicy()), profile=get_profile("claude")
+    )
+    name = adapter.session_name
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _b: "/usr/bin/tmux")
+
+    def fake_run(argv, **kwargs):
+        verb = argv[1]
+        if verb == "has-session":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        if verb in ("set-option", "kill-session"):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="server busy")
+        if verb == "list-sessions":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{name}\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+
+    with pytest.raises(MultiplexerError, match="is still there after tearing it down") as caught:
+        adapter._ensure_session(project)
+    assert isinstance(caught.value.__cause__, MultiplexerError)
 
 
 def test_ensure_session_reuses_its_own_session_in_a_shared_registry(tmp_path):
@@ -221,6 +363,7 @@ def test_ensure_session_reuses_its_own_session_in_a_shared_registry(tmp_path):
 
     adapter._ensure_session(tmp_path)
     assert mux.created == []
+    assert mux.killed == []  # a session it FOUND is never torn down
 
 
 def make_spec(tmp_path, task_id="1-1-a-dev-1", timeout_s=30.0, model="sonnet") -> SessionSpec:

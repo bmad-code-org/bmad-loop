@@ -655,6 +655,12 @@ def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambi
 _SETTLED_PROJECT: Path | None = None
 
 
+def settled_project() -> Path | None:
+    """The project this process configured its registry for, or ``None``
+    before :func:`export_psmux_registry_root` ran (library or test use)."""
+    return _SETTLED_PROJECT
+
+
 def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) -> str | None:
     """Point this process — and everything it spawns — at ``project``'s registry
     by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or
