@@ -182,9 +182,10 @@ def _configure_mux(project: Path) -> None:
     keep-diagnostics-working rule as the policy read above.
 
     It also *overrides* an ambient ``PSMUX_DATA_DIR`` rather than honouring it —
-    the root is derived, always, so that two processes given one project cannot
+    the root is derived, so that two processes given one project cannot
     disagree about where its sessions live (the full argument is in that
-    function). Overriding an operator's variable silently is how someone loses an
+    function) — unless policy ``[mux] honor_ambient_psmux_data_dir`` says the
+    operator's value is a persistent pin (#729). Overriding an operator's variable silently is how someone loses an
     hour to `psmux ls` showing nothing, so it is said once, here, at the only
     point that runs ahead of every command. stderr, not stdout: the ``--json``
     contract is one object on stdout and nothing else, and this is the
@@ -193,10 +194,10 @@ def _configure_mux(project: Path) -> None:
 
     path = _policy_path(project)
     try:
-        name = policy_mod.load(path).mux.backend or None
+        mux_policy = policy_mod.load(path).mux
     except (policy_mod.PolicyError, OSError):
-        name = None
-    configure_multiplexer(name, origin=path)
+        mux_policy = policy_mod.MuxPolicy()
+    configure_multiplexer(mux_policy.backend or None, origin=path)
     # Automatic selection probes availability before returning its cached
     # instance. Give that probe the derived root first: psmux's version probe
     # reaches `_run`, which must reject an empty/relative ambient value, and a
@@ -237,8 +238,12 @@ def _configure_mux(project: Path) -> None:
                 os.environ[runs.PSMUX_DATA_DIR] = ambient
     if not namespaced:
         return
-    root = runs.export_psmux_registry_root(project)
+    root = runs.export_psmux_registry_root(
+        project, honor_ambient=mux_policy.honor_ambient_psmux_data_dir
+    )
     if root is not None:
+        # An honoured value is the operator's own stated preference, so it gets
+        # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
             print(
                 f"note: using bmad-loop's own psmux registry {root} — your "
@@ -1270,17 +1275,30 @@ def _print_registry(project: Path) -> None:
         derived = str(runs.mux_registry_root(project))
     except (runs.StateRootError, OSError, RuntimeError):
         derived = None
-    # bmad-loop always derives, so a mismatch is not an operator's honoured
-    # export — that is not a thing any more — but the one case the export
-    # degrades on: an underivable state root, where it leaves whatever it found
-    # rather than inventing a root. Saying "derived" there would be a lie about
-    # the one situation an operator most needs told.
-    origin = (
-        "derived from the project"
-        if root == derived
-        else f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
-        "because no state root could be derived here"
-    )
+    # A root other than the derived one is either the operator's value honoured
+    # on their opt-in — asked of the same pure rule the export used — or the one
+    # case the export degrades on: an underivable state root, where it leaves
+    # whatever it found rather than inventing a root. Saying "derived" there
+    # would be a lie about the one situation an operator most needs told.
+    try:
+        honor = policy_mod.load(_policy_path(project)).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError):
+        honor = False
+    if root == derived:
+        origin = "derived from the project"
+    elif derived is not None and (
+        runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor) == root
+    ):
+        origin = (
+            f"your own ${runs.PSMUX_DATA_DIR}, honoured by "
+            "[mux] honor_ambient_psmux_data_dir — the derived root would be "
+            f"{derived}"
+        )
+    else:
+        origin = (
+            f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
+            "because no state root could be derived here"
+        )
     print(f"registry: {root} ({origin})")
     # A single-quoted PowerShell literal, whose only escape is doubling the quote:
     # an unescaped `C:\Users\O'Brien\...` ends the string mid-path and the line

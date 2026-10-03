@@ -1446,6 +1446,10 @@ JOURNAL_KINDS = frozenset(
         "story-escalation-resolved",
         # runsetup.py
         "composition-unwind-failed",
+        # A resume that could not clear its run's same-named session from a
+        # displaced psmux registry. No new diagnostics routing: its only field,
+        # `detail`, is already in `_JOURNAL_DROP_FIELDS`.
+        "displaced-session-not-cleared",
         "run-start",
         # stories_engine.py
         "checkpoint-pause",

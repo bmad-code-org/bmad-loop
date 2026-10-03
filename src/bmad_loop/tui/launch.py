@@ -21,9 +21,11 @@ import sys
 from enum import StrEnum
 from pathlib import Path
 
+from .. import policy as policy_mod
 from .. import runs
 from ..adapters.multiplexer import (
     MultiplexerError,
+    TerminalMultiplexer,
     get_multiplexer,
     mux_usable,
 )
@@ -64,6 +66,24 @@ def mux_available() -> bool:
 
 def session_exists(session: str) -> bool:
     return get_multiplexer().has_session(session)
+
+
+def agent_session_exists(session: str) -> bool:
+    """:func:`session_exists` for a run's AGENT session, the one an attach lands
+    on: in a registry shared with other projects (#729) a same-named session
+    may be another project's, and it does not exist as far as this project is
+    concerned. Saying why is the difference between that and "no session".
+
+    Kept off :func:`session_exists` itself, which also answers for the control
+    session — a per-project name already (`runs.ctl_session_for`), whose
+    session carries no project tag at all."""
+    if not session_exists(session):
+        return False
+    refusal = runs.foreign_session_refusal(session, get_multiplexer())
+    if refusal is not None:
+        print(f"warning: treating {session} as absent — {refusal}", file=sys.stderr)
+        return False
+    return True
 
 
 # Run-dir sidecar naming the ctl-session window start_detached minted last for
@@ -717,7 +737,7 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
     nothing to attach to."""
     session = runs.session_name(run_id)
     win_id = ctl_window_id(project, run_id)
-    agent_live = session_exists(session)
+    agent_live = agent_session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):
@@ -880,6 +900,53 @@ def cli_argv(*tail: str) -> list[str]:
     return [sys.executable, "-m", "bmad_loop.cli", *tail]
 
 
+def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
+    """Why a run launched from this process would land in a registry this
+    process does not watch, or ``None`` when it would not.
+
+    The registry is settled once per process (`cli._configure_mux`), but the
+    detached child re-reads ``[mux] honor_ambient_psmux_data_dir`` from
+    policy.toml, which the settings editor can rewrite under a running TUI. A
+    TUI that started honouring the operator's root and then had the switch
+    turned off would launch children into the derived root while it goes on
+    querying the old one: it could not see, attach to or stop what it started.
+    So the child's answer is predicted here with the same pure rule it will
+    apply (`runs.resolve_psmux_registry_root`), from the root it inherits —
+    this process's root in force — and a disagreement refuses the launch.
+
+    Asked only of a process that configured its registry for this project
+    (`runs.settled_project`), which every CLI entry does: there is nothing to
+    disagree with otherwise. The other direction (switch turned ON) cannot
+    drift: the child inherits this process's derived root, which the rule
+    never honours as a pin."""
+    if runs.settled_project() != project:
+        return None
+    try:
+        if not mux.has_registry_namespace():
+            return None
+        root = mux.registry_root()
+    except MultiplexerError:
+        return None  # selection already proved usable; the launch reports its own faults
+    if root is None:
+        return None
+    try:
+        derived = str(runs.mux_registry_root(project))
+    except (runs.StateRootError, OSError, RuntimeError):
+        return None  # the child cannot derive either, and keeps the root it inherits
+    try:
+        honor = policy_mod.load(project / policy_mod.POLICY_FILE).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError):
+        honor = False  # what the child's `_configure_mux` falls back to as well
+    child = runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor)
+    if child == root:
+        return None
+    return (
+        f"[mux] honor_ambient_psmux_data_dir changed since this TUI started: a new run "
+        f"would use the registry {child}, but this TUI watches {root} and could not "
+        "see, attach to or stop it — restart the TUI (bmad-loop tui), then launch"
+    )
+
+
 def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) -> str | None:
     """Run a bmad-loop command in a new window of the control session.
 
@@ -913,6 +980,9 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
             "multiplexer backend unavailable (binary missing, version unsupported, "
             "or a required helper absent)"
         )
+    drift = _registry_drift(project, mux)
+    if drift is not None:
+        raise LaunchError(drift)
     ctl = _ensure_ctl_session(project)
     try:
         win_id = (

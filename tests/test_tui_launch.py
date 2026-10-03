@@ -2189,6 +2189,158 @@ def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
     assert launch.attach_plan(Path("/proj"), "RID") is None
 
 
+class _SharedRegistryWithForeignSession:
+    """A shared (honoured, #729) registry where `bmad-loop-RID` is another
+    project's tagged session."""
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return "/shared-registry"
+
+    def session_name_key(self, name):
+        return name
+
+    def has_session(self, name):
+        return name == "bmad-loop-RID"
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return ["bmad-loop-RID"]
+
+    def session_options(self, _option):
+        return {"bmad-loop-RID": "0123456789abcdef"}
+
+
+def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tmp_path, capsys):
+    """In a registry shared with another project, `bmad-loop-RID` may be that
+    project's live coding session; attaching the operator to it is the by-name
+    hazard. `agent_session_exists` reads it as absent and says why, so with no
+    ctl window there is nothing to attach.
+
+    Ablate the gate in `agent_session_exists` and the plan attaches to it."""
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _SharedRegistryWithForeignSession())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+
+    assert launch.attach_plan(tmp_path, "RID") is None
+    assert "treating bmad-loop-RID as absent" in capsys.readouterr().err
+
+
+def test_session_exists_stays_a_plain_existence_check_in_a_shared_registry(monkeypatch, tmp_path):
+    """`session_exists` also answers for the control session, which carries no
+    project tag (its name is already per project), so the shared-registry
+    ownership gate must not reach it: gated, a prune in an operator's honoured
+    root read its own ctl session as absent and swept nothing.
+
+    Ablate by moving the gate back into `session_exists` and this fails."""
+
+    class _UntaggedCtl(_SharedRegistryWithForeignSession):
+        def has_session(self, name):
+            return name == "ctl-under-test"
+
+        def list_sessions_reporting(self, *, on_fault=None):
+            return ["ctl-under-test"]
+
+        def session_options(self, _option):
+            return {}
+
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _UntaggedCtl())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    assert launch.session_exists("ctl-under-test") is True
+    assert launch.agent_session_exists("ctl-under-test") is False
+
+
+class _HonouredRegistry:
+    """A namespacing backend whose registry in force is `root`."""
+
+    def __init__(self, root):
+        self._root = root
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return self._root
+
+
+def _write_honour_flag(project: Path, on: bool) -> None:
+    from bmad_loop import policy as policy_mod
+
+    path = project / policy_mod.POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"[mux]\nhonor_ambient_psmux_data_dir = {'true' if on else 'false'}\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("root", "flag_now", "drift"),
+    [
+        ("pinned", False, True),  # started honouring, switch turned off since
+        ("pinned", True, False),  # still honouring
+        ("derived", True, False),  # switch turned on since: the child inherits the derived root
+        ("derived", False, False),  # unchanged
+    ],
+)
+def test_registry_drift_predicts_where_a_child_would_settle(
+    monkeypatch, tmp_path, root, flag_now, drift
+):
+    """The detached child re-reads the switch from policy.toml and settles its
+    registry from the root it inherits (this process's). A TUI that started
+    honouring the operator's root and then had the switch turned off would
+    launch into a registry it does not watch; the other three combinations
+    land where the TUI looks.
+
+    Ablate the `child == root` comparison (never refuse) and the first row
+    fails."""
+    in_force = (
+        str(tmp_path / "pinned") if root == "pinned" else str(runs.mux_registry_root(tmp_path))
+    )
+    _write_honour_flag(tmp_path, flag_now)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(in_force))
+
+    assert (refusal is not None) is drift
+    if drift:
+        assert "restart the TUI" in refusal and in_force in refusal
+
+
+def test_registry_drift_is_not_asked_of_an_unconfigured_process(monkeypatch, tmp_path):
+    """Nothing to disagree with when this process never settled a registry for
+    the project (library or test use): the live psmux tests drive launches
+    under an isolated root without a CLI entry.
+
+    Ablate the `settled_project()` precondition and this refuses."""
+    _write_honour_flag(tmp_path, False)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+
+    assert launch._registry_drift(tmp_path, _HonouredRegistry(str(tmp_path / "pinned"))) is None
+
+
+def test_start_detached_refuses_a_launch_into_a_registry_it_does_not_watch(monkeypatch, tmp_path):
+    """The refusal sits at the one mutation every TUI launch converges on, ahead
+    of the control-session mint, and reaches the operator as a LaunchError.
+
+    Ablate the `_registry_drift` call in `start_detached` and the ctl session is
+    minted."""
+    minted: list[Path] = []
+    _write_honour_flag(tmp_path, False)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(
+        launch, "get_multiplexer", lambda: _HonouredRegistry(str(tmp_path / "pinned"))
+    )
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
+    monkeypatch.setattr(launch, "_ensure_ctl_session", lambda p: minted.append(p) or "ctl")
+
+    with pytest.raises(launch.LaunchError, match="restart the TUI"):
+        launch.start_detached(tmp_path, ["run"], "20260611-100000-aaaa", "run")
+    assert minted == []
+
+
 def test_run_captured_merges_streams(monkeypatch):
     def fake(argv, **kwargs):
         assert argv[:3] == [sys.executable, "-m", "bmad_loop.cli"]

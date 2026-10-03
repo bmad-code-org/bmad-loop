@@ -803,14 +803,60 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------- multiplexer
 
     def _ensure_session(self, cwd: Path) -> None:
-        if not self.mux.has_session(self.session_name):
+        if self.mux.has_session(self.session_name):
+            # Reusing it is right for this run's own session (a resume), and
+            # wrong for a same-named one of another project's in a shared
+            # registry (#729): every window would open inside it, under its tag.
+            refusal = runs.foreign_session_refusal(
+                self.session_name, self.mux, self.run_dir.parents[2]
+            )
+            if refusal is not None:
+                raise MultiplexerError(
+                    f"refusing to launch into the existing session {self.session_name}: "
+                    f"{refusal} — stop or rename that run, or turn off "
+                    "[mux] honor_ambient_psmux_data_dir"
+                )
+        else:
             self.mux.new_session(self.session_name, cwd, PANE_COLUMNS, PANE_LINES)
             # Tag the session with its project so a cleanup in another project
             # never prunes this run (run_dir = <project>/.bmad-loop/runs/<id>).
             project = self.run_dir.parents[2]
-            self.mux.set_session_option(
-                self.session_name, runs.PROJECT_OPTION, runs.project_tag(project)
-            )
+            try:
+                self.mux.set_session_option(
+                    self.session_name, runs.PROJECT_OPTION, runs.project_tag(project)
+                )
+            except Exception as tag_fault:
+                # Left standing, the untagged session would block this run id
+                # for good in a shared registry (#729): the ownership gate reads
+                # it as foreign, and the kill and cleanup paths refuse it. It is
+                # the one this call just minted, so tear it down by that exact
+                # name — straight through the backend, since the gate would
+                # refuse an untagged session by construction — and re-raise.
+                # The backend kill is best-effort and silent by contract, so
+                # whether it landed is read back rather than assumed.
+                listing_faults: list[str] = []
+                try:
+                    self.mux.kill_session(self.session_name)
+                    key = self.mux.session_name_key(self.session_name)
+                    survived = any(
+                        self.mux.session_name_key(n) == key
+                        for n in self.mux.list_sessions_reporting(on_fault=listing_faults.append)
+                    )
+                except Exception as kill_fault:
+                    listing_faults.append(str(kill_fault))
+                    survived = True
+                if survived or listing_faults:
+                    why = (
+                        f"could not be confirmed gone ({listing_faults[0]})"
+                        if listing_faults
+                        else "is still there after tearing it down"
+                    )
+                    raise MultiplexerError(
+                        f"tagging the new session {self.session_name} failed ({tag_fault}), "
+                        f"and the untagged session {why} — remove it by hand before "
+                        "resuming this run"
+                    ) from tag_fault
+                raise
 
     def interactive_argv(self, spec: SessionSpec) -> list[str]:
         extra = self.extra_args

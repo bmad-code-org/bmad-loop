@@ -7144,6 +7144,165 @@ def test_export_psmux_registry_root_converges_a_pane_child_that_moves_the_state_
     assert child == clean == clean_pinned == str(runs.mux_registry_root(tmp_path))
 
 
+# An absolute path that is not a derived root, spelled for the host OS.
+_PIN = os.path.abspath(os.path.join(os.sep, "operator", "pin"))
+
+
+@pytest.mark.parametrize(
+    ("ambient", "honor", "expected"),
+    [
+        (None, False, "derived"),
+        (None, True, "derived"),
+        (_PIN, False, "derived"),
+        (_PIN, True, "ambient"),
+        ("", True, "derived"),
+        ("relative/root", True, "derived"),
+        (".", True, "derived"),
+        (
+            os.path.join(os.path.dirname(_PIN), "0123456789abcdef", runs.MUX_REGISTRY_DIR),
+            True,
+            "derived",
+        ),
+        (os.path.join(os.path.dirname(_PIN), runs.MUX_REGISTRY_DIR), True, "ambient"),
+        ("\\registry", True, "derived"),  # rooted but drive-relative on Windows
+    ],
+)
+def test_resolve_psmux_registry_root(ambient, honor, expected):
+    """The whole decision, as a table. Honoured only on the opt-in AND an
+    absolute value that is not shaped like a derived root
+    (`<16-hex project tag>/_mux`); everything else derives. An operator's own
+    directory merely named `_mux` is still theirs.
+
+    Ablate any one conjunct in `resolve_psmux_registry_root` and a row fails:
+    the flag (row 3), absoluteness (rows 5-7, and on Windows the
+    drive-relative row 10, which `os.path.isabs` accepts below 3.13), the
+    derived-root exclusion (row 8), its tag-shape narrowing (row 9)."""
+    derived = os.path.abspath(os.path.join(os.sep, "state", "proj", runs.MUX_REGISTRY_DIR))
+    got = runs.resolve_psmux_registry_root(derived, ambient, honor_ambient=honor)
+    assert got == (ambient if expected == "ambient" else derived)
+
+
+@pytest.mark.parametrize("honor", [False, True])
+def test_the_policy_flag_closes_the_horn_it_names(tmp_path, monkeypatch, honor):
+    """#729's measured table, one row per process, for both settings of the flag.
+
+    The outer process runs under S1 with the pin R in its environment; the pane
+    child inherits what the outer exported and moves to S2. The flag is the
+    operator saying which kind of pin R is, so it names the clean process the
+    child has to agree with:
+
+    - off — a *transient* pin, typed into one shell: a clean S2 process has no
+      pin and derives D2;
+    - on — a *persistent* pin, exported by the profile: a clean S2 process
+      carries R and honours it.
+
+    Ablate the flag (always derive, or always honour) and one parametrization
+    fails."""
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    d1 = str(runs.mux_registry_root(tmp_path))
+    outer = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    # the pane child: carries whatever the outer exported, now under S2
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    child = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    monkeypatch.delenv("TMUX", raising=False)
+    if honor:  # persistent horn: a clean S2 process WITH the profile pin
+        monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    else:  # transient horn: a clean S2 process with NO pin
+        monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    clean = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    d2 = str(runs.mux_registry_root(tmp_path))
+    assert outer == (pinned if honor else d1)
+    assert child == clean == (pinned if honor else d2)
+
+
+def test_honouring_never_adopts_an_inherited_derived_root(tmp_path, monkeypatch):
+    """With the flag on and no pin at all, the outer process derives D1 and
+    exports it, so every pane child inherits D1 — which is not the operator's
+    pin and must not be honoured as one. A child moved to S2, or one run for
+    another project, re-derives exactly as a clean process does.
+
+    Ablate the derived-root exclusion in `resolve_psmux_registry_root` and both
+    asserts fail."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    d1 = runs.export_psmux_registry_root(tmp_path, honor_ambient=True)
+    assert d1 == str(runs.mux_registry_root(tmp_path))
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == str(
+        runs.mux_registry_root(tmp_path)
+    )
+
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, d1)
+    assert runs.export_psmux_registry_root(other, honor_ambient=True) == str(
+        runs.mux_registry_root(other)
+    )
+
+
+@pytest.mark.parametrize("ambient", ["", "relative/root", "."])
+def test_honouring_still_overrides_a_value_psmux_would_panic_on(tmp_path, monkeypatch, ambient):
+    """The flag honours a pin, not a typo: a relative or empty value is replaced
+    by the derived root exactly as with the flag off, so `PsmuxMultiplexer._run`'s
+    refusal stays reserved for the degrade arm it was written for.
+
+    Ablate the `os.path.isabs` conjunct in `resolve_psmux_registry_root` and
+    this fails."""
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
+    derived = str(runs.mux_registry_root(tmp_path))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == derived
+    assert os.environ[runs.PSMUX_DATA_DIR] == derived
+
+
+def test_ctl_session_for_follows_an_honoured_registry(tmp_path, monkeypatch):
+    """psmux's duplicate-server mutex is keyed on the session name alone, so the
+    control session in an honoured registry must not reuse the name the derived
+    registry's one holds: turning the opt-in on while the old control session
+    lives would otherwise make every TUI launch fail. With the derived root
+    settled, the name is unchanged.
+
+    Ablate the honoured-root arm in `ctl_session_for` and the first assert
+    fails."""
+    derived = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
+    as_derived = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "pinned"))
+    as_honoured = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, os.path.join(derived, "..", runs.MUX_REGISTRY_DIR))
+    respelled = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR)
+    unset = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+
+    assert as_honoured != as_derived
+    assert as_derived == unset == respelled
+    assert runs.is_ctl_session_name(as_honoured)
+
+
+def test_honouring_hands_the_derived_root_to_the_sweep(tmp_path, monkeypatch):
+    """Turning the flag on moves the registry from the derived root to the pin,
+    and sessions started before the switch are still in the derived one. It is
+    the displaced root now, so cleanup's tag-scoped legacy pass reaches it.
+
+    Ablate the `displaced = derived` arm in `export_psmux_registry_root` and
+    nothing is recorded."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == pinned
+    assert os.environ[runs.PSMUX_DATA_DIR] == pinned
+    assert psmux_backend._DISPLACED_ROOT == str(runs.mux_registry_root(tmp_path))
+
+
 def test_pinned_state_env_resolves_rather_than_forwards(tmp_path, monkeypatch):
     """What travels is the answer this process reached, not the override it was
     handed. Forwarding only when the operator set something leaves the common case
@@ -7714,6 +7873,9 @@ class _RegistryMux:
     def list_sessions(self):
         return list(self._sessions)
 
+    def list_sessions_reporting(self, *, on_fault=None):
+        return self.list_sessions()
+
     def session_options(self, _option):
         return dict(self._tags)
 
@@ -7902,6 +8064,131 @@ def test_prune_sessions_refuses_an_untagged_legacy_session_claimed_only_by_a_run
 
     assert runs.prune_sessions(ours) == ([], [], set())
     assert legacy.killed == []
+
+
+class _RemovingMux(_RegistryMux):
+    """A registry whose kill lands: the session leaves the listing."""
+
+    def kill_session(self, name):
+        super().kill_session(name)
+        key = self.session_name_key(name)
+        self._sessions = [s for s in self._sessions if self.session_name_key(s) != key]
+
+
+def test_kill_displaced_session_kills_only_this_runs_tag_proven_session(tmp_path, monkeypatch):
+    """A resume must clear a same-named session in a registry this process no
+    longer addresses, or psmux's name mutex (it spans registries) rejects the
+    resumed session's create. Exactly that one session, and only on its tag:
+    another run of ours stays, and a neighbour's same-named session and an
+    untagged one stay too, even though this project holds a dead `r1` run dir
+    the primary pass's untagged fallback would accept as proof.
+
+    Each one left standing is named, because it will still block the resume.
+    Ablate the `kill_session(run_id, legacy)` call and `mine.killed` is empty;
+    ablate the tag check and the other two are killed."""
+    ours = runs.project_tag(tmp_path)
+    (_make_state_run(tmp_path, "r1") / "engine.pid").write_text(str(_dead_pid()))
+    mine = _RemovingMux(
+        ["bmad-loop-r1", "bmad-loop-r2"], {"bmad-loop-r1": ours, "bmad-loop-r2": ours}
+    )
+    neighbour = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": "0123456789abcdef"}, root=str(tmp_path / "n")
+    )
+    untagged = _RegistryMux(["bmad-loop-r1"], {}, root=str(tmp_path / "u"))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [mine, neighbour, untagged])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert mine.killed == ["bmad-loop-r1"]
+    assert neighbour.killed == untagged.killed == []
+    assert len(blockers) == 2
+    assert str(tmp_path / "n") in blockers[0] and str(tmp_path / "u") in blockers[1]
+    assert all("bmad-loop-r1 left standing" in b for b in blockers)
+
+
+def test_kill_displaced_session_kills_even_though_the_resumed_run_reads_alive(
+    tmp_path, monkeypatch
+):
+    """By the time a resume sweeps, it has refused a live engine and published
+    its own pid, so the run reads alive. Reusing the prune partition's liveness
+    arm would spare every stale session — the one case this exists for.
+
+    Ablate by routing the claim back through `prunable_sessions` and this
+    fails."""
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
+    legacy = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert legacy.killed == ["bmad-loop-r1"]
+
+
+def test_kill_displaced_session_reports_a_registry_it_could_not_ask(tmp_path, monkeypatch):
+    """Could not ask is not "nothing there". A listing the backend folds into
+    `[]` reaches the sink, one that raises is caught, and a backend that cannot
+    be selected is a line of its own; registries that did answer are still
+    swept.
+
+    Ablate the `on_fault` sink (call `list_sessions()`) and the first line is
+    lost; ablate either `except MultiplexerError` arm and this raises."""
+
+    class _Folding(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            assert on_fault is not None
+            on_fault("list-sessions failed: rc 1")
+            return []
+
+    class _Raising(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            raise MultiplexerError("registry unreadable")
+
+    folding = _Folding([], {}, root=str(tmp_path / "fold"))
+    raising = _Raising([], {}, root=str(tmp_path / "raise"))
+    fine = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding, raising, fine])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert len(blockers) == 2
+    assert str(tmp_path / "fold") in blockers[0] and "rc 1" in blockers[0]
+    assert str(tmp_path / "raise") in blockers[1] and "registry unreadable" in blockers[1]
+    assert fine.killed == ["bmad-loop-r1"]
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    assert [
+        "backend selection failed: no backend" in f
+        for f in runs.kill_displaced_session(tmp_path, "r1")
+    ] == [True]
+
+
+def test_kill_displaced_session_names_a_session_its_kill_did_not_remove(tmp_path, monkeypatch):
+    """The kill is best-effort and silent, and a survivor still holds psmux's
+    name mutex, so it is read back and named rather than reported as cleared.
+
+    Ablate the re-listing and this returns `[]`."""
+    stuck = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)}, root=str(tmp_path / "s")
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [stuck])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert stuck.killed == ["bmad-loop-r1"]
+    assert blockers == [f"{tmp_path / 's'}: bmad-loop-r1 still standing after the kill"]
+
+
+def test_kill_displaced_session_matches_through_the_registrys_name_key(tmp_path, monkeypatch):
+    """psmux folds session-name case, so a resume of `r1` must find a stale
+    `bmad-loop-R1` — its mutex blocks `bmad-loop-r1` all the same.
+
+    Ablate the `session_name_key` comparison (match names exactly) and nothing
+    is killed."""
+    tag = runs.project_tag(tmp_path)
+    folding = _RemovingMux(["bmad-loop-R1"], {"bmad-loop-R1": tag}, fold=True)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert folding.killed == ["bmad-loop-r1"]
 
 
 def test_prune_sessions_still_claims_an_untagged_session_in_the_primary_registry(
@@ -8371,6 +8658,9 @@ def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_pa
     monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
     monkeypatch.setattr(runs, "mux_sessions", ours.list_sessions)
     monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    # As `cli._configure_mux` leaves a process: the derived root in force AND
+    # the project it was derived for, which is what lets the kill gate see it.
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
     # untagged over there: the run dir proves nothing in a shared registry
     legacy = _RegistryMux(["bmad-loop-dup"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
@@ -9680,3 +9970,244 @@ def test_rearm_for_reverify_locked_body_holds_the_run_lock_through_save(tmp_path
     monkeypatch.setattr(runs, "save_state", checked_save)
 
     runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+
+# ------------------------------------- by-name operations in a shared registry (#729)
+
+
+class _SharedRegistryMux:
+    """A namespacing backend whose registry in force is `root` — an operator's
+    honoured root another project may share. Only what the ownership gate and
+    the by-name verbs reach."""
+
+    def __init__(self, root, sessions, tags, *, list_fault=None, namespaced=True):
+        self._root = root
+        self._sessions = list(sessions)
+        self._tags = dict(tags)
+        self._list_fault = list_fault
+        self._namespaced = namespaced
+        self.killed: list[str] = []
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+    def registry_root(self):
+        return self._root
+
+    def session_name_key(self, name):
+        return name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        if self._list_fault is not None:
+            assert on_fault is not None
+            on_fault(self._list_fault)
+            return []
+        return list(self._sessions)
+
+    def session_options(self, _option):
+        return dict(self._tags)
+
+    def has_session(self, name):
+        return name in self._sessions
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+def _shared(monkeypatch, project, mux):
+    """Point the module-level seam at `mux` and record `project` as configured,
+    as `cli._configure_mux` does ahead of every command."""
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", project)
+    return mux
+
+
+_FOREIGN_TAG = "0123456789abcdef"
+
+
+def _foreign_r1(tmp_path):
+    return _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-r1"], {"bmad-loop-r1": _FOREIGN_TAG}
+    )
+
+
+def _own_r1(tmp_path):
+    return _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "refused"),
+    [
+        ("ours", False),
+        ("foreign", True),
+        ("untagged", True),
+        ("absent", False),
+        ("listing-fault", True),
+        ("no-project", True),
+    ],
+)
+def test_foreign_session_refusal_in_a_shared_registry(tmp_path, monkeypatch, case, refused):
+    """In a registry that is not this project's derived root, a same-named
+    session is this project's only on its tag. "Could not ask" and "no project
+    configured" refuse rather than read as absent.
+
+    Ablate the tag comparison and `foreign`/`untagged` stop refusing; ablate the
+    listing-fault arm and `listing-fault` stops refusing; ablate the
+    no-project arm and `no-project` stops refusing."""
+    name = "bmad-loop-r1"
+    tag = {"ours": runs.project_tag(tmp_path), "foreign": _FOREIGN_TAG}.get(case)
+    mux = _SharedRegistryMux(
+        str(tmp_path / "shared"),
+        [] if case == "absent" else [name],
+        {name: tag} if tag else {},
+        list_fault="list-sessions failed: rc 1" if case == "listing-fault" else None,
+    )
+    _shared(monkeypatch, None if case == "no-project" else tmp_path, mux)
+
+    assert (runs.foreign_session_refusal(name) is not None) is refused
+
+
+@pytest.mark.parametrize("where", ["derived", "default", "tmux"])
+def test_foreign_session_refusal_stays_out_of_a_registry_that_proves_ownership(
+    tmp_path, monkeypatch, where
+):
+    """The derived root proves ownership by construction, so no tag is read
+    there; psmux's own default registry (the pre-existing degrade arm) and tmux
+    keep their historical by-name behaviour. A foreign tag on the session makes
+    the point: it is never consulted.
+
+    Ablate the `root == derived` early return and the `derived` row refuses."""
+    name = "bmad-loop-r1"
+    root = {"derived": str(runs.mux_registry_root(tmp_path)), "default": None}.get(where)
+    mux = _SharedRegistryMux(root, [name], {name: _FOREIGN_TAG}, namespaced=where != "tmux")
+    _shared(monkeypatch, tmp_path, mux)
+
+    assert runs.foreign_session_refusal(name) is None
+
+
+def test_kill_session_leaves_another_projects_session_in_a_shared_registry(
+    tmp_path, monkeypatch, capsys
+):
+    """The chokepoint every by-name kill routes through: resume's stale-session
+    drop, stop's backstop, the engine's teardowns. In a shared registry a
+    neighbour's tagged `bmad-loop-r1` stays, and the refusal is said.
+
+    Ablate the gate in `kill_session` and it is killed."""
+    mux = _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+
+    runs.kill_session("r1")
+
+    assert mux.killed == []
+    assert "killing bmad-loop-r1 refused" in capsys.readouterr().err
+
+
+def test_kill_session_still_kills_its_own_session_in_a_shared_registry(tmp_path, monkeypatch):
+    mux = _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+
+    runs.kill_session("r1")
+
+    assert mux.killed == ["bmad-loop-r1"]
+
+
+def test_stop_run_backstop_leaves_another_projects_session(tmp_path, monkeypatch, capsys):
+    """Stop's backstop kill goes through the gated chokepoint, so stopping this
+    project's `r1` never takes a neighbour's same-named session with it."""
+    mux = _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> legacy/dead
+
+    assert runs.stop_run(run_dir) is True
+    assert mux.killed == []
+    assert "refused" in capsys.readouterr().err
+
+
+def test_session_liveness_does_not_read_another_projects_session_as_alive(tmp_path, monkeypatch):
+    """A same-named session in a shared registry proves nothing about this run:
+    'unknown', not 'alive', which would refuse this run's resume and delete
+    and hide it from cleanup.
+
+    Ablate the gate in `_session_liveness` and the first assert reads 'alive'."""
+    monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
+    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    assert runs._session_liveness("r1") == "unknown"
+
+    _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+    assert runs._session_liveness("r1") == "alive"
+
+
+def test_export_records_the_project_it_configured(tmp_path, monkeypatch):
+    """The gate's project comes from the export, recorded even when the
+    derivation fails (the degrade arm still needs a project to prove a tag
+    against).
+
+    Ablate the assignment in `export_psmux_registry_root` and both fail."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    runs.export_psmux_registry_root(tmp_path)
+    assert runs._SETTLED_PROJECT == tmp_path
+
+    other = tmp_path / "other"
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+
+    def boom(_project):
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.setattr(runs, "mux_registry_root", boom)
+    assert runs.export_psmux_registry_root(other) is None
+    assert runs._SETTLED_PROJECT == other
+
+
+def test_foreign_session_refusal_matches_through_the_registrys_name_key(tmp_path, monkeypatch):
+    """psmux folds session-name case, so a foreign-tagged `bmad-loop-R1` IS the
+    session a kill of `bmad-loop-r1` would reach.
+
+    Ablate the `session_name_key` comparisons (match names exactly) and the gate
+    sees no such session and lets the kill through."""
+    mux = _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-R1"], {"bmad-loop-R1": _FOREIGN_TAG}
+    )
+    mux.session_name_key = lambda name: name.lower()
+    _shared(monkeypatch, tmp_path, mux)
+
+    assert runs.foreign_session_refusal("bmad-loop-r1") is not None
+
+
+def test_kill_session_reports_whether_it_sent_the_kill(tmp_path, monkeypatch):
+    """`False` for a refused kill, which is also queued for a frontend that cannot
+    read stderr (the TUI's cleanup worker drains it).
+
+    Ablate the `_REFUSED_KILLS.append` and the drain comes back empty."""
+    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    assert runs.kill_session("r1") is False
+    drained = runs.drain_refused_kills()
+    assert len(drained) == 1 and "tagged for another project" in drained[0]
+    assert runs.drain_refused_kills() == []
+
+    _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+    assert runs.kill_session("r1") is True
+
+
+def test_prune_sessions_does_not_count_a_refused_kill_as_removed(tmp_path, monkeypatch):
+    """The partition judged the session ours, then the ownership gate refused the
+    kill (a listing that faulted in between): cleanup must not report it as
+    removed while it runs on.
+
+    Ablate the `kill_session(run_id) is not False` filter in `prune_sessions` and
+    `r1` is reported killed."""
+    monkeypatch.setattr(runs, "prunable_sessions", lambda _p, *_a, **_k: (["r1"], [], {"r1"}))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: False)
+
+    assert runs.prune_sessions(tmp_path) == ([], [], set())
+
+
+def test_session_liveness_says_why_it_did_not_read_alive(tmp_path, monkeypatch, capsys):
+    """'unknown' alone cannot tell a refused probe from an absent session, so the
+    refusal is warned about.
+
+    Ablate the warning in `_session_liveness` and stderr is empty."""
+    monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
+    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+
+    assert runs._session_liveness("r1") == "unknown"
+    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err

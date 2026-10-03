@@ -88,6 +88,9 @@ MUX_REGISTRY_DIR = "_mux"
 # selection, which probes a subprocess, so it cannot be routed through a backend
 # instance. See `export_psmux_registry_root`.
 PSMUX_DATA_DIR = "PSMUX_DATA_DIR"
+# What `project_tag` returns: the parent directory name of every derived
+# registry root. See `resolve_psmux_registry_root`.
+_PROJECT_TAG_RE = re.compile(r"[0-9a-f]{16}")
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
 PID_FILE = "engine.pid"
@@ -603,7 +606,62 @@ def mux_registry_root(project: Path) -> Path:
     return project_state_root(project) / MUX_REGISTRY_DIR
 
 
-def export_psmux_registry_root(project: Path) -> str | None:
+def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambient: bool) -> str:
+    """The registry root a process settles on: ``derived`` unless the operator
+    opted in (``[mux] honor_ambient_psmux_data_dir``) AND ``ambient`` is a value
+    worth honouring. Pure, so every process given one project, one policy file
+    and one environment reaches one answer — the outer process and a pane child
+    alike, which is what closes both horns of #729:
+
+    - **Transient pin** (typed into one shell): leave the flag off. Everything
+      derives, a pane child included, so a clean process without the pin finds
+      the session.
+    - **Persistent pin** (a profile exports it into every shell): turn it on.
+      The outer process honours the pin and exports it, a pane child inherits
+      and honours it, and a clean process carrying the profile pin honours it
+      too.
+
+    Whether the pin is persistent is not in the environment; the flag is the
+    operator saying so, from a per-project file both processes read. It is a
+    *whether* and never a *where*: ``policy.toml`` is written by the sessions
+    this orchestrator drives, so a policy-sourced path would let a driven
+    session aim the cleanup path's kills at a registry of its choosing.
+
+    Not honoured, even with the flag on:
+
+    - an empty or relative value — psmux panics on it, and no shell-relative
+      path can be one registry for two processes. ``Path.is_absolute`` and not
+      ``os.path.isabs``: below 3.13 the latter accepts a drive-relative
+      ``\\registry`` on Windows, which psmux rejects;
+    - a value shaped like a bmad-loop-derived root,
+      ``<project tag>/``:data:`MUX_REGISTRY_DIR`. That is what an outer process
+      exports when it derived, and a pane child inheriting it must not mistake
+      it for a pin: a child moved to another state root or another
+      ``--project`` re-derives, exactly as a clean process with no pin does.
+    """
+    if not (honor_ambient and ambient and Path(ambient).is_absolute()):
+        return derived
+    pin = Path(ambient)
+    if pin.name == MUX_REGISTRY_DIR and _PROJECT_TAG_RE.fullmatch(pin.parent.name):
+        return derived
+    return ambient
+
+
+# The project this process configured its registry for
+# (`export_psmux_registry_root`), or None before that ran. Process-local, set
+# once ahead of dispatch like the backend's displaced-root record; it is what
+# lets the by-name session operations prove ownership without a project
+# parameter (see `foreign_session_refusal`).
+_SETTLED_PROJECT: Path | None = None
+
+
+def settled_project() -> Path | None:
+    """The project this process configured its registry for, or ``None``
+    before :func:`export_psmux_registry_root` ran (library or test use)."""
+    return _SETTLED_PROJECT
+
+
+def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) -> str | None:
     """Point this process — and everything it spawns — at ``project``'s registry
     by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or
     ``None`` when no root could be derived.
@@ -616,17 +674,19 @@ def export_psmux_registry_root(project: Path) -> str | None:
     unreadable registry as ``False`` / ``[]`` — a live run reading itself as gone.
     One export ahead of dispatch covers every verb in-process.
 
-    **The root is always derived, and an ambient value never changes it.** That
-    is the whole rule, and the absence of an exception is the point:
-    :func:`mux_registry_root` is a pure function of (project, state root), so any
-    two bmad-loop processes given the same project and the same state root agree
-    — which is the entire property #537 exists to establish. A value already in
-    the environment is *overridden*, and the caller says so
+    **The root is derived, and an ambient value does not change it by
+    default.** :func:`mux_registry_root` is a pure function of (project, state
+    root), so any two bmad-loop processes given the same project and the same
+    state root agree — which is the entire property #537 exists to establish. A
+    value already in the environment is *overridden*, and the caller says so
     (:func:`cli._configure_mux` reports it once on stderr; ``bmad-loop mux``
-    discloses it).
+    discloses it). The one exception is an operator's stated preference,
+    ``honor_ambient`` (policy ``[mux] honor_ambient_psmux_data_dir``), decided
+    by :func:`resolve_psmux_registry_root` — see there for why a boolean and
+    not a path, and which values it still refuses to honour.
 
-    **Why an operator's own ``PSMUX_DATA_DIR`` is not honoured**, since honouring
-    it is the obvious kindness and it was tried:
+    **Why an operator's own ``PSMUX_DATA_DIR`` is not honoured by default**,
+    since honouring it is the obvious kindness and it was tried:
 
     - It would make the registry a function of the launch *shell*. A TUI started
       from the Start menu carries no profile environment and derives; a run
@@ -665,11 +725,10 @@ def export_psmux_registry_root(project: Path) -> str | None:
     Without that the override would strand exactly the sessions it displaced,
     with cleanup reporting a clean machine.
 
-    Wanting one registry to serve both is a real request and is deliberately not
-    answered here. It needs a stated operator preference rather than a guess at
-    one — and it must be a policy *whether*, never a *where*: ``policy.toml`` is
-    written by the sessions this orchestrator drives, so a policy-sourced root
-    would let a driven session choose which registry the cleanup path kills in.
+    Wanting one registry to serve both is answered by that stated preference
+    rather than a guess at one (#729). Honouring displaces the derived root
+    instead, and it is handed to the same sweep: sessions started before the
+    flag was turned on live there.
 
     **No ``BMAD_LOOP_*`` knob for the root either.** It is derived state, not
     configuration; ``BMAD_LOOP_STATE_DIR`` already relocates it transitively —
@@ -692,6 +751,11 @@ def export_psmux_registry_root(project: Path) -> str | None:
     diagnostics down with it. ``None`` means "no root established": psmux keeps
     whatever it had, which is also the root cleanup sweeps as the legacy one.
     """
+    global _SETTLED_PROJECT
+    # Recorded before anything can fail: the ownership gate needs the project
+    # on the degrade arm too, where the registry in force is not one derived
+    # for it (see `foreign_session_refusal`).
+    _SETTLED_PROJECT = project
     try:
         root = str(mux_registry_root(project))
     except (StateRootError, OSError, RuntimeError):
@@ -702,6 +766,13 @@ def export_psmux_registry_root(project: Path) -> str | None:
         # value psmux would panic on.
         return None
     displaced = os.environ.get(PSMUX_DATA_DIR)
+    derived = root
+    root = resolve_psmux_registry_root(derived, displaced, honor_ambient=honor_ambient)
+    if root != derived:
+        # Honoured: what is displaced now is the derived root, which holds any
+        # session started before the operator turned the flag on. Same sweep,
+        # same reason as the override arm below.
+        displaced = derived
     os.environ[PSMUX_DATA_DIR] = root
     if displaced is not None and displaced != root:
         # The variable is now gone, and it was the only record of where a
@@ -1231,7 +1302,15 @@ def _session_liveness(run_id: str) -> str:
     if not mux_usable(mux):  # forced-aware, like every other observer gate
         return "unknown"
     try:
-        return "alive" if mux.has_session(session_name(run_id)) else "unknown"
+        if not mux.has_session(session_name(run_id)):
+            return "unknown"
+        # A same-named session in a shared registry may be another project's:
+        # it proves nothing about this run, which is exactly 'unknown'.
+        refusal = foreign_session_refusal(session_name(run_id), mux)
+        if refusal is not None:
+            _warn_foreign_session(f"reading {session_name(run_id)} as this run's", refusal)
+            return "unknown"
+        return "alive"
     except (OSError, MultiplexerError):
         # The seam raises MultiplexerError (not OSError) on a backend failure; a
         # dead query proves nothing about a legacy run, so degrade to 'unknown'
@@ -1329,7 +1408,101 @@ def discover_runs(project: Path) -> tuple[list[RunInfo], str | None]:
 # ----------------------------------------------------------- stop / delete / archive
 
 
-def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
+def foreign_session_refusal(
+    name: str, mux: TerminalMultiplexer | None = None, project: Path | None = None
+) -> str | None:
+    """Why the session called ``name`` may NOT be treated as ``project``'s, or
+    ``None`` when it may (or does not exist).
+
+    A by-name operation — a kill, an attach, a liveness read, an adapter adopting
+    a session it finds already there — is sound only where the registry itself
+    proves ownership: the derived per-project root, whose every session is this
+    project's. An operator's honoured root (#729) is shared by every project that
+    honours it, and run ids are unique per project only, so there
+    ``bmad-loop-<id>`` may be a neighbour's. In such a registry the session must
+    carry this project's tag (:data:`PROJECT_OPTION` in :func:`accepted_tags`) —
+    the proof the cleanup sweep already demands (``require_tag``).
+
+    Gated: a namespacing backend whose root in force is set and is not the
+    derived one. Ungated: tmux (no namespace), the derived root, and psmux's own
+    default registry (``registry_root()`` ``None`` — the underivable-state-root
+    degrade arm, which predates #729 and is warned about at startup).
+
+    ``project`` defaults to the one this process configured
+    (``export_psmux_registry_root``); with neither, ownership cannot be proven
+    and the answer is a refusal. A listing that faults is a refusal too: "could
+    not ask" never reads as "absent".
+    """
+    mux = mux or get_multiplexer()
+    try:
+        if not mux.has_registry_namespace():
+            return None
+        root = mux.registry_root()
+    except MultiplexerError as exc:
+        return f"the multiplexer could not be asked which registry is in force: {exc}"
+    if root is None:
+        return None
+    project = project or _SETTLED_PROJECT
+    if project is None:
+        return (
+            f"the registry {root} is not one derived for a known project, so "
+            f"ownership of {name} cannot be proven"
+        )
+    try:
+        if root == str(mux_registry_root(project)):
+            return None
+    except (StateRootError, OSError, RuntimeError):
+        pass  # no derived root: the one in force proves nothing, so ask the tag
+    key = mux.session_name_key(name)
+    faults: list[str] = []
+    present: list[str] = []
+    tags: dict[str, str] = {}
+    try:
+        listed = mux.list_sessions_reporting(on_fault=faults.append)
+        present = [n for n in listed if mux.session_name_key(n) == key]
+        tags = mux.session_options(PROJECT_OPTION) if present and not faults else {}
+    except MultiplexerError as exc:
+        faults.append(str(exc))
+    if faults:
+        return (
+            f"the shared registry {root} could not be listed ({faults[0]}), so "
+            f"ownership of {name} cannot be proven"
+        )
+    if not present:
+        return None
+    tag = next((v for s, v in tags.items() if mux.session_name_key(s) == key), "")
+    try:
+        mine = accepted_tags(project)
+    except (OSError, RuntimeError) as exc:
+        return (
+            f"this project's tag could not be computed ({exc}), so ownership of "
+            f"{name} cannot be proven"
+        )
+    if tag in mine:
+        return None
+    whose = "untagged" if not tag else "tagged for another project"
+    return f"{name} in the shared registry {root} is {whose}, so it is not this project's"
+
+
+def _warn_foreign_session(what: str, refusal: str) -> None:
+    print(f"warning: {what} refused — {refusal}", file=sys.stderr)
+
+
+# Kills `kill_session` refused since the last `drain_refused_kills`, one line
+# each. stderr is the CLI's channel; the TUI cannot read it (Textual captures
+# it for the app's whole run), so its cleanup worker drains this instead.
+_REFUSED_KILLS: list[str] = []
+
+
+def drain_refused_kills() -> list[str]:
+    """The kills :func:`kill_session` refused since the last call, oldest
+    first, and forget them — for a frontend whose stderr nobody reads."""
+    drained = list(_REFUSED_KILLS)
+    del _REFUSED_KILLS[: len(drained)]
+    return drained
+
+
+def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> bool:
     """Kill a run's agent session (bmad-loop-<id>); a no-op when it is already
     gone or the multiplexer is unavailable.
 
@@ -1355,10 +1528,28 @@ def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
     deliberately so: a by-name kill in a shared registry without tag proof
     could take another project's same-named session (run ids are unique per
     project only). The legacy sweep in :func:`prune_sessions`, which does
-    demand the tag, is the path that reaches it."""
+    demand the tag, is the path that reaches it — and, for one run's session
+    on a resume, :func:`kill_displaced_session`.
+
+    In the primary registry the kill is also refused, with a warning, when that
+    registry is shared (an operator's honoured root, #729) and the session's
+    tag does not prove it this project's — :func:`foreign_session_refusal`.
+
+    Returns ``False`` when the kill was refused (either rule above), ``True``
+    when it was sent — sent, not landed: the backend kill is best-effort."""
     if run_id_aliases_control_session(run_id):
-        return
+        return False
+    if mux is None:
+        # The primary registry: a by-name kill there needs ownership proof when
+        # it is shared (`foreign_session_refusal`). An explicit `mux` is a legacy
+        # registry whose callers judged the tag already.
+        refusal = foreign_session_refusal(session_name(run_id))
+        if refusal is not None:
+            _warn_foreign_session(f"killing {session_name(run_id)}", refusal)
+            _REFUSED_KILLS.append(refusal)
+            return False
     (mux or get_multiplexer()).kill_session(session_name(run_id))
+    return True
 
 
 CTL_SESSION = "bmad-loop-ctl"
@@ -1413,6 +1604,11 @@ def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> st
     state root spelled in two such casings of the same non-ASCII name stays
     split, as it is for every other digest of an operator-supplied path.
 
+    When the operator's own root is honoured (``[mux]
+    honor_ambient_psmux_data_dir``), that settled root is digested alongside
+    the derived one: the name stays per project, and changes with the
+    registry it lives in.
+
     The degrade arm (namespaced transport, underivable state root) answers
     the fixed name: that arm runs on the transport's shared default registry,
     where a shared session scoped by per-window project tags is the correct,
@@ -1423,7 +1619,20 @@ def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> st
     if not mux.has_registry_namespace():
         return CTL_SESSION
     try:
-        scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+        derived = mux_registry_root(project)
+        scope = os.path.normcase(str(derived.resolve()))
+        # An honoured operator root (#729) is a different physical registry, so
+        # it gets a different name — or turning the opt-in on would mint the
+        # same name in the new registry while the old one's control session
+        # still holds psmux's mutex. Not honoured, the export settled the
+        # derived root and the name is byte-identical to before. Compared as
+        # identities, resolved and case-folded like `scope`, so another spelling
+        # of the derived registry is still that registry.
+        settled = os.environ.get(PSMUX_DATA_DIR)
+        if settled and Path(settled).is_absolute():
+            pinned = os.path.normcase(str(Path(settled).resolve()))
+            if pinned != scope:
+                scope += "\0" + pinned
     except (StateRootError, OSError, RuntimeError):
         return CTL_SESSION
     return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
@@ -1670,7 +1879,10 @@ def _registry_proves_ownership(project: Path) -> bool:
     ``PSMUX_DATA_DIR`` it found in force, and psmux honours any absolute value
     (``src/paths.rs``, source-read at v3.3.8) — so on that arm every verb,
     including the kill, addresses the operator's own registry while this project's
-    run dirs go on looking like ownership.
+    run dirs go on looking like ownership. The operator's opt-in
+    (``[mux] honor_ambient_psmux_data_dir``) puts every verb in their registry
+    on purpose, and it is just as shared: it misses the derived root, so the tag
+    is demanded there too.
 
     ``registry_root()`` answering ``None`` covers two cases, and they get
     **opposite** answers — conflating them was a defect, not caution. A backend
@@ -1734,8 +1946,8 @@ def prune_sessions(
     :func:`prunable_sessions`' untagged run-dir fallback is evidence only where
     the registry has already restricted the listing to this project. A legacy
     registry is shared by every project by definition; the primary one is shared
-    whenever the derivation failed — an ambient ``PSMUX_DATA_DIR`` left in
-    force, or nothing in force at all, where a namespacing backend runs on its
+    whenever the derivation failed or the operator opted into their own root — an
+    ambient ``PSMUX_DATA_DIR`` left or honoured in force, or nothing in force at all, where a namespacing backend runs on its
     own shared default registry. What that strictness leaves standing in a
     legacy registry is reported
     by :func:`legacy_registry_leftovers`, which the cleanup frontends print: a
@@ -1745,8 +1957,10 @@ def prune_sessions(
         project, require_tag=not _registry_proves_ownership(project)
     )
     if not dry_run:
-        for run_id in prunable:
-            kill_session(run_id)
+        # A kill the ownership gate refuses (a listing that faulted between the
+        # partition and the kill) is not reported as removed; it warned.
+        prunable = [run_id for run_id in prunable if kill_session(run_id) is not False]
+        unknown &= set(prunable)  # the killed subset, by contract
     try:
         legacies = _legacy_registries()
     except MultiplexerError:
@@ -1763,6 +1977,83 @@ def prune_sessions(
         live += [i for i in extra_live if i not in live]
         unknown |= extra_unknown
     return prunable, live, unknown
+
+
+def kill_displaced_session(project: Path, run_id: str) -> list[str]:
+    """Kill ``run_id``'s agent session in every legacy registry where its
+    ownership tag proves it this project's, and return one line per thing that
+    still stands in the resume's way: a registry that could not be listed, or a
+    same-named session left standing because nothing proves it ours. ``[]``
+    means every registry answered and none holds a blocker.
+
+    For a resume: :func:`kill_session` reaches only the registry this process
+    addresses, and psmux's duplicate-server guard is a mutex keyed on the
+    session name across every registry (psmux/psmux#599), so a same-named
+    session left standing in a registry this process no longer addresses — the
+    one it displaced (#537), psmux's default from before the per-project root,
+    or the derived one an opt-in to the operator's own root moved away from
+    (#729) — makes the resumed session's create fail.
+
+    **Tag-proven, never by name.** A legacy registry is shared and run ids are
+    unique per project only, so the rule is the one :func:`prune_sessions`'
+    legacy pass applies (``require_tag=True``): the session's
+    :data:`PROJECT_OPTION` tag must be one of :func:`accepted_tags`. The
+    partition's *liveness* arm is deliberately not reused: by the time a resume
+    gets here it has refused a live engine and published its own pid, so the
+    run reads alive and every stale session would be spared. The session is
+    this run's, and this process is its engine.
+
+    Listed through ``list_sessions_reporting`` so a failed listing reaches the
+    returned lines instead of folding into "no session". A failed tag read
+    still warns on the backend's own channel and proves nothing, so the session
+    is left standing and named here. The kill itself is best-effort and silent,
+    so the registry is re-listed after it and a survivor is named too.
+    """
+    if run_id_aliases_control_session(run_id):
+        return []
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        return [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    blockers: list[str] = []
+    mine = accepted_tags(project)
+    for legacy in legacies:
+        label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
+        listing_faults: list[str] = []
+        # Through the registry's own name key: on psmux `bmad-loop-R1` IS
+        # `bmad-loop-r1`, and the mutex folds the same way.
+        target = legacy.session_name_key(session_name(run_id))
+        try:
+            names = legacy.list_sessions_reporting(on_fault=listing_faults.append)
+            ours = [n for n in names if legacy.session_name_key(n) == target]
+            tags = legacy.session_options(PROJECT_OPTION) if ours else {}
+            killed = False
+            for name in ours:
+                if tags.get(name, "") in mine:
+                    kill_session(run_id, legacy)
+                    killed = True
+                else:
+                    blockers.append(
+                        f"{label}: {name} left standing — its ownership tag does not "
+                        "prove it this project's"
+                    )
+            # The kill is best-effort and silent by contract, so whether it
+            # landed is read back rather than assumed.
+            survivors = (
+                [
+                    n
+                    for n in legacy.list_sessions_reporting(on_fault=listing_faults.append)
+                    if legacy.session_name_key(n) == target
+                ]
+                if killed
+                else []
+            )
+        except MultiplexerError as exc:
+            blockers.append(f"{label}: could not be listed: {exc}")
+            continue
+        blockers += [f"{label}: could not be listed: {fault}" for fault in listing_faults]
+        blockers += [f"{label}: {name} still standing after the kill" for name in survivors]
+    return blockers
 
 
 #: How a frontend names psmux's OWN default registry, the one root

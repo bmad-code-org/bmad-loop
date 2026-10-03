@@ -665,6 +665,114 @@ def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch
     assert composed.engine.kwargs["min_severity"] is None
 
 
+def test_resume_sweeps_the_displaced_registry_and_reports_what_it_could_not_ask(
+    tmp_path, monkeypatch, capsys
+):
+    """The resume's stale-session sweep reaches the registries the session may
+    predate (psmux's name mutex spans registries, so a survivor there blocks the
+    new session's create), and a registry it could not ask is journalled and
+    warned about rather than folded into "nothing there".
+
+    Ablate the `runs.kill_displaced_session` call in `compose_resume` and
+    `swept` stays empty."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    state = RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now", run_type="sweep")
+    swept = []
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    def displaced(project, run_id):
+        swept.append((project, run_id))
+        return ["C:\\old: could not be listed: boom"]
+
+    monkeypatch.setattr(runs, "kill_displaced_session", displaced)
+    journal = Journal(run_dir)
+
+    runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=journal,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert swept == [(tmp_path, RUN_ID)]
+    details = [
+        e.get("detail")
+        for e in journal.entries()
+        if e.get("kind") == "displaced-session-not-cleared"
+    ]
+    assert details == ["C:\\old: could not be listed: boom"]
+    assert "could not be listed: boom" in capsys.readouterr().err
+
+
+class _SharedRegistryWithForeignR1:
+    """A shared (honoured, #729) registry holding another project's tagged
+    session under this run's name — just what the ownership gate reads."""
+
+    def __init__(self, root):
+        self._root = root
+        self.killed: list[str] = []
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return self._root
+
+    def session_name_key(self, name):
+        return name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return [runs.session_name(RUN_ID)]
+
+    def session_options(self, _option):
+        return {runs.session_name(RUN_ID): "0123456789abcdef"}
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+def test_resume_leaves_another_projects_same_named_session_alone(tmp_path, monkeypatch, capsys):
+    """Resume drops a stale agent session by name. In a registry shared with
+    another project, `bmad-loop-<id>` may be that project's live session, and
+    killing it would end its coding process: the real `runs.kill_session` gate
+    refuses and says so.
+
+    Ablate the gate in `runs.kill_session` and `mux.killed` holds the
+    neighbour's session."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    state = RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now", run_type="sweep")
+    mux = _SharedRegistryWithForeignR1(str(tmp_path / "shared"))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
+
+    runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert mux.killed == []
+    assert "refused" in capsys.readouterr().err
+
+
 def test_missing_sweep_options_requires_current_state_marker(tmp_path):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
