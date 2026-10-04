@@ -1247,6 +1247,99 @@ def test_resultless_stop_breadcrumb_explains_non_recursive_artifact_scan(tmp_pat
     assert crumb["verdict"] == "no-artifact"
     assert str(impl) in crumb["detail"]
     assert "subdirectories are not searched" in crumb["detail"]
+    # The nested file itself is named (#780) — the clause above is unconditional on
+    # every unpinned no-artifact, so only this line proves the fixture matters.
+    assert str(nested / "spec-3-1-foo.md") in crumb["detail"]
+    assert "never read back" in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_names_nested_frontmatter_candidate(tmp_path, monkeypatch):
+    """A marker-less nested spec finalized to a terminal frontmatter would have been
+    a #224 candidate directly under the dir, so it is named too."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text("---\nstatus: done\n---\n\n# Story\n", encoding="utf-8")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(nested / "spec-3-1-foo.md") in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_ignores_stale_nested_spec(tmp_path, monkeypatch):
+    """The nested probe keeps the launch floor: a spec older than the session is a
+    prior run's artifact, not a hint about this one."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    stale = nested / "spec-3-1-foo.md"
+    stale.write_text(_DONE_SPEC, encoding="utf-8")
+    launched = stale.stat().st_mtime_ns + 1_000
+    os.utime(stale, ns=(launched - 1_000, launched - 1_000))
+
+    assert adapter._result_json(_dev_handle(launched), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "subdirectories are not searched" in crumb["detail"]
+    assert str(stale) not in crumb["detail"]
+    assert "never read back" not in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_does_not_follow_symlinked_subdir(tmp_path, monkeypatch):
+    """A linked folder is not one level down — it may point anywhere — so the probe
+    leaves it alone, like every other artifact walk."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "spec-3-1-foo.md" not in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_reports_nested_probe_fault(tmp_path, monkeypatch):
+    """A probe that could not list the dir says so instead of reading as "nothing
+    nested"."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.devcontract,
+        "find_nested_result_hints",
+        lambda d, *, since_ns: ([], "PermissionError: denied"),
+    )
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "subdirectory probe failed: PermissionError: denied" in crumb["detail"]
+
+
+def test_nested_result_never_harvested(tmp_path, monkeypatch):
+    """HARD CONSTRAINT (#780): a nested hit is named, never read back as a result —
+    not on a Stop, not on the crash path."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False) is None
+    assert _breadcrumbs(adapter) == []  # wait=False never probes nor crumbs
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
 
 
 def test_resultless_stop_breadcrumb_stories_pending(tmp_path, monkeypatch):
@@ -1255,6 +1348,10 @@ def test_resultless_stop_breadcrumb_stories_pending(tmp_path, monkeypatch):
     assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True) is None
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "pending"
+    stories_dir = tmp_path / "epic" / "stories"
+    assert crumb["detail"] == (
+        f"no 1-*.md directly under {stories_dir} (subdirectories are not searched)"
+    )
 
 
 def test_resultless_stop_breadcrumb_stories_ambiguous(tmp_path):
@@ -7828,6 +7925,24 @@ def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
     assert "directly under" not in crumb["detail"]
     assert "subdirectories are not searched" not in crumb["detail"]
     assert "someone-elses" not in crumb["detail"]
+
+
+def test_expected_spec_breadcrumb_never_probes_subdirectories(tmp_path, monkeypatch):
+    """The nested probe (#780) belongs to the unpinned scan only: a pinned spec
+    names the one path owed and never mentions anything one level down."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(ours) in crumb["detail"]
+    assert str(nested) not in crumb["detail"]
+    assert "never read back" not in crumb["detail"]
 
 
 def test_dev_attempt_one_keeps_the_scan(tmp_path, monkeypatch):

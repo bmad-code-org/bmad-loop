@@ -1028,6 +1028,78 @@ def test_find_artifact_ignores_heading_in_longer_outer_fence(tmp_path):
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
+# ------------------------------------------------------- find_nested_result_hints
+
+
+def _deep_spec(path: Path, **kwargs) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _spec(path, **kwargs)
+
+
+def test_nested_hints_names_marker_and_frontmatter_specs_one_level_down(tmp_path):
+    marked = _deep_spec(tmp_path / "a" / "spec-1-1-x.md", auto_run="done")
+    bare = _deep_spec(tmp_path / "b" / "spec-1-2-y.md", auto_run=None)
+    _deep_spec(tmp_path / "spec-flat.md")  # directly in the dir: the flat scan's job, not a hint
+    _deep_spec(tmp_path / "a" / "deeper" / "spec-1-3-z.md")  # two levels down: never probed
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([marked, bare], None)
+
+
+def test_nested_hints_keep_the_launch_floor(tmp_path):
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
+def test_nested_hints_cap_at_limit(tmp_path):
+    for i in range(5):
+        _deep_spec(tmp_path / f"d{i}" / f"spec-1-{i}-x.md")
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0, limit=2)
+    assert fault is None
+    assert hits == [tmp_path / "d0" / "spec-1-0-x.md", tmp_path / "d1" / "spec-1-1-x.md"]
+
+
+def test_nested_hints_dedupe_preserving_order(tmp_path, monkeypatch):
+    """The two finders never overlap today (a marker excludes a spec from the
+    frontmatter scan), so overlap is forced: a later finder repeating a path must
+    neither duplicate it nor spend the limit on it."""
+    (tmp_path / "stories").mkdir()
+    a, b = tmp_path / "stories" / "a.md", tmp_path / "stories" / "b.md"
+    monkeypatch.setattr(devcontract, "find_result_artifact", lambda d, *, since_ns: a)
+    monkeypatch.setattr(devcontract, "find_frontmatter_candidates", lambda d, *, since_ns: [a, b])
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([a, b], None)
+
+
+def test_nested_hints_non_dir_input_is_not_a_fault(tmp_path):
+    assert devcontract.find_nested_result_hints(tmp_path / "ghost", since_ns=0) == ([], None)
+    (tmp_path / "file.md").write_text("x", encoding="utf-8")
+    assert devcontract.find_nested_result_hints(tmp_path / "file.md", since_ns=0) == ([], None)
+
+
+def test_nested_hints_skip_symlinked_subdirs(tmp_path):
+    outside = tmp_path / "outside"
+    _deep_spec(outside / "spec-1-1-x.md")
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    assert devcontract.find_nested_result_hints(impl, since_ns=0) == ([], None)
+
+
+def test_nested_hints_listing_fault_is_reported_not_empty(tmp_path, monkeypatch):
+    _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+
+    def boom(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == (
+        [],
+        "PermissionError: denied",
+    )
+
+
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
 # was killed) can end inside a multi-byte sequence; `read_text(encoding="utf-8")`
 # then raises UnicodeDecodeError — a ValueError, NOT an OSError.

@@ -2686,6 +2686,33 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return _SnapVerdict.REFUSE
         return _SnapVerdict.NEUTRAL
 
+    @staticmethod
+    def _nested_spec_hint(search_dirs: list[Path], *, since_ns: int) -> str:
+        """The unpinned ``no-artifact`` crumb's #780 suffix: name specs one level
+        below a searched dir that would have qualified directly in it (a
+        ``stories/`` layout rides to timeout otherwise, with nothing saying why).
+        Diagnosis only — the paths are named, never read back as a result. A probe
+        fault is reported as such rather than read as "nothing nested". Returns ""
+        when there is nothing to say."""
+        hits: list[Path] = []
+        faults: list[str] = []
+        for d in dict.fromkeys(search_dirs):
+            found, fault = devcontract.find_nested_result_hints(d, since_ns=since_ns)
+            hits += [p for p in found if p not in hits]
+            if fault is not None:
+                faults.append(fault)
+        hint = ""
+        if hits:
+            hint += (
+                "; qualifying spec(s) found in subdirectories, which are never read back: "
+                + ", ".join(str(p) for p in hits)
+                + " — move the spec directly under the artifacts dir, or use stories"
+                " mode ([stories] source) for a stories/ layout"
+            )
+        if faults:
+            hint += "; subdirectory probe failed: " + "; ".join(faults)
+        return hint
+
     def _frontmatter_fallback(
         self,
         handle: SessionHandle,
@@ -2800,6 +2827,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
                         else "no result artifact newer than session launch directly under: "
                         + where
                         + " (subdirectories are not searched)"
+                        + self._nested_spec_hint(search_dirs, since_ns=handle.launched_ns)
                     ),
                 )
             return None
@@ -2999,6 +3027,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # read FAULT (DW-457) — `stat-failed` / `unreadable-spec`, never filed
             # as the genuine `stale-mtime` / `not-terminal` answers it used to be.
             verdict, detail = state.kind, str(state.path or base)
+            if state.kind == stories.KIND_PENDING:
+                # Name the glob and its flatness (#780): a spec one folder deeper
+                # is never resolved, and a bare dir left that unsaid.
+                detail = (
+                    f"no {story_key}-*.md directly under {base / stories.STORIES_SUBDIR}"
+                    " (subdirectories are not searched)"
+                )
             fault: tuple[Path, str] | None = None
             if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
                 try:
