@@ -41,6 +41,9 @@ breaking changes may land in a minor release.
 - Explain that unpinned result-artifact scans search only the configured artifact
   directories themselves, so a nested story spec no longer produces an opaque
   `no-artifact` breadcrumb (#780).
+- Surface why a sprint-mode dev session found no result: `session-end` carries
+  the last resultless verdict, the `no-artifact` crumb names specs found one level
+  down, and `validate` warns `queue.nested-specs` on a nested spec layout (#780).
 
 ## [0.13.1] — 2026-10-01
 
