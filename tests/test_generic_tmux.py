@@ -7605,7 +7605,7 @@ def test_run_evicts_only_the_returning_task_ids_sibling_stores(tmp_path, monkeyp
 def test_eviction_is_a_noop_when_start_session_raised_pre_capture(tmp_path, monkeypatch):
     """Eviction must never manufacture an exception. `start_session` runs INSIDE the
     `try` the mixin's `finally` guards, so a launch that dies before anything was
-    recorded still reaches `_evict_task_state` with four empty stores — and the
+    recorded still reaches `_evict_task_state` with five empty stores — and the
     operator must see the transport fault, not a `KeyError` raised while cleaning
     up after it. This is why the seam uses `pop(..., None)` / `discard`, never
     `del` / `remove`: `del` on an absent key would REPLACE the real exception."""
@@ -7628,6 +7628,143 @@ def test_eviction_is_a_noop_when_start_session_raised_pre_capture(tmp_path, monk
     assert adapter._fm_fallback_obs == {}
     assert adapter._fm_transition_obs == {}
     assert adapter._contract_nudge_sent == set()
+    assert adapter._last_resultless == {}
+
+
+# ------------------------------ last resultless verdict on the result (#780)
+#
+# A spec nested under `impl/stories/` is outside the flat unpinned read-back, so
+# every Stop crumbs `no-artifact` into resultless-stops.jsonl and the session rides
+# to timeout. Nothing reads that file, so the mixin's `run()` folds the LAST crumb
+# onto a non-completed result for the engine's `session-end` entry. Ablations:
+# deleting the fold fails the timeout row; dropping the `status != "completed"`
+# gate fails the two completed rows; dropping the pop from `_evict_task_state`
+# fails the eviction rows.
+
+
+def _stub_dev_lifecycle(adapter, monkeypatch, wait):
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → the post-kill rescue runs
+
+
+def test_run_timeout_carries_last_resultless_verdict(tmp_path, monkeypatch):
+    """The #780 shape end to end through `run()`: a qualifying spec one directory
+    down, a real Stop read-back that crumbs `no-artifact`, a timeout the post-kill
+    rescue cannot upgrade (the scan stays flat). The LAST crumb rides the result,
+    overwriting an earlier one from the same session."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+
+    def wait(handle, running_spec):
+        adapter._note_resultless_stop(running_spec.task_id, "pending", "an earlier Stop")
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        return _unvouched("timeout")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert result.status == "timeout"
+    assert result.result_json is None  # diagnosed, never harvested
+    assert result.resultless_verdict == "no-artifact"
+    assert result.resultless_detail is not None
+    assert str(impl) in result.resultless_detail
+    assert "subdirectories are not searched" in result.resultless_detail
+    assert _breadcrumbs(adapter)[-1]["detail"] == result.resultless_detail
+
+
+def test_run_completed_carries_no_resultless_verdict(tmp_path, monkeypatch):
+    """Present-only: a session that completes after an earlier empty Stop leaves
+    both fields None — the crumb explained a Stop, not the session's outcome."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        return SessionResult(
+            status="completed",
+            result_json={"status": "done"},
+            session_id="sess",
+            transcript_path="/t.jsonl",
+        )
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert len(_breadcrumbs(adapter)) == 1  # the earlier crumb really was written
+    assert result.status == "completed"
+    assert result.resultless_verdict is None
+    assert result.resultless_detail is None
+
+
+def test_run_rescued_result_carries_no_resultless_verdict(tmp_path, monkeypatch):
+    """The fold sits after `_post_kill_reconcile`, so a stall the rescue upgrades to
+    `completed` is never annotated with the Stop-time crumb it outgrew."""
+    adapter, impl = make_dev_adapter(tmp_path)
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)  # written after that Stop
+        return _unvouched("stalled", stop_seen=True)
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert len(_breadcrumbs(adapter)) == 1
+    assert result.status == "completed"
+    assert result.result_json is not None
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.resultless_verdict is None
+    assert result.resultless_detail is None
+
+
+def test_last_resultless_evicted_after_run(tmp_path, monkeypatch):
+    """Same retention bound as the sibling stores: present during the session
+    (non-vacuous), gone once `run()` returns, scoped to the returning task id."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    adapter._note_resultless_stop("3-2-dev-1", "no-artifact", "another session in flight")
+    seen = {}
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        seen["present"] = running_spec.task_id in adapter._last_resultless
+        return _unvouched("timeout")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+    spec = _dev_spec(tmp_path)
+
+    adapter.run(spec)
+
+    assert seen["present"] is True
+    assert spec.task_id not in adapter._last_resultless
+    assert adapter._last_resultless["3-2-dev-1"] == ("no-artifact", "another session in flight")
+
+
+def test_last_resultless_evicted_when_wait_raises(tmp_path, monkeypatch):
+    """A raising `wait_for_completion` skips the fold but not the `finally`; the
+    exception reaches the caller unchanged."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+
+    def raising(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        assert running_spec.task_id in adapter._last_resultless
+        raise RuntimeError("stop requested")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, raising)
+    spec = _dev_spec(tmp_path)
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert spec.task_id not in adapter._last_resultless
 
 
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):

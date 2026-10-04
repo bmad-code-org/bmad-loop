@@ -7852,6 +7852,14 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
+        # empty read-back diagnosis (#780): same present-only convention. The
+        # last resultless-stop verdict lands here because nothing reads the
+        # crumb file, so a spec nested out of the read-back's reach timed out
+        # with no visible reason.
+        if result.resultless_verdict:
+            extras["resultless_verdict"] = result.resultless_verdict
+        if result.resultless_detail:
+            extras["resultless_detail"] = result.resultless_detail
         return extras
 
     @staticmethod
