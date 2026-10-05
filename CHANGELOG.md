@@ -38,6 +38,9 @@ breaking changes may land in a minor release.
 
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
+- Explain that unpinned result-artifact scans search only the configured artifact
+  directories themselves, so a nested story spec no longer produces an opaque
+  `no-artifact` breadcrumb (#780).
 
 ## [0.13.1] — 2026-10-01
 
