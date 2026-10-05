@@ -2786,3 +2786,40 @@ def test_the_remedy_commands_carry_the_root_through_a_shell_intact(monkeypatch, 
     assert shlex.split(set_env)[-2:] == [envvars.STATE_DIR, own]
     export = warning[warning.index("export ") : warning.index(", or recreating")]
     assert shlex.split(export) == ["export", f"{envvars.STATE_DIR}={own}"]
+
+
+@pytest.mark.parametrize("launcher", ["s2", "s1"])
+def test_stale_root_warning_on_a_shared_server(monkeypatch, tmp_path: Path, launcher):
+    """Two roots on one tmux server: `bmad-loop-ctl` is shared by every project
+    there, so the session-scoped remedy re-roots all of them. A launcher under
+    S2 against a server whose new panes resolve S1 warns, naming the shared
+    session, the condition on `set-environment` and the cost of `kill-server`;
+    a launcher under S1 against the same server stays silent.
+
+    Ablation: drop the shared-session clause from the warning and the S2 row
+    fails."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / launcher)})
+    pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
+
+    warned = _launch_against(monkeypatch, tmp_path, FakeRun(has_session_rc=0, pane_env=pane))
+    if launcher == "s1":
+        assert warned == []
+        return
+    assert len(warned) == 1
+    assert "shared by every bmad-loop project" in warned[0]
+    assert "only if none of them uses another state root" in warned[0]
+    assert "ends every session on this server" in warned[0]
+
+
+def test_silent_on_a_set_empty_inherited_override(monkeypatch, tmp_path: Path):
+    """Unlike HOME, an empty override reads as unset: a pane reporting
+    `BMAD_LOOP_STATE_DIR=` resolves exactly as if it had none, so with both
+    defaults agreeing there is no mismatch to report.
+
+    Ablation: read the override by key presence in `resolve_state_root` and
+    the empty value refuses as relative, which warns."""
+    home = str(tmp_path / "h")
+    _posix_env(monkeypatch, HOME=home)
+    pane = {envvars.STATE_DIR: "", "HOME": home}
+
+    assert _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane)) == []

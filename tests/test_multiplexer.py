@@ -1719,7 +1719,6 @@ class _EnvReplies:
 _MISS = (1, "", "unknown variable: BMAD_LOOP_STATE_DIR\n")
 
 
-@pytest.mark.usefixtures("force_tmux_backend")
 @pytest.mark.parametrize(
     ("replies", "expected", "asked"),
     [
@@ -1764,7 +1763,6 @@ def test_tmux_inherited_env_parses_show_environment(monkeypatch, replies, expect
     ]
 
 
-@pytest.mark.usefixtures("force_tmux_backend")
 @pytest.mark.parametrize(
     "failure",
     [

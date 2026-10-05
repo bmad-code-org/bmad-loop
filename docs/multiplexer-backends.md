@@ -69,11 +69,17 @@ a live run reads as gone (#731). When the TUI launches into its control session 
 that, and warns once — naming both roots — when it differs from its own. The launch still
 goes ahead; the warning detects, it does not fix. The remedy:
 
-- For new windows: `tmux set-environment -t =bmad-loop-ctl BMAD_LOOP_STATE_DIR <root>`. The
-  session scope matters, because a session value overrides the global one; add the same
-  command with `-g` to cover new sessions as well, or `tmux kill-server` to start clean.
+- For new windows: `tmux set-environment -t =bmad-loop-ctl BMAD_LOOP_STATE_DIR <root>`. On
+  tmux, `bmad-loop-ctl` is one session shared by every bmad-loop project on that server, so this
+  re-roots new windows for all of them: use it only when no project there runs under another
+  state root. The session scope matters, because a session value overrides the global one; add
+  the same command with `-g` to cover new sessions as well. `tmux kill-server` also starts clean,
+  but it ends every session on the server, live runs and your own sessions included.
 - Shells already open there, window 0 included, keep the environment they started with. They
   need `export BMAD_LOOP_STATE_DIR=<root>`, or recreating.
+
+Two projects that need different state roots cannot share one tmux server's control session
+safely until each launched run is handed its state root directly (#731).
 
 psmux cannot answer the question — its `show-environment` does not report inherited values
 — so there is no such warning on psmux. Its per-project registry is keyed on the state root,

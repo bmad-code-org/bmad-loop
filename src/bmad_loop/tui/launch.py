@@ -976,12 +976,14 @@ def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
     _warn_once(
         _STALE_ROOT,
         f"new windows in {session} would resolve {resolved}, not this process's "
-        f"state root {own}: its multiplexer server was started under a different "
-        "environment, so runs launched there can read as gone (#731). For new "
-        f"windows: tmux set-environment -t {shlex.quote('=' + session)} "
-        f"{envvars.STATE_DIR} {root} "
-        "(add -g for new sessions, or tmux kill-server to restart clean). Shells "
-        f"already open there need export {envvars.STATE_DIR}={root}, or recreating.",
+        f"state root {own}: its tmux server was started under a different "
+        "environment, so runs launched there can read as gone (#731, which tracks "
+        f"the lasting fix). {session} is shared by every bmad-loop project on this "
+        "tmux server, so set its root only if none of them uses another state root: "
+        f"tmux set-environment -t {shlex.quote('=' + session)} {envvars.STATE_DIR} {root} "
+        "(add -g for new sessions). tmux kill-server also starts clean, but it ends "
+        "every session on this server, live runs and your own sessions included. "
+        f"Shells already open there need export {envvars.STATE_DIR}={root}, or recreating.",
     )
 
 

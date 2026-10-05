@@ -2174,6 +2174,12 @@ _CASCADE_ARMS = [
     pytest.param("linux", {"HOME": "rel"}, None, id="posix-relative-home"),
     pytest.param("linux", {"override": "rel", "HOME": "h"}, None, id="posix-relative-override"),
     pytest.param(
+        "linux",
+        {"override": "empty", "XDG_STATE_HOME": "x", "HOME": "h"},
+        "x/bmad-loop",
+        id="posix-empty-override",
+    ),
+    pytest.param(
         "win32",
         {"override": "o", "LOCALAPPDATA": "l", "USERPROFILE": "p"},
         "o",
@@ -2189,6 +2195,12 @@ _CASCADE_ARMS = [
         id="win-profile",
     ),
     pytest.param("win32", {"XDG_STATE_HOME": "x", "HOME": "h"}, None, id="win-none"),
+    pytest.param(
+        "win32",
+        {"override": "empty", "LOCALAPPDATA": "l", "USERPROFILE": "p"},
+        "l/bmad-loop/state",
+        id="win-empty-override",
+    ),
 ]
 
 
@@ -2198,8 +2210,9 @@ def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
 ):
     """`state_root()` is `resolve_state_root` over this process's environment
     (#731), so on every cascade arm both must give the same, literal answer —
-    the root or the refusal. A spec value `rel` is written relative; every other
-    one is an absolute path under `tmp_path` (a trailing `/` kept as spelled).
+    the root or the refusal. A spec value `rel` is written relative, and `empty`
+    as `""` (an empty override reads as unset); every other one is an absolute
+    path under `tmp_path` (a trailing `/` kept as spelled).
 
     `USERPROFILE` mirrors `HOME` on the POSIX rows, as `_fake_home` does, so a
     faked-POSIX row means the same thing on a Windows host. HOME stays set on
@@ -2213,6 +2226,8 @@ def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
         name = envvars.STATE_DIR if key == "override" else key
         if value == "rel":
             env[name] = value
+        elif value == "empty":
+            env[name] = ""
         else:
             env[name] = str(tmp_path / value.rstrip("/")) + ("/" if value.endswith("/") else "")
     if platform == "linux":
