@@ -694,9 +694,9 @@ def find_nested_result_hints(
     Probes each immediate, non-symlinked subdirectory in sorted order with the
     existing finders — `find_result_artifact` then `find_frontmatter_candidates`
     — so it adds no qualification logic of its own. Returns at most `limit`
-    distinct paths, plus a fault string when listing the directory failed,
-    probing a subdirectory raised, or a nested `*.md` at/after the launch floor
-    could not be read: the fault is reported, never folded into an empty
+    distinct paths, plus a fault string when listing the directory or one of its
+    subdirectories failed, probing a subdirectory raised, or a nested `*.md`
+    at/after the launch floor could not be read: the fault is reported, never folded into an empty
     "nothing nested" answer, and a fault in one subdirectory keeps the hits
     already found in others. (The finders degrade an unreadable file to "no
     match" by contract, so a non-hit is probed once more here, purely to tell
@@ -716,6 +716,10 @@ def find_nested_result_hints(
             # 3.11 floor: Path.is_dir has no follow_symlinks=, so test the link first.
             if child.is_symlink() or not child.is_dir():
                 continue
+            # `Path.glob` (the finders' and ours below) swallows a listing fault
+            # and yields nothing, so an unlistable subdir would read as empty:
+            # list it explicitly first so the fault reaches the handler below.
+            os.listdir(child)
             marker = find_result_artifact(child, since_ns=since_ns)
             found = [marker] if marker is not None else []
             found += find_frontmatter_candidates(child, since_ns=since_ns)

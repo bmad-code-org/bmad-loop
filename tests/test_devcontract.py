@@ -1192,6 +1192,29 @@ def test_nested_hints_keep_earlier_hits_when_a_later_subdir_faults(tmp_path, mon
     assert f"could not probe {tmp_path / 'b'}: PermissionError" in fault
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_nested_hints_report_an_unlistable_subdir(tmp_path):
+    """`Path.glob` swallows a listing fault and yields nothing, so a subdirectory
+    that cannot be listed would read as "nothing nested". It is a fault instead,
+    and a readable sibling's hit is still named.
+
+    Ablation: drop the explicit `os.listdir(child)` and the fault is None."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    locked = tmp_path / "b"
+    _deep_spec(locked / "spec-1-2-y.md")
+    locked.chmod(0o000)
+    try:
+        hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+    finally:
+        locked.chmod(0o755)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {locked}: PermissionError" in fault
+
+
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
 # was killed) can end inside a multi-byte sequence; `read_text(encoding="utf-8")`
 # then raises UnicodeDecodeError — a ValueError, NOT an OSError.

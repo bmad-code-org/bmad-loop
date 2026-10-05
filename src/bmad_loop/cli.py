@@ -1870,15 +1870,23 @@ def _nested_spec_files(impl: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
     broader than the adapter's `devcontract.find_nested_result_hints` (any status,
     no launch floor): this is a preflight over the layout, not a judgment about one
     session's result. Returns `(spec_like, unreadable)`: a nested `*.md` whose read
-    raised is returned with its fault rather than dropped, since it may be the very
-    spec the layout hides. An OSError while LISTING propagates, so the caller
-    reports the fault instead of an empty answer."""
+    raised, or a subdirectory that could not be listed, is returned with its fault
+    rather than dropped, since it may hold the very spec the layout hides. An
+    OSError while listing `impl` itself propagates, so the caller reports the fault
+    instead of an empty answer."""
     if not impl.is_dir():
         return [], []
     found: list[Path] = []
     unreadable: list[tuple[Path, str]] = []
     for child in sorted(impl.iterdir()):
         if child.is_symlink() or not child.is_dir():
+            continue
+        # `Path.glob` swallows a listing fault and yields nothing, so an
+        # unlistable subdirectory would pass as empty: list it explicitly.
+        try:
+            os.listdir(child)
+        except OSError as e:
+            unreadable.append((child, f"{type(e).__name__}: {e}"))
             continue
         for path in sorted(child.glob("*.md")):
             try:
@@ -1910,7 +1918,7 @@ def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
         shown = unreadable[:3]
         report.warn(
             "queue.nested-specs",
-            f"could not read {len(unreadable)} *.md file(s) in subdirectories of "
+            f"could not read {len(unreadable)} path(s) in subdirectories of "
             f"{impl}, so they were not checked for a nested spec layout (e.g. "
             f"{'; '.join(f'{p}: {err}' for p, err in shown)})",
             {

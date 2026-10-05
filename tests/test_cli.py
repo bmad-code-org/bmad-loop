@@ -12211,6 +12211,35 @@ def test_validate_nested_specs_reports_an_unreadable_sole_candidate(tmp_path, mo
     assert finding.detail["unreadable"][0]["path"] == str(bad)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_validate_nested_specs_reports_an_unlistable_subdir(tmp_path):
+    """`Path.glob` swallows a listing fault and yields nothing, so a subdirectory
+    that cannot be listed would pass as a clean layout. It is warned on instead.
+
+    Ablation: drop the explicit `os.listdir(child)` in `_nested_spec_files` and no
+    finding is emitted."""
+    impl = tmp_path / "impl"
+    locked = impl / "stories"
+    locked.mkdir(parents=True)
+    (locked / "1-1-x.md").write_text(_NESTED_SPEC, encoding="utf-8")
+    locked.chmod(0o000)
+    report = cli.ValidationReport()
+    try:
+        cli._validate_nested_specs(impl, report)
+    finally:
+        locked.chmod(0o755)
+
+    (finding,) = report.findings
+    assert finding.check == "queue.nested-specs"
+    assert finding.severity == "warning"
+    assert str(locked) in finding.message
+    assert "PermissionError" in finding.message
+    assert finding.detail is not None
+    assert finding.detail["unreadable"][0]["path"] == str(locked)
+
+
 @pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
 def test_validate_warns_when_a_binary_on_path_refuses_to_run(
     project, capsys, monkeypatch, tmp_path, exit_code
