@@ -1,6 +1,6 @@
 # ADR 0001: Carrying the state root into session and parked-window panes
 
-- **Status:** Accepted (2026-10-02; approver answers in §8)
+- **Status:** Accepted (2026-10-02, @dracic); amended after acceptance, re-approved by dracic, 2026-10-05 (§8, "Amendments after acceptance")
 - **Date:** 2026-10-02
 - **Issues:** #730 (`PSMUX_BARE_ENV`), #731 (stale server substitutes its own `BMAD_LOOP_STATE_DIR`); context #729, #537 / PR #728
 - **Seam:** `TerminalMultiplexer` (`src/bmad_loop/adapters/multiplexer.py`)
@@ -8,10 +8,10 @@
 **Decision in brief:**
 
 1. Ship a launcher-side warning for the stale-server case first (Option B).
-2. Then carry the state root to parked engine windows in their **argv**, not their env (Option D). This fixes the damaging case on every backend without changing the seam.
+2. Then carry the state root (and, under #851's `[mux] honor_ambient_psmux_data_dir`, the registry root) to parked engine windows in their **argv**, not their env (Option D). This fixes the damaging case on every backend without changing the seam.
 3. The env-taking verb pair (Option C) is specified here but not scheduled.
 
-**Implementation status:** none of the stages is implemented as of this ADR. §6 is a plan of separately mergeable changes, and the `--state-root` option it describes does not exist until Stage 2 lands.
+**Implementation status:** none of the stages is implemented as of this ADR. §6 is a plan of separately mergeable changes, and the `--state-root` and `--registry-root` options it describes do not exist until Stage 2 lands.
 
 Details are in §5 and §6; the approver's answers are in §8.
 
@@ -28,11 +28,13 @@ Who is exposed:
 
 | Pane                                                            | Created by                                                | How it gets the state root                                                                                                                                                                               | Exposed?                    |
 | --------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| Coding-CLI window, probe window, attached resolve window        | `new_window(..., env, ...)`                               | Explicit `env` dict, forced through `runs.pin_state_root`. On psmux it travels as an in-source `$env:` prelude inside `-EncodedCommand` (`PsmuxMultiplexer._window_launch`). On tmux it travels as `-e`. | No, on every transport      |
+| Coding-CLI window, probe window                                 | `new_window(..., env, ...)`                               | Explicit `env` dict, forced through `runs.pin_state_root`. On psmux it travels as an in-source `$env:` prelude inside `-EncodedCommand` (`PsmuxMultiplexer._window_launch`). On tmux it travels as `-e`. | No, on every transport      |
 | TUI parked engine window (`run`, `sweep`, `resume`, `resolve`)  | `new_parked_window(session, name, cwd, argv, return_opt)` | Inheritance only. The released verb has no env parameter.                                                                                                                                                | **Yes**                     |
 | Window 0 of every session (the control session, agent sessions) | `new_session(name, cwd, cols, lines)`                     | Inheritance only. The released verb has no env parameter.                                                                                                                                                | **Yes**, see the note below |
 
 The parked engine window is where the damage happens: the engine it runs writes its control plane under the wrong root. Window 0 is a plain shell that keeps the session alive. bmad-loop runs nothing in it, so it is exposed only when an operator attaches and types a `bmad-loop` command there.
+
+The attached resolve session is not a window of its own. `resolve.run_session` runs the agent as a foreground `subprocess.run(argv, env={**os.environ, **adapter.interactive_env(spec)})` inside the TUI's parked `resolve-<id>` window. `interactive_env` pins the state root through `runs.pin_state_root`, but from the parked process's own root, so the session is exposed exactly as row 2 is, and Stage 2 fixes it transitively.
 
 ## 2. Post-mortem: why #537 cut the env transport
 
@@ -96,13 +98,13 @@ The pane env is the global env overlaid with the session env, so "what will a ne
 
 - `new-session -e` and `new-window -e` behave the same on both transports.
 - `show-environment` diverges: tmux reports inherited values and psmux does not.
-- Session-scoped `set-environment -t` exists only on tmux. On psmux it is server-wide, which comes to the same thing because a psmux server holds one session.
+- Session-scoped `set-environment -t` exists only on tmux. On psmux it is server-wide, which comes to the same thing because a psmux server holds one session. On tmux, the session bmad-loop would scope it to is `bmad-loop-ctl`, shared by every project on the server (`runs.ctl_session_for`), so a session-scoped value still reaches every project's parked windows.
 
 ## 4. Options
 
 ### A. Do nothing, document the remedies
 
-Keep the bare-env warning (`PsmuxMultiplexer._warn_if_bare_env`). In `docs/multiplexer-backends.md`, document `tmux kill-server` (or `set-environment -g BMAD_LOOP_STATE_DIR …`) after changing `BMAD_LOOP_STATE_DIR`.
+Keep the bare-env warning (`PsmuxMultiplexer._warn_if_bare_env`). In `docs/multiplexer-backends.md`, document `tmux kill-server` or `set-environment -g BMAD_LOOP_STATE_DIR …` after changing `BMAD_LOOP_STATE_DIR`. Both act on the whole server: bmad-loop's tmux control session `bmad-loop-ctl` is shared by every project there, `-g` re-roots all of them, and `kill-server` ends every session, live runs included.
 
 - **Pros:** zero code, zero risk.
 - **Cons:** #731 stays silent. A run reads as gone with nothing naming the cause. #730 stays unsupported.
@@ -136,18 +138,18 @@ How this answers each post-mortem item:
   - Without `seam_version = 2`, a same-named helper is never called.
   - A helper named `new_session_with_env` on a subclass that inherits its parent's `seam_version = 2` is not called either, because the class defining it did not declare the version itself.
 - **No delegation layer.** The bundled backends implement each pair over a private `_spawn_session(…, env: Mapping[str, str] | None)` / `_spawn_parked(…)`. Neither public verb calls the other.
-- **Fail loud at the boundary.** `register_multiplexer` takes a factory, not a class, so registration cannot inspect the backend without constructing it, and must not. The check therefore runs where the backend is first built (`multiplexer._select`, which `get_multiplexer` and `detect_multiplexers` reach). An instance whose class declares `seam_version >= 2` but still inherits a `NotImplementedError` default is **malformed**. Registration stays lazy.
+- **Fail loud at the boundary.** `register_multiplexer` takes a factory, not a class, so registration cannot inspect the backend without constructing it, and must not. The check therefore runs wherever core builds a backend: in `multiplexer._select`, which `get_multiplexer` reaches, and in `detect_multiplexers`' own row loop, which calls every registered factory again, separately from `_select`. An instance whose class declares `seam_version >= 2` but still inherits a `NotImplementedError` default is **malformed**. Registration stays lazy.
 
 The unavailable path is not reused for a malformed backend, because `_select` and `mux_usable` deliberately trust a forced backend even when it probes unavailable. Instead:
 
 - **Forced** selection (`BMAD_LOOP_MUX_BACKEND`, or policy `[mux] backend`) raises a `MultiplexerError` that names the missing verb.
 - **Automatic** selection skips a malformed backend, as it does a non-matching one, and the historical fallback excludes it.
-- A `detect_multiplexers` row reports it as malformed, with the reason.
+- A `detect_multiplexers` row reports it as malformed, with the reason in `MuxBackendInfo.probe_error`, from the row loop's own check.
 
 Bundled transports:
 
 - **tmux:** `new-session -e` and `new-window -e`, measured in §3.2.
-- **psmux:** `new-session -e`, which reaches window 0 and every later window after the bare clear at no warm-start cost (§3.1). Parked windows add a `$env:` prelude in the existing `_source_prefix` source, the transport `_window_launch` already uses.
+- **psmux:** `new-session -e`, which reaches window 0 and every later window after the bare clear at no warm-start cost (§3.1). Parked windows add a `$env:` prelude, the transport `_window_launch` already uses. It is a separate fragment composed ahead of `_source_prefix()`, not part of it. That hook takes no arguments and is an overridable dialect hook (`BaseTmuxBackend._source_prefix`, overridden by `PsmuxMultiplexer`), so giving it an `env` parameter would break a leaf that overrides it with the released signature: post-mortem item 1, one level down.
   - **Precedence caveat (source-read at both refs):** the server merges `-e` before `load_config` runs (`src/server/mod.rs` l.1023 then l.1040 at the tag; l.2005 then l.2023 on master). A config-file `set-environment BMAD_LOOP_STATE_DIR …` (`src/config.rs`, the `set-environment` arm) then overwrites `app.environment`, so it beats `-e` for window 0. tmux does not diverge this way: a session `-e` overrides the global env (§3.2).
   - The parked-window `$env:` prelude runs in the pane, so it wins over both.
   - The guarantee is therefore "window 0 gets the value unless the operator's psmux config sets the same variable". That is documented, not fought.
@@ -163,7 +165,7 @@ Assessment:
 The parked window does not run an arbitrary command. It runs `tui.launch.cli_argv(...)`, which is `[sys.executable, "-m", "bmad_loop.cli", *tail]`, a bmad-loop process core composes itself. The fact can ride the argv:
 
 - Add a hidden (`argparse.SUPPRESS`) top-level option, `--state-root <abs path>`.
-- `cli.main` applies it to `os.environ[BMAD_LOOP_STATE_DIR]` as its first act, ahead of `_configure_mux` and dispatch.
+- `cli.main` applies it to `os.environ[BMAD_LOOP_STATE_DIR]` immediately after `parse_args`, ahead of the `relay` branch, `_configure_mux` and dispatch.
 - The detached launcher adds it with its own resolved root.
 - When no root derives, the launcher **refuses** the detached launch with a `LaunchError` instead of omitting the flag. Omitting it would let the engine inherit whatever root the server holds, which may be a valid stale one, and the engine would then write where this launcher can never observe. A launcher that cannot name a root cannot watch the run, so refusing is the honest answer.
 
@@ -171,11 +173,11 @@ Every later reader (`envvars.state_dir`, `runs.pin_state_root`, the registry exp
 
 - **Pros:** fixes the damaging case (parked engine windows) for #730 **and** #731, on **every** backend including out-of-tree ones. Argv is opaque to the seam and survives both an env clear and a stale server. Zero seam change, so none of the three post-mortem modes can occur.
 - **Cons:**
-  - It carries only the state root. Since #537 that is the only fact the engine cannot re-derive: the psmux registry is derived from it, and coding-CLI windows are pinned from the engine's own env.
+  - It carries the state root, and under one opt-in the registry root too. Since #537 the state root is the only fact the engine cannot re-derive by default: the psmux registry is derived from it, and coding-CLI windows are pinned from the engine's own env. With #851's `[mux] honor_ambient_psmux_data_dir` on, the registry is the operator's `PSMUX_DATA_DIR`, a second fact that a bare-env pane drops. psmux re-adds only its 14-name allowlist (`apply_bare_env_if_set`) plus `TMUX`, `TMUX_PANE` and `PSMUX_SESSION` (`set_tmux_env`), never `PSMUX_DATA_DIR`, as measured on 3.3.8 in a bare and a normal pane. Stage 2 therefore carries the launcher's registry root as well (§6, Stage 2).
   - It does not reach window-0 shells.
-  - It adds a hidden CLI option, an internal contract with the same standing as `--run-id`.
+  - It adds a hidden CLI option, an internal contract with the same policy standing as `--run-id` (hidden, composed by the TUI). Parser structure differs: `--run-id` is a `run`/`sweep` subcommand option, while `--state-root` is top-level and precedes the subcommand.
   - The root becomes visible in the process list. It is a directory path, not a secret.
-  - It does not make `PSMUX_BARE_ENV` fully "supported": a coding CLI in a bare pane can still miss other variables it needs, which is psmux's documented trade (the user opted out of inheritance).
+  - It does not make `PSMUX_BARE_ENV` fully "supported". A bare pane also drops variables the env dict does not name, which is psmux's documented trade (the user opted out of inheritance). Two examples, both silent. A coding CLI can miss credentials or configuration. And `APPDATA` is gone (measured on psmux 3.3.8), so git run by the parked engine no longer reads `%APPDATA%\Git\ignore`, the Git for Windows ≥ 2.46 preference that `install._shield_home_git_ignore` documents. The operator's global excludes there stop applying to the engine's commits, and because the shield mirrors the git it runs beside, nothing reports it.
 - **Out-of-tree risk:** none. `new_parked_window`'s argv is already opaque, and every backend must run it verbatim.
 
 ### Rejected along the way
@@ -210,6 +212,8 @@ Nothing below is implemented yet. Each stage describes the change, files and tes
 
 Folding the two would make the pane-side resolution below wrong in exactly that arm. A Set `""` therefore stays `""`.
 
+Only `HOME` distinguishes the two. Every other input reads `""` as unset. `BMAD_LOOP_STATE_DIR` does so through `envvars.state_dir`, which the resolver calls with the pane's mapping and never reads by key presence. `XDG_STATE_HOME`, `LOCALAPPDATA` and `USERPROFILE` do so through `_state_base`, which rejects `""`. A pane that reports a set-empty override therefore resolves exactly as if it had none, and cannot cause a false mismatch.
+
 The query must not raise. It also must not fold a **failure** into a silent Unknown. Its full signature is `inherited_env(session, name, *, on_fault: Callable[[str], None] | None = None)`, following `list_sessions_reporting`:
 
 - A query this transport supports but could not complete (timeout, missing binary, an unexpected reply) returns `None` **and** hands `on_fault` a one-line description.
@@ -226,7 +230,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
   - any other failure: Unknown, reported through `on_fault`
 - **psmux:** keeps the seam default, Unknown. Inherited values are invisible to its `show-environment` (§3.1), and the per-project registry already closes the ordinary path.
 
-**The comparison.** `_ensure_ctl_session` runs it after **both** arms, a freshly created control session as well as a reused one: a new session on a stale tmux server inherits the stale global env too (measured, §3.2 row "`new-session` from an `/s2` client"). It compares **what each side would resolve**, not raw values:
+**The comparison.** `_ensure_ctl_session` runs it after the `has_session`/`new_session` branch, whichever way it went, for a freshly created control session as well as a reused one: a new session on a stale tmux server inherits the stale global env too (measured, §3.2 row "`new-session` from an `/s2` client"). It compares **what each side would resolve**, not raw values:
 
 - **The pane's root is resolved from every cascade input, not just the override.** `runs.state_root` falls back to `XDG_STATE_HOME`, then `HOME`, when `BMAD_LOOP_STATE_DIR` is unset (on win32: `LOCALAPPDATA`, then `USERPROFILE`). A stale server can carry a different `XDG_STATE_HOME` while neither side sets the override. Equally, an override can name exactly the root the pane's default would reach.
 - So Stage 1 factors the cascade out of `runs.state_root` into a pure `runs.resolve_state_root(env: Mapping[str, str], passwd_home: str | None) -> Path`.
@@ -234,6 +238,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
   - `passwd_home` is that value, passed in explicitly. `None` means no passwd entry exists, which is where `expanduser` returns `~` unexpanded.
   - The resolver uses `passwd_home` **only when `HOME` is absent** from `env`. A present `HOME`, empty included, is used as given, exactly as `expanduser` does.
   - `state_root()` becomes `resolve_state_root(os.environ, <the passwd home>)`. The passwd lookup runs lazily, only on the arm that reads it, so behavior is unchanged in every case, the passwd-dependent ones included.
+  - The resolver reads `sys.platform` itself, as `state_root` does, so its win32 arm is tested by monkeypatching `runs.sys.platform` (the `test_state_root_on_win32_prefers_localappdata_over_the_user_profile` pattern). The passwd lookup stays behind `sys.platform != "win32"`, which also keeps pyright's win32 analysis off `pwd`.
 - The launcher queries `inherited_env` for each input the platform's cascade reads, and builds the pane's mapping from the answers: a Set value becomes a key, `""` included, and `UNSET` leaves the key out. It then compares `resolve_state_root(pane_env, passwd_home)` with its own `runs.state_root()`.
   - It passes **its own** passwd home. A tmux server's sockets are per-UID, so a server it can reach runs as the same user.
 - Equal resolved roots mean a match. That holds whichever inputs produced them, so a default installation never warns and an equivalent override never warns.
@@ -241,24 +246,30 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 - If **any** input comes back Unknown, the comparison is Unknown. Unknown never warns about a mismatch, but a query fault reaches the warn sink through `on_fault`.
 - If the **launcher's own** root is underivable (`StateRootError`), Stage 1 skips the comparison and reports that, naming the error, through the same sink. The launch is not blocked here: the exception is caught inside the comparison and never escapes to the TUI callers. Refusing the launch is Stage 2's job.
 
-**The warning.** On a mismatch it warns once per process, through the TUI's warn sink rather than stderr. It names both roots and states the remedy:
+**The warning.** On a mismatch it warns once per process through a process-level sink, `tui.launch.warn_sink`. `run_tui` installs a toast (`App.notify`, which Textual documents as thread-safe) for the app's run, and restores `None` after it, because Textual redirects `sys.stderr` for the whole run. With no sink installed, as in the CLI, the line goes to stderr as `warning: …`. The once-per-process keys live in `launch._WARNED`, and an autouse test fixture resets both, as `_bare_env_unwarned` does for the bare-env warning. The warning names both roots and states the remedy:
 
-- For **future panes**: `tmux set-environment -t =<ctl> BMAD_LOOP_STATE_DIR <root>`. The session scope matters, because a session value overrides the global one (§3.2), so a global-only fix can leave a stale session value in force. Add `-g` as well to cover new sessions, or use `tmux kill-server` to restart clean.
+- For **future panes**, note that on tmux the control session is not per-project. `runs.ctl_session_for` answers the fixed, machine-shared `bmad-loop-ctl` on a transport with no registry namespace. Any value set there re-roots new windows for every project on that server, and two projects under different legitimate roots can never both match. The warning therefore:
+  - says that `<ctl>` is shared by every bmad-loop project on this tmux server;
+  - offers `tmux set-environment -t =<ctl> BMAD_LOOP_STATE_DIR <root>` only for a server where no project uses another state root. The session scope matters, because a session value overrides the global one (§3.2), so a global-only fix can leave a stale session value in force. Adding `-g` as well covers new sessions;
+  - names `tmux kill-server` only together with its cost: it ends every session on the server, live runs and the operator's own sessions included;
+  - names #731 as the lasting fix. Stage 2 hands each parked engine its root, and on a shared server that is the only fix.
 - For **already-running shells**, including window 0: no query can see them, and `set-environment` cannot change them. They need an in-shell `export BMAD_LOOP_STATE_DIR=<root>` or recreating.
-- Both commands render `<root>` (and `<ctl>`) **shell-quoted** (`shlex.quote`), never interpolated verbatim: a valid root such as `/home/me/state dir` would otherwise split into extra arguments (`set-environment` takes a single value), and shell metacharacters would change what a copied command runs. Stage 1's tests assert the quoting with a root that contains a space and a metacharacter.
+- Both commands render `<root>` (and `<ctl>`) **shell-quoted** (`shlex.quote`), never interpolated verbatim: a valid root such as `/home/me/state dir` would otherwise split into extra arguments (`set-environment` takes a single value), and shell metacharacters would change what a copied command runs. Stage 1's tests assert the quoting with a root that contains a space and a metacharacter. `shlex.quote` is POSIX-shell quoting. fish also reads `\\` and `\'` as escapes inside single quotes, so a root with two consecutive backslashes, or one ending in a backslash (which `shlex.quote` closes as `\'`), pastes differently there. That limit is named here; the remedy is not quoted per shell.
 
 **Files:**
 
 - `src/bmad_loop/adapters/multiplexer.py`: the default and its docstring
 - `src/bmad_loop/adapters/tmux_backend.py`: the implementation; argv stays quarantined there
 - `src/bmad_loop/runs.py`: `resolve_state_root`, extracted from `state_root` unchanged
+- `src/bmad_loop/envvars.py`: `state_dir` reads a given mapping, so the empty-override rule has one home
 - `src/bmad_loop/tui/launch.py`: the comparison
-- `docs/multiplexer-backends.md`: the remedy
+- `src/bmad_loop/tui/app.py`: installs the sink for the app's run
+- `docs/multiplexer-backends.md`: the remedy and its shared-server limits
 - `CHANGELOG.md`: `Fixed`
 
 **Tests at the lowest layer:**
 
-- `tests/test_multiplexer.py`, through a faked `subprocess.run` with `force_tmux_backend`:
+- `tests/test_multiplexer.py`, constructing `TmuxMultiplexer()` directly and faking `tmux_base.subprocess.run`, as the file's `_RecordRun` tests do. `force_tmux_backend` is not needed, because nothing goes through `get_multiplexer()`:
   - the tmux parse of Set, `-NAME`, a session miss that falls back to a global hit, and a global miss (both of the last two: `UNSET`)
   - a set-empty reply (`NAME=`) returns `""`, not `UNSET`
   - a failed query: Unknown, with exactly one `on_fault` call
@@ -270,6 +281,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
     - absent `HOME` with no passwd entry (`None`) matches what `state_root()` does today
     - `HOME=""` raises `StateRootError` even when a passwd home is given
     - ablate the absent-only guard by using `passwd_home` whenever `HOME` is falsy, and confirm the `HOME=""` case fails
+  - an empty `BMAD_LOOP_STATE_DIR` follows the cascade as if absent, on both platforms
 - `tests/test_tui_launch.py`:
   - warns on a mismatch after reuse **and** after creation
   - warns when only `XDG_STATE_HOME` differs and neither side sets the override
@@ -277,7 +289,10 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
   - warns when the pane's inherited value is relative (`StateRootError` on the pane side)
   - stays silent on Unknown, but surfaces a query fault through the sink
   - an underivable launcher root reports through the sink, raises nothing, and still launches
+  - stays silent when the pane reports a set-empty override and both defaults agree. Ablation: read the override by key presence, and this warns.
+  - two roots on one server: a launcher under S2 against a `bmad-loop-ctl` whose new panes resolve S1 warns, naming the shared session, the condition on `set-environment` and the cost of `kill-server`; a launcher under S1 against the same server stays silent. Ablation: drop the shared-session clause, and the S2 row fails.
   - ablate the comparison, and confirm the warn tests fail
+- `tests/test_tui_app.py`: `run_tui` installs the sink for the app's run and restores it afterwards.
 
 **Out-of-tree compatibility test (must exist):** `StubMux`, which implements only the released abstract set, goes through `_ensure_ctl_session` on both arms. It completes, `inherited_env` returns `None`, and no warning is emitted.
 
@@ -285,34 +300,40 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 
 **Change:**
 
-- Add a hidden top-level `--state-root` option, applied in `cli.main` before `relay` dispatch and `_configure_mux`.
-- It must be absolute. Otherwise `main` exits `USAGE` with one message, the same rule as `BMAD_LOOP_STATE_DIR`'s own validation.
-- `tui.launch.start_detached` inserts it from `runs.state_root()`, and raises `LaunchError` on `StateRootError` (see Option D). The other `cli_argv` caller is a captured `subprocess.run` that inherits the launcher's own env directly, so it needs no flag.
-- Stage 1's stale-root warning narrows to window-0 and other already-running shells, since the parked engine now receives the root explicitly. Per Stage 1, the wording says that a matching query cannot vouch for a shell that is already running.
-- The bare-env warning (`PsmuxMultiplexer._warn_if_bare_env`) is **not** narrowed. Stage 2 carries only the state root, so a coding-CLI pane in bare mode can still miss credentials or configuration its env dict does not name (Option D, Cons). Its text drops parked-window shells from the list of shells that lose `BMAD_LOOP_STATE_DIR`, and keeps the warning itself.
+- Add a hidden (`argparse.SUPPRESS`) top-level `--state-root` option. Being top-level, it precedes the subcommand (`bmad-loop --state-root=<root> run …`); after the subcommand, argparse rejects it as unrecognized. `cli.main` applies it to `os.environ[BMAD_LOOP_STATE_DIR]` immediately after `parse_args`, ahead of the `relay` branch and `_configure_mux`.
+- It must be absolute, judged by `os.path.isabs` on the raw string, as `runs.state_root` judges the variable. Otherwise the parser refuses it (`parser.error`, exit `USAGE`). That parse-time refusal is new behavior. `main` does not validate `BMAD_LOOP_STATE_DIR` today: `runs.state_root` raises `StateRootError` lazily inside handlers, and `mux` exits 0 under a relative value with a warning. The parity with the variable is the absoluteness rule, not the exit code. On POSIX, `/` is accepted, as the variable accepts it (the override bypasses `_state_base`'s not-the-root rule). On Windows the same native check decides, with no exception added: Python 3.13+ `ntpath.isabs` rejects a driveless `/` and accepts `C:\`, for the option and the variable alike. An empty value is refused because it is not absolute.
+- `tui.launch.start_detached` inserts it ahead of the subcommand, as `cli_argv(f"--state-root={root}", *argv_tail)` with the root from `runs.state_root()`, and raises `LaunchError` on `StateRootError` (see Option D). The `expected_cli(...)` assertions in `tests/test_tui_launch.py` change with it. The other `cli_argv` caller is a captured `subprocess.run` that inherits the launcher's own env directly, so it needs no flag.
+- **This bullet depends on #851 landing first.** Today `MuxPolicy` has no `honor_ambient_psmux_data_dir`, `runs.resolve_psmux_registry_root` does not exist, and `runs.export_psmux_registry_root` overrides every ambient root, so a forwarded root would simply be replaced by the derived one. If Stage 2 is implemented before #851, it ships `--state-root` alone and this bullet follows with #851. When the transport namespaces registries (`has_registry_namespace()`) and `registry_root()` answers a root, `start_detached` also inserts a hidden top-level `--registry-root=<root>` ahead of the subcommand. `cli.main` applies it to `PSMUX_DATA_DIR` beside `--state-root`, immediately after `parse_args`. It must be absolute; otherwise `USAGE` at parse time. `_configure_mux` then decides with #851's unchanged rule (`runs.resolve_psmux_registry_root`): the root is honoured only when the policy flag is on and the value is not derived-shaped. The option restores what inheritance would have delivered and nothing more. The launcher composes it from its own root in force, so it is not a policy-sourced path, and #851's "whether, never where" rule holds. Out-of-tree backends answer `False` and `None` by default and are handed nothing.
+- Stage 1's stale-root warning is demoted to an informational note, because the parked engine now receives its root explicitly. The note says that new shells in `<ctl>` resolve `<X>`, not this TUI's root, so a `bmad-loop` command typed into one would use `<X>`. Runs launched from this TUI are unaffected, and a matching query still cannot vouch for a shell that is already running. The note drops the `set-environment` and `kill-server` remedy: on tmux `<ctl>` is shared by every project on the server, so no value is right for all of them, and nothing bmad-loop runs is left exposed. `inherited_env` and the comparison stay, so the window-0 residual stays visible (§5). A test pins the new text and asserts that neither remedy command appears. Ablation: restore the remedy, and the test fails.
+- The bare-env warning (`PsmuxMultiplexer._warn_if_bare_env`) is **not** narrowed away. Stage 2 carries only the state root (and, under #851's opt-in, the registry root), so a coding-CLI pane in bare mode can still miss what its env dict does not name (Option D, Cons). Its text drops parked-window shells from the shells that lose `BMAD_LOOP_STATE_DIR`, keeps `warning: PSMUX_BARE_ENV` and `does not support` (the tests in `tests/test_psmux_backend.py` match both), and names the other losses. Its docstring, which also names parked windows, changes with it.
+- When the TUI is the launcher **and the selected backend is psmux**, the bare-env warning also reaches the TUI warn sink. On tmux or any other backend the switch means nothing, so nothing is re-surfaced, matching `_warn_if_bare_env`, which lives on `PsmuxMultiplexer` only. Its one firing per process happens before Textual starts, in `cli._configure_mux`'s backend probe (`_select` → `available()` → `version()` → `_run`). It therefore lands on the main screen, which Textual's alternate screen hides until exit, and the once-per-process latch is already spent. The parked engine never warns either, because the bare clear removes `PSMUX_BARE_ENV` from its env (measured). So `run_tui` re-surfaces it through `launch.warn_sink` itself, rather than waiting for a later firing.
 
 **Files:**
 
 - `src/bmad_loop/cli.py`
 - `src/bmad_loop/tui/launch.py`
+- `src/bmad_loop/tui/app.py`
 - `src/bmad_loop/adapters/psmux_backend.py`: warning text only
 - `docs/multiplexer-backends.md`
-- `CHANGELOG.md`: `Fixed` #731, `Changed` #730 scope
+- `CHANGELOG.md`: `Fixed` #731; `Changed` #730 scope; `Changed` the stale-state-root warning becomes a note about shells
 
 `envvars.py` gains nothing, because no new variable is introduced.
 
 **Tests at the lowest layer:**
 
 - `tests/test_cli.py`:
-  - `main(["--state-root", X, ...])` sets the variable before `_configure_mux` (assert on a spy)
-  - a relative value is refused with `USAGE`
-  - ablation: drop the assignment, and the spy test fails
+  - `main(["--state-root=" + X, "status", …])` sets the variable before the `relay` branch and `_configure_mux` (assert on a spy). A relative or empty value is refused with `USAGE` at parse time. A filesystem root is accepted: `/` on POSIX, a drive root such as `C:\` on Windows. `status --state-root=X`, after the subcommand, is refused as unrecognized. Ablation: drop the assignment, and the spy test fails.
+  - `--registry-root` sets `PSMUX_DATA_DIR` before `_configure_mux`. With the policy flag off, a derived-shaped value is re-derived, and an operator root is displaced (`note_displaced_registry`), exactly as an inherited one is. A relative value is refused with `USAGE`.
 - `tests/test_tui_launch.py`:
   - the parked argv carries the resolved root
   - an underivable root raises `LaunchError` and mints no window. Ablate the refusal, and confirm this test fails.
-- `tests/test_stories_e2e.py` (Linux only, real tmux, zero tokens): a server cold-started under S1, then a parked launch under S2, must land the engine's control plane under S2. This is the #731 reproduction as a regression gate.
+  - with an honoured root in force, the parked argv carries `--registry-root=<root>`; on tmux it carries none. Ablation: drop the insertion, and the honoured-root test fails.
+- `tests/test_tui_app.py`: with `PSMUX_BARE_ENV` on and psmux selected, `run_tui` toasts the bare-env warning once; ablate the re-surface and the toast list is empty. With tmux selected, nothing is toasted; ablate the backend check and this case fails.
+- `tests/test_psmux_backend.py`: the narrowed text keeps both matched phrases.
+- `tests/test_psmux_live.py` (real psmux, zero tokens, the `PARKED_ARGV` pattern): a parked window whose argv carries `--state-root=` with a space, non-ASCII text and a trailing backslash hands the child that argument byte-identical. Besides a bare drive root, a UNC share root such as `\\srv\my share\` is the one shape `Path` leaves with a trailing separator. Measured intact on psmux 3.3.8 with pwsh 7.6.6 (`$PSNativeCommandArgumentPassing` = `Windows`). pwsh before 7.3 defaults to `Legacy` passing, which breaks that case, and `PsmuxMultiplexer.available` does not gate on the pwsh version: a named residual.
+- A new module, `tests/test_tui_launch_tmux_e2e.py` (Linux only, real tmux, zero tokens). `tests/test_stories_e2e.py` can't host it: it drives only the CLI as subprocesses and uses the developer's default tmux server. The module runs on a private `TMUX_TMPDIR`. The autouse `_isolate_mux_registry` fixture already removes `TMUX`, which a client would otherwise follow to the operator's socket. The test cold-starts the server under S1, runs `tui.launch.start_detached` under S2, and asserts that the parked engine's control plane lands under S2: the #731 reproduction as a regression gate. It applies the `real_mux_e2e` group mark, which `test_every_real_tmux_e2e_joins_the_serialized_xdist_group` demands, with a string-literal skipif reason containing "tmux". It gets its own `_EXPECTED_E2E_DEF_COUNTS` entry in `tests/test_conftest.py`.
 
-**Out-of-tree compatibility test (must exist):** `start_detached` against `StubMux`. The argv handed to `StubMux.new_parked_window` contains `--state-root <root>`, and the call uses the released five-parameter signature.
+**Out-of-tree compatibility test (must exist):** `start_detached` against a `StubMux` subclass that records `new_parked_window` and `set_window_option`, declared with the released signatures. The base `StubMux` raises `AssertionError` on both, because the adapter must not call them. The recorded argv carries `--state-root=<root>` ahead of the subcommand, and `new_parked_window` received exactly the released five parameters.
 
 ### Stage 3: seam revision (specified, not scheduled; Option C)
 
@@ -322,7 +343,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
   - `seam_version` and `MUX_SEAM_VERSION`
   - the two `*_with_env` defaults
   - `supports_env_transport` with the owner rule
-  - the backend-construction check in `_select` (forced: raise; automatic and fallback: skip; detection: report)
+  - the backend-construction check, in `_select` (forced: raise; automatic and fallback: skip) and in `detect_multiplexers`' row loop (report, through `probe_error`)
 - `tmux_base.py`, `psmux_backend.py`: the private `_spawn_*` implementations and the declaration
 - Call sites, each calling the new verb only when `supports_env_transport(mux)` is True:
   - `tui/launch.py` (`_ensure_ctl_session`, `start_detached`)
@@ -347,7 +368,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
    - An unversioned out-of-tree backend with a method of that name is also never called. This is a characterization case, covered by both gates.
 4. **Half-declared.**
    - A factory registered through `register_multiplexer` is not invoked at registration.
-   - The instance it returns, which declares `seam_version = 2` but implements only one verb, is handled three ways: forced selection raises a `MultiplexerError` naming the missing verb; automatic selection and the fallback skip it; a `detect_multiplexers` row reports the reason.
+   - The instance it returns, which declares `seam_version = 2` but implements only one verb, is handled three ways: forced selection raises a `MultiplexerError` naming the missing verb; automatic selection and the fallback skip it; a `detect_multiplexers` row reports the reason (ablate the row-loop check and that row reads available).
    - Ablating the check makes the forced case fail.
 5. **Transport argv:**
    - tmux: `new-session ... -e BMAD_LOOP_STATE_DIR=<root>` and the parked `new-window ... -e`
@@ -359,11 +380,11 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 - **No per-window user options on psmux.** psmux has no per-window option store (bmad-loop #310), so the env transport never rides a window option.
 - **`-EncodedCommand` stays the window-command transport on psmux.** A quoted `new-window` command string still dies, and every env prelude above lives inside that encoded source.
 - **`_qualified_window_id` stays.** Bare `@N` ids route by the caller's server. Nothing here changes how window ids are minted or replayed.
-- **#729 (ambient `PSMUX_DATA_DIR`)** is a different question: which root, rather than how a root travels. This ADR does not answer it.
+- **#729 (ambient `PSMUX_DATA_DIR`)** asks which registry root; #851 answers it with `[mux] honor_ambient_psmux_data_dir`. How that root reaches a bare-env parked engine is a transport question, and this ADR answers it: Stage 2 carries it in argv beside the state root.
 
 ## 8. Approver decisions (2026-10-02)
 
-The approver's answers, recorded in full:
+Approver: @dracic. The answers below were given on 2026-10-02 and are recorded in full. Later changes do not rewrite them; they are listed under "Amendments after acceptance".
 
 - **A. The round-3 review findings are patched as proposed.**
   - Known-unset now has its own value, the `UNSET` sentinel, distinct from a set-empty `""` (Stage 1, "The query").
@@ -371,3 +392,18 @@ The approver's answers, recorded in full:
 - **B. Stage 3 is not scheduled.** Close #731 after Stage 2. Re-scope #730 to "parked windows supported, window-0 shells warned".
 - **C. The hidden `--state-root` option is accepted** as the internal contract Stage 2 will introduce, with the same standing as `--run-id`.
 - **D. This ADR is approved.** Status: Accepted.
+
+### Amendments after acceptance
+
+- **2026-10-02, `ee698b82`, editorial, made at the approver's request.** Marks Stages 1 and 2 as planned, not shipped, and words answer C as "the internal contract Stage 2 will introduce". No decision changed.
+- **2026-10-03, `22d21963`, Stage 2.** The bare-env warning is kept after Stage 2 and drops only its parked-window clause, because Stage 2 carries only the state root. Made in response to a review finding.
+- **2026-10-03, `14a1a3e3`, Stage 1.** Both remedy commands render the root and the control-session target with `shlex.quote`, and Stage 1's tests assert it. Made in response to a review finding.
+- **2026-10-05, review 5407768292.** Made in response to review findings:
+  - Stage 1's remedy states that tmux's control session is shared by every project on the server. It offers `set-environment` only where no other state root uses that server, and names the cost of `kill-server`.
+  - Stage 2 also carries the launcher's registry root (`--registry-root`), for #851's `[mux] honor_ambient_psmux_data_dir`.
+  - Stage 2 demotes the stale-root warning to an informational note, and re-surfaces the bare-env warning in the TUI.
+  - `--state-root`'s parse-time refusal is recorded as new behavior. It is top-level and precedes the subcommand. Answer C's "same standing as `--run-id`" means policy standing (hidden, composed by the TUI), not parser structure.
+  - The Stage 2 E2E gate moves to its own module.
+  - Answer B's re-scope of #730 now reads: parked windows land on the right state root, and on the right registry under that opt-in; window-0 shells and every other bare-env loss stay warned, as psmux's documented trade.
+
+Re-approved by @dracic on 2026-10-05: every amendment above.
