@@ -14764,6 +14764,42 @@ def test_unparked_session_end_carries_no_parked_key(project):
     assert dec and all(d["parked"] is False for d in dec)
 
 
+def test_session_end_extras_carries_resultless_verdict(project):
+    """#780: the adapter folds the last resultless-stop crumb onto a non-completed
+    result because nothing reads `resultless-stops.jsonl`; `session-end` is where
+    an operator finds why a nested spec rode to timeout. Diagnosis, not routing:
+    the timeout retries and defers exactly as a bare one does.
+
+    ABLATION: delete the resultless block in `_session_end_extras` and the
+    session-end assertions fail."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    detail = "no qualifying spec directly under: impl (subdirectories are not searched)"
+    timeout = SessionResult(
+        status="timeout", resultless_verdict="no-artifact", resultless_detail=detail
+    )
+    engine, adapter = make_engine(project, [timeout, timeout])
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # the retry ran: routing is untouched
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2
+    assert all(e["resultless_verdict"] == "no-artifact" for e in ends)
+    assert all(e["resultless_detail"] == detail for e in ends)
+
+
+def test_session_end_extras_omits_resultless_when_unset(project):
+    """Present-only, the `parked` convention: a session without a folded verdict
+    leaves neither key, so a grep finds exactly the diagnosed sessions."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends
+    assert all("resultless_verdict" not in e and "resultless_detail" not in e for e in ends)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same

@@ -681,6 +681,79 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     return [p for _, p in found]
 
 
+def find_nested_result_hints(
+    impl_artifacts: Path, *, since_ns: int, limit: int = 3
+) -> tuple[list[Path], str | None]:
+    """Diagnosis only (#780): specs ONE level below `impl_artifacts` that would
+    have qualified had they sat directly in it — so a `no-artifact` breadcrumb
+    can name the nested file instead of leaving the operator to guess why a
+    `stories/` layout rode to timeout. Nothing returned here is ever harvested:
+    the result scans stay flat (widening them would widen the #261 shared-dir
+    hazard), and a nested hit is named, never read back.
+
+    Probes each immediate, non-symlinked subdirectory in sorted order with the
+    existing finders — `find_result_artifact` then `find_frontmatter_candidates`
+    — so it adds no qualification logic of its own. Returns at most `limit`
+    distinct paths, plus a fault string when listing the directory or one of its
+    subdirectories failed, probing a subdirectory raised, or a nested `*.md`
+    at/after the launch floor could not be read: the fault is reported, never folded into an empty
+    "nothing nested" answer, and a fault in one subdirectory keeps the hits
+    already found in others. (The finders degrade an unreadable file to "no
+    match" by contract, so a non-hit is probed once more here, purely to tell
+    "not a spec" from "could not look".) A missing `impl_artifacts` is not a
+    fault — the flat scan already says so.
+    """
+    if not impl_artifacts.is_dir():
+        return [], None
+    hits: list[Path] = []
+    faults: list[str] = []
+    try:
+        children = sorted(impl_artifacts.iterdir())
+    except OSError as e:
+        return [], f"{type(e).__name__}: {e}"
+    for child in children:
+        try:
+            # 3.11 floor: Path.is_dir has no follow_symlinks=, so test the link first.
+            if child.is_symlink() or not child.is_dir():
+                continue
+            # `Path.glob` (the finders' and ours below) swallows a listing fault
+            # and yields nothing, so an unlistable subdir would read as empty:
+            # list it explicitly first so the fault reaches the handler below.
+            os.listdir(child)
+            marker = find_result_artifact(child, since_ns=since_ns)
+            found = [marker] if marker is not None else []
+            found += find_frontmatter_candidates(child, since_ns=since_ns)
+            for path in found:
+                if path not in hits:
+                    hits.append(path)
+                if len(hits) >= limit:
+                    return hits, "; ".join(faults) or None
+            for path in sorted(child.glob("*.md")):
+                if path not in found and (fault := _unreadable(path, since_ns=since_ns)):
+                    faults.append(fault)
+        except OSError as e:
+            faults.append(f"could not probe {child}: {type(e).__name__}: {e}")
+    return hits, "; ".join(faults) or None
+
+
+def _unreadable(path: Path, *, since_ns: int) -> str | None:
+    """A read fault on ONE nested `*.md` the finders passed over, or None when it
+    is readable, older than the launch floor, or gone (a file deleted between the
+    glob and the probe is not a fault)."""
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return None
+        # Read, not just open: the finders fail on the read too (EIO after a
+        # successful open), and a decode error is "not a spec", not a fault.
+        with path.open("rb") as f:
+            f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"could not read {path}: {type(e).__name__}: {e}"
+    return None
+
+
 def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     """Whether ONE file qualifies for the missing-marker fallback — the per-path
     predicate `find_frontmatter_candidates` applies to each glob hit, factored out

@@ -555,6 +555,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                         f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
                         {"unknown_keys": list(ss.unknown_keys)},
                     )
+                _validate_nested_specs(paths.implementation_artifacts, report)
             except sprintstatus.SprintStatusError as e:
                 report.fail("queue.sprint-status", str(e))
 
@@ -1858,6 +1859,85 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
             f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
             {"plugins": names},
         )
+
+
+def _nested_spec_files(impl: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Spec-like files ONE level below `impl` (#780): `*.md` in an immediate,
+    non-symlinked subdirectory whose frontmatter carries a non-empty `status:`.
+
+    Sprint mode's dev read-back globs only `impl` itself, so a spec kept in, say,
+    `impl/stories/` is never found and the session rides to timeout. Deliberately
+    broader than the adapter's `devcontract.find_nested_result_hints` (any status,
+    no launch floor): this is a preflight over the layout, not a judgment about one
+    session's result. Returns `(spec_like, unreadable)`: a nested `*.md` whose read
+    raised, or a subdirectory that could not be listed, is returned with its fault
+    rather than dropped, since it may hold the very spec the layout hides. An
+    OSError while listing `impl` itself propagates, so the caller reports the fault
+    instead of an empty answer."""
+    if not impl.is_dir():
+        return [], []
+    found: list[Path] = []
+    unreadable: list[tuple[Path, str]] = []
+    for child in sorted(impl.iterdir()):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        # `Path.glob` swallows a listing fault and yields nothing, so an
+        # unlistable subdirectory would pass as empty: list it explicitly.
+        try:
+            os.listdir(child)
+        except OSError as e:
+            unreadable.append((child, f"{type(e).__name__}: {e}"))
+            continue
+        for path in sorted(child.glob("*.md")):
+            try:
+                fm = frontmatter.read_frontmatter(path)
+            except OSError as e:
+                unreadable.append((path, f"{type(e).__name__}: {e}"))
+                continue
+            if frontmatter.status_of(fm):
+                found.append(path)
+    return found, unreadable
+
+
+def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
+    """Warn on a nested spec layout in sprint mode (#780). Never a failure — nothing
+    here gates a run — and silent when nothing is nested, the same no-`ok`-twin
+    reasoning as `policy.isolation-shared-artifact-dir`. A nested `*.md` that could
+    not be read is its own warning: silence would claim a clean layout the scan
+    never checked."""
+    try:
+        nested, unreadable = _nested_spec_files(impl)
+    except OSError as e:
+        report.warn(
+            "queue.nested-specs",
+            f"could not list subdirectories of {impl}: {type(e).__name__}: {e}",
+            {"path": str(impl), "error": f"{type(e).__name__}: {e}"},
+        )
+        return
+    if unreadable:
+        shown = unreadable[:3]
+        report.warn(
+            "queue.nested-specs",
+            f"could not read {len(unreadable)} path(s) in subdirectories of "
+            f"{impl}, so they were not checked for a nested spec layout (e.g. "
+            f"{'; '.join(f'{p}: {err}' for p, err in shown)})",
+            {
+                "path": str(impl),
+                "count": len(unreadable),
+                "unreadable": [{"path": str(p), "error": err} for p, err in shown],
+            },
+        )
+    if not nested:
+        return
+    examples = nested[:3]
+    report.warn(
+        "queue.nested-specs",
+        f"{len(nested)} spec-like file(s) in subdirectories of {impl} (e.g. "
+        f"{', '.join(str(p) for p in examples)}); sprint-mode dev sessions only read "
+        "specs directly under it — move them up, or use stories mode ([stories] "
+        "source) for a stories/ layout",
+        {"count": len(nested), "examples": [str(p) for p in examples]},
+    )
 
 
 def _validate_operator_registry(

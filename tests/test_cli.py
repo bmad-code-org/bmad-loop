@@ -11988,6 +11988,258 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     assert emitted <= VALIDATE_CHECKS
 
 
+# --- queue.nested-specs: a sprint spec layout the dev read-back never searches (#780) ---
+
+_NESTED_SPEC = "---\nstatus: ready-for-dev\n---\n# Story 1.1\n"
+
+
+def _nested_impl(project):
+    """The artifacts dir exactly as `cmd_validate` resolves it, so path assertions
+    compare like with like (a tmp_path under a symlinked /tmp resolves elsewhere)."""
+    return bmadconfig.load_paths(project.project).implementation_artifacts
+
+
+def _commit_nested(project, msg="nested spec fixture"):
+    git(project.project, "add", "-A")  # keep git.worktree-clean green: rc stays the verdict
+    git(project.project, "commit", "-q", "-m", msg)
+
+
+def _nested_findings(doc):
+    return [f for f in doc["findings"] if f["check"] == "queue.nested-specs"]
+
+
+def test_validate_warns_nested_specs_in_sprint_mode(project, capsys, monkeypatch):
+    """#780: a sprint spec kept in `impl/stories/` is never found by the flat dev
+    read-back, so the session rides to timeout. validate names the file before any
+    tokens are spent — as a warning, so rc stays 0.
+
+    Ablation: drop the `_validate_nested_specs` call from `cmd_validate` and this
+    reddens."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    impl = _nested_impl(project)
+    nested = impl / "stories" / "1-1-x.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(_NESTED_SPEC, encoding="utf-8")
+    _commit_nested(project)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["ok"] is True  # a warning is not a problem
+    (hit,) = _nested_findings(doc)
+    assert hit["severity"] == "warning"
+    assert str(nested) in hit["message"]
+    assert str(impl) in hit["message"]
+    assert "only read specs directly under it" in hit["message"]
+    assert hit["detail"] == {"count": 1, "examples": [str(nested)]}
+
+
+def test_validate_nested_specs_caps_examples_at_three(project, capsys, monkeypatch):
+    """The count is the whole layout; the examples are a sample, so a big stories/
+    dir cannot flood the line."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    impl = _nested_impl(project)
+    (impl / "stories").mkdir()
+    specs = [impl / "stories" / f"1-{i}-x.md" for i in range(1, 6)]
+    for spec in specs:
+        spec.write_text(_NESTED_SPEC, encoding="utf-8")
+    _commit_nested(project)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    (hit,) = _nested_findings(doc)
+    assert hit["detail"] == {"count": 5, "examples": [str(p) for p in specs[:3]]}
+    assert str(specs[3]) not in hit["message"]
+
+
+def test_validate_no_nested_specs_warning_on_stock_project(project, capsys, monkeypatch):
+    """Nothing bmad-loop itself lays down (init, hooks, the sprint board) may read
+    as a nested spec — a false positive here would fire on every project."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    assert _nested_impl(project).is_dir(), "premise: the scanned dir exists"
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["ok"] is True
+    assert _nested_findings(doc) == []
+
+
+def test_validate_nested_specs_ignores_plain_md(project, capsys, monkeypatch):
+    """Only a `*.md` whose frontmatter carries a non-empty `status:` is spec-like:
+    notes, a frontmatter-less doc, and a blank `status:` are not counted. One real
+    spec beside them pins the count, so the filter — not an empty scan — is what
+    keeps them out.
+
+    Ablation: drop the `status_of` gate in `_nested_spec_files` and count reddens."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    impl = _nested_impl(project)
+    notes = impl / "notes"
+    notes.mkdir()
+    (notes / "readme.md").write_text("# just notes\n", encoding="utf-8")
+    (notes / "blank.md").write_text("---\nstatus:\ntitle: x\n---\n", encoding="utf-8")
+    (notes / "other.txt").write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    spec = notes / "spec.md"
+    spec.write_text(_NESTED_SPEC, encoding="utf-8")
+    _commit_nested(project)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    (hit,) = _nested_findings(doc)
+    assert hit["detail"] == {"count": 1, "examples": [str(spec)]}
+
+
+def test_validate_nested_specs_does_not_follow_symlinked_dirs(
+    project, capsys, monkeypatch, tmp_path
+):
+    """A symlinked subdirectory is not part of the layout the read-back would scan,
+    and following one could walk anywhere — it is skipped.
+
+    Ablation: drop the `is_symlink()` skip in `_nested_spec_files` and a finding
+    appears."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    impl = _nested_impl(project)
+    outside = tmp_path / "outside-specs"
+    outside.mkdir()
+    (outside / "1-1-x.md").write_text(_NESTED_SPEC, encoding="utf-8")
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    _commit_nested(project)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert _nested_findings(doc) == []
+
+
+def test_validate_stories_mode_never_warns_nested_specs(project, capsys, monkeypatch):
+    """`stories/` IS the stories-mode layout (read directly through the spec folder),
+    so the sprint-mode warning must never fire there.
+
+    Ablation: run `_validate_nested_specs` in the stories branch too and this
+    reddens."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    nested = _nested_impl(project) / "stories" / "1-1-x.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(_NESTED_SPEC, encoding="utf-8")
+    _commit_nested(project)
+
+    argv = ["validate", "--project", str(project.project), "--spec", STORIES_SPEC_FOLDER]
+    cli.main([*argv, "--json"])  # the rc is the stories gates' verdict, not this check's
+    doc = json.loads(capsys.readouterr().out)
+
+    assert doc["mode"] == "stories"
+    assert _nested_findings(doc) == []
+
+
+def test_validate_nested_specs_reports_a_listing_fault(tmp_path, monkeypatch):
+    """An OSError while listing is a warning naming the fault — not a crash, and not
+    an empty "nothing nested" answer a caller could not tell from a clean layout."""
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    real_iterdir = Path.iterdir
+
+    def boom(self):
+        if self == impl:
+            raise PermissionError(13, "denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    report = cli.ValidationReport()
+
+    cli._validate_nested_specs(impl, report)
+
+    (finding,) = report.findings
+    assert finding.check == "queue.nested-specs"
+    assert finding.severity == "warning"
+    assert "PermissionError" in finding.message
+    assert finding.detail is not None and finding.detail["path"] == str(impl)
+
+
+def _deny_reads_of(monkeypatch, *denied):
+    real_read = cli.frontmatter.read_frontmatter
+
+    def flaky(path):
+        if path in denied:
+            raise PermissionError(13, "denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(cli.frontmatter, "read_frontmatter", flaky)
+
+
+def test_nested_spec_files_returns_an_unreadable_file_with_its_fault(tmp_path, monkeypatch):
+    """One unreadable file is returned with its fault, not counted as spec-like;
+    its readable siblings still are."""
+    impl = tmp_path / "impl"
+    (impl / "stories").mkdir(parents=True)
+    bad = impl / "stories" / "1-1-bad.md"
+    good = impl / "stories" / "1-2-good.md"
+    for spec in (bad, good):
+        spec.write_text(_NESTED_SPEC, encoding="utf-8")
+    _deny_reads_of(monkeypatch, bad)
+
+    found, unreadable = cli._nested_spec_files(impl)
+
+    assert found == [good]
+    ((path, err),) = unreadable
+    assert path == bad
+    assert err.startswith("PermissionError")
+
+
+def test_validate_nested_specs_reports_an_unreadable_sole_candidate(tmp_path, monkeypatch):
+    """When the only nested `*.md` cannot be read, the scan checked nothing — so it
+    must warn, not stay silent the way a clean layout does.
+
+    Ablation: drop the `unreadable` warning from `_validate_nested_specs` and no
+    finding is emitted."""
+    impl = tmp_path / "impl"
+    (impl / "stories").mkdir(parents=True)
+    bad = impl / "stories" / "1-1-x.md"
+    bad.write_text(_NESTED_SPEC, encoding="utf-8")
+    _deny_reads_of(monkeypatch, bad)
+    report = cli.ValidationReport()
+
+    cli._validate_nested_specs(impl, report)
+
+    (finding,) = report.findings
+    assert finding.check == "queue.nested-specs"
+    assert finding.severity == "warning"
+    assert str(bad) in finding.message
+    assert "PermissionError" in finding.message
+    assert finding.detail is not None
+    assert finding.detail["count"] == 1
+    assert finding.detail["unreadable"][0]["path"] == str(bad)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_validate_nested_specs_reports_an_unlistable_subdir(tmp_path):
+    """`Path.glob` swallows a listing fault and yields nothing, so a subdirectory
+    that cannot be listed would pass as a clean layout. It is warned on instead.
+
+    Ablation: drop the explicit `os.listdir(child)` in `_nested_spec_files` and no
+    finding is emitted."""
+    impl = tmp_path / "impl"
+    locked = impl / "stories"
+    locked.mkdir(parents=True)
+    (locked / "1-1-x.md").write_text(_NESTED_SPEC, encoding="utf-8")
+    locked.chmod(0o000)
+    report = cli.ValidationReport()
+    try:
+        cli._validate_nested_specs(impl, report)
+    finally:
+        locked.chmod(0o755)
+
+    (finding,) = report.findings
+    assert finding.check == "queue.nested-specs"
+    assert finding.severity == "warning"
+    assert str(locked) in finding.message
+    assert "PermissionError" in finding.message
+    assert finding.detail is not None
+    assert finding.detail["unreadable"][0]["path"] == str(locked)
+
+
 @pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
 def test_validate_warns_when_a_binary_on_path_refuses_to_run(
     project, capsys, monkeypatch, tmp_path, exit_code

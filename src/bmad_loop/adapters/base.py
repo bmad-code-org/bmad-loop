@@ -308,6 +308,15 @@ class SessionResult:
     # into the same prompt. `parked_evidence` names what matched. APPENDED.
     parked: bool = False
     parked_evidence: str | None = None
+    # Why the dev read-back last came up empty (#780): the verdict and detail of
+    # the session's last `resultless-stops.jsonl` crumb, folded in by
+    # `_DevSynthesisMixin.run` when the session ends non-completed. That file has
+    # no reader, so a spec nested one directory down rode to timeout with no
+    # visible reason; the engine journals these on `session-end` instead.
+    # Diagnostic only: never read by routing, never set on a completed result.
+    # APPENDED.
+    resultless_verdict: str | None = None
+    resultless_detail: str | None = None
 
 
 class CodingCLIAdapter(ABC):

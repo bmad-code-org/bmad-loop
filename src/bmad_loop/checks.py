@@ -68,6 +68,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "adapter.external-profile",
         "queue.sprint-status",
         "queue.sprint-status-unknown-keys",
+        # spec-like files one level under the artifacts dir: the sprint-mode dev
+        # read-back never searches subdirectories (#780)
+        "queue.nested-specs",
         "queue.stories-manifest",
         "git.worktree-clean",
         "git.probe",
