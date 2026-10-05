@@ -3021,6 +3021,9 @@ def test_run_removal_retries_a_transient_windows_sharing_violation(tmp_path, mon
     monkeypatch.setattr(platform_util.sys, "platform", real_platform)  # restore on teardown
     sleeps: list[float] = []
     monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    # ``time.sleep`` is the process-wide one: the session guard's tmux probe waits
+    # under a timeout, and ``Popen.wait`` polls with ``time.sleep`` on a slow host.
+    monkeypatch.setattr(runs, "_refuse_live_session", lambda *_a, **_k: None)
     real_unlink = os.unlink
     calls = {"n": 0}
 
@@ -3072,6 +3075,9 @@ def test_run_removal_final_failure_propagates_and_keeps_the_state_dir(tmp_path, 
     state_dir = _seed_state_dir(tmp_path, run_id)
     sleeps: list[float] = []
     monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    # ``time.sleep`` is the process-wide one: the session guard's tmux probe waits
+    # under a timeout, and ``Popen.wait`` polls with ``time.sleep`` on a slow host.
+    monkeypatch.setattr(runs, "_refuse_live_session", lambda *_a, **_k: None)
     real_unlink = os.unlink
     calls = {"n": 0}
     denied = PermissionError(13, "Permission denied")
