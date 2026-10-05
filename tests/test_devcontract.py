@@ -1100,6 +1100,45 @@ def test_nested_hints_listing_fault_is_reported_not_empty(tmp_path, monkeypatch)
     )
 
 
+def _deny_open_of(monkeypatch, denied: Path) -> None:
+    real_open = Path.open
+
+    def guarded(self, *args, **kwargs):
+        if self == denied:
+            raise PermissionError(13, "denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+
+def test_nested_hints_report_an_unreadable_file_beside_a_hit(tmp_path, monkeypatch):
+    """A nested `*.md` that cannot be opened is a fault, not "no match" — it may be
+    the very spec the layout hides. Its readable sibling is still named. The denied
+    file is non-terminal, so the finders pass over it on every Python whether or not
+    their reads route through `Path.open`.
+
+    Ablation: drop the `_unreadable` probe loop and the fault is None."""
+    hit = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-2-y.md", status="in-progress", auto_run=None)
+    _deny_open_of(monkeypatch, bad)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not read {bad}: PermissionError" in fault
+
+
+def test_nested_hints_ignore_an_unreadable_file_below_the_launch_floor(tmp_path, monkeypatch):
+    """A file older than the launch floor could not have been this session's spec,
+    so failing to open it is not worth a fault."""
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    _deny_open_of(monkeypatch, old)
+
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
 # was killed) can end inside a multi-byte sequence; `read_text(encoding="utf-8")`
 # then raises UnicodeDecodeError — a ValueError, NOT an OSError.

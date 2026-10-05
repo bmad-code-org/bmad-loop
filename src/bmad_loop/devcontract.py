@@ -694,13 +694,17 @@ def find_nested_result_hints(
     Probes each immediate, non-symlinked subdirectory in sorted order with the
     existing finders — `find_result_artifact` then `find_frontmatter_candidates`
     — so it adds no qualification logic of its own. Returns at most `limit`
-    distinct paths, plus a fault string when listing the directory failed: the
-    fault is reported, never folded into an empty "nothing nested" answer. A
+    distinct paths, plus a fault string when listing the directory failed or a
+    nested `*.md` at/after the launch floor could not be opened: the fault is
+    reported, never folded into an empty "nothing nested" answer. (The finders
+    degrade an unreadable file to "no match" by contract, so a non-hit is probed
+    once more here, purely to tell "not a spec" from "could not look".) A
     missing `impl_artifacts` is not a fault — the flat scan already says so.
     """
     if not impl_artifacts.is_dir():
         return [], None
     hits: list[Path] = []
+    faults: list[str] = []
     try:
         for child in sorted(impl_artifacts.iterdir()):
             # 3.11 floor: Path.is_dir has no follow_symlinks=, so test the link first.
@@ -713,10 +717,29 @@ def find_nested_result_hints(
                 if path not in hits:
                     hits.append(path)
                 if len(hits) >= limit:
-                    return hits, None
+                    return hits, "; ".join(faults) or None
+            for path in sorted(child.glob("*.md")):
+                if path not in found and (fault := _unreadable(path, since_ns=since_ns)):
+                    faults.append(fault)
     except OSError as e:
         return [], f"{type(e).__name__}: {e}"
-    return hits, None
+    return hits, "; ".join(faults) or None
+
+
+def _unreadable(path: Path, *, since_ns: int) -> str | None:
+    """A read fault on ONE nested `*.md` the finders passed over, or None when it
+    is readable, older than the launch floor, or gone (a file deleted between the
+    glob and the probe is not a fault)."""
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return None
+        with path.open("rb"):
+            pass
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"could not read {path}: {type(e).__name__}: {e}"
+    return None
 
 
 def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
