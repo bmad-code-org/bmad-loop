@@ -1139,6 +1139,59 @@ def test_nested_hints_ignore_an_unreadable_file_below_the_launch_floor(tmp_path,
     assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
 
 
+def test_nested_hints_report_a_read_fault_after_a_successful_open(tmp_path, monkeypatch):
+    """The finders fail on the read, not just the open (EIO on a flaky mount), so
+    the probe must read too: a file that opens but cannot be read is a fault.
+
+    Ablation: open without reading and the fault is None."""
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    real_open = Path.open
+
+    class _EioReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *args):
+            raise OSError(5, "Input/output error")
+
+    def guarded(self, *args, **kwargs):
+        return _EioReader() if self == bad else real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == []
+    assert fault is not None
+    assert f"could not read {bad}: OSError" in fault
+
+
+def test_nested_hints_keep_earlier_hits_when_a_later_subdir_faults(tmp_path, monkeypatch):
+    """A fault probing one subdirectory is reported beside the hits already found
+    in others — never trades the named nested spec for a bare fault.
+
+    Ablation: let the per-child OSError escape the loop and the hits are lost."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    (tmp_path / "b").mkdir()
+    real_find = devcontract.find_result_artifact
+
+    def find(d, *, since_ns):
+        if d.name == "b":
+            raise PermissionError(13, "denied", str(d))
+        return real_find(d, since_ns=since_ns)
+
+    monkeypatch.setattr(devcontract, "find_result_artifact", find)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {tmp_path / 'b'}: PermissionError" in fault
+
+
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
 # was killed) can end inside a multi-byte sequence; `read_text(encoding="utf-8")`
 # then raises UnicodeDecodeError — a ValueError, NOT an OSError.
