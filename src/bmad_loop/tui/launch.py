@@ -913,6 +913,10 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
     So the child's answer is predicted here with the same pure rule it will
     apply (`runs.resolve_psmux_registry_root`), from the root it inherits —
     this process's root in force — and a disagreement refuses the launch.
+    The prediction assumes inheritance. Under `PSMUX_BARE_ENV` a pane child
+    inherits no `PSMUX_DATA_DIR` (psmux re-adds only its allowlist), so it
+    derives. bmad-loop does not support that mode, and
+    `PsmuxMultiplexer._warn_if_bare_env` says so.
 
     Asked only of a process that configured its registry for this project
     (`runs.settled_project`), which every CLI entry does: there is nothing to

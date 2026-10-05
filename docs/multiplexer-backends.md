@@ -251,7 +251,9 @@ honor_ambient_psmux_data_dir = true
 ```
 
 bmad-loop then uses your value as the registry, a pane child inherits and honours it, and a clean
-process carrying your profile honours it too, so every process agrees. `bmad-loop mux` says
+process carrying your profile honours it too, so every process agrees. Not under `PSMUX_BARE_ENV`,
+which bmad-loop does not support: a bare pane inherits no `PSMUX_DATA_DIR`, so a run started there
+derives the registry instead. `bmad-loop mux` says
 `your own $PSMUX_DATA_DIR, honoured` and prints the derived root it would otherwise use. Leave the
 switch off for a value you typed into one shell: a process started without it would derive, and the
 session would read as gone there. Rules, all fixed:

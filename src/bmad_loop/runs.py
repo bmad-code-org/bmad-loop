@@ -618,8 +618,9 @@ def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambi
       the session.
     - **Persistent pin** (a profile exports it into every shell): turn it on.
       The outer process honours the pin and exports it, a pane child inherits
-      and honours it, and a clean process carrying the profile pin honours it
-      too.
+      and honours it (not under ``PSMUX_BARE_ENV``, where a pane inherits no
+      ``PSMUX_DATA_DIR``; see ``_warn_if_bare_env``), and a clean process
+      carrying the profile pin honours it too.
 
     Whether the pin is persistent is not in the environment; the flag is the
     operator saying so, from a per-project file both processes read. It is a
