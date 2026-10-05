@@ -1861,7 +1861,7 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
         )
 
 
-def _nested_spec_files(impl: Path) -> list[Path]:
+def _nested_spec_files(impl: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
     """Spec-like files ONE level below `impl` (#780): `*.md` in an immediate,
     non-symlinked subdirectory whose frontmatter carries a non-empty `status:`.
 
@@ -1869,30 +1869,36 @@ def _nested_spec_files(impl: Path) -> list[Path]:
     `impl/stories/` is never found and the session rides to timeout. Deliberately
     broader than the adapter's `devcontract.find_nested_result_hints` (any status,
     no launch floor): this is a preflight over the layout, not a judgment about one
-    session's result. An unreadable file is skipped; an OSError while LISTING
-    propagates, so the caller reports the fault instead of an empty answer."""
+    session's result. Returns `(spec_like, unreadable)`: a nested `*.md` whose read
+    raised is returned with its fault rather than dropped, since it may be the very
+    spec the layout hides. An OSError while LISTING propagates, so the caller
+    reports the fault instead of an empty answer."""
     if not impl.is_dir():
-        return []
+        return [], []
     found: list[Path] = []
+    unreadable: list[tuple[Path, str]] = []
     for child in sorted(impl.iterdir()):
         if child.is_symlink() or not child.is_dir():
             continue
         for path in sorted(child.glob("*.md")):
             try:
                 fm = frontmatter.read_frontmatter(path)
-            except OSError:
+            except OSError as e:
+                unreadable.append((path, f"{type(e).__name__}: {e}"))
                 continue
             if frontmatter.status_of(fm):
                 found.append(path)
-    return found
+    return found, unreadable
 
 
 def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
     """Warn on a nested spec layout in sprint mode (#780). Never a failure — nothing
     here gates a run — and silent when nothing is nested, the same no-`ok`-twin
-    reasoning as `policy.isolation-shared-artifact-dir`."""
+    reasoning as `policy.isolation-shared-artifact-dir`. A nested `*.md` that could
+    not be read is its own warning: silence would claim a clean layout the scan
+    never checked."""
     try:
-        nested = _nested_spec_files(impl)
+        nested, unreadable = _nested_spec_files(impl)
     except OSError as e:
         report.warn(
             "queue.nested-specs",
@@ -1900,6 +1906,19 @@ def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
             {"path": str(impl), "error": f"{type(e).__name__}: {e}"},
         )
         return
+    if unreadable:
+        shown = unreadable[:3]
+        report.warn(
+            "queue.nested-specs",
+            f"could not read {len(unreadable)} *.md file(s) in subdirectories of "
+            f"{impl}, so they were not checked for a nested spec layout (e.g. "
+            f"{'; '.join(f'{p}: {err}' for p, err in shown)})",
+            {
+                "path": str(impl),
+                "count": len(unreadable),
+                "unreadable": [{"path": str(p), "error": err} for p, err in shown],
+            },
+        )
     if not nested:
         return
     examples = nested[:3]

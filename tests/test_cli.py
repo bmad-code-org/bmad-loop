@@ -12156,25 +12156,59 @@ def test_validate_nested_specs_reports_a_listing_fault(tmp_path, monkeypatch):
     assert finding.detail is not None and finding.detail["path"] == str(impl)
 
 
-def test_nested_spec_files_skips_an_unreadable_file(tmp_path, monkeypatch):
-    """One unreadable file degrades to "not counted"; its readable siblings still
-    are."""
+def _deny_reads_of(monkeypatch, *denied):
+    real_read = cli.frontmatter.read_frontmatter
+
+    def flaky(path):
+        if path in denied:
+            raise PermissionError(13, "denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(cli.frontmatter, "read_frontmatter", flaky)
+
+
+def test_nested_spec_files_returns_an_unreadable_file_with_its_fault(tmp_path, monkeypatch):
+    """One unreadable file is returned with its fault, not counted as spec-like;
+    its readable siblings still are."""
     impl = tmp_path / "impl"
     (impl / "stories").mkdir(parents=True)
     bad = impl / "stories" / "1-1-bad.md"
     good = impl / "stories" / "1-2-good.md"
     for spec in (bad, good):
         spec.write_text(_NESTED_SPEC, encoding="utf-8")
-    real_read = cli.frontmatter.read_frontmatter
+    _deny_reads_of(monkeypatch, bad)
 
-    def flaky(path):
-        if path == bad:
-            raise PermissionError(13, "denied", str(path))
-        return real_read(path)
+    found, unreadable = cli._nested_spec_files(impl)
 
-    monkeypatch.setattr(cli.frontmatter, "read_frontmatter", flaky)
+    assert found == [good]
+    ((path, err),) = unreadable
+    assert path == bad
+    assert err.startswith("PermissionError")
 
-    assert cli._nested_spec_files(impl) == [good]
+
+def test_validate_nested_specs_reports_an_unreadable_sole_candidate(tmp_path, monkeypatch):
+    """When the only nested `*.md` cannot be read, the scan checked nothing — so it
+    must warn, not stay silent the way a clean layout does.
+
+    Ablation: drop the `unreadable` warning from `_validate_nested_specs` and no
+    finding is emitted."""
+    impl = tmp_path / "impl"
+    (impl / "stories").mkdir(parents=True)
+    bad = impl / "stories" / "1-1-x.md"
+    bad.write_text(_NESTED_SPEC, encoding="utf-8")
+    _deny_reads_of(monkeypatch, bad)
+    report = cli.ValidationReport()
+
+    cli._validate_nested_specs(impl, report)
+
+    (finding,) = report.findings
+    assert finding.check == "queue.nested-specs"
+    assert finding.severity == "warning"
+    assert str(bad) in finding.message
+    assert "PermissionError" in finding.message
+    assert finding.detail is not None
+    assert finding.detail["count"] == 1
+    assert finding.detail["unreadable"][0]["path"] == str(bad)
 
 
 @pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
