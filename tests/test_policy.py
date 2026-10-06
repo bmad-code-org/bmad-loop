@@ -796,6 +796,7 @@ _BOOLEAN_POLICY_FIELDS = [
     ("cleanup", "clean_tmp"),
     ("tui", "low_frame_rate"),
     ("operator", "enabled"),
+    ("mux", "honor_ambient_psmux_data_dir"),
 ]
 
 
@@ -1552,6 +1553,12 @@ def test_mux_defaults_to_auto():
 def test_mux_backend_parses_and_strips():
     pol = policy.loads('[mux]\nbackend = " psmux "\n')
     assert pol.mux.backend == "psmux"
+
+
+def test_mux_honor_ambient_psmux_data_dir_defaults_off_and_parses():
+    assert policy.loads("").mux.honor_ambient_psmux_data_dir is False
+    pol = policy.loads("[mux]\nhonor_ambient_psmux_data_dir = true\n")
+    assert pol.mux.honor_ambient_psmux_data_dir is True
 
 
 def test_mux_backend_rejects_junk():

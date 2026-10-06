@@ -999,7 +999,12 @@ def _isolate_mux_registry(monkeypatch):
     and for a sharper reason: it is written by the same export, it survives in
     module state rather than in the environment (which is the whole point of
     it), and a leftover value makes `legacy_registries()` hand every later test
-    an extra registry to sweep."""
+    an extra registry to sweep.
+
+    `runs._SETTLED_PROJECT` is reset on the same rule: the export records the
+    project it configured, and the ownership gate reads it, so a leftover would
+    judge a later test's sessions against an earlier test's project. Its record
+    of refused kills (`runs._REFUSED_KILLS`) likewise."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -1007,6 +1012,8 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+    monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
 
 
 def seed_project_files(root: Path) -> ProjectPaths:

@@ -912,6 +912,9 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
         def has_registry_namespace(self):
             return True
 
+        def registry_root(self):
+            return os.environ.get(runs.PSMUX_DATA_DIR)  # as the primary psmux instance answers
+
         def has_session(self, name):
             return False
 
@@ -1971,6 +1974,9 @@ class _NamespacedMux:
     def has_registry_namespace(self):
         return True
 
+    def registry_root(self):
+        return os.environ.get(runs.PSMUX_DATA_DIR)  # as the primary psmux instance answers
+
     def has_session(self, session):
         self.sessions.append(session)
         return True
@@ -2390,6 +2396,318 @@ def test_attach_plan_carries_the_unproven_count(monkeypatch, agent_live: bool):
         assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
     else:
         assert plan is None
+
+
+class _SharedRegistryWithForeignSession:
+    """A shared (honoured, #729) registry where `bmad-loop-RID` is another
+    project's tagged session."""
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return "/shared-registry"
+
+    def session_name_key(self, name):
+        return name
+
+    def has_session(self, name):
+        return name == "bmad-loop-RID"
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return ["bmad-loop-RID"]
+
+    def session_options(self, _option):
+        return {"bmad-loop-RID": "0123456789abcdef"}
+
+
+def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tmp_path, capsys):
+    """In a registry shared with another project, `bmad-loop-RID` may be that
+    project's live coding session; attaching the operator to it is the by-name
+    hazard. `agent_session_exists` reads it as absent and says why, so with no
+    ctl window there is nothing to attach.
+
+    Ablate the gate in `agent_session_exists` and the plan attaches to it."""
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _SharedRegistryWithForeignSession())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+
+    assert launch.attach_plan(tmp_path, "RID") == (None, 0)
+    assert "treating bmad-loop-RID as absent" in capsys.readouterr().err
+
+
+def test_session_exists_stays_a_plain_existence_check_in_a_shared_registry(monkeypatch, tmp_path):
+    """`session_exists` also answers for the control session, which carries no
+    project tag (its name is already per project), so the shared-registry
+    ownership gate must not reach it: gated, a prune in an operator's honoured
+    root read its own ctl session as absent and swept nothing.
+
+    Ablate by moving the gate back into `session_exists` and this fails."""
+
+    class _UntaggedCtl(_SharedRegistryWithForeignSession):
+        def has_session(self, name):
+            return name == "ctl-under-test"
+
+        def list_sessions_reporting(self, *, on_fault=None):
+            return ["ctl-under-test"]
+
+        def session_options(self, _option):
+            return {}
+
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _UntaggedCtl())
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    assert launch.session_exists("ctl-under-test") is True
+    assert launch.agent_session_exists("ctl-under-test") is False
+
+
+class _HonouredRegistry:
+    """A namespacing backend whose registry in force is `root`."""
+
+    def __init__(self, root):
+        self._root = root
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return self._root
+
+
+def _write_honour_flag(project: Path, on: bool) -> None:
+    from bmad_loop import policy as policy_mod
+
+    path = project / policy_mod.POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"[mux]\nhonor_ambient_psmux_data_dir = {'true' if on else 'false'}\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("root", "flag_now", "drift"),
+    [
+        ("pinned", False, True),  # started honouring, switch turned off since
+        ("pinned", True, False),  # still honouring
+        ("derived", True, False),  # switch turned on since, but nothing was displaced to honour
+        ("derived", False, False),  # unchanged
+    ],
+)
+def test_registry_drift_predicts_where_a_child_would_settle(
+    monkeypatch, tmp_path, root, flag_now, drift
+):
+    """The detached child re-reads the switch from policy.toml and settles its
+    registry from the root it inherits (this process's). A TUI that started
+    honouring the operator's root and then had the switch turned off would
+    launch into a registry it does not watch; the other three combinations
+    land where the TUI looks.
+
+    Ablate the `child == root` comparison (never refuse) and the first row
+    fails."""
+    in_force = (
+        str(tmp_path / "pinned") if root == "pinned" else str(runs.mux_registry_root(tmp_path))
+    )
+    _write_honour_flag(tmp_path, flag_now)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(in_force))
+
+    assert (refusal is not None) is drift
+    if drift:
+        assert "restart the TUI" in refusal and in_force in refusal
+
+
+def test_registry_drift_names_an_unreadable_policy(monkeypatch, tmp_path):
+    """A policy.toml that cannot be read is not a switch turned off: the child
+    falls back to off as well, so the launch is still refused, but the refusal
+    names the real cause rather than claiming the switch changed — and a
+    restart would not help, fixing the policy would.
+
+    Ablate the fault arm and the refusal says the switch changed."""
+    from bmad_loop import policy as policy_mod
+
+    pinned = str(tmp_path / "pinned")
+    path = tmp_path / policy_mod.POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[mux\nhonor_ambient_psmux_data_dir = true\n", encoding="utf-8")
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(pinned))
+
+    assert refusal is not None
+    assert refusal.startswith("policy.toml could not be read (")
+    assert "fix the policy, then launch" in refusal and pinned in refusal
+    assert "changed since this TUI started" not in refusal
+
+
+def test_registry_drift_refuses_after_the_switch_was_turned_on(monkeypatch, tmp_path):
+    """The switch turned ON under a TUI that overrode the operator's root R:
+    its children inherit the derived root and stay there, while every shell
+    carrying R would now honour it — runs started from the two places would land
+    in two registries. The TUI cannot follow without a restart, so it refuses.
+
+    Ablate the flip-ON arm in `_registry_drift` and this returns None."""
+    from bmad_loop.adapters import psmux_backend
+
+    derived = str(runs.mux_registry_root(tmp_path))
+    theirs = str(tmp_path / "their-own-registry")
+    _write_honour_flag(tmp_path, True)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", theirs)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(derived))
+
+    assert refusal is not None
+    assert refusal.startswith("[mux] honor_ambient_psmux_data_dir was turned on")
+    assert derived in refusal and theirs in refusal and "restart the TUI" in refusal
+
+
+@pytest.mark.parametrize("displaced", ["none", "unhonourable"])
+def test_registry_drift_has_nothing_to_refuse_without_an_honourable_displaced_root(
+    monkeypatch, tmp_path, displaced
+):
+    """The control: a TUI started without R in its environment displaced nothing
+    and cannot know R, and a displaced value the rule would not honour anyway (a
+    derived-registry shape) leaves every shell on the derived root too.
+
+    Ablate the `resolve_psmux_registry_root(...) == displaced` condition and the
+    second row refuses."""
+    from bmad_loop.adapters import psmux_backend
+
+    derived = runs.mux_registry_root(tmp_path)
+    if displaced == "unhonourable":
+        other = tmp_path / "elsewhere" / derived.parent.name / derived.name
+        monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(other))
+    _write_honour_flag(tmp_path, True)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    assert launch._registry_drift(tmp_path, _HonouredRegistry(str(derived))) is None
+
+
+class _ParkingRegistry(_HonouredRegistry):
+    """A namespacing (or not) backend that records the argv each parked window
+    would run."""
+
+    def __init__(self, root, *, namespaced=True):
+        super().__init__(root)
+        self._namespaced = namespaced
+        self.argvs: list[list[str]] = []
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+    def new_parked_window(self, session, name, cwd, argv, return_opt):
+        self.argvs.append(list(argv))
+        return "@7"
+
+    def set_window_option(self, window, option, value):
+        pass
+
+
+def _park(monkeypatch, tmp_path, mux) -> list[str]:
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
+    monkeypatch.setattr(launch, "_ensure_ctl_session", lambda _p: "ctl")
+    launch.start_detached(tmp_path, ["resume", "--project", str(tmp_path)], "RID", "resume")
+    (argv,) = mux.argvs
+    return argv
+
+
+def test_start_detached_forwards_the_displaced_registry(monkeypatch, tmp_path):
+    """The child inherits the derived root and so displaces nothing; without
+    the launcher's record a TUI-launched resume or cleanup never sweeps the
+    operator's pre-#537 registry. Forwarded top-level, ahead of the subcommand.
+
+    Ablate the forwarding in `start_detached` and the option is absent."""
+    from bmad_loop.adapters import psmux_backend
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", theirs)
+
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+
+    assert argv == launch.cli_argv(
+        f"--displaced-registry-root={theirs}", "resume", "--project", str(tmp_path)
+    )
+
+
+@pytest.mark.parametrize("case", ["nothing-displaced", "namespace-less", "displaced-in-force"])
+def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path, case):
+    """Nothing to forward — nothing displaced, a transport with no registry, or
+    a displaced root that is the one in force — leaves the argv byte-identical
+    to the one before the option existed.
+
+    Ablate the `has_registry_namespace()` gate and the second row forwards."""
+    from bmad_loop.adapters import psmux_backend
+
+    in_force = str(tmp_path / "derived")
+    if case != "nothing-displaced":
+        displaced = in_force if case == "displaced-in-force" else str(tmp_path / "theirs")
+        monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", displaced)
+    mux = _ParkingRegistry(in_force, namespaced=case != "namespace-less")
+
+    argv = _park(monkeypatch, tmp_path, mux)
+
+    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+
+
+def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path):
+    """A share root with whitespace keeps its trailing separator through
+    normalisation, and that is the shape Windows PowerShell older than 7.3
+    corrupts in a parked window's argv (ADR 0001 §6). Not forwarding it is the
+    behaviour before the option existed; forwarding it would name a registry
+    nobody used. The positive control — the same share one level down — is
+    forwarded, so the skip is the shape and not the share.
+
+    `isabs` is answered for these two literals so the win32 shape runs on POSIX
+    too. Ablate the skip and the first launch forwards."""
+    from bmad_loop.adapters import psmux_backend
+
+    share_root = r"\\srv\my share" + "\\"
+    below = r"\\srv\my share\registry"
+    real_isabs = os.path.isabs
+    monkeypatch.setattr(os.path, "isabs", lambda p: p in (share_root, below) or real_isabs(p))
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", share_root)
+
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", below)
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+    assert argv[3] == f"--displaced-registry-root={below}"
+
+
+def test_registry_drift_is_not_asked_of_an_unconfigured_process(monkeypatch, tmp_path):
+    """Nothing to disagree with when this process never settled a registry for
+    the project (library or test use): the live psmux tests drive launches
+    under an isolated root without a CLI entry.
+
+    Ablate the `settled_project()` precondition and this refuses."""
+    _write_honour_flag(tmp_path, False)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+
+    assert launch._registry_drift(tmp_path, _HonouredRegistry(str(tmp_path / "pinned"))) is None
+
+
+def test_start_detached_refuses_a_launch_into_a_registry_it_does_not_watch(monkeypatch, tmp_path):
+    """The refusal sits at the one mutation every TUI launch converges on, ahead
+    of the control-session mint, and reaches the operator as a LaunchError.
+
+    Ablate the `_registry_drift` call in `start_detached` and the ctl session is
+    minted."""
+    minted: list[Path] = []
+    _write_honour_flag(tmp_path, False)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(
+        launch, "get_multiplexer", lambda: _HonouredRegistry(str(tmp_path / "pinned"))
+    )
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
+    monkeypatch.setattr(launch, "_ensure_ctl_session", lambda p: minted.append(p) or "ctl")
+
+    with pytest.raises(launch.LaunchError, match="restart the TUI"):
+        launch.start_detached(tmp_path, ["run"], "20260611-100000-aaaa", "run")
+    assert minted == []
 
 
 def test_run_captured_merges_streams(monkeypatch):

@@ -573,7 +573,7 @@ class BmadLoopApp(App[None]):
         if not ok or lookup is None:
             return
         win_id, unproven = lookup
-        ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
+        ok, agent_live = self._mux_guarded(lambda: launch.agent_session_exists(session))
         if not ok:
             return
         # A sweep blocked on a decision prompt has no agent session — the
@@ -603,6 +603,17 @@ class BmadLoopApp(App[None]):
         else:
             if unproven:
                 return  # the warning above already said why
+            # Textual captures stderr, so agent_session_exists' warning about a
+            # same-named session of another project's never reaches the screen.
+            ok, refusal = self._mux_guarded(lambda: runs.foreign_session_refusal(session))
+            if not ok:
+                return
+            if refusal is not None:
+                # markup=False: the refusal carries a registry path.
+                self.notify(
+                    f"not attaching: {refusal}", severity="warning", timeout=10, markup=False
+                )
+                return
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
                 f"{launch.ctl_session(self.project)} window for this run (runs started outside "
@@ -1601,6 +1612,15 @@ class BmadLoopApp(App[None]):
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
             return
+        # A backstop kill the shared-registry ownership gate refused leaves the
+        # session standing and warns on stderr, which Textual swallows.
+        for refusal in runs.drain_refused_kills():
+            self.call_from_thread(
+                self.notify,
+                f"session not removed: {refusal}",
+                severity="warning",
+                markup=False,
+            )
         try:
             left = launch.kill_ctl_window(self.project, run_id)
         except (OSError, MultiplexerError, UnicodeError) as e:
@@ -1863,6 +1883,15 @@ class BmadLoopApp(App[None]):
             # window(s)" toast reads as a successful window sweep.
             self.call_from_thread(self.notify, f"ctl window prune failed: {e}", severity="error")
             windows, survived, unverifiable = [], [], []
+        # A kill the shared-registry ownership gate refused is left out of the
+        # count below and warned on stderr, which Textual swallows: say it here.
+        for refusal in runs.drain_refused_kills():
+            self.call_from_thread(
+                self.notify,
+                f"session not removed: {refusal}",
+                severity="warning",
+                markup=False,
+            )
         if unknown:
             self.call_from_thread(
                 self.notify,

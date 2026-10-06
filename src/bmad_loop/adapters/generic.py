@@ -803,14 +803,60 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------- multiplexer
 
     def _ensure_session(self, cwd: Path) -> None:
-        if not self.mux.has_session(self.session_name):
+        if self.mux.has_session(self.session_name):
+            # Reusing it is right for this run's own session (a resume), and
+            # wrong for a same-named one of another project's in a shared
+            # registry (#729): every window would open inside it, under its tag.
+            refusal = runs.foreign_session_refusal(
+                self.session_name, self.mux, self.run_dir.parents[2]
+            )
+            if refusal is not None:
+                raise MultiplexerError(
+                    f"refusing to launch into the existing session {self.session_name}: "
+                    f"{refusal} — stop or rename that run, or turn off "
+                    "[mux] honor_ambient_psmux_data_dir"
+                )
+        else:
             self.mux.new_session(self.session_name, cwd, PANE_COLUMNS, PANE_LINES)
             # Tag the session with its project so a cleanup in another project
             # never prunes this run (run_dir = <project>/.bmad-loop/runs/<id>).
             project = self.run_dir.parents[2]
-            self.mux.set_session_option(
-                self.session_name, runs.PROJECT_OPTION, runs.project_tag(project)
-            )
+            try:
+                self.mux.set_session_option(
+                    self.session_name, runs.PROJECT_OPTION, runs.project_tag(project)
+                )
+            except Exception as tag_fault:
+                # Left standing, the untagged session would block this run id
+                # for good in a shared registry (#729): the ownership gate reads
+                # it as foreign, and the kill and cleanup paths refuse it. It is
+                # the one this call just minted, so tear it down by that exact
+                # name — straight through the backend, since the gate would
+                # refuse an untagged session by construction — and re-raise.
+                # The backend kill is best-effort and silent by contract, so
+                # whether it landed is read back rather than assumed.
+                listing_faults: list[str] = []
+                try:
+                    self.mux.kill_session(self.session_name)
+                    key = self.mux.session_name_key(self.session_name)
+                    survived = any(
+                        self.mux.session_name_key(n) == key
+                        for n in self.mux.list_sessions_reporting(on_fault=listing_faults.append)
+                    )
+                except Exception as kill_fault:
+                    listing_faults.append(str(kill_fault))
+                    survived = True
+                if survived or listing_faults:
+                    why = (
+                        f"could not be confirmed gone ({listing_faults[0]})"
+                        if listing_faults
+                        else "is still there after tearing it down"
+                    )
+                    raise MultiplexerError(
+                        f"tagging the new session {self.session_name} failed ({tag_fault}), "
+                        f"and the untagged session {why} — remove it by hand before "
+                        "resuming this run"
+                    ) from tag_fault
+                raise
 
     def interactive_argv(self, spec: SessionSpec) -> list[str]:
         extra = self.extra_args
@@ -2275,13 +2321,19 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # Both fail closed at the affected scope without letting an unrelated bad
         # Markdown file suppress a newly created, readable story spec.
         #
-        # The heaviest of the four stores, and the reason the eviction seam exists:
+        # The heaviest of the five stores, and the reason the eviction seam exists:
         # an unpinned launch captures one entry per `*.md` in the artifacts dir, so
         # retaining a snapshot per session would grow O(sessions x files) for the
-        # adapter's lifetime (DW-96) where the three stores above grow O(sessions).
-        # All four are evicted the same way, by `_evict_task_state` from `run()`'s
+        # adapter's lifetime (DW-96) where the other four stores grow O(sessions).
+        # All five are evicted the same way, by `_evict_task_state` from `run()`'s
         # `finally`; the bound is in-flight scope, not a cap or an LRU.
         self._launch_auto_run_results: dict[str, dict[str, tuple[int, str] | None] | None] = {}
+        # Last resultless-stop crumb per session (#780): task_id -> (verdict,
+        # detail), overwritten by every `_note_resultless_stop` so it always holds
+        # the latest. Read once, by `run()` folding it onto a non-completed result
+        # before its `finally` evicts it (`_evict_task_state`); same lifetime
+        # doctrine as the stores above.
+        self._last_resultless: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _marker_path_key(path: Path) -> str:
@@ -2332,14 +2384,29 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # base that could alter method resolution.
         return cast(_SessionHost, super()).start_session(spec)
 
+    def _note_resultless_stop(self, task_id: str, verdict: str, detail: str = "") -> None:
+        super()._note_resultless_stop(task_id, verdict, detail)
+        self._last_resultless[task_id] = (verdict, detail)
+
     def run(self, spec: SessionSpec) -> SessionResult:
         try:
-            return cast(_SessionHost, super()).run(spec)
+            result = cast(_SessionHost, super()).run(spec)
+            # Surface why the read-back came up empty (#780) on the result the
+            # engine journals; the crumb file alone has no reader. Here, after
+            # `_post_kill_reconcile`, a rescued result is already `completed` and
+            # stays unannotated. Diagnostic only — the status is untouched.
+            last = self._last_resultless.get(spec.task_id)
+            if result.status != "completed" and last is not None:
+                verdict, detail = last
+                return dataclasses.replace(
+                    result, resultless_verdict=verdict, resultless_detail=detail
+                )
+            return result
         finally:
             self._evict_task_state(spec.task_id)
 
     def _evict_task_state(self, task_id: str) -> None:
-        """Retention bound for the four per-task stores named below (DW-96,
+        """Retention bound for the five per-task stores named below (DW-96,
         DW-106, DW-107). One documented eviction site rather than a pop scattered
         per store; hosts owning a store this mixin cannot reach (OpencodeDev-
         Adapter's `_server_procs`) override this and delegate up.
@@ -2375,6 +2442,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
         self._fm_fallback_obs.pop(task_id, None)
         self._fm_transition_obs.pop(task_id, None)
         self._contract_nudge_sent.discard(task_id)
+        self._last_resultless.pop(task_id, None)
 
     def _park_marker_session_authored(self, spec_path: Path, spec: SessionSpec) -> bool:
         """Whether the live marker differs from this session's launch marker."""
@@ -2664,6 +2732,33 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return _SnapVerdict.REFUSE
         return _SnapVerdict.NEUTRAL
 
+    @staticmethod
+    def _nested_spec_hint(search_dirs: list[Path], *, since_ns: int) -> str:
+        """The unpinned ``no-artifact`` crumb's #780 suffix: name specs one level
+        below a searched dir that would have qualified directly in it (a
+        ``stories/`` layout rides to timeout otherwise, with nothing saying why).
+        Diagnosis only — the paths are named, never read back as a result. A probe
+        fault is reported as such rather than read as "nothing nested". Returns ""
+        when there is nothing to say."""
+        hits: list[Path] = []
+        faults: list[str] = []
+        for d in dict.fromkeys(search_dirs):
+            found, fault = devcontract.find_nested_result_hints(d, since_ns=since_ns)
+            hits += [p for p in found if p not in hits]
+            if fault is not None:
+                faults.append(fault)
+        hint = ""
+        if hits:
+            hint += (
+                "; qualifying spec(s) found in subdirectories, which are never read back: "
+                + ", ".join(str(p) for p in hits)
+                + " — move the spec directly under the artifacts dir, or use stories"
+                " mode ([stories] source) for a stories/ layout"
+            )
+        if faults:
+            hint += "; subdirectory probe failed: " + "; ".join(faults)
+        return hint
+
     def _frontmatter_fallback(
         self,
         handle: SessionHandle,
@@ -2772,7 +2867,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
                 self._note_resultless_stop(
                     task_id,
                     "no-artifact",
-                    "no result artifact newer than session launch under: " + where,
+                    (
+                        f"no result artifact newer than session launch at: {where}"
+                        if only is not None
+                        else "no result artifact newer than session launch directly under: "
+                        + where
+                        + " (subdirectories are not searched)"
+                        + self._nested_spec_hint(search_dirs, since_ns=handle.launched_ns)
+                    ),
                 )
             return None
         if len(candidates) > 1:
@@ -2971,6 +3073,13 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # read FAULT (DW-457) — `stat-failed` / `unreadable-spec`, never filed
             # as the genuine `stale-mtime` / `not-terminal` answers it used to be.
             verdict, detail = state.kind, str(state.path or base)
+            if state.kind == stories.KIND_PENDING:
+                # Name the glob and its flatness (#780): a spec one folder deeper
+                # is never resolved, and a bare dir left that unsaid.
+                detail = (
+                    f"no {story_key}-*.md directly under {base / stories.STORIES_SUBDIR}"
+                    " (subdirectories are not searched)"
+                )
             fault: tuple[Path, str] | None = None
             if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
                 try:

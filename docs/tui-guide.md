@@ -331,7 +331,9 @@ One row per story (or sweep bundle/triage task) in the selected run:
   read fault, with the error),
   `ambiguous-frontmatter`, `unmodified-since-launch` — the spec's bytes were
   unchanged since review launch, so it is a prior `done` re-opened, not this
-  session's output (#276) — or `terminal-frontmatter-pending`).
+  session's output (#276) — or `terminal-frontmatter-pending`). A dev session
+  that ends non-completed also shows the last of these on its `session-end`
+  journal entry, as `resultless_verdict` / `resultless_detail` (#780).
 - **Log** — the active agent session's pane output (`logs/<task-id>.log`),
   ANSI colors preserved, starting with a dim `— <task-id>.log —` header. The
   active task is the last `session-start` without a matching `session-end`

@@ -95,6 +95,7 @@ from .runs import (
     clear_graceful_stop,
     consume_stop_request,
     deferred_stash_path,
+    drain_refused_kills,
     events_dir_for,
     graceful_stop_requested,
     kill_session,
@@ -1096,6 +1097,24 @@ class Engine:
             None,
         )
 
+    def _kill_run_session(self) -> None:
+        """Tear down this run's agent session, journaling a kill the
+        ownership gate refused (`runs.foreign_session_refusal`).
+
+        `kill_session` reports a refusal on stderr and in a queue only the TUI
+        drains, so an unattended run would otherwise leave no durable trace of
+        it — and a degrade must be visible (AGENTS.md: journal it). It matters
+        beyond a foreign session: the gate fails closed when the shared registry
+        cannot be listed, so a transient listing fault leaves this run's own
+        agent window live. One `session-kill-refused` entry per drained reason;
+        a refusal with none queued is the control-session alias arm.
+
+        `is False`, not falsy: only a refusal answers ``False``."""
+        if kill_session(self.state.run_id) is False:
+            refusals = drain_refused_kills() or ["run id aliases a control session"]
+            for refusal in refusals:
+                self.journal.append("session-kill-refused", detail=refusal)
+
     def _run_inner(self) -> RunSummary:
         self._install_stop_signals()
         try:
@@ -1158,7 +1177,7 @@ class Engine:
                 # _owns_signals); stop already kills it, and pause/interrupt
                 # leave it for resume to reuse.
                 if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
-                    kill_session(self.state.run_id)
+                    self._kill_run_session()
             except RunPaused as pause:
                 self.state.paused_reason = pause.reason
                 self.state.paused_stage = pause.stage
@@ -1196,13 +1215,13 @@ class Engine:
                     # a gracefully stopped child sweep is a clean completion from the
                     # parent's perspective (the parent journals sweep-auto-finished).
                     if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
-                        kill_session(self.state.run_id)
+                        self._kill_run_session()
                 else:
                     # Hard stop: the loop was interrupted inside adapter.run() (a
                     # signal), or unwound on either side of it because a hard stop
                     # request was honored — so the agent window may still be live.
                     # Tear the whole run session down.
-                    kill_session(self.state.run_id)
+                    self._kill_run_session()
                     if self._is_nested:
                         raise  # nested auto-sweep: let the owner record the stop
                     self.state.stopped = True
@@ -1229,7 +1248,7 @@ class Engine:
                 # engine disappear with stale state.
                 self._stopping = True  # swallow stop signals landing mid-teardown
                 try:
-                    kill_session(self.state.run_id)
+                    self._kill_run_session()
                 except (
                     BaseException
                 ):  # nosec B110 - best-effort teardown; the stop must still record
@@ -1255,7 +1274,7 @@ class Engine:
                 except OSError:
                     pass
                 try:
-                    kill_session(self.state.run_id)
+                    self._kill_run_session()
                 except (
                     Exception
                 ):  # nosec B110 - best-effort teardown; a crashing run must still record
@@ -7852,6 +7871,14 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
+        # empty read-back diagnosis (#780): same present-only convention. The
+        # last resultless-stop verdict lands here because nothing reads the
+        # crumb file, so a spec nested out of the read-back's reach timed out
+        # with no visible reason.
+        if result.resultless_verdict:
+            extras["resultless_verdict"] = result.resultless_verdict
+        if result.resultless_detail:
+            extras["resultless_detail"] = result.resultless_detail
         return extras
 
     @staticmethod

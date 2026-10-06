@@ -157,6 +157,215 @@ def test_ensure_session_tags_project(tmp_path, monkeypatch, force_tmux_backend):
     ]
 
 
+class _SharedRegistryMux:
+    """A shared (honoured, #729) registry already holding `name`, tagged `tag`."""
+
+    def __init__(self, name, tag):
+        self._name, self._tag = name, tag
+        self.created: list[str] = []
+        self.killed: list[str] = []
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return "/shared-registry"
+
+    def session_name_key(self, name):
+        return name
+
+    def has_session(self, name):
+        return name == self._name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return [self._name]
+
+    def session_options(self, _option):
+        return {self._name: self._tag} if self._tag else {}
+
+    def new_session(self, name, *_args):
+        self.created.append(name)
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+@pytest.mark.parametrize("tag", ["0123456789abcdef", ""], ids=["foreign", "untagged"])
+def test_ensure_session_refuses_to_adopt_another_projects_session(tmp_path, tag):
+    """In a registry shared with another project, an existing same-named
+    session may be that project's: adopting it would open this run's windows
+    inside it, under its tag. The launch fails with a clear error instead.
+
+    Ablate the gate in `_ensure_session` and it returns as if the session were
+    this run's own."""
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "RID"  # parents[2] == project
+    mux = _SharedRegistryMux("bmad-loop-RID", tag)
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir,
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+    with pytest.raises(MultiplexerError, match="refusing to launch into the existing session"):
+        adapter._ensure_session(tmp_path)
+    assert mux.created == []
+    assert mux.killed == []  # a session it FOUND is never torn down
+
+
+class _TagFailingMux:
+    """No session exists yet; minting one works, tagging it raises. Records the
+    session lifecycle so a teardown is observable, and models the backend kill
+    as what it is by contract: best-effort, so it can fail silently (`stuck`),
+    raise (`kill_fault`), or leave a registry that cannot be read back
+    (`list_fault`)."""
+
+    def __init__(self, *, kill_fault=None, stuck=False, list_fault=None):
+        self.sessions: list[str] = []
+        self.created: list[str] = []
+        self.killed: list[str] = []
+        self.tag_fault = MultiplexerError("set-option failed: transient")
+        self._kill_fault = kill_fault
+        self._stuck = stuck
+        self._list_fault = list_fault
+
+    def has_session(self, name):
+        return name in self.sessions
+
+    def session_name_key(self, name):
+        return name
+
+    def new_session(self, name, *_args):
+        self.created.append(name)
+        self.sessions.append(name)
+
+    def set_session_option(self, name, option, value):
+        raise self.tag_fault
+
+    def kill_session(self, name):
+        self.killed.append(name)
+        if self._kill_fault is not None:
+            raise self._kill_fault
+        if not self._stuck:
+            self.sessions.remove(name)
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        if self._list_fault is not None:
+            assert on_fault is not None
+            on_fault(self._list_fault)
+            return []
+        return list(self.sessions)
+
+
+def _tag_failing_adapter(tmp_path, mux):
+    return GenericTmuxAdapter(
+        run_dir=tmp_path / ".bmad-loop" / "runs" / "RID",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+
+def test_ensure_session_tears_down_a_session_it_could_not_tag(tmp_path):
+    """Left standing, an untagged session blocks its run id for good in a shared
+    registry (#729): the ownership gate reads it as foreign and the kill and
+    cleanup paths refuse it. The session this call just minted is torn down by
+    that exact name, confirmed gone, and the ORIGINAL error propagates.
+
+    Ablate the teardown and `mux.killed` is empty."""
+    mux = _TagFailingMux()
+    adapter = _tag_failing_adapter(tmp_path, mux)
+
+    with pytest.raises(MultiplexerError) as caught:
+        adapter._ensure_session(tmp_path)
+
+    assert caught.value is mux.tag_fault
+    assert mux.created == mux.killed == ["bmad-loop-RID"]
+    assert mux.sessions == []
+
+
+@pytest.mark.parametrize(
+    ("teardown", "said"),
+    [
+        ("raises", "could not be confirmed gone (kill-session failed: gone wrong)"),
+        ("silent", "is still there after tearing it down"),
+        ("unlistable", "could not be confirmed gone (list-sessions failed: rc 1)"),
+    ],
+)
+def test_ensure_session_says_so_when_the_teardown_did_not_land(tmp_path, teardown, said):
+    """The backend kill is best-effort and silent by contract, so a teardown is
+    read back, not assumed: a kill that raised, one that silently left the
+    session, and a registry that cannot be listed each raise one error naming
+    the tag fault and the leftover, chained from the tag fault.
+
+    Ablate the read-back (trust the kill) and the `silent` and `unlistable` rows
+    re-raise the bare tag fault instead."""
+    kill_fault = MultiplexerError("kill-session failed: gone wrong")
+    mux = _TagFailingMux(
+        kill_fault=kill_fault if teardown == "raises" else None,
+        stuck=teardown == "silent",
+        list_fault="list-sessions failed: rc 1" if teardown == "unlistable" else None,
+    )
+    adapter = _tag_failing_adapter(tmp_path, mux)
+
+    with pytest.raises(MultiplexerError) as caught:
+        adapter._ensure_session(tmp_path)
+
+    assert caught.value is not mux.tag_fault
+    assert caught.value.__cause__ is mux.tag_fault
+    assert said in str(caught.value)
+    assert "transient" in str(caught.value) and "remove it by hand" in str(caught.value)
+
+
+def test_ensure_session_reports_a_silent_teardown_failure_on_the_real_backend(
+    tmp_path, monkeypatch, force_tmux_backend
+):
+    """The bundled backend, not a double: `set-option` fails, `kill-session` fails
+    silently (the seam's `check=False`), and the listing still names the session.
+    The operator is told it is still there.
+
+    Ablate the read-back and the bare tag fault surfaces instead."""
+    project = tmp_path
+    run_dir = project / ".bmad-loop" / "runs" / "RID"
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir, policy=Policy(limits=LimitsPolicy()), profile=get_profile("claude")
+    )
+    name = adapter.session_name
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _b: "/usr/bin/tmux")
+
+    def fake_run(argv, **kwargs):
+        verb = argv[1]
+        if verb == "has-session":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        if verb in ("set-option", "kill-session"):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="server busy")
+        if verb == "list-sessions":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{name}\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+
+    with pytest.raises(MultiplexerError, match="is still there after tearing it down") as caught:
+        adapter._ensure_session(project)
+    assert isinstance(caught.value.__cause__, MultiplexerError)
+
+
+def test_ensure_session_reuses_its_own_session_in_a_shared_registry(tmp_path):
+    """The other half: this run's own tagged session (a resume) is reused."""
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "RID"
+    mux = _SharedRegistryMux("bmad-loop-RID", runs.project_tag(tmp_path))
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir,
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+    adapter._ensure_session(tmp_path)
+    assert mux.created == []
+    assert mux.killed == []  # a session it FOUND is never torn down
+
+
 def make_spec(tmp_path, task_id="1-1-a-dev-1", timeout_s=30.0, model="sonnet") -> SessionSpec:
     return SessionSpec(
         task_id=task_id,
@@ -727,6 +936,10 @@ class _UnitMux:
     def has_session(self, name):
         return True
 
+    def has_registry_namespace(self):
+        # tmux-shaped: the shared-registry ownership gate (#729) stays out.
+        return False
+
     def send_text(self, window_id, text):
         # The contract/stall nudges reach the mux too; recording them keeps that
         # off the host binary as well, which is the same promise as has_session.
@@ -1230,12 +1443,128 @@ def test_resultless_stop_breadcrumb_scan_no_artifact(tmp_path, monkeypatch):
     assert str(impl) in crumb["detail"]  # names the searched dirs
 
 
+def test_resultless_stop_breadcrumb_explains_non_recursive_artifact_scan(tmp_path, monkeypatch):
+    """A nested result is outside the legacy scan, so the breadcrumb must say so."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+        encoding="utf-8",
+    )
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(impl) in crumb["detail"]
+    assert "subdirectories are not searched" in crumb["detail"]
+    # The nested file itself is named (#780) — the clause above is unconditional on
+    # every unpinned no-artifact, so only this line proves the fixture matters.
+    assert str(nested / "spec-3-1-foo.md") in crumb["detail"]
+    assert "never read back" in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_names_nested_frontmatter_candidate(tmp_path, monkeypatch):
+    """A marker-less nested spec finalized to a terminal frontmatter would have been
+    a #224 candidate directly under the dir, so it is named too."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text("---\nstatus: done\n---\n\n# Story\n", encoding="utf-8")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(nested / "spec-3-1-foo.md") in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_ignores_stale_nested_spec(tmp_path, monkeypatch):
+    """The nested probe keeps the launch floor: a spec older than the session is a
+    prior run's artifact, not a hint about this one."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    stale = nested / "spec-3-1-foo.md"
+    stale.write_text(_DONE_SPEC, encoding="utf-8")
+    launched = stale.stat().st_mtime_ns + 1_000
+    os.utime(stale, ns=(launched - 1_000, launched - 1_000))
+
+    assert adapter._result_json(_dev_handle(launched), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "subdirectories are not searched" in crumb["detail"]
+    assert str(stale) not in crumb["detail"]
+    assert "never read back" not in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_does_not_follow_symlinked_subdir(tmp_path, monkeypatch):
+    """A linked folder is not one level down — it may point anywhere — so the probe
+    leaves it alone, like every other artifact walk."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "spec-3-1-foo.md" not in crumb["detail"]
+
+
+def test_resultless_stop_breadcrumb_reports_nested_probe_fault(tmp_path, monkeypatch):
+    """A probe that could not list the dir says so instead of reading as "nothing
+    nested"."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.devcontract,
+        "find_nested_result_hints",
+        lambda d, *, since_ns: ([], "PermissionError: denied"),
+    )
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert "subdirectory probe failed: PermissionError: denied" in crumb["detail"]
+
+
+def test_nested_result_never_harvested(tmp_path, monkeypatch):
+    """HARD CONSTRAINT (#780): a nested hit is named, never read back as a result —
+    not on a Stop, not on the crash path."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=False) is None
+    assert _breadcrumbs(adapter) == []  # wait=False never probes nor crumbs
+    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
+
+
 def test_resultless_stop_breadcrumb_stories_pending(tmp_path, monkeypatch):
     adapter, _ = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True) is None
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "pending"
+    stories_dir = tmp_path / "epic" / "stories"
+    assert crumb["detail"] == (
+        f"no 1-*.md directly under {stories_dir} (subdirectories are not searched)"
+    )
 
 
 def test_resultless_stop_breadcrumb_stories_ambiguous(tmp_path):
@@ -4605,6 +4934,10 @@ class _StartSessionMux:
         # window that died under a session that is still very much there.
         return True
 
+    def has_registry_namespace(self):
+        # tmux-shaped: the shared-registry ownership gate (#729) stays out.
+        return False
+
 
 @pytest.mark.parametrize(
     "task_id_kind", ["absolute", "parent-traversal", "empty", "windows-reserved"]
@@ -7586,7 +7919,7 @@ def test_run_evicts_only_the_returning_task_ids_sibling_stores(tmp_path, monkeyp
 def test_eviction_is_a_noop_when_start_session_raised_pre_capture(tmp_path, monkeypatch):
     """Eviction must never manufacture an exception. `start_session` runs INSIDE the
     `try` the mixin's `finally` guards, so a launch that dies before anything was
-    recorded still reaches `_evict_task_state` with four empty stores — and the
+    recorded still reaches `_evict_task_state` with five empty stores — and the
     operator must see the transport fault, not a `KeyError` raised while cleaning
     up after it. This is why the seam uses `pop(..., None)` / `discard`, never
     `del` / `remove`: `del` on an absent key would REPLACE the real exception."""
@@ -7609,6 +7942,143 @@ def test_eviction_is_a_noop_when_start_session_raised_pre_capture(tmp_path, monk
     assert adapter._fm_fallback_obs == {}
     assert adapter._fm_transition_obs == {}
     assert adapter._contract_nudge_sent == set()
+    assert adapter._last_resultless == {}
+
+
+# ------------------------------ last resultless verdict on the result (#780)
+#
+# A spec nested under `impl/stories/` is outside the flat unpinned read-back, so
+# every Stop crumbs `no-artifact` into resultless-stops.jsonl and the session rides
+# to timeout. Nothing reads that file, so the mixin's `run()` folds the LAST crumb
+# onto a non-completed result for the engine's `session-end` entry. Ablations:
+# deleting the fold fails the timeout row; dropping the `status != "completed"`
+# gate fails the two completed rows; dropping the pop from `_evict_task_state`
+# fails the eviction rows.
+
+
+def _stub_dev_lifecycle(adapter, monkeypatch, wait):
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → the post-kill rescue runs
+
+
+def test_run_timeout_carries_last_resultless_verdict(tmp_path, monkeypatch):
+    """The #780 shape end to end through `run()`: a qualifying spec one directory
+    down, a real Stop read-back that crumbs `no-artifact`, a timeout the post-kill
+    rescue cannot upgrade (the scan stays flat). The LAST crumb rides the result,
+    overwriting an earlier one from the same session."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+
+    def wait(handle, running_spec):
+        adapter._note_resultless_stop(running_spec.task_id, "pending", "an earlier Stop")
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        return _unvouched("timeout")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert result.status == "timeout"
+    assert result.result_json is None  # diagnosed, never harvested
+    assert result.resultless_verdict == "no-artifact"
+    assert result.resultless_detail is not None
+    assert str(impl) in result.resultless_detail
+    assert "subdirectories are not searched" in result.resultless_detail
+    assert _breadcrumbs(adapter)[-1]["detail"] == result.resultless_detail
+
+
+def test_run_completed_carries_no_resultless_verdict(tmp_path, monkeypatch):
+    """Present-only: a session that completes after an earlier empty Stop leaves
+    both fields None — the crumb explained a Stop, not the session's outcome."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        return SessionResult(
+            status="completed",
+            result_json={"status": "done"},
+            session_id="sess",
+            transcript_path="/t.jsonl",
+        )
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert len(_breadcrumbs(adapter)) == 1  # the earlier crumb really was written
+    assert result.status == "completed"
+    assert result.resultless_verdict is None
+    assert result.resultless_detail is None
+
+
+def test_run_rescued_result_carries_no_resultless_verdict(tmp_path, monkeypatch):
+    """The fold sits after `_post_kill_reconcile`, so a stall the rescue upgrades to
+    `completed` is never annotated with the Stop-time crumb it outgrew."""
+    adapter, impl = make_dev_adapter(tmp_path)
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)  # written after that Stop
+        return _unvouched("stalled", stop_seen=True)
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+
+    result = adapter.run(_dev_spec(tmp_path))
+
+    assert len(_breadcrumbs(adapter)) == 1
+    assert result.status == "completed"
+    assert result.result_json is not None
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.resultless_verdict is None
+    assert result.resultless_detail is None
+
+
+def test_last_resultless_evicted_after_run(tmp_path, monkeypatch):
+    """Same retention bound as the sibling stores: present during the session
+    (non-vacuous), gone once `run()` returns, scoped to the returning task id."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    adapter._note_resultless_stop("3-2-dev-1", "no-artifact", "another session in flight")
+    seen = {}
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        seen["present"] = running_spec.task_id in adapter._last_resultless
+        return _unvouched("timeout")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, wait)
+    spec = _dev_spec(tmp_path)
+
+    adapter.run(spec)
+
+    assert seen["present"] is True
+    assert spec.task_id not in adapter._last_resultless
+    assert adapter._last_resultless["3-2-dev-1"] == ("no-artifact", "another session in flight")
+
+
+def test_last_resultless_evicted_when_wait_raises(tmp_path, monkeypatch):
+    """A raising `wait_for_completion` skips the fold but not the `finally`; the
+    exception reaches the caller unchanged."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+
+    def raising(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        assert running_spec.task_id in adapter._last_resultless
+        raise RuntimeError("stop requested")
+
+    _stub_dev_lifecycle(adapter, monkeypatch, raising)
+    spec = _dev_spec(tmp_path)
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert spec.task_id not in adapter._last_resultless
 
 
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
@@ -7668,7 +8138,28 @@ def test_expected_spec_breadcrumb_names_the_pinned_path(tmp_path, monkeypatch):
     (crumb,) = _breadcrumbs(adapter)
     assert crumb["verdict"] == "no-artifact"
     assert str(ours) in crumb["detail"]
+    assert "at:" in crumb["detail"]
+    assert "directly under" not in crumb["detail"]
+    assert "subdirectories are not searched" not in crumb["detail"]
     assert "someone-elses" not in crumb["detail"]
+
+
+def test_expected_spec_breadcrumb_never_probes_subdirectories(tmp_path, monkeypatch):
+    """The nested probe (#780) belongs to the unpinned scan only: a pinned spec
+    names the one path owed and never mentions anything one level down."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text("---\nstatus: in-review\n---\n\n# Story\n")
+    nested = impl / "stories"
+    nested.mkdir()
+    (nested / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    assert adapter._result_json(_dev_handle(), _expecting(tmp_path, ours), wait=True) is None
+    (crumb,) = _breadcrumbs(adapter)
+    assert crumb["verdict"] == "no-artifact"
+    assert str(ours) in crumb["detail"]
+    assert str(nested) not in crumb["detail"]
+    assert "never read back" not in crumb["detail"]
 
 
 def test_dev_attempt_one_keeps_the_scan(tmp_path, monkeypatch):

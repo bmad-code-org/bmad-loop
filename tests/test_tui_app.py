@@ -3467,6 +3467,43 @@ async def test_delete_unknown_pid_warns_but_does_not_block(project_tree, monkeyp
         assert "cannot be undone" in app.screen._warning
 
 
+async def test_cleanup_says_which_kills_the_ownership_gate_refused(project, monkeypatch):
+    """A kill refused in a shared registry is left out of the removal count and
+    warned about on stderr, which Textual captures: the worker drains the refusals
+    and toasts each one.
+
+    Rendered (`notifications=True`), because the refusal carries a registry path:
+    with markup on, `[red]` would be eaten as a style tag.
+
+    Ablate the drain loop in `_cleanup_sessions_worker` and no toast names it;
+    drop its `markup=False` and the rendered path loses `[red]`."""
+    from bmad_loop import runs
+
+    def prune(_project):
+        runs._REFUSED_KILLS.append(
+            "bmad-loop-r1 in the shared registry C:\\[red]\\shared is tagged for another project"
+        )
+        return [], [], set()
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", prune)
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "session not removed" in text and "C:\\[red]\\shared" in text
+                for text, _severity in rendered_toasts(app)
+            ),
+        )
+
+
 async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
     # cleanup still prunes 'unknown' sessions (unknown never blocks cleanup) but
     # must say so instead of silently killing a possibly-live engine's session.
@@ -3781,6 +3818,43 @@ async def test_attach_without_agent_session_notifies(project, monkeypatch):
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("a")
         await until(pilot, lambda: any("no live agent session" in m for m in notifications(app)))
+
+
+async def test_attach_to_another_projects_session_says_why(project, monkeypatch):
+    """The session EXISTS, and is another project's: the attach must not land on
+    it, and since Textual captures stderr, `agent_session_exists`' warning never
+    reaches the screen — the handler says it in a toast instead of "no live
+    agent session".
+
+    Ablate the refusal toast in `action_attach` and only the generic message
+    appears; regress the handler to plain `session_exists` and it attaches."""
+    attached: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, run_id: None)
+    monkeypatch.setattr(
+        "bmad_loop.tui.app.runs.foreign_session_refusal",
+        lambda session, *_mux: (
+            f"{session} in the shared registry C:\\[red]\\shared is tagged for another project"
+        ),
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))
+    # notifications=True mounts the toast rack, so what is asserted is what the
+    # operator sees: with markup on, `[red]` would be eaten as a style tag.
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        await until(
+            pilot,
+            lambda: any(
+                "not attaching" in text and "C:\\[red]\\shared" in text
+                for text, _severity in rendered_toasts(app)
+            ),
+        )
+    assert attached == []
 
 
 async def test_attach_multiplexer_error_notifies(project, monkeypatch):
@@ -5869,6 +5943,37 @@ async def test_attach_says_why_an_unproven_ctl_window_is_out_of_reach(project, m
         needle = "cannot attach to the run window"
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
         assert not any("nothing to attach" in m for m in notifications(app))
+
+
+async def test_stop_run_says_when_its_backstop_kill_was_refused(project_tree, monkeypatch):
+    """A hard stop whose backstop kill the shared-registry ownership gate refused
+    leaves the session standing and warns on stderr, which Textual captures: the
+    stop worker drains the refusal and toasts it beside "stopped".
+
+    Ablate the drain loop in `_stop_run_worker` and no toast names it."""
+    from bmad_loop import runs
+
+    def stop(_run_dir):
+        runs._REFUSED_KILLS.append("bmad-loop-x in the shared registry S is untagged")
+        return True
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "stop_run", stop)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda proj, rid: 0)
+    make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("x")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "session not removed" in m and "is untagged" in m for m in notifications(app)
+            ),
+        )
 
 
 @pytest.mark.parametrize("live", ["dead", "unknown"])

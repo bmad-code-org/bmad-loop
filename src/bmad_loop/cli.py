@@ -182,9 +182,10 @@ def _configure_mux(project: Path) -> None:
     keep-diagnostics-working rule as the policy read above.
 
     It also *overrides* an ambient ``PSMUX_DATA_DIR`` rather than honouring it —
-    the root is derived, always, so that two processes given one project cannot
+    the root is derived, so that two processes given one project cannot
     disagree about where its sessions live (the full argument is in that
-    function). Overriding an operator's variable silently is how someone loses an
+    function) — unless policy ``[mux] honor_ambient_psmux_data_dir`` says the
+    operator's value is a persistent pin (#729). Overriding an operator's variable silently is how someone loses an
     hour to `psmux ls` showing nothing, so it is said once, here, at the only
     point that runs ahead of every command. stderr, not stdout: the ``--json``
     contract is one object on stdout and nothing else, and this is the
@@ -193,10 +194,10 @@ def _configure_mux(project: Path) -> None:
 
     path = _policy_path(project)
     try:
-        name = policy_mod.load(path).mux.backend or None
+        mux_policy = policy_mod.load(path).mux
     except (policy_mod.PolicyError, OSError):
-        name = None
-    configure_multiplexer(name, origin=path)
+        mux_policy = policy_mod.MuxPolicy()
+    configure_multiplexer(mux_policy.backend or None, origin=path)
     # Automatic selection probes availability before returning its cached
     # instance. Give that probe the derived root first: psmux's version probe
     # reaches `_run`, which must reject an empty/relative ambient value, and a
@@ -237,8 +238,12 @@ def _configure_mux(project: Path) -> None:
                 os.environ[runs.PSMUX_DATA_DIR] = ambient
     if not namespaced:
         return
-    root = runs.export_psmux_registry_root(project)
+    root = runs.export_psmux_registry_root(
+        project, honor_ambient=mux_policy.honor_ambient_psmux_data_dir
+    )
     if root is not None:
+        # An honoured value is the operator's own stated preference, so it gets
+        # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
             print(
                 f"note: using bmad-loop's own psmux registry {root} — your "
@@ -555,6 +560,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                         f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
                         {"unknown_keys": list(ss.unknown_keys)},
                     )
+                _validate_nested_specs(paths.implementation_artifacts, report)
             except sprintstatus.SprintStatusError as e:
                 report.fail("queue.sprint-status", str(e))
 
@@ -1270,17 +1276,30 @@ def _print_registry(project: Path) -> None:
         derived = str(runs.mux_registry_root(project))
     except (runs.StateRootError, OSError, RuntimeError):
         derived = None
-    # bmad-loop always derives, so a mismatch is not an operator's honoured
-    # export — that is not a thing any more — but the one case the export
-    # degrades on: an underivable state root, where it leaves whatever it found
-    # rather than inventing a root. Saying "derived" there would be a lie about
-    # the one situation an operator most needs told.
-    origin = (
-        "derived from the project"
-        if root == derived
-        else f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
-        "because no state root could be derived here"
-    )
+    # A root other than the derived one is either the operator's value honoured
+    # on their opt-in — asked of the same pure rule the export used — or the one
+    # case the export degrades on: an underivable state root, where it leaves
+    # whatever it found rather than inventing a root. Saying "derived" there
+    # would be a lie about the one situation an operator most needs told.
+    try:
+        honor = policy_mod.load(_policy_path(project)).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError):
+        honor = False
+    if root == derived:
+        origin = "derived from the project"
+    elif derived is not None and (
+        runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor) == root
+    ):
+        origin = (
+            f"your own ${runs.PSMUX_DATA_DIR}, honoured by "
+            "[mux] honor_ambient_psmux_data_dir — the derived root would be "
+            f"{derived}"
+        )
+    else:
+        origin = (
+            f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
+            "because no state root could be derived here"
+        )
     print(f"registry: {root} ({origin})")
     # A single-quoted PowerShell literal, whose only escape is doubling the quote:
     # an unescaped `C:\Users\O'Brien\...` ends the string mid-path and the line
@@ -1858,6 +1877,85 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
             f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
             {"plugins": names},
         )
+
+
+def _nested_spec_files(impl: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Spec-like files ONE level below `impl` (#780): `*.md` in an immediate,
+    non-symlinked subdirectory whose frontmatter carries a non-empty `status:`.
+
+    Sprint mode's dev read-back globs only `impl` itself, so a spec kept in, say,
+    `impl/stories/` is never found and the session rides to timeout. Deliberately
+    broader than the adapter's `devcontract.find_nested_result_hints` (any status,
+    no launch floor): this is a preflight over the layout, not a judgment about one
+    session's result. Returns `(spec_like, unreadable)`: a nested `*.md` whose read
+    raised, or a subdirectory that could not be listed, is returned with its fault
+    rather than dropped, since it may hold the very spec the layout hides. An
+    OSError while listing `impl` itself propagates, so the caller reports the fault
+    instead of an empty answer."""
+    if not impl.is_dir():
+        return [], []
+    found: list[Path] = []
+    unreadable: list[tuple[Path, str]] = []
+    for child in sorted(impl.iterdir()):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        # `Path.glob` swallows a listing fault and yields nothing, so an
+        # unlistable subdirectory would pass as empty: list it explicitly.
+        try:
+            os.listdir(child)
+        except OSError as e:
+            unreadable.append((child, f"{type(e).__name__}: {e}"))
+            continue
+        for path in sorted(child.glob("*.md")):
+            try:
+                fm = frontmatter.read_frontmatter(path)
+            except OSError as e:
+                unreadable.append((path, f"{type(e).__name__}: {e}"))
+                continue
+            if frontmatter.status_of(fm):
+                found.append(path)
+    return found, unreadable
+
+
+def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
+    """Warn on a nested spec layout in sprint mode (#780). Never a failure — nothing
+    here gates a run — and silent when nothing is nested, the same no-`ok`-twin
+    reasoning as `policy.isolation-shared-artifact-dir`. A nested `*.md` that could
+    not be read is its own warning: silence would claim a clean layout the scan
+    never checked."""
+    try:
+        nested, unreadable = _nested_spec_files(impl)
+    except OSError as e:
+        report.warn(
+            "queue.nested-specs",
+            f"could not list subdirectories of {impl}: {type(e).__name__}: {e}",
+            {"path": str(impl), "error": f"{type(e).__name__}: {e}"},
+        )
+        return
+    if unreadable:
+        shown = unreadable[:3]
+        report.warn(
+            "queue.nested-specs",
+            f"could not read {len(unreadable)} path(s) in subdirectories of "
+            f"{impl}, so they were not checked for a nested spec layout (e.g. "
+            f"{'; '.join(f'{p}: {err}' for p, err in shown)})",
+            {
+                "path": str(impl),
+                "count": len(unreadable),
+                "unreadable": [{"path": str(p), "error": err} for p, err in shown],
+            },
+        )
+    if not nested:
+        return
+    examples = nested[:3]
+    report.warn(
+        "queue.nested-specs",
+        f"{len(nested)} spec-like file(s) in subdirectories of {impl} (e.g. "
+        f"{', '.join(str(p) for p in examples)}); sprint-mode dev sessions only read "
+        "specs directly under it — move them up, or use stories mode ([stories] "
+        "source) for a stories/ layout",
+        {"count": len(nested), "examples": [str(p) for p in examples]},
+    )
 
 
 def _validate_operator_registry(
@@ -6306,6 +6404,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Deterministic orchestrator for the BMAD implementation phase",
     )
     parser.add_argument("--version", action="version", version=f"bmad-loop {__version__}")
+    # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
+    # detached child, never typed by hand. See the handling after `parse_args`.
+    parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -6748,6 +6849,23 @@ def main(argv: list[str] | None = None) -> int:
     # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
     if args.func is cmd_relay:
         return cmd_relay(args)
+    if args.displaced_registry_root:
+        # The launcher's displaced psmux registry, forwarded because its detached
+        # child inherits the derived root and so displaces nothing of its own —
+        # without it a TUI-launched resume or cleanup never sweeps the operator's
+        # pre-#537 registry. Recorded HERE, ahead of `_configure_mux`, because the
+        # record is first-wins (`note_displaced_registry`) and the export inside
+        # `_configure_mux` records what it displaces. The value comes from the launcher's own process record, never
+        # from policy.toml, and every kill in a legacy registry stays tag-proven, so
+        # the option gives a caller no reach beyond setting PSMUX_DATA_DIR itself.
+        # After the relay branch, which ignores it: a hook must never exit 2.
+        if not Path(args.displaced_registry_root).is_absolute():
+            parser.error(
+                f"--displaced-registry-root must be absolute: {args.displaced_registry_root!r}"
+            )
+        from .adapters.psmux_backend import note_displaced_registry
+
+        note_displaced_registry(args.displaced_registry_root)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

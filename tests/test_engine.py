@@ -14764,6 +14764,42 @@ def test_unparked_session_end_carries_no_parked_key(project):
     assert dec and all(d["parked"] is False for d in dec)
 
 
+def test_session_end_extras_carries_resultless_verdict(project):
+    """#780: the adapter folds the last resultless-stop crumb onto a non-completed
+    result because nothing reads `resultless-stops.jsonl`; `session-end` is where
+    an operator finds why a nested spec rode to timeout. Diagnosis, not routing:
+    the timeout retries and defers exactly as a bare one does.
+
+    ABLATION: delete the resultless block in `_session_end_extras` and the
+    session-end assertions fail."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    detail = "no qualifying spec directly under: impl (subdirectories are not searched)"
+    timeout = SessionResult(
+        status="timeout", resultless_verdict="no-artifact", resultless_detail=detail
+    )
+    engine, adapter = make_engine(project, [timeout, timeout])
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # the retry ran: routing is untouched
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2
+    assert all(e["resultless_verdict"] == "no-artifact" for e in ends)
+    assert all(e["resultless_detail"] == detail for e in ends)
+
+
+def test_session_end_extras_omits_resultless_when_unset(project):
+    """Present-only, the `parked` convention: a session without a folded verdict
+    leaves neither key, so a grep finds exactly the diagnosed sessions."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends
+    assert all("resultless_verdict" not in e and "resultless_detail" not in e for e in ends)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same
@@ -16037,6 +16073,71 @@ def test_nested_engine_reraises_crash(project, monkeypatch):
     assert (engine.run_dir / "crash.txt").read_text()  # traceback still persisted
     journal = engine.run_dir / "journal.jsonl"
     assert not journal.exists() or "run-crash" not in journal.read_text()
+
+
+def _loop_finishes():
+    return None
+
+
+def _loop_hard_stops():
+    raise RunStopped()
+
+
+def _loop_crashes():
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [_loop_finishes, _loop_hard_stops, _loop_crashes],
+    ids=["finish", "hard-stop", "crash"],
+)
+@pytest.mark.parametrize("kill_result", [False, None], ids=["refused", "sent"])
+def test_teardown_kill_refusal_is_journaled(project, monkeypatch, loop, kill_result):
+    """A teardown kill the ownership gate refused (`runs.foreign_session_refusal`)
+    is journaled as `session-kill-refused`, with the drained reason, on every
+    teardown arm — not left on stderr and in a queue only the TUI drains.
+
+    The `None` row is the control: engine tests stub `kill_session` with
+    `lambda rid: None`, and only a `False` answer is a refusal — so a queued
+    reason does not journal unless the kill actually reported one.
+
+    Ablation: make `_kill_run_session` call `kill_session` and return, and the
+    refused rows fail; test the result with `not` instead of `is False`, and
+    the sent rows fail."""
+    killed = []
+
+    def kill(rid):
+        killed.append(rid)
+        return kill_result
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", kill)
+    monkeypatch.setattr("bmad_loop.engine.drain_refused_kills", lambda: ["x is untagged"])
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(engine, "_loop", loop)
+
+    engine.run()
+
+    assert killed == ["test-run"]
+    refused = [e for e in engine.journal.entries() if e["kind"] == "session-kill-refused"]
+    if kill_result is False:
+        assert [e["detail"] for e in refused] == ["x is untagged"]
+    else:
+        assert refused == []
+
+
+def test_teardown_kill_refusal_without_a_reason_names_the_alias(project, monkeypatch):
+    """A refusal with no reason queued is `kill_session`'s control-session alias
+    arm, which refuses before the gate runs; it still journals, and says so."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: False)
+    monkeypatch.setattr("bmad_loop.engine.drain_refused_kills", lambda: [])
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(engine, "_loop", _loop_crashes)
+
+    engine.run()
+
+    refused = [e for e in engine.journal.entries() if e["kind"] == "session-kill-refused"]
+    assert [e["detail"] for e in refused] == ["run id aliases a control session"]
 
 
 def test_run_crash_after_finish_clears_finished(project, monkeypatch):

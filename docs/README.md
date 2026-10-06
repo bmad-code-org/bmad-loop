@@ -22,6 +22,7 @@ guides below go deeper, roughly in the order you'll need them.
 ## Project direction
 
 - **[Roadmap](ROADMAP.md)** — planned and intentionally-deferred work.
+- **[Architecture decision records](adr/README.md)** — design decisions with the options weighed and the reasons, starting with the multiplexer env transport.
 
 For released changes, see the [CHANGELOG](../CHANGELOG.md).
 

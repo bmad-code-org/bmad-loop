@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
+  absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
+  session registry instead of the derived per-project root; `bmad-loop mux`
+  says which source won (#729). Such a root can be shared by several projects,
+  so there a same-named session is killed, attached, read as live or adopted
+  by a launch only when its project tag proves it this project's; a refusal is
+  warned about, and a launch that would adopt one fails with the reason. The
+  same check applies without the opt-in when no state root can be derived and
+  an ambient `PSMUX_DATA_DIR` stays in force; a teardown kill it refuses is
+  journalled (`session-kill-refused`). A running TUI refuses launches after
+  the switch is flipped either way, until restarted.
 - Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
   before `[verify]` commands, before each dev and review session launch, and
   before a failed attempt is charged; a failing, hanging or unrunnable probe
@@ -36,6 +47,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Kill a resumed run's stale psmux session in the registry it predates (the
+  displaced or pre-#537 default root, or the derived one after opting in to
+  your own), tag-proven only; a same-named survivor there made the resumed
+  session's create fail on psmux's cross-registry name mutex. A registry that
+  cannot be listed, or a session left standing, is journalled and warned about.
+  A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
+  child), except a share-root shape older PowerShell would corrupt.
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
@@ -50,6 +68,12 @@ breaking changes may land in a minor release.
   window" (by `x`, `a`, `bmad-loop attach` and the window prune), `x` checks
   that the window it killed is gone, and a TUI run or sweep launch warns when
   its new window cannot be confirmed as this project's.
+- Explain that unpinned result-artifact scans search only the configured artifact
+  directories themselves, so a nested story spec no longer produces an opaque
+  `no-artifact` breadcrumb (#780).
+- Surface why a sprint-mode dev session found no result: `session-end` carries
+  the last resultless verdict, the `no-artifact` crumb names specs found one level
+  down, and `validate` warns `queue.nested-specs` on a nested spec layout (#780).
 
 ## [0.13.1] — 2026-10-01
 

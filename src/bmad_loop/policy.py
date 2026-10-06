@@ -365,6 +365,11 @@ class MuxPolicy:
     # data-only, and a plugin backend may not be importable in every context that
     # parses policy. Machine-specific: `bmad-loop init` gitignores policy.toml.
     backend: str = ""
+    # Honour an operator's own absolute PSMUX_DATA_DIR instead of overriding it
+    # with the derived per-project registry root (#729). A whether, never a
+    # where: policy.toml is writable by driven sessions, so it must not name a
+    # root — see runs.resolve_psmux_registry_root.
+    honor_ambient_psmux_data_dir: bool = False
 
 
 @dataclass(frozen=True)
@@ -1355,7 +1360,15 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f"{sorted(OPERATOR_ON_REVIEW_DEMOTION_MODES)}:"
             f" got {operator.on_review_demotion!r}"
         )
-    mux = MuxPolicy(backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip())
+    mux = MuxPolicy(
+        backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip(),
+        honor_ambient_psmux_data_dir=_typed_bool(
+            mux_d,
+            "mux",
+            "honor_ambient_psmux_data_dir",
+            MuxPolicy.honor_ambient_psmux_data_dir,
+        ),
+    )
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
             f"mux.backend must be a backend name (letters, digits, . _ -): got {mux.backend!r}"
@@ -1640,6 +1653,12 @@ enabled = true
 # `bmad-loop mux` lists backends and shows the selection; `bmad-loop mux set
 # <name>` writes this key. Takes effect on the next bmad-loop invocation.
 # backend = "tmux"
+# psmux only: true = use an absolute PSMUX_DATA_DIR your profile exports into
+# every shell as the session registry, instead of bmad-loop's derived
+# per-project one. Leave false for a value typed into a single shell.
+# Takes effect on the next bmad-loop invocation; a running TUI refuses launches
+# until restarted.
+# honor_ambient_psmux_data_dir = false
 """
 
 

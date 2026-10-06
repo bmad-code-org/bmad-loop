@@ -1028,6 +1028,193 @@ def test_find_artifact_ignores_heading_in_longer_outer_fence(tmp_path):
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
+# ------------------------------------------------------- find_nested_result_hints
+
+
+def _deep_spec(path: Path, **kwargs) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _spec(path, **kwargs)
+
+
+def test_nested_hints_names_marker_and_frontmatter_specs_one_level_down(tmp_path):
+    marked = _deep_spec(tmp_path / "a" / "spec-1-1-x.md", auto_run="done")
+    bare = _deep_spec(tmp_path / "b" / "spec-1-2-y.md", auto_run=None)
+    _deep_spec(tmp_path / "spec-flat.md")  # directly in the dir: the flat scan's job, not a hint
+    _deep_spec(tmp_path / "a" / "deeper" / "spec-1-3-z.md")  # two levels down: never probed
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([marked, bare], None)
+
+
+def test_nested_hints_keep_the_launch_floor(tmp_path):
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
+def test_nested_hints_cap_at_limit(tmp_path):
+    for i in range(5):
+        _deep_spec(tmp_path / f"d{i}" / f"spec-1-{i}-x.md")
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0, limit=2)
+    assert fault is None
+    assert hits == [tmp_path / "d0" / "spec-1-0-x.md", tmp_path / "d1" / "spec-1-1-x.md"]
+
+
+def test_nested_hints_dedupe_preserving_order(tmp_path, monkeypatch):
+    """The two finders never overlap today (a marker excludes a spec from the
+    frontmatter scan), so overlap is forced: a later finder repeating a path must
+    neither duplicate it nor spend the limit on it."""
+    (tmp_path / "stories").mkdir()
+    a, b = tmp_path / "stories" / "a.md", tmp_path / "stories" / "b.md"
+    monkeypatch.setattr(devcontract, "find_result_artifact", lambda d, *, since_ns: a)
+    monkeypatch.setattr(devcontract, "find_frontmatter_candidates", lambda d, *, since_ns: [a, b])
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([a, b], None)
+
+
+def test_nested_hints_non_dir_input_is_not_a_fault(tmp_path):
+    assert devcontract.find_nested_result_hints(tmp_path / "ghost", since_ns=0) == ([], None)
+    (tmp_path / "file.md").write_text("x", encoding="utf-8")
+    assert devcontract.find_nested_result_hints(tmp_path / "file.md", since_ns=0) == ([], None)
+
+
+def test_nested_hints_skip_symlinked_subdirs(tmp_path):
+    outside = tmp_path / "outside"
+    _deep_spec(outside / "spec-1-1-x.md")
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    assert devcontract.find_nested_result_hints(impl, since_ns=0) == ([], None)
+
+
+def test_nested_hints_listing_fault_is_reported_not_empty(tmp_path, monkeypatch):
+    _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+
+    def boom(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == (
+        [],
+        "PermissionError: denied",
+    )
+
+
+def _deny_open_of(monkeypatch, denied: Path) -> None:
+    real_open = Path.open
+
+    def guarded(self, *args, **kwargs):
+        if self == denied:
+            raise PermissionError(13, "denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+
+def test_nested_hints_report_an_unreadable_file_beside_a_hit(tmp_path, monkeypatch):
+    """A nested `*.md` that cannot be opened is a fault, not "no match" — it may be
+    the very spec the layout hides. Its readable sibling is still named. The denied
+    file is non-terminal, so the finders pass over it on every Python whether or not
+    their reads route through `Path.open`.
+
+    Ablation: drop the `_unreadable` probe loop and the fault is None."""
+    hit = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-2-y.md", status="in-progress", auto_run=None)
+    _deny_open_of(monkeypatch, bad)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not read {bad}: PermissionError" in fault
+
+
+def test_nested_hints_ignore_an_unreadable_file_below_the_launch_floor(tmp_path, monkeypatch):
+    """A file older than the launch floor could not have been this session's spec,
+    so failing to open it is not worth a fault."""
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    _deny_open_of(monkeypatch, old)
+
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
+def test_nested_hints_report_a_read_fault_after_a_successful_open(tmp_path, monkeypatch):
+    """The finders fail on the read, not just the open (EIO on a flaky mount), so
+    the probe must read too: a file that opens but cannot be read is a fault.
+
+    Ablation: open without reading and the fault is None."""
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    real_open = Path.open
+
+    class _EioReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *args):
+            raise OSError(5, "Input/output error")
+
+    def guarded(self, *args, **kwargs):
+        return _EioReader() if self == bad else real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == []
+    assert fault is not None
+    assert f"could not read {bad}: OSError" in fault
+
+
+def test_nested_hints_keep_earlier_hits_when_a_later_subdir_faults(tmp_path, monkeypatch):
+    """A fault probing one subdirectory is reported beside the hits already found
+    in others — never trades the named nested spec for a bare fault.
+
+    Ablation: let the per-child OSError escape the loop and the hits are lost."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    (tmp_path / "b").mkdir()
+    real_find = devcontract.find_result_artifact
+
+    def find(d, *, since_ns):
+        if d.name == "b":
+            raise PermissionError(13, "denied", str(d))
+        return real_find(d, since_ns=since_ns)
+
+    monkeypatch.setattr(devcontract, "find_result_artifact", find)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {tmp_path / 'b'}: PermissionError" in fault
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_nested_hints_report_an_unlistable_subdir(tmp_path):
+    """`Path.glob` swallows a listing fault and yields nothing, so a subdirectory
+    that cannot be listed would read as "nothing nested". It is a fault instead,
+    and a readable sibling's hit is still named.
+
+    Ablation: drop the explicit `os.listdir(child)` and the fault is None."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    locked = tmp_path / "b"
+    _deep_spec(locked / "spec-1-2-y.md")
+    locked.chmod(0o000)
+    try:
+        hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+    finally:
+        locked.chmod(0o755)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {locked}: PermissionError" in fault
+
+
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
 # was killed) can end inside a multi-byte sequence; `read_text(encoding="utf-8")`
 # then raises UnicodeDecodeError — a ValueError, NOT an OSError.

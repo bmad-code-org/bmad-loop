@@ -1529,8 +1529,18 @@ def compose_resume(
             resolved_sweep_options,
         )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
-    # interrupted run can leave a lingering bmad-loop-<id> session behind).
+    # interrupted run can leave a lingering bmad-loop-<id> session behind) — in
+    # this registry, and, tag-proven, in any registry the session predates: a
+    # same-named one left there blocks the new session's create.
     runs.kill_session(run_dir.name)
+    for blocker in runs.kill_displaced_session(project, run_dir.name):
+        journal.append("displaced-session-not-cleared", detail=blocker)
+        print(
+            f"warning: run {run_dir.name}: a stale agent session in an older "
+            f"registry may block this resume — {blocker}; if the resume fails to "
+            "create its session, check it with `bmad-loop cleanup`",
+            file=sys.stderr,
+        )
     adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     if state.run_type == "sweep":
         assert resolved_sweep_options is not None
