@@ -1004,7 +1004,13 @@ def _isolate_mux_registry(monkeypatch):
     `runs._SETTLED_PROJECT` is reset on the same rule: the export records the
     project it configured, and the ownership gate reads it, so a leftover would
     judge a later test's sessions against an earlier test's project. Its record
-    of refused kills (`runs._REFUSED_KILLS`) likewise."""
+    of refused kills (`runs._REFUSED_KILLS`) likewise.
+
+    The psmux backend's per-process PowerShell version answers are seeded with
+    an admitted `pwsh`: every psmux window launch probes that version first,
+    and the unit tests that fake `subprocess.run` for psmux would otherwise
+    hand the probe a psmux answer and see every launch refused. Tests of the
+    gate itself, and the live module, reset it to empty."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -1012,6 +1018,7 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {"pwsh": "7.6.6"})
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
     monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
 

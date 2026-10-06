@@ -42,7 +42,7 @@ import psmux_teardown
 import pytest
 
 from bmad_loop import runs
-from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters import psmux_backend, tmux_base
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.tui import launch
 
@@ -50,6 +50,13 @@ HAVE_PSMUX = sys.platform == "win32" and shutil.which("psmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_PSMUX, reason="requires Windows with psmux on PATH")
 
 PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks on read
+
+
+@pytest.fixture(autouse=True)
+def _probe_the_real_pwsh(monkeypatch):
+    """Drop conftest's seeded PowerShell answer, so every window launch here runs
+    the backend's real version probe against the installed pwsh."""
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
 
 
 def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch, psmux_data_root):
@@ -1115,3 +1122,25 @@ def test_adopted_a_relative_registry_root_is_refused_before_the_spawn(monkeypatc
         "in PsmuxMultiplexer._run is no longer standing in for a panic: "
         f"rc={raw.returncode} stderr={raw.stderr.strip()!r}"
     )
+
+
+def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe, monkeypatch):
+    """The runtime half of the PowerShell floor (#861): the backend's version
+    probe, pointed at the Windows PowerShell 5.1 that ships with Windows, reads
+    a version below 7.3, and a parked-window launch then refuses before psmux
+    mints anything. 5.1 is the stand-in for the pwsh 7.0-7.2 builds the floor
+    exists for: its native-command builder corrupts argv the same way (an
+    argument with a space and a trailing backslash swallows the next one).
+
+    A red here means the refusal stopped gating the launch, or 5.1 stopped
+    answering the probe's query."""
+    if shutil.which("powershell.exe") is None:
+        pytest.skip("requires Windows PowerShell 5.1 (powershell.exe)")
+    mux, session, _windows = probe
+    before = sorted(mux.list_window_ids(session))
+    monkeypatch.setattr(mux, "_PWSH", "powershell.exe")
+    with pytest.raises(tmux_base.TmuxError, match=r"PowerShell 7\.3 or later.*'5\.1\.") as refused:
+        mux.new_parked_window(session, "legacy-shell", Path.cwd(), PARKED_ARGV, "@r")
+    assert "upgrade pwsh to 7.3 or later" in str(refused.value)
+    assert psmux_backend._PWSH_VERSIONS["powershell.exe"].startswith("5.1.")
+    assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"

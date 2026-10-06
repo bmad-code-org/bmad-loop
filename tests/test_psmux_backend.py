@@ -11,7 +11,7 @@ import subprocess
 
 import pytest
 
-from bmad_loop.adapters import psmux_backend, tmux_base
+from bmad_loop.adapters import multiplexer, psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
@@ -744,6 +744,112 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
         assert isinstance(get_multiplexer(), PsmuxMultiplexer)
     finally:
         get_multiplexer.cache_clear()  # don't leak the forced pick to other tests
+
+
+# ------------------------------------------ PowerShell floor (#861)
+# Before 7.3, PowerShell's native-command builder corrupts the argv _join_argv
+# hands it, so every window launch probes the pwsh version and refuses below
+# the floor before psmux is asked to mint anything. The live module carries the
+# runtime half (the probe pointed at a real Windows PowerShell 5.1).
+
+
+def _pwsh_floor_fake(monkeypatch, reported: str) -> list[list[str]]:
+    """Answer the pwsh probe with ``reported`` and ``psmux -V`` with an admitted
+    build; record every spawn. The conftest seed is dropped, so the probe runs."""
+    calls: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "pwsh":
+            out = reported + "\n"
+        else:
+            out = "tmux 3.3.8\npsmux 3.3.8\n" if argv[1:] == ["-V"] else "@2\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    return calls
+
+
+def _launches(mux: PsmuxMultiplexer, tmp_path):
+    return {
+        "new_window": lambda: mux.new_window("s", "n", tmp_path, {}, "prog"),
+        "new_parked_window": lambda: mux.new_parked_window("s", "n", tmp_path, ["prog"], "@r"),
+    }
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["automatic", "forced"])
+def test_every_launch_refuses_powershell_older_than_7_3(monkeypatch, tmp_path, forced):
+    calls = _pwsh_floor_fake(monkeypatch, "7.2.19")
+    monkeypatch.setattr(psmux_backend.shutil, "which", lambda name: "x")
+    if forced:
+        monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "psmux")
+    else:
+        monkeypatch.delenv("BMAD_LOOP_MUX_BACKEND", raising=False)
+    get_multiplexer.cache_clear()
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(multiplexer.sys, "platform", "win32")
+            mux = get_multiplexer()
+    finally:
+        get_multiplexer.cache_clear()
+    assert isinstance(mux, PsmuxMultiplexer)
+    # The selection really took the named path: automatic selection ran
+    # available()'s `psmux -V`, a forced one skipped it.
+    assert (["psmux", "-V"] in calls) is not forced
+    for name, launch in _launches(mux, tmp_path).items():
+        with pytest.raises(TmuxError, match=r"PowerShell 7\.3 or later.*'7\.2\.19'.*upgrade pwsh"):
+            launch()
+        assert all(argv[:2] != ["psmux", "new-window"] for argv in calls), name
+    # Probed once for the process, not once per launch.
+    assert [argv[0] for argv in calls].count("pwsh") == 1
+
+
+@pytest.mark.parametrize("reported", ["7.3.0", "7.10.1", "7.6.0-preview.4"])
+def test_launch_admits_powershell_7_3_or_later(monkeypatch, tmp_path, reported):
+    calls = _pwsh_floor_fake(monkeypatch, reported)
+    for name, launch in _launches(PsmuxMultiplexer(), tmp_path).items():
+        minted = len([argv for argv in calls if argv[:2] == ["psmux", "new-window"]])
+        launch()
+        launched = [argv for argv in calls if argv[:2] == ["psmux", "new-window"]]
+        assert len(launched) == minted + 1, name
+        assert "& 'prog'" in _pwsh_payload(launched[-1]), name
+
+
+@pytest.mark.parametrize("reported", ["", "not a version", "5.1.26100.9444"])
+def test_launch_refuses_an_unreadable_or_legacy_powershell_version(monkeypatch, tmp_path, reported):
+    calls = _pwsh_floor_fake(monkeypatch, reported)
+    with pytest.raises(TmuxError, match="upgrade pwsh to 7.3 or later"):
+        PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog")
+    assert all(argv[0] == "pwsh" for argv in calls)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "not found", "pwsh"),
+        subprocess.TimeoutExpired("pwsh", 30),
+        subprocess.CompletedProcess(["pwsh"], 1, stdout="7.6.0\n", stderr="boom"),
+    ],
+    ids=["missing", "timeout", "nonzero-exit"],
+)
+def test_a_pwsh_probe_that_fails_raises_and_is_retried(monkeypatch, tmp_path, failure):
+    spawned: list[list[str]] = []
+
+    def failing(argv, **kwargs):
+        spawned.append(argv)
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", failing)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    mux = PsmuxMultiplexer()
+    for _ in range(2):
+        with pytest.raises(TmuxError, match="could not read the pwsh version"):
+            mux.new_window("s", "n", tmp_path, {}, "prog")
+    assert [argv[0] for argv in spawned] == ["pwsh", "pwsh"]
+    assert psmux_backend._PWSH_VERSIONS == {}
 
 
 # ------------------------------------------ TUI-side qualified window ids (#291)

@@ -47,6 +47,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse to open a psmux window when `pwsh` is older than 7.3, whose argument
+  passing corrupts a command's arguments (a path with a space and a trailing
+  backslash swallowed the next one); checked once per process, forced backend
+  included (#861).
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
