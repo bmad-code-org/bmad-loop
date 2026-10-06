@@ -8191,6 +8191,28 @@ def test_kill_displaced_session_matches_through_the_registrys_name_key(tmp_path,
     assert folding.killed == ["bmad-loop-r1"]
 
 
+def test_kill_displaced_session_reports_an_uncomputable_tag(tmp_path, monkeypatch):
+    """Without this project's tag nothing can be proven ours, so nothing is
+    killed — and the resume is told why in a line of its own, which
+    `compose_resume` journals and warns, instead of the fault raising out of it.
+    Same guard `foreign_session_refusal` puts on the same call.
+
+    Ablate the `except (OSError, RuntimeError)` arm and this raises."""
+    legacy = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    def boom(_project):
+        raise OSError("state dir unreadable")
+
+    monkeypatch.setattr(runs, "accepted_tags", boom)
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert len(blockers) == 1
+    assert "tag could not be computed (state dir unreadable)" in blockers[0]
+    assert "no legacy registry was swept" in blockers[0]
+    assert legacy.killed == []
+
+
 def test_prune_sessions_still_claims_an_untagged_session_in_the_primary_registry(
     tmp_path, monkeypatch
 ):

@@ -1450,6 +1450,10 @@ JOURNAL_KINDS = frozenset(
         # displaced psmux registry. No new diagnostics routing: its only field,
         # `detail`, is already in `_JOURNAL_DROP_FIELDS`.
         "displaced-session-not-cleared",
+        # engine.py: a teardown kill the ownership gate refused. No new
+        # diagnostics routing: its only field, `detail`, is already in
+        # `_JOURNAL_DROP_FIELDS`.
+        "session-kill-refused",
         "run-start",
         # stories_engine.py
         "checkpoint-pause",

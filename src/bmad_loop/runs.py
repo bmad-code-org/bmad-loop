@@ -2017,7 +2017,12 @@ def kill_displaced_session(project: Path, run_id: str) -> list[str]:
     except MultiplexerError as exc:
         return [f"no legacy registry could be checked: backend selection failed: {exc}"]
     blockers: list[str] = []
-    mine = accepted_tags(project)
+    try:
+        mine = accepted_tags(project)
+    except (OSError, RuntimeError) as exc:
+        return [
+            f"this project's tag could not be computed ({exc}), so no legacy registry was swept"
+        ]
     for legacy in legacies:
         label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
         listing_faults: list[str] = []

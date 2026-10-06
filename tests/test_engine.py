@@ -16039,6 +16039,71 @@ def test_nested_engine_reraises_crash(project, monkeypatch):
     assert not journal.exists() or "run-crash" not in journal.read_text()
 
 
+def _loop_finishes():
+    return None
+
+
+def _loop_hard_stops():
+    raise RunStopped()
+
+
+def _loop_crashes():
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [_loop_finishes, _loop_hard_stops, _loop_crashes],
+    ids=["finish", "hard-stop", "crash"],
+)
+@pytest.mark.parametrize("kill_result", [False, None], ids=["refused", "sent"])
+def test_teardown_kill_refusal_is_journaled(project, monkeypatch, loop, kill_result):
+    """A teardown kill the ownership gate refused (`runs.foreign_session_refusal`)
+    is journaled as `session-kill-refused`, with the drained reason, on every
+    teardown arm — not left on stderr and in a queue only the TUI drains.
+
+    The `None` row is the control: engine tests stub `kill_session` with
+    `lambda rid: None`, and only a `False` answer is a refusal — so a queued
+    reason does not journal unless the kill actually reported one.
+
+    Ablation: make `_kill_run_session` call `kill_session` and return, and the
+    refused rows fail; test the result with `not` instead of `is False`, and
+    the sent rows fail."""
+    killed = []
+
+    def kill(rid):
+        killed.append(rid)
+        return kill_result
+
+    monkeypatch.setattr("bmad_loop.engine.kill_session", kill)
+    monkeypatch.setattr("bmad_loop.engine.drain_refused_kills", lambda: ["x is untagged"])
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(engine, "_loop", loop)
+
+    engine.run()
+
+    assert killed == ["test-run"]
+    refused = [e for e in engine.journal.entries() if e["kind"] == "session-kill-refused"]
+    if kill_result is False:
+        assert [e["detail"] for e in refused] == ["x is untagged"]
+    else:
+        assert refused == []
+
+
+def test_teardown_kill_refusal_without_a_reason_names_the_alias(project, monkeypatch):
+    """A refusal with no reason queued is `kill_session`'s control-session alias
+    arm, which refuses before the gate runs; it still journals, and says so."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: False)
+    monkeypatch.setattr("bmad_loop.engine.drain_refused_kills", lambda: [])
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(engine, "_loop", _loop_crashes)
+
+    engine.run()
+
+    refused = [e for e in engine.journal.entries() if e["kind"] == "session-kill-refused"]
+    assert [e["detail"] for e in refused] == ["run id aliases a control session"]
+
+
 def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     """A post-loop step that throws after finished=True is recorded as a crash
     and the finished flag is cleared, so status classification reads CRASHED
