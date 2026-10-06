@@ -17683,6 +17683,77 @@ def test_main_hands_the_export_the_displaced_registry_not_the_probe_root(tmp_pat
     assert os.environ[runs.PSMUX_DATA_DIR] == str(runs.mux_registry_root(tmp_path))
 
 
+def test_main_records_a_forwarded_displaced_registry(force_psmux_backend, tmp_path, monkeypatch):
+    """A detached child inherits its launcher's derived root and so displaces
+    nothing; the launcher's own record reaches it as the hidden top-level
+    `--displaced-registry-root`, and from there the legacy sweep names it — the
+    registry an operator's pre-#537 sessions live in.
+
+    Ablate the `note_displaced_registry` call in `main` and `_DISPLACED_ROOT`
+    stays `None`."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+    from bmad_loop.adapters import psmux_backend
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    rc = cli.main(["--displaced-registry-root=" + theirs, "list", "--project", str(tmp_path)])
+
+    assert rc == 0
+    assert psmux_backend._DISPLACED_ROOT == theirs
+    legacy = multiplexer_mod.get_multiplexer().legacy_registries()
+    assert theirs in [r.registry_root() for r in legacy]
+
+
+def test_main_refuses_a_relative_displaced_registry(tmp_path, capsys, monkeypatch):
+    """psmux panics on a relative `PSMUX_DATA_DIR`, and the option is a value no
+    operator types: a relative one is a malformed launch, refused as a usage
+    error before anything is recorded or dispatched.
+
+    Ablate the `is_absolute()` check and `main` returns 0 with the value
+    recorded."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--displaced-registry-root=relative-root", "list", "--project", str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert psmux_backend._DISPLACED_ROOT is None
+    assert capsys.readouterr().out == ""
+
+
+def test_main_forwarded_root_precedes_the_exports_own(force_psmux_backend, tmp_path, monkeypatch):
+    """The record is first-wins, so the forwarded value is noted ahead of
+    `_configure_mux`, whose export notes whatever it displaces. Given an ambient
+    root of its own as well, the child keeps the launcher's record.
+
+    Ablate by moving the handling after `_configure_mux` and the export's
+    displaced value wins."""
+    from bmad_loop.adapters import psmux_backend
+
+    forwarded = str(tmp_path / "launchers-displaced")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "ambient-in-the-child"))
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    rc = cli.main(["--displaced-registry-root=" + forwarded, "list", "--project", str(tmp_path)])
+
+    assert rc == 0
+    assert psmux_backend._DISPLACED_ROOT == forwarded
+
+
+def test_relay_ignores_a_displaced_registry_root(monkeypatch):
+    """`relay` stays first to dispatch: a top-level option it has no use for,
+    however malformed, must not turn a hook into a usage error.
+
+    Ablate by moving the option handling ahead of the relay branch and this
+    exits 2."""
+    monkeypatch.setattr(cli, "cmd_relay", lambda _args: 0)
+    assert cli.main(["--displaced-registry-root=relative-root", "relay", "Stop"]) == 0
+
+
 def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
     tmp_path, capsys, monkeypatch
 ):

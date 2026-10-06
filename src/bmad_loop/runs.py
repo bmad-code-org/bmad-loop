@@ -662,6 +662,17 @@ def settled_project() -> Path | None:
     return _SETTLED_PROJECT
 
 
+def displaced_psmux_registry_root() -> str | None:
+    """The registry root this process's :func:`export_psmux_registry_root`
+    displaced, or ``None`` when it displaced nothing. Read by the TUI launcher,
+    so a detached child — which inherits the derived root and so displaces
+    nothing itself — still learns it (``--displaced-registry-root``). Imported
+    lazily for the same reason as the export's own call into the psmux leaf."""
+    from .adapters import psmux_backend
+
+    return psmux_backend._DISPLACED_ROOT
+
+
 def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) -> str | None:
     """Point this process — and everything it spawns — at ``project``'s registry
     by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or

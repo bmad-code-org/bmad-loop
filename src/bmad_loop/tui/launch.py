@@ -960,6 +960,26 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
     )
 
 
+def _forwardable_displaced_root(displaced: str | None, in_force: str | None) -> str | None:
+    """The spelling of this process's displaced registry root to hand a detached
+    child (see :func:`start_detached`), or ``None`` when there is nothing to
+    forward, or nothing that would survive the trip.
+
+    ``str(Path(...))`` drops a trailing separator everywhere but on a root. A
+    value that still ends in one *and* contains whitespace — a share root such
+    as ``\\\\srv\\my share\\`` — is the shape Windows PowerShell older than 7.3
+    corrupts on the way into a parked window's argv (ADR 0001 §6, "Argv fidelity
+    on psmux"), so it is not forwarded: a sweep that misses that root is the
+    outcome before this forwarding existed, while a corrupted value would name
+    a registry nobody used."""
+    if not displaced or not os.path.isabs(displaced) or displaced == in_force:
+        return None
+    normalized = str(Path(displaced))
+    if normalized.endswith(("/", "\\")) and any(c.isspace() for c in normalized):
+        return None
+    return normalized
+
+
 def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) -> str | None:
     """Run a bmad-loop command in a new window of the control session.
 
@@ -981,6 +1001,14 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     each button separately kept finding the path nobody gated (resolve was
     the fourth); gating the mutation cannot. Ahead of the mux probes so the
     refusal needs no transport to be phrased.
+
+    Forwards this process's displaced psmux registry root, as the hidden
+    top-level ``--displaced-registry-root`` ahead of the subcommand. The child
+    inherits the derived root and so displaces nothing itself; without the
+    option a TUI-launched resume or cleanup would never sweep the operator's
+    pre-#537 registry, which only this process recorded. A root of the shape
+    older PowerShell corrupts in transit is not forwarded
+    (:func:`_forwardable_displaced_root`).
     """
     if runs.run_id_aliases_control_session(run_id):
         raise LaunchError(
@@ -996,6 +1024,17 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     drift = _registry_drift(project, mux)
     if drift is not None:
         raise LaunchError(drift)
+    argv = cli_argv(*argv_tail)
+    try:
+        forwarded = (
+            _forwardable_displaced_root(runs.displaced_psmux_registry_root(), mux.registry_root())
+            if mux.has_registry_namespace()
+            else None
+        )
+    except MultiplexerError as e:
+        raise LaunchError(f"multiplexer registry query failed: {e}") from e
+    if forwarded is not None:
+        argv = cli_argv(f"--displaced-registry-root={forwarded}", *argv_tail)
     ctl = _ensure_ctl_session(project)
     try:
         win_id = (
@@ -1003,7 +1042,7 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
                 ctl,
                 f"{kind}-{run_id}",
                 project,
-                cli_argv(*argv_tail),
+                argv,
                 RETURN_OPTION,
             )
             or None

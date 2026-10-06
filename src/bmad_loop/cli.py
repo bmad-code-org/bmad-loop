@@ -6317,6 +6317,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Deterministic orchestrator for the BMAD implementation phase",
     )
     parser.add_argument("--version", action="version", version=f"bmad-loop {__version__}")
+    # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
+    # detached child, never typed by hand. See the handling after `parse_args`.
+    parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -6759,6 +6762,23 @@ def main(argv: list[str] | None = None) -> int:
     # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
     if args.func is cmd_relay:
         return cmd_relay(args)
+    if args.displaced_registry_root:
+        # The launcher's displaced psmux registry, forwarded because its detached
+        # child inherits the derived root and so displaces nothing of its own —
+        # without it a TUI-launched resume or cleanup never sweeps the operator's
+        # pre-#537 registry. Recorded HERE, ahead of `_configure_mux`, because the
+        # record is first-wins (`note_displaced_registry`) and the export inside
+        # `_configure_mux` records what it displaces. The value comes from the launcher's own process record, never
+        # from policy.toml, and every kill in a legacy registry stays tag-proven, so
+        # the option gives a caller no reach beyond setting PSMUX_DATA_DIR itself.
+        # After the relay branch, which ignores it: a hook must never exit 2.
+        if not Path(args.displaced_registry_root).is_absolute():
+            parser.error(
+                f"--displaced-registry-root must be absolute: {args.displaced_registry_root!r}"
+            )
+        from .adapters.psmux_backend import note_displaced_registry
+
+        note_displaced_registry(args.displaced_registry_root)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

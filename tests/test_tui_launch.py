@@ -2338,6 +2338,99 @@ def test_registry_drift_names_an_unreadable_policy(monkeypatch, tmp_path):
     assert "changed since this TUI started" not in refusal
 
 
+class _ParkingRegistry(_HonouredRegistry):
+    """A namespacing (or not) backend that records the argv each parked window
+    would run."""
+
+    def __init__(self, root, *, namespaced=True):
+        super().__init__(root)
+        self._namespaced = namespaced
+        self.argvs: list[list[str]] = []
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+    def new_parked_window(self, session, name, cwd, argv, return_opt):
+        self.argvs.append(list(argv))
+        return "@7"
+
+    def set_window_option(self, window, option, value):
+        pass
+
+
+def _park(monkeypatch, tmp_path, mux) -> list[str]:
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
+    monkeypatch.setattr(launch, "_ensure_ctl_session", lambda _p: "ctl")
+    launch.start_detached(tmp_path, ["resume", "--project", str(tmp_path)], "RID", "resume")
+    (argv,) = mux.argvs
+    return argv
+
+
+def test_start_detached_forwards_the_displaced_registry(monkeypatch, tmp_path):
+    """The child inherits the derived root and so displaces nothing; without
+    the launcher's record a TUI-launched resume or cleanup never sweeps the
+    operator's pre-#537 registry. Forwarded top-level, ahead of the subcommand.
+
+    Ablate the forwarding in `start_detached` and the option is absent."""
+    from bmad_loop.adapters import psmux_backend
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", theirs)
+
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+
+    assert argv == launch.cli_argv(
+        f"--displaced-registry-root={theirs}", "resume", "--project", str(tmp_path)
+    )
+
+
+@pytest.mark.parametrize("case", ["nothing-displaced", "namespace-less", "displaced-in-force"])
+def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path, case):
+    """Nothing to forward — nothing displaced, a transport with no registry, or
+    a displaced root that is the one in force — leaves the argv byte-identical
+    to the one before the option existed.
+
+    Ablate the `has_registry_namespace()` gate and the second row forwards."""
+    from bmad_loop.adapters import psmux_backend
+
+    in_force = str(tmp_path / "derived")
+    if case != "nothing-displaced":
+        displaced = in_force if case == "displaced-in-force" else str(tmp_path / "theirs")
+        monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", displaced)
+    mux = _ParkingRegistry(in_force, namespaced=case != "namespace-less")
+
+    argv = _park(monkeypatch, tmp_path, mux)
+
+    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+
+
+def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path):
+    """A share root with whitespace keeps its trailing separator through
+    normalisation, and that is the shape Windows PowerShell older than 7.3
+    corrupts in a parked window's argv (ADR 0001 §6). Not forwarding it is the
+    behaviour before the option existed; forwarding it would name a registry
+    nobody used. The positive control — the same share one level down — is
+    forwarded, so the skip is the shape and not the share.
+
+    `isabs` is answered for these two literals so the win32 shape runs on POSIX
+    too. Ablate the skip and the first launch forwards."""
+    from bmad_loop.adapters import psmux_backend
+
+    share_root = r"\\srv\my share" + "\\"
+    below = r"\\srv\my share\registry"
+    real_isabs = os.path.isabs
+    monkeypatch.setattr(os.path, "isabs", lambda p: p in (share_root, below) or real_isabs(p))
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", share_root)
+
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", below)
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+    assert argv[3] == f"--displaced-registry-root={below}"
+
+
 def test_registry_drift_is_not_asked_of_an_unconfigured_process(monkeypatch, tmp_path):
     """Nothing to disagree with when this process never settled a registry for
     the project (library or test use): the live psmux tests drive launches
