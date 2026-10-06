@@ -267,6 +267,9 @@ session would read as gone there. Rules, all fixed:
   like a clean process does.
 - The TUI's control session gets its own name in your registry, so turning the switch on while an
   old control session still runs in the derived root does not collide with it.
+- A running TUI keeps watching the registry it started with. After you flip the switch either way,
+  it refuses to launch a run until you restart it (`bmad-loop tui`). A run started then would land
+  in a registry the TUI no longer watches.
 - Sessions started in the derived root before you turned the switch on are still reached by
   `bmad-loop cleanup`'s tag-scoped sweep. Your registry is shared with your own sessions, so cleanup
   claims a session there only by its ownership tag.

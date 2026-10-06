@@ -1436,9 +1436,16 @@ def foreign_session_refusal(
     the proof the cleanup sweep already demands (``require_tag``).
 
     Gated: a namespacing backend whose root in force is set and is not the
-    derived one. Ungated: tmux (no namespace), the derived root, and psmux's own
-    default registry (``registry_root()`` ``None`` — the underivable-state-root
-    degrade arm, which predates #729 and is warned about at startup).
+    derived one. That reaches past the opt-in: on the flag-off degrade arm (no
+    state root derivable, so :func:`export_psmux_registry_root` leaves an
+    ambient ``PSMUX_DATA_DIR`` in force) the root in force is the operator's,
+    and it is gated just the same. Ungated: tmux (no namespace), the derived
+    root, and psmux's own default registry (``registry_root()`` ``None`` — the
+    same underivable arm with nothing ambient). That last one is shared too, and
+    :func:`_registry_proves_ownership` demands the tag for cleanup there, but a
+    cleanup sweep only narrows what it claims; this gate would refuse kills and
+    attaches by run id. The arm predates #729, startup warns about it, and gating
+    it would change its pre-#729 kill and attach behaviour.
 
     ``project`` defaults to the one this process configured
     (``export_psmux_registry_root``); with neither, ownership cannot be proven

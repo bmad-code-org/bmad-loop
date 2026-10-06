@@ -1656,6 +1656,8 @@ enabled = true
 # psmux only: true = use an absolute PSMUX_DATA_DIR your profile exports into
 # every shell as the session registry, instead of bmad-loop's derived
 # per-project one. Leave false for a value typed into a single shell.
+# Takes effect on the next bmad-loop invocation; a running TUI refuses launches
+# until restarted.
 # honor_ambient_psmux_data_dir = false
 """
 
