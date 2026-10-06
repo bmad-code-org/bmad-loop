@@ -61,6 +61,19 @@ breaking changes may land in a minor release.
   projects, instead of letting the run read as gone (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
+- Reach only control-session windows carrying this project's tag from `a`/`x`,
+  so a reused window id or a forged `ctl-window` record can no longer steer
+  them onto a neighbour's window; the record now only breaks ties among tagged
+  windows, and a window whose tag write failed is left alone until relaunched
+  (#750). When a window under the run's name is left alone because its tag reads
+  empty (never written, or unreadable — psmux's option probe can fail), `x`
+  warns that the control window was not closed instead of reporting a clean
+  stop, and `a` and `bmad-loop attach` say why they cannot reach it. A control
+  listing that fails outright is reported as such instead of reading as "no
+  window" (by `x`, `a`, `bmad-loop attach` and the window prune) — `a` and
+  `bmad-loop attach` then still reach the run's agent session — `x` checks
+  that the window it killed is gone, and a TUI run or sweep launch warns when
+  its new window cannot be confirmed as this project's.
 - Explain that unpinned result-artifact scans search only the configured artifact
   directories themselves, so a nested story spec no longer produces an opaque
   `no-artifact` breadcrumb (#780).

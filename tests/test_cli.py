@@ -2803,11 +2803,11 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: (
+        lambda proj, rid, **_kw: (
             planned.append((proj, rid))
             or (
-                ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
-                "=bmad-loop-ctl:sweep-RID",
+                (["tmux", "switch-client", "-t", "=bmad-loop-ctl"], "=bmad-loop-ctl:sweep-RID"),
+                0,
             )
         ),
     )
@@ -2833,9 +2833,9 @@ def test_attach_records_detach_outside_tmux(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: (
-            ["tmux", "attach", "-t", "=bmad-loop-ctl"],
-            "=bmad-loop-ctl:sweep-RID",
+        lambda proj, rid, **_kw: (
+            (["tmux", "attach", "-t", "=bmad-loop-ctl"], "=bmad-loop-ctl:sweep-RID"),
+            0,
         ),
     )
     monkeypatch.delenv("TMUX", raising=False)
@@ -2854,7 +2854,10 @@ def test_attach_agent_session_records_no_return(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: (["tmux", "attach", "-t", "=bmad-loop-20260101-000000-aaaa"], None),
+        lambda proj, rid, **_kw: (
+            (["tmux", "attach", "-t", "=bmad-loop-20260101-000000-aaaa"], None),
+            0,
+        ),
     )
     recorded: list = []
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: recorded.append((w, p)))
@@ -2870,10 +2873,94 @@ def test_attach_nothing_to_attach(project, monkeypatch, capsys):
     from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
-    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
-    assert "nothing to attach" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "nothing to attach" in err
+    assert "no readable project tag" not in err
+
+
+def test_attach_explains_an_unproven_ctl_window(project, monkeypatch, capsys):
+    # #750: a window under this run's name was refused for an empty tag (unset,
+    # or unreadable). With nothing else to attach the exit code stays the
+    # "nothing to attach" FAILURE, but stderr says why instead of passing the
+    # refusal off as an absence.
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 1))
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert "no readable project tag" in err
+    assert "nothing to attach" in err
+
+
+def test_attach_warns_before_falling_back_past_an_unproven_window(project, monkeypatch, capsys):
+    # The other half: a decision waits in the refused window, so the plan falls
+    # back to the agent session. The attach still happens - and the operator is
+    # told which window it went around, BEFORE the attach takes over the
+    # terminal: stderr is read inside the attach, not after it returns.
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    agent = ["tmux", "attach", "-t", "=bmad-loop-20260101-000000-aaaa"]
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: ((agent, None), 1))
+    seen_at_attach: list[str] = []
+
+    def attach(argv):
+        seen_at_attach.append(capsys.readouterr().err)
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", attach)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
+    assert len(seen_at_attach) == 1
+    assert "no readable project tag" in seen_at_attach[0]
+
+
+def test_attach_warns_about_a_ctl_lookup_fault_and_still_attaches(project, monkeypatch, capsys):
+    # #750: the real attach_plan, with a ctl lookup that raises. cmd_attach
+    # says so on stderr and still attaches to the live agent session, rc 0.
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    def boom(_proj, _rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(
+        "bmad_loop.tui.launch.runs.attach_target_argv", lambda target: ["mux", "attach", target]
+    )
+    called: list = []
+    monkeypatch.setattr(cli.subprocess, "call", lambda argv: called.append(argv) or 0)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
+    assert len(called) == 1 and called[0][:2] == ["mux", "attach"]
+    assert "could not check the run's control window" in capsys.readouterr().err
+
+
+def test_attach_does_not_claim_absence_after_a_ctl_lookup_fault(project, monkeypatch, capsys):
+    # With no agent session either, the attach fails (rc 1, FAILURE) — but its
+    # stderr says the ctl window could not be checked, never "nothing to
+    # attach", which would claim that unchecked window absent.
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    def boom(_proj, _rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: False)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert "could not check the run's control window" in err
+    assert "nothing to attach" not in err
 
 
 def test_attach_multiplexer_error_surfaces_clean_error(project, monkeypatch, capsys):
@@ -2884,7 +2971,7 @@ def test_attach_multiplexer_error_surfaces_clean_error(project, monkeypatch, cap
     from bmad_loop.adapters.multiplexer import MultiplexerError
     from bmad_loop.tui import launch
 
-    def boom(_proj, _rid):
+    def boom(_proj, _rid, **_kw):
         raise MultiplexerError("backend server not reachable")
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")

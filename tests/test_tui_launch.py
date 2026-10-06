@@ -36,7 +36,12 @@ class FakeRun:
     """Records argv; scripts the returncode of `tmux has-session` and the rows
     `list-windows` answers. The listing defaults to showing the window
     `new-window` just minted, which is what a real backend does — and what
-    ctl_window_recorded re-proves the record against."""
+    ctl_window_recorded re-proves the record against.
+
+    Like a real backend, a PROJECT_OPTION tag a `set-option` stamps on a window
+    shows up in its listed row — the only proof of ownership ctl_window_id
+    accepts (#750). A scripted row with its own third field (an empty one for
+    an untagged window) keeps it."""
 
     def __init__(
         self,
@@ -48,6 +53,7 @@ class FakeRun:
         self.calls: list[list[str]] = []
         self.has_session_rc = has_session_rc
         self.windows = windows
+        self.tags: dict[str, str] = {}
         # What `show-environment` reports a new pane inherits (#731): this
         # process's own env unless scripted (a server this launcher started
         # itself); `env_stderr` fails every such query instead.
@@ -67,9 +73,16 @@ class FakeRun:
         out = ""
         if argv[1] == "new-window":
             out = "@7\n"
+        elif argv[1:4] == ["set-option", "-w", "-t"] and argv[5:6] == [runs.PROJECT_OPTION]:
+            self.tags[argv[4]] = argv[6]  # tmux set-option -w -t <target> <option> <value>
         elif argv[1] == "list-windows":
-            out = self.windows
+            out = "".join(self._row(line) + "\n" for line in self.windows.splitlines())
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+    def _row(self, line: str) -> str:
+        win_id, *rest = line.split("\t")
+        tag = self.tags.get(win_id)
+        return f"{line}\t{tag}" if len(rest) == 1 and tag is not None else line
 
     def by_verb(self, verb: str) -> list[list[str]]:
         return [c for c in self.calls if c[1] == verb]
@@ -109,13 +122,15 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     # control session was missing: has-session, new-session, the state-root
     # check asks what a new pane inherits for each cascade input (#731),
     # new-window, then the project tag is stamped on the new window so
-    # cross-project cleanup never closes it
+    # cross-project cleanup never closes it, then the lookup `a`/`x` use
+    # re-reads the window to confirm the tag landed (#750)
     assert [c[1] for c in fake_run.calls] == [
         "has-session",
         "new-session",
         *["show-environment"] * len(runs.state_root_inputs()),
         "new-window",
         "set-option",
+        "list-windows",
     ]
     assert fake_run.by_verb("set-option")[0] == [
         "tmux",
@@ -328,10 +343,20 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
             for line in rows.splitlines()
         )
     calls: list[list[str]] = []
+    killed: set[str] = set()
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
-        out = rows if argv[1] == "list-windows" else ""
+        out = ""
+        if argv[1] == "kill-window":
+            killed.add(argv[-1])
+        elif argv[1] == "list-windows" and argv[-1] == "#{window_id}":
+            # list_window_ids: the ids still alive, as a real server answers
+            # after a kill (kill_ctl_window confirms its kill against this).
+            ids = (line.split("\t")[0] for line in rows.splitlines())
+            out = "".join(f"{i}\n" for i in ids if i and i not in killed)
+        elif argv[1] == "list-windows":
+            out = rows
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -433,24 +458,12 @@ def test_ctl_window_id_accepts_a_legacy_path_tag(monkeypatch, tmp_path: Path):
     assert launch.ctl_window_id(tmp_path, "RID") is None
 
 
-def test_ctl_window_id_admits_an_untagged_window_the_record_names(monkeypatch, tmp_path: Path):
-    # The tag is written by a best-effort set_window_option that can fail, and a
-    # window whose tag never landed must stay reachable by its own project
-    # rather than by nobody. start_detached records BEFORE it tags, so the
-    # record still names the window — and a record is a claim this project
-    # wrote, where a run dir is only a coincidence of the id.
-    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
-    _make_run(tmp_path)  # _record_ctl_window refuses to write without one
-    _write_record(tmp_path, "RID", "@4")
-    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
-
-
 def test_ctl_window_id_reads_the_record_after_the_listing(monkeypatch, tmp_path: Path):
     # Listing and record are two reads of a state a concurrent relaunch moves
     # between them — it mints its window, records it, then tags it — so their
     # order is load-bearing. Read the record FIRST and this call holds the id the
     # relaunch just superseded while the listing already carries both rows, and
-    # `recorded in matches` replays the corpse. Hoist the read above the
+    # `recorded in tagged` replays the corpse. Hoist the read above the
     # list_windows call and this answers "@1".
     tag = runs.project_tag(tmp_path)
     _make_run(tmp_path)
@@ -482,9 +495,9 @@ def test_ctl_window_id_refuses_an_untagged_window_without_a_record(monkeypatch, 
 def test_ctl_window_id_refuses_untagged_windows_the_record_does_not_name(
     monkeypatch, tmp_path: Path
 ):
-    # A record that resolves to nothing must not license the *other* untagged
-    # rows: drop the per-row equality and the bucket fills by listing order, so
-    # `a` and `x` land on whatever sorted first.
+    # A record that resolves to nothing must not license any untagged row: were
+    # untagged rows a bucket of their own it would fill by listing order, and
+    # `a` and `x` would land on whatever sorted first.
     _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\tresume-RID\t\n", tmp_path)
     _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@9")  # killed, pruned, or never in this listing
@@ -507,41 +520,204 @@ def test_ctl_window_id_refuses_an_untagged_neighbour_on_a_run_id_collision(
     _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")
 
     assert launch.ctl_window_id(mine, "RID") is None
+    # Since #750 not even the project that recorded it reaches an untagged row.
+    assert launch.ctl_window_id(theirs, "RID") is None
 
-    # Positive control: the same row, resolved by the project that recorded it,
-    # so the None above is the record gate refusing rather than a listing that
+    # Positive control: the same row carrying theirs' tag is theirs alone, so
+    # the Nones above are the tag gate refusing rather than a listing that
     # parsed to nothing or a run id that never matched.
+    _ctl_listing(monkeypatch, f"@4\tresume-RID\t{runs.project_tag(theirs)}\n")
+    assert launch.ctl_window_id(mine, "RID") is None
     assert launch.ctl_window_id(theirs, "RID") == "@4"
 
 
-def test_ctl_window_id_admits_a_record_naming_a_window_it_never_minted(monkeypatch, tmp_path: Path):
-    # Characterization (#750), not an endorsement: the record is a claim, and it
-    # sits under the project root every coding session can write (see
-    # _read_ctl_window), so its content proves the mint only as far as it is
-    # unforgeable — which it is not. A record naming an untagged window this
-    # project never minted is admitted here, and `x` resolves through here.
-    #
-    # Not a regression, which is the whole reason it is pinned rather than
-    # fixed: the gate this replaced was `runs.is_run(run_dir_for(...))`, and
-    # anything that can write the record can equally mint the run dir — which
-    # admitted EVERY untagged row under the name, with no id to guess. Closing
-    # it needs an identity channel the session does not own (the window's pane
-    # pid, recorded at mint and re-proven here), so this test is the state that
-    # fix has to change.
+def test_ctl_window_id_refuses_a_record_naming_a_window_it_never_minted(
+    monkeypatch, tmp_path: Path
+):
+    # #750: the record sits under the project root every coding session can
+    # write (see _read_ctl_window), and every identity it could carry beside
+    # the id — a pane pid included — is readable from the process table. So a
+    # record naming an untagged window this project never minted must admit
+    # nothing: only the tag, which needs a mux write to forge, proves a window
+    # is ours. The same refusal is the price paid by our own window whose tag
+    # write failed — the record cannot tell the two apart, which is the point.
     _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")  # untagged, and not ours
     _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@4")
-    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+    assert launch.ctl_window_id(tmp_path, "RID") is None
+
+
+def test_ctl_window_lookup_counts_the_untagged_rows_it_refuses(monkeypatch, tmp_path: Path):
+    # An empty tag is unset OR unreadable — psmux folds a failed option probe to
+    # "" for every row — so the refusal must be countable, or a caller reads it
+    # as "no window" and `x` reports a clean stop over a live one. Counted:
+    # same-run untagged rows only; another run's, or another project's tagged
+    # row, is an absence, not a refusal.
+    other = runs.project_tag(tmp_path / "elsewhere")
+    _ctl_listing(
+        monkeypatch,
+        f"@1\tresume-RID\t\n@2\trun-RID\t\n@3\trun-OTHER\t\n@4\tresume-RID\t{other}\n",
+        tmp_path,
+    )
+    assert launch.ctl_window_lookup(tmp_path, "RID") == (None, 2)
+    # A tagged match answers, and the refusal beside it is still counted: the
+    # untagged row may be a relaunch whose tag write failed — the live
+    # orchestrator — next to its parked, tagged predecessor.
+    _ctl_listing(monkeypatch, "@1\tresume-RID\t\n@2\trun-RID\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == ("@2", 1)
+    _ctl_listing(monkeypatch, "@2\trun-RID\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == ("@2", 0)
+    # A genuine absence stays a plain None.
+    _ctl_listing(monkeypatch, "@3\trun-OTHER\t\n", tmp_path)
+    assert launch.ctl_window_lookup(tmp_path, "RID") == (None, 0)
+
+
+def test_kill_ctl_window_reports_an_unproven_window_it_left(monkeypatch, tmp_path: Path):
+    # The stop path's half of the same rule: nothing is killed — the window
+    # cannot be proven ours — but the count comes back for the TUI to report.
+    calls = _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
+    assert launch.kill_ctl_window(tmp_path, "RID") == 1
+    assert not any(c[1] == "kill-window" for c in calls)
+    # And a clean kill reports nothing left.
+    calls = _ctl_listing(monkeypatch, "@4\tresume-RID\n", tmp_path)
+    assert launch.kill_ctl_window(tmp_path, "RID") == 0
+    assert ["tmux", "kill-window", "-t", "@4"] in calls
+
+
+class _ListingMux:
+    """Just the two listing reads _list_ctl_windows makes: a primary listing
+    and the list_window_ids probe that confirms an empty one."""
+
+    def __init__(self, rows, ids):
+        self.rows, self.ids = rows, ids
+
+    def list_windows(self, session, fields):
+        return list(self.rows)
+
+    def list_window_ids(self, session):
+        if isinstance(self.ids, Exception):
+            raise self.ids
+        return list(self.ids)
+
+
+def test_list_ctl_windows_raises_when_an_empty_listing_hides_windows():
+    # #750: list_windows answers [] for a FAILED query too (it only warns), so
+    # an empty answer is confirmed with list_window_ids. Windows there means the
+    # listing failed — a raise, never a clean absence `x` would report as such.
+    with pytest.raises(MultiplexerError, match="could not list the windows"):
+        launch._list_ctl_windows(_ListingMux([], ["@4"]), "ctl", ["window_id"])
+    # A probe that cannot take its own listing raises through, same type.
+    boom = MultiplexerError("server not reachable")
+    with pytest.raises(MultiplexerError, match="server not reachable"):
+        launch._list_ctl_windows(_ListingMux([], boom), "ctl", ["window_id"])
+
+
+def test_list_ctl_windows_answers_a_proven_absence_and_rows_unprobed():
+    # The probe's [] is a positive claim (listed empty, or proven gone): that is
+    # an absence. And a non-empty listing is answered as-is — the probe runs
+    # only when the listing came back empty.
+    assert launch._list_ctl_windows(_ListingMux([], []), "ctl", ["window_id"]) == []
+    boom = MultiplexerError("probe must not run")
+    rows = [("@4", "run-RID", "")]
+    assert launch._list_ctl_windows(_ListingMux(rows, boom), "ctl", ["window_id"]) == rows
+
+
+def test_ctl_window_lookup_raises_on_a_failed_listing(monkeypatch, tmp_path: Path):
+    # End to end over the tmux argv: the 3-field listing fails (rc 1, not a
+    # proven-gone session), so the base answers [] — while the id listing shows
+    # a window. The lookup must raise, not answer (None, 0), or `x` reports a
+    # clean stop over a live window and attach reports an ordinary absence.
+    def fake(argv, **kwargs):
+        if argv[1] == "list-windows" and "#{window_name}" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="lost connection")
+        out = "@4\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(MultiplexerError):
+        launch.ctl_window_lookup(tmp_path, "RID")
+    with pytest.raises(MultiplexerError):
+        launch.kill_ctl_window(tmp_path, "RID")
+
+
+def test_ctl_window_lookup_raises_when_the_backend_is_unavailable(monkeypatch, tmp_path: Path):
+    # #750: an unavailable backend is not "no window". Availability can change
+    # while the stop confirm modal is open, so the lookup re-reads it and
+    # raises — `x` must not report a clean stop, attach must not report an
+    # ordinary absence. Ablation: restore `return None, 0` and both pass
+    # silently as (None, 0) / 0.
+    monkeypatch.setattr(launch, "mux_available", lambda: False)
+    with pytest.raises(MultiplexerError, match="unavailable"):
+        launch.ctl_window_lookup(tmp_path, "RID")
+    with pytest.raises(MultiplexerError, match="unavailable"):
+        launch.kill_ctl_window(tmp_path, "RID")
+    # ctl_window_recorded turns it into "could not confirm", which its
+    # launchers warn on — never a confirmed window.
+    assert launch.ctl_window_recorded(tmp_path, "RID", "@7") is False
+
+
+def test_attach_plan_carries_on_past_an_unavailable_backend(monkeypatch):
+    # The unavailable raise reaches attach_plan's on_fault like any lookup
+    # fault: said, and the plan still resolves the agent session.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "mux_available", lambda: False)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    faults: list[str] = []
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    assert unproven == 0
+    assert len(faults) == 1 and "unavailable" in faults[0]
+
+
+def test_kill_ctl_window_raises_when_its_window_survives(monkeypatch, tmp_path: Path):
+    # kill_window is best-effort: a transport failure is a silent no-op. So
+    # the kill is confirmed against list_window_ids, and a window still listed
+    # afterwards raises instead of letting `x` report a clean stop over it.
+    tag = runs.project_tag(tmp_path)
+
+    def fake(argv, **kwargs):
+        out = ""
+        if argv[1] == "list-windows":
+            out = "@4\n" if argv[-1] == "#{window_id}" else f"@4\tresume-RID\t{tag}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")  # kill: no-op
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(MultiplexerError, match="survived the kill"):
+        launch.kill_ctl_window(tmp_path, "RID")
+
+
+def test_start_run_detached_reports_a_window_whose_tag_did_not_land(fake_run, tmp_path: Path):
+    # #750: a fresh run mints the only window under its id, but the lookup
+    # admits only tagged windows, so a tag write that did not land leaves `a`
+    # and `x` blind to it. The launcher re-reads through the lookup and returns
+    # None, the signal its caller warns on — as resume already did.
+    fake_run.windows = "@7\trun-RID\t\n"  # listed untagged: the tag never landed
+    assert launch.start_run_detached(tmp_path, "RID") is None
+    assert launch.start_sweep_detached(tmp_path, "RID") is None
+    # Positive control: the tag the launch stamps lands (FakeRun folds it in).
+    fake_run.windows = "@7\trun-RID\n"
+    assert launch.start_run_detached(tmp_path, "RID") == "@7"
+
+
+def test_unproven_notice_agrees_with_its_count(tmp_path: Path):
+    one = launch.unproven_ctl_window_notice(tmp_path, "RID", 1)
+    many = launch.unproven_ctl_window_notice(tmp_path, "RID", 3)
+    assert one.startswith("a window ") and " has no readable project tag" in one
+    assert " it cannot be proven" in one and "close it by hand" in one
+    assert many.startswith("3 windows ") and " have no readable project tag" in many
+    assert "their tags" in many and "check them" in many
+    assert " its " not in many and " it " not in many
 
 
 def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
-    # Untagged is a fallback, not a peer, even now that it takes a record to get
-    # in. Merged into one listing-ordered list the recorded untagged row beats
-    # this project's correctly tagged one on index — and for `x` that
-    # closes the wrong window. The tag is the stronger of the two proofs, so it
-    # wins.
+    # The record is a tie-break among tagged rows, never a route to an untagged
+    # one: naming the untagged row that sorts first must not steer `x` off this
+    # project's correctly tagged window.
     _ctl_listing(monkeypatch, "@1\trun-RID\t\n@2\trun-RID\n", tmp_path)
-    _write_record(tmp_path, "RID", "@1")  # recorded: the untagged row is otherwise admitted
+    _write_record(tmp_path, "RID", "@1")
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
@@ -688,8 +864,8 @@ def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_pa
     _write_record(tmp_path, "RID", "@2")
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
-    plan = launch.attach_plan(tmp_path, "RID")
-    assert plan is not None
+    plan, unproven = launch.attach_plan(tmp_path, "RID")
+    assert plan is not None and unproven == 0
     _argv, return_window = plan
     assert return_window == "@2"
     assert ["tmux", "select-window", "-t", "@2"] in calls
@@ -706,7 +882,11 @@ def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
 
 def test_ctl_window_id_no_session_or_tmux(monkeypatch, tmp_path: Path):
     def fake(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no session")
+        # A wording _SESSION_GONE_STDERR recognises: an empty listing is only
+        # trusted as "no window" when the confirming probe proves the session gone.
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="can't find session: bmad-loop-ctl"
+        )
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -1313,10 +1493,9 @@ def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, 
     # in front of the live `resume-RID`, so without the record the scan answers
     # the corpse (`@1`) and the degradation is real rather than notional.
     #
-    # Tagged as start_detached leaves them, which FakeRun does not fold into its
-    # scripted listing: untagged rows have needed the record to be candidates at
-    # all since #531, so they would answer None here for the wrong reason — the
-    # bucket being empty rather than the scan preferring the corpse.
+    # Both tagged, as two launches leave them (FakeRun folds in only the tag
+    # this launch stamps, on @7): an untagged row is never a candidate (#750),
+    # so an untagged @1 would leave nothing ambiguous to degrade to.
     tag = runs.project_tag(tmp_path)
     fake_run.windows = f"@1\trun-RID\t{tag}\n@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
@@ -1341,10 +1520,10 @@ def test_resume_does_not_warn_when_the_scan_is_unambiguous(fake_run, tmp_path: P
     # a file was written — warning here would cry wolf on every launch that has
     # nothing to disambiguate.
     #
-    # Carrying the tag start_detached stamps, which FakeRun does not fold into
-    # its scripted listing: with the record write failing, the tag is the only
-    # proof of ownership left, and an untagged row would answer None for that
-    # reason rather than for the unambiguous scan this is about.
+    # Carrying the tag start_detached stamps, spelled out rather than left to
+    # FakeRun: the tag is the only proof of ownership (#750), and an untagged
+    # row would answer None for that reason rather than for the unambiguous
+    # scan this is about.
     fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     _make_run(tmp_path)
 
@@ -1371,9 +1550,8 @@ def test_resume_reports_a_record_the_listing_does_not_carry(fake_run, tmp_path: 
     # ctl_window_id rejects it against the listing and falls through to the
     # first match, which is the ambiguity the warning exists for.
     # Tagged, so the fallthrough this is about has candidates: an untagged row
-    # is admitted only by an id-equal record, which is the very thing diverging
-    # here, so both rows would drop out and the None would be about the empty
-    # bucket rather than about the shape.
+    # is never one (#750), so both rows would drop out and the None would be
+    # about the empty bucket rather than about the shape.
     tag = runs.project_tag(tmp_path)
     fake_run.windows = f"@1\trun-RID\t{tag}\nctl:@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
@@ -1913,12 +2091,50 @@ def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path
 
 
 def test_prune_ctl_windows_no_session(monkeypatch, tmp_path: Path):
-    def fake(argv, **kwargs):  # has-session reports the ctl session is gone
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+    # No server at all: has-session says no, and the id listing PROVES it (tmux
+    # 3.4's verbatim stderr), so the scan answers a clean absence.
+    def fake(argv, **kwargs):
+        err = "no server running on /tmp/tmux-1000/default"
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=err)
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+
+
+def test_prune_ctl_windows_raises_when_a_false_has_session_proves_nothing(
+    monkeypatch, tmp_path: Path
+):
+    # #750: a False has-session is not proof (a refused connect reads the same),
+    # so the scan asks list_window_ids before reporting nothing to prune — and
+    # an rc 1 that proves nothing raises there, for both prune entry points.
+    def fake(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="lost connection")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(MultiplexerError):
+        launch.prune_ctl_windows(tmp_path)
+    with pytest.raises(MultiplexerError):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_prune_ctl_windows_raises_when_the_candidate_listing_fails(monkeypatch, tmp_path: Path):
+    # The session is there, but its formatted listing fails while the id
+    # listing shows windows: the scan raises instead of reading nothing to
+    # prune — revert it to a bare list_windows and this answers ([], [], []).
+    def fake(argv, **kwargs):
+        if argv[1] == "list-windows" and argv[-1] != "#{window_id}":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="lost connection")
+        out = "@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(MultiplexerError, match="could not list the windows"):
+        launch.prune_ctl_windows(tmp_path)
+    with pytest.raises(MultiplexerError, match="could not list the windows"):
+        launch.prunable_ctl_windows(tmp_path)
 
 
 def test_select_ctl_window_id_argv(fake_run):
@@ -2183,44 +2399,61 @@ def test_decision_pending_false_once_an_unreadable_line_follows(tmp_path: Path):
 
 def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: ("@2", 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
     selected: list[str] = []
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
-    argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "@2"
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
+    assert unproven == 0
     assert selected == ["@2"]
 
 
 def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: ("@2", 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
-    argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
-    assert return_window == "@2"
+    plan, _unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
 
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") == (
-        ["tmux", "attach", "-t", "=bmad-loop-RID"],
-        None,
+        (["tmux", "attach", "-t", "=bmad-loop-RID"], None),
+        0,
     )
 
 
 def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
-    assert launch.attach_plan(Path("/proj"), "RID") is None
+    assert launch.attach_plan(Path("/proj"), "RID") == (None, 0)
+
+
+@pytest.mark.parametrize("agent_live", [True, False], ids=["agent-fallback", "nothing"])
+def test_attach_plan_carries_the_unproven_count(monkeypatch, agent_live: bool):
+    # #750: a decision is waiting in a window whose tag reads empty, so the
+    # lookup refuses it. The plan must carry that refusal out - whether it then
+    # falls back to the agent session (bypassing the waiting decision) or has
+    # nothing at all - or the CLI reads it as an ordinary absence.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 1))
+    monkeypatch.setattr(launch, "session_exists", lambda s: agent_live)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID")
+    assert unproven == 1
+    if agent_live:
+        assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    else:
+        assert plan is None
 
 
 class _SharedRegistryWithForeignSession:
@@ -2255,10 +2488,10 @@ def test_attach_plan_will_not_attach_to_another_projects_session(monkeypatch, tm
     Ablate the gate in `agent_session_exists` and the plan attaches to it."""
     monkeypatch.setattr(launch, "get_multiplexer", lambda: _SharedRegistryWithForeignSession())
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
-    monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: None)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
 
-    assert launch.attach_plan(tmp_path, "RID") is None
+    assert launch.attach_plan(tmp_path, "RID") == (None, 0)
     assert "treating bmad-loop-RID as absent" in capsys.readouterr().err
 
 
@@ -2533,6 +2766,28 @@ def test_start_detached_refuses_a_launch_into_a_registry_it_does_not_watch(monke
     with pytest.raises(launch.LaunchError, match="restart the TUI"):
         launch.start_detached(tmp_path, ["run"], "20260611-100000-aaaa", "run")
     assert minted == []
+
+
+def test_attach_plan_reports_a_ctl_lookup_fault_and_reaches_the_agent(monkeypatch):
+    # #750: a ctl listing that could not be read goes to on_fault, and the plan
+    # carries on exactly as with no ctl window — here to the live agent
+    # session. Ablation: let the raise propagate and the attach is refused for
+    # a window it could not even check.
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    faults: list[str] = []
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    assert unproven == 0
+    assert faults == ["could not list the windows of bmad-loop-ctl"]
+    # Without a sink the fault is not swallowed: it propagates.
+    with pytest.raises(MultiplexerError):
+        launch.attach_plan(Path("/proj"), "RID")
 
 
 def test_run_captured_merges_streams(monkeypatch):
