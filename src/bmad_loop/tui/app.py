@@ -608,10 +608,11 @@ class BmadLoopApp(App[None]):
         if agent_live:
             target = runs.session_target(run_id)
         else:
-            if unproven:
-                return  # the warning above already said why
             # Textual captures stderr, so agent_session_exists' warning about a
             # same-named session of another project's never reaches the screen.
+            # Checked BEFORE the ctl early returns below: the ctl warning says why
+            # the window is out of reach, and only this says why the agent
+            # session is too.
             ok, refusal = self._mux_guarded(lambda: runs.foreign_session_refusal(session))
             if not ok:
                 return
@@ -621,6 +622,8 @@ class BmadLoopApp(App[None]):
                     f"not attaching: {refusal}", severity="warning", timeout=10, markup=False
                 )
                 return
+            if unproven:
+                return  # the warning above already said why
             if ctl_fault is not None:
                 return  # "no ctl window" would be a claim the fault toast unsays
             self.notify(

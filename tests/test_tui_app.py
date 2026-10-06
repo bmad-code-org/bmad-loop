@@ -3820,6 +3820,36 @@ async def test_attach_without_agent_session_notifies(project, monkeypatch):
         await until(pilot, lambda: any("no live agent session" in m for m in notifications(app)))
 
 
+async def test_attach_says_both_why_with_an_unproven_window_and_a_foreign_session(
+    project, monkeypatch
+):
+    """An unproven ctl window (#750) AND a same-named agent session that is
+    another project's: two reasons nothing is attached, and both must reach the
+    screen — the unproven-window warning, and the foreign-session refusal that
+    agent_session_exists only wrote to the stderr Textual captures.
+
+    Ablation: move `if unproven: return` back above the refusal check and only
+    the unproven-window warning appears."""
+    attached: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 1))
+    monkeypatch.setattr(
+        "bmad_loop.tui.app.runs.foreign_session_refusal",
+        lambda session, *_mux: f"{session} in the shared registry is tagged for another project",
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: any("not attaching" in m for m in notifications(app)))
+        assert any("cannot attach to the run window" in m for m in notifications(app))
+    assert attached == []
+
+
 async def test_attach_to_another_projects_session_says_why(project, monkeypatch):
     """The session EXISTS, and is another project's: the attach must not land on
     it, and since Textual captures stderr, `agent_session_exists`' warning never
