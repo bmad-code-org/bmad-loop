@@ -182,9 +182,10 @@ def _configure_mux(project: Path) -> None:
     keep-diagnostics-working rule as the policy read above.
 
     It also *overrides* an ambient ``PSMUX_DATA_DIR`` rather than honouring it —
-    the root is derived, always, so that two processes given one project cannot
+    the root is derived, so that two processes given one project cannot
     disagree about where its sessions live (the full argument is in that
-    function). Overriding an operator's variable silently is how someone loses an
+    function) — unless policy ``[mux] honor_ambient_psmux_data_dir`` says the
+    operator's value is a persistent pin (#729). Overriding an operator's variable silently is how someone loses an
     hour to `psmux ls` showing nothing, so it is said once, here, at the only
     point that runs ahead of every command. stderr, not stdout: the ``--json``
     contract is one object on stdout and nothing else, and this is the
@@ -193,10 +194,10 @@ def _configure_mux(project: Path) -> None:
 
     path = _policy_path(project)
     try:
-        name = policy_mod.load(path).mux.backend or None
+        mux_policy = policy_mod.load(path).mux
     except (policy_mod.PolicyError, OSError):
-        name = None
-    configure_multiplexer(name, origin=path)
+        mux_policy = policy_mod.MuxPolicy()
+    configure_multiplexer(mux_policy.backend or None, origin=path)
     # Automatic selection probes availability before returning its cached
     # instance. Give that probe the derived root first: psmux's version probe
     # reaches `_run`, which must reject an empty/relative ambient value, and a
@@ -237,8 +238,12 @@ def _configure_mux(project: Path) -> None:
                 os.environ[runs.PSMUX_DATA_DIR] = ambient
     if not namespaced:
         return
-    root = runs.export_psmux_registry_root(project)
+    root = runs.export_psmux_registry_root(
+        project, honor_ambient=mux_policy.honor_ambient_psmux_data_dir
+    )
     if root is not None:
+        # An honoured value is the operator's own stated preference, so it gets
+        # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
             print(
                 f"note: using bmad-loop's own psmux registry {root} — your "
@@ -1271,17 +1276,30 @@ def _print_registry(project: Path) -> None:
         derived = str(runs.mux_registry_root(project))
     except (runs.StateRootError, OSError, RuntimeError):
         derived = None
-    # bmad-loop always derives, so a mismatch is not an operator's honoured
-    # export — that is not a thing any more — but the one case the export
-    # degrades on: an underivable state root, where it leaves whatever it found
-    # rather than inventing a root. Saying "derived" there would be a lie about
-    # the one situation an operator most needs told.
-    origin = (
-        "derived from the project"
-        if root == derived
-        else f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
-        "because no state root could be derived here"
-    )
+    # A root other than the derived one is either the operator's value honoured
+    # on their opt-in — asked of the same pure rule the export used — or the one
+    # case the export degrades on: an underivable state root, where it leaves
+    # whatever it found rather than inventing a root. Saying "derived" there
+    # would be a lie about the one situation an operator most needs told.
+    try:
+        honor = policy_mod.load(_policy_path(project)).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError):
+        honor = False
+    if root == derived:
+        origin = "derived from the project"
+    elif derived is not None and (
+        runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor) == root
+    ):
+        origin = (
+            f"your own ${runs.PSMUX_DATA_DIR}, honoured by "
+            "[mux] honor_ambient_psmux_data_dir — the derived root would be "
+            f"{derived}"
+        )
+    else:
+        origin = (
+            f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
+            "because no state root could be derived here"
+        )
     print(f"registry: {root} ({origin})")
     # A single-quoted PowerShell literal, whose only escape is doubling the quote:
     # an unescaped `C:\Users\O'Brien\...` ends the string mid-path and the line
@@ -6379,6 +6397,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Deterministic orchestrator for the BMAD implementation phase",
     )
     parser.add_argument("--version", action="version", version=f"bmad-loop {__version__}")
+    # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
+    # detached child, never typed by hand. See the handling after `parse_args`.
+    parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -6821,6 +6842,23 @@ def main(argv: list[str] | None = None) -> int:
     # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
     if args.func is cmd_relay:
         return cmd_relay(args)
+    if args.displaced_registry_root:
+        # The launcher's displaced psmux registry, forwarded because its detached
+        # child inherits the derived root and so displaces nothing of its own —
+        # without it a TUI-launched resume or cleanup never sweeps the operator's
+        # pre-#537 registry. Recorded HERE, ahead of `_configure_mux`, because the
+        # record is first-wins (`note_displaced_registry`) and the export inside
+        # `_configure_mux` records what it displaces. The value comes from the launcher's own process record, never
+        # from policy.toml, and every kill in a legacy registry stays tag-proven, so
+        # the option gives a caller no reach beyond setting PSMUX_DATA_DIR itself.
+        # After the relay branch, which ignores it: a hook must never exit 2.
+        if not Path(args.displaced_registry_root).is_absolute():
+            parser.error(
+                f"--displaced-registry-root must be absolute: {args.displaced_registry_root!r}"
+            )
+        from .adapters.psmux_backend import note_displaced_registry
+
+        note_displaced_registry(args.displaced_registry_root)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

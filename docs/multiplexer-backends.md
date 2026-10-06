@@ -220,9 +220,9 @@ Two further consequences:
   but only while psmux's `exit-empty` is on; it is on by default, and `psmux show-options -g
 exit-empty` says which you have. With it off, an empty session stays.
 
-Setting `PSMUX_DATA_DIR` yourself does **not** move bmad-loop's registry. bmad-loop derives the
-root from the project and the state root and exports it over whatever it finds, saying so once on
-stderr when it replaced something. Your value is left alone for your own psmux sessions — it is
+By default, setting `PSMUX_DATA_DIR` yourself does **not** move bmad-loop's registry. bmad-loop
+derives the root from the project and the state root and exports it over whatever it finds, saying
+so once on stderr when it replaced something. Your value is left alone for your own psmux sessions — it is
 psmux's variable, not bmad-loop's, so bmad-loop overrides it rather than refusing to run.
 
 That is deliberate, and the reason is worth having: an honoured export would make the registry a
@@ -240,8 +240,39 @@ $env:PSMUX_DATA_DIR = '<root from bmad-loop mux>'
 psmux ls
 ```
 
-One registry serving both bmad-loop and your own psmux is a reasonable thing to want and is not
-available today; it needs a preference you state rather than one bmad-loop guesses at.
+One registry serving both bmad-loop and your own psmux is a preference you state rather than one
+bmad-loop guesses at ([#729](https://github.com/bmad-code-org/bmad-loop/issues/729)). If your
+profile exports `PSMUX_DATA_DIR` into **every** shell, turn on the switch in the project's
+`policy.toml`:
+
+```toml
+[mux]
+honor_ambient_psmux_data_dir = true
+```
+
+bmad-loop then uses your value as the registry, a pane child inherits and honours it, and a clean
+process carrying your profile honours it too, so every process agrees. Not under `PSMUX_BARE_ENV`,
+which bmad-loop does not support: a bare pane inherits no `PSMUX_DATA_DIR`, so a run started there
+derives the registry instead. `bmad-loop mux` says
+`your own $PSMUX_DATA_DIR, honoured` and prints the derived root it would otherwise use. Leave the
+switch off for a value you typed into one shell: a process started without it would derive, and the
+session would read as gone there. Rules, all fixed:
+
+- It is a yes/no switch, never a path. `policy.toml` is writable by the sessions bmad-loop drives,
+  so a policy-supplied root would let one aim cleanup's kills at a registry of its choosing.
+- With no `PSMUX_DATA_DIR` set, or a relative or empty one, the switch changes nothing: the derived
+  root is used.
+- A value shaped like a bmad-loop-derived root (`<16-hex project key>\_mux`) is never treated as
+  your pin. That is what a pane child inherits when the outer process derived, and it re-derives
+  like a clean process does.
+- The TUI's control session gets its own name in your registry, so turning the switch on while an
+  old control session still runs in the derived root does not collide with it.
+- A running TUI keeps watching the registry it started with. After you flip the switch either way,
+  it refuses to launch a run until you restart it (`bmad-loop tui`). A run started then would land
+  in a registry the TUI no longer watches.
+- Sessions started in the derived root before you turned the switch on are still reached by
+  `bmad-loop cleanup`'s tag-scoped sweep. Your registry is shared with your own sessions, so cleanup
+  claims a session there only by its ownership tag.
 
 Two consequences of deriving, both benign:
 
