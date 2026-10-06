@@ -5452,9 +5452,27 @@ def cmd_attach(args: argparse.Namespace) -> int:
     if run_dir is None:
         print("no runs found", file=sys.stderr)
         return 1
-    plan = launch.attach_plan(project, run_dir.name)
+    # A ctl listing that could not be read is said, then the attach carries on
+    # to the agent session rather than failing on a window it could not check.
+    ctl_faults: list[str] = []
+
+    def ctl_fault(msg: str) -> None:
+        ctl_faults.append(msg)
+        print(f"warning: could not check the run's control window: {msg}", file=sys.stderr)
+
+    plan, unproven = launch.attach_plan(project, run_dir.name, on_fault=ctl_fault)
+    if unproven:
+        # A window under this run's name was refused for an empty tag (#750):
+        # say so before attaching elsewhere — or reporting nothing — so the
+        # refusal is not mistaken for an absence. Before the attach, which takes
+        # over the terminal.
+        notice = launch.unproven_ctl_window_notice(project, run_dir.name, unproven)
+        print(f"warning: {notice}", file=sys.stderr)
     if plan is None:
-        print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
+        if not ctl_faults:
+            # Not after a ctl fault: "nothing to attach" would claim the
+            # unchecked ctl window absent (#750). The warning above stands.
+            print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
         return 1
     argv, return_window = plan
     # Record where to send the client once the sweep finishes this cycle's
