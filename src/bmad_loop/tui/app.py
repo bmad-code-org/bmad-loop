@@ -567,12 +567,19 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        # Guarded: a ctl listing that failed raises rather than reading as "no
-        # window" (#750), and the toast is the honest answer to `a` then.
-        ok, lookup = self._mux_guarded(lambda: launch.ctl_window_lookup(self.project, run_id))
-        if not ok or lookup is None:
-            return
-        win_id, unproven = lookup
+        # A ctl listing that failed raises rather than reading as "no window"
+        # (#750). Say so, but do not abort: the agent session may still be
+        # reachable, so carry on exactly as if there were no ctl window.
+        ctl_fault: str | None = None
+        try:
+            win_id, unproven = launch.ctl_window_lookup(self.project, run_id)
+        except MultiplexerError as e:
+            win_id, unproven, ctl_fault = None, 0, str(e)
+            self.notify(
+                f"could not check the run's control window: {e}",
+                severity="warning",
+                timeout=15,
+            )
         ok, agent_live = self._mux_guarded(lambda: launch.agent_session_exists(session))
         if not ok:
             return
@@ -614,6 +621,8 @@ class BmadLoopApp(App[None]):
                     f"not attaching: {refusal}", severity="warning", timeout=10, markup=False
                 )
                 return
+            if ctl_fault is not None:
+                return  # "no ctl window" would be a claim the fault toast unsays
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
                 f"{launch.ctl_session(self.project)} window for this run (runs started outside "

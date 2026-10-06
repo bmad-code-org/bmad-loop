@@ -18,6 +18,7 @@ import re
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
@@ -773,7 +774,9 @@ def decision_pending(run_dir: Path) -> bool:
     return bool(entries) and entries[-1].get("kind") == "decision-pending"
 
 
-def attach_plan(project: Path, run_id: str) -> tuple[tuple[list[str], str | None] | None, int]:
+def attach_plan(
+    project: Path, run_id: str, *, on_fault: Callable[[str], None] | None = None
+) -> tuple[tuple[list[str], str | None] | None, int]:
     """Pick where an interactive attach should land for this run and which window
     (if any) to record a return target on. Shared by the CLI `attach` command and
     mirroring the TUI's action_attach logic: prefer the orchestrator's ctl window
@@ -783,9 +786,20 @@ def attach_plan(project: Path, run_id: str) -> tuple[tuple[list[str], str | None
     of same-run windows refused for an empty tag, carried out with the plan
     because a None plan is not "no window" when it is nonzero, and an agent
     plan may have bypassed the very window a pending decision is waiting in
-    (#750). The caller must say so; see unproven_ctl_window_notice."""
+    (#750). The caller must say so; see unproven_ctl_window_notice.
+
+    A ctl lookup that raises (its listing could not be read) is handed to
+    `on_fault` and the plan carries on as if there were no ctl window: the
+    agent session may still be reachable, and an attach must not be refused
+    for a window it could not check. With no `on_fault` the raise propagates."""
     session = runs.session_name(run_id)
-    win_id, unproven = ctl_window_lookup(project, run_id)
+    try:
+        win_id, unproven = ctl_window_lookup(project, run_id)
+    except MultiplexerError as e:
+        if on_fault is None:
+            raise
+        on_fault(str(e))
+        win_id, unproven = None, 0
     agent_live = agent_session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live

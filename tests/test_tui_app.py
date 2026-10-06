@@ -5907,14 +5907,16 @@ async def test_stop_run_warns_when_the_ctl_listing_cannot_be_read(project_tree, 
         assert not any("stop failed" in m for m in notifications(app))
 
 
-async def test_attach_toasts_a_ctl_listing_it_could_not_read(project, monkeypatch):
-    # The attach half: a raise from the lookup is toasted by the guard, and
-    # nothing is attached — never the plain "nothing to attach" absence.
+async def test_attach_warns_about_a_ctl_listing_it_could_not_read(project, monkeypatch):
+    # #750: a raise from the ctl lookup is said — but with no agent session
+    # either, nothing is attached, and never the plain "nothing to attach",
+    # which would claim the ctl window is absent.
     def boom(proj, rid):
         raise MultiplexerError("could not list the windows of bmad-loop-ctl")
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(launch, "session_exists", lambda session: False)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda session: False)
+    monkeypatch.setattr("bmad_loop.tui.app.runs.foreign_session_refusal", lambda s, *_m: None)
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -5922,10 +5924,35 @@ async def test_attach_toasts_a_ctl_listing_it_could_not_read(project, monkeypatc
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("a")
-        needle = "could not list the windows"
+        needle = "could not check the run's control window"
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
         assert not any("nothing to attach" in m for m in notifications(app))
         assert isinstance(app.screen, DashboardScreen)
+
+
+async def test_attach_reaches_the_agent_past_a_ctl_lookup_fault(project, monkeypatch):
+    # The regression this pins: a ctl lookup that raises must not abort `a`.
+    # It warns, then resolves the agent session exactly as when there is no
+    # ctl window. Ablation: restore the guard's early return on the lookup and
+    # the attach below never happens.
+    attached: list[str] = []
+
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: bool(attached))
+        assert any("could not check the run's control window" in m for m in notifications(app))
+    assert attached == [runs_mod.session_target("20260611-100000-aaaa")]
 
 
 async def test_attach_says_why_an_unproven_ctl_window_is_out_of_reach(project, monkeypatch):

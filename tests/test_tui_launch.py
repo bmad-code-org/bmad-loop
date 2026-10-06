@@ -2710,6 +2710,28 @@ def test_start_detached_refuses_a_launch_into_a_registry_it_does_not_watch(monke
     assert minted == []
 
 
+def test_attach_plan_reports_a_ctl_lookup_fault_and_reaches_the_agent(monkeypatch):
+    # #750: a ctl listing that could not be read goes to on_fault, and the plan
+    # carries on exactly as with no ctl window — here to the live agent
+    # session. Ablation: let the raise propagate and the attach is refused for
+    # a window it could not even check.
+    def boom(proj, rid):
+        raise MultiplexerError("could not list the windows of bmad-loop-ctl")
+
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    faults: list[str] = []
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    assert unproven == 0
+    assert faults == ["could not list the windows of bmad-loop-ctl"]
+    # Without a sink the fault is not swallowed: it propagates.
+    with pytest.raises(MultiplexerError):
+        launch.attach_plan(Path("/proj"), "RID")
+
+
 def test_run_captured_merges_streams(monkeypatch):
     def fake(argv, **kwargs):
         assert argv[:3] == [sys.executable, "-m", "bmad_loop.cli"]

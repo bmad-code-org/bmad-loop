@@ -65,7 +65,8 @@ breaking changes may land in a minor release.
   warns that the control window was not closed instead of reporting a clean
   stop, and `a` and `bmad-loop attach` say why they cannot reach it. A control
   listing that fails outright is reported as such instead of reading as "no
-  window" (by `x`, `a`, `bmad-loop attach` and the window prune), `x` checks
+  window" (by `x`, `a`, `bmad-loop attach` and the window prune) — `a` and
+  `bmad-loop attach` then still reach the run's agent session — `x` checks
   that the window it killed is gone, and a TUI run or sweep launch warns when
   its new window cannot be confirmed as this project's.
 - Explain that unpinned result-artifact scans search only the configured artifact
