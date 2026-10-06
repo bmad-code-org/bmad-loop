@@ -7285,6 +7285,26 @@ def test_ctl_session_for_follows_an_honoured_registry(tmp_path, monkeypatch):
     assert runs.is_ctl_session_name(as_honoured)
 
 
+def test_ctl_session_for_reads_the_backends_root(tmp_path, monkeypatch):
+    """The honoured root is the one the backend's verbs resolve through, not
+    whatever the environment says: a bound instance answers for its own
+    registry, so its control session is named for that registry.
+
+    Ablate (read `PSMUX_DATA_DIR` from the environment again) and the bound
+    instance is named for the derived registry instead."""
+    derived = str(runs.mux_registry_root(tmp_path))
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    as_honoured = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
+    as_derived = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
+
+    bound = runs.ctl_session_for(tmp_path, _NamespaceStub(True, root=pinned))
+
+    assert as_honoured != as_derived  # the premise: the two roots name differently
+    assert bound == as_honoured
+
+
 def test_honouring_hands_the_derived_root_to_the_sweep(tmp_path, monkeypatch):
     """Turning the flag on moves the registry from the derived root to the pin,
     and sessions started before the switch are still in the derived one. It is
@@ -7334,14 +7354,19 @@ def test_pinned_state_env_degrades_on_an_underivable_state_root(monkeypatch):
 
 
 class _NamespaceStub:
-    """Duck-typed mux answering only the namespace question — all
-    ctl_session_for consults."""
+    """Duck-typed mux answering only what ctl_session_for consults: the
+    namespace question, and the registry root — the environment's, as the
+    primary psmux instance answers, unless bound to its own."""
 
-    def __init__(self, namespaced):
+    def __init__(self, namespaced, root=None):
         self._namespaced = namespaced
+        self._root = root
 
     def has_registry_namespace(self):
         return self._namespaced
+
+    def registry_root(self):
+        return self._root or os.environ.get(runs.PSMUX_DATA_DIR)
 
 
 def test_ctl_session_for_is_fixed_without_a_registry_namespace(tmp_path):

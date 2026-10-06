@@ -937,13 +937,22 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
         derived = str(runs.mux_registry_root(project))
     except (runs.StateRootError, OSError, RuntimeError):
         return None  # the child cannot derive either, and keeps the root it inherits
+    fault: Exception | None = None
     try:
         honor = policy_mod.load(project / policy_mod.POLICY_FILE).mux.honor_ambient_psmux_data_dir
-    except (policy_mod.PolicyError, OSError):
+    except (policy_mod.PolicyError, OSError) as exc:
         honor = False  # what the child's `_configure_mux` falls back to as well
+        fault = exc
     child = runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor)
     if child == root:
         return None
+    if fault is not None:
+        # The switch may not have changed at all: the child cannot read the
+        # policy either, so it falls back to off. Name the real cause.
+        return (
+            f"policy.toml could not be read ({fault}); a new run would use the registry "
+            f"{child}, but this TUI watches {root} — fix the policy, then launch"
+        )
     return (
         f"[mux] honor_ambient_psmux_data_dir changed since this TUI started: a new run "
         f"would use the registry {child}, but this TUI watches {root} and could not "

@@ -1628,8 +1628,10 @@ def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> st
         # still holds psmux's mutex. Not honoured, the export settled the
         # derived root and the name is byte-identical to before. Compared as
         # identities, resolved and case-folded like `scope`, so another spelling
-        # of the derived registry is still that registry.
-        settled = os.environ.get(PSMUX_DATA_DIR)
+        # of the derived registry is still that registry. The root is the
+        # backend's, not the environment's, so a bound instance answers for its
+        # own registry.
+        settled = mux.registry_root()
         if settled and Path(settled).is_absolute():
             pinned = os.path.normcase(str(Path(settled).resolve()))
             if pinned != scope:

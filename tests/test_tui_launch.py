@@ -762,6 +762,9 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
         def has_registry_namespace(self):
             return True
 
+        def registry_root(self):
+            return os.environ.get(runs.PSMUX_DATA_DIR)  # as the primary psmux instance answers
+
         def has_session(self, name):
             return False
 
@@ -1823,6 +1826,9 @@ class _NamespacedMux:
     def has_registry_namespace(self):
         return True
 
+    def registry_root(self):
+        return os.environ.get(runs.PSMUX_DATA_DIR)  # as the primary psmux instance answers
+
     def has_session(self, session):
         self.sessions.append(session)
         return True
@@ -2307,6 +2313,29 @@ def test_registry_drift_predicts_where_a_child_would_settle(
     assert (refusal is not None) is drift
     if drift:
         assert "restart the TUI" in refusal and in_force in refusal
+
+
+def test_registry_drift_names_an_unreadable_policy(monkeypatch, tmp_path):
+    """A policy.toml that cannot be read is not a switch turned off: the child
+    falls back to off as well, so the launch is still refused, but the refusal
+    names the real cause rather than claiming the switch changed — and a
+    restart would not help, fixing the policy would.
+
+    Ablate the fault arm and the refusal says the switch changed."""
+    from bmad_loop import policy as policy_mod
+
+    pinned = str(tmp_path / "pinned")
+    path = tmp_path / policy_mod.POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[mux\nhonor_ambient_psmux_data_dir = true\n", encoding="utf-8")
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(pinned))
+
+    assert refusal is not None
+    assert refusal.startswith("policy.toml could not be read (")
+    assert "fix the policy, then launch" in refusal and pinned in refusal
+    assert "changed since this TUI started" not in refusal
 
 
 def test_registry_drift_is_not_asked_of_an_unconfigured_process(monkeypatch, tmp_path):
