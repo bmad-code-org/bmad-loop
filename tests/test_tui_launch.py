@@ -613,6 +613,36 @@ def test_ctl_window_lookup_raises_on_a_failed_listing(monkeypatch, tmp_path: Pat
         launch.kill_ctl_window(tmp_path, "RID")
 
 
+def test_ctl_window_lookup_raises_when_the_backend_is_unavailable(monkeypatch, tmp_path: Path):
+    # #750: an unavailable backend is not "no window". Availability can change
+    # while the stop confirm modal is open, so the lookup re-reads it and
+    # raises — `x` must not report a clean stop, attach must not report an
+    # ordinary absence. Ablation: restore `return None, 0` and both pass
+    # silently as (None, 0) / 0.
+    monkeypatch.setattr(launch, "mux_available", lambda: False)
+    with pytest.raises(MultiplexerError, match="unavailable"):
+        launch.ctl_window_lookup(tmp_path, "RID")
+    with pytest.raises(MultiplexerError, match="unavailable"):
+        launch.kill_ctl_window(tmp_path, "RID")
+    # ctl_window_recorded turns it into "could not confirm", which its
+    # launchers warn on — never a confirmed window.
+    assert launch.ctl_window_recorded(tmp_path, "RID", "@7") is False
+
+
+def test_attach_plan_carries_on_past_an_unavailable_backend(monkeypatch):
+    # The unavailable raise reaches attach_plan's on_fault like any lookup
+    # fault: said, and the plan still resolves the agent session.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "mux_available", lambda: False)
+    monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    faults: list[str] = []
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    assert unproven == 0
+    assert len(faults) == 1 and "unavailable" in faults[0]
+
+
 def test_kill_ctl_window_raises_when_its_window_survives(monkeypatch, tmp_path: Path):
     # kill_window is best-effort: a transport failure is a silent no-op. So
     # the kill is confirmed against list_window_ids, and a window still listed

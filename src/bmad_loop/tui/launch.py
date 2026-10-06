@@ -482,11 +482,16 @@ def ctl_window_lookup(project: Path, run_id: str) -> tuple[str | None, int]:
     run id, so the count is a notice, never a target.
 
     Raises MultiplexerError when the listing itself could not be read (see
-    _list_ctl_windows): that is not "no window" either, and every caller
-    surfaces it — the TUI's guarded attach, the stop worker, the CLI's error
-    backstop, ctl_window_recorded's "could not confirm"."""
+    _list_ctl_windows), and when the backend is unavailable at all: neither is
+    "no window", and every caller surfaces it — the TUI's attach warns and
+    carries on to the agent session, the stop worker warns the window may still
+    be running, the CLI attach warns on stderr, ctl_window_recorded says it
+    could not confirm. Availability is re-read here, not trusted from a
+    caller's gate: it can change while a confirm modal is open."""
     if not mux_available():
-        return None, 0
+        raise MultiplexerError(
+            "multiplexer backend unavailable: the run's control window could not be looked up"
+        )
     mine = runs.accepted_tags(project)
     tagged: list[str] = []
     unproven = 0
@@ -853,7 +858,9 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     PsmuxMultiplexer.list_windows reads every tag as empty, so an untagged row
     of ours whose run dir is gone is skipped here without a report. Telling an
     unreadable tag from an unset one needs an `on_fault` on list_windows, which
-    is a seam change.
+    is a seam change. Likewise an unavailable backend still reads as no
+    candidates here (the early `return []`), a known residual left for a
+    separate decision.
     """
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
