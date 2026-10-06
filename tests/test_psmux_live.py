@@ -1179,6 +1179,11 @@ def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher
     mux = PsmuxMultiplexer()
     if not mux.available():
         pytest.skip("psmux present but not an admitted version")
+    try:
+        mux._require_pwsh_floor()
+    except tmux_base.TmuxError as exc:
+        # A pre-7.3 pwsh is the refusal test's host, not this scenario's.
+        pytest.skip(f"pwsh below the supported floor: {exc}")
     printer = tmp_path / "printer.py"
     printer.write_text(_ARGV_PRINTER, encoding="utf-8")
     if launcher == "exe":
