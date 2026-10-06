@@ -816,12 +816,46 @@ def test_launch_admits_powershell_7_3_or_later(monkeypatch, tmp_path, reported):
         assert "& 'prog'" in _pwsh_payload(launched[-1]), name
 
 
-@pytest.mark.parametrize("reported", ["", "not a version", "5.1.26100.9444"])
-def test_launch_refuses_an_unreadable_or_legacy_powershell_version(monkeypatch, tmp_path, reported):
-    calls = _pwsh_floor_fake(monkeypatch, reported)
-    with pytest.raises(TmuxError, match="upgrade pwsh to 7.3 or later"):
+def test_launch_refuses_windows_powershell_5_1(monkeypatch, tmp_path):
+    calls = _pwsh_floor_fake(monkeypatch, "5.1.26100.9444")
+    with pytest.raises(TmuxError, match=r"'5\.1\.26100\.9444'.*upgrade pwsh to 7.3 or later"):
         PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog")
     assert all(argv[0] == "pwsh" for argv in calls)
+
+
+@pytest.mark.parametrize(
+    "reported",
+    ["", "not a version", "7.3garbage", "7.6.6 extra", "v7.6.6", "7", "7.6.6-", "7.6.6\n7.2.0"],
+)
+def test_launch_refuses_an_unreadable_powershell_version(monkeypatch, tmp_path, reported):
+    """The whole answer must be a version: a valid prefix with anything after
+    it, or a second line, is not one — and never reads as admitted."""
+    calls = _pwsh_floor_fake(monkeypatch, reported)
+    with pytest.raises(TmuxError, match="could not read the pwsh version: unrecognized answer"):
+        PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog")
+    assert all(argv[0] == "pwsh" for argv in calls)
+
+
+def test_new_session_refuses_powershell_older_than_7_3(monkeypatch, tmp_path):
+    """The initial window of a new session runs psmux's default shell, so
+    session creation is gated like every other window launch."""
+    calls = _pwsh_floor_fake(monkeypatch, "7.2.19")
+    with pytest.raises(TmuxError, match=r"'7\.2\.19'.*upgrade pwsh"):
+        PsmuxMultiplexer().new_session("s", tmp_path)
+    assert all(argv[0] == "pwsh" for argv in calls)
+
+
+def test_every_window_source_opts_into_standard_argument_passing(rec, tmp_path):
+    """Under the default Windows mode, PowerShell 7.3+ still builds a batch
+    launcher's command line the legacy way; the source opts out first. The
+    runtime half is in test_psmux_live (real pwsh, a .cmd launcher)."""
+    mux = PsmuxMultiplexer()
+    mux.new_window("s", "n", tmp_path, {}, "prog")
+    mux.new_parked_window("s", "n", tmp_path, ["prog"], "@r")
+    launches = [argv for argv, _ in rec.calls if argv[1] == "new-window"]
+    assert len(launches) == 2
+    for argv in launches:
+        assert _pwsh_payload(argv).startswith("$PSNativeCommandArgumentPassing = 'Standard'; ")
 
 
 @pytest.mark.parametrize(

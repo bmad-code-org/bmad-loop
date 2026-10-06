@@ -28,6 +28,7 @@ everywhere else, and when psmux is absent or an unsupported version.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -1144,3 +1145,78 @@ def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe,
     assert "upgrade pwsh to 7.3 or later" in str(refused.value)
     assert psmux_backend._PWSH_VERSIONS["powershell.exe"].startswith("5.1.")
     assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"
+
+
+# Argument shapes a window's argv must deliver byte-for-byte to its target on a
+# supported pwsh, whatever kind of launcher the target is.
+_ARGV_SHAPES = [
+    "--state-root=C:\\dir with space\\",
+    "--x=C:\\a b\\\\",
+    'say "hi"',
+    'a\\"b c',
+    "",
+    "žćč dir ü — 日本",
+    "Use the $bmad-dev-auto skill",
+    "spec at `x.md` now",
+    "next",
+]
+_ARGV_PRINTER = (
+    "import json, os, sys\n"
+    "open(os.environ['ARGV_OUT'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+)
+
+
+@pytest.mark.parametrize("launcher", ["exe", "ps1", "cmd"])
+def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher):
+    """The backend's own encoded source, run by the installed pwsh, hands the
+    target its argv byte-for-byte: a native .exe, an npm-style .ps1 shim, and
+    an npm-style .cmd batch launcher. Under the default Windows argument mode
+    pwsh 7.3+ still builds a batch launcher's command line the legacy way, so
+    the .cmd row fails on an embedded quote, a backslash-quote with a space
+    and an empty argument unless the source opts into Standard mode first
+    (`_shell_wrap`). No psmux server is involved: the window's shell command
+    is executed directly, exactly as psmux would spawn it."""
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    printer = tmp_path / "printer.py"
+    printer.write_text(_ARGV_PRINTER, encoding="utf-8")
+    if launcher == "exe":
+        target = [sys.executable, str(printer)]
+    elif launcher == "ps1":
+        policy = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", "Get-ExecutionPolicy"],
+            capture_output=True,
+            text=True,
+            timeout=tmux_base.TMUX_TIMEOUT_S,
+        ).stdout.strip()
+        if policy in ("AllSigned", "Restricted"):
+            pytest.skip(f"execution policy {policy} does not run a local .ps1")
+        shim = tmp_path / "shim.ps1"
+        shim.write_text(
+            f"& {psmux_backend._pwsh_quote(sys.executable)} "
+            '"$PSScriptRoot/printer.py" $args\nexit $LASTEXITCODE\n',
+            encoding="utf-8",
+        )
+        target = [str(shim)]
+    else:
+        shim = tmp_path / "shim.cmd"
+        shim.write_text(
+            f'@ECHO off\r\n"{sys.executable}" "%~dp0printer.py" %*\r\n', encoding="utf-8"
+        )
+        target = [str(shim)]
+    out = tmp_path / "argv.json"
+    command = mux._shell_wrap(
+        f"$env:ARGV_OUT = {psmux_backend._pwsh_quote(str(out))}; "
+        + mux._join_argv([*target, *_ARGV_SHAPES])
+    )
+    ran = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert out.exists(), f"the {launcher} target never ran: {ran.stderr.strip()!r}"
+    assert json.loads(out.read_text(encoding="utf-8")) == _ARGV_SHAPES
