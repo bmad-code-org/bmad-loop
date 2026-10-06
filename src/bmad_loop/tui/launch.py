@@ -920,9 +920,14 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
 
     Asked only of a process that configured its registry for this project
     (`runs.settled_project`), which every CLI entry does: there is nothing to
-    disagree with otherwise. The other direction (switch turned ON) cannot
-    drift: the child inherits this process's derived root, which the rule
-    never honours as a pin."""
+    disagree with otherwise. The other direction (switch turned ON) leaves the
+    child where this process is — it inherits the derived root, which the rule
+    never honours as a pin — but no longer where the operator is: a TUI that
+    overrode the operator's root R recorded it as displaced, and with the
+    switch now on, every shell carrying R would honour it while this TUI and
+    its children stay in the derived registry. That is refused too. A TUI
+    started without R in its environment (from the Start menu, say) displaced
+    nothing, cannot know R, and so has nothing to refuse."""
     if runs.settled_project() != project:
         return None
     try:
@@ -945,6 +950,19 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
         fault = exc
     child = runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor)
     if child == root:
+        if honor and root == derived:
+            displaced = runs.displaced_psmux_registry_root()
+            if (
+                displaced
+                and runs.resolve_psmux_registry_root(derived, displaced, honor_ambient=True)
+                == displaced
+            ):
+                return (
+                    "[mux] honor_ambient_psmux_data_dir was turned on since this TUI "
+                    f"started: a new run would stay in the derived registry {root}, while "
+                    f"shells carrying your PSMUX_DATA_DIR now use {displaced} — restart "
+                    "the TUI (bmad-loop tui), then launch"
+                )
         return None
     if fault is not None:
         # The switch may not have changed at all: the child cannot read the

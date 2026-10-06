@@ -2287,7 +2287,7 @@ def _write_honour_flag(project: Path, on: bool) -> None:
     [
         ("pinned", False, True),  # started honouring, switch turned off since
         ("pinned", True, False),  # still honouring
-        ("derived", True, False),  # switch turned on since: the child inherits the derived root
+        ("derived", True, False),  # switch turned on since, but nothing was displaced to honour
         ("derived", False, False),  # unchanged
     ],
 )
@@ -2336,6 +2336,50 @@ def test_registry_drift_names_an_unreadable_policy(monkeypatch, tmp_path):
     assert refusal.startswith("policy.toml could not be read (")
     assert "fix the policy, then launch" in refusal and pinned in refusal
     assert "changed since this TUI started" not in refusal
+
+
+def test_registry_drift_refuses_after_the_switch_was_turned_on(monkeypatch, tmp_path):
+    """The switch turned ON under a TUI that overrode the operator's root R:
+    its children inherit the derived root and stay there, while every shell
+    carrying R would now honour it — runs started from the two places would land
+    in two registries. The TUI cannot follow without a restart, so it refuses.
+
+    Ablate the flip-ON arm in `_registry_drift` and this returns None."""
+    from bmad_loop.adapters import psmux_backend
+
+    derived = str(runs.mux_registry_root(tmp_path))
+    theirs = str(tmp_path / "their-own-registry")
+    _write_honour_flag(tmp_path, True)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", theirs)
+
+    refusal = launch._registry_drift(tmp_path, _HonouredRegistry(derived))
+
+    assert refusal is not None
+    assert refusal.startswith("[mux] honor_ambient_psmux_data_dir was turned on")
+    assert derived in refusal and theirs in refusal and "restart the TUI" in refusal
+
+
+@pytest.mark.parametrize("displaced", ["none", "unhonourable"])
+def test_registry_drift_has_nothing_to_refuse_without_an_honourable_displaced_root(
+    monkeypatch, tmp_path, displaced
+):
+    """The control: a TUI started without R in its environment displaced nothing
+    and cannot know R, and a displaced value the rule would not honour anyway (a
+    derived-registry shape) leaves every shell on the derived root too.
+
+    Ablate the `resolve_psmux_registry_root(...) == displaced` condition and the
+    second row refuses."""
+    from bmad_loop.adapters import psmux_backend
+
+    derived = runs.mux_registry_root(tmp_path)
+    if displaced == "unhonourable":
+        other = tmp_path / "elsewhere" / derived.parent.name / derived.name
+        monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(other))
+    _write_honour_flag(tmp_path, True)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+
+    assert launch._registry_drift(tmp_path, _HonouredRegistry(str(derived))) is None
 
 
 class _ParkingRegistry(_HonouredRegistry):
