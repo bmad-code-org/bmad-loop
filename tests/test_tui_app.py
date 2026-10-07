@@ -9207,7 +9207,8 @@ def test_run_tui_toasts_launch_warnings_for_the_app_run_only(monkeypatch, tmp_pa
     monkeypatch.setattr(tui_app, "BmadLoopApp", _StubApp)
     monkeypatch.setattr(tui_app, "mux_usable", lambda: True)
     assert tui_app.run_tui(tmp_path) == 0
-    assert toasts == [("stale root", {"severity": "warning", "markup": False})]
+    # Long enough to read both roots and the remedy: the latch never re-shows it.
+    assert toasts == [("stale root", {"severity": "warning", "timeout": 30, "markup": False})]
     assert launch.warn_sink is None
 
 
