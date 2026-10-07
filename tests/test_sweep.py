@@ -30322,6 +30322,11 @@ def _build_origin_template(root: Path, commits) -> tuple[str, ...]:
     git(root, "init", "-q")
     git(root, "config", "user.email", "test@example.com")
     git(root, "config", "user.name", "Test")
+    # Same race `_project_template` disables: each commit spawns a detached
+    # `git maintenance run --auto` that can unlink `objects/maintenance.lock`
+    # while `private_origin` is copytree-ing this template, failing an
+    # arbitrary test on `[Errno 2]`. The copies inherit it via .git/config.
+    git(root, "config", "maintenance.auto", "false")
     oids = []
     for message, files in commits:
         for name, text in files.items():
