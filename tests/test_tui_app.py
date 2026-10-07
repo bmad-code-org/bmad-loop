@@ -9184,6 +9184,34 @@ def test_run_tui_survives_junk_forced_backend(monkeypatch, tmp_path):
     assert ran == [True]
 
 
+def test_run_tui_toasts_launch_warnings_for_the_app_run_only(monkeypatch, tmp_path):
+    """Launch warnings (the #731 state-root check) default to stderr, which
+    Textual captures for the app's whole run, so run_tui routes them to a
+    warning toast while the app runs, and restores stderr afterwards, so a
+    finished app is never handed a late warning."""
+    from bmad_loop.tui import app as tui_app
+
+    toasts: list[tuple[str, dict]] = []
+
+    class _StubApp:
+        def __init__(self, _project):
+            pass
+
+        def notify(self, message, **kwargs):
+            toasts.append((message, kwargs))
+
+        def run(self):
+            assert launch.warn_sink is not None
+            launch.warn_sink("stale root")
+
+    monkeypatch.setattr(tui_app, "BmadLoopApp", _StubApp)
+    monkeypatch.setattr(tui_app, "mux_usable", lambda: True)
+    assert tui_app.run_tui(tmp_path) == 0
+    # Long enough to read both roots and the remedy: the latch never re-shows it.
+    assert toasts == [("stale root", {"severity": "warning", "timeout": 30, "markup": False})]
+    assert launch.warn_sink is None
+
+
 def _write_two_triage_decisions(run_dir: Path) -> None:
     """A sweep triage carrying TWO decisions, so a walk has somewhere to continue to."""
     import json
