@@ -2585,7 +2585,7 @@ def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=Non
     """An in-place run paused on a story whose attempt committed above its baseline:
     the reported shape (isolation none, rollback off). `phase` is the story's terminal
     phase; `spec` is "live" (in the artifacts dir) or "stashed" (moved under the run
-    dir the way `Engine._stash_deferred_artifacts` moves it)."""
+    dir the way `Engine._defer` stashes it)."""
     from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
 
     project = tmp_path / "proj"

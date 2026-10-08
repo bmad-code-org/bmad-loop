@@ -4194,14 +4194,15 @@ def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
     engine.state.tasks[task.story_key] = task
 
-    # The refusal is non-fixable, so the attempt is rolled back and the phase ends
-    # in the pause its unrecoverable binding forces. The PAUSE is the point for
-    # this row's purposes — "did not verify green" — and the journal below names
-    # the cause. Under the mutation this row exists to catch, the park verifies,
-    # commits, and nothing raises at all.
-    with pytest.raises(RunPaused):
-        engine._dev_phase(task)
+    # The refusal is non-fixable, so the attempts are rolled back and the story
+    # defers. The DEFER is the point for this row's purposes — "did not verify
+    # green" — and the journal below names the cause. Under the mutation this row
+    # exists to catch, the park verifies and commits as AWAITING_OPERATOR.
+    engine._dev_phase(task)
 
+    assert task.phase == Phase.DEFERRED and task.commit_sha is None
+    # the operator's pre-launch spec is input, not attempt output: it stays (DW-528)
+    assert read_frontmatter(recorded)["status"] == "awaiting-operator"
     reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert reasons and all(r == "no changes in worktree since baseline commit" for r in reasons)
     # the waiver never fired, so nothing was journaled as a skipped gate
@@ -11974,6 +11975,87 @@ def test_long_critical_reason_is_lossless_in_records_and_bounded_only_for_displa
 # ------------------------------------------------------ deferred-artifact stash
 
 
+def _stash(engine, task):
+    """Stage then finish with no rollback in between: `_defer`'s stash when the
+    rollback leaves the spec as it found it."""
+    engine._finish_deferred_stash(task, engine._stage_deferred_stash(task))
+
+
+def _staged_spec(project, engine, text="attempt output\n"):
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(text, encoding="utf-8")
+    task.spec_file = str(sp)
+    return task, sp, engine._stage_deferred_stash(task)
+
+
+def test_finish_deferred_stash_keeps_a_spec_the_rollback_put_back(project):
+    """DW-528: bytes that changed between staging and finishing are the rollback's
+    (a tracked spec reset to its baseline); they stay live, and the stash keeps the
+    attempt's output.
+
+    Ablation, performed: drop the `live == stashed` term and the baseline spec is
+    unlinked."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+    sp.write_text("baseline\n", encoding="utf-8")  # what the reset republished
+
+    engine._finish_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "baseline\n"
+    assert staged.target.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == [staged.target]
+
+
+def test_finish_deferred_stash_keeps_the_attempts_pre_launch_spec(project):
+    """DW-528: an unchanged spec equal to the attempt's pre-launch snapshot is its
+    input, not its output, and stays live.
+
+    Ablation, performed: drop the snapshot term and the operator's spec is
+    unlinked."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine, "operator input\n")
+    task.dispatched_spec_snapshot = b"operator input\n"
+
+    engine._finish_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "operator input\n"
+    assert staged.target.is_file()
+
+
+def test_discard_deferred_stash_drops_the_copy_of_a_live_spec(project):
+    """DW-528: a paused rollback left the spec live, so nothing is stashed."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+
+    engine._discard_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == []
+    assert "deferred-artifacts-stashed" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_discard_deferred_stash_lands_the_only_copy(project):
+    """DW-528: when the pause followed a change to the live spec, the staged copy
+    may be the attempt's only version, so it is landed and journaled rather than
+    dropped.
+
+    Ablation, performed: drop the copy unconditionally and the attempt's spec is
+    gone."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+    sp.write_text("operator input\n", encoding="utf-8")  # restored before the pause
+
+    engine._discard_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "operator input\n"
+    assert staged.target.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == [staged.target]
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("deferred-artifacts-stashed") == 1
+
+
 def test_stash_deferred_artifacts_moves_spec_into_run_dir(project):
     engine, _ = make_engine(project, [])
     task = StoryTask("1-1-a", 1)
@@ -11982,7 +12064,7 @@ def test_stash_deferred_artifacts_moves_spec_into_run_dir(project):
     sp.write_text("first attempt\n", encoding="utf-8")
     task.spec_file = str(sp)
 
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     dest = engine.run_dir / "deferred" / "1-1-a"
     assert (dest / sp.name).read_text(encoding="utf-8") == "first attempt\n"
@@ -12006,7 +12088,7 @@ def test_stash_deferred_artifacts_overwrites_a_prior_stash(project):
     dest.mkdir(parents=True, exist_ok=True)
     (dest / sp.name).write_text("first attempt\n", encoding="utf-8")
 
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
     assert not sp.exists()
@@ -12040,7 +12122,7 @@ def test_stash_deferred_artifacts_survives_a_win32_sharing_violation(project, mo
         real_replace(src, dst)
 
     monkeypatch.setattr(platform_util.os, "replace", sharing_violation_once)
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert calls["n"] == 2  # denied once, retried, landed
     assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
@@ -12071,7 +12153,7 @@ def test_stash_deferred_artifacts_retries_a_locked_source_spec(project, monkeypa
         real_unlink(path)
 
     monkeypatch.setattr(platform_util.os, "unlink", locked_once)
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert calls["n"] == 2  # denied once, retried, removed
     assert not sp.exists()
@@ -12097,7 +12179,7 @@ def test_stash_deferred_artifacts_keeps_source_and_cleans_tmp_on_replace_failure
 
     monkeypatch.setattr("bmad_loop.engine.atomic_replace", boom)
     with pytest.raises(PermissionError):
-        engine._stash_deferred_artifacts(task)
+        _stash(engine, task)
 
     assert sp.read_text(encoding="utf-8") == "work\n"
     assert list((engine.run_dir / "deferred" / "1-1-a").iterdir()) == []
@@ -24920,15 +25002,20 @@ def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project,
     commit, and the spec/board finish at done."""
     engine, marker, baseline = _deferred_in_place(project, tmp_path)
     kinds = [e["kind"] for e in engine.journal.entries()]
-    # Which pause fired on the defer: NOT manual-recovery shape (c) but the
-    # owned-spec one — `_defer` stashes the spec into the run dir BEFORE its
-    # rollback, so `rollback_or_pause` finds the attempt-bound spec missing and
-    # pauses through `pause_for_owned_spec_recovery` (which tells the operator to
-    # reset — exactly what --reverify must steer them away from).
-    assert "rollback-owned-spec-manual-required" in kinds
-    assert "rollback-manual-required" not in kinds
-    assert "attempt-owned spec needs manual recovery" in engine.state.paused_reason
+    # Which pause fired on the defer: manual-recovery shape (c), committed work
+    # present (DW-528). The stash follows the rollback's decision, so the
+    # attempt-bound spec is still live when `rollback_or_pause` looks for it and
+    # the owned-spec pause never fires; the paused tree keeps the spec live.
+    assert "rollback-manual-required" in kinds
+    assert "rollback-owned-spec-unavailable" not in kinds
+    assert "rollback-owned-spec-manual-required" not in kinds
+    assert "deferred-artifacts-stashed" not in kinds
+    assert "manual recovery needed (committed work present)" in engine.state.paused_reason
     assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+    live = spec_path(project, "1-1-a")
+    assert live.is_file()
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert not stash.parent.exists() or list(stash.parent.iterdir()) == []  # nothing staged
 
     marker.write_text("up\n")  # the operator restarts the container
     runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
@@ -24954,6 +25041,81 @@ def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project,
         if e["verification_sequence"] == decision["verification_sequence"]
     ]
     assert [(e["verification_stage"], e["returncode"]) for e in replay] == [("dev", 0)]
+
+
+def test_in_place_defer_with_rollback_on_auto_recovers_and_stashes(project, tmp_path):
+    """DW-528, rollback ON: the same deferred in-place story auto-rolls back — its
+    commits parked, the bound spec restored — and the attempt's spec lands in the
+    run-dir stash. The run never pauses for owned-spec recovery.
+
+    Ablation, performed: stash the spec before `_rollback_or_pause` again (the old
+    `_defer` order) and the rollback finds the bound spec missing, journals
+    `rollback-owned-spec-unavailable` and pauses the run."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    policy = dataclasses.replace(_reverify_policy(marker), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt"),
+            _committing_dev(project, "1-1-a", "e2e-2.txt"),
+        ],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.preserve_ref is not None
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" in kinds and "deferred-artifacts-stashed" in kinds
+    assert "rollback-owned-spec-unavailable" not in kinds
+    assert "rollback-owned-spec-manual-required" not in kinds
+    assert "rollback-manual-required" not in kinds
+    live = spec_path(project, "1-1-a")
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert stash.is_file()
+    assert list(stash.parent.iterdir()) == [stash]  # no staging residue
+    # the rollback restored the attempt's pre-launch spec, and that stays live
+    assert live.is_file() and live.read_bytes() == task.dispatched_spec_snapshot
+
+
+def test_in_place_defer_fault_after_the_reset_still_lands_the_stash(project, tmp_path, monkeypatch):
+    """DW-528: the stash lands last, so a fault between the reset and that landing
+    (here the ledger reopen, whose write faults propagate) must not leave the
+    attempt's spec only as an unjournaled staging copy that `--reverify` cannot
+    find. The reset already replaced the live spec, so the copy is landed and
+    journaled on the way out.
+
+    Ablation, performed: drop the `except BaseException` arm around the ledger
+    repair in `_defer` and only `<name>.tmp` remains, with no stash row."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    policy = dataclasses.replace(_reverify_policy(marker), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt"),
+            _committing_dev(project, "1-1-a", "e2e-2.txt"),
+        ],
+        policy=policy,
+    )
+
+    def ledger_fault(task):
+        raise OSError("ledger write refused")
+
+    monkeypatch.setattr(engine, "_reopen_ledger_after_defer", ledger_fault)
+    assert engine.run().crashed
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" in kinds and "deferred-artifacts-stashed" in kinds
+    live = spec_path(project, "1-1-a")
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert stash.is_file()
+    assert list(stash.parent.iterdir()) == [stash]  # no staging residue
 
 
 def test_reverify_runs_the_recommended_review(project, tmp_path):

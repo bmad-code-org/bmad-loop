@@ -47,6 +47,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop an in-place defer from stashing the spec before its rollback decides
+  (DW-528). Moving the spec out first made the rollback pause on owned-spec
+  recovery: with `rollback_on_failure` off it now pauses with the
+  committed-work manual-recovery notice and keeps the spec live; with it on it
+  auto-rolls back and stashes the spec.
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per

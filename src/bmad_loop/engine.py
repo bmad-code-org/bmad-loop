@@ -704,6 +704,17 @@ class _ArmedClose(NamedTuple):
     exact: bool
 
 
+class _StagedStash(NamedTuple):
+    """A deferred spec copied into the run dir but not yet landed (DW-528).
+
+    ``staged`` is the copy beside ``target`` in the stash dir; ``spec`` is the live
+    spec it was copied from, left in place for the rollback to judge."""
+
+    spec: Path
+    staged: Path
+    target: Path
+
+
 class _LedgerAnchor(StrEnum):
     """How much authority a baseline probe established for a ledger restore (#735).
 
@@ -9322,7 +9333,12 @@ class Engine:
             return
         advance(task, Phase.DEFERRED)
         if task.baseline_commit:
-            self._stash_deferred_artifacts(task)
+            # The stash follows the rollback's decision (DW-528). Moving the spec out
+            # first left an attempt-bound spec missing, so `rollback_or_pause` paused
+            # on owned-spec recovery whatever `rollback_on_failure` said. Only a copy
+            # is staged now — a reset that deletes the spec cannot take the work with
+            # it — and the live spec stays for the rollback to judge.
+            staged = self._stage_deferred_stash(task)
             deferred_work = self.workspace.paths.deferred_work
             # REPAIR/WRITE (DW-146), absence preserved: this snapshot is the input
             # to `_restore_defer_ledger`, so a snapshot taken from bytes nobody
@@ -9351,11 +9367,14 @@ class Engine:
                 # Narrow, deliberate catch of the unwind-to-the-top pause (#342):
                 # the pause already persisted Phase.DEFERRED (terminal), so resume
                 # will never re-enter this method — the defer record is emitted
-                # now or never. Every pause path fires BEFORE safe_reset, so the
-                # tree is untouched: the standard recovery note's parked/destroyed
-                # claims would be wrong here — the ACTION REQUIRED notice just
-                # above this one in ATTENTION is the authoritative pointer.
-                # Re-raised untouched: the run still pauses.
+                # now or never. A pause fires before the reset the recovery note
+                # describes, so its parked/destroyed claims would be wrong here —
+                # the ACTION REQUIRED notice just above this one in ATTENTION is the
+                # authoritative pointer. Re-raised untouched: the run still pauses.
+                # The spec normally stays live, so the staged stash copy is dropped;
+                # a pause after a post-reset spec restore is why the discard
+                # compares bytes before dropping it.
+                self._discard_deferred_stash(task, staged)
                 self._record_defer(
                     task,
                     reason,
@@ -9364,6 +9383,9 @@ class Engine:
                     "attempt's work is); if only the environment was broken, `bmad-loop "
                     f"resolve {self.state.run_id} --reverify` re-verifies the kept work",
                 )
+                raise
+            except BaseException:
+                self._discard_deferred_stash(task, staged)
                 raise
             # The reset reverts a *tracked* ledger's uncommitted edits, so the
             # review-found entries it erased are real knowledge worth putting
@@ -9375,13 +9397,22 @@ class Engine:
             # that landed BEFORE the reset is the reset's casualty, not the
             # restore's: the snapshot predates both, so nothing here can tell
             # that write apart from the session's own erased edits.
-            if snapshot is not None:
-                self._restore_defer_ledger(task, snapshot)
-            # The restore deliberately keeps review-found ledger knowledge, but
-            # it also replays this bundle's accepted close after the code was
-            # discarded. Let the mode undo only the close it can identify as its
-            # own; the base path has no bundle close and is a no-op.
-            self._reopen_ledger_after_defer(task)
+            try:
+                if snapshot is not None:
+                    self._restore_defer_ledger(task, snapshot)
+                # The restore deliberately keeps review-found ledger knowledge, but
+                # it also replays this bundle's accepted close after the code was
+                # discarded. Let the mode undo only the close it can identify as its
+                # own; the base path has no bundle close and is a no-op.
+                self._reopen_ledger_after_defer(task)
+            except BaseException:
+                # The reset already ran: the staged copy may be the attempt's only
+                # version, so it must not stay behind as an unjournaled `.tmp`.
+                self._discard_deferred_stash(task, staged)
+                raise
+            # Last, so a stash fault after the reset cannot cost the ledger repair
+            # above: the snapshot it restores from exists only in memory.
+            self._finish_deferred_stash(task, staged)
         self._record_defer(task, reason)
 
     def _restore_defer_ledger(self, task: StoryTask, snapshot: str) -> None:
@@ -10414,10 +10445,33 @@ class Engine:
             status=landed,
         )
 
-    def _stash_deferred_artifacts(self, task: StoryTask) -> None:
-        """Move the deferred story's spec out of the artifacts dir into the run
-        dir: a leftover in-review spec would confuse the next attempt, but the
-        work in it is worth keeping for the human.
+    def _stage_deferred_stash(self, task: StoryTask) -> _StagedStash | None:
+        """First half of moving a deferred story's spec out of the artifacts dir into
+        the run dir: a leftover in-review spec would confuse the next attempt, but
+        the work in it is worth keeping for the human. None when there is no spec.
+
+        Only a copy is made, beside the stash target, and the live spec and any
+        earlier stash of it stay untouched. `_defer` stages before its rollback,
+        so a reset that deletes the spec cannot take the work with it, then hands
+        the copy to `_finish_deferred_stash` once the rollback completes or to
+        `_discard_deferred_stash` when it pauses (DW-528). Staging inside the
+        stash dir keeps the later replace same-filesystem, preserving
+        `shutil.move`'s cross-device tolerance."""
+        if not task.spec_file:
+            return None
+        spec_path = Path(task.spec_file)
+        if not spec_path.is_file():
+            return None
+        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
+        dest = target.parent
+        dest.mkdir(parents=True, exist_ok=True)
+        tmp = dest / (spec_path.name + ".tmp")
+        shutil.copy2(spec_path, tmp)
+        return _StagedStash(spec_path, tmp, target)
+
+    def _land_deferred_stash(self, task: StoryTask, staged: _StagedStash) -> bytes:
+        """`atomic_replace` the staged copy onto its stash target, journal it, and
+        return the stashed bytes.
 
         A story that defers twice re-stashes the same filename, so the target may
         exist. `shutil.move` survived that on Windows only by accident: `os.rename`
@@ -10426,39 +10480,62 @@ class Engine:
         (#101) — it re-fails outright when an AV/indexer handle turns the rename into
         a sharing violation (WinError 5/32) and `copy2` then cannot open the same
         locked target, and it is non-atomic, so a crash mid-copy leaves a truncated
-        stash. Staging a copy inside `dest` and `atomic_replace`-ing it onto the
-        target overwrites in one step, carries #98's win32 retry, and — because the
-        staging copy lives in `dest` — keeps the replace same-filesystem, preserving
-        `shutil.move`'s cross-device tolerance.
+        stash. The replace overwrites in one step and carries #98's win32 retry.
 
-        Both halves of the move are retried: Windows denies a delete against an open
-        handle just as it denies a rename-over, so an unretried `unlink` would fail
-        the run on the very hazard the replace now rides out. The order is
-        replace-then-unlink because `_defer` calls this before the rollback and the
-        `story-deferred` journal append — a failure here aborts the deferral, so it
-        must be able to leave a duplicate spec, never a hole where the work was."""
-        if not task.spec_file:
-            return
-        spec_path = Path(task.spec_file)
-        if not spec_path.is_file():
-            return
-        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
-        dest = target.parent
-        dest.mkdir(parents=True, exist_ok=True)
-        tmp = dest / (spec_path.name + ".tmp")
-        shutil.copy2(spec_path, tmp)
+        On failure the staged copy is dropped only while the live spec still holds
+        the same work: after a reset it may be the only copy left, and a stash must
+        be able to leave a duplicate spec, never a hole where the work was."""
         try:
-            atomic_replace(tmp, target)
+            stashed = staged.staged.read_bytes()
+            atomic_replace(staged.staged, staged.target)
         except BaseException:
-            with contextlib.suppress(OSError):  # the copy is disposable; keep the real error
-                tmp.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                if staged.spec.read_bytes() == staged.staged.read_bytes():
+                    staged.staged.unlink(missing_ok=True)
             raise
-        retrying_unlink(spec_path)
         self.journal.append(
             "deferred-artifacts-stashed",
             story_key=task.story_key,
-            stashed_to=str(target),
+            stashed_to=str(staged.target),
         )
+        return stashed
+
+    def _finish_deferred_stash(self, task: StoryTask, staged: _StagedStash | None) -> None:
+        """Land a staged copy and take the attempt's spec out of the artifacts dir.
+
+        The live spec is unlinked only while it still holds the staged bytes. After
+        a rollback, different bytes are something the rollback put back (a tracked
+        spec reset to its baseline, or an attempt-owned spec restored to its
+        pre-launch snapshot), and those stay. An unchanged spec that equals the
+        attempt's pre-launch snapshot is the attempt's input, not its output, so it
+        stays too. The unlink is retried like the replace: Windows denies a delete
+        against an open handle just as it denies a rename-over."""
+        if staged is None:
+            return
+        stashed = self._land_deferred_stash(task, staged)
+        try:
+            live = staged.spec.read_bytes()
+        except FileNotFoundError:
+            live = None
+        if live == stashed and live != task.dispatched_spec_snapshot:
+            retrying_unlink(staged.spec)
+
+    def _discard_deferred_stash(self, task: StoryTask, staged: _StagedStash | None) -> None:
+        """Drop a staged copy whose spec is staying live: the rollback paused, or the
+        defer failed, before the stash could land. Only while the live spec still
+        holds the staged bytes — a pause can follow a byte-exact restore of an
+        attempt-owned spec, and a fault can follow the reset, and then the copy is
+        the attempt's only version, so it is landed on the stash target (and
+        journaled) instead. Best-effort: it runs while a pause or fault is
+        propagating, and a leftover copy beside the stash costs nothing."""
+        if staged is None:
+            return
+        with contextlib.suppress(OSError):
+            if staged.spec.read_bytes() == staged.staged.read_bytes():
+                retrying_unlink(staged.staged)
+                return
+        with contextlib.suppress(OSError):
+            self._land_deferred_stash(task, staged)
 
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)

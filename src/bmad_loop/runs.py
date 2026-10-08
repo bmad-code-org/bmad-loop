@@ -6481,7 +6481,7 @@ def _rearm_escalation_locked(
 
 
 def deferred_stash_path(run_dir: Path, story_key: str, spec_name: str) -> Path:
-    """Where `Engine._stash_deferred_artifacts` keeps a deferred story's spec:
+    """Where `Engine._defer` stashes a deferred story's spec:
     ``{run_dir}/deferred/<story_key>/<spec_name>``, the key made one safe path
     segment. One definition for the writer and for `rearm_for_reverify`, which
     restores the spec from there (DW-522), so the two cannot name different files."""
@@ -6540,7 +6540,7 @@ def reverify_refusal(
     * the code root is still the live repository root and the baseline is set;
     * in place: the baseline is an ancestor of HEAD, something sits above it
       (commits or a dirty tree, measured as the dev proof-of-work gate measures it),
-      and the spec is live or stashed where `_stash_deferred_artifacts` put it;
+      and the spec is live or stashed where `Engine._defer` put it;
     * mounted: the kept worktree is the attempt (`_mounted_reverify_refusal`).
 
     Any git fault refuses: this decides whether a replay may claim the tree.
@@ -6770,14 +6770,15 @@ def _rearm_for_reverify_locked(
     still carrying one), and the environment fault the gesture vouches is fixed.
     `generation` is bumped (#705) so any session the replay leads to mints fresh ids.
 
-    A deferred in-place story's spec was moved to the run dir by
-    `Engine._stash_deferred_artifacts` (a worktree unit's stays in its kept tree,
-    which the reverify arm reopens); it is copied back (the stash kept) through a
-    confined atomic write, never creating a directory. That copy sits inside the
+    A deferred in-place story's spec is either still live (its rollback paused, or
+    put the spec back) or was moved to the run dir by `Engine._defer` (a worktree
+    unit's stays in its kept tree, which the reverify arm reopens); a stashed one
+    is copied back (the stash kept) through a confined atomic write, never
+    creating a directory. That copy sits inside the
     same BaseException transaction shape as `_rearm_escalation_locked`: if the
     commit (`save_state`) did not land, the copy THIS call created is removed again,
-    so a failed re-arm leaves the tree as it found it. A spec the operator already
-    put back is used as-is and never touched.
+    so a failed re-arm leaves the tree as it found it. A live spec is used as-is
+    and never touched.
 
     Raises RearmError, state untouched, when `reverify_refusal` names a reason.
     Does NOT clear the pause; the caller resumes."""
