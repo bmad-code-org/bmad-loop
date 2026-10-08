@@ -5729,7 +5729,12 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    # The listing behind prune_sessions reads an unavailable backend as no
+    # sessions; this names the cases where that is not a clean answer (#864).
+    sessions_scan_error = runs.session_scan_error(project)
     if not args.json:
+        if sessions_scan_error is not None:
+            print(f"session prune failed: {sessions_scan_error}", file=sys.stderr)
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
             # Pruning kills the tmux session, never the engine pid, so the warning
@@ -5781,6 +5786,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
                 legacy_unverified=unverified,
+                sessions_scan_error=sessions_scan_error,
             )
         )
         return 0

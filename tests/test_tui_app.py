@@ -3526,6 +3526,73 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
 
 
+async def test_cleanup_toasts_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    project, monkeypatch
+):
+    # #864: with no usable backend, both listings read as nothing to prune; a
+    # live run of this project makes that a failure each half must toast, while
+    # the session receipt is still reported.
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["fin-1"], [], set()))
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "session prune failed" in m and "live run 20260611-100000-aaaa" in m
+                for m in notifications(app)
+            ),
+        )
+        await until(
+            pilot,
+            lambda: any(
+                "ctl window prune failed" in m and "is unavailable" in m for m in notifications(app)
+            ),
+        )
+        await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
+
+
+async def test_cleanup_scan_failure_toasts_keep_a_bracketed_path(project, monkeypatch):
+    """Both scan-failure toasts can carry a filesystem path (an unlistable runs
+    dir), so they render without markup: drop either `markup=False` and the
+    rendered path loses `[red]`."""
+    from bmad_loop import runs
+
+    path = "C:\\[red]\\runs"
+
+    def ctl_boom(_p):
+        raise MultiplexerError(f"a runs dir it cannot list ({path})")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", lambda _p: f"cannot list ({path})")
+    monkeypatch.setattr(launch, "prune_ctl_windows", ctl_boom)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        for prefix in ("session prune failed", "ctl window prune failed"):
+            await until(
+                pilot,
+                lambda prefix=prefix: any(
+                    text.startswith(prefix) and path in text
+                    for text, _severity in rendered_toasts(app)
+                ),
+            )
+
+
 @pytest.mark.parametrize(
     "fault, toast",
     [

@@ -1879,6 +1879,17 @@ class BmadLoopApp(App[None]):
         except (MultiplexerError, UnicodeError) as e:
             self.call_from_thread(self.notify, f"session prune failed: {e}", severity="error")
             return
+        # The cli cleanup's sessions.scan_error, as a toast: an unavailable
+        # backend reads as no sessions, which is not clean while a run of this
+        # project is or may be alive (#864). The ctl-window arm below reports its own.
+        sessions_scan_error = runs.session_scan_error(self.project)
+        if sessions_scan_error is not None:
+            self.call_from_thread(
+                self.notify,
+                f"session prune failed: {sessions_scan_error}",
+                severity="error",
+                markup=False,
+            )
         # prune_ctl_windows probes has_session on the shared ctl session, a
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
@@ -1893,7 +1904,9 @@ class BmadLoopApp(App[None]):
             # unknown-pid warning) rather than swallowing it on an early return.
             # Named: a bare transport message next to a "removed N session(s), 0
             # window(s)" toast reads as a successful window sweep.
-            self.call_from_thread(self.notify, f"ctl window prune failed: {e}", severity="error")
+            self.call_from_thread(
+                self.notify, f"ctl window prune failed: {e}", severity="error", markup=False
+            )
             windows, survived, unverifiable = [], [], []
         # A kill the shared-registry ownership gate refused is left out of the
         # count below and warned on stderr, which Textual swallows: say it here.

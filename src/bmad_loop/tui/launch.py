@@ -843,6 +843,33 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
     return unproven
 
 
+def _ctl_window_evidence(project: Path) -> str | None:
+    """What says a control window of this project could still exist, or None:
+    a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
+    raising on an unavailable backend in _ctl_window_candidates.
+
+    A verified prune drops the record of the window it removed
+    (_forget_pruned_records), so the evidence clears with the window. A record
+    whose window survived, could not be verified, or went some other way (a
+    stop) stays, and an unavailable backend is then reported rather than read
+    as clean: a false "nothing to prune" is the defect, a report that the scan
+    could not run is not."""
+    # Ungated, like live_run_evidence: a record outlives a lost state.json.
+    # An unlistable runs dir yields nothing here and is named there instead.
+    # Presence, not a read: a record that cannot be read still says a window
+    # was minted, and lstat neither follows a link nor opens a FIFO. Only a
+    # proved absence is absence; a stat that fails otherwise counts.
+    for run_dir in runs.all_run_dirs(project) or []:
+        try:
+            os.lstat(run_dir / _CTL_WINDOW_FILE)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
+        return f"a control window recorded for run {run_dir.name}"
+    return runs.live_run_evidence(project)
+
+
 def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     """(window_id, window_name) for parked control-session run windows whose run
     is no longer live — the kill candidates for a prune.
@@ -861,14 +888,24 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     PsmuxMultiplexer.list_windows reads every tag as empty, so an untagged row
     of ours whose run dir is gone is skipped here without a report. Telling an
     unreadable tag from an unset one needs an `on_fault` on list_windows, which
-    is a seam change. Likewise an unavailable backend still reads as no
-    candidates here (the early `return []`), a known residual left for a
-    separate decision.
+    is a seam change.
+
+    An unavailable backend is not folded into "no candidates" when this project
+    has evidence a control window could exist (_ctl_window_evidence): it raises,
+    so both prune callers report it (#864). Without that evidence it still
+    answers `[]` — a host with no multiplexer and nothing of ours to reach is a
+    clean scan, not a failure on every run.
     """
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
     if not mux_usable(mux):
-        return []
+        evidence = _ctl_window_evidence(project)
+        if evidence is None:
+            return []
+        raise MultiplexerError(
+            f"multiplexer backend {type(mux).__name__} is unavailable, but this "
+            f"project still has {evidence}; its control windows cannot be listed"
+        )
     # A False has-session is weaker than it looks (its seam note): a refused
     # connect reads the same as a missing session. So it only short-circuits
     # when list_window_ids agrees there is nothing — whose [] is a positive
@@ -972,7 +1009,36 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
         return [], [], [name for _win_id, name in candidates]
     removed = [name for win_id, name in candidates if win_id not in live]
     survived = [name for win_id, name in candidates if win_id in live]
+    _forget_pruned_records(
+        project, [(win_id, name) for win_id, name in candidates if win_id not in live]
+    )
     return removed, survived, []
+
+
+def _forget_pruned_records(project: Path, removed: list[tuple[str, str]]) -> None:
+    """Drop the ctl-window record of each run a verified prune removed the
+    RECORDED window of, so the evidence _ctl_window_evidence reads clears with
+    the window.
+
+    Matched by id against the verified removals, not by absence from the
+    post-kill listing: a run can hold more than one window, and a relaunch
+    racing this prune records a window that listing never saw — absent from
+    it, yet alive. Only a record naming a window this prune proved gone goes;
+    one naming any other window (a survivor, a newer launch, one that was never
+    a candidate) stays, and so does an unreadable one.
+
+    Ceiling: the read and the unlink are two steps, so a relaunch landing
+    between them still loses its record. That costs the attach/stop tie-break
+    a hint (ctl_window_id falls back to the name scan) and, with the backend
+    later unavailable, one piece of evidence — closing it needs a lock shared
+    with the launch path."""
+    gone_by_run: dict[str, set[str]] = {}
+    for win_id, name in removed:
+        if m := _CTL_WINDOW_RE.match(name):
+            gone_by_run.setdefault(m.group(1), set()).add(win_id)
+    for run_id, gone in gone_by_run.items():
+        if _read_ctl_window(project, run_id) in gone:
+            _forget_ctl_window(project, run_id)
 
 
 def ctl_session(project: Path) -> str:
