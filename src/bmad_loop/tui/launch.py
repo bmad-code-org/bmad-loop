@@ -840,6 +840,30 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
         mux.kill_window(win_id)
         if win_id in mux.list_window_ids(ctl_session(project)):
             raise MultiplexerError(f"control window {win_id} survived the kill")
+        # Verified gone, so the record must not stay behind as evidence a
+        # control window may exist: a later unavailable backend would read as a
+        # failed cleanup scan (#864). Same id-match rule as the prune
+        # (_forget_record_if_gone): only a record still naming the killed window
+        # is touched, never one a racing relaunch wrote. A hard stop kills the
+        # one window the lookup resolved, so a same-run window may still stand:
+        # the record is re-pointed at it, and the prune that later removes it
+        # clears the record by the same rule. A record beside only unproven
+        # windows stays as their evidence, and a lookup that cannot answer
+        # keeps it; the kill itself is already verified either way.
+        try:
+            remaining, left_unproven = ctl_window_lookup(project, run_id)
+        except MultiplexerError:
+            return unproven
+        if remaining is not None:
+            # _record_ctl_window forgets instead of writing for a run dir with
+            # no state.json, which would drop the standing window's evidence:
+            # there the record stays as it is. (A failed write forgets too —
+            # its documented fallback, left as a ceiling here.)
+            run_dir = runs.run_dir_for(project, run_id)
+            if runs.is_run(run_dir) and _read_ctl_window(project, run_id) == win_id:
+                _record_ctl_window(project, run_id, remaining)
+        elif left_unproven == 0:
+            _forget_record_if_gone(project, run_id, {win_id})
     return unproven
 
 
@@ -848,12 +872,12 @@ def _ctl_window_evidence(project: Path) -> str | None:
     a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
     raising on an unavailable backend in _ctl_window_candidates.
 
-    A verified prune drops the record of the window it removed
-    (_forget_pruned_records), so the evidence clears with the window. A record
-    whose window survived, could not be verified, or went some other way (a
-    stop) stays, and an unavailable backend is then reported rather than read
-    as clean: a false "nothing to prune" is the defect, a report that the scan
-    could not run is not."""
+    A verified prune or hard stop drops the record of the window it removed
+    (_forget_record_if_gone), so the evidence clears with the window. A record
+    whose window survived, could not be verified, or went some other way (it
+    exited by itself, or was closed by hand) stays, and an unavailable backend
+    is then reported rather than read as clean: a false "nothing to prune" is
+    the defect, a report that the scan could not run is not."""
     # Ungated, like live_run_evidence: a record outlives a lost state.json.
     # An unlistable runs dir yields nothing here and is named there instead.
     # Presence, not a read: a record that cannot be read still says a window
@@ -1037,8 +1061,17 @@ def _forget_pruned_records(project: Path, removed: list[tuple[str, str]]) -> Non
         if m := _CTL_WINDOW_RE.match(name):
             gone_by_run.setdefault(m.group(1), set()).add(win_id)
     for run_id, gone in gone_by_run.items():
-        if _read_ctl_window(project, run_id) in gone:
-            _forget_ctl_window(project, run_id)
+        _forget_record_if_gone(project, run_id, gone)
+
+
+def _forget_record_if_gone(project: Path, run_id: str, gone: set[str]) -> None:
+    """Drop `run_id`'s ctl-window record when it names one of the window ids in
+    `gone` — ids a caller has just verified removed. The one id-match rule for
+    the prune (_forget_pruned_records) and the hard stop (kill_ctl_window,
+    which also re-points a record at a same-run window still standing); see
+    the former for why it is an id match and for its race ceiling."""
+    if _read_ctl_window(project, run_id) in gone:
+        _forget_ctl_window(project, run_id)
 
 
 def ctl_session(project: Path) -> str:

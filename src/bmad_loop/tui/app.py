@@ -1843,7 +1843,11 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(self.notify, note, severity="warning")
 
     def action_cleanup_sessions(self) -> None:
-        if self._mux_missing():
+        if not launch.mux_available():
+            # No multiplexer: nothing to prune, but a project with recorded
+            # control windows or live runs must hear that its cleanup could not
+            # look, not just that the backend is missing (#864).
+            self._unavailable_cleanup_worker()
             return
 
         def done(ok: bool | None) -> None:
@@ -1858,6 +1862,37 @@ class BmadLoopApp(App[None]):
             ),
             done,
         )
+
+    @work(thread=True, group="lifecycle")
+    def _unavailable_cleanup_worker(self) -> None:
+        """The cleanup worker's two scan-failure toasts, for a backend that is
+        unavailable before the cleanup starts; the old backend-missing toast
+        when neither scan reports. A worker, not the foreground: the evidence
+        scans read run dirs every coding session can write (an engine.pid may
+        be a FIFO), so a stuck read must not freeze the dashboard.
+
+        A misconfigured process host (ProcessHostError) is a scan that could
+        not run, reported like one: an escape from a worker thread would take
+        the whole dashboard down."""
+        errors: list[str] = []
+        try:
+            session_error = runs.session_scan_error(self.project)
+        except ProcessHostError as e:
+            session_error = str(e)
+        if session_error is not None:
+            errors.append(f"session prune failed: {session_error}")
+        try:
+            launch.prunable_ctl_windows(self.project)
+        except (MultiplexerError, UnicodeError, ProcessHostError) as e:
+            errors.append(f"ctl window prune failed: {e}")
+        for message in errors:
+            self.call_from_thread(self.notify, message, severity="error", markup=False)
+        if not errors:
+            self.call_from_thread(
+                self.notify,
+                "multiplexer backend unavailable — launch/attach disabled",
+                severity="error",
+            )
 
     @work(thread=True, group="lifecycle")
     def _cleanup_sessions_worker(self) -> None:

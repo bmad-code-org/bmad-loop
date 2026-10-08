@@ -356,7 +356,11 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
             ids = (line.split("\t")[0] for line in rows.splitlines())
             out = "".join(f"{i}\n" for i in ids if i and i not in killed)
         elif argv[1] == "list-windows":
-            out = rows
+            # A killed window leaves the formatted listing too, as on a real
+            # server (kill_ctl_window re-looks the run up after its kill).
+            out = "".join(
+                f"{line}\n" for line in rows.splitlines() if line.split("\t")[0] not in killed
+            )
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -3250,3 +3254,90 @@ def test_prune_keeps_an_unreadable_record(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
     with pytest.raises(MultiplexerError, match="control window recorded"):
         launch.prunable_ctl_windows(tmp_path)
+
+
+def test_kill_ctl_window_forgets_the_record_of_the_window_it_verified_gone(
+    monkeypatch, tmp_path: Path
+):
+    # A hard stop verifies its kill like the prune does, so it clears the same
+    # evidence: a record left behind would make a later unavailable backend
+    # read as a failed cleanup scan.
+    _ctl_listing(monkeypatch, "@2\tresume-RID\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    assert launch.kill_ctl_window(tmp_path, "RID") == 0
+    assert not record.exists()
+
+
+def test_kill_ctl_window_keeps_the_record_while_a_same_run_window_stands(
+    monkeypatch, tmp_path: Path
+):
+    # The stop kills the recorded resume window; its parked predecessor @1 is
+    # still standing. With the engine gone the record is that window's only
+    # evidence, so it is re-pointed at @1 — and the prune that later verifies
+    # @1 gone clears it by the id-match rule, instead of keeping a record that
+    # names a window no prune will ever remove.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
+    assert launch.kill_ctl_window(tmp_path, "RID") == 0
+    assert record.read_text(encoding="utf-8") == "@1"
+    launch._forget_pruned_records(tmp_path, [("@1", "run-RID")])
+    assert not record.exists()
+
+
+def test_kill_ctl_window_does_not_repoint_a_record_a_racing_relaunch_wrote(
+    monkeypatch, tmp_path: Path
+):
+    # The record names @9, a window the listing never carried (a relaunch
+    # racing the stop), so the kill falls back to @1. A sibling @2 still
+    # stands, but the record is not the stop's to re-point: it stays @9.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@9")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
+    launch.kill_ctl_window(tmp_path, "RID")
+    assert record.read_text(encoding="utf-8") == "@9"
+
+
+def test_kill_ctl_window_keeps_the_record_of_a_run_without_state(monkeypatch, tmp_path: Path):
+    # A sibling stands, but the run dir has no state.json, where the record
+    # writer forgets instead of writing: re-pointing there would drop the
+    # standing window's only evidence, so the record stays as it is.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    assert launch.kill_ctl_window(tmp_path, "RID") == 0
+    assert record.read_text(encoding="utf-8") == "@2"
+
+
+def test_kill_ctl_window_keeps_the_record_beside_an_unproven_window(monkeypatch, tmp_path: Path):
+    # Only an untagged same-run window is left: nothing proves it ours, so no
+    # prune will remove it, and the record stays as its evidence.
+    _ctl_listing(monkeypatch, "@2\tresume-RID\n@1\trun-RID\t\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    assert launch.kill_ctl_window(tmp_path, "RID") == 1
+    assert record.read_text(encoding="utf-8") == "@2"
+
+
+def test_kill_ctl_window_keeps_a_record_naming_another_window(monkeypatch, tmp_path: Path):
+    # The record names a window the listing does not carry (a relaunch racing
+    # the stop), so the kill falls back to @1: only the killed id may go.
+    _ctl_listing(monkeypatch, "@1\trun-RID\n", tmp_path)
+    record = _write_record(tmp_path, "RID", "@9")
+    launch.kill_ctl_window(tmp_path, "RID")
+    assert record.read_text(encoding="utf-8") == "@9"
+
+
+def test_kill_ctl_window_keeps_the_record_of_a_window_that_survived(monkeypatch, tmp_path: Path):
+    tag = runs.project_tag(tmp_path)
+
+    def fake(argv, **kwargs):
+        out = ""
+        if argv[1] == "list-windows":
+            out = "@4\n" if argv[-1] == "#{window_id}" else f"@4\tresume-RID\t{tag}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")  # kill: no-op
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    record = _write_record(tmp_path, "RID", "@4")
+    with pytest.raises(MultiplexerError, match="survived the kill"):
+        launch.kill_ctl_window(tmp_path, "RID")
+    assert record.read_text(encoding="utf-8") == "@4"
