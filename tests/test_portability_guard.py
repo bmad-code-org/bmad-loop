@@ -1255,6 +1255,12 @@ JOURNAL_KINDS = frozenset(
         # `diagnostics._JOURNAL_DROP_FIELDS`; the run ids and `worktree` are benign.
         "unit-replay-start",
         "unit-replay-handoff",
+        # DW-534. A replay run's merge held back because its story is already done
+        # on the main checkout's board, or that board cannot be read, from
+        # `WorktreeFlow.refuse_superseded_replay`. `story_key` aliases by name,
+        # `replay_of` is benign, and `path` (the board) and `error` are presence-only
+        # in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "replay-merge-refused",
         # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
         # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
         # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from

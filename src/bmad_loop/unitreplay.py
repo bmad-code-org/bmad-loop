@@ -35,7 +35,12 @@ resume for `resolve --reverify` to ride (DW-522 re-arms a PAUSED run). The contr
 Refused, each with its own message (`runs.standalone_replay_refusal`): an in-place
 (non-worktree) task, a detached `scm.branch_per = "run"` unit, sweep runs,
 stories-mode runs, and a story already done on the main checkout's sprint board, or
-a board that cannot be read (DW-533). No LLM call anywhere: this is deterministic orchestration.
+a board that cannot be read (DW-533). The mint-time board read does not cover a replay
+run resumed later (`--no-resume`, or paused and resumed after another run finished the
+story), so `WorktreeFlow.refuse_superseded_replay` re-reads the main checkout's board
+right before the replay run's merge starts: a done row or an unreadable board journals
+``replay-merge-refused`` and keeps the branch and escalates, leaving the replay run paused
+(DW-534). No LLM call anywhere: this is deterministic orchestration.
 """
 
 from __future__ import annotations

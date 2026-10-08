@@ -66,6 +66,10 @@ breaking changes may land in a minor release.
   already `done` on the main checkout's sprint board (a later run re-drove and
   finished it), so the replay cannot merge superseded work; an unreadable board
   refuses too (DW-533).
+- Re-read the main checkout's board right before a replay run merges its unit, so a
+  replay minted with `--no-resume`, or resumed after another run finished the story,
+  keeps the branch and escalates (`replay-merge-refused`) instead of merging
+  superseded work; an unreadable board refuses too (DW-534).
 - Stop an in-place defer from stashing the spec before its rollback decides
   (DW-528). Moving the spec out first made the rollback pause on owned-spec
   recovery: with `rollback_on_failure` off it now pauses with the

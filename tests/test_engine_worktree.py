@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -11760,6 +11761,175 @@ def test_resolve_finished_run_refuses_a_story_already_done_on_the_board(
     assert _replay_dirs(engine) == [] and unit.is_dir()
     assert built == []
     assert _state_bytes(engine.run_dir) == finished_before
+
+
+def _mint_replay_then_resume(project, engine, marker, monkeypatch, board_edit) -> Path:
+    """Mint a replay of 1-1-a with `--no-resume`, let `board_edit` change the main
+    checkout (committed, as a later run's merge would leave it), then resume the
+    replay run with the environment back. Returns the replay run's dir."""
+    from bmad_loop import cli
+
+    _mock_adapters(monkeypatch)
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--no-resume") == 0
+    [replay_dir] = _replay_dirs(engine)
+    board_edit()
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "board moved while the replay waited")
+    marker.write_text("up\n")
+    cli.main(["resume", "--project", str(project.project), replay_dir.name])
+    return replay_dir
+
+
+def _assert_replay_merge_refused(project, replay_dir) -> dict:
+    """The replay run paused on 1-1-a escalated, its branch and worktree kept under
+    the replay run and its change kept off the target. Returns the refusal row."""
+    replay = load_state(replay_dir)
+    a = replay.tasks["1-1-a"]
+    assert not replay.finished and replay.paused_stage == PAUSE_ESCALATION
+    assert a.phase == Phase.ESCALATED
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    assert git(project.project, "rev-parse", "--verify", "-q", f"refs/heads/{a.branch}")
+    assert Path(a.worktree_path).is_dir()
+    rows = Journal(replay_dir).entries()
+    kinds = [e["kind"] for e in rows]
+    assert "unit-merged" not in kinds
+    [refused] = [e for e in rows if e["kind"] == "replay-merge-refused"]
+    assert refused["story_key"] == "1-1-a" and refused["replay_of"]
+    [escalated] = [e for e in rows if e["kind"] == "story-escalated"]
+    assert f"recover the work by hand from branch {a.branch!r}" in escalated["reason"]
+    return refused
+
+
+def test_replay_run_does_not_merge_a_story_done_on_the_board_since_mint(
+    project, tmp_path, monkeypatch
+):
+    """A replay minted with `--no-resume` waits; meanwhile another run finishes 1-1-a
+    and the main board says done. The resume replays and commits the unit, then
+    re-reads the main board before the merge and keeps the unit instead (DW-534).
+
+    Ablation: delete the `status != "done"` return's done arm in
+    `WorktreeFlow.refuse_superseded_replay` (return unconditionally on a read) and
+    the unit merges over the finished story."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+
+    replay_dir = _mint_replay_then_resume(
+        project, engine, marker, monkeypatch, lambda: set_sprint(project, "1-1-a", "done")
+    )
+
+    refused = _assert_replay_merge_refused(project, replay_dir)
+    assert refused["status"] == "done" and refused["error"] is None
+    assert load_state(replay_dir).tasks["1-1-a"].commit_sha  # replayed, then held back
+    [escalated] = [e for e in Journal(replay_dir).entries() if e["kind"] == "story-escalated"]
+    assert "story 1-1-a is already done on the sprint board" in escalated["reason"]
+
+
+def test_replay_run_does_not_merge_over_an_unreadable_board(project, tmp_path, monkeypatch):
+    """The main board cannot be read when the replay reaches its merge, so the done
+    question cannot be answered: the merge fails closed the same way (DW-534). The
+    read is faulted rather than the file corrupted: any edit to the tracked board
+    conflicts with the unit's own board commit, which would refuse the merge anyway.
+
+    Ablation: make `refuse_superseded_replay`'s except arm `return` and the unit
+    merges."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    main_board = project.sprint_status.resolve()
+    real_story_status = sprintstatus.story_status
+
+    from bmad_loop import cli
+
+    faulted = [True]
+
+    def story_status(path, key):
+        if faulted[0] and Path(path).resolve() == main_board:
+            raise sprintstatus.SprintStatusError(f"{path}: unreadable (test fault)")
+        return real_story_status(path, key)
+
+    def fault_main_board():
+        # after the mint, whose own DW-533 gate reads the same board
+        monkeypatch.setattr(sprintstatus, "story_status", story_status)
+        (project.project / "other.txt").write_text("a later run\n", encoding="utf-8")
+
+    replay_dir = _mint_replay_then_resume(project, engine, marker, monkeypatch, fault_main_board)
+
+    refused = _assert_replay_merge_refused(project, replay_dir)
+    assert refused["status"] is None and "unreadable (test fault)" in refused["error"]
+    [escalated] = [e for e in Journal(replay_dir).entries() if e["kind"] == "story-escalated"]
+    assert "cannot read the sprint board" in escalated["reason"]
+    assert f"bmad-loop resolve {replay_dir.name} --adopt-branch" in escalated["reason"]
+
+    # the remedy the reason names: with the board readable again, adopting the kept
+    # branch re-asks the board (not done) and merges the replayed work
+    faulted[0] = False
+    runs.adopt_escalated_branch(replay_dir, "1-1-a")
+    # the first resume ran in this process, so its engine.pid reads as live
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    cli.main(["resume", "--project", str(project.project), replay_dir.name])
+    replay = load_state(replay_dir)
+    assert replay.finished and replay.tasks["1-1-a"].phase == Phase.DONE
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
+@pytest.mark.parametrize(
+    ("replay", "first_integration", "asked"),
+    [(False, False, True), (True, True, True), (True, False, False)],
+    ids=["integrate", "terminal-first-integration", "merge-in-flight"],
+)
+def test_merge_local_asks_the_replay_board_gate_only_before_a_merge_starts(
+    project, monkeypatch, replay, first_integration, asked
+):
+    """`merge_local` asks `refuse_superseded_replay` before a fresh merge, including
+    the DW-385 terminal-unit arm (`first_integration`), but never on a resume replay
+    of a merge already in flight, which a refusal could strand half-landed (DW-534).
+
+    Ablation: narrow the call-site guard to `if not replay:` and the
+    terminal-first-integration row fails; widen it to every call and the
+    merge-in-flight row fails."""
+    engine, _ = make_engine(project, [])
+    flow = engine._worktree_flow
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DONE, commit_sha="0" * 40)
+
+    class Asked(Exception):
+        pass
+
+    class Merging(Exception):
+        pass
+
+    def gate(_task, _unit):
+        raise Asked
+
+    def past_the_gate(*_a, **_k):
+        raise Merging
+
+    monkeypatch.setattr(flow, "refuse_superseded_replay", gate)
+    monkeypatch.setattr(verify, "rev_parse_head", past_the_gate)
+    monkeypatch.setattr(flow, "prepare_publication", past_the_gate)
+    monkeypatch.setattr(flow, "_emit", lambda *_a, **_k: None)
+    unit = types.SimpleNamespace(path=project.project, branch="b", workspace=None)
+
+    with pytest.raises(Asked if asked else Merging):
+        flow.merge_local(task, unit, replay=replay, first_integration=first_integration)
+
+
+def test_replay_run_still_merges_a_story_not_done_on_the_board(project, tmp_path, monkeypatch):
+    """Control: another run's commit lands while the replay waits but leaves 1-1-a
+    short of done on the main board, so the resumed replay still merges (DW-534
+    refuses only a done row)."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") != "done"
+
+    replay_dir = _mint_replay_then_resume(
+        project,
+        engine,
+        marker,
+        monkeypatch,
+        lambda: (project.project / "other.txt").write_text("a later run\n", encoding="utf-8"),
+    )
+
+    replay = load_state(replay_dir)
+    assert replay.finished and replay.tasks["1-1-a"].phase == Phase.DONE
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    kinds = [e["kind"] for e in Journal(replay_dir).entries()]
+    assert "unit-merged" in kinds and "replay-merge-refused" not in kinds
 
 
 def test_resolve_finished_run_replay_re_defers_and_keeps_the_unit_under_the_replay(

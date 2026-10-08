@@ -33,7 +33,15 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, codex_trust, deferredwork, gates, verify, workspace_trust
+from . import (
+    artifact_publication,
+    codex_trust,
+    deferredwork,
+    gates,
+    sprintstatus,
+    verify,
+    workspace_trust,
+)
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
@@ -3406,6 +3414,8 @@ class WorktreeFlow:
         """Merge a DONE unit's branch into the target branch from the main repo."""
         if first_integration:
             self._emit("pre_integrate", task)
+        if not replay or first_integration:
+            self.refuse_superseded_replay(task, unit)
         if task.dw_ids:
             self.prepare_publication(task, unit.workspace.paths)
         receipt_required = False
@@ -4878,6 +4888,56 @@ class WorktreeFlow:
             f"`bmad-loop resume {self.state.run_id}`",
             task.story_key,
         )
+
+    def refuse_superseded_replay(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Keep a replay run's unit unmerged when its story is already done (DW-534).
+
+        `runs.standalone_replay_refusal` reads the board only when the replay run is
+        minted (DW-533). A replay minted with `--no-resume`, or one paused and resumed
+        later, can reach this merge after another run finished the story, and the
+        post-merge carry would not notice: `sprintstatus.advance` never regresses a
+        done row. So a replay run (`state.replay_of`) re-reads the story's row on the
+        MAIN checkout's board right before a merge starts. This run's own advances
+        land in the unit's copy, so the main row is never done on this run's behalf.
+        A done row, or a board that cannot be read, journals `replay-merge-refused`
+        and keeps the branch and escalates, the shape of every DONE unit that cannot
+        merge. Not asked while a merge is in flight (`merge_local`'s replay arms): a
+        refusal there could strand a half-landed merge."""
+        if not self.state.replay_of:
+            return
+        key = task.story_key
+        board = self.paths.sprint_status
+        by_hand = f"recover the work by hand from branch {task.branch!r}"
+        status: str | None = None
+        try:
+            status = sprintstatus.story_status(board, key)
+        except (sprintstatus.SprintStatusError, OSError, ValueError) as e:
+            error = str(e)
+            reason = (
+                f"replay run {self.state.run_id} cannot read the sprint board at {board} "
+                f"to rule out story {key} already being done ({e}), so its unit was not "
+                f"merged; fix the board, then `bmad-loop resolve {self.state.run_id} "
+                f"--adopt-branch` merges the kept branch (a plain re-arm discards it), or "
+                f"{by_hand}"
+            )
+        else:
+            if status != "done":
+                return
+            error = None
+            reason = (
+                f"story {key} is already done on the sprint board, so replay run "
+                f"{self.state.run_id}'s unit (replaying run {self.state.replay_of}) is "
+                f"superseded work and was not merged; {by_hand}"
+            )
+        self.journal.append(
+            "replay-merge-refused",
+            story_key=key,
+            replay_of=self.state.replay_of,
+            path=str(board),
+            status=status,
+            error=error,
+        )
+        self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
