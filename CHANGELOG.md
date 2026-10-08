@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `resolve <finished-run> --reverify --story <key>`: replay a finished
+  run's kept deferred worktree unit in a new replay run that takes the
+  worktree over and merges it on a pass; the finished run stays finished
+  (DW-525).
 - Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
   absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
   session registry instead of the derived per-project root; `bmad-loop mux`

@@ -413,6 +413,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # The kept worktree's path BEFORE the DW-525 replay moved it into the replay
+        # run (`unit-replay-start`, `unit-replay-handoff`): a host path embedding the
+        # finished run dir and the story slug, presence-only for `path`'s reason —
+        # `story_key` already correlates the record.
+        "from_worktree",
         # `pinned-config-edit-refused`'s (DW-368) per-file descriptions of a story's
         # edit to a pinned hook config: each quotes the worktree-relative config
         # path, the changed top-level keys of the operator's settings, and an

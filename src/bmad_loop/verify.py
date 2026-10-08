@@ -6849,6 +6849,16 @@ def worktree_remove(repo: Path, path: Path, force: bool = False) -> None:
         raise GitError(f"git worktree remove {path} failed: {out}")
 
 
+def worktree_move(repo: Path, src: Path, dst: Path) -> None:
+    """`git worktree move <src> <dst>`: relocate a linked worktree, updating git's
+    admin entry for it. ``dst`` must not exist and its parent must (git creates
+    neither). Used by the standalone kept-unit replay (DW-525) to hand a finished
+    run's kept unit to the replay run that now owns it. Raises GitError."""
+    rc, out = _git(repo, "worktree", "move", str(src), str(dst))
+    if rc != 0:
+        raise GitError(f"git worktree move {src} -> {dst} failed: {out}")
+
+
 def worktree_prune(repo: Path) -> None:
     """Drop administrative entries for worktrees whose directories are gone.
     Best-effort housekeeping — never raises. The return code is already ignored,

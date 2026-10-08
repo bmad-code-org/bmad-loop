@@ -1577,6 +1577,12 @@ class Engine:
     def _loop(self) -> None:
         self._finish_inflight()
         self._clear_accept_baseline()
+        if self.state.replay_of:
+            # DW-525: a replay run (`unitreplay`) owns only its seeded unit, which
+            # `_finish_inflight`'s reverify arm just drove — no `_pick_next`, no
+            # run-end retrospective, no auto-sweep. `_run_inner` still GCs, runs the
+            # DW-386 escalation check and records `finished`.
+            return
         while True:
             # First statement of the loop body: one site covers every story
             # boundary this base loop reaches — between stories, right after

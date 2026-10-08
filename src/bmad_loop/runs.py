@@ -6530,7 +6530,9 @@ def reverify_refusal(
     * it has a spec, a completed dev session whose result the replay can read and
       no failed dev or fix session after it, and
       no stories-mode plan review owed;
-    * the run is paused (a finished run has no resume to replay on). In place, the
+    * the run is paused (a finished run has no resume to replay on — its kept
+      worktree unit is replayed by a new run instead, `standalone_replay_refusal`
+      and `unitreplay`, DW-525). In place, the
       pause must be the escalation stage naming THIS story, and the story the last
       one the run picked — any later story's commits would otherwise be squashed
       into this one's. A worktree unit squashes only its own branch, and an isolated
@@ -6547,47 +6549,15 @@ def reverify_refusal(
     """
     run_id = state.run_id
     rearm_hint = f"`bmad-loop resolve {run_id}`"
-    if state.run_type == "sweep":
-        return (
-            f"--reverify is not supported for sweep runs ({story_key}); re-arm it with "
-            f"{rearm_hint} instead"
-        )
-    if task.phase == Phase.ESCALATED:
-        if not env_fault_site_reverifiable(task):
-            return (
-                f"story {story_key} is escalated for a reason a verify replay cannot clear "
-                f"(environment fault site: {task.env_fault_site or 'none'}); resolve it "
-                f"with {rearm_hint}"
-            )
-    elif task.phase != Phase.DEFERRED:
-        return (
-            f"story {story_key} is neither deferred nor escalated (phase: {task.phase}), "
-            "so there is nothing to re-verify"
-        )
-    if not task.spec_file:
-        return f"story {story_key} has no story spec, so there is nothing to re-verify"
-    latest = latest_completed_dev_record(task)
-    if latest is None or latest.result_json is None:
-        return (
-            f"story {story_key} has no completed dev session result to re-verify; "
-            f"re-arm it with {rearm_hint}"
-        )
-    # The completed record must BE the latest dev-role one (fix sessions included):
-    # a crashed or timed-out session after it left its partial work on the tree,
-    # which the earlier result does not describe. The escalated sites check this in
-    # `env_fault_site_reverifiable`; a DEFERRED story reaches here without it.
-    last_dev = next(s for s in reversed(task.sessions) if s.role == "dev" and not s.label)
-    if last_dev is not latest:
-        return (
-            f"story {story_key}'s latest dev session ({last_dev.task_id}) ended "
-            f"{last_dev.status}, so the tree holds its partial work, not a finished "
-            f"attempt; re-arm it with {rearm_hint}"
-        )
-    if task.plan_review_owed or task.plan_checkpoint_pending:
-        return (
-            f"story {story_key} still owes a plan review, so its implementation cannot be "
-            "re-verified yet"
-        )
+    refusal = _reverify_task_refusal(
+        state,
+        task,
+        story_key,
+        remedy=f"re-arm it with {rearm_hint}",
+        escalated_remedy=f"resolve it with {rearm_hint}",
+    )
+    if refusal is not None:
+        return refusal
     mounted = bool(task.worktree_path)
     if state.finished or state.paused_stage is None:
         # A finished run has no resume left to replay on.
@@ -6612,23 +6582,20 @@ def reverify_refusal(
             f"a later story was picked after {story_key}, so the tree is no longer its "
             "attempt alone; an in-place replay would squash that work into this story"
         )
-    try:
-        paths = bmadconfig.load_paths(project_root)
-    except bmadconfig.BmadConfigError as e:
-        return f"cannot read the BMAD config to locate the code root ({e})"
+    paths, refusal = _reverify_root_refusal(state, task, story_key, project_root=project_root)
+    if refusal is not None:
+        return refusal
+    assert paths is not None
     code_root = state.code_root
-    if str(paths.repo_root) != str(code_root):
-        return (
-            f"the code root in the BMAD config has changed since run {run_id} started; "
-            "the attempt this replay would verify lives in the previous tree — restore "
-            "the previous `repo_root` value first"
-        )
-    baseline = task.baseline_commit
-    if not baseline:
-        return f"story {story_key} has no recorded baseline, so its attempt cannot be located"
+    baseline = task.baseline_commit or ""
     if mounted:
         return _mounted_reverify_refusal(
-            state, task, story_key, run_dir=run_dir, paths=paths, rearm_hint=rearm_hint
+            state,
+            task,
+            story_key,
+            run_dir=run_dir,
+            paths=paths,
+            remedy=f"re-arm it with {rearm_hint}",
         )
     try:
         verify.rev_parse_head(code_root)
@@ -6662,6 +6629,203 @@ def reverify_refusal(
     return None
 
 
+def _reverify_task_refusal(
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    remedy: str,
+    escalated_remedy: str,
+) -> str | None:
+    """The task-level preconditions of a verify replay, shared by `reverify_refusal`
+    (a paused run) and `standalone_replay_refusal` (a finished run, DW-525) so the
+    two entries cannot drift: a story run, a DEFERRED or reverifiable env-fault
+    ESCALATED story, a spec, a completed dev result that IS the latest dev-role
+    session, and no plan review owed. ``remedy`` / ``escalated_remedy`` are the
+    clauses naming what the operator can do instead, which differ by entry (a
+    finished run has no re-arm)."""
+    if state.run_type == "sweep":
+        return f"--reverify is not supported for sweep runs ({story_key}); {remedy} instead"
+    if task.phase == Phase.ESCALATED:
+        if not env_fault_site_reverifiable(task):
+            return (
+                f"story {story_key} is escalated for a reason a verify replay cannot clear "
+                f"(environment fault site: {task.env_fault_site or 'none'}); "
+                f"{escalated_remedy}"
+            )
+    elif task.phase != Phase.DEFERRED:
+        return (
+            f"story {story_key} is neither deferred nor escalated (phase: {task.phase}), "
+            "so there is nothing to re-verify"
+        )
+    if not task.spec_file:
+        return f"story {story_key} has no story spec, so there is nothing to re-verify"
+    latest = latest_completed_dev_record(task)
+    if latest is None or latest.result_json is None:
+        return f"story {story_key} has no completed dev session result to re-verify; {remedy}"
+    # The completed record must BE the latest dev-role one (fix sessions included):
+    # a crashed or timed-out session after it left its partial work on the tree,
+    # which the earlier result does not describe. The escalated sites check this in
+    # `env_fault_site_reverifiable`; a DEFERRED story reaches here without it.
+    last_dev = next(s for s in reversed(task.sessions) if s.role == "dev" and not s.label)
+    if last_dev is not latest:
+        return (
+            f"story {story_key}'s latest dev session ({last_dev.task_id}) ended "
+            f"{last_dev.status}, so the tree holds its partial work, not a finished "
+            f"attempt; {remedy}"
+        )
+    if task.plan_review_owed or task.plan_checkpoint_pending:
+        return (
+            f"story {story_key} still owes a plan review, so its implementation cannot be "
+            "re-verified yet"
+        )
+    return None
+
+
+def _reverify_root_refusal(
+    state: RunState, task: StoryTask, story_key: str, *, project_root: Path
+) -> tuple[bmadconfig.ProjectPaths | None, str | None]:
+    """``(paths, None)`` when the run's code root is still the live repository root
+    and the story has a baseline, else ``(None, refusal)``. Shared by both replay
+    entries, like `_reverify_task_refusal`."""
+    try:
+        paths = bmadconfig.load_paths(project_root)
+    except bmadconfig.BmadConfigError as e:
+        return None, f"cannot read the BMAD config to locate the code root ({e})"
+    if str(paths.repo_root) != str(state.code_root):
+        return None, (
+            f"the code root in the BMAD config has changed since run {state.run_id} "
+            "started; the attempt this replay would verify lives in the previous tree — "
+            "restore the previous `repo_root` value first"
+        )
+    if not task.baseline_commit:
+        return None, (
+            f"story {story_key} has no recorded baseline, so its attempt cannot be located"
+        )
+    return paths, None
+
+
+def standalone_replay_refusal(
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    run_dir: Path,
+    project_root: Path,
+) -> str | None:
+    """Why `resolve <finished-run> --reverify --story <key>` cannot mint a replay run
+    for this story's kept unit, or None when it can (DW-525, `unitreplay`).
+
+    Shared by the CLI's early exit and `unitreplay.mint_replay_run`'s locked
+    re-check. A finished run has no resume, so the replay rides a NEW run that takes
+    the kept worktree over; the preconditions are the paused entry's
+    (`_reverify_task_refusal`, `_reverify_root_refusal`, `_mounted_reverify_refusal`)
+    plus the shape only a finished isolated story run can hand over: the run is
+    finished, a sprint-status story run (not a sweep, not stories mode), the story
+    DEFERRED (a finished run never holds an ESCALATED task — DW-386) in a kept
+    worktree unit on its own branch, with a target branch to merge into.
+
+    No remedy here names `bmad-loop resolve <run>` without `--reverify`: resolve
+    refuses a finished run, so every one points at recovering the work by hand.
+    Any git fault refuses."""
+    run_id = state.run_id
+    patch = run_dir / "failed" / safe_segment(story_key) / "changes.patch"
+    sources = [f"branch {task.branch!r}"] if task.branch else []
+    if patch.is_file():
+        sources.append(f"the diff saved at {patch}")
+    by_hand = f"run {run_id} is finished and cannot be re-armed, so recover the work by hand"
+    if sources:
+        by_hand += " from " + " or ".join(sources)
+    if not state.finished:
+        return (
+            f"run {run_id} is not finished; re-verify its story with "
+            f"`bmad-loop resolve {run_id} --reverify --story {story_key}`"
+        )
+    if state.run_type == "sweep":
+        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; " f"{by_hand}"
+    if state.source == "stories":
+        return (
+            f"a finished stories-mode run's story ({story_key}) cannot be replayed "
+            f"(sprint-status runs only); {by_hand}"
+        )
+    if task.phase != Phase.DEFERRED:
+        return (
+            f"story {story_key} is not deferred (phase: {task.phase}), so finished run "
+            f"{run_id} holds no kept unit of it to re-verify"
+        )
+    if not task.worktree_path:
+        return (
+            f"story {story_key} was deferred in place, and only a worktree unit's kept "
+            f"worktree outlives a finished run; {by_hand}"
+        )
+    if not state.target_branch:
+        return f"run {run_id} recorded no target branch to merge story {story_key} into"
+    # A unit an earlier replay took over is not "gone": a replay run owns it (and may
+    # have merged it). Read before the mounted checks, whose torn-down-unit wording
+    # would send the operator to recover work that is no longer this run's. An
+    # unreadable journal skips the check — visibly: a mounted refusal then says the
+    # hand-off could not be ruled out.
+    entries = journal_entries_or_none(run_dir)
+    handed_to = next(
+        (
+            str(e.get("replay_run", ""))
+            for e in reversed(entries or [])
+            if e.get("kind") == "unit-replay-handoff" and e.get("story_key") == story_key
+        ),
+        None,
+    )
+    if handed_to is not None:
+        return (
+            f"story {story_key}'s kept unit was already handed to replay run {handed_to}; "
+            f"see `bmad-loop status {handed_to}`"
+        )
+    refusal = _reverify_task_refusal(
+        state, task, story_key, remedy=by_hand, escalated_remedy=by_hand
+    )
+    if refusal is not None:
+        return refusal
+    paths, refusal = _reverify_root_refusal(state, task, story_key, project_root=project_root)
+    if refusal is not None:
+        return refusal
+    assert paths is not None
+    refusal = _mounted_reverify_refusal(
+        state, task, story_key, run_dir=run_dir, paths=paths, remedy=by_hand
+    )
+    if refusal is not None and entries is None:
+        refusal += (
+            f" (run {run_id}'s journal could not be read, so an earlier replay "
+            "hand-off of this unit could not be ruled out)"
+        )
+    return refusal
+
+
+def latch_for_reverify(task: StoryTask, origin: str) -> None:
+    """Latch ``task`` for a verify replay of its kept attempt (DW-522): DEV_VERIFY
+    with `reverify_from` = ``origin``, and everything a replay must not inherit reset.
+    The one definition shared by `_rearm_for_reverify_locked` (a paused run) and
+    `unitreplay.mint_replay_run` (a finished run's unit, DW-525).
+
+    Deliberate direct assignment, not a state-machine transition: DEFERRED and
+    ESCALATED have no legal exit (mirrors `adopt_escalated_branch` and
+    `_rearm_escalation_locked`), and DEV_VERIFY is the persisted "dev product on the
+    tree, verify it" phase the engine's reverify arm replays."""
+    task.phase = Phase.DEV_VERIFY
+    task.reverify_from = origin
+    # A prior replay's post-PROCEED marker (DW-527) belongs to that continuation; this
+    # replay sets its own when it PROCEEDs.
+    task.reverify_replayed = ""
+    # MANDATORY: a task still carrying a defer reason is re-deferred by the mounted
+    # defer-replay arm of `_finish_inflight` instead of being replayed.
+    task.defer_reason = None
+    task.generation += 1  # #705: no session id the earlier attempt minted is reused
+    task.review_cycle = 0
+    task.followup_reviews_spent = 0
+    task.salvage_refile_pending = False
+    task.adopt_pending = False
+    task.rearmed = False  # not a clean rebuild: the tree is kept
+    task.env_fault_site = None  # the operator vouches the environment is fixed (DW-523)
+
+
 def _mounted_reverify_refusal(
     state: RunState,
     task: StoryTask,
@@ -6669,9 +6833,11 @@ def _mounted_reverify_refusal(
     *,
     run_dir: Path,
     paths: bmadconfig.ProjectPaths,
-    rearm_hint: str,
+    remedy: str,
 ) -> str | None:
-    """`reverify_refusal`'s worktree arm: the kept unit must still be the attempt.
+    """`reverify_refusal`'s worktree arm, shared with `standalone_replay_refusal`
+    (DW-525): the kept unit must still be the attempt. ``remedy`` is the clause
+    naming what the operator can do instead.
 
     The engine's reverify arm reopens the mount through `reopen_unit`, which demands
     a registered worktree on the recorded branch, so the same shape is refused here
@@ -6684,14 +6850,14 @@ def _mounted_reverify_refusal(
         kept = f"; its diff was saved at {patch}" if patch.is_file() else ""
         return (
             f"the worktree for story {story_key} ({wt}) is gone (scm.keep_failed off){kept}; "
-            f"there is no kept unit to re-verify, re-arm it with {rearm_hint}"
+            f"there is no kept unit to re-verify, {remedy}"
         )
     baseline = task.baseline_commit or ""
     try:
         if not verify.worktree_is_registered(state.code_root, wt):
             return (
                 f"{wt} is no longer a worktree of {state.code_root}, so it is not "
-                f"story {story_key}'s kept unit; re-arm it with {rearm_hint}"
+                f"story {story_key}'s kept unit; {remedy}"
             )
         branch = verify.current_branch(wt)
         if branch != task.branch:
@@ -6702,7 +6868,7 @@ def _mounted_reverify_refusal(
             )
             return (
                 f"the worktree for story {story_key} is on {on}, not its unit branch "
-                f"{task.branch!r}; re-arm it with {rearm_hint}"
+                f"{task.branch!r}; {remedy}"
             )
         if not verify.is_ancestor(wt, baseline, "HEAD"):
             return (
@@ -6723,7 +6889,7 @@ def _mounted_reverify_refusal(
     if not has_product:
         return (
             f"the worktree holds nothing above story {story_key}'s baseline; there is no "
-            f"product to re-verify, re-arm it with {rearm_hint}"
+            f"product to re-verify, {remedy}"
         )
     if not spec_path.is_file():
         return (
@@ -6806,25 +6972,8 @@ def _rearm_for_reverify_locked(
     # DW-446, as `_rearm_escalation_locked`: reconcile the mint-time root identities
     # before the pinned spec write below; persisted by the `save_state` that commits.
     reconcile_root_identities(state, run_dir, journal, live_project)
-    # Deliberate direct assignment, not a state-machine transition: DEFERRED and
-    # ESCALATED have no legal exit (mirrors `adopt_escalated_branch` and
-    # `_rearm_escalation_locked`), and DEV_VERIFY is the persisted "dev product on the
-    # tree, verify it" phase the engine's reverify arm replays.
-    task.phase = Phase.DEV_VERIFY
-    task.reverify_from = origin
-    # A prior replay's post-PROCEED marker (DW-527) belongs to that continuation; this
-    # replay sets its own when it PROCEEDs.
-    task.reverify_replayed = ""
-    # MANDATORY: a task still carrying a defer reason is re-deferred by the mounted
-    # defer-replay arm of `_finish_inflight` instead of being replayed.
-    task.defer_reason = None
-    task.generation += 1  # #705: no session id the earlier attempt minted is reused
-    task.review_cycle = 0
-    task.followup_reviews_spent = 0
-    task.salvage_refile_pending = False
-    task.adopt_pending = False
-    task.rearmed = False  # not a clean rebuild: the tree is kept
-    task.env_fault_site = None  # the operator vouches the environment is fixed (DW-523)
+    # The one latch reset, shared with the finished-run replay mint (DW-525).
+    latch_for_reverify(task, origin)
 
     spec_path = live_spec_path(task, state, live_project)
     restored = False

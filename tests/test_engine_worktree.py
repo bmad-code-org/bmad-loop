@@ -11585,3 +11585,316 @@ def test_reverify_refuses_a_finished_run(project, tmp_path):
     engine, _ = _deferred_unit_then_escalation(project, tmp_path, escalate_b=False)
     assert load_state(engine.run_dir).finished
     _refused_reverify(engine, explicit_story=True, match="is not paused")
+
+
+# ------------------------- resolve <finished-run> --reverify --story (DW-525)
+
+
+def _finished_kept_unit(project, tmp_path, **scm):
+    """A FINISHED isolated run whose deferred unit 1-1-a kept its worktree and branch
+    (the verify marker was missing), with the base skills installed and a policy.toml
+    on disk matching the run's — what `resolve`'s preflights and the replay run's
+    resume read. Returns (engine, marker); the marker is still missing."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)  # committed by the helper's `commit_sprint`
+    engine, marker = _deferred_unit_then_escalation(project, tmp_path, escalate_b=False, **scm)
+    assert load_state(engine.run_dir).finished
+    scm_rows = "".join(f"{k} = {json.dumps(v)}\n" for k, v in scm.items())
+    (project.project / ".bmad-loop" / "policy.toml").write_text(
+        '[gates]\nmode = "none"\n[notify]\ndesktop = false\nfile = true\n'
+        f'[scm]\nisolation = "worktree"\n{scm_rows}'
+        "[limits]\nmax_dev_attempts = 1\nmax_followup_reviews = 99\n"
+        f"[verify]\ncommands = [{json.dumps(_file_exists_cmd(marker))}]\n",
+        encoding="utf-8",
+    )
+    return engine, marker
+
+
+def _resolve_finished(project, engine, *extra):
+    from bmad_loop import cli
+
+    return cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project.project),
+            engine.run_dir.name,
+            "--reverify",
+            *extra,
+        ]
+    )
+
+
+def _mock_adapters(monkeypatch) -> list[MockAdapter]:
+    """Stub the CLI's adapter build with script-less mocks; returns the box the
+    built adapters land in, so a test can assert no session ran."""
+    from bmad_loop import cli
+
+    built: list[MockAdapter] = []
+
+    def make(*_a, **_k):
+        adapters = {role: MockAdapter([]) for role in cli.ROLES}
+        built.extend(adapters.values())
+        return adapters
+
+    monkeypatch.setattr(cli, "_make_adapters", make)
+    return built
+
+
+def _replay_dirs(engine) -> list[Path]:
+    return sorted(p for p in engine.run_dir.parent.iterdir() if p != engine.run_dir)
+
+
+def test_resolve_finished_run_replays_the_kept_unit_in_a_new_run(
+    project, tmp_path, monkeypatch, capsys
+):
+    """DW-525 end to end: a finished isolated run's kept DEFERRED unit, once the
+    environment is back, is replayed by `resolve <run> --reverify --story K --resume`
+    in a NEW replay run that merges the unit into the target branch and finishes —
+    no dev session — while the finished run's state.json stays byte-identical and its
+    journal gains only the `unit-replay-handoff` pointer. A second replay of the same
+    unit refuses: the move took the worktree (the double-replay guard)."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+    branch = engine.state.tasks["1-1-a"].branch
+    marker.write_text("up\n")  # the operator restarts the container
+    built = _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
+
+    assert _state_bytes(engine.run_dir) == finished_before
+    assert load_state(engine.run_dir).finished
+    [replay_dir] = _replay_dirs(engine)
+    replay = load_state(replay_dir)
+    assert replay.replay_of == engine.run_dir.name and replay.finished and not replay.paused
+    a = replay.tasks["1-1-a"]
+    assert a.phase == Phase.DONE and a.commit_sha and a.reverify_from == ""
+    assert list(replay.tasks) == ["1-1-a"]
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert all(adapter.sessions == [] for adapter in built)
+    assert not unit.exists()  # moved out of the finished run, then torn down at merge
+    replay_rows = Journal(replay_dir).entries()
+    assert replay_rows[0]["kind"] == "unit-replay-start"
+    assert replay_rows[0]["replay_of"] == engine.run_dir.name
+    assert replay_rows[0]["branch"] == branch and replay_rows[0]["from_worktree"] == str(unit)
+    kinds = [e["kind"] for e in replay_rows]
+    assert "resume-reverify" in kinds and "unit-merged" in kinds and "run-complete" in kinds
+    assert "story-start" not in kinds  # `_loop` picked nothing else
+    handoff = Journal(engine.run_dir).entries()[-1]
+    assert handoff["kind"] == "unit-replay-handoff"
+    assert handoff["replay_run"] == replay_dir.name and handoff["story_key"] == "1-1-a"
+
+    # the finished run no longer holds the unit: a second replay refuses, naming the
+    # replay run that owns it (not "gone"), and mints nothing
+    capsys.readouterr()
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 1
+    err = capsys.readouterr().err
+    assert f"handed to replay run {replay_dir.name}" in err and "is gone" not in err
+    assert _replay_dirs(engine) == [replay_dir]
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
+def test_resolve_finished_run_no_resume_leaves_the_replay_resumable(
+    project, tmp_path, monkeypatch, capsys
+):
+    """`--no-resume` mints the replay run — worktree moved under it, task latched —
+    and leaves it neither paused nor finished, naming the resume gesture; the
+    finished run is untouched apart from its handoff pointer."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    old_unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+    _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--no-resume") == 0
+
+    [replay_dir] = _replay_dirs(engine)
+    assert f"resume when ready: bmad-loop resume {replay_dir.name}" in capsys.readouterr().out
+    replay = load_state(replay_dir)
+    assert not replay.finished and not replay.paused
+    a = replay.tasks["1-1-a"]
+    assert a.phase == Phase.DEV_VERIFY and a.reverify_from == "deferred"
+    assert Path(a.worktree_path).parent == replay_dir / "worktrees"
+    assert Path(a.worktree_path).is_dir() and not old_unit.exists()
+    assert current_branch(Path(a.worktree_path)) == a.branch
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
+def test_resolve_finished_run_without_story_errors(project, tmp_path, monkeypatch, capsys):
+    """No `--story`: refused naming the flag, nothing minted, nothing moved."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+
+    assert _resolve_finished(project, engine, "--resume") == 1
+
+    assert "--story <key>" in capsys.readouterr().err
+    assert _replay_dirs(engine) == [] and unit.is_dir()
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
+def test_resolve_finished_run_replay_re_defers_and_keeps_the_unit_under_the_replay(
+    project, tmp_path, monkeypatch
+):
+    """A replay before the environment is back re-defers the unit; the replay run
+    finishes with the unit DEFERRED and its worktree kept under the REPLAY run, so the
+    replay run itself is replayable in turn."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
+
+    [replay_dir] = _replay_dirs(engine)
+    replay = load_state(replay_dir)
+    a = replay.tasks["1-1-a"]
+    assert replay.finished and a.phase == Phase.DEFERRED
+    assert Path(a.worktree_path).is_dir()
+    assert Path(a.worktree_path).parent == replay_dir / "worktrees"
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    assert (
+        runs.standalone_replay_refusal(
+            replay, a, "1-1-a", run_dir=replay_dir, project_root=project.project
+        )
+        is None
+    )
+
+
+def test_resolve_finished_run_replay_that_escalates_leaves_the_replay_run_paused(
+    project, tmp_path, monkeypatch
+):
+    """A replay whose verify fails on a resolved re-drive re-escalates rather than
+    re-defers (`escalation.decide_reverify`): the REPLAY run ends paused at that
+    escalation, resumable by the ordinary `resolve`, with the unit's worktree kept
+    under it — and the finished run stays finished, its state.json untouched."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished = load_state(engine.run_dir)
+    finished.tasks["1-1-a"].resolved_redrive = True
+    save_state(engine.run_dir, finished)
+    finished_before = _state_bytes(engine.run_dir)
+    _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
+
+    [replay_dir] = _replay_dirs(engine)
+    replay = load_state(replay_dir)
+    a = replay.tasks["1-1-a"]
+    assert not replay.finished and replay.paused_stage == PAUSE_ESCALATION
+    assert replay.paused_story_key == "1-1-a" and a.phase == Phase.ESCALATED
+    assert Path(a.worktree_path).is_dir()
+    assert Path(a.worktree_path).parent == replay_dir / "worktrees"
+    assert _state_bytes(engine.run_dir) == finished_before
+    assert load_state(engine.run_dir).finished
+
+
+@pytest.mark.parametrize(
+    ("dirty", "fragment"),
+    [("checkout", "git checkout"), ("edit", "commit or stash")],
+    ids=["off-target-branch", "dirty-checkout"],
+)
+def test_resolve_finished_run_refuses_an_unready_main_checkout(
+    project, tmp_path, monkeypatch, capsys, dirty, fragment
+):
+    """The unit merges into the main checkout, so it must be clean and on the run's
+    target branch before anything is minted.
+
+    Ablation: delete the on-target (resp. clean) check in
+    `cli._resolve_reverify_finished` and the replay is minted."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    if dirty == "checkout":
+        git(project.project, "checkout", "-q", "-b", "elsewhere")
+    else:
+        (project.project / "src.txt").write_text("operator edit\n")
+    monkeypatch.setattr(
+        "bmad_loop.cli._confirm", lambda _q: pytest.fail("prompted for a refused replay")
+    )
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a") == 1
+
+    assert fragment in capsys.readouterr().err
+    assert _replay_dirs(engine) == []
+    assert Path(engine.state.tasks["1-1-a"].worktree_path).is_dir()
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
+def test_resolve_finished_run_confirm_declined_creates_nothing(
+    project, tmp_path, monkeypatch, capsys
+):
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    monkeypatch.setattr("bmad_loop.cli._confirm", lambda _q: False)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a") == 0
+
+    captured = capsys.readouterr()
+    assert "NEW replay run" in captured.err and "stays finished" in captured.err
+    assert "cancelled" in captured.out
+    assert _replay_dirs(engine) == []
+    assert Path(engine.state.tasks["1-1-a"].worktree_path).is_dir()
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
+def test_resolve_finished_run_force_admits_an_unknown_liveness(project, tmp_path, monkeypatch):
+    """`--force` reaches the mint's locked re-check: an unverifiable engine liveness
+    on the finished run still mints the replay run."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--no-resume", "--force") == 0
+
+    [replay_dir] = _replay_dirs(engine)
+    assert load_state(replay_dir).replay_of == engine.run_dir.name
+
+
+def _drop_base_skills(project, _monkeypatch):
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree)
+
+
+def _isolation_conflict(_project, monkeypatch):
+    from bmad_loop import bmadconfig
+
+    monkeypatch.setattr(
+        bmadconfig, "worktree_isolation_conflict", lambda *_a: "error: isolation conflict"
+    )
+
+
+def _under_floor_git(_project, monkeypatch):
+    import subprocess
+
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=b"git version 2.25.1\n", stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [_drop_base_skills, _isolation_conflict, _under_floor_git],
+    ids=["missing-skill", "isolation", "git-floor"],
+)
+def test_resolve_finished_run_preflight_refusal_mints_nothing(
+    project, tmp_path, monkeypatch, arrange
+):
+    """A resume preflight the replay run would fail refuses BEFORE anything is
+    minted, so no replay run is left owning the moved worktree."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    finished_before = _state_bytes(engine.run_dir)
+    unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+    arrange(project, monkeypatch)
+    _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 1
+
+    assert _replay_dirs(engine) == []
+    assert unit.is_dir()
+    assert _state_bytes(engine.run_dir) == finished_before

@@ -35,7 +35,7 @@ from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import RunState, StoryTask
+from bmad_loop.model import Phase, RunState, StoryTask
 from bmad_loop.process_host import ProcessHost
 
 
@@ -10242,6 +10242,152 @@ def test_rearm_for_reverify_locked_body_holds_the_run_lock_through_save(tmp_path
     monkeypatch.setattr(runs, "save_state", checked_save)
 
     runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+
+# --------------------------- standalone_replay_refusal: finished runs (DW-525)
+
+
+def _finished_mounted_run(tmp_path):
+    """`_reverify_run`'s attempt moved into a kept worktree unit of a FINISHED
+    isolated run: a registered worktree on the unit branch under the run dir, holding
+    a committed change above the baseline and the spec — the shape a deferred unit
+    leaves behind under `scm.keep_failed`. Returns (run_dir, project, worktree)."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = run_dir / "worktrees" / _REVERIFY_KEY
+    wt.parent.mkdir(parents=True)
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit or "")
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / _REVERIFY_SPEC_REL
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes(_REVERIFY_SPEC_BYTES)
+    task.worktree_path = str(wt)
+    task.branch = branch
+    state.clear_pause()
+    state.finished = True
+    state.target_branch = "main"
+    save_state(run_dir, state)
+    return run_dir, project, wt
+
+
+def _standalone_refusal(run_dir, project):
+    state = load_state(run_dir)
+    return runs.standalone_replay_refusal(
+        state,
+        state.tasks[_REVERIFY_KEY],
+        _REVERIFY_KEY,
+        run_dir=run_dir,
+        project_root=project,
+    )
+
+
+def test_standalone_replay_admits_a_finished_runs_kept_unit(tmp_path):
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def _remove_worktree(run_dir, project):
+    wt = Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path)
+    git(project, "worktree", "remove", "--force", str(wt))
+
+
+def _detach_worktree(run_dir, _project):
+    git(Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path), "checkout", "-q", "--detach")
+
+
+# Each row: (id, arrange, expected refusal fragment). The first six gate the shape
+# only a finished isolated story run can hand over; the rest are the shared
+# `_reverify_task_refusal` / `_mounted_reverify_refusal` arms, reached with the
+# finished-run remedy.
+_STANDALONE_REFUSALS = [
+    ("not_finished", _state_edit(lambda s, _t: setattr(s, "finished", False)), "is not finished"),
+    ("sweep_run", _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")), "sweep run"),
+    ("stories_mode", _state_edit(lambda s, _t: setattr(s, "source", "stories")), "stories-mode"),
+    (
+        "not_deferred",
+        _state_edit(lambda _s, t: setattr(t, "phase", Phase.DONE)),
+        "is not deferred (phase: done)",
+    ),
+    ("in_place", _state_edit(lambda _s, t: setattr(t, "worktree_path", "")), "deferred in place"),
+    (
+        "no_target_branch",
+        _state_edit(lambda s, _t: setattr(s, "target_branch", "")),
+        "no target branch",
+    ),
+    (
+        "no_completed_dev_result",
+        _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
+        "no completed dev session result",
+    ),
+    (
+        "plan_review_owed",
+        _state_edit(lambda _s, t: setattr(t, "plan_review_owed", True)),
+        "still owes a plan review",
+    ),
+    ("worktree_gone", _remove_worktree, "is gone"),
+    ("detached", _detach_worktree, "detached HEAD"),
+]
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [pytest.param(*row[1:], id=row[0]) for row in _STANDALONE_REFUSALS],
+)
+def test_standalone_replay_refuses(tmp_path, arrange, fragment):
+    """Every refusal row names its reason; none tells the operator to run a bare
+    `bmad-loop resolve <run>` (resolve refuses a finished run) — the remedy points at
+    recovering the work by hand.
+
+    Ablation: delete the `wt.is_dir()` check in `runs._mounted_reverify_refusal` and
+    the worktree-gone row fails (it falls to the registration check's message);
+    delete the `current_branch` check there and the detached row is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    arrange(run_dir, project)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and fragment in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+def test_standalone_replay_remedy_names_the_branch_and_saved_patch(tmp_path):
+    """A torn-down unit's refusal points at the branch and the diff the teardown
+    saved, not at a re-arm."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    patch = run_dir / "failed" / _REVERIFY_KEY / "changes.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff\n", encoding="utf-8")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert "recover the work by hand" in refusal
+    assert f"bmad-loop/r1/{_REVERIFY_KEY}" in refusal and str(patch) in refusal
+
+
+def test_standalone_replay_refusal_says_an_unreadable_journal_skipped_the_handoff_check(
+    tmp_path,
+):
+    """An undecodable journal cannot rule out an earlier replay hand-off, so a
+    torn-down-unit refusal says so rather than passing for a plain teardown.
+
+    Ablation: drop the `entries is None` clause in `runs.standalone_replay_refusal`
+    and the refusal no longer mentions the journal."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    with (run_dir / "journal.jsonl").open("ab") as f:
+        f.write(b"\xff\xfe not utf-8\n")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and "is gone" in refusal
+    assert "journal could not be read" in refusal
 
 
 # ------------------------------------- by-name operations in a shared registry (#729)

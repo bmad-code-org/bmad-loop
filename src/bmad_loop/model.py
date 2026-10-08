@@ -1216,6 +1216,14 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # DW-525: the id of the FINISHED run this run is a standalone kept-unit replay
+    # of (`resolve <finished-run> --reverify --story <key>`, `unitreplay`), or ""
+    # for every ordinary run. Pinned at mint like `run_type` — resume never
+    # re-derives it. While set, `Engine._loop` processes only the seeded unit: it
+    # returns right after in-flight recovery, so a replay never picks new stories,
+    # runs the run-end retrospective or auto-sweeps. Deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    replay_of: str = ""
     # Version of the separately persisted sweep.json options format. Zero means
     # a pre-marker run, where a missing options file is the legacy unrestricted
     # shape. Selector-capable sweeps stamp the current nonzero version at launch,
@@ -1404,6 +1412,7 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "replay_of": self.replay_of,
             "sweep_options_version": self.sweep_options_version,
             "sweep_options_digest": self.sweep_options_digest,
             "source": self.source,
@@ -1445,6 +1454,7 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            replay_of=str(d.get("replay_of", "")),
             sweep_options_version=int(d.get("sweep_options_version", 0)),
             sweep_options_digest=str(d.get("sweep_options_digest", "")),
             source=str(d.get("source", "sprint-status")),

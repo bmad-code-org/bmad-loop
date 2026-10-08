@@ -16553,6 +16553,32 @@ def test_resume_with_epic_filter_stays_in_scoped_epic(project):
     assert "epic-boundary" not in kinds
 
 
+def test_replay_run_loop_processes_only_its_seeded_unit(project, monkeypatch):
+    """DW-525: a replay run (`RunState.replay_of` set, `unitreplay`) owns only the
+    unit `_finish_inflight` drives — `_loop` returns right after in-flight recovery,
+    so an actionable story on the board is never picked, no run-end retrospective or
+    auto-sweep runs, and `_run_inner` still records the run finished.
+
+    Ablation: delete the `replay_of` early return in `Engine._loop` and `_pick_next`
+    is called (and the story dispatched)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [])
+    engine.state.replay_of = "20260101-000000-beef"
+    picked, ends = [], []
+    real_pick = engine._pick_next
+    monkeypatch.setattr(engine, "_pick_next", lambda: picked.append(True) or real_pick())
+    monkeypatch.setattr(engine, "_run_end_retrospective", lambda: ends.append("retro"))
+    monkeypatch.setattr(engine, "_maybe_auto_sweep", lambda *a: ends.append("sweep"))
+
+    summary = engine.run()
+
+    assert picked == [] and ends == []
+    assert adapter.sessions == []
+    assert "1-1-a" not in engine.state.tasks
+    assert engine.state.finished and not summary.paused and not summary.crashed
+    assert "story-start" not in [e["kind"] for e in engine.journal.entries()]
+
+
 def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
     """Fix B (hardening): selection exhausts the current epic before advancing,
     even when an actionable story of another epic sits earlier in file order.

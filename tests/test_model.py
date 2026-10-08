@@ -73,6 +73,18 @@ def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     assert RunState.from_dict(d).code_root_restamp_pending is False
 
 
+def test_run_state_replay_of_round_trips_and_defaults_empty():
+    """DW-525: the finished run a replay run replays survives the state round trip,
+    and a state.json from before the field existed reads back "" — an ordinary run."""
+    state = _state(repo_root="/code")
+    assert state.replay_of == ""
+    state.replay_of = "20260101-000000-beef"
+    assert RunState.from_dict(state.to_dict()).replay_of == "20260101-000000-beef"
+    d = state.to_dict()
+    del d["replay_of"]
+    assert RunState.from_dict(d).replay_of == ""
+
+
 def test_mint_time_root_identities_round_trip_as_two_int_lists():
     """DW-446: `RunState.run_dir_identity` and `StoryTask.worktree_identity` persist
     as a two-int JSON list (or null) and read back as the same tuple.

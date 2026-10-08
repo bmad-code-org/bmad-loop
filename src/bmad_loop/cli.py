@@ -4043,6 +4043,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
+    # DW-525: a FINISHED run has no resume to replay on, so `--reverify` there mints a
+    # replay run for the named kept worktree unit instead. Routed ahead of the pause
+    # gate (a finished run is not paused); every paused-run branch below is untouched.
+    if getattr(args, "reverify", False) and state.finished:
+        return _resolve_reverify_finished(args, project, run_dir, state)
     # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
     # stage (an isolated defer never pauses the run); `reverify_refusal` decides
     # whether the named story qualifies. Everything else needs the escalation pause.
@@ -4699,6 +4704,152 @@ def _resolve_reverify(
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
+
+
+def _resolve_reverify_finished(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+) -> int:
+    """`resolve <finished-run> --reverify --story <key>` (DW-525): replay a finished
+    run's kept DEFERRED worktree unit in a NEW replay run (`unitreplay`).
+
+    `_resolve_reverify`'s shape: liveness gate → `runs.standalone_replay_refusal` →
+    the resume preflights the replay run will face (git floor, isolation conflict,
+    base skills) plus a clean main checkout on the run's target branch, which the
+    unit merges into → HEAD read → printed claim → `_confirm` (skipped when
+    `--resume`/`--no-resume` is given) → `unitreplay.mint_replay_run`, whose locked
+    re-check repeats the refusal → `--no-resume` hint or `_resume_paused_run` on the
+    replay run. The finished run stays finished; its state.json is never written."""
+    from .unitreplay import ReplayError, mint_replay_run
+
+    story_key = args.story
+    if not story_key:
+        print(
+            f"error: run {args.run_id} is finished — name the deferred worktree unit to "
+            f"replay with `bmad-loop resolve {args.run_id} --reverify --story <key>`",
+            file=sys.stderr,
+        )
+        return 1
+    live = runs.engine_liveness(run_dir)
+    if live == "alive":
+        print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+        return 1
+    if live == "unknown":
+        if not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to replay. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+            "proceeding anyway (--force)",
+            file=sys.stderr,
+        )
+    task = state.tasks.get(story_key)
+    if task is None:
+        print(f"error: run {args.run_id} has no task for story {story_key}", file=sys.stderr)
+        return 1
+    refusal = runs.standalone_replay_refusal(
+        state, task, story_key, run_dir=run_dir, project_root=project
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    try:
+        paths = bmadconfig.load_paths(project)
+    except bmadconfig.BmadConfigError as e:
+        print(f"error: cannot read the BMAD config ({e})", file=sys.stderr)
+        return 1
+    pol = policy_mod.load(_policy_path(project))
+    # The resume preflights the replay run will face, taken BEFORE anything is minted
+    # so a refusal there cannot strand a replay run that owns the moved worktree.
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if not _require_base_skills(project, pol):
+        return 1
+    target = state.target_branch
+    try:
+        clean = verify.worktree_clean(paths.repo_root, project=paths.project)
+        on = verify.current_branch(paths.repo_root)
+    except verify.GitError as e:
+        print(f"error: cannot inspect the main checkout ({e})", file=sys.stderr)
+        return 1
+    if on != target:
+        print(
+            f"error: the main checkout is on {on!r}, not run {args.run_id}'s target "
+            f"branch {target!r}, which the unit merges into — `git checkout {target}` "
+            "first",
+            file=sys.stderr,
+        )
+        return 1
+    if not clean:
+        print(
+            "error: the main checkout is not clean — commit or stash first (the unit "
+            "merges into it)",
+            file=sys.stderr,
+        )
+        return 1
+    wt = Path(task.worktree_path)
+    try:
+        head = verify.rev_parse_head(wt)
+    except verify.GitError as e:
+        print(f"error: cannot read HEAD of {wt} ({e})", file=sys.stderr)
+        return 1
+    print(
+        f"replaying {story_key} from finished run {args.run_id} in a NEW replay run — run "
+        f"{args.run_id} stays finished. The attempt is branch {task.branch} in its kept "
+        f"worktree {wt}, HEAD {head[:12]} above baseline "
+        f"{(task.baseline_commit or '')[:12]}, plus any uncommitted changes; the "
+        "worktree moves into the replay run's directory. No dev session and no resolve "
+        "agent run: the [verify] commands are replayed, then review follows policy and "
+        f"the unit merges into target branch {target} on a pass",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"create a replay run for {story_key} from finished run {args.run_id} and resume it?"
+    ):
+        print("cancelled — nothing was created; the run is still finished")
+        return 0
+    profiles = _launch_profiles(pol, project)
+    digest = _trusted_config_digest(pol, project, profiles=profiles)
+    try:
+        replay_dir = mint_replay_run(
+            project=project,
+            paths=paths,
+            policy=pol,
+            finished_run_dir=run_dir,
+            story_key=story_key,
+            expected_generation=task.generation,
+            trusted_config_digest=digest,
+            force=bool(args.force),
+        )
+    except ReplayError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    replay_id = replay_dir.name
+    print(
+        f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
+        "verify replays on resume"
+    )
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {replay_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {replay_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {replay_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, replay_dir)
 
 
 def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
@@ -6659,8 +6810,10 @@ def main(argv: list[str] | None = None) -> int:
         "changes, and resume by replaying its verification: the [verify] commands "
         "re-run on that work and, when they pass, it is reviewed per policy and "
         "committed (a unit merged) — no dev session and no resolve agent. Fix the "
-        "environment first. With --story, a worktree unit is accepted under any pause "
-        "(not for sweep runs)",
+        "environment first. Not for sweep runs. With --story, a worktree unit is "
+        "accepted under any pause; on a FINISHED run, --story names a kept deferred "
+        "worktree unit to replay in a new replay run, and the finished run stays "
+        "finished (not for stories-mode runs)",
     )
     resolve_p.add_argument(
         "--resume",

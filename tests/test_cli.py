@@ -18945,3 +18945,91 @@ def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path,
     err = capsys.readouterr().err
     assert "an in-place replay re-verifies only the story the run stopped on" in err
     assert _state_bytes(run_dir) == before
+
+
+# -------------------------- resolve <finished-run> --reverify (DW-525) gates
+
+
+def _finished_reverify_project(tmp_path):
+    """`_reverify_project`'s run, recorded FINISHED (not paused) — the shape the
+    finished-run replay entry routes on."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    state.finished = True
+    save_state(run_dir, state)
+    return run_dir, project
+
+
+def _no_replay(monkeypatch):
+    from bmad_loop import unitreplay
+
+    monkeypatch.setattr(
+        unitreplay, "mint_replay_run", lambda **_k: pytest.fail("minted a replay run")
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+
+def test_resolve_reverify_finished_run_needs_the_story_named(tmp_path, monkeypatch, capsys):
+    """A finished run is routed to the replay entry ahead of the pause gate, which
+    names `--story <key>` instead of the generic not-paused refusal.
+
+    Ablation: delete the `state.finished` routing in `cmd_resolve` and the pause
+    gate's "not paused at an escalation" refusal prints instead."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "is finished" in err and "--story <key>" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_in_place_story(tmp_path, monkeypatch, capsys):
+    """Only a worktree unit's kept worktree outlives a finished run; an in-place
+    deferred story is refused before any preflight or prompt."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "deferred in place" in err and "recover the work by hand" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_unknown_story(tmp_path, monkeypatch, capsys):
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", "9-9-z", "--resume") == 1
+
+    assert "has no task for story 9-9-z" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("live", "fragment"),
+    [("alive", "still live"), ("unknown", "--force")],
+    ids=["alive", "unknown"],
+)
+def test_resolve_reverify_finished_run_gates_on_liveness(
+    tmp_path, monkeypatch, capsys, live, fragment
+):
+    """The liveness gate runs first: a provably-live engine refuses, an unverifiable
+    one needs --force."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: live)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    assert fragment in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before

@@ -266,6 +266,8 @@ SAVE_STATE_CALLERS = {
     ("runs.py", "_stop_run_once"),
     ("runsetup.py", "compose_run"),
     ("runsetup.py", "compose_sweep"),
+    # DW-525: the replay run's first publication, outside the finished run's lock
+    ("unitreplay.py", "_publish_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
@@ -283,6 +285,8 @@ RUN_STATE_TRANSACTIONS = {
     ("runsetup.py", "compose_run"),
     ("runsetup.py", "compose_sweep"),
     ("tui/app.py", "_do_rearm"),
+    # DW-525: the locked re-check + worktree move under the FINISHED run's lock
+    ("unitreplay.py", "mint_replay_run"),
 }
 
 # The two refusal surfaces review iteration 6 kept re-finding by hand, enumerated so
@@ -332,6 +336,8 @@ ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "cmd_run"): 1,
     ("cli.py", "cmd_sweep"): 1,
     ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm re-read
+    # DW-525: the finished-run replay, before a replay run is minted
+    ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "cmd_validate"): 1,  # reports a Finding rather than aborting
     ("cli.py", "_prepare_resume_locked"): 1,  # behind both `resume` and the re-arm
     ("cli.py", "_warn_preflight_would_abort"): 1,  # the dry-run honesty banner
@@ -788,6 +794,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # exists to draw. Names no path, identifier or prose.
         "regen_cause",
         "remaining",
+        # DW-525: run ids (the `run_id` shape) — the finished run a replay run
+        # replays (`unit-replay-start`) and the replay run a finished run handed its
+        # kept unit to (`unit-replay-handoff`).
+        "replay_of",
+        "replay_run",
         "reset_from",
         "restore",
         "returncode",
@@ -1235,6 +1246,15 @@ JOURNAL_KINDS = frozenset(
         # (`reverify-decision`), from `Engine._resume_reverify`.
         "resume-reverify",
         "reverify-decision",
+        # DW-525. The standalone kept-unit replay of a FINISHED run, from
+        # `unitreplay`: `unit-replay-start` opens the replay run's journal
+        # (`replay_of` = the finished run id, `from_worktree` -> `worktree` the
+        # move), and `unit-replay-handoff` is the one pointer appended to the
+        # finished run's journal (`replay_run` = the replay run id). `story_key`,
+        # `branch`, `baseline` alias by name; `from_worktree` is presence-only in
+        # `diagnostics._JOURNAL_DROP_FIELDS`; the run ids and `worktree` are benign.
+        "unit-replay-start",
+        "unit-replay-handoff",
         # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
         # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
         # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from
