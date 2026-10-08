@@ -49,6 +49,9 @@ breaking changes may land in a minor release.
 - Add a TUI re-verify action: `V` (and `R`/`p` on a deferred pause) picks a
   DEFERRED story or worktree unit and opens `bmad-loop resolve <run> --reverify`
   in a control window; `R` points at `V` when deferred units exist (DW-524).
+- List the paused story in the TUI's `V` re-verify picker when it is ESCALATED
+  at a replayable environment-fault site, as `resolve --reverify` accepts; `R`
+  still opens the resolve agent (DW-532).
 
 ### Changed
 

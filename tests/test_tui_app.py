@@ -10002,7 +10002,7 @@ def test_reverify_targets_order_and_exclusions():
     assert _deferred_units(state) == ["3-1-c", "5-1-e"]
 
 
-def test_reverify_targets_skip_a_paused_story_that_is_not_deferred():
+def test_reverify_targets_skip_a_paused_escalation_without_a_replayable_env_fault():
     state = RunState(
         run_id="r",
         project="/p",
@@ -10017,6 +10017,75 @@ def test_reverify_targets_skip_a_paused_story_that_is_not_deferred():
     assert _reverify_targets(state) == ["2-1-b"]
     empty = dataclasses.replace(state, tasks={})
     assert _reverify_targets(empty) == []
+
+
+def _escalated_task(
+    key: str, site: str | None, *, dev_status: str | None = None, unit: bool = False
+) -> StoryTask:
+    sessions = [SessionRecord(task_id=key, role="dev", status=dev_status)] if dev_status else []
+    return StoryTask(
+        story_key=key,
+        epic=int(key.split("-")[0]),
+        phase=Phase.ESCALATED,
+        env_fault_site=site,
+        sessions=sessions,
+        worktree_path=f"/wt/{key}" if unit else "",
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "listed"),
+    [
+        (_escalated_task("1-1-a", "verify:dev"), True),
+        (_escalated_task("1-1-a", "probe:decision:review"), True),
+        (_escalated_task("1-1-a", "probe:decision:dev", dev_status="completed"), True),
+        (_escalated_task("1-1-a", "probe:decision:dev", dev_status="crashed"), False),
+        (_escalated_task("1-1-a", "probe:dispatch:dev"), False),
+        (_escalated_task("1-1-a", None), False),
+    ],
+    ids=[
+        "verify-site",
+        "review-decision-site",
+        "dev-decision-completed",
+        "dev-decision-crashed",
+        "dispatch-site",
+        "no-env-fault",
+    ],
+)
+def test_reverify_targets_list_an_escalated_paused_story_at_a_replayable_site(task, listed):
+    """DW-532: the paused story is a target when it is ESCALATED and
+    `env_fault_site_reverifiable` holds — what `runs.reverify_refusal` accepts —
+    and never at a dispatch site, without an env fault, or at a decision site whose
+    leg did not complete. Ablation, performed: drop the ESCALATED arm and every
+    `True` row fails."""
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task, "2-1-b": _deferred_task("2-1-b", unit=True)},
+    )
+    assert _reverify_targets(state) == (["1-1-a", "2-1-b"] if listed else ["2-1-b"])
+
+
+def test_reverify_targets_skip_an_escalated_unit_that_is_not_paused():
+    """Only the PAUSED escalated story qualifies (it launches without `--story`,
+    under the CLI's in-place rule): an escalated replayable worktree unit under
+    another pause is not listed. Ablation, performed: build the head from every
+    escalated replayable task and this fails."""
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.ESCALATED),
+            "2-1-b": _escalated_task("2-1-b", "verify:dev", unit=True),
+        },
+    )
+    assert _reverify_targets(state) == []
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
@@ -10083,6 +10152,40 @@ async def test_reverify_a_unit_under_another_pause(project_tree, monkeypatch):
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_reverify_an_escalated_env_fault_paused_story(project_tree, monkeypatch):
+    """DW-532: `V` on a run paused at the escalation of a story whose environment
+    fault left a replayable product offers that story, and confirming launches
+    `resolve --reverify` WITHOUT `--story` (the CLI's in-place rule) and attaches.
+    `R` still opens the resolve agent's confirm, not the picker. Ablation,
+    performed: drop the ESCALATED arm of `_reverify_targets` and `V` toasts
+    "no story to re-verify" instead."""
+    launched, selected, calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": _escalated_task("1-1-a", "verify:dev")},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#cancel"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await ready(pilot, "#ok")
+        assert _select_values(app) == ["1-1-a"]
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": None})]
+    assert selected == ["@7"]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
 async def test_reverify_lists_the_paused_story_first_then_units(project_tree, monkeypatch):
     launched, _selected, calls, _stamps = _reverify_stubs(monkeypatch)
     make_run(
@@ -10137,7 +10240,7 @@ async def test_reverify_with_nothing_deferred_launches_nothing(project_tree, mon
     async with app.run_test() as pilot:
         await _at_dashboard(app, pilot)
         await pilot.press("V")
-        want = f"no deferred story to re-verify in run {_REVERIFY_RUN}"
+        want = f"no story to re-verify in run {_REVERIFY_RUN}"
         await until(pilot, lambda: want in notifications(app))
         assert isinstance(app.screen, DashboardScreen)
     assert launched == []

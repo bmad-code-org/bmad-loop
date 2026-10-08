@@ -966,9 +966,10 @@ class EscalationModal(BaseDialog):
 
 
 class ReverifyModal(BaseDialog):
-    """Pick the DEFERRED story whose kept work `bmad-loop resolve --reverify`
-    should re-verify (DW-524). Dismisses with the chosen story key, None on
-    cancel/escape.
+    """Pick the story whose kept work `bmad-loop resolve --reverify` should
+    re-verify (DW-524): a DEFERRED one, or the paused story ESCALATED at a
+    replayable environment-fault site (DW-532). Dismisses with the chosen story
+    key, None on cancel/escape.
 
     Confirms only the TARGET: the binding confirmation of what the replay will
     claim (HEAD/baseline, the squash-in of changes since the pause) is the CLI's
@@ -997,8 +998,10 @@ class ReverifyModal(BaseDialog):
 
     def compose(self) -> ComposeResult:
         body = Text()
-        body.append("deferred, not escalated: its kept work can be re-verified instead of ")
-        body.append("re-driven.\nopens ")
+        body.append(
+            "a deferred story, or one escalated by an environment fault, keeps its work: "
+            "it can be re-verified instead of re-driven.\nopens "
+        )
         body.append(f"bmad-loop resolve {self._run_id} --reverify", style="bold")
         body.append(
             " in a control window, which states HEAD/baseline and that changes since the "

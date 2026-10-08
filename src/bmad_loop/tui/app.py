@@ -50,6 +50,7 @@ from ..model import (
     Phase,
     RunState,
     StoryTask,
+    env_fault_site_reverifiable,
 )
 from ..platform_util import LockUnavailableError, resolve_or_lexical
 from ..policy import POLICY_FILE
@@ -100,11 +101,24 @@ def _deferred_units(state: RunState) -> list[str]:
 
 def _reverify_targets(state: RunState) -> list[str]:
     """Every story `resolve --reverify` could be pointed at from the TUI: the
-    paused story first when it is DEFERRED, then `_deferred_units`. ESCALATED
-    stories are never targets — their remedy is the resolve agent."""
+    paused story first when it is DEFERRED, or ESCALATED at an environment-fault
+    site a replay can clear (`model.env_fault_site_reverifiable`, the test
+    `runs.reverify_refusal` applies — DW-532), then `_deferred_units`. Only the
+    PAUSED escalated story qualifies: it launches without `--story`, so the CLI
+    keeps its in-place rule. Any other escalation is never a target — its remedy
+    is the resolve agent (`R`), which stays available for this one too."""
     key = state.paused_story_key
     task = state.tasks.get(key) if key else None
-    head = [key] if key and task is not None and task.phase == Phase.DEFERRED else []
+    head = (
+        [key]
+        if key
+        and task is not None
+        and (
+            task.phase == Phase.DEFERRED
+            or (task.phase == Phase.ESCALATED and env_fault_site_reverifiable(task))
+        )
+        else []
+    )
     return head + _deferred_units(state)
 
 
@@ -759,8 +773,9 @@ class BmadLoopApp(App[None]):
         )
 
     def action_reverify_run(self) -> None:
-        """`V`: re-verify a DEFERRED story's kept work (DW-524) — the paused story
-        when it is DEFERRED, or a DEFERRED worktree unit under any pause. The TUI
+        """`V`: re-verify a story's kept work (DW-524) — the paused story when it
+        is DEFERRED or ESCALATED at a replayable environment-fault site (DW-532),
+        or a DEFERRED worktree unit under any pause. The TUI
         only picks the target and launches `bmad-loop resolve --reverify`; the CLI
         states the claim, confirms, re-checks liveness under the run lock and
         refuses what it refuses, all in the control window."""
@@ -781,7 +796,7 @@ class BmadLoopApp(App[None]):
             return
         targets = _reverify_targets(state)
         if not targets:
-            self.notify(f"no deferred story to re-verify in run {run_id}", severity="warning")
+            self.notify(f"no story to re-verify in run {run_id}", severity="warning")
             return
         self._open_reverify(run_id, run_dir, state, targets)
 
