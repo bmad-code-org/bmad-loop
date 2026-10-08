@@ -11735,6 +11735,33 @@ def test_resolve_finished_run_without_story_errors(project, tmp_path, monkeypatc
     assert _state_bytes(engine.run_dir) == finished_before
 
 
+def test_resolve_finished_run_refuses_a_story_already_done_on_the_board(
+    project, tmp_path, monkeypatch, capsys
+):
+    """A later run re-drove and finished 1-1-a, so the main checkout's board says done:
+    the kept unit is superseded work, refused before any prompt or mint (DW-533).
+
+    Ablation: delete the `board_status == "done"` check in
+    `runs.standalone_replay_refusal` and a replay run is minted."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    set_sprint(project, "1-1-a", "done")
+    # committed, so the clean-checkout preflight behind the gate would admit the replay
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "1-1-a done by a later run")
+    finished_before = _state_bytes(engine.run_dir)
+    unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+    built = _mock_adapters(monkeypatch)
+
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "story 1-1-a is already done on the sprint board" in err
+    assert "recover the work by hand" in err
+    assert _replay_dirs(engine) == [] and unit.is_dir()
+    assert built == []
+    assert _state_bytes(engine.run_dir) == finished_before
+
+
 def test_resolve_finished_run_replay_re_defers_and_keeps_the_unit_under_the_replay(
     project, tmp_path, monkeypatch
 ):

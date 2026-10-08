@@ -62,6 +62,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse `resolve <finished-run> --reverify --story <key>` when the story is
+  already `done` on the main checkout's sprint board (a later run re-drove and
+  finished it), so the replay cannot merge superseded work; an unreadable board
+  refuses too (DW-533).
 - Stop an in-place defer from stashing the spec before its rollback decides
   (DW-528). Moving the spec out first made the rollback pause on owned-spec
   recovery: with `rollback_on_failure` off it now pauses with the

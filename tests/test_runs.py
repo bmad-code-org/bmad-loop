@@ -10266,6 +10266,7 @@ def _finished_mounted_run(tmp_path):
     spec = wt / _REVERIFY_SPEC_REL
     spec.parent.mkdir(parents=True, exist_ok=True)
     spec.write_bytes(_REVERIFY_SPEC_BYTES)
+    _write_board(project, "review")
     task.worktree_path = str(wt)
     task.branch = branch
     state.clear_pause()
@@ -10273,6 +10274,16 @@ def _finished_mounted_run(tmp_path):
     state.target_branch = "main"
     save_state(run_dir, state)
     return run_dir, project, wt
+
+
+def _write_board(project, status):
+    """The main checkout's sprint board, holding `_REVERIFY_KEY` at `status`."""
+    board = project / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
+    board.write_text(
+        f"development_status:\n  epic-1: in-progress\n  {_REVERIFY_KEY}: {status}\n",
+        encoding="utf-8",
+    )
+    return board
 
 
 def _standalone_refusal(run_dir, project):
@@ -10388,6 +10399,57 @@ def test_standalone_replay_refusal_says_an_unreadable_journal_skipped_the_handof
 
     assert refusal is not None and "is gone" in refusal
     assert "journal could not be read" in refusal
+
+
+@pytest.mark.parametrize("status", ["backlog", "in-progress", "review", "awaiting-operator"])
+def test_standalone_replay_admits_a_story_not_done_on_the_board(tmp_path, status):
+    """Only a done row refuses (DW-533); any earlier row leaves the replay admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, status)
+
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def test_standalone_replay_refuses_a_story_already_done_on_the_board(tmp_path):
+    """A later run re-drove and finished the story, so the kept unit is superseded work
+    a replay must not merge (DW-533).
+
+    Ablation: delete the `board_status == "done"` check in
+    `runs.standalone_replay_refusal` and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, "done")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"story {_REVERIFY_KEY} is already done on the sprint board" in refusal
+    assert "recover the work by hand" in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda board: board.unlink(), id="missing"),
+        pytest.param(lambda board: board.write_bytes(b"\xff\xfe not utf-8\n"), id="undecodable"),
+        pytest.param(lambda board: board.write_text("[1, 2]\n", encoding="utf-8"), id="no-map"),
+    ],
+)
+def test_standalone_replay_refuses_when_the_board_cannot_be_read(tmp_path, corrupt):
+    """A board that cannot be read cannot rule out a done row, so the replay fails
+    closed with a refusal naming the board (DW-533).
+
+    Ablation: make the `except` arm in `runs.standalone_replay_refusal` fall through
+    and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    board = _write_board(project, "review")
+    corrupt(board)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"cannot read the sprint board at {board}" in refusal
+    assert "recover the work by hand" in refusal
 
 
 # ------------------------------------- by-name operations in a shared registry (#729)

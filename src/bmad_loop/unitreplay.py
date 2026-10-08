@@ -33,8 +33,9 @@ resume for `resolve --reverify` to ride (DW-522 re-arms a PAUSED run). The contr
   then removes the claimed run dir; nothing persisted in the finished run changes.
 
 Refused, each with its own message (`runs.standalone_replay_refusal`): an in-place
-(non-worktree) task, a detached `scm.branch_per = "run"` unit, sweep runs, and
-stories-mode runs. No LLM call anywhere: this is deterministic orchestration.
+(non-worktree) task, a detached `scm.branch_per = "run"` unit, sweep runs,
+stories-mode runs, and a story already done on the main checkout's sprint board, or
+a board that cannot be read (DW-533). No LLM call anywhere: this is deterministic orchestration.
 """
 
 from __future__ import annotations

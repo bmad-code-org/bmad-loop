@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, verify
+from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, sprintstatus, verify
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -6723,7 +6723,8 @@ def standalone_replay_refusal(
     plus the shape only a finished isolated story run can hand over: the run is
     finished, a sprint-status story run (not a sweep, not stories mode), the story
     DEFERRED (a finished run never holds an ESCALATED task — DW-386) in a kept
-    worktree unit on its own branch, with a target branch to merge into.
+    worktree unit on its own branch, with a target branch to merge into, and the
+    story not already done on the main checkout's sprint board (DW-533).
 
     No remedy here names `bmad-loop resolve <run>` without `--reverify`: resolve
     refuses a finished run, so every one points at recovering the work by hand.
@@ -6788,6 +6789,22 @@ def standalone_replay_refusal(
     if refusal is not None:
         return refusal
     assert paths is not None
+    # DW-533: a later run may have re-driven and finished this story (`_pick_next`
+    # skips only its own run's tasks), and `sprintstatus.advance` never regresses a
+    # done row, so nothing downstream would stop the replay merging superseded work.
+    # An unreadable board refuses: it cannot rule that out.
+    try:
+        board_status = sprintstatus.story_status(paths.sprint_status, story_key)
+    except (sprintstatus.SprintStatusError, OSError, ValueError) as e:
+        return (
+            f"cannot read the sprint board at {paths.sprint_status} to rule out story "
+            f"{story_key} already being done ({e}); fix the board and retry, or {by_hand}"
+        )
+    if board_status == "done":
+        return (
+            f"story {story_key} is already done on the sprint board, so run {run_id}'s "
+            f"kept unit is superseded work; {by_hand}"
+        )
     refusal = _mounted_reverify_refusal(
         state, task, story_key, run_dir=run_dir, paths=paths, remedy=by_hand
     )
