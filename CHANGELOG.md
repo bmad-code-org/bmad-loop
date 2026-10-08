@@ -69,6 +69,10 @@ breaking changes may land in a minor release.
   projects, instead of letting the run read as gone (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
+- Resume a `resolve --reverify` story whose review or fix died with the host by
+  re-running the verify replay, not resume-restart (DW-527).
+- Guard a review-dispatch environment pause with no completed prior pass: it now
+  resumes into the next review cycle, outside sweep runs (DW-529).
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
   so a reused window id or a forged `ctl-window` record can no longer steer
   them onto a neighbour's window; the record now only breaks ties among tagged

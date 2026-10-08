@@ -603,6 +603,20 @@ def test_reverify_from_unknown_value_is_kept_not_dropped():
     assert StoryTask.from_dict(doc).reverify_from == "from-the-future"
 
 
+def test_reverify_replayed_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_replayed="escalated")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_replayed == "escalated"
+
+
+def test_reverify_replayed_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_replayed"]  # state.json from before the field existed (DW-527)
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
+    doc["reverify_replayed"] = None  # a null is not a replay continuation either
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
+
+
 def _dev_record(status: str) -> SessionRecord:
     return SessionRecord(task_id="1-1-a-dev-1", role="dev", status=status)
 

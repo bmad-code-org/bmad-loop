@@ -4167,6 +4167,22 @@ def test_adopt_clears_env_fault_site(tmp_path):
     assert task.env_fault_site is None
 
 
+def test_adopt_clears_a_post_replay_marker(tmp_path):
+    """DW-527: the adopted branch is finalized as-is, so a `--reverify`
+    continuation's post-replay marker must not survive onto the COMMITTING task.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `adopt_escalated_branch` and this reddens."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_replayed = "escalated"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
+
+
 def _adoptable(tmp_path):
     """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
     wt = tmp_path / "wt"
@@ -4677,6 +4693,24 @@ def test_rearm_clears_a_stale_reverify_latch(tmp_path):
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
+
+
+def test_rearm_clears_a_post_replay_marker(tmp_path):
+    """DW-527: a `--reverify` continuation that escalated in review leaves
+    `reverify_replayed` on the escalated task. A plain re-arm re-implements from the
+    baseline, so it clears the marker; left set, a mid-review crash of the re-drive
+    would re-latch a verify replay instead of taking resume-restart.
+
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
+    reddens on the surviving marker."""
+    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_replayed = "deferred"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
 
 
 # --------------------------------------------- #90: abandoned restore-latch residue
@@ -9916,6 +9950,25 @@ def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     assert task.reverify_from == "escalated"
     assert task.env_fault_site is None
     assert _reverify_rows(run_dir)[0]["origin"] == "escalated"
+
+
+def test_rearm_for_reverify_clears_a_prior_post_replay_marker(tmp_path):
+    """DW-527: a prior replay's post-PROCEED marker belongs to that continuation;
+    the new re-arm latches `reverify_from` and clears the marker.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `_rearm_for_reverify_locked` and this reddens."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.reverify_replayed = "escalated"
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.reverify_from == "deferred" and task.reverify_replayed == ""
 
 
 def test_rearm_for_reverify_skips_plugin_workflow_sessions(tmp_path):

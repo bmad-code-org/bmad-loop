@@ -458,6 +458,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `accepted-with-open-items` / `rejected` / `unknown`) — never the doc's raw
     # text. Kind-scoped because `verdict` is generic.
     "retro-auto-finished": frozenset({"verdict"}),
+    # DW-527: the literal `post-proceed`, marking the row `_finish_inflight`'s
+    # post-replay arm writes (a re-latched `--reverify` replay) apart from the
+    # ordinary reverify arm's. Kind-scoped because `replay` is generic.
+    "resume-reverify": frozenset({"replay"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name

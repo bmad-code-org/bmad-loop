@@ -11369,6 +11369,53 @@ def test_reverify_kept_deferred_unit_merges_without_a_dev_session(project, tmp_p
     assert decision["action"] == "proceed" and decision["origin"] == "deferred"
 
 
+def test_reverify_kept_unit_crash_mid_review_re_verifies_and_merges(project, tmp_path):
+    """DW-527, worktree: the replay of a kept unit PROCEEDs, then the host dies inside
+    the review session it led to. The resume re-latches the replay in that same unit
+    (`resume-reverify` with `replay: post-proceed`), the review re-runs there, and the
+    unit merges — no restart discard.
+
+    Ablation, performed: delete the `elif task.reverify_replayed:` arm of
+    `Engine._finish_inflight` and the resume takes `resume-restart`, discarding the
+    unit for a fresh dev re-drive; the scripted review effect then runs as that dev
+    session in a fresh unit with no spec and the run crashes."""
+    engine, marker = _deferred_unit_then_escalation(
+        project, tmp_path, a_script=[wt_dev_effect(project, "1-1-a", followup_review=True)]
+    )
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(
+        engine.run_dir, "1-1-a", project_root=project.project, explicit_story=True
+    )
+    unit_path = load_state(engine.run_dir).tasks["1-1-a"].worktree_path
+
+    def crash_mid_review(spec):
+        raise RuntimeError("host died mid-review")
+
+    crashed_engine, crashed_adapter = resume_engine(project, engine, [crash_mid_review])
+    assert crashed_engine.run().crashed
+    assert [s.role for s in crashed_adapter.sessions] == ["review"]
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_RUNNING and crashed.reverify_replayed == "deferred"
+
+    resumed, adapter = resume_engine(
+        project, crashed_engine, [wt_review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed  # still paused on escalated 1-1-b
+    assert [s.role for s in adapter.sessions] == ["review"]
+    assert Path(adapter.sessions[0].cwd).resolve() == Path(unit_path).resolve()
+    saved = load_state(engine.run_dir)
+    a = saved.tasks["1-1-a"]
+    assert a.phase == Phase.DONE and a.commit_sha
+    assert saved.tasks["1-1-b"].phase == Phase.ESCALATED
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    (post_replay,) = [e for e in _rows(resumed, "resume-reverify") if e.get("replay")]
+    assert post_replay["replay"] == "post-proceed"
+    kinds = journal_kinds(resumed)
+    assert "unit-merged" in kinds and "resume-restart" not in kinds
+
+
 def test_reverify_failed_replay_re_defers_and_keeps_the_worktree(project, tmp_path):
     """DW-522, worktree: replaying before the environment is back re-defers the unit
     (no retry, no session) and closes it the way the first defer did — the worktree

@@ -5588,6 +5588,9 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
         # engine's resume arm already completes without re-running any gate.
         task.phase = Phase.COMMITTING
         task.adopt_pending = True
+        # The adopted branch is finalized as-is, never through a post-replay re-verify
+        # (DW-527): a marker a prior `--reverify` continuation left must not outlive it.
+        task.reverify_replayed = ""
         # The adopted branch is committed as-is: no environment fault remains on
         # record for the story (DW-523).
         task.env_fault_site = None
@@ -5805,6 +5808,9 @@ def _rearm_escalation_locked(
     # before its decision cleared it (a refused board write): left set, the fresh
     # attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
     task.reverify_from = ""
+    # ... and the post-replay marker (DW-527): left set, a mid-review crash of this
+    # re-drive would re-latch a verify replay instead of restarting.
+    task.reverify_replayed = ""
 
     # The spec this re-arm writes to and the bytes it FOUND there — the two inputs the
     # rollback below needs. Declared out here because their consumers sit past every
@@ -6805,6 +6811,9 @@ def _rearm_for_reverify_locked(
     # tree, verify it" phase the engine's reverify arm replays.
     task.phase = Phase.DEV_VERIFY
     task.reverify_from = origin
+    # A prior replay's post-PROCEED marker (DW-527) belongs to that continuation; this
+    # replay sets its own when it PROCEEDs.
+    task.reverify_replayed = ""
     # MANDATORY: a task still carrying a defer reason is re-deferred by the mounted
     # defer-replay arm of `_finish_inflight` instead of being replayed.
     task.defer_reason = None

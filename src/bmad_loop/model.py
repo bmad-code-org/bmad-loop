@@ -637,6 +637,17 @@ class StoryTask:
     # = no reverify pending. Survives the resume serialization round-trip;
     # deliberately absent from `documents.py`'s `--json` projection (schema 1).
     reverify_from: str = ""
+    # Set by Engine._resume_reverify when a `resolve --reverify` replay PROCEEDs
+    # (DW-527): the replay's origin ("deferred" / "escalated"), kept after
+    # `reverify_from` is spent so a host death mid-review/fix of that continuation
+    # can re-latch the replay. Read by `_finish_inflight`'s post-replay arm, which
+    # re-verifies the kept tree instead of letting resume-restart roll it back.
+    # Cleared by every non-PROCEED replay decision and by every re-arm out of a
+    # terminal phase (runs.rearm_escalation, rearm_for_reverify, adopt_escalated_branch),
+    # so a later re-drive's crash still restarts. "" = no replay continuation.
+    # Survives the resume serialization round-trip; deliberately absent from
+    # `documents.py`'s `--json` projection (schema 1).
+    reverify_replayed: str = ""
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -770,6 +781,7 @@ class StoryTask:
             "restore_patch": self.restore_patch,
             "adopt_pending": self.adopt_pending,
             "reverify_from": self.reverify_from,
+            "reverify_replayed": self.reverify_replayed,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -1051,6 +1063,7 @@ class StoryTask:
             restore_patch=d.get("restore_patch"),
             adopt_pending=bool(d.get("adopt_pending", False)),
             reverify_from=str(d.get("reverify_from", "") or ""),
+            reverify_replayed=str(d.get("reverify_replayed", "") or ""),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),

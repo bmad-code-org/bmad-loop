@@ -2376,9 +2376,10 @@ class Engine:
                 # attempt, the baseline, or anything else moved — so NO rollback:
                 # the tree (and any commit the operator made while paused) is the
                 # one the story starts from. The story gate was asked above, before
-                # the site cleared. A review-dispatch pause needs no arm of its own:
-                # it sits at DEV_VERIFY + spec_file (first cycle) or at
-                # REVIEW_VERIFY with the completed pass on record (later cycles).
+                # the site cleared. A review-dispatch pause at DEV_VERIFY + spec_file
+                # (first cycle) or at REVIEW_VERIFY with the completed pass on record
+                # resumes through the spec-approval or completed-pass replay arms;
+                # the remaining REVIEW_VERIFY shape has its own arm below (DW-529).
                 self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
                 if mounted:
                     unit = self._reopen_unit(task)
@@ -2392,6 +2393,69 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._drive_story(task)
+            elif env_role == "review" and task.phase == Phase.REVIEW_VERIFY:
+                # DW-529: the review loop paused at its dispatch gate after a cycle
+                # whose pass did not complete (a crashed/stalled session the decision
+                # retried), so the completed-pass replay arm above found nothing to
+                # replay. As with the dev dispatch arm, nothing ran past the pause:
+                # no rollback — re-enter the loop, whose gate dispatches the next
+                # cycle (REVIEW_VERIFY -> REVIEW_RUNNING is legal). No damping spend
+                # is pending: only a completed pass earns one.
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._review_and_commit(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._review_and_commit(task)
+            elif task.reverify_replayed:
+                # DW-527: a `resolve --reverify` replay PROCEEDed, then the host died
+                # mid-review/fix of that continuation. The task is neither DEFERRED
+                # nor ESCALATED, so the operator cannot issue the second `--reverify`
+                # this arm stands in for; it reproduces that re-arm's counter and
+                # generation resets (fresh review loop, bumped generation so the reset
+                # cycle never re-mints the crashed session's id — #705). The other
+                # latches that re-arm clears cannot be set on a task reaching here: the
+                # mounted defer arm, the COMMITTING arm and dispatch-site consumption
+                # all precede this arm, and an in-place `_defer` advances to DEFERRED
+                # before any save. It then re-runs the verify replay, which
+                # re-vouches for whatever tree the dead session left before any
+                # review. Saved after the re-latch, so the next crash lands on the
+                # ordinary reverify arm above. Every earlier finishing arm
+                # (spec-approval, completed-pass replay, COMMITTING) still wins.
+                origin = task.reverify_replayed
+                self.journal.append(
+                    "resume-reverify",
+                    story_key=task.story_key,
+                    origin=origin,
+                    replay="post-proceed",
+                )
+                task.phase = Phase.DEV_VERIFY  # deliberate reset, not a normal transition
+                task.reverify_from = origin
+                task.reverify_replayed = ""
+                task.generation += 1
+                task.review_cycle = 0
+                task.followup_reviews_spent = 0
+                task.salvage_refile_pending = False
+                self._save()
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._resume_reverify(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._resume_reverify(task)
             else:
                 # This arm is the one that does not finish work: it discards the
                 # worktree or resets the tree to baseline and re-runs the story
@@ -6755,11 +6819,17 @@ class Engine:
         action makes persists it cleared: a crash mid-defer then replays through
         the defer arm, never through a second verify replay. The accepted-session
         latch is deliberately not stamped: the generation the re-arm bumped means
-        no record matches the current attempt, and story runs never read it."""
+        no record matches the current attempt, and story runs never read it.
+
+        A PROCEED leaves `reverify_replayed` set to the origin in the same save that
+        spends the latch (DW-527): a host death mid-review/fix of the continuation then
+        re-latches the replay through `_finish_inflight`'s post-replay arm instead of
+        falling to resume-restart. Every other outcome clears it."""
         origin = task.reverify_from
         record = latest_completed_dev_record(task)
         if record is None or record.result_json is None:
             task.reverify_from = ""
+            task.reverify_replayed = ""
             self._escalate(task, "reverify: no completed dev result to re-verify")
             return
         result_json = record.result_json
@@ -6793,6 +6863,7 @@ class Engine:
             verification_sequence=verified.sequence,
         )
         task.reverify_from = ""
+        task.reverify_replayed = origin if decision.action == Action.PROCEED else ""
         if decision.action == Action.PROCEED:
             self._save()
             self._emit("post_dev_phase", task)
