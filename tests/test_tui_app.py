@@ -3574,7 +3574,8 @@ async def test_cleanup_toasts_a_session_scan_the_process_host_could_not_run(proj
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["fin-1"], [], set()))
     monkeypatch.setattr(runs, "session_scan_error", scan)
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    # The ctl-window scan's evidence gate reads the same liveness, so it fails too.
+    monkeypatch.setattr(launch, "prune_ctl_windows", scan)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -3582,12 +3583,13 @@ async def test_cleanup_toasts_a_session_scan_the_process_host_could_not_run(proj
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await click(pilot, await ready(pilot, "#ok"))
-        await until(
-            pilot,
-            lambda: any(
-                "session prune failed: unknown process host" in m for m in notifications(app)
-            ),
-        )
+        for prefix in ("session prune failed", "ctl window prune failed"):
+            await until(
+                pilot,
+                lambda prefix=prefix: any(
+                    f"{prefix}: unknown process host" in m for m in notifications(app)
+                ),
+            )
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
         assert isinstance(app.screen, DashboardScreen)
 

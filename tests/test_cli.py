@@ -19034,3 +19034,43 @@ def test_cleanup_text_unavailable_backend_without_evidence_is_silent(tmp_path, m
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     assert capsys.readouterr().err == ""
+
+
+def _process_host_broken(monkeypatch):
+    """Both cleanup scans fail on a misconfigured process host: the evidence
+    gates read engine liveness, which raises ProcessHostError."""
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+    from bmad_loop.tui import launch
+
+    def boom(_p):
+        raise ProcessHostError("unknown process host 'bogus'")
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", boom)
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_carries_a_process_host_fault_as_both_scan_errors(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    _process_host_broken(monkeypatch)
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys, err_contains="ctl window prune failed")
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert "unknown process host" in doc["sessions"]["scan_error"]
+    assert "unknown process host" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_text_reports_a_process_host_fault_and_exits_zero(tmp_path, monkeypatch, capsys):
+    _process_host_broken(monkeypatch)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "session prune failed: unknown process host" in captured.err
+    assert "ctl window prune failed: unknown process host" in captured.err
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out

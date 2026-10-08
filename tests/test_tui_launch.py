@@ -356,11 +356,7 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
             ids = (line.split("\t")[0] for line in rows.splitlines())
             out = "".join(f"{i}\n" for i in ids if i and i not in killed)
         elif argv[1] == "list-windows":
-            # A killed window leaves the formatted listing too, as on a real
-            # server (kill_ctl_window re-looks the run up after its kill).
-            out = "".join(
-                f"{line}\n" for line in rows.splitlines() if line.split("\t")[0] not in killed
-            )
+            out = rows
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -3182,229 +3178,18 @@ def test_ctl_candidates_count_an_unstattable_window_record_as_evidence(monkeypat
         launch.prunable_ctl_windows(tmp_path)
 
 
-def _record(tmp_path: Path, run_id: str, win_id: str) -> Path:
-    """A dead run dir of this project whose last launch recorded `win_id`."""
-    record = _make_run(tmp_path, run_id) / "ctl-window"
-    record.write_text(win_id, encoding="utf-8")
-    return record
-
-
-def test_verified_prune_forgets_the_record_and_a_later_unavailable_scan_is_silent(
+def test_a_verified_prune_keeps_the_record_and_a_later_unavailable_scan_reports(
     monkeypatch, tmp_path: Path
 ):
-    # The evidence clears with the window: once the prune has verified @6 gone,
-    # its record no longer makes an unavailable backend read as a failure.
-    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
-    record = _record(tmp_path, "20260101-000000-dead2", "@6")
-    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
-    assert "run-20260101-000000-dead2" in removed
-    assert not record.exists()
-    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
-    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")  # the fake's live run ended
-    assert launch.prunable_ctl_windows(tmp_path) == []
-
-
-@pytest.mark.parametrize("kill", ["fails", "unknowable"])
-def test_prune_keeps_the_record_of_a_window_not_verified_gone(monkeypatch, tmp_path: Path, kill):
-    # A survivor, or a kill whose outcome could not be probed, proves nothing
-    # gone: the record stays and an unavailable backend is still reported.
-    _ctl_prune_fake(monkeypatch, tmp_path, kill=kill)
-    record = _record(tmp_path, "20260101-000000-dead2", "@6")
-    launch.prune_ctl_windows(tmp_path)
-    assert record.read_text(encoding="utf-8") == "@6"
-
-
-def test_prune_repoints_the_record_at_a_same_run_window_that_survived(tmp_path: Path):
-    # The prune removed the recorded @2 but its sibling @1 survived the kill:
-    # forgetting would leave @1 with no evidence once the engine is gone, so
-    # the record follows the survivor, as on a hard stop.
-    record = _write_record(tmp_path, "RID", "@2")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
-    launch._forget_pruned_records(tmp_path, candidates, {"@1"})
-    assert record.read_text(encoding="utf-8") == "@1"
-
-
-def test_prune_ctl_windows_repoints_the_record_when_a_sibling_survives(monkeypatch, tmp_path: Path):
-    # Through the real prune: two windows of one dead run are candidates, the
-    # recorded @2 goes, and the kill of its sibling @1 does not land. The
-    # record must follow @1 — the call site has to hand the survivors over.
-    run_id = "20260101-000000-dead"
-    tag = runs.project_tag(tmp_path)
-    rows = {"@1": f"run-{run_id}", "@2": f"resume-{run_id}"}
-    gone: set[str] = set()
-
-    def fake(argv, **kwargs):
-        out = ""
-        if argv[1] == "kill-window" and argv[-1] == "@2":
-            gone.add("@2")  # @1's kill is a silent no-op: it survives
-        elif argv[1] == "list-windows":
-            alive = [w for w in rows if w not in gone]
-            if argv[-1] == "#{window_id}":
-                out = "".join(f"{w}\n" for w in alive)
-            else:
-                out = "".join(f"{w}\t{rows[w]}\t{tag}\n" for w in alive)
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    record = _write_record(tmp_path, run_id, "@2")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    assert launch.prune_ctl_windows(tmp_path) == ([f"resume-{run_id}"], [f"run-{run_id}"], [])
-    assert record.read_text(encoding="utf-8") == "@1"
-
-
-def test_prune_keeps_the_record_of_a_run_without_state_beside_a_survivor(tmp_path: Path):
-    # The record writer forgets instead of writing without state.json, so a
-    # re-point there would drop the survivor's evidence: the record stays.
-    record = _write_record(tmp_path, "RID", "@2")
-    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
-    launch._forget_pruned_records(tmp_path, candidates, {"@1"})
-    assert record.read_text(encoding="utf-8") == "@2"
-
-
-def test_prune_forgets_the_record_once_every_window_of_the_run_is_gone(tmp_path: Path):
-    record = _write_record(tmp_path, "RID", "@2")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
-    launch._forget_pruned_records(tmp_path, candidates, set())
-    assert not record.exists()
-
-
-def test_prune_keeps_a_record_naming_a_window_still_standing(monkeypatch, tmp_path: Path):
-    # The run's pruned window is gone, but its record names another window the
-    # post-kill listing still carries: that one is not proved gone.
-    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
-    record = _record(tmp_path, "20260101-000000-dead2", "@5")
-    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
-    assert "run-20260101-000000-dead2" in removed
-    assert record.read_text(encoding="utf-8") == "@5"
-
-
-def test_dry_run_prune_keeps_the_record(monkeypatch, tmp_path: Path):
-    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
-    record = _record(tmp_path, "20260101-000000-dead2", "@6")
-    assert "run-20260101-000000-dead2" in launch.prunable_ctl_windows(tmp_path)
-    assert record.read_text(encoding="utf-8") == "@6"
-
-
-def test_prune_keeps_a_record_a_racing_relaunch_wrote(monkeypatch, tmp_path: Path):
-    # A relaunch landing after the post-kill listing records a window that
-    # listing never saw: absent from it, yet alive. Only a record naming a
-    # window this prune removed may go.
-    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
-    record = _record(tmp_path, "20260101-000000-dead2", "@9")
-    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
-    assert "run-20260101-000000-dead2" in removed
-    assert record.read_text(encoding="utf-8") == "@9"
-
-
-def test_prune_keeps_an_unreadable_record(monkeypatch, tmp_path: Path):
-    # Nothing proves an unreadable record's window gone: it stays, and a later
-    # unavailable-backend scan still reports it.
+    # Records are sticky evidence by decision: a verified kill does not prove
+    # the run's other windows gone, so nothing drops the record with it.
     _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
     record = _make_run(tmp_path, "20260101-000000-dead2") / "ctl-window"
-    record.write_bytes(b"\xff\xfe")
-    launch.prune_ctl_windows(tmp_path)
-    assert record.read_bytes() == b"\xff\xfe"
+    record.write_text("@6", encoding="utf-8")
+    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
+    assert "run-20260101-000000-dead2" in removed
+    assert record.read_text(encoding="utf-8") == "@6"
     monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
     with pytest.raises(MultiplexerError, match="control window recorded"):
         launch.prunable_ctl_windows(tmp_path)
-
-
-def test_kill_ctl_window_forgets_the_record_of_the_window_it_verified_gone(
-    monkeypatch, tmp_path: Path
-):
-    # A hard stop verifies its kill like the prune does, so it clears the same
-    # evidence: a record left behind would make a later unavailable backend
-    # read as a failed cleanup scan.
-    _ctl_listing(monkeypatch, "@2\tresume-RID\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@2")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    assert launch.kill_ctl_window(tmp_path, "RID") == 0
-    assert not record.exists()
-
-
-def test_settle_never_forgets_the_record_of_a_run_without_state(tmp_path: Path):
-    # No state.json: the candidate scan skips an untagged window of such a run,
-    # so "no sibling left" is unproven and the record may be its only evidence.
-    # Both callers go through the same rule; the prune's is the one shown.
-    record = _write_record(tmp_path, "RID", "@2")
-    launch._forget_pruned_records(tmp_path, [("@2", "resume-RID")], set())
-    assert record.read_text(encoding="utf-8") == "@2"
-
-
-def test_kill_ctl_window_keeps_the_record_while_a_same_run_window_stands(
-    monkeypatch, tmp_path: Path
-):
-    # The stop kills the recorded resume window; its parked predecessor @1 is
-    # still standing. With the engine gone the record is that window's only
-    # evidence, so it is re-pointed at @1 — and the prune that later verifies
-    # @1 gone clears it by the id-match rule, instead of keeping a record that
-    # names a window no prune will ever remove.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@2")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    assert launch.kill_ctl_window(tmp_path, "RID") == 0
-    assert record.read_text(encoding="utf-8") == "@1"
-    launch._forget_pruned_records(tmp_path, [("@1", "run-RID")], set())
-    assert not record.exists()
-
-
-def test_kill_ctl_window_does_not_repoint_a_record_a_racing_relaunch_wrote(
-    monkeypatch, tmp_path: Path
-):
-    # The record names @9, a window the listing never carried (a relaunch
-    # racing the stop), so the kill falls back to @1. A sibling @2 still
-    # stands, but the record is not the stop's to re-point: it stays @9.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@9")
-    (record.parent / "state.json").write_text("{}", encoding="utf-8")
-    launch.kill_ctl_window(tmp_path, "RID")
-    assert record.read_text(encoding="utf-8") == "@9"
-
-
-def test_kill_ctl_window_keeps_the_record_of_a_run_without_state(monkeypatch, tmp_path: Path):
-    # A sibling stands, but the run dir has no state.json, where the record
-    # writer forgets instead of writing: re-pointing there would drop the
-    # standing window's only evidence, so the record stays as it is.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@2")
-    assert launch.kill_ctl_window(tmp_path, "RID") == 0
-    assert record.read_text(encoding="utf-8") == "@2"
-
-
-def test_kill_ctl_window_keeps_the_record_beside_an_unproven_window(monkeypatch, tmp_path: Path):
-    # Only an untagged same-run window is left: nothing proves it ours, so no
-    # prune will remove it, and the record stays as its evidence.
-    _ctl_listing(monkeypatch, "@2\tresume-RID\n@1\trun-RID\t\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@2")
-    assert launch.kill_ctl_window(tmp_path, "RID") == 1
-    assert record.read_text(encoding="utf-8") == "@2"
-
-
-def test_kill_ctl_window_keeps_a_record_naming_another_window(monkeypatch, tmp_path: Path):
-    # The record names a window the listing does not carry (a relaunch racing
-    # the stop), so the kill falls back to @1: only the killed id may go.
-    _ctl_listing(monkeypatch, "@1\trun-RID\n", tmp_path)
-    record = _write_record(tmp_path, "RID", "@9")
-    launch.kill_ctl_window(tmp_path, "RID")
-    assert record.read_text(encoding="utf-8") == "@9"
-
-
-def test_kill_ctl_window_keeps_the_record_of_a_window_that_survived(monkeypatch, tmp_path: Path):
-    tag = runs.project_tag(tmp_path)
-
-    def fake(argv, **kwargs):
-        out = ""
-        if argv[1] == "list-windows":
-            out = "@4\n" if argv[-1] == "#{window_id}" else f"@4\tresume-RID\t{tag}\n"
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")  # kill: no-op
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    record = _write_record(tmp_path, "RID", "@4")
-    with pytest.raises(MultiplexerError, match="survived the kill"):
-        launch.kill_ctl_window(tmp_path, "RID")
-    assert record.read_text(encoding="utf-8") == "@4"

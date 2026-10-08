@@ -840,19 +840,6 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
         mux.kill_window(win_id)
         if win_id in mux.list_window_ids(ctl_session(project)):
             raise MultiplexerError(f"control window {win_id} survived the kill")
-        # Verified gone, so the record must not stay behind as evidence a
-        # control window may exist: a later unavailable backend would read as a
-        # failed cleanup scan (#864). A hard stop kills the one window the
-        # lookup resolved, so a same-run window may still stand; _settle_record
-        # applies the rule the prune shares. A record beside only unproven
-        # windows stays as their evidence, and a lookup that cannot answer
-        # keeps it; the kill itself is already verified either way.
-        try:
-            remaining, left_unproven = ctl_window_lookup(project, run_id)
-        except MultiplexerError:
-            return unproven
-        if remaining is not None or left_unproven == 0:
-            _settle_record(project, run_id, {win_id}, remaining)
     return unproven
 
 
@@ -861,12 +848,14 @@ def _ctl_window_evidence(project: Path) -> str | None:
     a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
     raising on an unavailable backend in _ctl_window_candidates.
 
-    A verified prune or hard stop drops the record of the window it removed
-    (_settle_record), so the evidence clears with the window. A record
-    whose window survived, could not be verified, or went some other way (it
-    exited by itself, or was closed by hand) stays, and an unavailable backend
-    is then reported rather than read as clean: a false "nothing to prune" is
-    the defect, a report that the scan could not run is not."""
+    A record is sticky: nothing drops it when its window goes, by a prune, a
+    stop or otherwise. So a project that launched from the dashboard reports
+    an unavailable backend on every cleanup until its run dirs are removed.
+    That is the intended direction: a false "nothing to prune" is the defect,
+    a report that the scan could not run is not. Dropping the record with the
+    window was tried and given up — a verified kill does not prove the run's
+    other windows (the current one, untagged ones) gone, and the record was
+    then the only evidence left for them."""
     # Ungated, like live_run_evidence: a record outlives a lost state.json.
     # An unlistable runs dir yields nothing here and is named there instead.
     # Presence, not a read: a record that cannot be read still says a window
@@ -1022,66 +1011,7 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
         return [], [], [name for _win_id, name in candidates]
     removed = [name for win_id, name in candidates if win_id not in live]
     survived = [name for win_id, name in candidates if win_id in live]
-    _forget_pruned_records(project, candidates, live)
     return removed, survived, []
-
-
-def _forget_pruned_records(
-    project: Path, candidates: list[tuple[str, str]], live: set[str]
-) -> None:
-    """Settle the ctl-window record of each run a verified prune removed a
-    window of (_settle_record), so the evidence _ctl_window_evidence reads
-    clears with the windows — and only with all of them: a run whose sibling
-    window survived the kill keeps a record, re-pointed at the survivor, or
-    that window has no evidence once the engine is gone.
-
-    Matched by id against the verified removals, not by absence from the
-    post-kill listing: a relaunch racing this prune records a window that
-    listing never saw — absent from it, yet alive. Only a record naming a
-    window this prune proved gone is touched; one naming any other window (a
-    survivor, a newer launch, one that was never a candidate) stays, and so
-    does an unreadable one.
-
-    Ceiling: the read and the write are two steps, so a relaunch landing
-    between them still loses its record. That costs the attach/stop tie-break
-    a hint (ctl_window_id falls back to the name scan) and, with the backend
-    later unavailable, one piece of evidence — closing it needs a lock shared
-    with the launch path."""
-    gone_by_run: dict[str, set[str]] = {}
-    survivor_of: dict[str, str] = {}
-    for win_id, name in candidates:
-        m = _CTL_WINDOW_RE.match(name)
-        if m is None:
-            continue
-        if win_id in live:
-            survivor_of.setdefault(m.group(1), win_id)
-        else:
-            gone_by_run.setdefault(m.group(1), set()).add(win_id)
-    for run_id, gone in gone_by_run.items():
-        _settle_record(project, run_id, gone, survivor_of.get(run_id))
-
-
-def _settle_record(project: Path, run_id: str, gone: set[str], standing: str | None) -> None:
-    """After a verified kill of the window ids in `gone`: when `run_id`'s
-    record names one of them, re-point it at `standing` — a same-run window
-    still alive — or, with none standing, forget it. The one rule for the
-    prune (_forget_pruned_records) and the hard stop (kill_ctl_window); see
-    the former for why it is an id match and for its race ceiling.
-
-    A run dir without state.json keeps its record either way. A re-point
-    cannot happen there (_record_ctl_window forgets instead of writing), and
-    neither may a forget: the candidate scan skips an untagged window of such
-    a run, so "no sibling standing" is unproven there and the record may be
-    the only evidence left for one. (A failed write forgets too — its
-    documented fallback, left as a ceiling here.)"""
-    if _read_ctl_window(project, run_id) not in gone:
-        return
-    if not runs.is_run(runs.run_dir_for(project, run_id)):
-        return
-    if standing is None:
-        _forget_ctl_window(project, run_id)
-    else:
-        _record_ctl_window(project, run_id, standing)
 
 
 def ctl_session(project: Path) -> str:
