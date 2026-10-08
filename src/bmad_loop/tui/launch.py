@@ -842,28 +842,17 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
             raise MultiplexerError(f"control window {win_id} survived the kill")
         # Verified gone, so the record must not stay behind as evidence a
         # control window may exist: a later unavailable backend would read as a
-        # failed cleanup scan (#864). Same id-match rule as the prune
-        # (_forget_record_if_gone): only a record still naming the killed window
-        # is touched, never one a racing relaunch wrote. A hard stop kills the
-        # one window the lookup resolved, so a same-run window may still stand:
-        # the record is re-pointed at it, and the prune that later removes it
-        # clears the record by the same rule. A record beside only unproven
+        # failed cleanup scan (#864). A hard stop kills the one window the
+        # lookup resolved, so a same-run window may still stand; _settle_record
+        # applies the rule the prune shares. A record beside only unproven
         # windows stays as their evidence, and a lookup that cannot answer
         # keeps it; the kill itself is already verified either way.
         try:
             remaining, left_unproven = ctl_window_lookup(project, run_id)
         except MultiplexerError:
             return unproven
-        if remaining is not None:
-            # _record_ctl_window forgets instead of writing for a run dir with
-            # no state.json, which would drop the standing window's evidence:
-            # there the record stays as it is. (A failed write forgets too —
-            # its documented fallback, left as a ceiling here.)
-            run_dir = runs.run_dir_for(project, run_id)
-            if runs.is_run(run_dir) and _read_ctl_window(project, run_id) == win_id:
-                _record_ctl_window(project, run_id, remaining)
-        elif left_unproven == 0:
-            _forget_record_if_gone(project, run_id, {win_id})
+        if remaining is not None or left_unproven == 0:
+            _settle_record(project, run_id, {win_id}, remaining)
     return unproven
 
 
@@ -873,7 +862,7 @@ def _ctl_window_evidence(project: Path) -> str | None:
     raising on an unavailable backend in _ctl_window_candidates.
 
     A verified prune or hard stop drops the record of the window it removed
-    (_forget_record_if_gone), so the evidence clears with the window. A record
+    (_settle_record), so the evidence clears with the window. A record
     whose window survived, could not be verified, or went some other way (it
     exited by itself, or was closed by hand) stays, and an unavailable backend
     is then reported rather than read as clean: a false "nothing to prune" is
@@ -1033,45 +1022,62 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
         return [], [], [name for _win_id, name in candidates]
     removed = [name for win_id, name in candidates if win_id not in live]
     survived = [name for win_id, name in candidates if win_id in live]
-    _forget_pruned_records(
-        project, [(win_id, name) for win_id, name in candidates if win_id not in live]
-    )
+    _forget_pruned_records(project, candidates, live)
     return removed, survived, []
 
 
-def _forget_pruned_records(project: Path, removed: list[tuple[str, str]]) -> None:
-    """Drop the ctl-window record of each run a verified prune removed the
-    RECORDED window of, so the evidence _ctl_window_evidence reads clears with
-    the window.
+def _forget_pruned_records(
+    project: Path, candidates: list[tuple[str, str]], live: set[str]
+) -> None:
+    """Settle the ctl-window record of each run a verified prune removed a
+    window of (_settle_record), so the evidence _ctl_window_evidence reads
+    clears with the windows — and only with all of them: a run whose sibling
+    window survived the kill keeps a record, re-pointed at the survivor, or
+    that window has no evidence once the engine is gone.
 
     Matched by id against the verified removals, not by absence from the
-    post-kill listing: a run can hold more than one window, and a relaunch
-    racing this prune records a window that listing never saw — absent from
-    it, yet alive. Only a record naming a window this prune proved gone goes;
-    one naming any other window (a survivor, a newer launch, one that was never
-    a candidate) stays, and so does an unreadable one.
+    post-kill listing: a relaunch racing this prune records a window that
+    listing never saw — absent from it, yet alive. Only a record naming a
+    window this prune proved gone is touched; one naming any other window (a
+    survivor, a newer launch, one that was never a candidate) stays, and so
+    does an unreadable one.
 
-    Ceiling: the read and the unlink are two steps, so a relaunch landing
+    Ceiling: the read and the write are two steps, so a relaunch landing
     between them still loses its record. That costs the attach/stop tie-break
     a hint (ctl_window_id falls back to the name scan) and, with the backend
     later unavailable, one piece of evidence — closing it needs a lock shared
     with the launch path."""
     gone_by_run: dict[str, set[str]] = {}
-    for win_id, name in removed:
-        if m := _CTL_WINDOW_RE.match(name):
+    survivor_of: dict[str, str] = {}
+    for win_id, name in candidates:
+        m = _CTL_WINDOW_RE.match(name)
+        if m is None:
+            continue
+        if win_id in live:
+            survivor_of.setdefault(m.group(1), win_id)
+        else:
             gone_by_run.setdefault(m.group(1), set()).add(win_id)
     for run_id, gone in gone_by_run.items():
-        _forget_record_if_gone(project, run_id, gone)
+        _settle_record(project, run_id, gone, survivor_of.get(run_id))
 
 
-def _forget_record_if_gone(project: Path, run_id: str, gone: set[str]) -> None:
-    """Drop `run_id`'s ctl-window record when it names one of the window ids in
-    `gone` — ids a caller has just verified removed. The one id-match rule for
-    the prune (_forget_pruned_records) and the hard stop (kill_ctl_window,
-    which also re-points a record at a same-run window still standing); see
-    the former for why it is an id match and for its race ceiling."""
-    if _read_ctl_window(project, run_id) in gone:
+def _settle_record(project: Path, run_id: str, gone: set[str], standing: str | None) -> None:
+    """After a verified kill of the window ids in `gone`: when `run_id`'s
+    record names one of them, re-point it at `standing` — a same-run window
+    still alive — or, with none standing, forget it. The one rule for the
+    prune (_forget_pruned_records) and the hard stop (kill_ctl_window); see
+    the former for why it is an id match and for its race ceiling.
+
+    A re-point needs a run dir with state.json: _record_ctl_window forgets
+    instead of writing without one, which would drop the standing window's
+    evidence, so there the record stays as it is. (A failed write forgets too
+    — its documented fallback, left as a ceiling here.)"""
+    if _read_ctl_window(project, run_id) not in gone:
+        return
+    if standing is None:
         _forget_ctl_window(project, run_id)
+    elif runs.is_run(runs.run_dir_for(project, run_id)):
+        _record_ctl_window(project, run_id, standing)
 
 
 def ctl_session(project: Path) -> str:

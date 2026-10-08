@@ -3214,6 +3214,63 @@ def test_prune_keeps_the_record_of_a_window_not_verified_gone(monkeypatch, tmp_p
     assert record.read_text(encoding="utf-8") == "@6"
 
 
+def test_prune_repoints_the_record_at_a_same_run_window_that_survived(tmp_path: Path):
+    # The prune removed the recorded @2 but its sibling @1 survived the kill:
+    # forgetting would leave @1 with no evidence once the engine is gone, so
+    # the record follows the survivor, as on a hard stop.
+    record = _write_record(tmp_path, "RID", "@2")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
+    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
+    launch._forget_pruned_records(tmp_path, candidates, {"@1"})
+    assert record.read_text(encoding="utf-8") == "@1"
+
+
+def test_prune_ctl_windows_repoints_the_record_when_a_sibling_survives(monkeypatch, tmp_path: Path):
+    # Through the real prune: two windows of one dead run are candidates, the
+    # recorded @2 goes, and the kill of its sibling @1 does not land. The
+    # record must follow @1 — the call site has to hand the survivors over.
+    run_id = "20260101-000000-dead"
+    tag = runs.project_tag(tmp_path)
+    rows = {"@1": f"run-{run_id}", "@2": f"resume-{run_id}"}
+    gone: set[str] = set()
+
+    def fake(argv, **kwargs):
+        out = ""
+        if argv[1] == "kill-window" and argv[-1] == "@2":
+            gone.add("@2")  # @1's kill is a silent no-op: it survives
+        elif argv[1] == "list-windows":
+            alive = [w for w in rows if w not in gone]
+            if argv[-1] == "#{window_id}":
+                out = "".join(f"{w}\n" for w in alive)
+            else:
+                out = "".join(f"{w}\t{rows[w]}\t{tag}\n" for w in alive)
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    record = _write_record(tmp_path, run_id, "@2")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
+    assert launch.prune_ctl_windows(tmp_path) == ([f"resume-{run_id}"], [f"run-{run_id}"], [])
+    assert record.read_text(encoding="utf-8") == "@1"
+
+
+def test_prune_keeps_the_record_of_a_run_without_state_beside_a_survivor(tmp_path: Path):
+    # The record writer forgets instead of writing without state.json, so a
+    # re-point there would drop the survivor's evidence: the record stays.
+    record = _write_record(tmp_path, "RID", "@2")
+    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
+    launch._forget_pruned_records(tmp_path, candidates, {"@1"})
+    assert record.read_text(encoding="utf-8") == "@2"
+
+
+def test_prune_forgets_the_record_once_every_window_of_the_run_is_gone(tmp_path: Path):
+    record = _write_record(tmp_path, "RID", "@2")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
+    candidates = [("@1", "run-RID"), ("@2", "resume-RID")]
+    launch._forget_pruned_records(tmp_path, candidates, set())
+    assert not record.exists()
+
+
 def test_prune_keeps_a_record_naming_a_window_still_standing(monkeypatch, tmp_path: Path):
     # The run's pruned window is gone, but its record names another window the
     # post-kill listing still carries: that one is not proved gone.
@@ -3281,7 +3338,7 @@ def test_kill_ctl_window_keeps_the_record_while_a_same_run_window_stands(
     (record.parent / "state.json").write_text("{}", encoding="utf-8")
     assert launch.kill_ctl_window(tmp_path, "RID") == 0
     assert record.read_text(encoding="utf-8") == "@1"
-    launch._forget_pruned_records(tmp_path, [("@1", "run-RID")])
+    launch._forget_pruned_records(tmp_path, [("@1", "run-RID")], set())
     assert not record.exists()
 
 
