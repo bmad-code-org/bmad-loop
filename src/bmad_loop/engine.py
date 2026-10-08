@@ -2417,20 +2417,21 @@ class Engine:
                 # replay. As with the dev dispatch arm, nothing ran past the pause:
                 # no rollback — re-enter the loop, whose gate dispatches the next
                 # cycle (REVIEW_VERIFY -> REVIEW_RUNNING is legal). No damping spend
-                # is pending: only a completed pass earns one.
+                # is pending: only a completed pass earns one. The loop is already
+                # running, so its entry gate is not re-asked (DW-531).
                 self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
                 if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
                     try:
-                        self._review_and_commit(task)
+                        self._review_and_commit(task, resumed_loop=True)
                     finally:
                         self.workspace = prev
                     self._integrate_unit(task, unit)
                 else:
                     self._release_orphaned_mount(task)
-                    self._review_and_commit(task)
+                    self._review_and_commit(task, resumed_loop=True)
             elif task.reverify_replayed:
                 # DW-527: a `resolve --reverify` replay PROCEEDed, then the host died
                 # mid-review/fix of that continuation. The task is neither DEFERRED
@@ -3626,7 +3627,11 @@ class Engine:
             task.spec_file = str(spec_path)
 
     def _review_and_commit(
-        self, task: StoryTask, resume_result: SessionResult | None = None
+        self,
+        task: StoryTask,
+        resume_result: SessionResult | None = None,
+        *,
+        resumed_loop: bool = False,
     ) -> None:
         # A replayed REVIEW result finalized at `awaiting-operator` under
         # on_review_demotion = "park" is a review demotion (DW-383), not a dev park
@@ -3663,8 +3668,18 @@ class Engine:
         # scored the flag; kept as the orchestrator-side bound): once the damping
         # grant is spent, such a round converges + refiles instead of burning
         # cycles to the outer cap.
+        #
+        # The gate decides whether to START the loop, so it applies only on a fresh
+        # entry (DW-531). A resume that re-enters a loop already in progress — the
+        # completed-pass replay (`resume_result`) or a caller passing `resumed_loop`
+        # (the DW-529 review dispatch arm, a post-fix DEV_VERIFY resume) — carries
+        # the last pass's flag, which the uninterrupted loop never re-checks: a
+        # done/followup-False pass whose verify gate failed fixably re-reviews
+        # after its fix, and a non-terminal pass loops regardless of the flag.
         if (
-            self.policy.review.trigger == "recommended"
+            resume_result is None
+            and not resumed_loop
+            and self.policy.review.trigger == "recommended"
             and not task.followup_review_recommended
             and not task.salvage_refile_pending
         ):
@@ -6814,10 +6829,21 @@ class Engine:
         """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
         Base: the spec-approval-gate resume — run the review loop + commit.
         StoriesEngine overrides this to re-drive the implement leg of a
-        plan-checkpoint-paused story (leg-2) instead."""
+        plan-checkpoint-paused story (leg-2) instead.
+
+        A spent review cycle means the DEV_VERIFY being resumed is a fix-phase
+        repair inside the review loop whose next step the host died before
+        launching (no dispatch pause lands there: the fix's verify preflight
+        leaves the probes fresh), so the loop is re-entered past its entry gate
+        (DW-531). A green fix gets the re-review it owed. A failed fix with budget
+        left resumes into a review of the failing tree, whose verify gate then
+        routes back to repair: one extra pass, the same as with the flag set.
+        Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
+        re-drive. That re-drive keeps its counters and so reviews once instead of
+        skipping, which is the conservative direction."""
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
-        self._review_and_commit(task)
+        self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
 
     def _resume_reverify(self, task: StoryTask) -> None:
         """Replay dev verification against the kept attempt product (DW-522).

@@ -14449,6 +14449,107 @@ def test_review_entry_dispatch_pause_resumes_into_review(project, tmp_path):
     assert not _rows(engine2, "resume-restart")
 
 
+def test_post_fix_crash_before_review_dispatch_resumes_into_review(project, tmp_path):
+    """DW-531, the confirmed shape. A review pass finalizes `done` without
+    recommending a follow-up, its verify gate fails (fixable), and the fix session
+    repairs it, so the loop goes on to re-review. The host dies at the next cycle's
+    dispatch, before the cycle is charged. The task is persisted at DEV_VERIFY with
+    one review cycle spent and the stale `followup_review_recommended: false`.
+    Resume (the spec-approval arm) re-enters the loop past its
+    `trigger = "recommended"` entry gate and runs the re-review the uninterrupted
+    loop would have run. (A dispatch PAUSE cannot land here: the fix's verify
+    preflight leaves the probes fresh, so `_gate_dispatch` skips.)
+
+    Ablation, performed: drop `resumed_loop` from `_resume_after_dev_verify`'s
+    `_review_and_commit` call and the resume journals `review-not-recommended`
+    and commits through `_skip_review_and_commit` with no review session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=_env_policy(rig, rig.verify([0, 1, 0])),
+    )
+    original_gate = engine._gate_dispatch
+
+    def dies_at_post_fix_review_dispatch(task, role):
+        if role == "review" and task.review_cycle == 1:
+            raise RuntimeError("host died before the post-fix review dispatch")
+        return original_gate(task, role)
+
+    engine._gate_dispatch = dies_at_post_fix_review_dispatch
+    assert engine.run().crashed
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file
+    assert task.review_cycle == 1 and task.attempt == 2
+    assert task.followup_review_recommended is False
+    assert _rows(engine, "review-verify-failed")
+
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2 and task.attempt == 2
+    assert _rows(engine2, "resume-review")
+    assert not _rows(engine2, "review-not-recommended")
+    assert not _rows(engine2, "resume-restart")
+
+
+def test_review_loop_dispatch_pause_after_unrecommending_pass_replays_into_next_cycle(
+    project, tmp_path
+):
+    """DW-531, completed-pass replay arm: a completed pass left the spec short of
+    `done` while no longer recommending a follow-up — the loop runs another pass
+    regardless of the flag — and the next cycle's dispatch gate pauses. The replay
+    re-enters the loop with that pass's `followup_review_recommended: false` on the
+    task; it must replay into the next cycle, not the entry gate's skip.
+
+    Ablation, performed: drop the `resume_result is None` term from
+    `_review_and_commit`'s entry gate and the resume journals
+    `review-not-recommended` and runs no review session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=True, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    assert load_state(engine.run_dir).tasks["1-1-a"].followup_review_recommended is False
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    (replayed,) = _rows(engine2, "resume-verify")
+    assert replayed["role"] == "review"
+    assert not _rows(engine2, "review-not-recommended")
+    assert not _rows(engine2, "resume-restart")
+
+
 def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
     """A completed, unfinalized review pass loops to the next cycle without
     charging anything, so nothing probes until that cycle's dispatch gate — which
@@ -14487,8 +14588,9 @@ def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
     assert not _rows(engine2, "resume-restart")
 
 
+@pytest.mark.parametrize("unrecommending", [False, True])
 def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_cycle(
-    project, tmp_path
+    project, tmp_path, unrecommending
 ):
     """DW-529, a guard for an unreachable shape: the same REVIEW_VERIFY dispatch
     pause, but with the prior cycle's pass not on record as completed. Today a
@@ -14498,15 +14600,21 @@ def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_c
     replay; the resume re-enters the review loop with no rollback, the next cycle
     dispatches, and the story commits.
 
+    `unrecommending` (DW-531): the last completed pass left
+    `followup_review_recommended: false` on the task, and the resumed loop still
+    dispatches — the arm re-enters past the entry gate.
+
     Ablation, performed: delete the review `resume-env-dispatch` arm of
-    `Engine._finish_inflight` and the resume takes `resume-restart` instead."""
+    `Engine._finish_inflight` and the resume takes `resume-restart` instead; drop
+    its `resumed_loop=True` and the `unrecommending` case journals
+    `review-not-recommended` and runs no review session."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     rig = _env_rig(tmp_path)
     engine, adapter = make_engine(
         project,
         [
             dev_effect(project, "1-1-a"),
-            rig.dies_during(review_effect(project, "1-1-a", clean=False, finalized=False)),
+            rig.dies_during(review_effect(project, "1-1-a", clean=unrecommending, finalized=False)),
         ],
         policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
     )
@@ -14521,6 +14629,7 @@ def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_c
     record.status = "crashed"
     record.result_json = None
     save_state(engine.run_dir, state)
+    assert state.tasks["1-1-a"].followup_review_recommended is not unrecommending
 
     rig.up.write_text("up\n")
     engine2, adapter2 = resume_engine(
@@ -14539,6 +14648,7 @@ def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_c
     assert dispatched["role"] == "review"
     assert not _rows(engine2, "resume-verify")
     assert not _rows(engine2, "resume-restart")
+    assert not _rows(engine2, "review-not-recommended")
 
 
 def test_isolated_review_dispatch_pause_after_a_non_completed_pass_reopens_unit(project, tmp_path):

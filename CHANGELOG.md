@@ -90,6 +90,9 @@ breaking changes may land in a minor release.
   re-running the verify replay, not resume-restart (DW-527).
 - Guard a review-dispatch environment pause with no completed prior pass: it now
   resumes into the next review cycle, outside sweep runs (DW-529).
+- Resume a review loop interrupted mid-loop into its next review pass instead of
+  re-asking the `followup_review_recommended` entry gate, which skipped the
+  re-review a stale `false` flag owed (DW-531).
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
   so a reused window id or a forged `ctl-window` record can no longer steer
   them onto a neighbour's window; the record now only breaks ties among tagged
