@@ -965,6 +965,68 @@ class EscalationModal(BaseDialog):
         self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
 
 
+class ReverifyModal(BaseDialog):
+    """Pick the DEFERRED story whose kept work `bmad-loop resolve --reverify`
+    should re-verify (DW-524). Dismisses with the chosen story key, None on
+    cancel/escape.
+
+    Confirms only the TARGET: the binding confirmation of what the replay will
+    claim (HEAD/baseline, the squash-in of changes since the pause) is the CLI's
+    own prompt in the control window this opens, so it is stated once, there,
+    and cannot drift from what the CLI actually does. Story keys are engine
+    text and render as rich Text, never markup."""
+
+    DEFAULT_CSS = """
+    ReverifyModal #body {
+        height: auto;
+        max-height: 60%;
+    }
+    """
+
+    def __init__(self, run_id: str, targets: list[str], paused_story_key: str | None):
+        super().__init__()
+        self._run_id = run_id
+        self._targets = targets
+        self._paused_story_key = paused_story_key
+
+    def _label(self, key: str) -> Text:
+        label = Text(key)
+        marker = "paused story" if key == self._paused_story_key else "worktree unit"
+        label.append(f"  ({marker})", style="dim")
+        return label
+
+    def compose(self) -> ComposeResult:
+        body = Text()
+        body.append("deferred, not escalated: its kept work can be re-verified instead of ")
+        body.append("re-driven.\nopens ")
+        body.append(f"bmad-loop resolve {self._run_id} --reverify", style="bold")
+        body.append(
+            " in a control window, which states HEAD/baseline and that changes since the "
+            "pause are squashed into the story's commit, then asks you to confirm there.\n"
+        )
+        body.append("to move on instead, resume with e.", style="dim")
+        with Vertical(id="dialog"):
+            yield Label("re-verify kept work", classes="title")
+            with VerticalScroll(id="body"):
+                yield Static(body)
+            yield Select(
+                [(self._label(key), key) for key in self._targets],
+                value=self._targets[0],
+                allow_blank=False,
+                id="target",
+            )
+            with Horizontal(classes="buttons"):
+                yield Button("re-verify", variant="warning", id="ok")
+                yield Button("cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "ok":
+            self.dismiss(None)
+            return
+        value = self.query_one("#target", Select).value
+        self.dismiss(value if isinstance(value, str) else None)
+
+
 class ValidateFindingsModal(BaseDialog):
     """`validate --json` rendered structurally: verdict, then one row per finding.
 

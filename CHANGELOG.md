@@ -37,13 +37,16 @@ breaking changes may land in a minor release.
   worktree unit — then review per policy and commit or merge, with no dev
   session and no resolve agent; a worktree unit is accepted under any pause
   when `--story` names it, and sweep runs are refused (DW-522).
+- Add a TUI re-verify action: `V` (and `R`/`p` on a deferred pause) picks a
+  DEFERRED story or worktree unit and opens `bmad-loop resolve <run> --reverify`
+  in a control window; `R` points at `V` when deferred units exist (DW-524).
 
 ### Changed
 
 - Reword the rc 126/127 environment-fault pause to name the shell convention
   instead of asserting "command not found / not executable" (DW-523).
-- Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
-  gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
+- Point deferred-story and environment-fault pause notices at
+  `bmad-loop resolve <run> --reverify` (DW-522).
 
 ### Fixed
 
