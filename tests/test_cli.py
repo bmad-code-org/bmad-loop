@@ -18170,6 +18170,31 @@ def test_root_options_are_refused_on_relay_too(monkeypatch, option, value):
     assert relayed == []
 
 
+def test_a_refused_registry_root_leaves_the_state_root_unset(tmp_path, monkeypatch):
+    """Both options are validated before either is applied, so a valid
+    `--state-root` beside a refused `--registry-root` changes nothing a later
+    in-process `main` call could inherit.
+
+    Ablation: assign `--state-root` before validating `--registry-root` and the
+    variable reads the forwarded root."""
+    inherited = os.environ[envvars.STATE_DIR]
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "--state-root=" + str(tmp_path / "launchers-root"),
+                "--registry-root=relative-root",
+                "list",
+                "--project",
+                str(tmp_path),
+            ]
+        )
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert os.environ[envvars.STATE_DIR] == inherited
+
+
 def test_state_root_option_accepts_a_filesystem_root(tmp_path, monkeypatch):
     """`/` on POSIX and a drive root on Windows are absolute, and the variable
     accepts them (the override bypasses `_state_base`'s not-the-root rule)."""

@@ -48,9 +48,6 @@ breaking changes may land in a minor release.
   land on the right state root, and on the right registry under
   `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
   loss stay warned, and the TUI repeats the warning once its screen is up.
-- Demote the TUI's stale state-root warning to a note about shells in the
-  control session, without the `set-environment` / `kill-server` remedy: runs
-  launched from the TUI are no longer exposed.
 
 ### Fixed
 
@@ -73,11 +70,11 @@ breaking changes may land in a minor release.
   cannot be listed, or a session left standing, is journalled and warned about.
   A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
   child), except a share-root shape older PowerShell would corrupt.
-- Warn once in the TUI when its tmux control session would hand new windows a
-  different state root than its own (a server started under another
-  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
-  `tmux set-environment` remedy, with its limits on a server shared by several
-  projects, instead of letting the run read as gone (#731).
+- Note once in the TUI when new shells in its tmux control session would
+  resolve a different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots, so a
+  `bmad-loop` command typed into one is not silently aimed elsewhere; runs the
+  TUI launches are handed their root and are unaffected (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 - Reach only control-session windows carrying this project's tag from `a`/`x`,

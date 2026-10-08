@@ -6863,13 +6863,15 @@ def main(argv: list[str] | None = None) -> int:
     # directory. The registry root is set only; `_configure_mux` still decides
     # whether it is honoured (`runs.resolve_psmux_registry_root`), and judges it
     # with `Path.is_absolute` for the reason given there.
+    # Both are validated before either is set, so a refused one leaves this
+    # process's environment exactly as it found it.
+    if args.state_root is not None and not os.path.isabs(args.state_root):
+        parser.error(f"--state-root must be absolute: {args.state_root!r}")
+    if args.registry_root is not None and not Path(args.registry_root).is_absolute():
+        parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
     if args.state_root is not None:
-        if not os.path.isabs(args.state_root):
-            parser.error(f"--state-root must be absolute: {args.state_root!r}")
         os.environ[envvars.STATE_DIR] = args.state_root
     if args.registry_root is not None:
-        if not Path(args.registry_root).is_absolute():
-            parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
         os.environ[runs.PSMUX_DATA_DIR] = args.registry_root
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
