@@ -1917,7 +1917,12 @@ class BmadLoopApp(App[None]):
         # The cli cleanup's sessions.scan_error, as a toast: an unavailable
         # backend reads as no sessions, which is not clean while a run of this
         # project is or may be alive (#864). The ctl-window arm below reports its own.
-        sessions_scan_error = runs.session_scan_error(self.project)
+        # A misconfigured process host is a scan that could not run, as in
+        # _unavailable_cleanup_worker: an escape here takes the dashboard down.
+        try:
+            sessions_scan_error = runs.session_scan_error(self.project)
+        except ProcessHostError as e:
+            sessions_scan_error = str(e)
         if sessions_scan_error is not None:
             self.call_from_thread(
                 self.notify,

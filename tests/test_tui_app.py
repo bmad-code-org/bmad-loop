@@ -3561,6 +3561,37 @@ async def test_cleanup_toasts_both_scans_for_a_live_run_behind_an_unavailable_ba
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
 
 
+async def test_cleanup_toasts_a_session_scan_the_process_host_could_not_run(project, monkeypatch):
+    # The normal worker's post-prune session scan reads engine liveness, which a
+    # misconfigured process host fails with ProcessHostError. It is a scan that
+    # could not run: toasted, with the receipt still reported and no crash.
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+
+    def scan(_p):
+        raise ProcessHostError("unknown process host")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["fin-1"], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", scan)
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "session prune failed: unknown process host" in m for m in notifications(app)
+            ),
+        )
+        await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)
+
+
 async def test_cleanup_with_no_multiplexer_scans_off_the_event_loop(project, monkeypatch):
     """The evidence scans read run dirs any coding session can write (an
     engine.pid may be a FIFO), so they run on a worker thread, and a

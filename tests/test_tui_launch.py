@@ -3321,8 +3321,18 @@ def test_kill_ctl_window_forgets_the_record_of_the_window_it_verified_gone(
     # read as a failed cleanup scan.
     _ctl_listing(monkeypatch, "@2\tresume-RID\n", tmp_path)
     record = _write_record(tmp_path, "RID", "@2")
+    (record.parent / "state.json").write_text("{}", encoding="utf-8")
     assert launch.kill_ctl_window(tmp_path, "RID") == 0
     assert not record.exists()
+
+
+def test_settle_never_forgets_the_record_of_a_run_without_state(tmp_path: Path):
+    # No state.json: the candidate scan skips an untagged window of such a run,
+    # so "no sibling left" is unproven and the record may be its only evidence.
+    # Both callers go through the same rule; the prune's is the one shown.
+    record = _write_record(tmp_path, "RID", "@2")
+    launch._forget_pruned_records(tmp_path, [("@2", "resume-RID")], set())
+    assert record.read_text(encoding="utf-8") == "@2"
 
 
 def test_kill_ctl_window_keeps_the_record_while_a_same_run_window_stands(

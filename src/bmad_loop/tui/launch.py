@@ -1068,15 +1068,19 @@ def _settle_record(project: Path, run_id: str, gone: set[str], standing: str | N
     prune (_forget_pruned_records) and the hard stop (kill_ctl_window); see
     the former for why it is an id match and for its race ceiling.
 
-    A re-point needs a run dir with state.json: _record_ctl_window forgets
-    instead of writing without one, which would drop the standing window's
-    evidence, so there the record stays as it is. (A failed write forgets too
-    — its documented fallback, left as a ceiling here.)"""
+    A run dir without state.json keeps its record either way. A re-point
+    cannot happen there (_record_ctl_window forgets instead of writing), and
+    neither may a forget: the candidate scan skips an untagged window of such
+    a run, so "no sibling standing" is unproven there and the record may be
+    the only evidence left for one. (A failed write forgets too — its
+    documented fallback, left as a ceiling here.)"""
     if _read_ctl_window(project, run_id) not in gone:
+        return
+    if not runs.is_run(runs.run_dir_for(project, run_id)):
         return
     if standing is None:
         _forget_ctl_window(project, run_id)
-    elif runs.is_run(runs.run_dir_for(project, run_id)):
+    else:
         _record_ctl_window(project, run_id, standing)
 
 
