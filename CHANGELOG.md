@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `bmad-loop validate --probes`: run every `[environment] probe` (not
+  fail-fast, each bounded by `probe_timeout_s`) and report one
+  `environment.probe` finding per probe; a probe that fails, times out or
+  cannot be started fails validate. Plain `validate` only notes configured
+  probes as not run (DW-526).
 - Add `resolve <finished-run> --reverify --story <key>`: replay a finished
   run's kept deferred worktree unit in a new replay run that takes the
   worktree over and merges it on a pass; the finished run stays finished

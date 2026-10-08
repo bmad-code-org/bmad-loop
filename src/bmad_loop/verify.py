@@ -9760,6 +9760,65 @@ def run_environment_probes(policy: Policy, cwd: Path) -> ProbeOutcome:
     return ProbeOutcome(tuple(results), None, timeout_s)
 
 
+ProbeStatus = Literal["pass", "fail", "timeout", "interrupted"]
+
+
+@dataclass(frozen=True)
+class ProbeCheck:
+    """One probe's verdict from :func:`check_environment_probes` (DW-526).
+
+    ``status`` is the operator-facing classification; ``reason`` is
+    :func:`probe_failure_reason` on a ``fail`` or ``timeout`` (the same phrase a
+    run's environment pause would carry), ``"interrupted by a hard stop
+    request"`` on ``interrupted``, and ``""`` on ``pass``."""
+
+    result: CommandResult
+    status: ProbeStatus
+    reason: str
+
+
+def check_environment_probes(policy: Policy, cwd: Path) -> tuple[ProbeCheck, ...]:
+    """Run EVERY ``[environment] probe`` in ``cwd`` and classify each — the
+    ``bmad-loop validate --probes`` runner (DW-526).
+
+    Not fail-fast, unlike :func:`run_environment_probes`: the run stops at the
+    first failure because one broken environment is enough to pause, but an
+    operator checking a probe list wants every broken probe named in one pass,
+    not one per re-run. Only a hard stop ends the pass early — an interrupted
+    probe is recorded and nothing after it spawns.
+
+    Deliberately NOT a preflight call: it runs no ``[verify]`` command, journals
+    nothing, and is not one of the compositions tests/test_portability_guard.py
+    pins to the preflight runners. What it shares with the run is the verdict —
+    the same :func:`_run_shell_command` runner, ``probe_timeout_s`` bound,
+    :func:`_probe_timed_out`/:func:`_probe_failed` predicates and
+    :func:`probe_failure_reason` phrasing — so validate and the run cannot
+    disagree on a given probe RESULT. They can still see different environments:
+    validate probes the run's code root (``repo_root``), which is where the run
+    probes too except under worktree isolation, where each unit probes its own
+    mounted worktree — a fresh checkout without the gitignored or untracked
+    files a probe might rely on. No probes configured spawns nothing and
+    returns ``()``."""
+    timeout_s = policy.environment.probe_timeout_s
+    checks: list[ProbeCheck] = []
+    for probe in policy.environment.probes:
+        result = _run_shell_command(probe, cwd, timeout_s)
+        if result.interrupted:
+            checks.append(ProbeCheck(result, "interrupted", "interrupted by a hard stop request"))
+            break
+        if _probe_timed_out(result):
+            checks.append(
+                ProbeCheck(result, "timeout", probe_failure_reason(result, timeout_s, cwd=cwd))
+            )
+        elif _probe_failed(result, cwd):
+            checks.append(
+                ProbeCheck(result, "fail", probe_failure_reason(result, timeout_s, cwd=cwd))
+            )
+        else:
+            checks.append(ProbeCheck(result, "pass", ""))
+    return tuple(checks)
+
+
 def environment_preflight_outcome(probe: ProbeOutcome) -> VerifyOutcome:
     """The escalation for a failed environment preflight: an env fault with
     cause ``"probe"``, so the run pauses without charging the attempt and no

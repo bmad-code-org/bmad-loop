@@ -443,6 +443,68 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
 # ----------------------------------------------------------------- commands
 
 
+def _validate_environment_probes(
+    pol: policy_mod.Policy, cwd: Path, report: ValidationReport, *, run: bool
+) -> None:
+    """The ``[environment] probes`` findings of ``validate`` (DW-526).
+
+    Opt-in, like ``--render-probe``: a probe is operator-authored shell, and plain
+    validate must stay non-executing for a fresh clone. Without ``run`` a
+    configured list is only noted — an ``ok`` severity on purpose (a warning on
+    every plain validate would teach operators to ignore warnings), and the
+    message plus ``detail.run: false`` say plainly that nothing ran. With no
+    probes and no flag, nothing is reported, so that output is unchanged.
+
+    With ``run`` every probe runs (:func:`verify.check_environment_probes`, not
+    fail-fast) and each is one ``environment.probe`` finding. ``returncode`` is
+    None when no exit status exists — a timeout, a spawn fault, an interrupt —
+    because the runner's sentinels are not exit codes and the ``--json`` contract
+    must not publish them as one."""
+    probes = pol.environment.probes
+    timeout_s = pol.environment.probe_timeout_s
+    if not run:
+        if probes:
+            report.ok(
+                "environment.probes-not-run",
+                f"{len(probes)} [environment] probe(s) configured, not run "
+                "— pass --probes to execute them",
+                {"probes": list(probes), "run": False},
+            )
+        return
+    if not probes:
+        report.ok(
+            "environment.probes-none",
+            "no [environment] probes configured — nothing to run",
+        )
+        return
+    for index, check in enumerate(verify.check_environment_probes(pol, cwd)):
+        result = check.result
+        exited = check.status not in ("timeout", "interrupted") and result.spawn_error is None
+        detail = {
+            "command": result.command,
+            "index": index,
+            "status": check.status,
+            "returncode": result.returncode if exited else None,
+            "reason": check.reason,
+            "timeout_s": timeout_s,
+            "cwd": str(cwd),
+        }
+        if check.status == "pass":
+            report.ok("environment.probe", f"environment probe passed: {result.command}", detail)
+            continue
+        if check.status == "fail":
+            message = f"environment probe failed ({check.reason}): {result.command}"
+        else:  # timeout / interrupted: the reason already reads as the verdict
+            message = f"environment probe {check.reason}: {result.command}"
+        tail = next(
+            (line.strip() for line in reversed(result.output_tail.splitlines()) if line.strip()),
+            "",
+        )
+        if tail and tail not in check.reason:
+            message += f" — {tail}"
+        report.fail("environment.probe", message, detail)
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from .install import relay_registered
 
@@ -1139,6 +1201,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"trees": triage_trees, "skill": install.SWEEP_SKILL},
             )
         report.extend(sweep_findings)
+
+    # DW-526. Probes run in `clean_root`, the run's code root (`repo_root`). That is
+    # where a run probes too, except under worktree isolation: there each unit
+    # probes its own mounted worktree, a fresh checkout validate cannot reproduce
+    # (gitignored/untracked files a probe relies on are absent from it). Skipped
+    # on an unloadable policy: the `policy` problem above already reports it.
+    if pol is not None:
+        _validate_environment_probes(
+            pol, clean_root, report, run=bool(getattr(args, "probes", False))
+        )
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -6613,6 +6685,13 @@ def main(argv: list[str] | None = None) -> int:
         "throwaway temp copy of _bmad/ + the skill (no coding CLI, project untouched; "
         "the launcher, typically `uv run --no-cache`, fetches the renderer's deps on "
         "each probe, so it needs network access)",
+    )
+    validate_p.add_argument(
+        "--probes",
+        action="store_true",
+        help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
+        "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
+        "that fails, times out or cannot be started fails validate",
     )
     machine.add_json_flag(validate_p, "check findings")
 
