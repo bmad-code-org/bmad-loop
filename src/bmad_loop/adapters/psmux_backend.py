@@ -82,7 +82,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from .tmux_base import PARKED_RETURN_DETACH, BaseTmuxBackend, TmuxError
+from .tmux_base import PARKED_RETURN_DETACH, TMUX_TIMEOUT_S, BaseTmuxBackend, TmuxError
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # psmux's registry-root variable, as psmux spells it. `runs.PSMUX_DATA_DIR` holds
@@ -98,6 +98,19 @@ def _pwsh_quote(value: str) -> str:
     # is doubling the quote itself.
     return "'" + value.replace("'", "''") + "'"
 
+
+# The PowerShell floor for every window launch, the query that reads the
+# version (a query Windows PowerShell 5.1 answers too), and each executable's answer,
+# probed once per process — see `PsmuxMultiplexer._require_pwsh_floor`.
+_PWSH_FLOOR = (7, 3)
+_PWSH_VERSION_QUERY = "$PSVersionTable.PSVersion.ToString()"
+_PWSH_VERSIONS: dict[str, str] = {}
+# The whole stripped answer: two to four numeric parts (Windows PowerShell reports
+# four, pwsh three) and an optional prerelease suffix (`7.6.0-preview.4`).
+# Anything else — a prefix with trailing text, a second line — is unreadable.
+_PWSH_VERSION_SHAPE = re.compile(r"(\d+)\.(\d+)(?:\.\d+){0,2}(?:-[0-9A-Za-z.]+)?")
+# Prepended to every window's source; see `PsmuxMultiplexer._shell_wrap`.
+_STANDARD_ARGUMENT_PASSING = "$PSNativeCommandArgumentPassing = 'Standard'; "
 
 # One warning per process about `PSMUX_BARE_ENV`, not per verb — see
 # `PsmuxMultiplexer._warn_if_bare_env`.
@@ -158,6 +171,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # the distinct psmux name never collides with another tmux-family install
     # (e.g. a tmux-windows port owning ``tmux`` on the same PATH).
     _BINARY = "psmux"
+    # The shell every window's source runs under (see _shell_wrap).
+    _PWSH = "pwsh"
     # psmux emits UTF-8; decoding with the console codepage (cp1252) garbles
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
@@ -407,8 +422,77 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # psmux joins the trailing argv and re-parses it through an outer shell,
         # which strips embedded quoting; -EncodedCommand (base64 of UTF-16LE) is
         # the lossless transport for arbitrary shell source.
+        #
+        # Standard argument passing first: under the default Windows mode,
+        # PowerShell 7.3+ still builds a batch launcher's (.cmd/.bat, e.g. an
+        # npm-installed CLI's shim) command line the legacy way, which drops an
+        # empty argument and mangles an embedded quote (measured on 7.6; an .exe
+        # or .ps1 target is unaffected either way). Batch launchers keep
+        # further argument limits of their own, tracked separately.
+        self._require_pwsh_floor()
+        source = _STANDARD_ARGUMENT_PASSING + source
         encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-        return ["pwsh", "-NoProfile", "-EncodedCommand", encoded]
+        return [self._PWSH, "-NoProfile", "-EncodedCommand", encoded]
+
+    def _require_pwsh_floor(self) -> None:
+        """Refuse a window launch under PowerShell older than 7.3 (#861).
+
+        ``_join_argv`` hands each argument to PowerShell's native-command
+        builder, and before 7.3 that builder corrupts argv: an argument with
+        whitespace and a trailing backslash is wrapped in quotes without
+        escaping the backslash, so it swallows the next one; an empty argument
+        is dropped; an embedded quote is stripped (measured on Windows
+        PowerShell 5.1 through a real parked window; pwsh 7.6 delivers all of
+        them intact). A path ending in a backslash and holding a space is
+        enough. So every window launch checks the version first — in
+        ``_shell_wrap``, the one place a window's ``pwsh`` argv is built, and in
+        ``new_session``, whose initial window runs psmux's default shell — which
+        no backend selection (automatic or forced) routes around, and refuses
+        before psmux mints anything. Probed once per process per executable; an
+        answer is cached (and an unreadable one refused each time), while a
+        probe that failed to run or exited nonzero is retried, and raises, each
+        time.
+
+        Ceiling, named: the probe resolves ``pwsh`` on this process's PATH, the window
+        on its psmux server's, which inherits the env of whichever process
+        created the session — the same PATH in every bmad-loop flow unless an
+        operator changes it between the two. Pinning one absolute path for
+        both would close that, but ``pipe_pane`` space-joins this argv, so it
+        needs quoting there first.
+        """
+        reported = _PWSH_VERSIONS.get(self._PWSH)
+        if reported is None:
+            try:
+                proc = subprocess.run(
+                    [self._PWSH, "-NoProfile", "-NonInteractive", "-Command", _PWSH_VERSION_QUERY],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="backslashreplace",
+                    timeout=TMUX_TIMEOUT_S,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                raise TmuxError(f"could not read the {self._PWSH} version: {exc}") from exc
+            if proc.returncode != 0:
+                raise TmuxError(
+                    f"could not read the {self._PWSH} version: exit {proc.returncode}: "
+                    f"{proc.stderr.strip()}"
+                )
+            reported = proc.stdout.strip()
+            _PWSH_VERSIONS[self._PWSH] = reported
+        parsed = _PWSH_VERSION_SHAPE.fullmatch(reported)
+        if parsed is None:
+            raise TmuxError(
+                f"could not read the {self._PWSH} version: unrecognized answer "
+                f"{reported!r}; psmux windows need PowerShell 7.3 or later"
+            )
+        if (int(parsed[1]), int(parsed[2])) < _PWSH_FLOOR:
+            raise TmuxError(
+                f"psmux windows need PowerShell 7.3 or later, and {self._PWSH} reports "
+                f"{reported!r}: older versions corrupt command arguments "
+                "(a path with a space and a trailing backslash, an empty or quoted "
+                "argument); upgrade pwsh to 7.3 or later"
+            )
 
     def _parked_trailer(self, return_opt: str) -> str:
         # The base's trailer re-expressed in pwsh — the tmux verbs are protocol-
@@ -500,6 +584,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         }
         env["PSMUX_ALLOW_NESTING"] = "1"
+        # The initial window is a window launch too: the same PowerShell floor
+        # as `_shell_wrap`, checked before psmux creates anything.
+        self._require_pwsh_floor()
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
         try:
             proc = self._run(
@@ -1457,7 +1544,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # version query; the lru-cached selected instance re-probes a swapped
         # install only on restart (detect_multiplexers' fresh instances
         # re-probe every call).
-        if not all(shutil.which(exe) for exe in (self._BINARY, "pwsh")):
+        if not all(shutil.which(exe) for exe in (self._BINARY, self._PWSH)):
             return False
         if self._version_ok is None:
             # A missing patch segment reads as 0 — psmux hardwires three-part

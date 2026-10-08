@@ -97,7 +97,16 @@ when available; `available()` requires the
 `psmux` and `pwsh` (PowerShell) binaries on `PATH` and a psmux **3.3.8 or newer** (older
 releases report unavailable and selection falls through: 3.3.6 and below can force-kill a
 recycled PID during teardown, and the backend's verbs are written against fixes that landed
-in 3.3.8 rather than routing around the defects they close). Native Windows is still
+in 3.3.8 rather than routing around the defects they close). Every psmux window launch also
+needs **PowerShell 7.3 or newer** as `pwsh`: older versions corrupt the arguments of the
+command a window runs (a path with a space and a trailing backslash swallows the next
+argument; an empty or quoted argument is mangled), so the backend reads the `pwsh` version
+once per process and refuses to open a window or create a session under an older one (or
+one whose version it cannot read), naming what it found and asking you to upgrade pwsh. A
+forced backend (`BMAD_LOOP_MUX_BACKEND=psmux` or `[mux] backend`) is refused the same way
+(#861). Window commands run with PowerShell's Standard argument passing, so a `.cmd` or
+`.bat` launcher (an npm-installed CLI's shim) receives an empty or quoted argument intact;
+batch launchers have remaining argument limits, tracked separately. Native Windows is still
 experimental — see the
 [roadmap](ROADMAP.md#native-windows-multiplexer-backend) for the remaining work. WSL is
 unaffected: it _is_ Linux and uses tmux — provided bmad-loop was installed with the

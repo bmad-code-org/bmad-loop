@@ -47,6 +47,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse to open a psmux window or create a psmux session when `pwsh` is older
+  than 7.3, whose argument passing corrupts a command's arguments (a path with a
+  space and a trailing backslash swallowed the next one); checked once per
+  process, forced backend included, and an unrecognized version answer is
+  refused too (#861).
+- Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
+  shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
+  intact; batch launchers have remaining argument limits, tracked separately.
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
