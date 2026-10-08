@@ -104,7 +104,11 @@ argument; an empty or quoted argument is mangled), so the backend reads the `pws
 once per process and refuses to open a window or create a session under an older one (or
 one whose version it cannot read), naming what it found and asking you to upgrade pwsh. A
 forced backend (`BMAD_LOOP_MUX_BACKEND=psmux` or `[mux] backend`) is refused the same way
-(#861). Window commands run with PowerShell's Standard argument passing, so a `.cmd` or
+(#861). The backend resolves `pwsh` to one absolute path on its own `PATH`, reads that
+executable's version, and launches every window and the pipe-pane log sink with that same
+path, so the psmux server's `PATH` never picks a different one; a `pwsh` that does not
+resolve is refused. A new session's initial window still runs psmux's own default shell
+(#863). Window commands run with PowerShell's Standard argument passing, so a `.cmd` or
 `.bat` launcher (an npm-installed CLI's shim) receives an empty or quoted argument intact;
 batch launchers have remaining argument limits, tracked separately. Native Windows is still
 experimental — see the
