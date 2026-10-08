@@ -410,12 +410,15 @@ def test_bare_env_mode_warns_once_per_process(
 ):
     """bmad-loop does not support `PSMUX_BARE_ENV` (psmux is on iff the value is
     "1" or case-insensitive "true" — `src/pane.rs:890-892`, source-read at
-    v3.3.8): under it a session's window-0 shell and the TUI's parked engine
-    windows lose `BMAD_LOOP_STATE_DIR` by inheritance and derive their own
-    registry, so a run can read as gone. Said once per process, not per verb.
+    v3.3.8): under it a session's window-0 shell loses `BMAD_LOOP_STATE_DIR` by
+    inheritance and derives its own registry, so a command typed there can read
+    a run as gone, and a coding CLI loses what its env dict does not name. The
+    TUI's parked engine windows are no longer among the losses: they are handed
+    both roots in their argv (#731). Said once per process, not per verb.
 
     Ablate the warning out of `_warn_if_bare_env` and this fails; ablate the
-    `_BARE_ENV_WARNED` guard and the count reads two."""
+    `_BARE_ENV_WARNED` guard and the count reads two; restore the parked-window
+    clause and the last assertion fails."""
     monkeypatch.setenv("PSMUX_BARE_ENV", value)
     mux = PsmuxMultiplexer()
     mux._run(["list-sessions"], check=False)
@@ -423,6 +426,8 @@ def test_bare_env_mode_warns_once_per_process(
     err = capsys.readouterr().err
     assert err.count("warning: PSMUX_BARE_ENV") == 1
     assert "does not support" in err
+    assert "window-0 shell" in err and "credentials" in err
+    assert "parked" not in err
 
 
 @pytest.mark.parametrize("value", [None, "0", "", "yes"])
@@ -771,10 +776,17 @@ def _pwsh_floor_fake(monkeypatch, reported: str) -> list[list[str]]:
     return calls
 
 
+# A parked engine's argv as the TUI composes it, carrying the one root shape
+# PowerShell older than 7.3 corrupts: whitespace and a trailing backslash.
+_PARKED_ENGINE_ARGV = ["prog", "--state-root=" + r"\\srv\my share" + "\\", "run"]
+
+
 def _launches(mux: PsmuxMultiplexer, tmp_path):
     return {
         "new_window": lambda: mux.new_window("s", "n", tmp_path, {}, "prog"),
-        "new_parked_window": lambda: mux.new_parked_window("s", "n", tmp_path, ["prog"], "@r"),
+        "new_parked_window": lambda: mux.new_parked_window(
+            "s", "n", tmp_path, _PARKED_ENGINE_ARGV, "@r"
+        ),
     }
 
 

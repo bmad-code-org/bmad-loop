@@ -6418,6 +6418,11 @@ def main(argv: list[str] | None = None) -> int:
     # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
     # detached child, never typed by hand. See the handling after `parse_args`.
     parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: the launcher's own state root and registry
+    # root, handed to a parked engine in its argv because inheritance cannot
+    # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
+    parser.add_argument("--state-root", help=argparse.SUPPRESS)
+    parser.add_argument("--registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -6849,6 +6854,23 @@ def main(argv: list[str] | None = None) -> int:
     relay_p.set_defaults(func=cmd_relay)
 
     args = parser.parse_args(argv)
+    # Applied ahead of everything below, the relay branch included, so every later
+    # reader (`runs.state_root`, `_configure_mux`'s registry decision, the env a
+    # coding-CLI window is pinned from) sees what the launcher resolved, exactly as
+    # if inheritance had delivered it. Refused when not absolute: the variable has
+    # the same rule (`runs.state_root` judges it with `os.path.isabs` on the raw
+    # string), and a relative root names a different directory per working
+    # directory. The registry root is set only; `_configure_mux` still decides
+    # whether it is honoured (`runs.resolve_psmux_registry_root`), and judges it
+    # with `Path.is_absolute` for the reason given there.
+    if args.state_root is not None:
+        if not os.path.isabs(args.state_root):
+            parser.error(f"--state-root must be absolute: {args.state_root!r}")
+        os.environ[envvars.STATE_DIR] = args.state_root
+    if args.registry_root is not None:
+        if not Path(args.registry_root).is_absolute():
+            parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
+        os.environ[runs.PSMUX_DATA_DIR] = args.registry_root
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
     # inside the session whose completion it reports, and a hook that exits non-zero

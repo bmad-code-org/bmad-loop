@@ -44,9 +44,20 @@ breaking changes may land in a minor release.
   instead of asserting "command not found / not executable" (DW-523).
 - Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
   gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
+- Narrow the `PSMUX_BARE_ENV` support gap (#730): TUI-parked engine windows now
+  land on the right state root, and on the right registry under
+  `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
+  loss stay warned, and the TUI repeats the warning once its screen is up.
+- Demote the TUI's stale state-root warning to a note about shells in the
+  control session, without the `set-environment` / `kill-server` remedy: runs
+  launched from the TUI are no longer exposed.
 
 ### Fixed
 
+- Hand each TUI-launched engine the TUI's own state root, and its registry root
+  on psmux, on the parked window's command line, so a multiplexer server started
+  under another state root no longer runs it where the TUI cannot see it; a TUI
+  with no derivable state root refuses the launch (#731)
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per

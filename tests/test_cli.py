@@ -18093,6 +18093,164 @@ def test_relay_ignores_a_displaced_registry_root(monkeypatch):
     assert cli.main(["--displaced-registry-root=relative-root", "relay", "Stop"]) == 0
 
 
+def _spy_ahead_of_dispatch(monkeypatch, *names: str) -> dict[str, dict[str, str | None]]:
+    """Record the state and registry variables each of ``names`` (the relay
+    handler, `_configure_mux`) sees when `main` reaches it."""
+    seen: dict[str, dict[str, str | None]] = {}
+
+    def spy(name):
+        def record(*_args, **_kwargs):
+            seen[name] = {
+                "state": os.environ.get(envvars.STATE_DIR),
+                "registry": os.environ.get(runs.PSMUX_DATA_DIR),
+            }
+            return 0 if name == "cmd_relay" else None
+
+        return record
+
+    for name in names:
+        monkeypatch.setattr(cli, name, spy(name))
+    return seen
+
+
+def test_state_root_option_is_applied_before_relay_and_mux_setup(tmp_path, monkeypatch):
+    """The parked engine's state root rides its argv (#731), so `main` applies it
+    to `BMAD_LOOP_STATE_DIR` right after parsing: ahead of the relay branch and of
+    `_configure_mux`, whose registry export derives from it.
+
+    Ablate the assignment in `main` and both spies see the sandbox root."""
+    root = str(tmp_path / "launchers-root")
+    seen = _spy_ahead_of_dispatch(monkeypatch, "cmd_relay", "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--state-root=" + root, "relay", "Stop"]) == 0
+    assert seen["cmd_relay"]["state"] == root
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "inherited"))
+    assert cli.main(["--state-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["state"] == root
+    assert os.environ[envvars.STATE_DIR] == root
+
+
+@pytest.mark.parametrize("value", ["relative-root", ""], ids=["relative", "empty"])
+def test_state_root_option_refuses_a_value_that_is_not_absolute(
+    tmp_path, capsys, monkeypatch, value
+):
+    """Absolute, judged by `os.path.isabs` on the raw string as the variable is:
+    a relative root names a different directory per working directory. Refused
+    at parse time, before anything is set or dispatched.
+
+    Ablate the `isabs` check and `main` returns 0 with the value set."""
+    inherited = os.environ[envvars.STATE_DIR]
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--state-root=" + value, "list", "--project", str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert "--state-root must be absolute" in capsys.readouterr().err
+    assert os.environ[envvars.STATE_DIR] == inherited
+
+
+@pytest.mark.parametrize("option", ["--state-root", "--registry-root"])
+@pytest.mark.parametrize("value", ["relative-root", ""], ids=["relative", "empty"])
+def test_root_options_are_refused_on_relay_too(monkeypatch, option, value):
+    """Both options are validated ahead of the relay branch, where they are
+    applied: no hook registration composes either, so a malformed one is a
+    malformed launch, and the relay is never reached.
+
+    Ablation: move the option handling below the relay branch and `cmd_relay`
+    runs."""
+    relayed: list[bool] = []
+    monkeypatch.setattr(cli, "cmd_relay", lambda _args: relayed.append(True) or 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([f"{option}={value}", "relay", "Stop"])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert relayed == []
+
+
+def test_state_root_option_accepts_a_filesystem_root(tmp_path, monkeypatch):
+    """`/` on POSIX and a drive root on Windows are absolute, and the variable
+    accepts them (the override bypasses `_state_base`'s not-the-root rule)."""
+    root = "C:\\" if sys.platform == "win32" else "/"
+    seen = _spy_ahead_of_dispatch(monkeypatch, "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--state-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["state"] == root
+
+
+def test_state_root_option_after_the_subcommand_is_unrecognized(tmp_path, monkeypatch):
+    """Top-level only: the launcher puts it ahead of the subcommand, and a
+    subcommand never accepts it."""
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["list", "--project", str(tmp_path), "--state-root=" + str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+
+
+def test_registry_root_option_is_set_before_mux_setup(tmp_path, monkeypatch):
+    """The launcher's registry root rides the argv beside the state root, because
+    a `PSMUX_BARE_ENV` pane inherits no `PSMUX_DATA_DIR`. `main` only sets it;
+    `_configure_mux` still decides whether it is honoured.
+
+    Ablate the assignment and the spy sees no registry."""
+    root = str(tmp_path / "launchers-registry")
+    seen = _spy_ahead_of_dispatch(monkeypatch, "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--registry-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["registry"] == root
+
+
+def test_registry_root_option_refuses_a_relative_value(tmp_path, capsys, monkeypatch):
+    """psmux panics on a relative registry root. Refused at parse time.
+
+    Ablate the `is_absolute()` check and `main` returns 0."""
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--registry-root=relative-root", "list", "--project", str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert "--registry-root must be absolute" in capsys.readouterr().err
+    assert runs.PSMUX_DATA_DIR not in os.environ
+
+
+@pytest.mark.parametrize("shape", ["derived", "operator"])
+def test_registry_root_option_meets_the_unchanged_honour_rule(
+    force_psmux_backend, tmp_path, monkeypatch, shape
+):
+    """With `[mux] honor_ambient_psmux_data_dir` off, a forwarded root is treated
+    exactly as an inherited one: a derived-shaped value is re-derived (here, for
+    a child under another state root, so the re-derivation is visible), and an
+    operator root is displaced and recorded for the legacy sweep. The option
+    restores inheritance and nothing more."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    if shape == "derived":
+        forwarded = str(runs.mux_registry_root(tmp_path))
+        monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "childs-root"))
+    else:
+        forwarded = str(tmp_path / "their-own-registry")
+    seen = {}
+
+    def handler(_args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+
+    assert cli.main(["--registry-root=" + forwarded, "list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == str(runs.mux_registry_root(tmp_path)) != forwarded
+    if shape == "operator":
+        assert psmux_backend._DISPLACED_ROOT == forwarded
+
+
 def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
     tmp_path, capsys, monkeypatch
 ):

@@ -37,7 +37,7 @@ from .. import (
     stories,
     verify,
 )
-from ..adapters.multiplexer import MultiplexerError, mux_usable
+from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
     PAUSE_ENVIRONMENT,
@@ -2058,6 +2058,18 @@ def run_tui(project: Path) -> int:
         message, severity="warning", timeout=30, markup=False
     )
     try:
+        # The bare-env warning fired once already, in `_configure_mux`'s backend
+        # probe, onto the screen Textual is about to hide, and its latch is spent.
+        # Said again here, through the sink, and only when psmux is the selected
+        # backend: on any other transport the switch means nothing.
+        from ..adapters.psmux_backend import PsmuxMultiplexer, bare_env_warning
+
+        try:
+            selected = get_multiplexer()
+        except MultiplexerError:
+            selected = None
+        if isinstance(selected, PsmuxMultiplexer) and (bare := bare_env_warning(os.environ)):
+            launch._warn_once("psmux-bare-env", bare)
         app.run()
     finally:
         launch.warn_sink = None

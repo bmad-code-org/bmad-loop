@@ -1140,8 +1140,11 @@ def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe,
     mux, session, _windows = probe
     before = sorted(mux.list_window_ids(session))
     monkeypatch.setattr(mux, "_PWSH", "powershell.exe")
+    # A parked engine's argv as the TUI composes it, carrying the root shape
+    # 5.1 corrupts: the state root must never reach the engine damaged.
+    engine = launch.cli_argv("--state-root=" + _SHARE_ROOT, "status", "--project", str(Path.cwd()))
     with pytest.raises(tmux_base.TmuxError, match=r"PowerShell 7\.3 or later.*'5\.1\.") as refused:
-        mux.new_parked_window(session, "legacy-shell", Path.cwd(), PARKED_ARGV, "@r")
+        mux.new_parked_window(session, "legacy-shell", Path.cwd(), engine, "@r")
     assert "upgrade pwsh to 7.3 or later" in str(refused.value)
     assert psmux_backend._PWSH_VERSIONS["powershell.exe"].startswith("5.1.")
     assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"
@@ -1225,3 +1228,51 @@ def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher
     )
     assert out.exists(), f"the {launcher} target never ran: {ran.stderr.strip()!r}"
     assert json.loads(out.read_text(encoding="utf-8")) == _ARGV_SHAPES
+
+
+# A parked engine's root options in the shapes a Windows root can take after
+# `Path` normalisation: a space, non-ASCII text and a trailing backslash (a
+# drive root keeps one), and a UNC share root such as `\\srv\my share\`, the
+# one shape `Path` leaves with a trailing separator that also holds whitespace.
+_SHARE_ROOT = r"\\srv\my share" + "\\"
+_ROOT_OPTIONS = [
+    "--state-root=" + r"C:\state dir žćč — 日本" + "\\",
+    f"--state-root={_SHARE_ROOT}",
+    f"--registry-root={_SHARE_ROOT}",
+]
+# Written beside the target and renamed into place, so the poll below never
+# reads a half-written file.
+_ARGV_TO_FILE = (
+    "import json, os, sys\n"
+    "tmp = sys.argv[1] + '.tmp'\n"
+    "with open(tmp, 'w', encoding='utf-8') as f:\n"
+    "    f.write(json.dumps(sys.argv[2:]))\n"
+    "os.replace(tmp, sys.argv[1])\n"
+)
+
+
+def test_a_parked_window_hands_the_engine_its_root_options_intact(probe, tmp_path):
+    """The parked-window argv is how a TUI-launched engine learns its state root
+    and registry root (#731), so a real psmux parked window must hand its child
+    each option byte-for-byte on the installed pwsh, ahead of the subcommand,
+    in exactly the shapes that older PowerShell corrupts. Below pwsh 7.3 the
+    launch is refused instead (the test below)."""
+    mux, session, _windows = probe
+    try:
+        mux._require_pwsh_floor()
+    except tmux_base.TmuxError as exc:
+        pytest.skip(f"pwsh below the supported floor: {exc}")
+    printer = tmp_path / "printer.py"
+    printer.write_text(_ARGV_TO_FILE, encoding="utf-8")
+    out = tmp_path / "argv.json"
+    tail = [*_ROOT_OPTIONS, "run", "--project", str(tmp_path)]
+
+    mux.new_parked_window(
+        session, "root-options", tmp_path, [sys.executable, str(printer), str(out), *tail], "@r"
+    )
+
+    deadline = time.monotonic() + 30
+    while not out.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert out.exists(), "the parked child never ran"
+    assert json.loads(out.read_text(encoding="utf-8")) == tail

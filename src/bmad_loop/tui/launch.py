@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -23,7 +22,6 @@ from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
-from .. import envvars
 from .. import policy as policy_mod
 from .. import runs
 from ..adapters.multiplexer import (
@@ -1011,21 +1009,24 @@ _WARNED: set[str] = set()
 _STALE_ROOT = "stale-state-root"
 
 
-def _warn_once(key: str, message: str) -> None:
+def _warn_once(key: str, message: str, *, label: str = "warning") -> None:
     if key in _WARNED:
         return
     _WARNED.add(key)
     if warn_sink is None:
-        print(f"warning: {message}", file=sys.stderr)
+        print(f"{label}: {message}", file=sys.stderr)
     else:
         warn_sink(message)
 
 
 def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
-    """Warn once when a new pane in ``session`` would resolve a different state
+    """Note once when a new pane in ``session`` would resolve a different state
     root than this process (#731): a multiplexer server hands its panes the env
-    it started with, so a server started under another root runs every parked
-    window there, and a live run reads as gone.
+    it started with, so a shell opened there resolves the server's root. A run
+    launched from here is not exposed (``start_detached`` hands each parked
+    engine its root), so this is a note about shells, and it names no remedy:
+    on tmux ``session`` is shared by every project on the server, so no value
+    set there is right for all of them.
 
     Compares resolved roots, not raw values: each input the platform's cascade
     reads is asked of the transport (``inherited_env``), the pane's root is
@@ -1033,7 +1034,7 @@ def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
     process can reach runs as the same user), and only a different root — or
     none at all — warns. Any unknown answer makes the comparison unknown and
     silent, while a query fault is reported in its own words. Never raises and
-    never blocks the launch: the warning detects, it does not refuse."""
+    never blocks the launch."""
     if _STALE_ROOT in _WARNED:
         return
     try:
@@ -1070,19 +1071,13 @@ def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
     if pane == own:
         return
     resolved = str(pane) if pane is not None else "no usable state root"
-    # Quoted for the POSIX shell the operator pastes them into.
-    root = shlex.quote(str(own))
     _warn_once(
         _STALE_ROOT,
-        f"new windows in {session} would resolve {resolved}, not this process's "
-        f"state root {own}: its tmux server was started under a different "
-        "environment, so runs launched there can read as gone (#731, which tracks "
-        f"the lasting fix). {session} is shared by every bmad-loop project on this "
-        "tmux server, so set its root only if none of them uses another state root: "
-        f"tmux set-environment -t {shlex.quote('=' + session)} {envvars.STATE_DIR} {root} "
-        "(add -g for new sessions). tmux kill-server also starts clean, but it ends "
-        "every session on this server, live runs and your own sessions included. "
-        f"Shells already open there need export {envvars.STATE_DIR}={root}, or recreating.",
+        f"new shells in {session} resolve {resolved}, not this TUI's state root {own}, "
+        "so a bmad-loop command typed into one would use that root. Runs launched from "
+        "this TUI are unaffected: each is handed its root (#731). A shell already open "
+        "there can differ either way; no query can see it.",
+        label="note",
     )
 
 
@@ -1105,10 +1100,9 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
     So the child's answer is predicted here with the same pure rule it will
     apply (`runs.resolve_psmux_registry_root`), from the root it inherits —
     this process's root in force — and a disagreement refuses the launch.
-    The prediction assumes inheritance. Under `PSMUX_BARE_ENV` a pane child
-    inherits no `PSMUX_DATA_DIR` (psmux re-adds only its allowlist), so it
-    derives. bmad-loop does not support that mode, and
-    `PsmuxMultiplexer._warn_if_bare_env` says so.
+    The child receives that root in its argv (`--registry-root`, see
+    `start_detached`), so the prediction holds under `PSMUX_BARE_ENV` too,
+    where a pane inherits no `PSMUX_DATA_DIR`.
 
     Asked only of a process that configured its registry for this project
     (`runs.settled_project`), which every CLI entry does: there is nothing to
@@ -1212,7 +1206,20 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     the fourth); gating the mutation cannot. Ahead of the mux probes so the
     refusal needs no transport to be phrased.
 
-    Forwards this process's displaced psmux registry root, as the hidden
+    Hands the window this process's state root, as the hidden top-level
+    ``--state-root`` ahead of the subcommand, and on a transport that
+    namespaces registries the registry root in force as ``--registry-root``.
+    The window would otherwise inherit both from the multiplexer server, which
+    may have started under another root (#731) or clear its panes' env
+    (``PSMUX_BARE_ENV``, #730), and the engine would write where this process
+    never looks. No state root, no launch: omitting the option would let the
+    engine inherit whatever the server holds, and a launcher that cannot name
+    a root could not watch the run anyway. The registry root restores only
+    what inheritance would have delivered; the child's ``_configure_mux``
+    still decides whether it is honoured. On psmux the argv reaches the child
+    intact because a window launch refuses PowerShell older than 7.3 (#862).
+
+    Also forwards this process's displaced psmux registry root, as the hidden
     top-level ``--displaced-registry-root`` ahead of the subcommand. The child
     inherits the derived root and so displaces nothing itself; without the
     option a TUI-launched resume or cleanup would never sweep the operator's
@@ -1231,20 +1238,29 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
             "multiplexer backend unavailable (binary missing, version unsupported, "
             "or a required helper absent)"
         )
+    try:
+        state_root = runs.state_root()
+    except runs.StateRootError as e:
+        raise LaunchError(
+            f"cannot launch {kind}: no state root to hand the window, so this TUI could "
+            f"not watch the run it starts: {e}"
+        ) from e
     drift = _registry_drift(project, mux)
     if drift is not None:
         raise LaunchError(drift)
-    argv = cli_argv(*argv_tail)
+    hidden = [f"--state-root={state_root}"]
     try:
-        forwarded = (
-            _forwardable_displaced_root(runs.displaced_psmux_registry_root(), mux.registry_root())
-            if mux.has_registry_namespace()
-            else None
-        )
+        namespaced = mux.has_registry_namespace()
+        in_force = mux.registry_root() if namespaced else None
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer registry query failed: {e}") from e
-    if forwarded is not None:
-        argv = cli_argv(f"--displaced-registry-root={forwarded}", *argv_tail)
+    if in_force is not None:
+        hidden.append(f"--registry-root={in_force}")
+    if namespaced:
+        forwarded = _forwardable_displaced_root(runs.displaced_psmux_registry_root(), in_force)
+        if forwarded is not None:
+            hidden.append(f"--displaced-registry-root={forwarded}")
+    argv = cli_argv(*hidden, *argv_tail)
     ctl = _ensure_ctl_session(project)
     try:
         win_id = (
