@@ -578,6 +578,85 @@ def test_read_pid_identity_reads_undecodable_bytes_as_unreadable(tmp_path, monke
     assert runs.engine_alive(run_dir) is False
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_engine_liveness_reads_a_fifo_pid_file_as_unknown_without_blocking(tmp_path, monkeypatch):
+    """#868: a FIFO at ``engine.pid`` blocked the reader's open until a writer
+    appeared, hanging `cleanup` and the TUI cleanup worker. It is a read fault,
+    reported as ``'unknown'``, and answered at once.
+
+    ABLATION: drop ``O_NONBLOCK`` and the call never returns (the thread is still
+    blocked when the join times out); drop the ``S_ISREG`` check and the empty
+    FIFO reads as no pid, so liveness says ``'dead'``."""
+    run_dir = _make_run(tmp_path, "r1")
+    pidfile = run_dir / "engine.pid"
+    os.mkfifo(pidfile)
+
+    def _no_host():
+        raise AssertionError("a FIFO pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    outcome: list[object] = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            (runs.read_pid_identity(run_dir), runs.engine_liveness(run_dir))
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        with open(pidfile, "wb"):  # release the blocked open so the thread can end
+            pass
+        pytest.fail("the pid reader blocked on a FIFO")
+    assert outcome == [((None, runs._PID_FILE_UNREADABLE), "unknown")]
+
+
+def test_read_pid_identity_refuses_an_oversized_record_and_closes_its_fd(tmp_path, monkeypatch):
+    """#868: the reader takes one bounded read. A record past the cap is a read
+    fault, never a parsed prefix: truncation would drop the identity token and turn
+    an identity-checked record into a legacy pid-only one that skips the reuse
+    guard. Every opened descriptor is closed, and a failed close is a read fault.
+
+    ABLATION: drop the oversize check and the padded row reads ``(4242, None)``;
+    drop the ``finally`` close and the fd bookkeeping fails; move the close out of
+    the guarded block and the failing close raises."""
+    run_dir = _make_run(tmp_path, "r1")
+    pidfile = run_dir / "engine.pid"
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(*args, **kwargs):
+        opened.append(real_open(*args, **kwargs))
+        return opened[-1]
+
+    def spy_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(runs.os, "open", spy_open)
+    monkeypatch.setattr(runs.os, "close", spy_close)
+
+    pidfile.write_bytes(b"4242" + b" " * runs._MAX_PID_FILE_BYTES + b"999.0")
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    pidfile.write_bytes(b"4242" + b" " * 4 + b"999.0")
+    assert runs.read_pid_identity(run_dir) == (4242, 999.0)
+    pidfile.unlink()
+    pidfile.mkdir()  # non-regular: refused after open on POSIX, at open on win32
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert opened == closed
+
+    pidfile.rmdir()
+    pidfile.write_text("4242 999.0")
+
+    def failing_close(fd):
+        real_close(fd)
+        raise OSError(errno.EIO, "close failed")
+
+    monkeypatch.setattr(runs.os, "close", failing_close)
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+
+
 def test_engine_liveness(tmp_path, monkeypatch):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.engine_liveness(run_dir) == "dead"  # no pid file → nothing to gate on

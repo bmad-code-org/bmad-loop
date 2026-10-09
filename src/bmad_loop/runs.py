@@ -127,6 +127,7 @@ _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "no
 # looks at it. Deliberately a finite float, never NaN: `stop_run` compares pid-file
 # tuples for equality, and an unreadable file read twice must compare equal.
 _PID_FILE_UNREADABLE = -2.0
+_MAX_PID_FILE_BYTES = 4096
 
 
 class StopRunError(Exception):
@@ -1257,11 +1258,35 @@ def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
     would be), which holds no pid file just as surely. Non-UTF-8 bytes (a torn
     write, a planted file) are a read fault too: ``UnicodeDecodeError`` used to
     escape and abort every command that iterates runs. Only that error is caught —
-    the int/float parse arms below keep their own ``ValueError`` semantics."""
+    the int/float parse arms below keep their own ``ValueError`` semantics.
+
+    The open never blocks and only a regular file is read (#868): a FIFO at the pid
+    path used to block ``open`` until a writer appeared, hanging every liveness
+    probe (``cleanup``, the TUI cleanup worker). A non-regular file is a read
+    fault, never "no pid file". Same idiom as :func:`read_trusted_config_digest`:
+    the check is ``fstat`` on the opened descriptor, so it cannot be raced, and
+    ``O_NONBLOCK`` degrades to 0 on win32, which has no FIFOs at this path."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
     try:
-        tokens = pidfile.read_text(encoding="utf-8").split()
+        fd = os.open(pidfile, flags)
     except (FileNotFoundError, NotADirectoryError):
         return None, None
+    except OSError:
+        return None, _PID_FILE_UNREADABLE
+    try:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None, _PID_FILE_UNREADABLE
+            data = os.read(fd, _MAX_PID_FILE_BYTES + 1)
+        finally:
+            os.close(fd)  # inside the outer try: a failed close is a read fault too
+        # A real pid file is "<pid> <identity>", far under the cap. An oversized one is
+        # a fault, not a prefix to parse: truncation could drop the identity token and
+        # turn an identity-checked record into a legacy pid-only one.
+        if len(data) > _MAX_PID_FILE_BYTES:
+            return None, _PID_FILE_UNREADABLE
+        tokens = data.decode("utf-8").split()
     except (OSError, UnicodeDecodeError):
         return None, _PID_FILE_UNREADABLE
     if not tokens:
