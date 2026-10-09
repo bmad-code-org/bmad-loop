@@ -4087,23 +4087,3 @@ def test_filesystem_name_labels_a_win32_volume(tmp_path):
     fs_name, sep, volume = label.partition(" at ")
     assert sep and fs_name and volume.endswith("\\")
     assert str(tmp_path).casefold().startswith(volume.casefold().rstrip("\\"))
-
-
-def test_platform_helpers_typecheck_for_windows_target():
-    """Keep feature-gated POSIX APIs valid under the native Windows type surface."""
-    root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pyright",
-            "--pythonplatform",
-            "Windows",
-            "src/bmad_loop/platform_util.py",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr

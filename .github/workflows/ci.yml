@@ -455,6 +455,17 @@ jobs:
         # runs locally, resolving the same pinned version from uv.lock.
         run: uv run pyright
 
+      # This job runs on Linux, whose `os` stubs include POSIX/Linux-only names
+      # (O_DIRECTORY, setxattr, sysconf). A native Windows or macOS host checks
+      # against a narrower surface, so these steps keep `uv run pyright` clean
+      # there too: code that needs such a name fetches it with a default-free
+      # `getattr` inside its runtime check.
+      - name: Pyright (Windows os surface)
+        run: uv run pyright --pythonplatform Windows
+
+      - name: Pyright (Darwin os surface)
+        run: uv run pyright --pythonplatform Darwin
+
   build:
     # Packaging smoke test. Every other job runs from the source tree, so a
     # packaging break is invisible to them — it has bitten before (`.trunk` had

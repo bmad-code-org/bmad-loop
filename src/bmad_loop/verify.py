@@ -707,6 +707,9 @@ def _integration_snapshot_root(run_dir: Path, operation_identity: str, pin: _Run
     if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
         raise IntegrationEvidenceError("persisted target integration operation is malformed")
     if DIR_FD_ANCHORED_WRITES:
+        # ``O_DIRECTORY`` exists only on the dir-fd arm; the native Windows type
+        # stubs lack it, so resolve it inside the gate.
+        o_directory = getattr(os, "O_DIRECTORY")
         run_fd = open_dir_confined(run_dir, run_dir, root_identity=pin.identity)
         if run_fd is None:
             raise IntegrationEvidenceError(
@@ -720,7 +723,7 @@ def _integration_snapshot_root(run_dir: Path, operation_identity: str, pin: _Run
             try:
                 parent_fd = os.open(
                     _INTEGRATION_SNAPSHOT_DIR,
-                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY | o_directory | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=run_fd,
                 )
             except OSError as exc:
@@ -786,7 +789,10 @@ def _open_snapshot_directory(directory: Path, pin: _RunDirPin | None) -> int:
     missing record refuses. Without a pin (the restore's staging file in the
     target repository) the leaf-``O_NOFOLLOW`` open stands."""
     if pin is None:
-        return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        # Every caller runs on the dir-fd arm only, where ``O_DIRECTORY``
+        # exists; the native Windows type stubs lack it.
+        o_directory = getattr(os, "O_DIRECTORY")
+        return os.open(directory, os.O_RDONLY | o_directory | getattr(os, "O_NOFOLLOW", 0))
     fd = open_dir_confined(pin.run_dir, directory, root_identity=pin.identity)
     if fd is None:
         raise IntegrationEvidenceError(
@@ -2602,14 +2608,18 @@ def _open_restore_parent(repo: Path, parent: Path) -> int:
         relative = parent.relative_to(repo)
     except ValueError as exc:
         raise IntegrationRestoreError("target restoration parent escaped repository") from exc
-    root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_directory = getattr(os, "O_DIRECTORY")
+    o_nofollow = getattr(os, "O_NOFOLLOW")
+    root_fd = os.open(repo, os.O_RDONLY | o_directory)
     fd = root_fd
     try:
         for part in relative.parts:
             try:
                 nested = os.open(
                     part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    os.O_RDONLY | o_directory | o_nofollow,
                     dir_fd=fd,
                 )
             except FileNotFoundError:
@@ -2617,7 +2627,7 @@ def _open_restore_parent(repo: Path, parent: Path) -> int:
                 os.fsync(fd)
                 nested = os.open(
                     part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    os.O_RDONLY | o_directory | o_nofollow,
                     dir_fd=fd,
                 )
             if fd != root_fd:
@@ -2647,8 +2657,11 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
         return
     if not stat.S_ISDIR(mode):
         raise IntegrationRestoreError("target expected-absent path became unsafe")
+    # Every caller runs on the dir-fd arm only, where ``O_DIRECTORY`` exists;
+    # the native Windows type stubs lack it.
+    o_directory = getattr(os, "O_DIRECTORY")
     child_fd = os.open(
-        name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+        name, os.O_RDONLY | o_directory | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
     )
     try:
         for child in os.listdir(child_fd):
@@ -11442,13 +11455,17 @@ def _make_candidate_parents(
     fd = open_dir_confined(root, root, root_identity=root_identity)
     if fd is None:
         raise OSError(f"candidate root {root} could not be opened")
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_directory = getattr(os, "O_DIRECTORY")
+    o_nofollow = getattr(os, "O_NOFOLLOW")
     try:
         for part in relative.parts:
             try:
                 os.mkdir(part, 0o777, dir_fd=fd)
             except FileExistsError:
                 pass
-            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            nested = os.open(part, os.O_RDONLY | o_directory | o_nofollow, dir_fd=fd)
             fd, previous = nested, fd
             os.close(previous)
     finally:

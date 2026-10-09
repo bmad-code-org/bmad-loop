@@ -210,7 +210,7 @@ def _lineage(event_name, invocation):
         if launch is None:
             return "unknown"
         try:
-            ticks = os.sysconf("SC_CLK_TCK")
+            ticks = getattr(os, "sysconf")("SC_CLK_TCK")  # POSIX-only
         except (AttributeError, OSError, ValueError):
             return "unknown"
         if ticks <= 0:
