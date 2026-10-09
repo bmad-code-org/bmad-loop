@@ -4849,8 +4849,8 @@ class Engine:
         ``dev_primitive_or_default`` maps to the legacy name.
 
         Resolved against the WORKSPACE, never the main checkout: the session runs
-        with ``cwd=self.workspace.root``, so the tree deciding whether the spelled
-        name is a command at all is the worktree's. The two agree on a freshly
+        with ``cwd=self.workspace.paths.project``, so the tree deciding whether the
+        spelled name is a command at all is the worktree's. The two agree on a freshly
         provisioned unit — ``provision_worktree`` copies the primitive in from the
         main repo — but NOT on resume: ``reopen_unit`` re-mounts an existing
         worktree without re-provisioning it, so a main checkout upgraded across the
@@ -8172,7 +8172,8 @@ class Engine:
 
             # The marker path lands in the same implementation-artifacts dir the
             # dev adapter already searches — correct in place and under worktree
-            # isolation alike, because spec.cwd is self.workspace.root either way.
+            # isolation alike, because spec.cwd is self.workspace.paths.project
+            # either way.
             # This is the PRODUCER of the marker name. ``role``, not the default:
             # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
             # runs on THAT adapter, whose skill tree can be a different one at a
@@ -8198,7 +8199,12 @@ class Engine:
             task_id=task_id,
             role=role,
             prompt=prompt,
-            cwd=self.workspace.root,
+            # The mount project, not the checkout root: every coding CLI discovers
+            # its hook config and skill tree from its cwd (or upward from it), and
+            # provisioning and `init` put them in the project, which a nested
+            # `repo_root:` puts BELOW the root — from there no probed CLI loaded the
+            # Stop relay (DW-484). Code and git work still answer to the root.
+            cwd=self.workspace.paths.project,
             env=env,
             model=cfg.model,
             effort=cfg.effort,

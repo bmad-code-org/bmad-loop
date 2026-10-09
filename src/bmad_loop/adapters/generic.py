@@ -45,7 +45,6 @@ from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
-from ..mountpaths import rebased_project
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
@@ -2484,14 +2483,14 @@ class _DevSynthesisMixin(_ResultFileMixin):
         raise NotImplementedError
 
     def _artifact_dirs(self, cwd: Path) -> list[Path]:
-        # In worktree isolation the skill runs with cwd set to the worktree and
-        # writes its terminal spec under the worktree's rebased implementation-
+        # In worktree isolation the skill runs with cwd set to the mount project
+        # and writes its terminal spec under the worktree's rebased implementation-
         # artifacts dir, not the main checkout's. Resolve the search dir from the
-        # live session cwd (a no-op in place, where cwd is the code root and
-        # rebased() re-derives the project at its offset inside it, DW-379, and
-        # for artifact dirs configured outside the project tree, which rebased()
-        # leaves put). Keep the configured dir as a defensive fallback.
-        primary = self.paths.rebased(cwd).implementation_artifacts
+        # live session cwd, which IS the mount project (DW-484: the worktree, or
+        # `<worktree>/<offset>` under a nested `repo_root`; the project itself in
+        # place, where this is a no-op, as it is for an artifact dir configured
+        # outside the project tree). Keep the configured dir as a defensive fallback.
+        primary = self.paths.artifact_at(self.paths.implementation_artifacts, Path(cwd))
         dirs = [primary]
         if self.paths.implementation_artifacts != primary:
             dirs.append(self.paths.implementation_artifacts)
@@ -3000,9 +2999,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         <id>-*.md`` by id (never the mtime scan) and synthesize from it.
 
         ``BMAD_LOOP_SPEC_FOLDER`` carries the project-relative (or absolute) spec
-        folder; rebase a relative one onto the project's place in ``spec.cwd`` (the
-        mount project under isolation, ``<cwd>/<offset>`` under a nested
-        ``repo_root``) so worktree isolation resolves inside the live checkout.
+        folder; anchor a relative one on ``spec.cwd``, which is the mount project
+        (DW-484), so worktree isolation resolves inside the live checkout.
         A PRESENT or SENTINEL spec synthesizes (a blocked sentinel becomes a
         CRITICAL escalation → PAUSE, same as any block) — but only when the spec was
         (re)written by THIS session: like the mtime-scan path's ``since_ns`` floor, a
@@ -3033,16 +3031,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
         story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or ""
         folder = Path(spec.env["BMAD_LOOP_SPEC_FOLDER"])
-        # Project-relative, so anchored on the project's place in the live checkout:
-        # `spec.cwd` is the code root, which a nested `repo_root:` puts above the
-        # project (`<cwd>/<offset>`), and `StoriesEngine._stories_folder` joins the
-        # same folder on the project (DW-379). Lexical — the default config's offset
-        # is `.`, so this is `spec.cwd` itself there.
-        base = (
-            folder
-            if folder.is_absolute()
-            else rebased_project(self.paths.project, self.paths.repo_root, Path(spec.cwd)) / folder
-        )
+        # Project-relative, so anchored on the project's place in the live checkout,
+        # which is `spec.cwd` itself: sessions run in the mount project (DW-484),
+        # and `StoriesEngine._stories_folder` joins the same folder on the project
+        # (DW-379).
+        base = folder if folder.is_absolute() else Path(spec.cwd) / folder
         plan_halt = bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
         deadline = time.monotonic() + RESULT_GRACE_S
         # The launch-snapshot faults (DW-456) are crumbed once per read-back call,

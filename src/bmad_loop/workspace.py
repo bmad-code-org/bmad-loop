@@ -10,7 +10,8 @@ lives in the main repo and is passed separately — it never moves.
   (.bmad-loop/runs/<run_id>/worktrees/, which `bmad-loop init` gitignores, so it
   stays invisible to the main checkout's `git status`), with paths rebased onto
   it — a project nested inside `repo_root` keeps its offset there (DW-379), while
-  `root` stays the checkout root either way. open_unit_workspace /
+  `root` stays the checkout root either way. Sessions run in `paths.project`, not
+  `root`: each coding CLI finds its hook config and skills from its cwd (DW-484). open_unit_workspace /
   close_unit_workspace manage the branch + worktree lifecycle; the engine merges
   the unit branch back into the target branch from the main repo between units.
 """
@@ -64,9 +65,10 @@ def _rmtree_confined(wt: Path, run_dir: Path) -> bool:
 
 @dataclass(frozen=True)
 class Workspace:
-    root: Path  # where sessions run (cwd) and git operates
+    root: Path  # where code and git work happens
     # artifact paths rebased onto `root`; under isolation `paths.project` is the
-    # mount project (`root` itself, or `root/<offset>` for a nested project)
+    # mount project (`root` itself, or `root/<offset>` for a nested project), and
+    # `paths.project` is where sessions run (cwd), in place too (DW-484)
     paths: ProjectPaths
 
     @classmethod

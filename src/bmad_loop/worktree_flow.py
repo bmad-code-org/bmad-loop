@@ -776,8 +776,8 @@ def _seed_bmad_tree(
 
     Renderer-backed skills receive the mount PROJECT as their project root — the
     worktree itself in the default config, ``<worktree>/<offset>`` for a project
-    nested in ``repo_root`` (DW-379), while the session cwd stays the checkout root,
-    the accepted parity with isolation none — and do not walk upward for ``_bmad``.
+    nested in ``repo_root`` (DW-379), which is also the session cwd (DW-484) — and
+    do not walk upward for ``_bmad``.
     Copy every usable file except generated render output,
     per-file and without clobbering checkout content. The shared Traversable walk is
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
@@ -1425,8 +1425,8 @@ def provision_worktree(
             written.update(_written_rels(worktree, landed))
 
     # Renderer-backed skills are handed the mount project as their project root (the
-    # worktree, or `<worktree>/<offset>` under a nested `repo_root`; the session cwd
-    # stays the checkout root either way, DW-379). Merge
+    # worktree, or `<worktree>/<offset>` under a nested `repo_root`, DW-379), which is
+    # also the session cwd (DW-484). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
     seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
@@ -4962,9 +4962,9 @@ class WorktreeFlow:
     def seed_workspace_trust(
         self, task: StoryTask, worktree: Path, profiles: Sequence[CLIProfile]
     ) -> None:
-        """Extend the operator's workspace-trust grant for the main checkout to
-        ``worktree``, for every loaded profile declaring ``[workspace_trust]``
-        (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
+        """Extend the operator's workspace-trust grant for the main project to the
+        mount project in ``worktree``, for every loaded profile declaring
+        ``[workspace_trust]`` (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
         root-trust rule. Profiles without the table touch nothing under ``~``.
 
         Seeded → ``worktree-trust-seeded``; root not trusted or file/key missing →
@@ -4973,14 +4973,16 @@ class WorktreeFlow:
         a write fault escalates the unit (repair writes raise)."""
         # spec -> the first declaring profile's binary, named in the remedy
         specs: dict[WorkspaceTrustSpec, str] = {}
+        # Exact-path trust, so the path granted is the session cwd — the mount
+        # project — and the grant it inherits is the in-place cwd's, the main
+        # project (DW-484). Both are the checkout roots in the default config.
+        mount = self._mount_project(worktree)
         for p in profiles:
             if p.workspace_trust is not None:
                 specs.setdefault(p.workspace_trust, p.binary)
         for spec, binary in specs.items():
             try:
-                outcome, detail = workspace_trust.seed(
-                    spec, worktree, trusted_root=self.paths.repo_root
-                )
+                outcome, detail = workspace_trust.seed(spec, mount, trusted_root=self.paths.project)
             except workspace_trust.WorkspaceTrustError as e:
                 self.escalate_unit(  # always raises RunPaused
                     task,
@@ -4995,14 +4997,14 @@ class WorktreeFlow:
                     "worktree-trust-seeded",
                     story_key=task.story_key,
                     key=spec.key,
-                    path=str(worktree),
+                    path=str(mount),
                 )
             elif outcome == "root-untrusted":
                 self.journal.append(
                     "worktree-trust-unseeded",
                     story_key=task.story_key,
                     key=spec.key,
-                    path=str(worktree),
+                    path=str(mount),
                     reason=detail,
                 )
                 # The run goes on, but the session will sit on the CLI's trust

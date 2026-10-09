@@ -39,6 +39,7 @@ from conftest import (
     install_build_auto_skill,
     nested_repo_root_paths,
     refuse_to_resolve,
+    session_checkout_root,
     set_sprint,
     write_gated_ledger,
     write_ledger,
@@ -114,7 +115,7 @@ def wt_dev_effect(
     defaults True so the review runs under the default trigger = "recommended"."""
 
     def effect(spec):
-        cwd = spec.cwd
+        cwd = session_checkout_root(project, spec.cwd)
         wt = project.rebased(cwd)
         baseline = rev_parse_head(cwd)
         if write_src:
@@ -10691,15 +10692,18 @@ def test_adopt_of_a_task_with_operator_actions_parks_it(project):
 
 def test_worktree_nested_repo_root_runs_and_merges_back(project):
     """DW-379 end to end: the BMAD project nested at `<repo>/app`, `repo_root` the
-    checkout, `isolation = "worktree"`. The unit mount mirrors the main checkout, so
-    the session runs from the mount ROOT (as it runs from `repo_root` in place) while
-    its workspace paths — and the spec it writes — sit under `<mount>/app`; the
-    persisted spec spelling is project-relative; the unit merges back and leaves the
-    main tree clean.
+    checkout, `isolation = "worktree"`. The unit mount mirrors the main checkout, and
+    the session runs in the mount PROJECT `<mount>/app` (DW-484: as it runs in the
+    project in place — the tree holding the hook config and skills provisioning
+    seeded, which no coding CLI discovers from the mount root), where its workspace
+    paths and the spec it writes also sit; the persisted spec spelling is
+    project-relative; the unit merges back and leaves the main tree clean.
 
     Ablation: restore `project=new_root` in `ProjectPaths.rebased` and the workspace
     assertion reddens on `<mount>` — the session would look for its artifacts in the
-    OUTER tree's `_bmad-output`."""
+    OUTER tree's `_bmad-output`. Restore `cwd=self.workspace.root` in
+    `Engine._run_session`'s SessionSpec and the run crashes before `done`: the
+    fake session, treating its cwd as the mount project, writes above the mount."""
     paths = nested_repo_root_paths(project)
     repo, app = paths.repo_root, paths.project
     commit_sprint(paths, {"1-1-a": "ready-for-dev"})
@@ -10724,9 +10728,11 @@ def test_worktree_nested_repo_root_runs_and_merges_back(project):
     summary = engine.run()
 
     assert summary.done == 1 and not summary.paused, journal_kinds(engine)
-    mount = seen["cwd"]
-    assert isinstance(mount, Path) and mount != repo.resolve()
-    assert seen["project"] == mount / "app"
+    cwd = seen["cwd"]
+    assert isinstance(cwd, Path) and cwd.name == "app"
+    mount = cwd.parent
+    assert mount != repo.resolve() and mount.parent.name == "worktrees"
+    assert seen["project"] == mount / "app" == cwd
     impl = mount / "app" / "_bmad-output" / "implementation-artifacts"
     assert seen["spec"] == impl / "spec-1-1-a.md"
     task = engine.state.tasks["1-1-a"]
@@ -11177,6 +11183,43 @@ def test_worktree_trust_is_seeded_before_the_dev_session(project, tmp_path, monk
     assert kinds.count("worktree-trust-seeded") == 1
     assert kinds.index("worktree-opened") < kinds.index("worktree-trust-seeded")
     assert list(json.loads(settings.read_text(encoding="utf-8"))) == ["theme", "trustedWorkspaces"]
+
+
+def test_nested_worktree_trust_grants_the_mount_project(project, tmp_path, monkeypatch):
+    """DW-484: trust is exact-path and granted to the session cwd, which a nested
+    `repo_root` puts at `<mount>/app`; it is inherited from the in-place cwd's grant,
+    the main project — the checkout root is deliberately NOT listed.
+
+    Ablation: seed `worktree` again and the cwd assertion reddens on `<mount>`;
+    restore `trusted_root=self.paths.repo_root` and nothing is seeded
+    (`worktree-trust-unseeded`), since only the project is trusted."""
+    paths = nested_repo_root_paths(project)
+    home = _trust_home(tmp_path, monkeypatch)
+    settings = home / ".agy-test" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"trustedWorkspaces": [str(paths.project)]}), encoding="utf-8")
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    dev = wt_dev_effect(paths, "1-1-a", followup_review=False)
+    seen_at_launch: list[tuple[str, list[str]]] = []
+
+    def dev_checking_trust(spec):
+        listed = json.loads(settings.read_text(encoding="utf-8"))["trustedWorkspaces"]
+        seen_at_launch.append((str(Path(spec.cwd).resolve()), listed))
+        return dev(spec)
+
+    engine, adapter = make_engine(paths, [dev_checking_trust])
+    _attach_trust_profile(adapter)
+    engine.state.repo_root = str(paths.repo_root)  # as runsetup stamps it at run start
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused, journal_kinds(engine)
+    [(cwd, listed)] = seen_at_launch
+    wt = Path(engine.state.tasks["1-1-a"].worktree_path or "").resolve()
+    assert cwd == str(wt / "app")
+    assert listed == [str(paths.project), cwd]
+    rows = [e for e in engine.journal.entries() if e["kind"] == "worktree-trust-seeded"]
+    assert [r["path"] for r in rows] == [str(wt / "app")]
 
 
 def test_worktree_trust_unseeded_when_the_root_is_untrusted(project, tmp_path, monkeypatch):

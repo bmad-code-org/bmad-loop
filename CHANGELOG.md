@@ -62,6 +62,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Launch dev, review and workflow sessions in the project (the mount project
+  under worktree isolation), not the `repo_root` checkout root. With a project
+  nested in `repo_root`, Claude Code, Codex and agy loaded neither the project's
+  hook config nor its skills from the root, so no Stop hook ever fired. agy
+  workspace trust now grants the mount project, inherited from the main
+  project's grant (DW-484).
 - Refuse `resolve <finished-run> --reverify --story <key>` when the story is
   already `done` on the main checkout's sprint board (a later run re-drove and
   finished it), so the replay cannot merge superseded work; an unreadable board
