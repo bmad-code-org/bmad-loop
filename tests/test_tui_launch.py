@@ -3078,3 +3078,118 @@ def test_silent_on_a_set_empty_inherited_override(monkeypatch, tmp_path: Path):
     pane = {envvars.STATE_DIR: "", "HOME": home}
 
     assert _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane)) == []
+
+
+# ------------------------------------- unavailable backend + evidence (#864)
+
+
+def test_ctl_candidates_raise_for_an_unavailable_backend_with_a_recorded_window(
+    monkeypatch, tmp_path: Path
+):
+    # A recorded ctl window says one of ours may still be standing on a server
+    # this process cannot reach: an empty answer would read as nothing to prune.
+    run_dir = _make_run(tmp_path, "20260101-000000-fin")
+    (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+    with pytest.raises(MultiplexerError, match="is unavailable"):
+        launch.prune_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_raise_for_an_unavailable_backend_with_a_live_run(
+    monkeypatch, tmp_path: Path
+):
+    run_dir = _make_run(tmp_path, "20260101-000000-live")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    with pytest.raises(MultiplexerError, match="live run 20260101-000000-live"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_stay_empty_for_an_unavailable_backend_without_evidence(
+    monkeypatch, tmp_path: Path, capsys
+):
+    # A host with no multiplexer and nothing of ours to reach: a clean scan,
+    # silently — not a failure on every cleanup.
+    _make_run(tmp_path, "20260101-000000-fin")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    assert launch.prunable_ctl_windows(tmp_path) == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert capsys.readouterr().err == ""
+
+
+def test_ctl_candidates_ignore_evidence_for_a_usable_backend(monkeypatch, tmp_path: Path):
+    # The module pins a forced backend, which mux_usable trusts: the evidence
+    # gate is never consulted and the scan runs as before, live run included.
+    _killed, _probes = _ctl_prune_fake(monkeypatch, tmp_path)
+    (runs.run_dir_for(tmp_path, "20260101-000000-live") / "ctl-window").write_text(
+        "@9", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        launch, "_ctl_window_evidence", lambda _p: pytest.fail("evidence read for a usable mux")
+    )
+    assert launch.prunable_ctl_windows(tmp_path) == [
+        "sweep-20260101-000000-dead",
+        "run-20260101-000000-dead2",
+    ]
+
+
+def test_ctl_candidates_see_a_recorded_window_whose_run_lost_its_state_file(
+    monkeypatch, tmp_path: Path
+):
+    # The record outlives a lost state.json, so the evidence listing is ungated.
+    run_dir = runs.run_dir_for(tmp_path, "20260101-000000-fin")
+    run_dir.mkdir(parents=True)
+    (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_count_an_unreadable_window_record_as_evidence(monkeypatch, tmp_path: Path):
+    # A record that cannot be read (here: a directory where the file belongs)
+    # still says a window was minted; reading it as absent would be clean.
+    run_dir = _make_run(tmp_path, "20260101-000000-fin")
+    (run_dir / "ctl-window").mkdir()
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_count_an_unstattable_window_record_as_evidence(monkeypatch, tmp_path: Path):
+    # Only a proved absence is absence: a stat that fails otherwise counts.
+    _make_run(tmp_path, "20260101-000000-fin")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if Path(path).name == "ctl-window":
+            raise PermissionError("denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(launch.os, "lstat", lstat)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_a_verified_prune_keeps_the_record_and_a_later_unavailable_scan_reports(
+    monkeypatch, tmp_path: Path
+):
+    # Records are sticky evidence by decision: a verified kill does not prove
+    # the run's other windows gone, so nothing drops the record with it.
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
+    record = _make_run(tmp_path, "20260101-000000-dead2") / "ctl-window"
+    record.write_text("@6", encoding="utf-8")
+    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
+    assert "run-20260101-000000-dead2" in removed
+    assert record.read_text(encoding="utf-8") == "@6"
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded"):
+        launch.prunable_ctl_windows(tmp_path)

@@ -18945,3 +18945,132 @@ def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path,
     err = capsys.readouterr().err
     assert "an in-place replay re-verifies only the story the run stopped on" in err
     assert _state_bytes(run_dir) == before
+
+
+# ----------------------------- cleanup over an unavailable backend (#864)
+
+
+def _unavailable_backend(monkeypatch, project, *, live: bool, recorded: bool):
+    """No usable multiplexer, the prune's sessions half stubbed to a receipt, and
+    the evidence each scan_error is gated on: a live run and/or a recorded ctl
+    window. Each scan's own gate is real."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    run_dir = runs.run_dir_for(project, "20260101-000000-aaaa")
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    if recorded:
+        (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(runs, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive" if live else "dead")
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_reports_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    _unavailable_backend(monkeypatch, tmp_path, live=True, recorded=False)
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys, err_contains="ctl window prune failed")
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert "live run 20260101-000000-aaaa" in doc["sessions"]["scan_error"]
+    assert "agent sessions cannot be listed" in doc["sessions"]["scan_error"]
+    assert "control windows cannot be listed" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_json_recorded_window_sets_only_the_ctl_scan_error(tmp_path, monkeypatch, capsys):
+    # A recorded ctl window is evidence for the window half only: nothing says an
+    # agent session is running, so the sessions half reports nothing.
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=True)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert "scan_error" not in doc["sessions"]
+    assert "control window recorded" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
+    tmp_path, monkeypatch, capsys
+):
+    # The mux-less host with nothing of ours: the document is exactly the one
+    # emitted before sessions.scan_error existed, and stderr stays empty.
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=False)
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["sessions"] == {
+        "removed": ["fin-1"],
+        "live": [],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+        "legacy_unverified": [],
+    }
+    assert doc["ctl_windows"]["scan_error"] is None
+
+
+def test_cleanup_text_names_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    tmp_path, monkeypatch, capsys
+):
+    _unavailable_backend(monkeypatch, tmp_path, live=True, recorded=False)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "session prune failed: multiplexer backend" in captured.err
+    assert "ctl window prune failed: multiplexer backend" in captured.err
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+
+
+def test_cleanup_text_unavailable_backend_without_evidence_is_silent(tmp_path, monkeypatch, capsys):
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=False)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def _process_host_broken(monkeypatch):
+    """Both cleanup scans fail on a misconfigured process host: the evidence
+    gates read engine liveness, which raises ProcessHostError."""
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+    from bmad_loop.tui import launch
+
+    def boom(_p):
+        raise ProcessHostError("unknown process host 'bogus'")
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", boom)
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_carries_a_process_host_fault_as_both_scan_errors(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    _process_host_broken(monkeypatch)
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys, err_contains="ctl window prune failed")
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert "unknown process host" in doc["sessions"]["scan_error"]
+    assert "unknown process host" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_text_reports_a_process_host_fault_and_exits_zero(tmp_path, monkeypatch, capsys):
+    _process_host_broken(monkeypatch)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "session prune failed: unknown process host" in captured.err
+    assert "ctl window prune failed: unknown process host" in captured.err
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out

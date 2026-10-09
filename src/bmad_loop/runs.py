@@ -2065,6 +2065,50 @@ def prune_sessions(
     return prunable, live, unknown
 
 
+def live_run_evidence(project: Path) -> str | None:
+    """A run of this project whose engine is or may be alive, or a runs dir that
+    could not be listed (it may hide one), described for an operator — or None.
+
+    The evidence that a multiplexer artifact of this project could still exist
+    on a server this process cannot reach: an unavailable backend then must not
+    read as a clean "nothing to clean up" (#864). Without it, an unavailable
+    backend is a host with nothing of ours to reach, and stays silent.
+
+    Ungated (:func:`all_run_dirs`' listing, not :func:`list_run_dirs`): a run
+    whose state.json is gone still holds its engine.pid. And an 'unknown'
+    liveness counts, since a pid that cannot be probed may be a live engine."""
+    names, fault = _run_dir_names(project)
+    if names is None:
+        return f"a runs dir it cannot list ({fault})"
+    for name in sorted(names):
+        liveness = engine_liveness(project / RUNS_DIR / name)
+        if liveness == "alive":
+            return f"a live run {name}"
+        if liveness == "unknown":
+            return f"a run {name} whose engine may be live (unverifiable pid)"
+    return None
+
+
+def session_scan_error(project: Path) -> str | None:
+    """Why the agent-session half of a prune could not see this project's
+    sessions, or None. The listing behind :func:`prunable_sessions` answers
+    ``[]`` for a backend that is not there, which is the right answer on a host
+    without a multiplexer and the wrong one while :func:`live_run_evidence` says
+    a session of ours may be running on a server this process cannot reach. A
+    forced backend counts as usable (:func:`mux_usable`), so it is never
+    reported here (#864)."""
+    mux = get_multiplexer()
+    if mux_usable(mux):
+        return None
+    evidence = live_run_evidence(project)
+    if evidence is None:
+        return None
+    return (
+        f"multiplexer backend {type(mux).__name__} is unavailable, but this project "
+        f"still has {evidence}; its agent sessions cannot be listed"
+    )
+
+
 def kill_displaced_session(project: Path, run_id: str) -> list[str]:
     """Kill ``run_id``'s agent session in every legacy registry where its
     ownership tag proves it this project's, and return one line per thing that

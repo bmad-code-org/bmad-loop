@@ -5729,7 +5729,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    # The listing behind prune_sessions reads an unavailable backend as no
+    # sessions; this names the cases where that is not a clean answer (#864).
+    # A misconfigured process host fails the liveness read behind it: a scan
+    # that could not run, carried like one rather than exiting 1 with stdout
+    # empty and the sessions receipt lost (the ctl-window arm below, same).
+    try:
+        sessions_scan_error = runs.session_scan_error(project)
+    except ProcessHostError as e:
+        sessions_scan_error = str(e)
     if not args.json:
+        if sessions_scan_error is not None:
+            print(f"session prune failed: {sessions_scan_error}", file=sys.stderr)
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
             # Pruning kills the tmux session, never the engine pid, so the warning
@@ -5752,7 +5763,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
         else:
             windows, survived, unverifiable = launch.prune_ctl_windows(project)
-    except (MultiplexerError, UnicodeError) as e:
+    except (MultiplexerError, UnicodeError, ProcessHostError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
         # partition alone is also what a clean scan that found nothing emits, so
@@ -5762,6 +5773,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # POSIX handler and do not all normalize a decode fault to the seam type
         # (#380); it is the same scan failure, and letting it reach main()'s
         # backstop would empty stdout of the sessions receipt this arm protects.
+        # ProcessHostError: the evidence gate reads engine liveness (#864).
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
         scan_error = str(e)
@@ -5781,6 +5793,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
                 legacy_unverified=unverified,
+                sessions_scan_error=sessions_scan_error,
             )
         )
         return 0

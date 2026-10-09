@@ -843,6 +843,35 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
     return unproven
 
 
+def _ctl_window_evidence(project: Path) -> str | None:
+    """What says a control window of this project could still exist, or None:
+    a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
+    raising on an unavailable backend in _ctl_window_candidates.
+
+    A record is sticky: nothing drops it when its window goes, by a prune, a
+    stop or otherwise. So a project that launched from the dashboard reports
+    an unavailable backend on every cleanup until its run dirs are removed.
+    That is the intended direction: a false "nothing to prune" is the defect,
+    a report that the scan could not run is not. Dropping the record with the
+    window was tried and given up — a verified kill does not prove the run's
+    other windows (the current one, untagged ones) gone, and the record was
+    then the only evidence left for them."""
+    # Ungated, like live_run_evidence: a record outlives a lost state.json.
+    # An unlistable runs dir yields nothing here and is named there instead.
+    # Presence, not a read: a record that cannot be read still says a window
+    # was minted, and lstat neither follows a link nor opens a FIFO. Only a
+    # proved absence is absence; a stat that fails otherwise counts.
+    for run_dir in runs.all_run_dirs(project) or []:
+        try:
+            os.lstat(run_dir / _CTL_WINDOW_FILE)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
+        return f"a control window recorded for run {run_dir.name}"
+    return runs.live_run_evidence(project)
+
+
 def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     """(window_id, window_name) for parked control-session run windows whose run
     is no longer live — the kill candidates for a prune.
@@ -861,14 +890,24 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     PsmuxMultiplexer.list_windows reads every tag as empty, so an untagged row
     of ours whose run dir is gone is skipped here without a report. Telling an
     unreadable tag from an unset one needs an `on_fault` on list_windows, which
-    is a seam change. Likewise an unavailable backend still reads as no
-    candidates here (the early `return []`), a known residual left for a
-    separate decision.
+    is a seam change.
+
+    An unavailable backend is not folded into "no candidates" when this project
+    has evidence a control window could exist (_ctl_window_evidence): it raises,
+    so both prune callers report it (#864). Without that evidence it still
+    answers `[]` — a host with no multiplexer and nothing of ours to reach is a
+    clean scan, not a failure on every run.
     """
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
     if not mux_usable(mux):
-        return []
+        evidence = _ctl_window_evidence(project)
+        if evidence is None:
+            return []
+        raise MultiplexerError(
+            f"multiplexer backend {type(mux).__name__} is unavailable, but this "
+            f"project still has {evidence}; its control windows cannot be listed"
+        )
     # A False has-session is weaker than it looks (its seam note): a refused
     # connect reads the same as a missing session. So it only short-circuits
     # when list_window_ids agrees there is nothing — whose [] is a positive

@@ -55,6 +55,13 @@ breaking changes may land in a minor release.
 - Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
   shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
   intact; batch launchers have remaining argument limits, tracked separately.
+- Report an unavailable multiplexer in `bmad-loop cleanup` and the TUI cleanup
+  instead of reading it as nothing to prune, when this project has a recorded
+  control window or a live run: `ctl_windows.scan_error` and the new optional
+  `sessions.scan_error` say why, exit stays 0. A host without a multiplexer
+  and without such evidence sees no change. Records are sticky, so a project
+  that launched from the TUI keeps reporting it until its run dirs are removed
+  (#864).
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
