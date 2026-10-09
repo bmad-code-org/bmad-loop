@@ -55,6 +55,9 @@ breaking changes may land in a minor release.
   on psmux, on the parked window's command line, so a multiplexer server started
   under another state root no longer runs it where the TUI cannot see it; a TUI
   with no derivable state root refuses the launch (#731)
+- Keep a TUI-launched tmux window open after its command exits on hosts whose
+  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
+  refuses at once, so the window closed with its exit status unread.
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per

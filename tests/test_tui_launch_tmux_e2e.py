@@ -8,9 +8,11 @@ server holds.
 
 Linux only, zero tokens: the parked engine is `bmad-loop run --dry-run`, which
 prints the events channel a real run would use (the control plane, under the
-state root) and spawns nothing. The server runs on a private `TMUX_TMPDIR`, and
-the autouse `_isolate_mux_registry` fixture removes `TMUX`, which a client would
-otherwise follow to the operator's own socket.
+state root) and spawns nothing. It also gates the park itself: on a host whose
+`sh` is dash, a window that does not park is gone before it can be read. The
+server runs on a private `TMUX_TMPDIR`, and the autouse `_isolate_mux_registry`
+fixture removes `TMUX`, which a client would otherwise follow to the operator's
+own socket.
 """
 
 from __future__ import annotations
@@ -57,15 +59,24 @@ def test_e2e_parked_engine_resolves_the_launchers_root_on_a_stale_server(
         )
         assert win, "the parked window was not minted"
 
+        # The window parks after its command exits (`BaseTmuxBackend._PARK`),
+        # so the whole screen stays readable once the exit banner is up. A
+        # window that did not park is gone by then, and capture-pane says so.
         deadline = time.monotonic() + 30
-        screen = ""
-        while "BMAD_LOOP_EVENTS_DIR=" not in screen and time.monotonic() < deadline:
+        captured = subprocess.CompletedProcess([], 1, "", "")
+        while "[bmad-loop exited" not in captured.stdout and time.monotonic() < deadline:
             time.sleep(0.2)
-            screen = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-J", "-t", win],
-                capture_output=True,
-                text=True,
-            ).stdout
+            captured = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-t", win], capture_output=True, text=True
+            )
+        windows = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F", "#{window_id} #{window_name}"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "[bmad-loop exited" in captured.stdout, (captured.stderr, windows)
+        assert f"{win} run-RID" in windows, "the window did not park after its command"
+        screen = captured.stdout
         assert "BMAD_LOOP_EVENTS_DIR=" in screen, screen
         (line,) = [ln for ln in screen.splitlines() if "BMAD_LOOP_EVENTS_DIR=" in ln]
         events = Path(line.split("BMAD_LOOP_EVENTS_DIR=", 1)[1].strip())
