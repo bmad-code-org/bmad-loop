@@ -11985,7 +11985,9 @@ def _staged_spec(project, engine, text="attempt output\n"):
     task = StoryTask("1-1-a", 1)
     sp = spec_path(project, "1-1-a")
     sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(text, encoding="utf-8")
+    # Bytes, not write_text: Windows text mode writes CRLF, and the DW-528 snapshot
+    # comparison is byte-exact, so a `b"...\n"` snapshot would never match there.
+    sp.write_bytes(text.encode("utf-8"))
     task.spec_file = str(sp)
     return task, sp, engine._stage_deferred_stash(task)
 
