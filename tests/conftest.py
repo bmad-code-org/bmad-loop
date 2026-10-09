@@ -967,6 +967,11 @@ def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
     point_state_root(monkeypatch, _state_root_allocator)
 
 
+# The absolute pwsh the psmux backend resolves to under the suite (see
+# `_isolate_mux_registry`).
+PINNED_PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_mux_registry(monkeypatch):
     """Keep the psmux registry root, and the inside-a-pane marker, out of the
@@ -1006,11 +1011,14 @@ def _isolate_mux_registry(monkeypatch):
     judge a later test's sessions against an earlier test's project. Its record
     of refused kills (`runs._REFUSED_KILLS`) likewise.
 
-    The psmux backend's per-process PowerShell version answers are seeded with
-    an admitted `pwsh`: every psmux window launch probes that version first,
-    and the unit tests that fake `subprocess.run` for psmux would otherwise
-    hand the probe a psmux answer and see every launch refused. Tests of the
-    gate itself, and the live module, reset it to empty."""
+    The psmux backend's `pwsh` resolution is pinned to ``PINNED_PWSH`` and its
+    per-process PowerShell version answers are seeded with that path admitted:
+    every psmux window launch resolves and probes pwsh first, and the unit tests
+    that fake `subprocess.run` for psmux would otherwise hand the probe a psmux
+    answer (or, on a host without pwsh, find nothing to resolve) and see every
+    launch refused. The pinned path holds a space, as a default install under
+    Program Files does. Tests of the gate itself, and the live module,
+    reset the answers to empty; the live module also restores real resolution."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -1018,7 +1026,8 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
-    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {"pwsh": "7.6.6"})
+    monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_pwsh_path", lambda self: PINNED_PWSH)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {PINNED_PWSH: "7.6.6"})
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
     monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
 

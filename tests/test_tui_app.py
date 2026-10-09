@@ -3527,6 +3527,185 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
         await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
 
 
+async def test_cleanup_toasts_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    project, monkeypatch
+):
+    # #864: with no usable backend, both listings read as nothing to prune; a
+    # live run of this project makes that a failure each half must toast, while
+    # the session receipt is still reported.
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["fin-1"], [], set()))
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "session prune failed" in m and "live run 20260611-100000-aaaa" in m
+                for m in notifications(app)
+            ),
+        )
+        await until(
+            pilot,
+            lambda: any(
+                "ctl window prune failed" in m and "is unavailable" in m for m in notifications(app)
+            ),
+        )
+        await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
+
+
+async def test_cleanup_toasts_a_session_scan_the_process_host_could_not_run(project, monkeypatch):
+    # The normal worker's post-prune session scan reads engine liveness, which a
+    # misconfigured process host fails with ProcessHostError. It is a scan that
+    # could not run: toasted, with the receipt still reported and no crash.
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+
+    def scan(_p):
+        raise ProcessHostError("unknown process host")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["fin-1"], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", scan)
+    # The ctl-window scan's evidence gate reads the same liveness, so it fails too.
+    monkeypatch.setattr(launch, "prune_ctl_windows", scan)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        for prefix in ("session prune failed", "ctl window prune failed"):
+            await until(
+                pilot,
+                lambda prefix=prefix: any(
+                    f"{prefix}: unknown process host" in m for m in notifications(app)
+                ),
+            )
+        await until(pilot, lambda: any("removed 1 session(s)" in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)
+
+
+async def test_cleanup_with_no_multiplexer_scans_off_the_event_loop(project, monkeypatch):
+    """The evidence scans read run dirs any coding session can write (an
+    engine.pid may be a FIFO), so they run on a worker thread, and a
+    misconfigured process host is toasted as a failed scan, not a crash. Both
+    toasts render a bracketed path literally."""
+    import threading
+
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+
+    on_main: list[bool] = []
+    path = "C:\\[red]\\runs"
+
+    def scan(_p):
+        on_main.append(threading.current_thread() is threading.main_thread())
+        raise ProcessHostError(f"unknown process host ({path})")
+
+    monkeypatch.setattr(launch, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "session_scan_error", scan)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", scan)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        for prefix in ("session prune failed", "ctl window prune failed"):
+            await until(
+                pilot,
+                lambda prefix=prefix: any(
+                    text.startswith(prefix) and path in text
+                    for text, _severity in rendered_toasts(app)
+                ),
+            )
+        assert on_main == [False, False]
+        assert isinstance(app.screen, DashboardScreen)
+
+
+async def test_cleanup_with_no_multiplexer_reports_the_evidence_gated_scans(project, monkeypatch):
+    # #864, through the real preflight: the backend is missing before `c` is
+    # pressed, which is the steady state on a host that lost its multiplexer.
+    # A live run of this project makes both scans report, not just "backend
+    # unavailable", and nothing reaches the confirm modal or the worker.
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _m=None: False)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(
+            pilot,
+            lambda: any(
+                "session prune failed" in m and "live run 20260611-100000-aaaa" in m
+                for m in notifications(app)
+            ),
+        )
+        await until(pilot, lambda: any("ctl window prune failed" in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)
+        assert not any("launch/attach disabled" in m for m in notifications(app))
+
+
+async def test_cleanup_with_no_multiplexer_and_no_evidence_keeps_the_old_message(
+    project, monkeypatch
+):
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_usable", lambda _m=None: False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _m=None: False)
+    make_run(project.project, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: any("launch/attach disabled" in m for m in notifications(app)))
+        assert not any("prune failed" in m for m in notifications(app))
+        assert isinstance(app.screen, DashboardScreen)
+
+
+async def test_cleanup_scan_failure_toasts_keep_a_bracketed_path(project, monkeypatch):
+    """Both scan-failure toasts can carry a filesystem path (an unlistable runs
+    dir), so they render without markup: drop either `markup=False` and the
+    rendered path loses `[red]`."""
+    from bmad_loop import runs
+
+    path = "C:\\[red]\\runs"
+
+    def ctl_boom(_p):
+        raise MultiplexerError(f"a runs dir it cannot list ({path})")
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", lambda _p: f"cannot list ({path})")
+    monkeypatch.setattr(launch, "prune_ctl_windows", ctl_boom)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        for prefix in ("session prune failed", "ctl window prune failed"):
+            await until(
+                pilot,
+                lambda prefix=prefix: any(
+                    text.startswith(prefix) and path in text
+                    for text, _severity in rendered_toasts(app)
+                ),
+            )
+
+
 @pytest.mark.parametrize(
     "fault, toast",
     [
@@ -9211,6 +9390,48 @@ def test_run_tui_toasts_launch_warnings_for_the_app_run_only(monkeypatch, tmp_pa
     # Long enough to read both roots and the remedy: the latch never re-shows it.
     assert toasts == [("stale root", {"severity": "warning", "timeout": 30, "markup": False})]
     assert launch.warn_sink is None
+
+
+@pytest.mark.parametrize("backend", ["psmux", "tmux"])
+def test_run_tui_resurfaces_the_bare_env_warning_on_psmux_only(monkeypatch, tmp_path, backend):
+    """`PSMUX_BARE_ENV`'s once-per-process warning fires in `_configure_mux`'s
+    backend probe, before Textual hides the screen it printed to, so `run_tui`
+    says it again through the toast sink. Only on psmux: the switch means
+    nothing on any other transport.
+
+    Ablation: drop the re-surface and the psmux row's toast list is empty; drop
+    the backend check and the tmux row toasts."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+    from bmad_loop.tui import app as tui_app
+
+    toasts: list[str] = []
+
+    class _StubApp:
+        def __init__(self, _project):
+            pass
+
+        def notify(self, message, **_kwargs):
+            toasts.append(message)
+
+        def run(self):
+            pass
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", backend)
+    monkeypatch.setenv("PSMUX_BARE_ENV", "1")
+    monkeypatch.setattr(launch, "_WARNED", set())
+    monkeypatch.setattr(tui_app, "BmadLoopApp", _StubApp)
+    monkeypatch.setattr(tui_app, "mux_usable", lambda: True)
+    mux_mod.get_multiplexer.cache_clear()
+    try:
+        assert tui_app.run_tui(tmp_path) == 0
+        assert tui_app.run_tui(tmp_path) == 0  # once per process
+    finally:
+        mux_mod.get_multiplexer.cache_clear()
+    if backend == "tmux":
+        assert toasts == []
+        return
+    (toast,) = toasts
+    assert toast.startswith("PSMUX_BARE_ENV is on, which bmad-loop does not support")
 
 
 def _write_two_triage_decisions(run_dir: Path) -> None:

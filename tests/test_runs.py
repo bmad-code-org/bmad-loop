@@ -10711,3 +10711,68 @@ def test_session_liveness_says_why_it_did_not_read_alive(tmp_path, monkeypatch, 
 
     assert runs._session_liveness("r1") == "unknown"
     assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
+
+
+# ------------------------------------------- session_scan_error (#864)
+
+
+def test_session_scan_error_names_a_live_run_behind_an_unavailable_backend(tmp_path, monkeypatch):
+    # The listing behind the prune reads a missing backend as no sessions; with
+    # a live run of this project that is not a clean answer and must be named.
+    run_dir = _make_run(tmp_path, "live-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None
+    assert "unavailable" in err and "live run live-1" in err
+
+
+def test_session_scan_error_names_an_unreadable_run_listing(tmp_path, monkeypatch):
+    # An unreadable listing may hide a live run: reported, not read as clean.
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "_run_dir_names", lambda _p: (None, "runs: cannot list"))
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "runs: cannot list" in err
+
+
+def test_session_scan_error_is_silent_without_evidence(tmp_path, monkeypatch):
+    # A host with no multiplexer and nothing of ours running: no report.
+    _make_run(tmp_path, "fin-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    assert runs.session_scan_error(tmp_path) is None
+
+
+def test_session_scan_error_is_silent_for_a_usable_backend(tmp_path, monkeypatch):
+    # A forced backend counts as usable even when its probe fails, so the real
+    # mux_usable answers True here and a live run reports nothing.
+    from bmad_loop.adapters import multiplexer
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    multiplexer.get_multiplexer.cache_clear()
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(multiplexer, "_FORCED_UNUSABLE_WARNED", True)
+    _make_run(tmp_path, "live-1")
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    try:
+        assert runs.session_scan_error(tmp_path) is None
+    finally:
+        multiplexer.get_multiplexer.cache_clear()
+
+
+def test_session_scan_error_names_a_run_whose_liveness_is_unknown(tmp_path, monkeypatch):
+    # An unverifiable pid may be a live engine: evidence, not absence.
+    _make_run(tmp_path, "odd-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "run odd-1 whose engine may be live" in err
+
+
+def test_session_scan_error_sees_a_live_run_that_lost_its_state_file(tmp_path, monkeypatch):
+    # The listing is ungated: a run whose state.json is gone still holds its pid.
+    run_dir = _make_run(tmp_path, "live-1", with_state=False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "live run live-1" in err

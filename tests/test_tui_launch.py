@@ -110,7 +110,11 @@ def fake_run(monkeypatch) -> FakeRun:
 
 
 def expected_cli(*tail: str) -> str:
-    return shlex.join([sys.executable, "-m", "bmad_loop.cli", *tail])
+    """The parked command line: the launcher's state root rides ahead of the
+    subcommand (#731)."""
+    return shlex.join(
+        [sys.executable, "-m", "bmad_loop.cli", f"--state-root={runs.state_root()}", *tail]
+    )
 
 
 def test_start_run_detached_argv(fake_run, tmp_path: Path):
@@ -2706,18 +2710,23 @@ def test_start_detached_forwards_the_displaced_registry(monkeypatch, tmp_path):
     theirs = str(tmp_path / "their-own-registry")
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", theirs)
 
-    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
+    derived = str(tmp_path / "derived")
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(derived))
 
     assert argv == launch.cli_argv(
-        f"--displaced-registry-root={theirs}", "resume", "--project", str(tmp_path)
+        f"--state-root={runs.state_root()}",
+        f"--registry-root={derived}",
+        f"--displaced-registry-root={theirs}",
+        "resume",
+        "--project",
+        str(tmp_path),
     )
 
 
 @pytest.mark.parametrize("case", ["nothing-displaced", "namespace-less", "displaced-in-force"])
 def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path, case):
     """Nothing to forward — nothing displaced, a transport with no registry, or
-    a displaced root that is the one in force — leaves the argv byte-identical
-    to the one before the option existed.
+    a displaced root that is the one in force — leaves the option out.
 
     Ablate the `has_registry_namespace()` gate and the second row forwards."""
     from bmad_loop.adapters import psmux_backend
@@ -2730,7 +2739,10 @@ def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path,
 
     argv = _park(monkeypatch, tmp_path, mux)
 
-    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+    registry = [] if case == "namespace-less" else [f"--registry-root={in_force}"]
+    assert argv == launch.cli_argv(
+        f"--state-root={runs.state_root()}", *registry, "resume", "--project", str(tmp_path)
+    )
 
 
 def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path):
@@ -2752,11 +2764,65 @@ def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", share_root)
 
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
-    assert argv == launch.cli_argv("resume", "--project", str(tmp_path))
+    assert not any(a.startswith("--displaced-registry-root=") for a in argv)
 
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", below)
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
-    assert argv[3] == f"--displaced-registry-root={below}"
+    assert argv[5] == f"--displaced-registry-root={below}"
+
+
+def test_start_detached_hands_the_window_an_honoured_registry_root(monkeypatch, tmp_path):
+    """An operator's honoured root is the one in force here, and a parked engine
+    under `PSMUX_BARE_ENV` would not inherit it: it rides the argv, ahead of the
+    subcommand, beside the state root.
+
+    Ablate the `--registry-root` insertion in `start_detached` and this fails."""
+    pinned = str(tmp_path / "their-pinned-registry")
+
+    argv = _park(monkeypatch, tmp_path, _ParkingRegistry(pinned))
+
+    assert argv[3:6] == [f"--state-root={runs.state_root()}", f"--registry-root={pinned}", "resume"]
+
+
+def test_start_detached_on_an_out_of_tree_backend_uses_the_released_verbs(monkeypatch, tmp_path):
+    """A backend declared with only the released signatures is handed the
+    state root through the argv it already runs verbatim: `new_parked_window`
+    receives exactly its five released parameters, and the recorded argv
+    carries `--state-root=<root>` ahead of the subcommand. Nothing about the
+    seam changed for it."""
+    from test_multiplexer import StubMux
+
+    class _ReleasedParkingMux(StubMux):
+        def __init__(self):
+            super().__init__()
+            self.parked: list[tuple] = []
+            self.tagged: list[tuple] = []
+
+        def new_parked_window(self, session, name, cwd, argv, return_opt):
+            self.parked.append((session, name, cwd, argv, return_opt))
+            return "@9"
+
+        def set_window_option(self, target, option, value):
+            self.tagged.append((target, option, value))
+
+    stub = _ReleasedParkingMux()
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: stub)
+
+    assert (
+        launch.start_detached(tmp_path, ["run", "--project", str(tmp_path)], "RID", "run") == "@9"
+    )
+
+    ((session, name, cwd, argv, return_opt),) = stub.parked
+    assert (session, name, cwd, return_opt) == (
+        launch.ctl_session(tmp_path),
+        "run-RID",
+        tmp_path,
+        launch.RETURN_OPTION,
+    )
+    assert argv == launch.cli_argv(
+        f"--state-root={runs.state_root()}", "run", "--project", str(tmp_path)
+    )
+    assert stub.tagged == [("@9", runs.PROJECT_OPTION, runs.project_tag(tmp_path))]
 
 
 def test_registry_drift_is_not_asked_of_an_unconfigured_process(monkeypatch, tmp_path):
@@ -2899,9 +2965,8 @@ def _launch_against(monkeypatch, tmp_path: Path, fake: FakeRun) -> list[str]:
 def test_stale_server_root_warns_once_after_either_arm(monkeypatch, tmp_path: Path, reuse):
     """A server started under another root hands every new pane that root —
     on a reused control session AND on one created just now, since a new
-    session on a stale server inherits its global env too. One warning names
-    both roots and the remedy, through the sink, once per process; the launch
-    goes ahead.
+    session on a stale server inherits its global env too. One note names
+    both roots, through the sink, once per process; the launch goes ahead.
 
     Ablation: drop the `_warn_if_stale_state_root` call from
     `_ensure_ctl_session` and both rows fail on the empty sink."""
@@ -2913,7 +2978,7 @@ def test_stale_server_root_warns_once_after_either_arm(monkeypatch, tmp_path: Pa
     warned = _launch_against(monkeypatch, tmp_path, fake)
     assert len(warned) == 1
     assert str(tmp_path / "s1") in warned[0] and str(tmp_path / "s2") in warned[0]
-    assert f"tmux set-environment -t ={runs.CTL_SESSION} BMAD_LOOP_STATE_DIR" in warned[0]
+    assert "Runs launched from this TUI are unaffected" in warned[0]
 
     queries = len(fake.by_verb("show-environment"))
     launch.start_run_detached(tmp_path, "RID2")
@@ -2972,24 +3037,46 @@ def test_unknown_is_silent_but_a_query_fault_is_reported(monkeypatch, tmp_path: 
     assert "no server running" in warned[0] and "would resolve" not in warned[0]
 
 
-def test_an_underivable_launcher_root_is_reported_and_still_launches(monkeypatch, tmp_path: Path):
-    """With no root of its own there is nothing to compare: say so through the
-    sink, raise nothing, and launch anyway — refusing is not this check's job."""
+def test_an_underivable_launcher_root_is_reported_by_the_check(monkeypatch, tmp_path: Path):
+    """With no root of its own there is nothing to compare: the check says so
+    through the sink and raises nothing. Refusing is the launcher's job (below)."""
     _posix_env(monkeypatch, **{envvars.STATE_DIR: "relative/state"})
+    warned: list[str] = []
+    monkeypatch.setattr(tmux_base.subprocess, "run", FakeRun())
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(launch, "warn_sink", warned.append)
 
-    warned = _launch_against(monkeypatch, tmp_path, FakeRun())
+    launch._ensure_ctl_session(tmp_path)
     assert len(warned) == 1 and envvars.STATE_DIR in warned[0]
 
 
+def test_an_underivable_launcher_root_refuses_the_launch(monkeypatch, tmp_path: Path):
+    """A launcher that cannot name a state root cannot hand the window one, and
+    omitting `--state-root` would let the engine inherit whatever root the
+    server holds, where this launcher never looks. So the launch is refused
+    before anything is minted.
+
+    Ablation: fall back to omitting the option instead of raising and a window
+    is minted."""
+    _posix_env(monkeypatch, **{envvars.STATE_DIR: "relative/state"})
+    fake = FakeRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    with pytest.raises(launch.LaunchError, match="no state root"):
+        launch.start_run_detached(tmp_path, "RID")
+    assert fake.by_verb("new-session") == [] and fake.by_verb("new-window") == []
+
+
 def test_without_a_sink_the_warning_goes_to_stderr(monkeypatch, tmp_path: Path, capsys):
-    """The CLI-side default: no sink installed means a `warning:` line."""
+    """The CLI-side default: no sink installed means a `note:` line."""
     _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / "s2")})
     pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
     monkeypatch.setattr(tmux_base.subprocess, "run", FakeRun(pane_env=pane))
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     launch.start_run_detached(tmp_path, "RID")
-    assert "warning: new windows in" in capsys.readouterr().err
+    assert "note: new shells in" in capsys.readouterr().err
 
 
 def test_an_out_of_tree_backend_goes_through_both_arms_silently(
@@ -3050,43 +3137,34 @@ def test_the_comparison_skips_the_passwd_lookup_it_does_not_need(monkeypatch, tm
     assert _launch_against(monkeypatch, tmp_path, FakeRun()) == []
 
 
-def test_the_remedy_commands_carry_the_root_through_a_shell_intact(monkeypatch, tmp_path: Path):
-    """The remedy is meant to be pasted into a shell, so a root with a space and
-    an apostrophe must survive as one word in both commands.
-
-    Ablation: interpolate `own` unquoted and both splits break the root apart."""
-    own = str(tmp_path / "o'brien state")
-    _posix_env(monkeypatch, **{envvars.STATE_DIR: own})
-    pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
-
-    (warning,) = _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane))
-    set_env = warning[warning.index("tmux set-environment") : warning.index(" (add -g")]
-    assert shlex.split(set_env)[-2:] == [envvars.STATE_DIR, own]
-    export = warning[warning.index("export ") : warning.index(", or recreating")]
-    assert shlex.split(export) == ["export", f"{envvars.STATE_DIR}={own}"]
-
-
 @pytest.mark.parametrize("launcher", ["s2", "s1"])
-def test_stale_root_warning_on_a_shared_server(monkeypatch, tmp_path: Path, launcher):
-    """Two roots on one tmux server: `bmad-loop-ctl` is shared by every project
-    there, so the session-scoped remedy re-roots all of them. A launcher under
-    S2 against a server whose new panes resolve S1 warns, naming the shared
-    session, the condition on `set-environment` and the cost of `kill-server`;
-    a launcher under S1 against the same server stays silent.
+def test_stale_root_note_on_a_shared_server(monkeypatch, tmp_path: Path, launcher):
+    """Two roots on one tmux server: a launcher under S2 against a
+    `bmad-loop-ctl` whose new panes resolve S1 says that a command typed into
+    one of its shells would use S1, and that its own runs are unaffected; a
+    launcher under S1 against the same server stays silent. No remedy is
+    offered: the session is shared by every project on the server, so no value
+    set there is right for all of them, and the parked engine is handed its
+    root anyway.
 
-    Ablation: drop the shared-session clause from the warning and the S2 row
-    fails."""
+    Ablation: restore the `set-environment` / `kill-server` remedy and the S2
+    row fails."""
+    s1 = str(tmp_path / "s1")
     _posix_env(monkeypatch, **{envvars.STATE_DIR: str(tmp_path / launcher)})
-    pane = {envvars.STATE_DIR: str(tmp_path / "s1")}
+    pane = {envvars.STATE_DIR: s1}
 
     warned = _launch_against(monkeypatch, tmp_path, FakeRun(has_session_rc=0, pane_env=pane))
     if launcher == "s1":
         assert warned == []
         return
-    assert len(warned) == 1
-    assert "shared by every bmad-loop project" in warned[0]
-    assert "only if none of them uses another state root" in warned[0]
-    assert "ends every session on this server" in warned[0]
+    (note,) = warned
+    assert note == (
+        f"new shells in {runs.CTL_SESSION} resolve {s1}, not this TUI's state root "
+        f"{tmp_path / 's2'}, so a bmad-loop command typed into one would use that root. "
+        "Runs launched from this TUI are unaffected: each is handed its root (#731). "
+        "A shell already open there can differ either way; no query can see it."
+    )
+    assert "set-environment" not in note and "kill-server" not in note
 
 
 def test_silent_on_a_set_empty_inherited_override(monkeypatch, tmp_path: Path):
@@ -3101,3 +3179,118 @@ def test_silent_on_a_set_empty_inherited_override(monkeypatch, tmp_path: Path):
     pane = {envvars.STATE_DIR: "", "HOME": home}
 
     assert _launch_against(monkeypatch, tmp_path, FakeRun(pane_env=pane)) == []
+
+
+# ------------------------------------- unavailable backend + evidence (#864)
+
+
+def test_ctl_candidates_raise_for_an_unavailable_backend_with_a_recorded_window(
+    monkeypatch, tmp_path: Path
+):
+    # A recorded ctl window says one of ours may still be standing on a server
+    # this process cannot reach: an empty answer would read as nothing to prune.
+    run_dir = _make_run(tmp_path, "20260101-000000-fin")
+    (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+    with pytest.raises(MultiplexerError, match="is unavailable"):
+        launch.prune_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_raise_for_an_unavailable_backend_with_a_live_run(
+    monkeypatch, tmp_path: Path
+):
+    run_dir = _make_run(tmp_path, "20260101-000000-live")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    with pytest.raises(MultiplexerError, match="live run 20260101-000000-live"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_stay_empty_for_an_unavailable_backend_without_evidence(
+    monkeypatch, tmp_path: Path, capsys
+):
+    # A host with no multiplexer and nothing of ours to reach: a clean scan,
+    # silently — not a failure on every cleanup.
+    _make_run(tmp_path, "20260101-000000-fin")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    assert launch.prunable_ctl_windows(tmp_path) == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert capsys.readouterr().err == ""
+
+
+def test_ctl_candidates_ignore_evidence_for_a_usable_backend(monkeypatch, tmp_path: Path):
+    # The module pins a forced backend, which mux_usable trusts: the evidence
+    # gate is never consulted and the scan runs as before, live run included.
+    _killed, _probes = _ctl_prune_fake(monkeypatch, tmp_path)
+    (runs.run_dir_for(tmp_path, "20260101-000000-live") / "ctl-window").write_text(
+        "@9", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        launch, "_ctl_window_evidence", lambda _p: pytest.fail("evidence read for a usable mux")
+    )
+    assert launch.prunable_ctl_windows(tmp_path) == [
+        "sweep-20260101-000000-dead",
+        "run-20260101-000000-dead2",
+    ]
+
+
+def test_ctl_candidates_see_a_recorded_window_whose_run_lost_its_state_file(
+    monkeypatch, tmp_path: Path
+):
+    # The record outlives a lost state.json, so the evidence listing is ungated.
+    run_dir = runs.run_dir_for(tmp_path, "20260101-000000-fin")
+    run_dir.mkdir(parents=True)
+    (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_count_an_unreadable_window_record_as_evidence(monkeypatch, tmp_path: Path):
+    # A record that cannot be read (here: a directory where the file belongs)
+    # still says a window was minted; reading it as absent would be clean.
+    run_dir = _make_run(tmp_path, "20260101-000000-fin")
+    (run_dir / "ctl-window").mkdir()
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_ctl_candidates_count_an_unstattable_window_record_as_evidence(monkeypatch, tmp_path: Path):
+    # Only a proved absence is absence: a stat that fails otherwise counts.
+    _make_run(tmp_path, "20260101-000000-fin")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if Path(path).name == "ctl-window":
+            raise PermissionError("denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(launch.os, "lstat", lstat)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded for run 20260101"):
+        launch.prunable_ctl_windows(tmp_path)
+
+
+def test_a_verified_prune_keeps_the_record_and_a_later_unavailable_scan_reports(
+    monkeypatch, tmp_path: Path
+):
+    # Records are sticky evidence by decision: a verified kill does not prove
+    # the run's other windows gone, so nothing drops the record with it.
+    _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
+    record = _make_run(tmp_path, "20260101-000000-dead2") / "ctl-window"
+    record.write_text("@6", encoding="utf-8")
+    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
+    assert "run-20260101-000000-dead2" in removed
+    assert record.read_text(encoding="utf-8") == "@6"
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    with pytest.raises(MultiplexerError, match="control window recorded"):
+        launch.prunable_ctl_windows(tmp_path)

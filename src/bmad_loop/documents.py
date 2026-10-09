@@ -395,6 +395,7 @@ def cleanup_document(
     scan_error: str | None = None,
     legacy_leftovers: list[str] | None = None,
     legacy_unverified: list[str] | None = None,
+    sessions_scan_error: str | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -448,21 +449,33 @@ def cleanup_document(
     `legacy_unverified` means "not looked at", not "nothing left". Additive, no
     schema bump; the text mode prints each line on stderr.
 
+    `sessions.scan_error` is present only when the session listing could not
+    see this project's sessions (#864): the backend is unavailable while a run
+    of this project is or may be alive (`runs.session_scan_error`). `removed` and
+    `live` beside it then mean "no answer", not "verified empty". Absent, not
+    `null`, when there is nothing to report, so every document emitted before
+    the key existed is still a valid one. Additive, no schema bump; separate
+    from `ctl_windows.scan_error`, which is the other half's scan. The text
+    mode prints it on stderr.
+
     `sessions.removed` did NOT get the same treatment and is still the pre-kill
     prunable partition — an *attempted* kill, since `kill_session` is best-effort
     and silent in exactly the way `kill_window` is. #435 narrowed the windows
     half only; read the sessions half with that in mind.
     """
+    sessions: dict[str, object] = {
+        "removed": list(killed),
+        "live": list(live),
+        "unverifiable_pid": sorted(unknown),
+        "legacy_leftovers": list(legacy_leftovers or []),
+        "legacy_unverified": list(legacy_unverified or []),
+    }
+    if sessions_scan_error is not None:
+        sessions["scan_error"] = sessions_scan_error
     return {
         "schema_version": CLEANUP_SCHEMA_VERSION,
         "dry_run": dry_run,
-        "sessions": {
-            "removed": list(killed),
-            "live": list(live),
-            "unverifiable_pid": sorted(unknown),
-            "legacy_leftovers": list(legacy_leftovers or []),
-            "legacy_unverified": list(legacy_unverified or []),
-        },
+        "sessions": sessions,
         "ctl_windows": {
             "removed": list(windows),
             "survived": list(windows_survived),

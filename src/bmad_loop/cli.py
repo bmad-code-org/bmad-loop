@@ -5952,7 +5952,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    # The listing behind prune_sessions reads an unavailable backend as no
+    # sessions; this names the cases where that is not a clean answer (#864).
+    # A misconfigured process host fails the liveness read behind it: a scan
+    # that could not run, carried like one rather than exiting 1 with stdout
+    # empty and the sessions receipt lost (the ctl-window arm below, same).
+    try:
+        sessions_scan_error = runs.session_scan_error(project)
+    except ProcessHostError as e:
+        sessions_scan_error = str(e)
     if not args.json:
+        if sessions_scan_error is not None:
+            print(f"session prune failed: {sessions_scan_error}", file=sys.stderr)
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
             # Pruning kills the tmux session, never the engine pid, so the warning
@@ -5975,7 +5986,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
         else:
             windows, survived, unverifiable = launch.prune_ctl_windows(project)
-    except (MultiplexerError, UnicodeError) as e:
+    except (MultiplexerError, UnicodeError, ProcessHostError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
         # partition alone is also what a clean scan that found nothing emits, so
@@ -5985,6 +5996,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # POSIX handler and do not all normalize a decode fault to the seam type
         # (#380); it is the same scan failure, and letting it reach main()'s
         # backstop would empty stdout of the sessions receipt this arm protects.
+        # ProcessHostError: the evidence gate reads engine liveness (#864).
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
         scan_error = str(e)
@@ -6004,6 +6016,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
                 legacy_unverified=unverified,
+                sessions_scan_error=sessions_scan_error,
             )
         )
         return 0
@@ -6641,6 +6654,11 @@ def main(argv: list[str] | None = None) -> int:
     # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
     # detached child, never typed by hand. See the handling after `parse_args`.
     parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: the launcher's own state root and registry
+    # root, handed to a parked engine in its argv because inheritance cannot
+    # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
+    parser.add_argument("--state-root", help=argparse.SUPPRESS)
+    parser.add_argument("--registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -7081,6 +7099,25 @@ def main(argv: list[str] | None = None) -> int:
     relay_p.set_defaults(func=cmd_relay)
 
     args = parser.parse_args(argv)
+    # Applied ahead of everything below, the relay branch included, so every later
+    # reader (`runs.state_root`, `_configure_mux`'s registry decision, the env a
+    # coding-CLI window is pinned from) sees what the launcher resolved, exactly as
+    # if inheritance had delivered it. Refused when not absolute: the variable has
+    # the same rule (`runs.state_root` judges it with `os.path.isabs` on the raw
+    # string), and a relative root names a different directory per working
+    # directory. The registry root is set only; `_configure_mux` still decides
+    # whether it is honoured (`runs.resolve_psmux_registry_root`), and judges it
+    # with `Path.is_absolute` for the reason given there.
+    # Both are validated before either is set, so a refused one leaves this
+    # process's environment exactly as it found it.
+    if args.state_root is not None and not os.path.isabs(args.state_root):
+        parser.error(f"--state-root must be absolute: {args.state_root!r}")
+    if args.registry_root is not None and not Path(args.registry_root).is_absolute():
+        parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
+    if args.state_root is not None:
+        os.environ[envvars.STATE_DIR] = args.state_root
+    if args.registry_root is not None:
+        os.environ[runs.PSMUX_DATA_DIR] = args.registry_root
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
     # inside the session whose completion it reports, and a hook that exits non-zero

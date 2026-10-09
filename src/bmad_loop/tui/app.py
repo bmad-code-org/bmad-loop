@@ -37,7 +37,7 @@ from .. import (
     stories,
     verify,
 )
-from ..adapters.multiplexer import MultiplexerError, mux_usable
+from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
     PAUSE_ENVIRONMENT,
@@ -1953,7 +1953,11 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(self.notify, note, severity="warning")
 
     def action_cleanup_sessions(self) -> None:
-        if self._mux_missing():
+        if not launch.mux_available():
+            # No multiplexer: nothing to prune, but a project with recorded
+            # control windows or live runs must hear that its cleanup could not
+            # look, not just that the backend is missing (#864).
+            self._unavailable_cleanup_worker()
             return
 
         def done(ok: bool | None) -> None:
@@ -1968,6 +1972,37 @@ class BmadLoopApp(App[None]):
             ),
             done,
         )
+
+    @work(thread=True, group="lifecycle")
+    def _unavailable_cleanup_worker(self) -> None:
+        """The cleanup worker's two scan-failure toasts, for a backend that is
+        unavailable before the cleanup starts; the old backend-missing toast
+        when neither scan reports. A worker, not the foreground: the evidence
+        scans read run dirs every coding session can write (an engine.pid may
+        be a FIFO), so a stuck read must not freeze the dashboard.
+
+        A misconfigured process host (ProcessHostError) is a scan that could
+        not run, reported like one: an escape from a worker thread would take
+        the whole dashboard down."""
+        errors: list[str] = []
+        try:
+            session_error = runs.session_scan_error(self.project)
+        except ProcessHostError as e:
+            session_error = str(e)
+        if session_error is not None:
+            errors.append(f"session prune failed: {session_error}")
+        try:
+            launch.prunable_ctl_windows(self.project)
+        except (MultiplexerError, UnicodeError, ProcessHostError) as e:
+            errors.append(f"ctl window prune failed: {e}")
+        for message in errors:
+            self.call_from_thread(self.notify, message, severity="error", markup=False)
+        if not errors:
+            self.call_from_thread(
+                self.notify,
+                "multiplexer backend unavailable — launch/attach disabled",
+                severity="error",
+            )
 
     @work(thread=True, group="lifecycle")
     def _cleanup_sessions_worker(self) -> None:
@@ -1989,21 +2024,40 @@ class BmadLoopApp(App[None]):
         except (MultiplexerError, UnicodeError) as e:
             self.call_from_thread(self.notify, f"session prune failed: {e}", severity="error")
             return
+        # The cli cleanup's sessions.scan_error, as a toast: an unavailable
+        # backend reads as no sessions, which is not clean while a run of this
+        # project is or may be alive (#864). The ctl-window arm below reports its own.
+        # A misconfigured process host is a scan that could not run, as in
+        # _unavailable_cleanup_worker: an escape here takes the dashboard down.
+        try:
+            sessions_scan_error = runs.session_scan_error(self.project)
+        except ProcessHostError as e:
+            sessions_scan_error = str(e)
+        if sessions_scan_error is not None:
+            self.call_from_thread(
+                self.notify,
+                f"session prune failed: {sessions_scan_error}",
+                severity="error",
+                markup=False,
+            )
         # prune_ctl_windows probes has_session on the shared ctl session, a
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
         try:
             windows, survived, unverifiable = launch.prune_ctl_windows(self.project)
-        except (MultiplexerError, UnicodeError) as e:
+        except (MultiplexerError, UnicodeError, ProcessHostError) as e:
             # UnicodeError: a strict-POSIX decode fault from a scan probe that
             # does not normalize it to the seam type (#380) — the cli cleanup
             # arm's twin; an escape here kills the worker thread instead.
+            # ProcessHostError: the evidence gate reads engine liveness (#864).
             # prune_sessions already killed the agent sessions above; surface the
             # ctl-window failure but keep reporting that completed work (and the
             # unknown-pid warning) rather than swallowing it on an early return.
             # Named: a bare transport message next to a "removed N session(s), 0
             # window(s)" toast reads as a successful window sweep.
-            self.call_from_thread(self.notify, f"ctl window prune failed: {e}", severity="error")
+            self.call_from_thread(
+                self.notify, f"ctl window prune failed: {e}", severity="error", markup=False
+            )
             windows, survived, unverifiable = [], [], []
         # A kill the shared-registry ownership gate refused is left out of the
         # count below and warned on stderr, which Textual swallows: say it here.
@@ -2168,6 +2222,18 @@ def run_tui(project: Path) -> int:
         message, severity="warning", timeout=30, markup=False
     )
     try:
+        # The bare-env warning fired once already, in `_configure_mux`'s backend
+        # probe, onto the screen Textual is about to hide, and its latch is spent.
+        # Said again here, through the sink, and only when psmux is the selected
+        # backend: on any other transport the switch means nothing.
+        from ..adapters.psmux_backend import PsmuxMultiplexer, bare_env_warning
+
+        try:
+            selected = get_multiplexer()
+        except MultiplexerError:
+            selected = None
+        if isinstance(selected, PsmuxMultiplexer) and (bare := bare_env_warning(os.environ)):
+            launch._warn_once("psmux-bare-env", bare)
         app.run()
     finally:
         launch.warn_sink = None

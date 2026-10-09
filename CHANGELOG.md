@@ -39,6 +39,10 @@ breaking changes may land in a minor release.
 
 - Reword the rc 126/127 environment-fault pause to name the shell convention
   instead of asserting "command not found / not executable".
+- Narrow the `PSMUX_BARE_ENV` support gap (#730): TUI-parked engine windows now
+  land on the right state root, and on the right registry under
+  `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
+  loss stay warned, and the TUI repeats the warning once its screen is up.
 
 ### Fixed
 
@@ -47,14 +51,31 @@ breaking changes may land in a minor release.
   its hooks nor its skills, so sessions never reported completion.
 - Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
   was moved out before the rollback, so every such defer paused for spec recovery.
+- Hand each TUI-launched engine the TUI's own state root, and its registry root
+  on psmux, on the parked window's command line, so a multiplexer server started
+  under another state root no longer runs it where the TUI cannot see it; a TUI
+  with no derivable state root refuses the launch (#731)
+- Keep a TUI-launched tmux window open after its command exits on hosts whose
+  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
+  refuses at once, so the window closed with its exit status unread.
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per
   process, forced backend included, and an unrecognized version answer is
   refused too (#861).
+- Launch psmux windows and the pipe-pane log sink with the same absolute `pwsh`
+  path whose version was checked, instead of letting the psmux server's PATH pick
+  one; a `pwsh` that does not resolve is refused (#863).
 - Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
   shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
   intact; batch launchers have remaining argument limits, tracked separately.
+- Report an unavailable multiplexer in `bmad-loop cleanup` and the TUI cleanup
+  instead of reading it as nothing to prune, when this project has a recorded
+  control window or a live run: `ctl_windows.scan_error` and the new optional
+  `sessions.scan_error` say why, exit stays 0. A host without a multiplexer
+  and without such evidence sees no change. Records are sticky, so a project
+  that launched from the TUI keeps reporting it until its run dirs are removed
+  (#864).
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
@@ -62,11 +83,11 @@ breaking changes may land in a minor release.
   cannot be listed, or a session left standing, is journalled and warned about.
   A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
   child), except a share-root shape older PowerShell would corrupt.
-- Warn once in the TUI when its tmux control session would hand new windows a
-  different state root than its own (a server started under another
-  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
-  `tmux set-environment` remedy, with its limits on a server shared by several
-  projects, instead of letting the run read as gone (#731).
+- Note once in the TUI when new shells in its tmux control session would
+  resolve a different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots, so a
+  `bmad-loop` command typed into one is not silently aimed elsewhere; runs the
+  TUI launches are handed their root and are unaffected (#731).
 - Resume a review loop interrupted after a fix into its next review pass; it
   re-checked `followup_review_recommended` and could skip the re-review.
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
