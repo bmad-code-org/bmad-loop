@@ -44,9 +44,20 @@ breaking changes may land in a minor release.
   instead of asserting "command not found / not executable" (DW-523).
 - Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
   gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
+- Narrow the `PSMUX_BARE_ENV` support gap (#730): TUI-parked engine windows now
+  land on the right state root, and on the right registry under
+  `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
+  loss stay warned, and the TUI repeats the warning once its screen is up.
 
 ### Fixed
 
+- Hand each TUI-launched engine the TUI's own state root, and its registry root
+  on psmux, on the parked window's command line, so a multiplexer server started
+  under another state root no longer runs it where the TUI cannot see it; a TUI
+  with no derivable state root refuses the launch (#731)
+- Keep a TUI-launched tmux window open after its command exits on hosts whose
+  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
+  refuses at once, so the window closed with its exit status unread.
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per
@@ -69,11 +80,11 @@ breaking changes may land in a minor release.
   cannot be listed, or a session left standing, is journalled and warned about.
   A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
   child), except a share-root shape older PowerShell would corrupt.
-- Warn once in the TUI when its tmux control session would hand new windows a
-  different state root than its own (a server started under another
-  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
-  `tmux set-environment` remedy, with its limits on a server shared by several
-  projects, instead of letting the run read as gone (#731).
+- Note once in the TUI when new shells in its tmux control session would
+  resolve a different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots, so a
+  `bmad-loop` command typed into one is not silently aimed elsewhere; runs the
+  TUI launches are handed their root and are unaffected (#731).
 - Escalate an environment fault at the review-budget rescue gate instead of
   deferring the story as unconverged (DW-523).
 - Reach only control-session windows carrying this project's tag from `a`/`x`,

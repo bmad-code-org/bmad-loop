@@ -683,8 +683,9 @@ def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambi
       the session.
     - **Persistent pin** (a profile exports it into every shell): turn it on.
       The outer process honours the pin and exports it, a pane child inherits
-      and honours it (not under ``PSMUX_BARE_ENV``, where a pane inherits no
-      ``PSMUX_DATA_DIR``; see ``_warn_if_bare_env``), and a clean process
+      and honours it (a TUI-parked engine is handed it in argv, so that holds
+      under ``PSMUX_BARE_ENV`` too, where a pane inherits no ``PSMUX_DATA_DIR``;
+      see ``_warn_if_bare_env``), and a clean process
       carrying the profile pin honours it too.
 
     Whether the pin is persistent is not in the environment; the flag is the
@@ -817,9 +818,9 @@ def export_psmux_registry_root(project: Path, *, honor_ambient: bool = False) ->
     **No root travels between processes.** Because every bmad-loop process
     derives its own root, nothing about a registry has to be transported at
     all. What does have to travel is the *state root*: coding-CLI windows are
-    told it explicitly through their env dict (:func:`pinned_state_env`), and
-    everything else — a session's window-0 shell, the TUI's parked engine
-    windows — inherits it, as it always has. psmux's ``PSMUX_BARE_ENV=1`` mode
+    told it explicitly through their env dict (:func:`pinned_state_env`), the
+    TUI's parked engine windows in their argv (``--state-root``, #731), and a
+    session's window-0 shell inherits it. psmux's ``PSMUX_BARE_ENV=1`` mode
     breaks that inheritance and is **not supported**: the psmux backend warns
     once per process when it is on (see ``PsmuxMultiplexer._warn_if_bare_env``).
 

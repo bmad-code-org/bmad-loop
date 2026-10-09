@@ -9391,6 +9391,48 @@ def test_run_tui_toasts_launch_warnings_for_the_app_run_only(monkeypatch, tmp_pa
     assert launch.warn_sink is None
 
 
+@pytest.mark.parametrize("backend", ["psmux", "tmux"])
+def test_run_tui_resurfaces_the_bare_env_warning_on_psmux_only(monkeypatch, tmp_path, backend):
+    """`PSMUX_BARE_ENV`'s once-per-process warning fires in `_configure_mux`'s
+    backend probe, before Textual hides the screen it printed to, so `run_tui`
+    says it again through the toast sink. Only on psmux: the switch means
+    nothing on any other transport.
+
+    Ablation: drop the re-surface and the psmux row's toast list is empty; drop
+    the backend check and the tmux row toasts."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+    from bmad_loop.tui import app as tui_app
+
+    toasts: list[str] = []
+
+    class _StubApp:
+        def __init__(self, _project):
+            pass
+
+        def notify(self, message, **_kwargs):
+            toasts.append(message)
+
+        def run(self):
+            pass
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", backend)
+    monkeypatch.setenv("PSMUX_BARE_ENV", "1")
+    monkeypatch.setattr(launch, "_WARNED", set())
+    monkeypatch.setattr(tui_app, "BmadLoopApp", _StubApp)
+    monkeypatch.setattr(tui_app, "mux_usable", lambda: True)
+    mux_mod.get_multiplexer.cache_clear()
+    try:
+        assert tui_app.run_tui(tmp_path) == 0
+        assert tui_app.run_tui(tmp_path) == 0  # once per process
+    finally:
+        mux_mod.get_multiplexer.cache_clear()
+    if backend == "tmux":
+        assert toasts == []
+        return
+    (toast,) = toasts
+    assert toast.startswith("PSMUX_BARE_ENV is on, which bmad-loop does not support")
+
+
 def _write_two_triage_decisions(run_dir: Path) -> None:
     """A sweep triage carrying TWO decisions, so a walk has somewhere to continue to."""
     import json

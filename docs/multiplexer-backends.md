@@ -63,26 +63,23 @@ The two floors are independent and neither implies the other.
 A tmux server is long-lived, and its panes inherit the environment the _server_ started
 with, not the environment of the client asking for the pane. A server started while
 `BMAD_LOOP_STATE_DIR` (or `XDG_STATE_HOME`, or `HOME`) named one state root, and reused
-later by a bmad-loop under another, runs every parked engine window under the first root, so
-a live run reads as gone (#731). When the TUI launches into its control session it asks tmux
-(`show-environment`) what a new window there would inherit, resolves the state root from
-that, and warns once — naming both roots — when it differs from its own. The launch still
-goes ahead; the warning detects, it does not fix. The remedy:
+later by a bmad-loop under another, hands every new shell there the first root. The engine
+windows the TUI parks are not exposed: the TUI hands each one its own state root on the
+command line (a hidden `--state-root` option ahead of the subcommand, #731), so the run lands
+where the TUI watches whatever the server holds, and two projects under different state roots
+can share one server. A TUI that cannot derive a state root of its own refuses the launch
+rather than let the engine inherit one it could not watch.
 
-- For new windows: `tmux set-environment -t =bmad-loop-ctl BMAD_LOOP_STATE_DIR <root>`. On
-  tmux, `bmad-loop-ctl` is one session shared by every bmad-loop project on that server, so this
-  re-roots new windows for all of them: use it only when no project there runs under another
-  state root. The session scope matters, because a session value overrides the global one; add
-  the same command with `-g` to cover new sessions as well. `tmux kill-server` also starts clean,
-  but it ends every session on the server, live runs and your own sessions included.
-- Shells already open there, window 0 included, keep the environment they started with. They
-  need `export BMAD_LOOP_STATE_DIR=<root>`, or recreating.
-
-Two projects that need different state roots cannot share one tmux server's control session
-safely until each launched run is handed its state root directly (#731).
+What stays exposed is a shell: window 0 of the control session, or any shell opened there, still
+inherits the server's root, so a `bmad-loop` command typed into one would use it. When the TUI
+launches into its control session it asks tmux (`show-environment`) what a new window there
+would inherit, resolves the state root from that, and notes once — naming both roots — when it
+differs from its own. It offers no remedy: on tmux `bmad-loop-ctl` is one session shared by every
+bmad-loop project on the server, so no value set there is right for all of them, and nothing
+bmad-loop launches needs one. A shell that must agree can `export BMAD_LOOP_STATE_DIR=<root>`.
 
 psmux cannot answer the question — its `show-environment` does not report inherited values
-— so there is no such warning on psmux. Its per-project registry is keyed on the state root,
+— so there is no such note on psmux. Its per-project registry is keyed on the state root,
 so a psmux launcher under one root never reaches a server started under another through
 the ordinary path.
 
@@ -288,9 +285,11 @@ honor_ambient_psmux_data_dir = true
 ```
 
 bmad-loop then uses your value as the registry, a pane child inherits and honours it, and a clean
-process carrying your profile honours it too, so every process agrees. Not under `PSMUX_BARE_ENV`,
-which bmad-loop does not support: a bare pane inherits no `PSMUX_DATA_DIR`, so a run started there
-derives the registry instead. `bmad-loop mux` says
+process carrying your profile honours it too, so every process agrees. An engine window the TUI
+parks is handed the registry in force on its command line (a hidden `--registry-root`, beside
+`--state-root`), so it agrees even under `PSMUX_BARE_ENV`, where a pane inherits no
+`PSMUX_DATA_DIR`; a run typed into a bare window-0 shell derives the registry instead. The handed
+value is judged by the same rules as an inherited one. `bmad-loop mux` says
 `your own $PSMUX_DATA_DIR, honoured` and prints the derived root it would otherwise use. Leave the
 switch off for a value you typed into one shell: a process started without it would derive, and the
 session would read as gone there. Rules, all fixed:
@@ -322,8 +321,9 @@ Two consequences of deriving, both benign:
 
 How the state root reaches the windows bmad-loop opens: coding-CLI windows (the engine's sessions
 and the probe launcher's window) are **told** it through their env dict, which travels inside the
-command the window runs; everything else — a session's initial shell window, the engine windows
-the TUI parks — inherits it from the multiplexer server, as it always has. The told entry is
+command the window runs; the engine windows the TUI parks are handed it on their command line
+(`--state-root`, #731); a session's initial shell window inherits it from the multiplexer server,
+as it always has. The told entry is
 always this process's own answer: a `BMAD_LOOP_STATE_DIR` declared in a profile's `[env]` table is
 overwritten with the resolved root, and when no root can be derived the entry is removed rather
 than forwarded — the window then inherits and fails exactly as its parent does, instead of being
@@ -334,16 +334,19 @@ escape hatch for a Windows environment block near the 32 KB `CreateProcessW` lim
 child's environment and rebuilds it from a 14-name allowlist that drops both
 `BMAD_LOOP_STATE_DIR` and the `LOCALAPPDATA` its default falls back to — so an inherited value is
 no value at all. (`TMUX` is still set in the pane, but by psmux afterwards, not by the allowlist,
-which does not contain it.) A `bmad-loop` run in a window-0 shell or a parked engine window under
-that switch then re-derives the state root from what survived, and lands somewhere else — reading
-its own live session as gone — whenever `BMAD_LOOP_STATE_DIR` was in force or `LOCALAPPDATA` points
-outside `%USERPROFILE%\AppData\Local`; `USERPROFILE` survives the clear, so a default profile
-re-derives the same root. Coding-CLI windows keep working — their env rides the in-command
-transport, which psmux applies after the bare-env clear (source-read at v3.3.8). bmad-loop warns
-once per process when the switch is on in its environment (the server, not this process, is what
-reads the switch at pane spawn, so a server already running with it on under a clean client is not
-detected); the
-remedy is to unset `PSMUX_BARE_ENV` for bmad-loop's sessions.
+which does not contain it.) The windows bmad-loop launches keep their roots: a parked engine window
+is handed its state root and registry root on its command line, and a coding-CLI window's env
+rides the in-command transport, which psmux applies after the bare-env clear (source-read at
+v3.3.8). A `bmad-loop` command typed into a window-0 shell under that switch re-derives the state
+root from what survived, and lands somewhere else — reading a live session as gone — whenever
+`BMAD_LOOP_STATE_DIR` was in force or `LOCALAPPDATA` points outside `%USERPROFILE%\AppData\Local`;
+`USERPROFILE` survives the clear, so a default profile re-derives the same root. The clear also
+drops every variable a window's env dict does not name, silently: a coding CLI can miss
+credentials or configuration, and without `APPDATA` git stops reading your global excludes in
+`%APPDATA%\Git\ignore`. bmad-loop warns once per process when the switch is on in its environment
+(the server, not this process, is what reads the switch at pane spawn, so a server already running
+with it on under a clean client is not detected), and the TUI shows the warning again once its
+screen is up; the remedy is to unset `PSMUX_BARE_ENV` for bmad-loop's sessions.
 
 If the state root cannot be derived at all — `BMAD_LOOP_STATE_DIR` set to a relative path, say —
 bmad-loop has no registry of its own to point at, says so, and leaves whatever `PSMUX_DATA_DIR` you

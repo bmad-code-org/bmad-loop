@@ -410,7 +410,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: _EXIT_CAPTURE override MUST bind the variable ``ec``.
     _EXIT_CAPTURE = "ec=$?"
     _ECHO = "echo"
-    _PARK = "read -r"
+    # A variable name is required by POSIX `read`: dash (Debian/Ubuntu `sh`)
+    # rejects a bare `read -r` with exit 2 at once, so the window closed the
+    # moment its command ended instead of parking. bash's `$REPLY` default had
+    # hidden that.
+    _PARK = "read -r _"
 
     def _join_argv(self, argv: list[str]) -> str:
         """Render ``argv`` as one shell command line in this dialect."""

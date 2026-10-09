@@ -124,6 +124,21 @@ def _bare_env_on(value: str | None) -> bool:
     return value is not None and (value == "1" or value.lower() == "true")
 
 
+def bare_env_warning(env: Mapping[str, str]) -> str | None:
+    """The ``PSMUX_BARE_ENV`` warning for a process with environment ``env``,
+    or ``None`` when the mode is off. See ``PsmuxMultiplexer._warn_if_bare_env``."""
+    if not _bare_env_on(env.get("PSMUX_BARE_ENV")):
+        return None
+    return (
+        "PSMUX_BARE_ENV is on, which bmad-loop does not support — psmux clears each "
+        "pane's environment, so a session's window-0 shell loses BMAD_LOOP_STATE_DIR "
+        "and derives its own state root and registry (a bmad-loop command typed into "
+        "one can read a run as gone), and coding-CLI windows lose every variable "
+        "bmad-loop does not set for them, such as credentials, configuration and "
+        "APPDATA (git's global excludes); unset PSMUX_BARE_ENV for bmad-loop's sessions"
+    )
+
+
 # The `PSMUX_DATA_DIR` that was in force before this process derived its own and
 # overwrote it (`runs.export_psmux_registry_root`), or None when nothing was
 # displaced. Process-local, and the *only* record of it: the variable itself is
@@ -268,41 +283,38 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         Under it psmux ``env_clear``s every pane child and repopulates from a
         14-name allowlist (``src/pane.rs:889-908``, source-read at v3.3.8;
         measured in a real pane) that drops ``BMAD_LOOP_STATE_DIR`` *and* the
-        ``LOCALAPPDATA`` its default cascade falls back to. Coding-CLI windows
-        still get the state root — their env rides the in-source
-        ``-EncodedCommand`` prelude, which runs in the pane after the clear
-        (see ``_window_launch``) — but a session's window-0 shell and the TUI's
-        parked engine windows rely on inheritance, so a bmad-loop run in one of
-        those re-derives the state root from what survived. That diverges, and
-        the run then reads this very session as gone, in exactly two cases:
-        ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
+        ``LOCALAPPDATA`` its default cascade falls back to. Two kinds of pane
+        are covered anyway: coding-CLI windows get the state root through the
+        in-source ``-EncodedCommand`` prelude, which runs in the pane after the
+        clear (see ``_window_launch``), and the TUI's parked engine windows get
+        it, and the registry root, in their argv (``tui.launch.start_detached``,
+        #731). A session's window-0 shell still relies on inheritance, so a
+        bmad-loop command typed into one re-derives the state root from what
+        survived. That diverges, and the run then reads as gone, in exactly two
+        cases: ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
         default cascade answers somewhere else), or ``LOCALAPPDATA`` names
         something other than ``%USERPROFILE%\\AppData\\Local`` (a redirected
         or roaming profile). ``USERPROFILE`` *is* on the allowlist, so on a
-        default profile the fallback arm lands on the same root and nothing
-        diverges — the mode is unsupported because the failure is silent when
-        it does happen, not because it always does. Supporting it means an env
-        transport on the session and parked-window verbs, which is its own
-        seam change — tracked
-        as a follow-up issue, deliberately outside #537.
+        default profile the fallback arm lands on the same root. The clear also
+        drops every variable a pane's env dict does not name: a coding CLI can
+        miss credentials or configuration, and without ``APPDATA`` git no longer
+        reads the operator's global excludes in ``%APPDATA%\\Git\\ignore``,
+        all silently. That is psmux's documented trade for the mode.
 
         Warned, not refused: the variable is psmux's (an operator may run their
         own sessions under it), and most commands never open a window. Ceiling:
         psmux reads the switch in the *server* process at pane spawn; this
         process's effective env is a proxy for it, so a server already running
-        with the mode on under a clean client is not detected here.
+        with the mode on under a clean client is not detected here. The TUI
+        re-surfaces the line (``bare_env_warning``), because this firing lands
+        before Textual takes the screen.
         """
         global _BARE_ENV_WARNED
-        if _BARE_ENV_WARNED or not _bare_env_on(effective.get("PSMUX_BARE_ENV")):
+        warning = bare_env_warning(effective)
+        if _BARE_ENV_WARNED or warning is None:
             return
         _BARE_ENV_WARNED = True
-        print(
-            "warning: PSMUX_BARE_ENV is on, which bmad-loop does not support — "
-            "session and parked-window shells lose BMAD_LOOP_STATE_DIR and derive "
-            "their own state root and registry, so a run can read as gone; unset "
-            "PSMUX_BARE_ENV for bmad-loop's sessions",
-            file=sys.stderr,
-        )
+        print(f"warning: {warning}", file=sys.stderr)
 
     def registry_root(self) -> str | None:
         """The registry root a verb from this instance inherits — the process
