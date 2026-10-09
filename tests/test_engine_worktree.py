@@ -10751,6 +10751,39 @@ def test_worktree_nested_repo_root_runs_and_merges_back(project):
     assert "worktree-module-skills-dropped" not in kinds
 
 
+def test_nested_codex_hook_trust_is_queried_at_the_mount_project(project, monkeypatch):
+    """DW-341 under DW-484's nested layout: provisioning writes `.codex/hooks.json`
+    into the mount PROJECT `<mount>/app` and the session launches there, so both trust
+    gates — unit entry in `run_isolated` and per session in `Engine._run_session` —
+    query that path. The mount root holds no hook config; querying it would escalate
+    every nested Codex unit as unreadable or untrusted before its first session.
+
+    Ablation, performed: query `worktree` instead of `self._mount_project(worktree)` in
+    `gate_codex_hook_trust` and both queries name the mount root."""
+    from bmad_loop.adapters.profile import get_profile
+
+    paths = nested_repo_root_paths(project)
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(paths, [wt_dev_effect(paths, "1-1-a", followup_review=False)])
+    engine.state.repo_root = str(paths.repo_root)
+    monkeypatch.setattr(adapter, "profile", get_profile("codex"), raising=False)
+    queried: list[Path] = []
+
+    def trust(path, _profile, *, binary=None, marker=None):
+        queried.append(path)
+        return worktree_flow.codex_trust.TrustResult("trusted", "stub")
+
+    monkeypatch.setattr(worktree_flow.codex_trust, "project_hook_trust", trust)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused, journal_kinds(engine)
+    wt = Path(engine.state.tasks["1-1-a"].worktree_path or "")
+    assert wt.parent.name == "worktrees"
+    # unit entry (dev and review share the mock, so deduped), then the dev session
+    assert queried == [wt / "app"] * 2
+
+
 def _nested_unit(project):
     """Nested roots, a committed board, an engine, and one mounted unit."""
     from bmad_loop.workspace import open_unit_workspace

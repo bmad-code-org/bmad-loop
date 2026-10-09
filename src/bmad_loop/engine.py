@@ -95,6 +95,7 @@ from .runs import (
     clear_graceful_stop,
     consume_stop_request,
     deferred_stash_path,
+    deferred_stash_staged_path,
     drain_refused_kills,
     events_dir_for,
     graceful_stop_requested,
@@ -4592,6 +4593,9 @@ class Engine:
             task.restore_patch = None
             # An adopted branch (DW-386) is likewise committed; its latch is spent.
             task.adopt_pending = False
+            # So is a replay continuation (DW-527): the post-replay resume arm
+            # re-latches only a continuation that has not committed yet.
+            task.reverify_replayed = ""
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
         except verify.GitError as e:
@@ -10501,9 +10505,8 @@ class Engine:
         if not spec_path.is_file():
             return None
         target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
-        dest = target.parent
-        dest.mkdir(parents=True, exist_ok=True)
-        tmp = dest / (spec_path.name + ".tmp")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = deferred_stash_staged_path(target)
         shutil.copy2(spec_path, tmp)
         return _StagedStash(spec_path, tmp, target)
 
@@ -10522,7 +10525,9 @@ class Engine:
 
         On failure the staged copy is dropped only while the live spec still holds
         the same work: after a reset it may be the only copy left, and a stash must
-        be able to leave a duplicate spec, never a hole where the work was."""
+        be able to leave a duplicate spec, never a hole where the work was. A kept
+        copy is what `runs.rearm_for_reverify` restores the spec from when the
+        landed stash is absent."""
         try:
             stashed = staged.staged.read_bytes()
             atomic_replace(staged.staged, staged.target)

@@ -10012,6 +10012,26 @@ def test_rearm_for_reverify_restores_the_stashed_spec_byte_exact(tmp_path):
     assert row["spec_file"] == str(spec_path)
 
 
+def test_rearm_for_reverify_restores_from_a_staged_copy_whose_landing_failed(tmp_path):
+    """DW-528: `Engine._defer` stages the spec beside its stash target before the
+    rollback and lands it after. When that landing fails after the reset took the live
+    spec, the staged copy is kept as the attempt's only version; the refusal gate
+    accepts it and the re-arm restores the spec from it, byte-exact.
+
+    Ablation, performed: read only the landed stash in `_deferred_stash_source` and
+    the re-arm refuses with "neither at"."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    stash.rename(staged)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert staged.read_bytes() == _REVERIFY_SPEC_BYTES  # kept, like a landed stash
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
+
+
 def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
     """A spec the operator already put back wins over the stash: it may carry their
     own edits, and the replay verifies what is on the tree."""

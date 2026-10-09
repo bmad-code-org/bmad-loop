@@ -1882,11 +1882,15 @@ class WorktreeFlow:
         *,
         roles: tuple[str, ...] = DEV_PRIMITIVE_ROLES,
     ) -> None:
-        """Escalate the unit unless Codex trusts its hooks in ``worktree`` (DW-341).
+        """Escalate the unit unless Codex trusts its hooks in the mount at
+        ``worktree`` (DW-341).
 
         Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
         Codex silently skips hooks without a trust grant for that path — the
-        session's Stop would never arrive. So each Codex-dialect adapter among
+        session's Stop would never arrive. The path queried is the mount PROJECT,
+        where both the hook config and the session cwd sit (DW-484): ``worktree``
+        itself by default, ``<worktree>/<offset>`` under a nested ``repo_root``,
+        where the mount root holds no hook config. So each Codex-dialect adapter among
         ``roles`` is checked through the one trust oracle
         (:func:`codex_trust.project_hook_trust`) with the binary it will launch.
         Two callers: :meth:`run_isolated` checks every dev/review role at unit
@@ -1905,6 +1909,7 @@ class WorktreeFlow:
         and non-Codex dialects are skipped; main-checkout sessions never reach here.
         """
         adapters = self._adapters_get()
+        mount = self._mount_project(worktree)
         seen: set[tuple[str, str, tuple[str, ...] | None]] = set()
         for role in roles:
             adapter = adapters[role]
@@ -1923,15 +1928,15 @@ class WorktreeFlow:
                 if extra_args is None
                 else dataclasses.replace(profile, bypass_args=extra_args)
             )
-            trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
             if trust.status == "unverifiable" and trust.reason == codex_trust.QUERY_FAILED_REASON:
                 # The query itself failed, not Codex's verdict: one retry absorbs a
                 # transient app-server spawn failure or timeout before escalating.
-                trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+                trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
             if trust.status == "trusted":
                 continue
             self.escalate_unit(  # always raises RunPaused
-                task, self._codex_trust_reason(role, worktree, trust.status, trust.reason)
+                task, self._codex_trust_reason(role, mount, trust.status, trust.reason)
             )
 
     def _codex_trust_reason(self, role: str, worktree: Path, status: str, reason: str) -> str:

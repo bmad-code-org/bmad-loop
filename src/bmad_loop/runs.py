@@ -6488,6 +6488,22 @@ def deferred_stash_path(run_dir: Path, story_key: str, spec_name: str) -> Path:
     return run_dir / "deferred" / safe_segment(story_key) / spec_name
 
 
+def deferred_stash_staged_path(stash: Path) -> Path:
+    """The staging copy `Engine._stage_deferred_stash` writes beside ``stash`` before
+    the rollback (DW-528). It outlives a failed landing only when the live spec no
+    longer holds the same bytes, so it may then be the attempt's only copy; one
+    definition, so `rearm_for_reverify` reads the file the engine wrote."""
+    return stash.with_name(stash.name + ".tmp")
+
+
+def _deferred_stash_source(run_dir: Path, story_key: str, spec_name: str) -> Path | None:
+    """The stashed spec a reverify re-arm restores from: the landed stash, else a
+    staged copy whose landing failed, else None."""
+    stash = deferred_stash_path(run_dir, story_key, spec_name)
+    staged = deferred_stash_staged_path(stash)
+    return stash if stash.is_file() else staged if staged.is_file() else None
+
+
 def latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:
     """The task's latest COMPLETED dev-role session record, or None. Fix sessions are
     recorded under the dev role too, so a repaired attempt's verdict is the one read.
@@ -6621,7 +6637,10 @@ def reverify_refusal(
             f"{rearm_hint}"
         )
     stash = deferred_stash_path(run_dir, story_key, spec_path.name)
-    if not spec_path.is_file() and not stash.is_file():
+    if (
+        not spec_path.is_file()
+        and _deferred_stash_source(run_dir, story_key, spec_path.name) is None
+    ):
         return (
             f"story {story_key}'s spec is neither at {spec_path} nor stashed at {stash}; "
             "restore it there, then re-run resolve"
@@ -6998,7 +7017,9 @@ def _rearm_for_reverify_locked(
         # Only an in-place defer stashes the spec; a mounted unit's stays in its kept
         # worktree, which `reverify_refusal` already found holding it.
         if not task.worktree_path and not spec_path.is_file():
-            stash = deferred_stash_path(run_dir, key, spec_path.name)
+            stash = _deferred_stash_source(run_dir, key, spec_path.name) or deferred_stash_path(
+                run_dir, key, spec_path.name
+            )
             try:
                 atomic_write_bytes_confined(
                     spec_path,

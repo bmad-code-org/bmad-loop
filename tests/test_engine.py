@@ -25259,7 +25259,11 @@ def test_in_place_defer_fault_after_the_reset_still_lands_the_stash(project, tmp
 def test_reverify_runs_the_recommended_review(project, tmp_path):
     """DW-522: a passing replay hands the kept work to the review loop under normal
     policy — the dev result recommended a follow-up review, so exactly one review
-    session runs (and still no dev session) before the commit."""
+    session runs (and still no dev session) before the commit. The commit spends the
+    post-replay latch (DW-527), so a DONE task never carries it.
+
+    Ablation, performed: drop the `reverify_replayed` reset from
+    `_finalize_commit_phase` and the DONE task keeps `"deferred"`."""
     engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
     marker.write_text("up\n")
     runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
@@ -25269,7 +25273,9 @@ def test_reverify_runs_the_recommended_review(project, tmp_path):
     engine2.run()
 
     assert [s.role for s in adapter2.sessions] == ["review"]
-    assert engine2.state.tasks["1-1-a"].phase == Phase.DONE
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.reverify_replayed == ""
 
 
 def test_reverify_crash_mid_review_after_a_passing_replay_re_verifies(project, tmp_path):
@@ -25311,7 +25317,7 @@ def test_reverify_crash_mid_review_after_a_passing_replay_re_verifies(project, t
     assert [s.role for s in adapter3.sessions] == ["review"]  # no dev session
     task = engine3.state.tasks["1-1-a"]
     assert task.phase == Phase.DONE
-    assert task.reverify_from == ""
+    assert task.reverify_from == "" and task.reverify_replayed == ""
     assert task.generation == crashed_generation + 1  # #705: no re-minted session id
     assert task.review_cycle == 1
     assert len(verify.commits_above(project.project, baseline)) == 1  # squashed

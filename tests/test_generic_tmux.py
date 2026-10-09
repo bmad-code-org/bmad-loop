@@ -1003,6 +1003,37 @@ def test_artifact_dirs_is_identity_in_place_under_a_nested_repo_root(tmp_path):
     assert adapter._artifact_dirs(app) == [impl]
 
 
+def test_artifact_dirs_never_scans_the_main_checkout_from_a_worktree_mount(tmp_path):
+    """DW-484, worktree isolation under a nested `repo_root:`: the session cwd is the
+    mount project `<worktree>/app`, so the scan reads the mount's rebased artifacts
+    dir and nothing else. The main checkout's dir is never where the session writes;
+    a marker another writer drops there after launch would otherwise be read back as
+    this session's result.
+
+    Ablation, performed: re-append the configured dir as a fallback and the scan
+    lists the main checkout's `impl` second."""
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    impl = app / "_bmad-output" / "impl"
+    impl.mkdir(parents=True)
+    mount = tmp_path / "wt" / "app"
+    paths = ProjectPaths(
+        project=app,
+        implementation_artifacts=impl,
+        planning_artifacts=app / "_bmad-output" / "plan",
+        repo_root=repo,
+    )
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        paths=paths,
+        mux=_UnitMux(),
+    )
+
+    assert adapter._artifact_dirs(mount) == [(mount / "_bmad-output" / "impl").resolve()]
+
+
 class _ScriptedWatcher:
     """SignalWatcher stand-in: yields a scripted HookEvent per wait_for call, then
     None. on_call(n) fires before the nth return so a test can flush an on-disk

@@ -2489,12 +2489,10 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # live session cwd, which IS the mount project (DW-484: the worktree, or
         # `<worktree>/<offset>` under a nested `repo_root`; the project itself in
         # place, where this is a no-op, as it is for an artifact dir configured
-        # outside the project tree). Keep the configured dir as a defensive fallback.
-        primary = self.paths.artifact_at(self.paths.implementation_artifacts, Path(cwd))
-        dirs = [primary]
-        if self.paths.implementation_artifacts != primary:
-            dirs.append(self.paths.implementation_artifacts)
-        return dirs
+        # outside the project tree). Only that dir: the main checkout's is never
+        # where a worktree session writes, so a marker landing there after launch
+        # is another writer's and must not be read back as this session's result.
+        return [self.paths.artifact_at(self.paths.implementation_artifacts, Path(cwd))]
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         sr = self._synth_result(handle, spec, wait=wait)
