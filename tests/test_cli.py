@@ -15707,6 +15707,191 @@ def test_validate_render_probe_is_silent_when_policy_is_unloadable(
     assert not marker.exists()
 
 
+# ------------------- DW-526: validate --probes -------------------------------
+
+
+def _probe_policy(*probes: str) -> str:
+    return CLAUDE_ONLY_POLICY + f"[environment]\nprobes = {json.dumps(list(probes))}\n"
+
+
+def _marker_probe(marker) -> str:
+    """A probe that leaves `marker` (outside the project) behind when it runs."""
+    return f"\"{sys.executable}\" -c \"open(r'{marker}', 'w').close()\""
+
+
+def _environment_findings(doc):
+    return [f for f in doc["findings"] if f["check"].startswith("environment.")]
+
+
+def test_validate_probes_pass_is_an_ok_finding(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0"))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    assert doc["schema_version"] == 1 and doc["ok"] is True
+    [probe] = _environment_findings(doc)
+    assert probe["check"] == "environment.probe" and probe["severity"] == "ok"
+    assert probe["detail"] == {
+        "command": "exit 0",
+        "index": 0,
+        "status": "pass",
+        "returncode": 0,
+        "reason": "",
+        "timeout_s": 60,
+        "cwd": str(project.project),
+    }
+
+
+def test_validate_probes_failure_is_a_problem_and_every_probe_reports(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0", "exit 6"))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert doc["ok"] is False
+    probes = _environment_findings(doc)
+    assert [(f["check"], f["severity"]) for f in probes] == [
+        ("environment.probe", "ok"),
+        ("environment.probe", "problem"),
+    ]
+    failed = probes[1]["detail"]
+    assert failed["command"] == "exit 6" and failed["index"] == 1
+    assert failed["status"] == "fail" and failed["returncode"] == 6
+    assert failed["reason"] == "rc=6"
+    # the probe is the only problem: every other gate stayed green
+    assert [f["check"] for f in doc["findings"] if f["severity"] == "problem"] == [
+        "environment.probe"
+    ]
+
+
+def test_validate_without_probes_flag_runs_nothing_and_notes_it(
+    project, capsys, monkeypatch, tmp_path
+):
+    """The opt-in. Ablation: run the probes regardless of the flag and the
+    marker appears."""
+    marker = tmp_path / "probe-ran"
+    probes = ("exit 0", _marker_probe(marker))
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy(*probes))
+
+    doc = machine_json(_validate_argv(project), capsys)
+
+    assert not marker.exists()
+    [note] = _environment_findings(doc)
+    assert note["check"] == "environment.probes-not-run" and note["severity"] == "ok"
+    assert note["detail"] == {"probes": list(probes), "run": False}
+    assert "2 [environment] probe(s)" in note["message"] and "--probes" in note["message"]
+
+    # and with the flag the same marker probe does run
+    machine_json(_validate_argv(project, "--probes"), capsys)
+    assert marker.exists()
+
+
+def test_validate_probes_flag_with_none_configured(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    assert doc["ok"] is True
+    assert [f["check"] for f in _environment_findings(doc)] == ["environment.probes-none"]
+
+
+def test_validate_without_probes_reports_no_environment_finding(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(_validate_argv(project), capsys)
+
+    assert _environment_findings(doc) == []
+
+
+def test_validate_probes_is_silent_when_policy_is_unloadable(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0"))
+    _write_policy(project.project, "[adapter]\nname = ")  # unparseable
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert _environment_findings(doc) == []
+
+
+def test_validate_probes_returncode_is_null_when_no_exit_status_exists(
+    project, capsys, monkeypatch
+):
+    """Timeout, spawn fault and hard stop carry runner sentinels (-1, SPAWN_FAULT_RC,
+    INTERRUPTED_RC), never an exit code, so the contract publishes null for each.
+    The interrupt also ends the pass: the probe after it is never reported."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=_probe_policy("hangs", "unstartable", "stopped", "never"),
+    )
+    legs = {
+        "hangs": verify.CommandResult("hangs", -1, "timed out"),
+        "unstartable": verify.CommandResult(
+            "unstartable", verify.SPAWN_FAULT_RC, "OSError: boom", spawn_error="OSError: boom"
+        ),
+        "stopped": verify.CommandResult(
+            "stopped", verify.INTERRUPTED_RC, "interrupted", interrupted=True
+        ),
+    }
+    monkeypatch.setattr(verify, "_run_shell_command", lambda command, cwd, timeout: legs[command])
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert [
+        (f["severity"], f["detail"]["status"], f["detail"]["returncode"])
+        for f in _environment_findings(doc)
+    ] == [
+        ("problem", "timeout", None),
+        ("problem", "fail", None),
+        ("problem", "interrupted", None),
+    ]
+    # the spawn fault's tail is already in its reason, so it is not repeated
+    spawn = _environment_findings(doc)[1]
+    assert spawn["detail"]["reason"] == "could not be started: OSError: boom"
+    assert "—" not in spawn["message"]
+
+
+def test_validate_probes_text_mode_prints_the_probe_lines(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0", "exit 6"))
+
+    assert cli.main(["validate", "--project", str(project.project), "--probes"]) == 1
+    out, err = capsys.readouterr()
+
+    assert "  ok: environment probe passed: exit 0" in out
+    assert "FAIL: environment probe failed (rc=6): exit 6" in err
+
+
+def test_validate_probes_failure_message_carries_the_output_tail(project, capsys, monkeypatch):
+    """A failing probe's last non-empty output line is appended to its message."""
+    probe = f'"{sys.executable}" -c "print(\'db down\'); raise SystemExit(1)"'
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy(probe))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    [finding] = _environment_findings(doc)
+    assert finding["message"] == f"environment probe failed (rc=1): {probe} — db down"
+
+
+def test_validate_probes_run_in_the_code_root_under_a_repo_root_override(
+    project, monkeypatch, capsys
+):
+    """Probes run in `clean_root` (`repo_root`), not the project dir. The probe
+    passes only where an `app/` subdirectory exists — the nested repo root, never
+    the project itself. Ablation: probe `project` instead and it fails rc=1."""
+    probe = f'"{sys.executable}" -c "import os, sys; sys.exit(0 if os.path.isdir(\'app\') else 1)"'
+    paths = _nested_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=NO_ISOLATION_POLICY + f"\n[environment]\nprobes = {json.dumps([probe])}\n",
+    )
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json", "--probes"], capsys)
+
+    [finding] = _environment_findings(doc)
+    assert finding["severity"] == "ok" and finding["detail"]["status"] == "pass"
+    assert finding["detail"]["cwd"] == str(paths.repo_root)
+
+
 def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):
     """The shim upstream's rename left behind is REFUSED, not driven.
 
@@ -18093,6 +18278,189 @@ def test_relay_ignores_a_displaced_registry_root(monkeypatch):
     assert cli.main(["--displaced-registry-root=relative-root", "relay", "Stop"]) == 0
 
 
+def _spy_ahead_of_dispatch(monkeypatch, *names: str) -> dict[str, dict[str, str | None]]:
+    """Record the state and registry variables each of ``names`` (the relay
+    handler, `_configure_mux`) sees when `main` reaches it."""
+    seen: dict[str, dict[str, str | None]] = {}
+
+    def spy(name):
+        def record(*_args, **_kwargs):
+            seen[name] = {
+                "state": os.environ.get(envvars.STATE_DIR),
+                "registry": os.environ.get(runs.PSMUX_DATA_DIR),
+            }
+            return 0 if name == "cmd_relay" else None
+
+        return record
+
+    for name in names:
+        monkeypatch.setattr(cli, name, spy(name))
+    return seen
+
+
+def test_state_root_option_is_applied_before_relay_and_mux_setup(tmp_path, monkeypatch):
+    """The parked engine's state root rides its argv (#731), so `main` applies it
+    to `BMAD_LOOP_STATE_DIR` right after parsing: ahead of the relay branch and of
+    `_configure_mux`, whose registry export derives from it.
+
+    Ablate the assignment in `main` and both spies see the sandbox root."""
+    root = str(tmp_path / "launchers-root")
+    seen = _spy_ahead_of_dispatch(monkeypatch, "cmd_relay", "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--state-root=" + root, "relay", "Stop"]) == 0
+    assert seen["cmd_relay"]["state"] == root
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "inherited"))
+    assert cli.main(["--state-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["state"] == root
+    assert os.environ[envvars.STATE_DIR] == root
+
+
+@pytest.mark.parametrize("value", ["relative-root", ""], ids=["relative", "empty"])
+def test_state_root_option_refuses_a_value_that_is_not_absolute(
+    tmp_path, capsys, monkeypatch, value
+):
+    """Absolute, judged by `os.path.isabs` on the raw string as the variable is:
+    a relative root names a different directory per working directory. Refused
+    at parse time, before anything is set or dispatched.
+
+    Ablate the `isabs` check and `main` returns 0 with the value set."""
+    inherited = os.environ[envvars.STATE_DIR]
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--state-root=" + value, "list", "--project", str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert "--state-root must be absolute" in capsys.readouterr().err
+    assert os.environ[envvars.STATE_DIR] == inherited
+
+
+@pytest.mark.parametrize("option", ["--state-root", "--registry-root"])
+@pytest.mark.parametrize("value", ["relative-root", ""], ids=["relative", "empty"])
+def test_root_options_are_refused_on_relay_too(monkeypatch, option, value):
+    """Both options are validated ahead of the relay branch, where they are
+    applied: no hook registration composes either, so a malformed one is a
+    malformed launch, and the relay is never reached.
+
+    Ablation: move the option handling below the relay branch and `cmd_relay`
+    runs."""
+    relayed: list[bool] = []
+    monkeypatch.setattr(cli, "cmd_relay", lambda _args: relayed.append(True) or 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([f"{option}={value}", "relay", "Stop"])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert relayed == []
+
+
+def test_a_refused_registry_root_leaves_the_state_root_unset(tmp_path, monkeypatch):
+    """Both options are validated before either is applied, so a valid
+    `--state-root` beside a refused `--registry-root` changes nothing a later
+    in-process `main` call could inherit.
+
+    Ablation: assign `--state-root` before validating `--registry-root` and the
+    variable reads the forwarded root."""
+    inherited = os.environ[envvars.STATE_DIR]
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "--state-root=" + str(tmp_path / "launchers-root"),
+                "--registry-root=relative-root",
+                "list",
+                "--project",
+                str(tmp_path),
+            ]
+        )
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert os.environ[envvars.STATE_DIR] == inherited
+
+
+def test_state_root_option_accepts_a_filesystem_root(tmp_path, monkeypatch):
+    """`/` on POSIX and a drive root on Windows are absolute, and the variable
+    accepts them (the override bypasses `_state_base`'s not-the-root rule)."""
+    root = "C:\\" if sys.platform == "win32" else "/"
+    seen = _spy_ahead_of_dispatch(monkeypatch, "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--state-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["state"] == root
+
+
+def test_state_root_option_after_the_subcommand_is_unrecognized(tmp_path, monkeypatch):
+    """Top-level only: the launcher puts it ahead of the subcommand, and a
+    subcommand never accepts it."""
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["list", "--project", str(tmp_path), "--state-root=" + str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+
+
+def test_registry_root_option_is_set_before_mux_setup(tmp_path, monkeypatch):
+    """The launcher's registry root rides the argv beside the state root, because
+    a `PSMUX_BARE_ENV` pane inherits no `PSMUX_DATA_DIR`. `main` only sets it;
+    `_configure_mux` still decides whether it is honoured.
+
+    Ablate the assignment and the spy sees no registry."""
+    root = str(tmp_path / "launchers-registry")
+    seen = _spy_ahead_of_dispatch(monkeypatch, "_configure_mux")
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["--registry-root=" + root, "list", "--project", str(tmp_path)]) == 0
+    assert seen["_configure_mux"]["registry"] == root
+
+
+def test_registry_root_option_refuses_a_relative_value(tmp_path, capsys, monkeypatch):
+    """psmux panics on a relative registry root. Refused at parse time.
+
+    Ablate the `is_absolute()` check and `main` returns 0."""
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--registry-root=relative-root", "list", "--project", str(tmp_path)])
+
+    assert exc.value.code == cli.ExitCode.USAGE
+    assert "--registry-root must be absolute" in capsys.readouterr().err
+    assert runs.PSMUX_DATA_DIR not in os.environ
+
+
+@pytest.mark.parametrize("shape", ["derived", "operator"])
+def test_registry_root_option_meets_the_unchanged_honour_rule(
+    force_psmux_backend, tmp_path, monkeypatch, shape
+):
+    """With `[mux] honor_ambient_psmux_data_dir` off, a forwarded root is treated
+    exactly as an inherited one: a derived-shaped value is re-derived (here, for
+    a child under another state root, so the re-derivation is visible), and an
+    operator root is displaced and recorded for the legacy sweep. The option
+    restores inheritance and nothing more."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    if shape == "derived":
+        forwarded = str(runs.mux_registry_root(tmp_path))
+        monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "childs-root"))
+    else:
+        forwarded = str(tmp_path / "their-own-registry")
+    seen = {}
+
+    def handler(_args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+
+    assert cli.main(["--registry-root=" + forwarded, "list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == str(runs.mux_registry_root(tmp_path)) != forwarded
+    if shape == "operator":
+        assert psmux_backend._DISPLACED_ROOT == forwarded
+
+
 def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
     tmp_path, capsys, monkeypatch
 ):
@@ -18945,3 +19313,220 @@ def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path,
     err = capsys.readouterr().err
     assert "an in-place replay re-verifies only the story the run stopped on" in err
     assert _state_bytes(run_dir) == before
+
+
+# -------------------------- resolve <finished-run> --reverify (DW-525) gates
+
+
+def _finished_reverify_project(tmp_path):
+    """`_reverify_project`'s run, recorded FINISHED (not paused) — the shape the
+    finished-run replay entry routes on."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    state.finished = True
+    save_state(run_dir, state)
+    return run_dir, project
+
+
+def _no_replay(monkeypatch):
+    from bmad_loop import unitreplay
+
+    monkeypatch.setattr(
+        unitreplay, "mint_replay_run", lambda **_k: pytest.fail("minted a replay run")
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+
+def test_resolve_reverify_finished_run_needs_the_story_named(tmp_path, monkeypatch, capsys):
+    """A finished run is routed to the replay entry ahead of the pause gate, which
+    names `--story <key>` instead of the generic not-paused refusal.
+
+    Ablation: delete the `state.finished` routing in `cmd_resolve` and the pause
+    gate's "not paused at an escalation" refusal prints instead."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "is finished" in err and "--story <key>" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_in_place_story(tmp_path, monkeypatch, capsys):
+    """Only a worktree unit's kept worktree outlives a finished run; an in-place
+    deferred story is refused before any preflight or prompt."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "deferred in place" in err and "recover the work by hand" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_unknown_story(tmp_path, monkeypatch, capsys):
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", "9-9-z", "--resume") == 1
+
+    assert "has no task for story 9-9-z" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("live", "fragment"),
+    [("alive", "still live"), ("unknown", "--force")],
+    ids=["alive", "unknown"],
+)
+def test_resolve_reverify_finished_run_gates_on_liveness(
+    tmp_path, monkeypatch, capsys, live, fragment
+):
+    """The liveness gate runs first: a provably-live engine refuses, an unverifiable
+    one needs --force."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: live)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    assert fragment in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+# ----------------------------- cleanup over an unavailable backend (#864)
+
+
+def _unavailable_backend(monkeypatch, project, *, live: bool, recorded: bool):
+    """No usable multiplexer, the prune's sessions half stubbed to a receipt, and
+    the evidence each scan_error is gated on: a live run and/or a recorded ctl
+    window. Each scan's own gate is real."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    run_dir = runs.run_dir_for(project, "20260101-000000-aaaa")
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    if recorded:
+        (run_dir / "ctl-window").write_text("@7", encoding="utf-8")
+    monkeypatch.setattr(runs, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive" if live else "dead")
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_reports_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    _unavailable_backend(monkeypatch, tmp_path, live=True, recorded=False)
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys, err_contains="ctl window prune failed")
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert "live run 20260101-000000-aaaa" in doc["sessions"]["scan_error"]
+    assert "agent sessions cannot be listed" in doc["sessions"]["scan_error"]
+    assert "control windows cannot be listed" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_json_recorded_window_sets_only_the_ctl_scan_error(tmp_path, monkeypatch, capsys):
+    # A recorded ctl window is evidence for the window half only: nothing says an
+    # agent session is running, so the sessions half reports nothing.
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=True)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert "scan_error" not in doc["sessions"]
+    assert "control window recorded" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
+    tmp_path, monkeypatch, capsys
+):
+    # The mux-less host with nothing of ours: the document is exactly the one
+    # emitted before sessions.scan_error existed, and stderr stays empty.
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=False)
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["sessions"] == {
+        "removed": ["fin-1"],
+        "live": [],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+        "legacy_unverified": [],
+    }
+    assert doc["ctl_windows"]["scan_error"] is None
+
+
+def test_cleanup_text_names_both_scans_for_a_live_run_behind_an_unavailable_backend(
+    tmp_path, monkeypatch, capsys
+):
+    _unavailable_backend(monkeypatch, tmp_path, live=True, recorded=False)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "session prune failed: multiplexer backend" in captured.err
+    assert "ctl window prune failed: multiplexer backend" in captured.err
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+
+
+def test_cleanup_text_unavailable_backend_without_evidence_is_silent(tmp_path, monkeypatch, capsys):
+    _unavailable_backend(monkeypatch, tmp_path, live=False, recorded=False)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def _process_host_broken(monkeypatch):
+    """Both cleanup scans fail on a misconfigured process host: the evidence
+    gates read engine liveness, which raises ProcessHostError."""
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
+    from bmad_loop.tui import launch
+
+    def boom(_p):
+        raise ProcessHostError("unknown process host 'bogus'")
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+    monkeypatch.setattr(runs, "session_scan_error", boom)
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_carries_a_process_host_fault_as_both_scan_errors(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    _process_host_broken(monkeypatch)
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys, err_contains="ctl window prune failed")
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert "unknown process host" in doc["sessions"]["scan_error"]
+    assert "unknown process host" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_text_reports_a_process_host_fault_and_exits_zero(tmp_path, monkeypatch, capsys):
+    _process_host_broken(monkeypatch)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "session prune failed: unknown process host" in captured.err
+    assert "ctl window prune failed: unknown process host" in captured.err
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out

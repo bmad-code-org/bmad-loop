@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -23,7 +22,6 @@ from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
-from .. import envvars
 from .. import policy as policy_mod
 from .. import runs
 from ..adapters.multiplexer import (
@@ -843,6 +841,35 @@ def kill_ctl_window(project: Path, run_id: str) -> int:
     return unproven
 
 
+def _ctl_window_evidence(project: Path) -> str | None:
+    """What says a control window of this project could still exist, or None:
+    a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
+    raising on an unavailable backend in _ctl_window_candidates.
+
+    A record is sticky: nothing drops it when its window goes, by a prune, a
+    stop or otherwise. So a project that launched from the dashboard reports
+    an unavailable backend on every cleanup until its run dirs are removed.
+    That is the intended direction: a false "nothing to prune" is the defect,
+    a report that the scan could not run is not. Dropping the record with the
+    window was tried and given up — a verified kill does not prove the run's
+    other windows (the current one, untagged ones) gone, and the record was
+    then the only evidence left for them."""
+    # Ungated, like live_run_evidence: a record outlives a lost state.json.
+    # An unlistable runs dir yields nothing here and is named there instead.
+    # Presence, not a read: a record that cannot be read still says a window
+    # was minted, and lstat neither follows a link nor opens a FIFO. Only a
+    # proved absence is absence; a stat that fails otherwise counts.
+    for run_dir in runs.all_run_dirs(project) or []:
+        try:
+            os.lstat(run_dir / _CTL_WINDOW_FILE)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
+        return f"a control window recorded for run {run_dir.name}"
+    return runs.live_run_evidence(project)
+
+
 def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     """(window_id, window_name) for parked control-session run windows whose run
     is no longer live — the kill candidates for a prune.
@@ -861,14 +888,24 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     PsmuxMultiplexer.list_windows reads every tag as empty, so an untagged row
     of ours whose run dir is gone is skipped here without a report. Telling an
     unreadable tag from an unset one needs an `on_fault` on list_windows, which
-    is a seam change. Likewise an unavailable backend still reads as no
-    candidates here (the early `return []`), a known residual left for a
-    separate decision.
+    is a seam change.
+
+    An unavailable backend is not folded into "no candidates" when this project
+    has evidence a control window could exist (_ctl_window_evidence): it raises,
+    so both prune callers report it (#864). Without that evidence it still
+    answers `[]` — a host with no multiplexer and nothing of ours to reach is a
+    clean scan, not a failure on every run.
     """
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
     if not mux_usable(mux):
-        return []
+        evidence = _ctl_window_evidence(project)
+        if evidence is None:
+            return []
+        raise MultiplexerError(
+            f"multiplexer backend {type(mux).__name__} is unavailable, but this "
+            f"project still has {evidence}; its control windows cannot be listed"
+        )
     # A False has-session is weaker than it looks (its seam note): a refused
     # connect reads the same as a missing session. So it only short-circuits
     # when list_window_ids agrees there is nothing — whose [] is a positive
@@ -1011,21 +1048,24 @@ _WARNED: set[str] = set()
 _STALE_ROOT = "stale-state-root"
 
 
-def _warn_once(key: str, message: str) -> None:
+def _warn_once(key: str, message: str, *, label: str = "warning") -> None:
     if key in _WARNED:
         return
     _WARNED.add(key)
     if warn_sink is None:
-        print(f"warning: {message}", file=sys.stderr)
+        print(f"{label}: {message}", file=sys.stderr)
     else:
         warn_sink(message)
 
 
 def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
-    """Warn once when a new pane in ``session`` would resolve a different state
+    """Note once when a new pane in ``session`` would resolve a different state
     root than this process (#731): a multiplexer server hands its panes the env
-    it started with, so a server started under another root runs every parked
-    window there, and a live run reads as gone.
+    it started with, so a shell opened there resolves the server's root. A run
+    launched from here is not exposed (``start_detached`` hands each parked
+    engine its root), so this is a note about shells, and it names no remedy:
+    on tmux ``session`` is shared by every project on the server, so no value
+    set there is right for all of them.
 
     Compares resolved roots, not raw values: each input the platform's cascade
     reads is asked of the transport (``inherited_env``), the pane's root is
@@ -1033,7 +1073,7 @@ def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
     process can reach runs as the same user), and only a different root — or
     none at all — warns. Any unknown answer makes the comparison unknown and
     silent, while a query fault is reported in its own words. Never raises and
-    never blocks the launch: the warning detects, it does not refuse."""
+    never blocks the launch."""
     if _STALE_ROOT in _WARNED:
         return
     try:
@@ -1070,19 +1110,13 @@ def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
     if pane == own:
         return
     resolved = str(pane) if pane is not None else "no usable state root"
-    # Quoted for the POSIX shell the operator pastes them into.
-    root = shlex.quote(str(own))
     _warn_once(
         _STALE_ROOT,
-        f"new windows in {session} would resolve {resolved}, not this process's "
-        f"state root {own}: its tmux server was started under a different "
-        "environment, so runs launched there can read as gone (#731, which tracks "
-        f"the lasting fix). {session} is shared by every bmad-loop project on this "
-        "tmux server, so set its root only if none of them uses another state root: "
-        f"tmux set-environment -t {shlex.quote('=' + session)} {envvars.STATE_DIR} {root} "
-        "(add -g for new sessions). tmux kill-server also starts clean, but it ends "
-        "every session on this server, live runs and your own sessions included. "
-        f"Shells already open there need export {envvars.STATE_DIR}={root}, or recreating.",
+        f"new shells in {session} resolve {resolved}, not this TUI's state root {own}, "
+        "so a bmad-loop command typed into one would use that root. Runs launched from "
+        "this TUI are unaffected: each is handed its root (#731). A shell already open "
+        "there can differ either way; no query can see it.",
+        label="note",
     )
 
 
@@ -1105,10 +1139,9 @@ def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
     So the child's answer is predicted here with the same pure rule it will
     apply (`runs.resolve_psmux_registry_root`), from the root it inherits —
     this process's root in force — and a disagreement refuses the launch.
-    The prediction assumes inheritance. Under `PSMUX_BARE_ENV` a pane child
-    inherits no `PSMUX_DATA_DIR` (psmux re-adds only its allowlist), so it
-    derives. bmad-loop does not support that mode, and
-    `PsmuxMultiplexer._warn_if_bare_env` says so.
+    The child receives that root in its argv (`--registry-root`, see
+    `start_detached`), so the prediction holds under `PSMUX_BARE_ENV` too,
+    where a pane inherits no `PSMUX_DATA_DIR`.
 
     Asked only of a process that configured its registry for this project
     (`runs.settled_project`), which every CLI entry does: there is nothing to
@@ -1212,7 +1245,20 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     the fourth); gating the mutation cannot. Ahead of the mux probes so the
     refusal needs no transport to be phrased.
 
-    Forwards this process's displaced psmux registry root, as the hidden
+    Hands the window this process's state root, as the hidden top-level
+    ``--state-root`` ahead of the subcommand, and on a transport that
+    namespaces registries the registry root in force as ``--registry-root``.
+    The window would otherwise inherit both from the multiplexer server, which
+    may have started under another root (#731) or clear its panes' env
+    (``PSMUX_BARE_ENV``, #730), and the engine would write where this process
+    never looks. No state root, no launch: omitting the option would let the
+    engine inherit whatever the server holds, and a launcher that cannot name
+    a root could not watch the run anyway. The registry root restores only
+    what inheritance would have delivered; the child's ``_configure_mux``
+    still decides whether it is honoured. On psmux the argv reaches the child
+    intact because a window launch refuses PowerShell older than 7.3 (#862).
+
+    Also forwards this process's displaced psmux registry root, as the hidden
     top-level ``--displaced-registry-root`` ahead of the subcommand. The child
     inherits the derived root and so displaces nothing itself; without the
     option a TUI-launched resume or cleanup would never sweep the operator's
@@ -1231,20 +1277,29 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
             "multiplexer backend unavailable (binary missing, version unsupported, "
             "or a required helper absent)"
         )
+    try:
+        state_root = runs.state_root()
+    except runs.StateRootError as e:
+        raise LaunchError(
+            f"cannot launch {kind}: no state root to hand the window, so this TUI could "
+            f"not watch the run it starts: {e}"
+        ) from e
     drift = _registry_drift(project, mux)
     if drift is not None:
         raise LaunchError(drift)
-    argv = cli_argv(*argv_tail)
+    hidden = [f"--state-root={state_root}"]
     try:
-        forwarded = (
-            _forwardable_displaced_root(runs.displaced_psmux_registry_root(), mux.registry_root())
-            if mux.has_registry_namespace()
-            else None
-        )
+        namespaced = mux.has_registry_namespace()
+        in_force = mux.registry_root() if namespaced else None
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer registry query failed: {e}") from e
-    if forwarded is not None:
-        argv = cli_argv(f"--displaced-registry-root={forwarded}", *argv_tail)
+    if in_force is not None:
+        hidden.append(f"--registry-root={in_force}")
+    if namespaced:
+        forwarded = _forwardable_displaced_root(runs.displaced_psmux_registry_root(), in_force)
+        if forwarded is not None:
+            hidden.append(f"--displaced-registry-root={forwarded}")
+    argv = cli_argv(*hidden, *argv_tail)
     ctl = _ensure_ctl_session(project)
     try:
         win_id = (
@@ -1360,14 +1415,26 @@ def resume_detached(project: Path, run_id: str) -> str | None:
     return _reachable_window(project, run_id, win_id)
 
 
-def start_resolve_detached(project: Path, run_id: str) -> str | None:
+def start_resolve_detached(
+    project: Path, run_id: str, *, reverify: bool = False, story: str | None = None
+) -> str | None:
     """Run `bmad-loop resolve <run_id>` in a ctl-session window. The caller
     attaches to it: the resolve agent is interactive, and the post-session
     confirm + resume happen in that same window. Returns the window id so the
-    caller attaches to exactly this window, not a stale same-run_id window."""
-    return start_detached(
-        project, ["resolve", "--project", str(project), run_id], run_id, "resolve"
-    )
+    caller attaches to exactly this window, not a stale same-run_id window.
+
+    `reverify` appends `--reverify` (DW-524): the CLI's statement of what the
+    replay will claim (HEAD/baseline, the squash-in warning), its confirm, the
+    liveness re-check under the run lock and the resume all run in that same
+    window — the TUI decides nothing about the target beyond naming it.
+    `story` appends `--story <key>`; omitted, the CLI defaults to the paused
+    story."""
+    tail = ["resolve", "--project", str(project), run_id]
+    if reverify:
+        tail.append("--reverify")
+    if story is not None:
+        tail += ["--story", story]
+    return start_detached(project, tail, run_id, "resolve")
 
 
 def run_captured_streams(argv_tail: list[str]) -> tuple[int, str, str]:

@@ -390,10 +390,10 @@ class StoriesEngine(Engine):
         if label is not None:
             return {}
         # Let the dev/review adapter resolve the story spec deterministically by
-        # id (skip the mtime scan). Project-relative — the adapter anchors it on the
-        # project's place in spec.cwd (`mountpaths.rebased_project`, the offset a
-        # nested `repo_root:` adds, DW-379), matching `_stories_folder`, so it is
-        # correct in place and under worktree isolation.
+        # id (skip the mtime scan). Project-relative — the adapter anchors it on
+        # spec.cwd, the mount project (DW-484; at the offset a nested `repo_root:`
+        # adds, DW-379), matching `_stories_folder`, so it is correct in place and
+        # under worktree isolation.
         env = {"BMAD_LOOP_SPEC_FOLDER": self._spec_folder_rel}
         # On a plan-halt leg tell the adapter to synthesize the ready-for-dev spec
         # as a *successful* terminal (plan done), not died-mid-flight. Keyed off the

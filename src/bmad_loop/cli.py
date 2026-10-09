@@ -443,6 +443,68 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
 # ----------------------------------------------------------------- commands
 
 
+def _validate_environment_probes(
+    pol: policy_mod.Policy, cwd: Path, report: ValidationReport, *, run: bool
+) -> None:
+    """The ``[environment] probes`` findings of ``validate`` (DW-526).
+
+    Opt-in, like ``--render-probe``: a probe is operator-authored shell, and plain
+    validate must stay non-executing for a fresh clone. Without ``run`` a
+    configured list is only noted — an ``ok`` severity on purpose (a warning on
+    every plain validate would teach operators to ignore warnings), and the
+    message plus ``detail.run: false`` say plainly that nothing ran. With no
+    probes and no flag, nothing is reported, so that output is unchanged.
+
+    With ``run`` every probe runs (:func:`verify.check_environment_probes`, not
+    fail-fast) and each is one ``environment.probe`` finding. ``returncode`` is
+    None when no exit status exists — a timeout, a spawn fault, an interrupt —
+    because the runner's sentinels are not exit codes and the ``--json`` contract
+    must not publish them as one."""
+    probes = pol.environment.probes
+    timeout_s = pol.environment.probe_timeout_s
+    if not run:
+        if probes:
+            report.ok(
+                "environment.probes-not-run",
+                f"{len(probes)} [environment] probe(s) configured, not run "
+                "— pass --probes to execute them",
+                {"probes": list(probes), "run": False},
+            )
+        return
+    if not probes:
+        report.ok(
+            "environment.probes-none",
+            "no [environment] probes configured — nothing to run",
+        )
+        return
+    for index, check in enumerate(verify.check_environment_probes(pol, cwd)):
+        result = check.result
+        exited = check.status not in ("timeout", "interrupted") and result.spawn_error is None
+        detail = {
+            "command": result.command,
+            "index": index,
+            "status": check.status,
+            "returncode": result.returncode if exited else None,
+            "reason": check.reason,
+            "timeout_s": timeout_s,
+            "cwd": str(cwd),
+        }
+        if check.status == "pass":
+            report.ok("environment.probe", f"environment probe passed: {result.command}", detail)
+            continue
+        if check.status == "fail":
+            message = f"environment probe failed ({check.reason}): {result.command}"
+        else:  # timeout / interrupted: the reason already reads as the verdict
+            message = f"environment probe {check.reason}: {result.command}"
+        tail = next(
+            (line.strip() for line in reversed(result.output_tail.splitlines()) if line.strip()),
+            "",
+        )
+        if tail and tail not in check.reason:
+            message += f" — {tail}"
+        report.fail("environment.probe", message, detail)
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from .install import relay_registered
 
@@ -1139,6 +1201,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"trees": triage_trees, "skill": install.SWEEP_SKILL},
             )
         report.extend(sweep_findings)
+
+    # DW-526. Probes run in `clean_root`, the run's code root (`repo_root`). That is
+    # where a run probes too, except under worktree isolation: there each unit
+    # probes its own mounted worktree, a fresh checkout validate cannot reproduce
+    # (gitignored/untracked files a probe relies on are absent from it). Skipped
+    # on an unloadable policy: the `policy` problem above already reports it.
+    if pol is not None:
+        _validate_environment_probes(
+            pol, clean_root, report, run=bool(getattr(args, "probes", False))
+        )
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -4043,6 +4115,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
+    # DW-525: a FINISHED run has no resume to replay on, so `--reverify` there mints a
+    # replay run for the named kept worktree unit instead. Routed ahead of the pause
+    # gate (a finished run is not paused); every paused-run branch below is untouched.
+    if getattr(args, "reverify", False) and state.finished:
+        return _resolve_reverify_finished(args, project, run_dir, state)
     # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
     # stage (an isolated defer never pauses the run); `reverify_refusal` decides
     # whether the named story qualifies. Everything else needs the escalation pause.
@@ -4699,6 +4776,152 @@ def _resolve_reverify(
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
+
+
+def _resolve_reverify_finished(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+) -> int:
+    """`resolve <finished-run> --reverify --story <key>` (DW-525): replay a finished
+    run's kept DEFERRED worktree unit in a NEW replay run (`unitreplay`).
+
+    `_resolve_reverify`'s shape: liveness gate → `runs.standalone_replay_refusal` →
+    the resume preflights the replay run will face (git floor, isolation conflict,
+    base skills) plus a clean main checkout on the run's target branch, which the
+    unit merges into → HEAD read → printed claim → `_confirm` (skipped when
+    `--resume`/`--no-resume` is given) → `unitreplay.mint_replay_run`, whose locked
+    re-check repeats the refusal → `--no-resume` hint or `_resume_paused_run` on the
+    replay run. The finished run stays finished; its state.json is never written."""
+    from .unitreplay import ReplayError, mint_replay_run
+
+    story_key = args.story
+    if not story_key:
+        print(
+            f"error: run {args.run_id} is finished — name the deferred worktree unit to "
+            f"replay with `bmad-loop resolve {args.run_id} --reverify --story <key>`",
+            file=sys.stderr,
+        )
+        return 1
+    live = runs.engine_liveness(run_dir)
+    if live == "alive":
+        print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+        return 1
+    if live == "unknown":
+        if not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to replay. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+            "proceeding anyway (--force)",
+            file=sys.stderr,
+        )
+    task = state.tasks.get(story_key)
+    if task is None:
+        print(f"error: run {args.run_id} has no task for story {story_key}", file=sys.stderr)
+        return 1
+    refusal = runs.standalone_replay_refusal(
+        state, task, story_key, run_dir=run_dir, project_root=project
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    try:
+        paths = bmadconfig.load_paths(project)
+    except bmadconfig.BmadConfigError as e:
+        print(f"error: cannot read the BMAD config ({e})", file=sys.stderr)
+        return 1
+    pol = policy_mod.load(_policy_path(project))
+    # The resume preflights the replay run will face, taken BEFORE anything is minted
+    # so a refusal there cannot strand a replay run that owns the moved worktree.
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if not _require_base_skills(project, pol):
+        return 1
+    target = state.target_branch
+    try:
+        clean = verify.worktree_clean(paths.repo_root, project=paths.project)
+        on = verify.current_branch(paths.repo_root)
+    except verify.GitError as e:
+        print(f"error: cannot inspect the main checkout ({e})", file=sys.stderr)
+        return 1
+    if on != target:
+        print(
+            f"error: the main checkout is on {on!r}, not run {args.run_id}'s target "
+            f"branch {target!r}, which the unit merges into — `git checkout {target}` "
+            "first",
+            file=sys.stderr,
+        )
+        return 1
+    if not clean:
+        print(
+            "error: the main checkout is not clean — commit or stash first (the unit "
+            "merges into it)",
+            file=sys.stderr,
+        )
+        return 1
+    wt = Path(task.worktree_path)
+    try:
+        head = verify.rev_parse_head(wt)
+    except verify.GitError as e:
+        print(f"error: cannot read HEAD of {wt} ({e})", file=sys.stderr)
+        return 1
+    print(
+        f"replaying {story_key} from finished run {args.run_id} in a NEW replay run — run "
+        f"{args.run_id} stays finished. The attempt is branch {task.branch} in its kept "
+        f"worktree {wt}, HEAD {head[:12]} above baseline "
+        f"{(task.baseline_commit or '')[:12]}, plus any uncommitted changes; the "
+        "worktree moves into the replay run's directory. No dev session and no resolve "
+        "agent run: the [verify] commands are replayed, then review follows policy and "
+        f"the unit merges into target branch {target} on a pass",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"create a replay run for {story_key} from finished run {args.run_id} and resume it?"
+    ):
+        print("cancelled — nothing was created; the run is still finished")
+        return 0
+    profiles = _launch_profiles(pol, project)
+    digest = _trusted_config_digest(pol, project, profiles=profiles)
+    try:
+        replay_dir = mint_replay_run(
+            project=project,
+            paths=paths,
+            policy=pol,
+            finished_run_dir=run_dir,
+            story_key=story_key,
+            expected_generation=task.generation,
+            trusted_config_digest=digest,
+            force=bool(args.force),
+        )
+    except ReplayError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    replay_id = replay_dir.name
+    print(
+        f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
+        "verify replays on resume"
+    )
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {replay_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {replay_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {replay_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, replay_dir)
 
 
 def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
@@ -5729,7 +5952,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    # The listing behind prune_sessions reads an unavailable backend as no
+    # sessions; this names the cases where that is not a clean answer (#864).
+    # A misconfigured process host fails the liveness read behind it: a scan
+    # that could not run, carried like one rather than exiting 1 with stdout
+    # empty and the sessions receipt lost (the ctl-window arm below, same).
+    try:
+        sessions_scan_error = runs.session_scan_error(project)
+    except ProcessHostError as e:
+        sessions_scan_error = str(e)
     if not args.json:
+        if sessions_scan_error is not None:
+            print(f"session prune failed: {sessions_scan_error}", file=sys.stderr)
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
             # Pruning kills the tmux session, never the engine pid, so the warning
@@ -5752,7 +5986,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
         else:
             windows, survived, unverifiable = launch.prune_ctl_windows(project)
-    except (MultiplexerError, UnicodeError) as e:
+    except (MultiplexerError, UnicodeError, ProcessHostError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
         # partition alone is also what a clean scan that found nothing emits, so
@@ -5762,6 +5996,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # POSIX handler and do not all normalize a decode fault to the seam type
         # (#380); it is the same scan failure, and letting it reach main()'s
         # backstop would empty stdout of the sessions receipt this arm protects.
+        # ProcessHostError: the evidence gate reads engine liveness (#864).
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
         scan_error = str(e)
@@ -5781,6 +6016,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
                 legacy_unverified=unverified,
+                sessions_scan_error=sessions_scan_error,
             )
         )
         return 0
@@ -6418,6 +6654,11 @@ def main(argv: list[str] | None = None) -> int:
     # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
     # detached child, never typed by hand. See the handling after `parse_args`.
     parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: the launcher's own state root and registry
+    # root, handed to a parked engine in its argv because inheritance cannot
+    # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
+    parser.add_argument("--state-root", help=argparse.SUPPRESS)
+    parser.add_argument("--registry-root", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -6462,6 +6703,13 @@ def main(argv: list[str] | None = None) -> int:
         "throwaway temp copy of _bmad/ + the skill (no coding CLI, project untouched; "
         "the launcher, typically `uv run --no-cache`, fetches the renderer's deps on "
         "each probe, so it needs network access)",
+    )
+    validate_p.add_argument(
+        "--probes",
+        action="store_true",
+        help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
+        "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
+        "that fails, times out or cannot be started fails validate",
     )
     machine.add_json_flag(validate_p, "check findings")
 
@@ -6659,8 +6907,10 @@ def main(argv: list[str] | None = None) -> int:
         "changes, and resume by replaying its verification: the [verify] commands "
         "re-run on that work and, when they pass, it is reviewed per policy and "
         "committed (a unit merged) — no dev session and no resolve agent. Fix the "
-        "environment first. With --story, a worktree unit is accepted under any pause "
-        "(not for sweep runs)",
+        "environment first. Not for sweep runs. With --story, a worktree unit is "
+        "accepted under any pause; on a FINISHED run, --story names a kept deferred "
+        "worktree unit to replay in a new replay run, and the finished run stays "
+        "finished (not for stories-mode runs)",
     )
     resolve_p.add_argument(
         "--resume",
@@ -6849,6 +7099,25 @@ def main(argv: list[str] | None = None) -> int:
     relay_p.set_defaults(func=cmd_relay)
 
     args = parser.parse_args(argv)
+    # Applied ahead of everything below, the relay branch included, so every later
+    # reader (`runs.state_root`, `_configure_mux`'s registry decision, the env a
+    # coding-CLI window is pinned from) sees what the launcher resolved, exactly as
+    # if inheritance had delivered it. Refused when not absolute: the variable has
+    # the same rule (`runs.state_root` judges it with `os.path.isabs` on the raw
+    # string), and a relative root names a different directory per working
+    # directory. The registry root is set only; `_configure_mux` still decides
+    # whether it is honoured (`runs.resolve_psmux_registry_root`), and judges it
+    # with `Path.is_absolute` for the reason given there.
+    # Both are validated before either is set, so a refused one leaves this
+    # process's environment exactly as it found it.
+    if args.state_root is not None and not os.path.isabs(args.state_root):
+        parser.error(f"--state-root must be absolute: {args.state_root!r}")
+    if args.registry_root is not None and not Path(args.registry_root).is_absolute():
+        parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
+    if args.state_root is not None:
+        os.environ[envvars.STATE_DIR] = args.state_root
+    if args.registry_root is not None:
+        os.environ[runs.PSMUX_DATA_DIR] = args.registry_root
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
     # inside the session whose completion it reports, and a hook that exits non-zero

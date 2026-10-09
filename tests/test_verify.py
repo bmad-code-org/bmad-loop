@@ -2578,6 +2578,105 @@ def test_win32_unrunnable_probe_counts_as_failure(tmp_path, monkeypatch):
     assert probe.reason == "check.sh is not executable by cmd (extension not in PATHEXT)"
 
 
+# DW-526: `check_environment_probes`, the `validate --probes` runner.
+
+
+def test_check_environment_probes_none_configured_spawns_nothing(tmp_path, monkeypatch):
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: spawned.append(command)
+    )
+
+    assert verify.check_environment_probes(Policy(), tmp_path) == ()
+    assert spawned == []
+
+
+def test_check_environment_probes_all_pass(tmp_path):
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK, _OK)))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert [c.status for c in checks] == ["pass", "pass"]
+    assert [c.reason for c in checks] == ["", ""]
+    assert all(c.result.returncode == 0 for c in checks)
+
+
+def test_check_environment_probes_is_not_fail_fast(tmp_path):
+    """Every probe runs: the one after a failure still spawns. Ablation: `break`
+    after a `fail` (the `run_environment_probes` shape) and the marker is absent."""
+    marker = tmp_path / "second-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=("exit 3", _marker_cmd(marker))))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert [(c.result.command, c.status) for c in checks] == [
+        ("exit 3", "fail"),
+        (_marker_cmd(marker), "pass"),
+    ]
+    assert checks[0].reason == "rc=3" and checks[0].result.returncode == 3
+    assert marker.exists()
+
+
+def test_check_environment_probes_timeout(tmp_path, monkeypatch):
+    """Faked with the runner's timeout leg, as `test_probe_timeout_is_a_failure`
+    does; the probe bound reaches the runner and the reason names it."""
+    timeouts: list[float] = []
+
+    def timed_out(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, -1, "timed out")
+
+    monkeypatch.setattr(verify, "_run_shell_command", timed_out)
+    policy = Policy(environment=EnvironmentPolicy(probes=("hangs", "also"), probe_timeout_s=2))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert timeouts == [2, 2]  # not fail-fast on a timeout either
+    assert [c.status for c in checks] == ["timeout", "timeout"]
+    assert checks[0].reason == "timed out after 2s"
+
+
+def test_check_environment_probes_spawn_fault_is_a_fail(tmp_path):
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    [check] = verify.check_environment_probes(policy, tmp_path / "nowhere")
+
+    assert check.status == "fail" and check.result.spawn_error is not None
+    assert check.reason.startswith("could not be started: ")
+
+
+def test_check_environment_probes_interrupt_stops_the_pass(tmp_path, monkeypatch):
+    """A hard stop ends the pass: the interrupted probe is reported, nothing after
+    it spawns. Ablation: drop the `break` and the second command is spawned."""
+    spawned: list[str] = []
+
+    def interrupted(command, cwd, timeout):
+        spawned.append(command)
+        return verify.CommandResult(command, verify.INTERRUPTED_RC, "interrupted", interrupted=True)
+
+    monkeypatch.setattr(verify, "_run_shell_command", interrupted)
+    policy = Policy(environment=EnvironmentPolicy(probes=("first", "second")))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert spawned == ["first"]
+    assert [c.status for c in checks] == ["interrupted"]
+
+
+def test_check_environment_probes_win32_unrunnable_probe_is_a_fail(tmp_path, monkeypatch):
+    """Twin of `test_win32_unrunnable_probe_counts_as_failure`: rc 0 from a probe
+    cmd cannot run is a `fail`. Ablation: drop the `env_fault_reason` arm from
+    `_probe_failed` and this reads `pass`."""
+    reason = "check.sh is not executable by cmd (extension not in PATHEXT)"
+    monkeypatch.setattr(verify, "env_fault_reason", lambda result, cwd, **_: reason)
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    [check] = verify.check_environment_probes(policy, tmp_path)
+
+    assert check.status == "fail" and check.result.returncode == 0
+    assert check.reason == reason
+
+
 def test_preflight_failure_skips_verify_commands(tmp_path):
     """A failed probe escalates as an env fault with cause "probe" and runs NO
     `[verify]` command; `on_results` is not called (nothing ran to record), and

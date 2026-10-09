@@ -92,6 +92,12 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "host.process",
         "host.win32-on-wsl-path",
         "notify.desktop-unavailable",
+        # `validate --probes`: one per configured [environment] probe, ok on pass (DW-526)
+        "environment.probe",
+        # probes configured but validate ran without --probes: a note, nothing spawned (DW-526)
+        "environment.probes-not-run",
+        # `validate --probes` with no [environment] probes configured (DW-526)
+        "environment.probes-none",
         "plugins.manifests",
         "skills.base",
         "skills.base-missing",

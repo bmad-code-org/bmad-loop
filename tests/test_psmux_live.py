@@ -28,6 +28,7 @@ everywhere else, and when psmux is absent or an unsupported version.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -42,7 +43,7 @@ import psmux_teardown
 import pytest
 
 from bmad_loop import runs
-from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters import psmux_backend, tmux_base
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.tui import launch
 
@@ -50,6 +51,18 @@ HAVE_PSMUX = sys.platform == "win32" and shutil.which("psmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_PSMUX, reason="requires Windows with psmux on PATH")
 
 PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks on read
+
+# The real resolver, captured before conftest pins it for every test.
+_REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
+
+
+@pytest.fixture(autouse=True)
+def _probe_the_real_pwsh(monkeypatch):
+    """Drop conftest's pinned pwsh path and seeded PowerShell answer, so every
+    window launch here resolves the installed pwsh and runs the backend's real
+    version probe against it."""
+    monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
 
 
 def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch, psmux_data_root):
@@ -826,6 +839,74 @@ def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe,
     assert not log.with_name(log.name + ".sink.ps1").exists()  # no sidecar, ever again
 
 
+def test_a_pinned_pwsh_path_with_shell_syntax_launches_and_pipes(probe, tmp_path, monkeypatch):
+    """The window and the pipe-pane sink run the absolute pwsh path the version
+    probe read (#863), even when that path holds what psmux's own command
+    tokenizer cannot carry: a space, `( )` as in `Program Files (x86)`, an
+    apostrophe and a doubled space. A junction so named stands in for such an
+    install, so the row holds wherever pwsh is installed; Windows reports a
+    process launched through it under the junction path, so counting images
+    there counts only the pinned pwsh itself, never a wrapper shell that merely
+    names it in its arguments.
+
+    A red here means psmux stopped running a `&`-led command under its own
+    PowerShell verbatim, so the call-operator line no longer reaches pwsh."""
+    mux, session, _windows = probe
+    installed = Path(_REAL_PWSH_PATH(mux))
+    link = tmp_path / "pinned (x86) pwsh's  dir"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(installed.parent)],
+        capture_output=True,
+        text=True,
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert made.returncode == 0, f"probe setup: junction failed: {made.stderr.strip()!r}"
+    pinned_images = (
+        "@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "
+        f"{psmux_backend._pwsh_quote(str(link) + chr(92) + '*')} }}).Count"
+    )
+
+    def await_images(at_least: int) -> int:
+        deadline = time.monotonic() + 7.5
+        count = int(_powershell(pinned_images).strip())
+        while count < at_least and time.monotonic() < deadline:
+            time.sleep(0.25)
+            count = int(_powershell(pinned_images).strip())
+        return count
+
+    try:
+        monkeypatch.setattr(mux, "_PWSH", str(link / installed.name))
+        assert mux._pwsh_path() == str(link / installed.name)
+        text = ""
+        for attempt in range(2):  # psmux/psmux#482's spawn race
+            before = await_images(0)
+            window = _mint_probe_window(mux, session, f"pinned-{attempt}", tmp_path)
+            # The parked window runs the pinned pwsh, before any sink exists.
+            assert await_images(before + 1) >= before + 1, "the window is not the pinned pwsh"
+            log = tmp_path / f"pinned log {attempt}.txt"
+            mux.pipe_pane(window, log)
+            # The sink is a second pinned image — read before the keystrokes
+            # below answer the park and close the window.
+            assert await_images(before + 2) >= before + 2, "the sink is not the pinned pwsh"
+            for argv in (
+                ["send-keys", "-t", window, "-l", "echo pinnedprobe"],
+                ["send-keys", "-t", window, "Enter"],
+            ):
+                sent = mux._run(argv, check=False)
+                assert sent.returncode == 0, f"probe setup: {argv[0]}: {sent.stderr.strip()!r}"
+            deadline = time.monotonic() + 7.5
+            while time.monotonic() < deadline:
+                text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+                if "pinnedprobe" in text:
+                    break
+                time.sleep(0.25)
+            if "pinnedprobe" in text:
+                break
+        assert "pinnedprobe" in text, f"no pane bytes through the pinned sink: {text[:200]!r}"
+    finally:
+        os.rmdir(link)  # the junction only, never the install it points at
+
+
 def test_adopted_select_window_focuses_a_qualified_window_id(probe):
     mux, session, windows = probe
     # Start focused on the OTHER window, so a green here is a move rather than a
@@ -1115,3 +1196,157 @@ def test_adopted_a_relative_registry_root_is_refused_before_the_spawn(monkeypatc
         "in PsmuxMultiplexer._run is no longer standing in for a panic: "
         f"rc={raw.returncode} stderr={raw.stderr.strip()!r}"
     )
+
+
+def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe, monkeypatch):
+    """The runtime half of the PowerShell floor (#861): the backend's version
+    probe, pointed at the Windows PowerShell 5.1 that ships with Windows, reads
+    a version below 7.3, and a parked-window launch then refuses before psmux
+    mints anything. 5.1 is the stand-in for the pwsh 7.0-7.2 builds the floor
+    exists for: its native-command builder corrupts argv the same way (an
+    argument with a space and a trailing backslash swallows the next one).
+
+    A red here means the refusal stopped gating the launch, or 5.1 stopped
+    answering the probe's query."""
+    if shutil.which("powershell.exe") is None:
+        pytest.skip("requires Windows PowerShell 5.1 (powershell.exe)")
+    mux, session, _windows = probe
+    before = sorted(mux.list_window_ids(session))
+    monkeypatch.setattr(mux, "_PWSH", "powershell.exe")
+    # A parked engine's argv as the TUI composes it, carrying the root shape
+    # 5.1 corrupts: the state root must never reach the engine damaged.
+    engine = launch.cli_argv("--state-root=" + _SHARE_ROOT, "status", "--project", str(Path.cwd()))
+    with pytest.raises(tmux_base.TmuxError, match=r"PowerShell 7\.3 or later.*'5\.1\.") as refused:
+        mux.new_parked_window(session, "legacy-shell", Path.cwd(), engine, "@r")
+    assert "upgrade pwsh to 7.3 or later" in str(refused.value)
+    assert psmux_backend._PWSH_VERSIONS[mux._pwsh_path()].startswith("5.1.")
+    assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"
+
+
+# Argument shapes a window's argv must deliver byte-for-byte to its target on a
+# supported pwsh, whatever kind of launcher the target is.
+_ARGV_SHAPES = [
+    "--state-root=C:\\dir with space\\",
+    "--x=C:\\a b\\\\",
+    'say "hi"',
+    'a\\"b c',
+    "",
+    "žćč dir ü — 日本",
+    "Use the $bmad-dev-auto skill",
+    "spec at `x.md` now",
+    "next",
+]
+_ARGV_PRINTER = (
+    "import json, os, sys\n"
+    "open(os.environ['ARGV_OUT'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+)
+
+
+@pytest.mark.parametrize("launcher", ["exe", "ps1", "cmd"])
+def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher):
+    """The backend's own encoded source, run by the installed pwsh, hands the
+    target its argv byte-for-byte: a native .exe, an npm-style .ps1 shim, and
+    an npm-style .cmd batch launcher. Under the default Windows argument mode
+    pwsh 7.3+ still builds a batch launcher's command line the legacy way, so
+    the .cmd row fails on an embedded quote, a backslash-quote with a space
+    and an empty argument unless the source opts into Standard mode first
+    (`_shell_wrap`). No psmux server is involved: the window's shell command
+    is run under pwsh `-Command`, exactly as psmux would spawn it."""
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    try:
+        mux._require_pwsh_floor()
+    except tmux_base.TmuxError as exc:
+        # A pre-7.3 pwsh is the refusal test's host, not this scenario's.
+        pytest.skip(f"pwsh below the supported floor: {exc}")
+    printer = tmp_path / "printer.py"
+    printer.write_text(_ARGV_PRINTER, encoding="utf-8")
+    if launcher == "exe":
+        target = [sys.executable, str(printer)]
+    elif launcher == "ps1":
+        policy = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", "Get-ExecutionPolicy"],
+            capture_output=True,
+            text=True,
+            timeout=tmux_base.TMUX_TIMEOUT_S,
+        ).stdout.strip()
+        if policy in ("AllSigned", "Restricted"):
+            pytest.skip(f"execution policy {policy} does not run a local .ps1")
+        shim = tmp_path / "shim.ps1"
+        shim.write_text(
+            f"& {psmux_backend._pwsh_quote(sys.executable)} "
+            '"$PSScriptRoot/printer.py" $args\nexit $LASTEXITCODE\n',
+            encoding="utf-8",
+        )
+        target = [str(shim)]
+    else:
+        shim = tmp_path / "shim.cmd"
+        shim.write_text(
+            f'@ECHO off\r\n"{sys.executable}" "%~dp0printer.py" %*\r\n', encoding="utf-8"
+        )
+        target = [str(shim)]
+    out = tmp_path / "argv.json"
+    command = mux._shell_wrap(
+        f"$env:ARGV_OUT = {psmux_backend._pwsh_quote(str(out))}; "
+        + mux._join_argv([*target, *_ARGV_SHAPES])
+    )
+    # psmux runs the window's one call-operator line under its own PowerShell.
+    ran = subprocess.run(
+        [mux._pwsh_path(), "-NoLogo", "-Command", *command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert out.exists(), f"the {launcher} target never ran: {ran.stderr.strip()!r}"
+    assert json.loads(out.read_text(encoding="utf-8")) == _ARGV_SHAPES
+
+
+# A parked engine's root options in the shapes a Windows root can take after
+# `Path` normalisation: a space, non-ASCII text and a trailing backslash (a
+# drive root keeps one), and a UNC share root such as `\\srv\my share\`, the
+# one shape `Path` leaves with a trailing separator that also holds whitespace.
+_SHARE_ROOT = r"\\srv\my share" + "\\"
+_ROOT_OPTIONS = [
+    "--state-root=" + r"C:\state dir žćč — 日本" + "\\",
+    f"--state-root={_SHARE_ROOT}",
+    f"--registry-root={_SHARE_ROOT}",
+]
+# Written beside the target and renamed into place, so the poll below never
+# reads a half-written file.
+_ARGV_TO_FILE = (
+    "import json, os, sys\n"
+    "tmp = sys.argv[1] + '.tmp'\n"
+    "with open(tmp, 'w', encoding='utf-8') as f:\n"
+    "    f.write(json.dumps(sys.argv[2:]))\n"
+    "os.replace(tmp, sys.argv[1])\n"
+)
+
+
+def test_a_parked_window_hands_the_engine_its_root_options_intact(probe, tmp_path):
+    """The parked-window argv is how a TUI-launched engine learns its state root
+    and registry root (#731), so a real psmux parked window must hand its child
+    each option byte-for-byte on the installed pwsh, ahead of the subcommand,
+    in exactly the shapes that older PowerShell corrupts. Below pwsh 7.3 the
+    launch is refused instead (the test below)."""
+    mux, session, _windows = probe
+    try:
+        mux._require_pwsh_floor()
+    except tmux_base.TmuxError as exc:
+        pytest.skip(f"pwsh below the supported floor: {exc}")
+    printer = tmp_path / "printer.py"
+    printer.write_text(_ARGV_TO_FILE, encoding="utf-8")
+    out = tmp_path / "argv.json"
+    tail = [*_ROOT_OPTIONS, "run", "--project", str(tmp_path)]
+
+    mux.new_parked_window(
+        session, "root-options", tmp_path, [sys.executable, str(printer), str(out), *tail], "@r"
+    )
+
+    deadline = time.monotonic() + 30
+    while not out.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert out.exists(), "the parked child never ran"
+    assert json.loads(out.read_text(encoding="utf-8")) == tail

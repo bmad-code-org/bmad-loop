@@ -20,33 +20,65 @@ breaking changes may land in a minor release.
   an ambient `PSMUX_DATA_DIR` stays in force; a teardown kill it refuses is
   journalled (`session-kill-refused`). A running TUI refuses launches after
   the switch is flipped either way, until restarted.
-- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
-  before `[verify]` commands, before each dev and review session launch, and
-  before a failed attempt is charged; a failing, hanging or unrunnable probe
-  pauses the run as an environment fault and charges nothing (DW-523).
+- Add `[environment] probes` (+ `probe_timeout_s`): health checks run before
+  `[verify]` and before each session launch. A failing probe pauses the run as an
+  environment fault without charging the story an attempt, and `bmad-loop resume`
+  re-probes and relaunches. A session reporting `Environment fault: <text>`
+  triggers the probes; `bmad-loop validate --probes` runs them all.
 - Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
-  exiting with it declares an environment fault, not a code failure (DW-523).
-- Add the `environment` pause stage: a probe failing before a session launch
-  pauses there, and a plain `bmad-loop resume` re-probes and launches the same
-  session with no rollback (DW-523).
-- Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
-  probe trigger: the run pauses only when a probe confirms it (DW-523).
-- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED
-  story's kept work, or an environment-fault escalated one's when the fault left
-  finished work to verify — HEAD in place, or the kept
-  worktree unit — then review per policy and commit or merge, with no dev
-  session and no resolve agent; a worktree unit is accepted under any pause
-  when `--story` names it, and sweep runs are refused (DW-522).
+  exiting with it is an environment fault, not a code failure.
+- Add `bmad-loop resolve <run> --reverify`: re-run `[verify]` on a deferred or
+  environment-fault story's kept work, then review and commit or merge it with no
+  new dev session. Deferred and environment-fault pause notices point at it.
+- Add `bmad-loop resolve <finished-run> --reverify --story <key>`: replay a
+  finished run's kept worktree unit in a new run that merges it on a pass. A story
+  already `done` on the sprint board is refused.
+- Add `V` to the TUI: pick a re-verifiable story and run `resolve --reverify` on it.
 
 ### Changed
 
 - Reword the rc 126/127 environment-fault pause to name the shell convention
-  instead of asserting "command not found / not executable" (DW-523).
-- Point deferred-story and environment-fault pause notices, and the TUI `R`/`p`
-  gestures on a deferred story, at `bmad-loop resolve <run> --reverify` (DW-522).
+  instead of asserting "command not found / not executable".
+- Narrow the `PSMUX_BARE_ENV` support gap (#730): TUI-parked engine windows now
+  land on the right state root, and on the right registry under
+  `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
+  loss stay warned, and the TUI repeats the warning once its screen is up.
 
 ### Fixed
 
+- Launch sessions in the BMAD project, not the `repo_root` checkout root. With
+  the project nested inside `repo_root`, Claude Code, Codex and agy found neither
+  its hooks nor its skills, so sessions never reported completion.
+- Pause a worktree unit's merge when the main checkout is not on the run's target
+  branch; a run resumed after the operator checked out another branch merged the
+  unit into that branch instead.
+- Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
+  was moved out before the rollback, so every such defer paused for spec recovery.
+- Hand each TUI-launched engine the TUI's own state root, and its registry root
+  on psmux, on the parked window's command line, so a multiplexer server started
+  under another state root no longer runs it where the TUI cannot see it; a TUI
+  with no derivable state root refuses the launch (#731)
+- Keep a TUI-launched tmux window open after its command exits on hosts whose
+  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
+  refuses at once, so the window closed with its exit status unread.
+- Refuse to open a psmux window or create a psmux session when `pwsh` is older
+  than 7.3, whose argument passing corrupts a command's arguments (a path with a
+  space and a trailing backslash swallowed the next one); checked once per
+  process, forced backend included, and an unrecognized version answer is
+  refused too (#861).
+- Launch psmux windows and the pipe-pane log sink with the same absolute `pwsh`
+  path whose version was checked, instead of letting the psmux server's PATH pick
+  one; a `pwsh` that does not resolve is refused (#863).
+- Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
+  shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
+  intact; batch launchers have remaining argument limits, tracked separately.
+- Report an unavailable multiplexer in `bmad-loop cleanup` and the TUI cleanup
+  instead of reading it as nothing to prune, when this project has a recorded
+  control window or a live run: `ctl_windows.scan_error` and the new optional
+  `sessions.scan_error` say why, exit stays 0. A host without a multiplexer
+  and without such evidence sees no change. Records are sticky, so a project
+  that launched from the TUI keeps reporting it until its run dirs are removed
+  (#864).
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
@@ -54,13 +86,13 @@ breaking changes may land in a minor release.
   cannot be listed, or a session left standing, is journalled and warned about.
   A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
   child), except a share-root shape older PowerShell would corrupt.
-- Warn once in the TUI when its tmux control session would hand new windows a
-  different state root than its own (a server started under another
-  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
-  `tmux set-environment` remedy, with its limits on a server shared by several
-  projects, instead of letting the run read as gone (#731).
-- Escalate an environment fault at the review-budget rescue gate instead of
-  deferring the story as unconverged (DW-523).
+- Note once in the TUI when new shells in its tmux control session would
+  resolve a different state root than its own (a server started under another
+  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots, so a
+  `bmad-loop` command typed into one is not silently aimed elsewhere; runs the
+  TUI launches are handed their root and are unaffected (#731).
+- Resume a review loop interrupted after a fix into its next review pass; it
+  re-checked `followup_review_recommended` and could skip the re-review.
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
   so a reused window id or a forged `ctl-window` record can no longer steer
   them onto a neighbour's window; the record now only breaks ties among tagged

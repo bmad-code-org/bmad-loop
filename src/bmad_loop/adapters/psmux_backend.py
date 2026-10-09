@@ -82,7 +82,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from .tmux_base import PARKED_RETURN_DETACH, BaseTmuxBackend, TmuxError
+from .tmux_base import PARKED_RETURN_DETACH, TMUX_TIMEOUT_S, BaseTmuxBackend, TmuxError
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # psmux's registry-root variable, as psmux spells it. `runs.PSMUX_DATA_DIR` holds
@@ -99,6 +99,20 @@ def _pwsh_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# The PowerShell floor for every window launch, the query that reads the
+# version (a query Windows PowerShell 5.1 answers too), and each executable's answer
+# keyed by its absolute path, probed once per process — see
+# `PsmuxMultiplexer._require_pwsh_floor`.
+_PWSH_FLOOR = (7, 3)
+_PWSH_VERSION_QUERY = "$PSVersionTable.PSVersion.ToString()"
+_PWSH_VERSIONS: dict[str, str] = {}
+# The whole stripped answer: two to four numeric parts (Windows PowerShell reports
+# four, pwsh three) and an optional prerelease suffix (`7.6.0-preview.4`).
+# Anything else — a prefix with trailing text, a second line — is unreadable.
+_PWSH_VERSION_SHAPE = re.compile(r"(\d+)\.(\d+)(?:\.\d+){0,2}(?:-[0-9A-Za-z.]+)?")
+# Prepended to every window's source; see `PsmuxMultiplexer._shell_wrap`.
+_STANDARD_ARGUMENT_PASSING = "$PSNativeCommandArgumentPassing = 'Standard'; "
+
 # One warning per process about `PSMUX_BARE_ENV`, not per verb — see
 # `PsmuxMultiplexer._warn_if_bare_env`.
 _BARE_ENV_WARNED = False
@@ -109,6 +123,21 @@ def _bare_env_on(value: str | None) -> bool:
     source-read at v3.3.8): on iff the value is "1" or case-insensitively
     "true"."""
     return value is not None and (value == "1" or value.lower() == "true")
+
+
+def bare_env_warning(env: Mapping[str, str]) -> str | None:
+    """The ``PSMUX_BARE_ENV`` warning for a process with environment ``env``,
+    or ``None`` when the mode is off. See ``PsmuxMultiplexer._warn_if_bare_env``."""
+    if not _bare_env_on(env.get("PSMUX_BARE_ENV")):
+        return None
+    return (
+        "PSMUX_BARE_ENV is on, which bmad-loop does not support — psmux clears each "
+        "pane's environment, so a session's window-0 shell loses BMAD_LOOP_STATE_DIR "
+        "and derives its own state root and registry (a bmad-loop command typed into "
+        "one can read a run as gone), and coding-CLI windows lose every variable "
+        "bmad-loop does not set for them, such as credentials, configuration and "
+        "APPDATA (git's global excludes); unset PSMUX_BARE_ENV for bmad-loop's sessions"
+    )
 
 
 # The `PSMUX_DATA_DIR` that was in force before this process derived its own and
@@ -158,6 +187,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # the distinct psmux name never collides with another tmux-family install
     # (e.g. a tmux-windows port owning ``tmux`` on the same PATH).
     _BINARY = "psmux"
+    # The shell every window's source runs under (see _shell_wrap).
+    _PWSH = "pwsh"
     # psmux emits UTF-8; decoding with the console codepage (cp1252) garbles
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
@@ -253,41 +284,38 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         Under it psmux ``env_clear``s every pane child and repopulates from a
         14-name allowlist (``src/pane.rs:889-908``, source-read at v3.3.8;
         measured in a real pane) that drops ``BMAD_LOOP_STATE_DIR`` *and* the
-        ``LOCALAPPDATA`` its default cascade falls back to. Coding-CLI windows
-        still get the state root — their env rides the in-source
-        ``-EncodedCommand`` prelude, which runs in the pane after the clear
-        (see ``_window_launch``) — but a session's window-0 shell and the TUI's
-        parked engine windows rely on inheritance, so a bmad-loop run in one of
-        those re-derives the state root from what survived. That diverges, and
-        the run then reads this very session as gone, in exactly two cases:
-        ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
+        ``LOCALAPPDATA`` its default cascade falls back to. Two kinds of pane
+        are covered anyway: coding-CLI windows get the state root through the
+        in-source ``-EncodedCommand`` prelude, which runs in the pane after the
+        clear (see ``_window_launch``), and the TUI's parked engine windows get
+        it, and the registry root, in their argv (``tui.launch.start_detached``,
+        #731). A session's window-0 shell still relies on inheritance, so a
+        bmad-loop command typed into one re-derives the state root from what
+        survived. That diverges, and the run then reads as gone, in exactly two
+        cases: ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
         default cascade answers somewhere else), or ``LOCALAPPDATA`` names
         something other than ``%USERPROFILE%\\AppData\\Local`` (a redirected
         or roaming profile). ``USERPROFILE`` *is* on the allowlist, so on a
-        default profile the fallback arm lands on the same root and nothing
-        diverges — the mode is unsupported because the failure is silent when
-        it does happen, not because it always does. Supporting it means an env
-        transport on the session and parked-window verbs, which is its own
-        seam change — tracked
-        as a follow-up issue, deliberately outside #537.
+        default profile the fallback arm lands on the same root. The clear also
+        drops every variable a pane's env dict does not name: a coding CLI can
+        miss credentials or configuration, and without ``APPDATA`` git no longer
+        reads the operator's global excludes in ``%APPDATA%\\Git\\ignore``,
+        all silently. That is psmux's documented trade for the mode.
 
         Warned, not refused: the variable is psmux's (an operator may run their
         own sessions under it), and most commands never open a window. Ceiling:
         psmux reads the switch in the *server* process at pane spawn; this
         process's effective env is a proxy for it, so a server already running
-        with the mode on under a clean client is not detected here.
+        with the mode on under a clean client is not detected here. The TUI
+        re-surfaces the line (``bare_env_warning``), because this firing lands
+        before Textual takes the screen.
         """
         global _BARE_ENV_WARNED
-        if _BARE_ENV_WARNED or not _bare_env_on(effective.get("PSMUX_BARE_ENV")):
+        warning = bare_env_warning(effective)
+        if _BARE_ENV_WARNED or warning is None:
             return
         _BARE_ENV_WARNED = True
-        print(
-            "warning: PSMUX_BARE_ENV is on, which bmad-loop does not support — "
-            "session and parked-window shells lose BMAD_LOOP_STATE_DIR and derive "
-            "their own state root and registry, so a run can read as gone; unset "
-            "PSMUX_BARE_ENV for bmad-loop's sessions",
-            file=sys.stderr,
-        )
+        print(f"warning: {warning}", file=sys.stderr)
 
     def registry_root(self) -> str | None:
         """The registry root a verb from this instance inherits — the process
@@ -407,8 +435,103 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # psmux joins the trailing argv and re-parses it through an outer shell,
         # which strips embedded quoting; -EncodedCommand (base64 of UTF-16LE) is
         # the lossless transport for arbitrary shell source.
+        #
+        # Standard argument passing first: under the default Windows mode,
+        # PowerShell 7.3+ still builds a batch launcher's (.cmd/.bat, e.g. an
+        # npm-installed CLI's shim) command line the legacy way, which drops an
+        # empty argument and mangles an embedded quote (measured on 7.6; an .exe
+        # or .ps1 target is unaffected either way). Batch launchers keep
+        # further argument limits of their own, tracked separately.
+        #
+        # The executable is the absolute path the floor just probed, so the
+        # window runs exactly the pwsh that was admitted (#863). It ships as one
+        # PowerShell call-operator line: psmux 3.3.8 runs a `&`-led window or
+        # pipe-pane command under its own PowerShell (`pwsh`, else `powershell`,
+        # `-Command`) without tokenizing it, so a path holding a space, `( )`, an
+        # apostrophe or a doubled space arrives verbatim. Unquoted, psmux would
+        # tokenize it and fall back to that shell on any metacharacter, which
+        # breaks `C:\Program Files (x86)`.
+        pwsh = self._require_pwsh_floor()
+        source = _STANDARD_ARGUMENT_PASSING + source
         encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-        return ["pwsh", "-NoProfile", "-EncodedCommand", encoded]
+        return [self._join_argv([pwsh, "-NoProfile", "-EncodedCommand", encoded])]
+
+    def _pwsh_path(self) -> str:
+        # Resolved on every launch rather than cached, so a PATH change takes
+        # effect at once and the probe cache, keyed by this path, follows it.
+        found = shutil.which(self._PWSH)
+        if found is None:
+            raise TmuxError(
+                f"{self._PWSH} not found on PATH; psmux windows need PowerShell 7.3 or later"
+            )
+        return os.path.abspath(found)
+
+    def _require_pwsh_floor(self) -> str:
+        """Refuse a window launch under PowerShell older than 7.3 (#861), and
+        return the absolute path of the pwsh that passed.
+
+        ``_join_argv`` hands each argument to PowerShell's native-command
+        builder, and before 7.3 that builder corrupts argv: an argument with
+        whitespace and a trailing backslash is wrapped in quotes without
+        escaping the backslash, so it swallows the next one; an empty argument
+        is dropped; an embedded quote is stripped (measured on Windows
+        PowerShell 5.1 through a real parked window; pwsh 7.6 delivers all of
+        them intact). A path ending in a backslash and holding a space is
+        enough. So every window launch checks the version first — in
+        ``_shell_wrap``, the one place a window's ``pwsh`` argv is built, and in
+        ``new_session``, whose initial window runs psmux's default shell — which
+        no backend selection (automatic or forced) routes around, and refuses
+        before psmux mints anything. ``pwsh`` is resolved to one absolute path
+        on this process's PATH (refused when it does not resolve), and that
+        path is both what the probe runs and what ``_shell_wrap`` launches, so
+        the psmux server's own PATH never picks the window's pwsh (#863).
+        Probed once per process per path; an answer is cached (and an
+        unreadable one refused each time), while a probe that failed to run or
+        exited nonzero is retried, and raises, each time.
+
+        Ceiling, named: ``new_session``'s initial window runs psmux's own
+        default shell, which psmux resolves on its server's PATH — the server
+        inherits the env of whichever process created the session, so it is
+        the same PATH in every bmad-loop flow unless an operator changes it
+        between the probe and the create. Pinning that window too means
+        passing an explicit shell command to ``new-session``, which changes how
+        the window starts, so it is left as psmux's choice.
+        """
+        pwsh = self._pwsh_path()
+        reported = _PWSH_VERSIONS.get(pwsh)
+        if reported is None:
+            try:
+                proc = subprocess.run(
+                    [pwsh, "-NoProfile", "-NonInteractive", "-Command", _PWSH_VERSION_QUERY],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="backslashreplace",
+                    timeout=TMUX_TIMEOUT_S,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                raise TmuxError(f"could not read the {self._PWSH} version: {exc}") from exc
+            if proc.returncode != 0:
+                raise TmuxError(
+                    f"could not read the {self._PWSH} version: exit {proc.returncode}: "
+                    f"{proc.stderr.strip()}"
+                )
+            reported = proc.stdout.strip()
+            _PWSH_VERSIONS[pwsh] = reported
+        parsed = _PWSH_VERSION_SHAPE.fullmatch(reported)
+        if parsed is None:
+            raise TmuxError(
+                f"could not read the {self._PWSH} version: unrecognized answer "
+                f"{reported!r}; psmux windows need PowerShell 7.3 or later"
+            )
+        if (int(parsed[1]), int(parsed[2])) < _PWSH_FLOOR:
+            raise TmuxError(
+                f"psmux windows need PowerShell 7.3 or later, and {pwsh} reports "
+                f"{reported!r}: older versions corrupt command arguments "
+                "(a path with a space and a trailing backslash, an empty or quoted "
+                "argument); upgrade pwsh to 7.3 or later"
+            )
+        return pwsh
 
     def _parked_trailer(self, return_opt: str) -> str:
         # The base's trailer re-expressed in pwsh — the tmux verbs are protocol-
@@ -500,6 +623,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         }
         env["PSMUX_ALLOW_NESTING"] = "1"
+        # The initial window is a window launch too: the same PowerShell floor
+        # as `_shell_wrap`, checked before psmux creates anything.
+        self._require_pwsh_floor()
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
         try:
             proc = self._run(
@@ -1400,16 +1526,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # is pwsh source shipped through the same `-EncodedCommand` transport as
         # every other window command (psmux 3.3.8 passes dash-flag tokens and
         # quoting through pipe-pane intact — psmux/psmux#482, psmux/psmux#563).
-        # Space-joining the wrapped argv needs no quoting of its own: base64 is
-        # `[A-Za-z0-9+/=]`, and the log path rides inside the encoded source via
+        # The wrapped command is _shell_wrap's one call-operator line, which
+        # psmux runs under its own PowerShell, so the pinned pwsh path is quoted
+        # there (#863). The log path rides inside the encoded source via
         # _pwsh_quote, so a spaced, `$`-bearing or backticked path is carried
-        # verbatim rather than re-parsed. The sink is byte-exact like `cat >>`
-        # (raw stream copy: no console decode of the pane bytes, no re-encode, no
-        # CRLF normalization) and flushes per chunk: the run log is live-tailed
-        # for activity detection, and a buffered copy never surfaces bytes — pipe
-        # EOF is unreliable on psmux. Known ceiling: a spawn race that exits 0
-        # still yields a silent empty log — the warning below covers surfaced
-        # failures only.
+        # verbatim rather than re-parsed. The sink is byte-exact like
+        # `cat >>` (raw stream copy: no console decode of the pane bytes, no
+        # re-encode, no CRLF normalization) and flushes per chunk: the run log is
+        # live-tailed for activity detection, and a buffered copy never surfaces
+        # bytes — pipe EOF is unreliable on psmux. Known ceiling: a spawn race
+        # that exits 0 still yields a silent empty log — the warning below covers
+        # surfaced failures only.
         sink = (
             "$in = [System.Console]::OpenStandardInput()\n"
             f"$out = [System.IO.File]::Open({_pwsh_quote(str(log_file))}, "
@@ -1420,7 +1547,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             "$out.Dispose()\n"
         )
         try:
-            self._tmux("pipe-pane", "-t", window_id, "-o", " ".join(self._shell_wrap(sink)))
+            self._tmux("pipe-pane", "-t", window_id, "-o", *self._shell_wrap(sink))
         except (TmuxError, UnicodeEncodeError) as exc:
             # Best-effort, as the base: a window that died on launch (or psmux's
             # first-pipe-after-new-window spawn race, noted in psmux/psmux#482)
@@ -1457,7 +1584,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # version query; the lru-cached selected instance re-probes a swapped
         # install only on restart (detect_multiplexers' fresh instances
         # re-probe every call).
-        if not all(shutil.which(exe) for exe in (self._BINARY, "pwsh")):
+        if not all(shutil.which(exe) for exe in (self._BINARY, self._PWSH)):
             return False
         if self._version_ok is None:
             # A missing patch segment reads as 0 — psmux hardwires three-part

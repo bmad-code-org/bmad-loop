@@ -7,15 +7,20 @@ decoded back (base64 → UTF-16LE) to assert its composition.
 
 import base64
 import os
+import re
 import subprocess
 
 import pytest
+from conftest import PINNED_PWSH
 
-from bmad_loop.adapters import psmux_backend, tmux_base
+from bmad_loop.adapters import multiplexer, psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 from bmad_loop.adapters.tmux_base import TmuxError
+
+# The real resolver, captured before conftest pins it for every test.
+_REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
 
 
 class _RecordRun:
@@ -53,11 +58,13 @@ def _decode(encoded: str) -> str:
     return base64.b64decode(encoded).decode("utf-16-le")
 
 
-def _pwsh_payload(argv: list) -> str:
-    """Assert the trailing args are a pwsh -EncodedCommand launch; return the
-    decoded shell source."""
-    assert argv[-4:-1] == ["pwsh", "-NoProfile", "-EncodedCommand"]
-    return _decode(argv[-1])
+def _pwsh_payload(argv: list, pwsh: str = PINNED_PWSH) -> str:
+    """Assert the last arg is one call-operator line launching ``pwsh`` with
+    -EncodedCommand; return the decoded shell source."""
+    call = f"& {psmux_backend._pwsh_quote(pwsh)} '-NoProfile' '-EncodedCommand' "
+    launched = re.fullmatch(re.escape(call) + r"'([A-Za-z0-9+/=]+)'", argv[-1])
+    assert launched is not None, argv[-1]
+    return _decode(launched[1])
 
 
 # ------------------------------------------------------------------ decoding
@@ -79,7 +86,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
 
     # the tmux-family scaffolding is the base's, spawned via the psmux binary,
     # with no -e flags — the env rides the encoded source's prelude instead
-    assert rec.argv[:12] == [
+    assert rec.argv[:11] == [
         "psmux",
         "new-window",
         "-t",
@@ -91,8 +98,8 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
         "-P",
         "-F",
         "#{window_id}",
-        "pwsh",
     ]
+    assert len(rec.argv) == 12
     assert "-e" not in rec.argv
 
     source = _pwsh_payload(rec.argv)
@@ -410,12 +417,15 @@ def test_bare_env_mode_warns_once_per_process(
 ):
     """bmad-loop does not support `PSMUX_BARE_ENV` (psmux is on iff the value is
     "1" or case-insensitive "true" — `src/pane.rs:890-892`, source-read at
-    v3.3.8): under it a session's window-0 shell and the TUI's parked engine
-    windows lose `BMAD_LOOP_STATE_DIR` by inheritance and derive their own
-    registry, so a run can read as gone. Said once per process, not per verb.
+    v3.3.8): under it a session's window-0 shell loses `BMAD_LOOP_STATE_DIR` by
+    inheritance and derives its own registry, so a command typed there can read
+    a run as gone, and a coding CLI loses what its env dict does not name. The
+    TUI's parked engine windows are no longer among the losses: they are handed
+    both roots in their argv (#731). Said once per process, not per verb.
 
     Ablate the warning out of `_warn_if_bare_env` and this fails; ablate the
-    `_BARE_ENV_WARNED` guard and the count reads two."""
+    `_BARE_ENV_WARNED` guard and the count reads two; restore the parked-window
+    clause and the last assertion fails."""
     monkeypatch.setenv("PSMUX_BARE_ENV", value)
     mux = PsmuxMultiplexer()
     mux._run(["list-sessions"], check=False)
@@ -423,6 +433,8 @@ def test_bare_env_mode_warns_once_per_process(
     err = capsys.readouterr().err
     assert err.count("warning: PSMUX_BARE_ENV") == 1
     assert "does not support" in err
+    assert "window-0 shell" in err and "credentials" in err
+    assert "parked" not in err
 
 
 @pytest.mark.parametrize("value", [None, "0", "", "yes"])
@@ -584,11 +596,10 @@ def test_pipe_pane_ships_the_sink_as_an_encoded_flag_transport(rec, tmp_path, na
 
     assert len(rec.calls) == 1
     assert rec.argv[:5] == ["psmux", "pipe-pane", "-t", "@1", "-o"]
-    # One `-o` string, space-joined: base64 is [A-Za-z0-9+/=], so nothing in the
-    # composed command needs quoting against psmux's re-parse.
-    piped = rec.argv[5].split(" ")
-    assert piped[:3] == ["pwsh", "-NoProfile", "-EncodedCommand"]
-    sink = _decode(piped[3])
+    # One `-o` string, a call-operator line for psmux's PowerShell sink shell:
+    # the pinned pwsh path holds a space, so it travels quoted (#863).
+    assert len(rec.argv) == 6
+    sink = _pwsh_payload(rec.argv)
     # byte-exact raw stream copy (no console decode / re-encode / CRLF mangling),
     # flushed per chunk so the live tail sees bytes incrementally
     quoted = str(log).replace(chr(39), chr(39) * 2)
@@ -744,6 +755,207 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
         assert isinstance(get_multiplexer(), PsmuxMultiplexer)
     finally:
         get_multiplexer.cache_clear()  # don't leak the forced pick to other tests
+
+
+# ------------------------------------------ PowerShell floor (#861)
+# Before 7.3, PowerShell's native-command builder corrupts the argv _join_argv
+# hands it, so every window launch probes the pwsh version and refuses below
+# the floor before psmux is asked to mint anything. The live module carries the
+# runtime half (the probe pointed at a real Windows PowerShell 5.1).
+
+
+def _pwsh_floor_fake(monkeypatch, reported: str) -> list[list[str]]:
+    """Answer the pwsh probe with ``reported`` and ``psmux -V`` with an admitted
+    build; record every spawn. The conftest seed is dropped, so the probe runs."""
+    calls: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == PINNED_PWSH:
+            out = reported + "\n"
+        else:
+            out = "tmux 3.3.8\npsmux 3.3.8\n" if argv[1:] == ["-V"] else "@2\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    return calls
+
+
+# A parked engine's argv as the TUI composes it, carrying the one root shape
+# PowerShell older than 7.3 corrupts: whitespace and a trailing backslash.
+_PARKED_ENGINE_ARGV = ["prog", "--state-root=" + r"\\srv\my share" + "\\", "run"]
+
+
+def _launches(mux: PsmuxMultiplexer, tmp_path):
+    return {
+        "new_window": lambda: mux.new_window("s", "n", tmp_path, {}, "prog"),
+        "new_parked_window": lambda: mux.new_parked_window(
+            "s", "n", tmp_path, _PARKED_ENGINE_ARGV, "@r"
+        ),
+    }
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["automatic", "forced"])
+def test_every_launch_refuses_powershell_older_than_7_3(monkeypatch, tmp_path, forced):
+    calls = _pwsh_floor_fake(monkeypatch, "7.2.19")
+    monkeypatch.setattr(psmux_backend.shutil, "which", lambda name: "x")
+    if forced:
+        monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "psmux")
+    else:
+        monkeypatch.delenv("BMAD_LOOP_MUX_BACKEND", raising=False)
+    get_multiplexer.cache_clear()
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(multiplexer.sys, "platform", "win32")
+            mux = get_multiplexer()
+    finally:
+        get_multiplexer.cache_clear()
+    assert isinstance(mux, PsmuxMultiplexer)
+    # The selection really took the named path: automatic selection ran
+    # available()'s `psmux -V`, a forced one skipped it.
+    assert (["psmux", "-V"] in calls) is not forced
+    for name, launch in _launches(mux, tmp_path).items():
+        with pytest.raises(TmuxError, match=r"PowerShell 7\.3 or later.*'7\.2\.19'.*upgrade pwsh"):
+            launch()
+        assert all(argv[:2] != ["psmux", "new-window"] for argv in calls), name
+    # Probed once for the process, not once per launch.
+    assert [argv[0] for argv in calls].count(PINNED_PWSH) == 1
+
+
+@pytest.mark.parametrize("reported", ["7.3.0", "7.10.1", "7.6.0-preview.4"])
+def test_launch_admits_powershell_7_3_or_later(monkeypatch, tmp_path, reported):
+    calls = _pwsh_floor_fake(monkeypatch, reported)
+    for name, launch in _launches(PsmuxMultiplexer(), tmp_path).items():
+        minted = len([argv for argv in calls if argv[:2] == ["psmux", "new-window"]])
+        launch()
+        launched = [argv for argv in calls if argv[:2] == ["psmux", "new-window"]]
+        assert len(launched) == minted + 1, name
+        assert "& 'prog'" in _pwsh_payload(launched[-1]), name
+
+
+def test_launch_refuses_windows_powershell_5_1(monkeypatch, tmp_path):
+    calls = _pwsh_floor_fake(monkeypatch, "5.1.26100.9444")
+    with pytest.raises(TmuxError, match=r"'5\.1\.26100\.9444'.*upgrade pwsh to 7.3 or later"):
+        PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog")
+    assert all(argv[0] == PINNED_PWSH for argv in calls)
+
+
+@pytest.mark.parametrize(
+    "reported",
+    ["", "not a version", "7.3garbage", "7.6.6 extra", "v7.6.6", "7", "7.6.6-", "7.6.6\n7.2.0"],
+)
+def test_launch_refuses_an_unreadable_powershell_version(monkeypatch, tmp_path, reported):
+    """The whole answer must be a version: a valid prefix with anything after
+    it, or a second line, is not one — and never reads as admitted."""
+    calls = _pwsh_floor_fake(monkeypatch, reported)
+    with pytest.raises(TmuxError, match="could not read the pwsh version: unrecognized answer"):
+        PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog")
+    assert all(argv[0] == PINNED_PWSH for argv in calls)
+
+
+def test_new_session_refuses_powershell_older_than_7_3(monkeypatch, tmp_path):
+    """The initial window of a new session runs psmux's default shell, so
+    session creation is gated like every other window launch."""
+    calls = _pwsh_floor_fake(monkeypatch, "7.2.19")
+    with pytest.raises(TmuxError, match=r"'7\.2\.19'.*upgrade pwsh"):
+        PsmuxMultiplexer().new_session("s", tmp_path)
+    assert all(argv[0] == PINNED_PWSH for argv in calls)
+
+
+def test_every_window_source_opts_into_standard_argument_passing(rec, tmp_path):
+    """Under the default Windows mode, PowerShell 7.3+ still builds a batch
+    launcher's command line the legacy way; the source opts out first. The
+    runtime half is in test_psmux_live (real pwsh, a .cmd launcher)."""
+    mux = PsmuxMultiplexer()
+    mux.new_window("s", "n", tmp_path, {}, "prog")
+    mux.new_parked_window("s", "n", tmp_path, ["prog"], "@r")
+    launches = [argv for argv, _ in rec.calls if argv[1] == "new-window"]
+    assert len(launches) == 2
+    for argv in launches:
+        assert _pwsh_payload(argv).startswith("$PSNativeCommandArgumentPassing = 'Standard'; ")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "not found", "pwsh"),
+        subprocess.TimeoutExpired("pwsh", 30),
+        subprocess.CompletedProcess(["pwsh"], 1, stdout="7.6.0\n", stderr="boom"),
+    ],
+    ids=["missing", "timeout", "nonzero-exit"],
+)
+def test_a_pwsh_probe_that_fails_raises_and_is_retried(monkeypatch, tmp_path, failure):
+    spawned: list[list[str]] = []
+
+    def failing(argv, **kwargs):
+        spawned.append(argv)
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", failing)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    mux = PsmuxMultiplexer()
+    for _ in range(2):
+        with pytest.raises(TmuxError, match="could not read the pwsh version"):
+            mux.new_window("s", "n", tmp_path, {}, "prog")
+    assert [argv[0] for argv in spawned] == [PINNED_PWSH, PINNED_PWSH]
+    assert psmux_backend._PWSH_VERSIONS == {}
+
+
+def test_launch_probes_and_runs_the_same_resolved_pwsh(monkeypatch, tmp_path):
+    """The probe and the window run one absolute path, resolved on this
+    process's PATH, so the psmux server's PATH never picks the window's pwsh
+    (#863). Resolved per launch: a PATH change is probed afresh."""
+    monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
+    calls: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        out = "7.6.6\n" if argv[0] != "psmux" else "@2\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    mux = PsmuxMultiplexer()
+    for found in ("first-pwsh.exe", "second-pwsh.exe"):
+        monkeypatch.setattr(
+            psmux_backend.shutil,
+            "which",
+            lambda name, found=found: found if name == "pwsh" else None,
+        )
+        pinned = os.path.abspath(found)
+        del calls[:]
+        mux.new_window("s", "n", tmp_path, {}, "prog")
+        probe, launch = calls
+        assert probe[0] == pinned
+        assert launch[:2] == ["psmux", "new-window"]
+        _pwsh_payload(launch, pinned)
+    assert set(psmux_backend._PWSH_VERSIONS) == {
+        os.path.abspath("first-pwsh.exe"),
+        os.path.abspath("second-pwsh.exe"),
+    }
+
+
+def test_every_launch_refuses_a_pwsh_that_does_not_resolve(monkeypatch, tmp_path):
+    """No pwsh on PATH is refused before psmux mints anything, as an
+    unreadable version is — never launched by bare name for the server's PATH
+    to pick."""
+    monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
+    monkeypatch.setattr(psmux_backend.shutil, "which", lambda name: None)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **kwargs: spawned.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    mux = PsmuxMultiplexer()
+    launches = {**_launches(mux, tmp_path), "new_session": lambda: mux.new_session("s", tmp_path)}
+    for name, launch in launches.items():
+        with pytest.raises(TmuxError, match=r"pwsh not found on PATH.*PowerShell 7\.3"):
+            launch()
+        assert spawned == [], name
 
 
 # ------------------------------------------ TUI-side qualified window ids (#291)

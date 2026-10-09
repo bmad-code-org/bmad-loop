@@ -403,6 +403,7 @@ producer kind that merely contains its spelling is not restyled:
 | `e`      | resume the selected paused/interrupted run (confirm modal)                 |
 | `p`      | review the selected paused run in the stage-appropriate HITL viewer        |
 | `R`      | resolve a run paused at an escalation (interactive, then re-arm)           |
+| `V`      | re-verify a story's kept work (`resolve --reverify`, pick target)          |
 | `d`      | answer deferred-work decisions past sweeps left unanswered (modal walk)    |
 | `a`      | attach to the selected run's live session or orchestrator window           |
 | `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)  |
@@ -541,11 +542,32 @@ leaves the story escalated and the run paused — the safe default.
 `environment` stage needs no resolve: `R` says so and points at resume (fix the
 environment, then `e`). A pause whose story was **deferred** rather than
 escalated (a manual-recovery pause after a defer) is not re-armed either: `R`
-and `p` notify `run bmad-loop resolve <run> --reverify (re-verify kept work) or
-bmad-loop resume <run> (move on)` and stop there — the TUI does not drive
-`--reverify`, so run it from a shell. The notice keys on the paused story only;
-a deferred worktree unit under another story's pause is reached with
-`bmad-loop resolve <run> --reverify --story <key>`.
+and `p` open the **re-verify** picker instead (below).
+
+### Re-verifying kept work (`V`)
+
+`V` re-verifies a story's kept work with
+[`bmad-loop resolve <run> --reverify`](FEATURES.md#resolve-reverify). It opens a
+small picker listing every target in the selected paused run: the paused story
+first when it is DEFERRED, or ESCALATED at an environment-fault site a replay can
+clear (marked `(paused story)`), then each DEFERRED worktree unit under any
+pause, in run order (marked `(worktree unit)`). Only the paused story is listed
+among escalated ones, and only at such a site — any other escalation's remedy is
+`R`, which still opens the resolve agent for the escalated paused story too.
+Confirming launches `bmad-loop resolve --reverify` in a control window and
+attaches, adding `--story <key>` for every target except the paused story.
+Everything binding
+happens in that window: the CLI states HEAD and the baseline, warns that
+commits and edits made since the pause are squashed into the story's commit,
+asks you to confirm, re-checks the engine under the run lock and resumes — and
+refuses there what it refuses (a sweep run, a story with no completed dev
+result, …). To move on instead, resume with `e`.
+
+`V` warns and launches nothing on an unpaused run, on a run with nothing to
+re-verify, or — checked when you confirm the picker — when the engine may still
+be live. When `R` refuses a pause or confirms an escalation
+while DEFERRED worktree units sit under it, its notice or confirm names those
+units and points at `V`.
 
 ## Reviewing a paused run (`p`)
 

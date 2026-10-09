@@ -967,6 +967,11 @@ def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
     point_state_root(monkeypatch, _state_root_allocator)
 
 
+# The absolute pwsh the psmux backend resolves to under the suite (see
+# `_isolate_mux_registry`).
+PINNED_PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_mux_registry(monkeypatch):
     """Keep the psmux registry root, and the inside-a-pane marker, out of the
@@ -1004,7 +1009,16 @@ def _isolate_mux_registry(monkeypatch):
     `runs._SETTLED_PROJECT` is reset on the same rule: the export records the
     project it configured, and the ownership gate reads it, so a leftover would
     judge a later test's sessions against an earlier test's project. Its record
-    of refused kills (`runs._REFUSED_KILLS`) likewise."""
+    of refused kills (`runs._REFUSED_KILLS`) likewise.
+
+    The psmux backend's `pwsh` resolution is pinned to ``PINNED_PWSH`` and its
+    per-process PowerShell version answers are seeded with that path admitted:
+    every psmux window launch resolves and probes pwsh first, and the unit tests
+    that fake `subprocess.run` for psmux would otherwise hand the probe a psmux
+    answer (or, on a host without pwsh, find nothing to resolve) and see every
+    launch refused. The pinned path holds a space, as a default install under
+    Program Files does. Tests of the gate itself, and the live module,
+    reset the answers to empty; the live module also restores real resolution."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -1012,6 +1026,8 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_pwsh_path", lambda self: PINNED_PWSH)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {PINNED_PWSH: "7.6.6"})
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
     monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
 
@@ -1298,6 +1314,19 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     git(repo_root, "add", NESTED_SUBDIR)
     git(repo_root, "commit", "-q", "-m", f"seed the {NESTED_SUBDIR}/ project")
     return load_paths(project)
+
+
+def session_checkout_root(paths: ProjectPaths, cwd: Path) -> Path:
+    """The checkout root a session launched at ``cwd`` works in.
+
+    Sessions run in the mount project (DW-484), which a nested `repo_root` puts at
+    ``<checkout>/<offset>``; a fake session editing code or rebasing `paths` needs
+    the checkout itself. Lexical: strips one parent per offset component, so it is
+    ``cwd`` unchanged in the default config."""
+    root = Path(cwd)
+    for _ in paths.project.relative_to(paths.repo_root).parts:
+        root = root.parent
+    return root
 
 
 OUTER_DECOY_LEDGER = b"# outer ledger\n"
@@ -2578,7 +2607,7 @@ def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=Non
     """An in-place run paused on a story whose attempt committed above its baseline:
     the reported shape (isolation none, rollback off). `phase` is the story's terminal
     phase; `spec` is "live" (in the artifacts dir) or "stashed" (moved under the run
-    dir the way `Engine._stash_deferred_artifacts` moves it)."""
+    dir the way `Engine._defer` stashes it)."""
     from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
 
     project = tmp_path / "proj"

@@ -11,7 +11,7 @@
 2. Then carry the state root (and, under #851's `[mux] honor_ambient_psmux_data_dir`, the registry root) to parked engine windows in their **argv**, not their env (Option D). This fixes the damaging case on every backend without changing the seam.
 3. The env-taking verb pair (Option C) is specified here but not scheduled.
 
-**Implementation status:** none of the stages is implemented as of this ADR. §6 is a plan of separately mergeable changes, and the `--state-root` and `--registry-root` options it describes do not exist until Stage 2 lands.
+**Implementation status:** Stage 1 shipped in #854. Stage 2 is implemented (2026-10-08): the hidden `--state-root` and `--registry-root` options exist, and argv fidelity on psmux takes the refusal route through #862's PowerShell 7.3 floor. Stage 3 stays unscheduled. §6 keeps its original planning text; the decisions Stage 2 had to make are under "Amendments after acceptance".
 
 Details are in §5 and §6; the approver's answers are in §8.
 
@@ -423,3 +423,10 @@ Approver: @dracic. The answers below were given on 2026-10-02 and are recorded i
   - After re-approval, as a correctness fix with no decision changed: Option D's coverage is narrowed to backends that deliver the parked argv intact. Stage 2 must deliver a root that ends in a backslash and contains whitespace intact on psmux under PowerShell older than 7.3 (measured corrupt on Windows PowerShell 5.1), either by making the transport safe or by refusing that PowerShell. A test on a pre-7.3 runtime (Windows PowerShell 5.1) pins whichever route is taken; the refusal route adds a faked-probe unit test as a supplement.
 
 Re-approved by @dracic on 2026-10-05: every amendment above.
+
+- **2026-10-08, Stage 2 implementation.** Decisions the plan left open, none of which changes a decision above:
+  - **Argv fidelity takes the refusal route.** #862 refuses PowerShell older than 7.3 before any psmux window or session is created, forced backend included (`PsmuxMultiplexer._require_pwsh_floor`). Stage 2 adds no second guard. #862's runtime test (Windows PowerShell 5.1) and its faked-probe unit test now park an engine argv carrying `--state-root=\\srv\my share\`. The older `_forwardable_displaced_root` skip of that shape is left as it is.
+  - **`--registry-root` is forwarded whenever the transport namespaces registries and a root is in force**, the derived one included, because the option restores what inheritance would have delivered. On tmux, and on a psmux default-registry instance, none is forwarded. The child's `_configure_mux` judges it by #851's unchanged rule.
+  - **Both options are validated ahead of the relay branch**, as the plan places them. So a malformed `--state-root` or `--registry-root` on `relay` exits `USAGE`, unlike `--displaced-registry-root`, which the relay ignores. No hook registration composes either option.
+  - **The stale-root note** goes to stderr as `note: …` when no sink is installed. The TUI toast keeps the warning severity of the shared sink.
+  - **The E2E gate observes the control plane through `run --dry-run`**, whose `BMAD_LOOP_EVENTS_DIR` line is the events channel a real run would use under its state root. That keeps the gate at zero tokens without seeding a run.

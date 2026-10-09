@@ -1365,9 +1365,10 @@ def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
 # byte-identical to the pre-seam inline code, and a leaf that overrides only
 # the hooks still gets the base's scaffolding without touching a method body.
 
-# the exact sh source the POSIX backend produced before the hooks existed
+# the exact sh source the POSIX backend produced before the hooks existed, but
+# for the park's variable name, which dash requires (see `BaseTmuxBackend._PARK`)
 _PARKED_SH_SOURCE = (
-    'echo hi; ec=$?; echo "[bmad-loop exited $ec — press enter]"; read -r; '
+    'echo hi; ec=$?; echo "[bmad-loop exited $ec — press enter]"; read -r _; '
     "ret=$(tmux show-options -wqv %3 2>/dev/null); "
     'if [ "$ret" = "detach" ]; then tmux detach-client 2>/dev/null; '
     'elif [ -n "$ret" ]; then '

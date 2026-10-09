@@ -33,7 +33,15 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, codex_trust, deferredwork, gates, verify, workspace_trust
+from . import (
+    artifact_publication,
+    codex_trust,
+    deferredwork,
+    gates,
+    sprintstatus,
+    verify,
+    workspace_trust,
+)
 from .adapters.profile import ProfileError
 from .install import (
     _REVIEW_LAYER_SKILLS,
@@ -768,8 +776,8 @@ def _seed_bmad_tree(
 
     Renderer-backed skills receive the mount PROJECT as their project root — the
     worktree itself in the default config, ``<worktree>/<offset>`` for a project
-    nested in ``repo_root`` (DW-379), while the session cwd stays the checkout root,
-    the accepted parity with isolation none — and do not walk upward for ``_bmad``.
+    nested in ``repo_root`` (DW-379), which is also the session cwd (DW-484) — and
+    do not walk upward for ``_bmad``.
     Copy every usable file except generated render output,
     per-file and without clobbering checkout content. The shared Traversable walk is
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
@@ -1417,8 +1425,8 @@ def provision_worktree(
             written.update(_written_rels(worktree, landed))
 
     # Renderer-backed skills are handed the mount project as their project root (the
-    # worktree, or `<worktree>/<offset>` under a nested `repo_root`; the session cwd
-    # stays the checkout root either way, DW-379). Merge
+    # worktree, or `<worktree>/<offset>` under a nested `repo_root`, DW-379), which is
+    # also the session cwd (DW-484). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
     seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
@@ -1874,11 +1882,15 @@ class WorktreeFlow:
         *,
         roles: tuple[str, ...] = DEV_PRIMITIVE_ROLES,
     ) -> None:
-        """Escalate the unit unless Codex trusts its hooks in ``worktree`` (DW-341).
+        """Escalate the unit unless Codex trusts its hooks in the mount at
+        ``worktree`` (DW-341).
 
         Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
         Codex silently skips hooks without a trust grant for that path — the
-        session's Stop would never arrive. So each Codex-dialect adapter among
+        session's Stop would never arrive. The path queried is the mount PROJECT,
+        where both the hook config and the session cwd sit (DW-484): ``worktree``
+        itself by default, ``<worktree>/<offset>`` under a nested ``repo_root``,
+        where the mount root holds no hook config. So each Codex-dialect adapter among
         ``roles`` is checked through the one trust oracle
         (:func:`codex_trust.project_hook_trust`) with the binary it will launch.
         Two callers: :meth:`run_isolated` checks every dev/review role at unit
@@ -1897,6 +1909,7 @@ class WorktreeFlow:
         and non-Codex dialects are skipped; main-checkout sessions never reach here.
         """
         adapters = self._adapters_get()
+        mount = self._mount_project(worktree)
         seen: set[tuple[str, str, tuple[str, ...] | None]] = set()
         for role in roles:
             adapter = adapters[role]
@@ -1915,15 +1928,15 @@ class WorktreeFlow:
                 if extra_args is None
                 else dataclasses.replace(profile, bypass_args=extra_args)
             )
-            trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+            trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
             if trust.status == "unverifiable" and trust.reason == codex_trust.QUERY_FAILED_REASON:
                 # The query itself failed, not Codex's verdict: one retry absorbs a
                 # transient app-server spawn failure or timeout before escalating.
-                trust = codex_trust.project_hook_trust(worktree, queried, binary=binary)
+                trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
             if trust.status == "trusted":
                 continue
             self.escalate_unit(  # always raises RunPaused
-                task, self._codex_trust_reason(role, worktree, trust.status, trust.reason)
+                task, self._codex_trust_reason(role, mount, trust.status, trust.reason)
             )
 
     def _codex_trust_reason(self, role: str, worktree: Path, status: str, reason: str) -> str:
@@ -3404,8 +3417,11 @@ class WorktreeFlow:
         first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
+        self.require_target_checked_out(task)
         if first_integration:
             self._emit("pre_integrate", task)
+        if not replay or first_integration:
+            self.refuse_superseded_replay(task, unit)
         if task.dw_ids:
             self.prepare_publication(task, unit.workspace.paths)
         receipt_required = False
@@ -4879,6 +4895,96 @@ class WorktreeFlow:
             task.story_key,
         )
 
+    def require_target_checked_out(self, task: StoryTask) -> None:
+        """Pause unless the main checkout is on the run's pinned target branch.
+
+        `verify.merge_branch` merges into whatever the main checkout has checked out,
+        and `ensure_target_branch` checks the target only once, at run start. A run
+        paused before integration (a replay minted with `--no-resume` included) can be
+        resumed after the operator checked out another branch, and the unit would land
+        there. Asked before any hook, write-ahead record or target mutation, so the
+        pause leaves nothing to undo: check the target out and a plain
+        `bmad-loop resume` replays the merge. A run with no pinned target (persisted
+        before target_branch existed) keeps merging into the checkout as it did."""
+        target = self.state.target_branch
+        if not target:
+            return
+        repo = self.paths.repo_root
+        try:
+            on = verify.current_branch(repo)
+        except verify.GitError as e:
+            self._pause(
+                f"cannot read the main checkout's branch before merging {task.branch} "
+                f"into {target}: {e}",
+                task.story_key,
+                cause=e,
+            )
+        if on == target:
+            return
+        self.journal.append(
+            "merge-target-not-checked-out",
+            story_key=task.story_key,
+            branch=task.branch,
+            target_branch=target,
+            checked_out_branch=on,
+        )
+        self._pause(
+            f"the main checkout {repo} is on {on!r}, not this run's target branch "
+            f"{target!r}, so unit {task.branch} was not merged; `git checkout {target}` "
+            "there, then `bmad-loop resume`",
+            task.story_key,
+        )
+
+    def refuse_superseded_replay(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Keep a replay run's unit unmerged when its story is already done (DW-534).
+
+        `runs.standalone_replay_refusal` reads the board only when the replay run is
+        minted (DW-533). A replay minted with `--no-resume`, or one paused and resumed
+        later, can reach this merge after another run finished the story, and the
+        post-merge carry would not notice: `sprintstatus.advance` never regresses a
+        done row. So a replay run (`state.replay_of`) re-reads the story's row on the
+        MAIN checkout's board right before a merge starts. This run's own advances
+        land in the unit's copy, so the main row is never done on this run's behalf.
+        A done row, or a board that cannot be read, journals `replay-merge-refused`
+        and keeps the branch and escalates, the shape of every DONE unit that cannot
+        merge. Not asked while a merge is in flight (`merge_local`'s replay arms): a
+        refusal there could strand a half-landed merge."""
+        if not self.state.replay_of:
+            return
+        key = task.story_key
+        board = self.paths.sprint_status
+        by_hand = f"recover the work by hand from branch {task.branch!r}"
+        status: str | None = None
+        try:
+            status = sprintstatus.story_status(board, key)
+        except (sprintstatus.SprintStatusError, OSError, ValueError) as e:
+            error = str(e)
+            reason = (
+                f"replay run {self.state.run_id} cannot read the sprint board at {board} "
+                f"to rule out story {key} already being done ({e}), so its unit was not "
+                f"merged; fix the board, then `bmad-loop resolve {self.state.run_id} "
+                f"--adopt-branch` merges the kept branch (a plain re-arm discards it), or "
+                f"{by_hand}"
+            )
+        else:
+            if status != "done":
+                return
+            error = None
+            reason = (
+                f"story {key} is already done on the sprint board, so replay run "
+                f"{self.state.run_id}'s unit (replaying run {self.state.replay_of}) is "
+                f"superseded work and was not merged; {by_hand}"
+            )
+        self.journal.append(
+            "replay-merge-refused",
+            story_key=key,
+            replay_of=self.state.replay_of,
+            path=str(board),
+            status=status,
+            error=error,
+        )
+        self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
         escalate. Shared by every merge-back failure path: a target dirtied with
@@ -4902,9 +5008,9 @@ class WorktreeFlow:
     def seed_workspace_trust(
         self, task: StoryTask, worktree: Path, profiles: Sequence[CLIProfile]
     ) -> None:
-        """Extend the operator's workspace-trust grant for the main checkout to
-        ``worktree``, for every loaded profile declaring ``[workspace_trust]``
-        (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
+        """Extend the operator's workspace-trust grant for the main project to the
+        mount project in ``worktree``, for every loaded profile declaring
+        ``[workspace_trust]`` (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
         root-trust rule. Profiles without the table touch nothing under ``~``.
 
         Seeded → ``worktree-trust-seeded``; root not trusted or file/key missing →
@@ -4913,14 +5019,16 @@ class WorktreeFlow:
         a write fault escalates the unit (repair writes raise)."""
         # spec -> the first declaring profile's binary, named in the remedy
         specs: dict[WorkspaceTrustSpec, str] = {}
+        # Exact-path trust, so the path granted is the session cwd — the mount
+        # project — and the grant it inherits is the in-place cwd's, the main
+        # project (DW-484). Both are the checkout roots in the default config.
+        mount = self._mount_project(worktree)
         for p in profiles:
             if p.workspace_trust is not None:
                 specs.setdefault(p.workspace_trust, p.binary)
         for spec, binary in specs.items():
             try:
-                outcome, detail = workspace_trust.seed(
-                    spec, worktree, trusted_root=self.paths.repo_root
-                )
+                outcome, detail = workspace_trust.seed(spec, mount, trusted_root=self.paths.project)
             except workspace_trust.WorkspaceTrustError as e:
                 self.escalate_unit(  # always raises RunPaused
                     task,
@@ -4935,14 +5043,14 @@ class WorktreeFlow:
                     "worktree-trust-seeded",
                     story_key=task.story_key,
                     key=spec.key,
-                    path=str(worktree),
+                    path=str(mount),
                 )
             elif outcome == "root-untrusted":
                 self.journal.append(
                     "worktree-trust-unseeded",
                     story_key=task.story_key,
                     key=spec.key,
-                    path=str(worktree),
+                    path=str(mount),
                     reason=detail,
                 )
                 # The run goes on, but the session will sit on the CLI's trust

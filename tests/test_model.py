@@ -73,6 +73,18 @@ def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     assert RunState.from_dict(d).code_root_restamp_pending is False
 
 
+def test_run_state_replay_of_round_trips_and_defaults_empty():
+    """DW-525: the finished run a replay run replays survives the state round trip,
+    and a state.json from before the field existed reads back "" — an ordinary run."""
+    state = _state(repo_root="/code")
+    assert state.replay_of == ""
+    state.replay_of = "20260101-000000-beef"
+    assert RunState.from_dict(state.to_dict()).replay_of == "20260101-000000-beef"
+    d = state.to_dict()
+    del d["replay_of"]
+    assert RunState.from_dict(d).replay_of == ""
+
+
 def test_mint_time_root_identities_round_trip_as_two_int_lists():
     """DW-446: `RunState.run_dir_identity` and `StoryTask.worktree_identity` persist
     as a two-int JSON list (or null) and read back as the same tuple.
@@ -601,6 +613,20 @@ def test_reverify_from_unknown_value_is_kept_not_dropped():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     doc["reverify_from"] = "from-the-future"
     assert StoryTask.from_dict(doc).reverify_from == "from-the-future"
+
+
+def test_reverify_replayed_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_replayed="escalated")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_replayed == "escalated"
+
+
+def test_reverify_replayed_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_replayed"]  # state.json from before the field existed (DW-527)
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
+    doc["reverify_replayed"] = None  # a null is not a replay continuation either
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
 
 
 def _dev_record(status: str) -> SessionRecord:

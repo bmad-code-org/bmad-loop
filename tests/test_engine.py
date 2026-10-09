@@ -4194,14 +4194,15 @@ def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
     task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
     engine.state.tasks[task.story_key] = task
 
-    # The refusal is non-fixable, so the attempt is rolled back and the phase ends
-    # in the pause its unrecoverable binding forces. The PAUSE is the point for
-    # this row's purposes — "did not verify green" — and the journal below names
-    # the cause. Under the mutation this row exists to catch, the park verifies,
-    # commits, and nothing raises at all.
-    with pytest.raises(RunPaused):
-        engine._dev_phase(task)
+    # The refusal is non-fixable, so the attempts are rolled back and the story
+    # defers. The DEFER is the point for this row's purposes — "did not verify
+    # green" — and the journal below names the cause. Under the mutation this row
+    # exists to catch, the park verifies and commits as AWAITING_OPERATOR.
+    engine._dev_phase(task)
 
+    assert task.phase == Phase.DEFERRED and task.commit_sha is None
+    # the operator's pre-launch spec is input, not attempt output: it stays (DW-528)
+    assert read_frontmatter(recorded)["status"] == "awaiting-operator"
     reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert reasons and all(r == "no changes in worktree since baseline commit" for r in reasons)
     # the waiver never fired, so nothing was journaled as a skipped gate
@@ -11974,6 +11975,89 @@ def test_long_critical_reason_is_lossless_in_records_and_bounded_only_for_displa
 # ------------------------------------------------------ deferred-artifact stash
 
 
+def _stash(engine, task):
+    """Stage then finish with no rollback in between: `_defer`'s stash when the
+    rollback leaves the spec as it found it."""
+    engine._finish_deferred_stash(task, engine._stage_deferred_stash(task))
+
+
+def _staged_spec(project, engine, text="attempt output\n"):
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # Bytes, not write_text: Windows text mode writes CRLF, and the DW-528 snapshot
+    # comparison is byte-exact, so a `b"...\n"` snapshot would never match there.
+    sp.write_bytes(text.encode("utf-8"))
+    task.spec_file = str(sp)
+    return task, sp, engine._stage_deferred_stash(task)
+
+
+def test_finish_deferred_stash_keeps_a_spec_the_rollback_put_back(project):
+    """DW-528: bytes that changed between staging and finishing are the rollback's
+    (a tracked spec reset to its baseline); they stay live, and the stash keeps the
+    attempt's output.
+
+    Ablation, performed: drop the `live == stashed` term and the baseline spec is
+    unlinked."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+    sp.write_text("baseline\n", encoding="utf-8")  # what the reset republished
+
+    engine._finish_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "baseline\n"
+    assert staged.target.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == [staged.target]
+
+
+def test_finish_deferred_stash_keeps_the_attempts_pre_launch_spec(project):
+    """DW-528: an unchanged spec equal to the attempt's pre-launch snapshot is its
+    input, not its output, and stays live.
+
+    Ablation, performed: drop the snapshot term and the operator's spec is
+    unlinked."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine, "operator input\n")
+    task.dispatched_spec_snapshot = b"operator input\n"
+
+    engine._finish_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "operator input\n"
+    assert staged.target.is_file()
+
+
+def test_discard_deferred_stash_drops_the_copy_of_a_live_spec(project):
+    """DW-528: a paused rollback left the spec live, so nothing is stashed."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+
+    engine._discard_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == []
+    assert "deferred-artifacts-stashed" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_discard_deferred_stash_lands_the_only_copy(project):
+    """DW-528: when the pause followed a change to the live spec, the staged copy
+    may be the attempt's only version, so it is landed and journaled rather than
+    dropped.
+
+    Ablation, performed: drop the copy unconditionally and the attempt's spec is
+    gone."""
+    engine, _ = make_engine(project, [])
+    task, sp, staged = _staged_spec(project, engine)
+    sp.write_text("operator input\n", encoding="utf-8")  # restored before the pause
+
+    engine._discard_deferred_stash(task, staged)
+
+    assert sp.read_text(encoding="utf-8") == "operator input\n"
+    assert staged.target.read_text(encoding="utf-8") == "attempt output\n"
+    assert list(staged.target.parent.iterdir()) == [staged.target]
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("deferred-artifacts-stashed") == 1
+
+
 def test_stash_deferred_artifacts_moves_spec_into_run_dir(project):
     engine, _ = make_engine(project, [])
     task = StoryTask("1-1-a", 1)
@@ -11982,7 +12066,7 @@ def test_stash_deferred_artifacts_moves_spec_into_run_dir(project):
     sp.write_text("first attempt\n", encoding="utf-8")
     task.spec_file = str(sp)
 
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     dest = engine.run_dir / "deferred" / "1-1-a"
     assert (dest / sp.name).read_text(encoding="utf-8") == "first attempt\n"
@@ -12006,7 +12090,7 @@ def test_stash_deferred_artifacts_overwrites_a_prior_stash(project):
     dest.mkdir(parents=True, exist_ok=True)
     (dest / sp.name).write_text("first attempt\n", encoding="utf-8")
 
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
     assert not sp.exists()
@@ -12040,7 +12124,7 @@ def test_stash_deferred_artifacts_survives_a_win32_sharing_violation(project, mo
         real_replace(src, dst)
 
     monkeypatch.setattr(platform_util.os, "replace", sharing_violation_once)
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert calls["n"] == 2  # denied once, retried, landed
     assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
@@ -12071,7 +12155,7 @@ def test_stash_deferred_artifacts_retries_a_locked_source_spec(project, monkeypa
         real_unlink(path)
 
     monkeypatch.setattr(platform_util.os, "unlink", locked_once)
-    engine._stash_deferred_artifacts(task)
+    _stash(engine, task)
 
     assert calls["n"] == 2  # denied once, retried, removed
     assert not sp.exists()
@@ -12097,7 +12181,7 @@ def test_stash_deferred_artifacts_keeps_source_and_cleans_tmp_on_replace_failure
 
     monkeypatch.setattr("bmad_loop.engine.atomic_replace", boom)
     with pytest.raises(PermissionError):
-        engine._stash_deferred_artifacts(task)
+        _stash(engine, task)
 
     assert sp.read_text(encoding="utf-8") == "work\n"
     assert list((engine.run_dir / "deferred" / "1-1-a").iterdir()) == []
@@ -14367,6 +14451,107 @@ def test_review_entry_dispatch_pause_resumes_into_review(project, tmp_path):
     assert not _rows(engine2, "resume-restart")
 
 
+def test_post_fix_crash_before_review_dispatch_resumes_into_review(project, tmp_path):
+    """DW-531, the confirmed shape. A review pass finalizes `done` without
+    recommending a follow-up, its verify gate fails (fixable), and the fix session
+    repairs it, so the loop goes on to re-review. The host dies at the next cycle's
+    dispatch, before the cycle is charged. The task is persisted at DEV_VERIFY with
+    one review cycle spent and the stale `followup_review_recommended: false`.
+    Resume (the spec-approval arm) re-enters the loop past its
+    `trigger = "recommended"` entry gate and runs the re-review the uninterrupted
+    loop would have run. (A dispatch PAUSE cannot land here: the fix's verify
+    preflight leaves the probes fresh, so `_gate_dispatch` skips.)
+
+    Ablation, performed: drop `resumed_loop` from `_resume_after_dev_verify`'s
+    `_review_and_commit` call and the resume journals `review-not-recommended`
+    and commits through `_skip_review_and_commit` with no review session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            _fix_session_effect,
+        ],
+        policy=_env_policy(rig, rig.verify([0, 1, 0])),
+    )
+    original_gate = engine._gate_dispatch
+
+    def dies_at_post_fix_review_dispatch(task, role):
+        if role == "review" and task.review_cycle == 1:
+            raise RuntimeError("host died before the post-fix review dispatch")
+        return original_gate(task, role)
+
+    engine._gate_dispatch = dies_at_post_fix_review_dispatch
+    assert engine.run().crashed
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file
+    assert task.review_cycle == 1 and task.attempt == 2
+    assert task.followup_review_recommended is False
+    assert _rows(engine, "review-verify-failed")
+
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2 and task.attempt == 2
+    assert _rows(engine2, "resume-review")
+    assert not _rows(engine2, "review-not-recommended")
+    assert not _rows(engine2, "resume-restart")
+
+
+def test_review_loop_dispatch_pause_after_unrecommending_pass_replays_into_next_cycle(
+    project, tmp_path
+):
+    """DW-531, completed-pass replay arm: a completed pass left the spec short of
+    `done` while no longer recommending a follow-up — the loop runs another pass
+    regardless of the flag — and the next cycle's dispatch gate pauses. The replay
+    re-enters the loop with that pass's `followup_review_recommended: false` on the
+    task; it must replay into the next cycle, not the entry gate's skip.
+
+    Ablation, performed: drop the `resume_result is None` term from
+    `_review_and_commit`'s entry gate and the resume journals
+    `review-not-recommended` and runs no review session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=True, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    assert load_state(engine.run_dir).tasks["1-1-a"].followup_review_recommended is False
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    (replayed,) = _rows(engine2, "resume-verify")
+    assert replayed["role"] == "review"
+    assert not _rows(engine2, "review-not-recommended")
+    assert not _rows(engine2, "resume-restart")
+
+
 def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
     """A completed, unfinalized review pass loops to the next cycle without
     charging anything, so nothing probes until that cycle's dispatch gate — which
@@ -14402,6 +14587,128 @@ def test_review_loop_dispatch_pause_replays_completed_pass(project, tmp_path):
     (replayed,) = _rows(engine2, "resume-verify")
     assert replayed["role"] == "review"
     assert _rows(engine2, "env-fault-cleared")
+    assert not _rows(engine2, "resume-restart")
+
+
+@pytest.mark.parametrize("unrecommending", [False, True])
+def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_cycle(
+    project, tmp_path, unrecommending
+):
+    """DW-529, a guard for an unreachable shape: the same REVIEW_VERIFY dispatch
+    pause, but with the prior cycle's pass not on record as completed. Today a
+    retried crash cannot produce it (the RETRY's decision seam probes, leaving the
+    probes fresh, so `_gate_dispatch` skips), so the state is fabricated by recasting
+    the persisted cycle-1 record. The completed-pass replay arm then has nothing to
+    replay; the resume re-enters the review loop with no rollback, the next cycle
+    dispatches, and the story commits.
+
+    `unrecommending` (DW-531): the last completed pass left
+    `followup_review_recommended: false` on the task, and the resumed loop still
+    dispatches — the arm re-enters past the entry gate.
+
+    Ablation, performed: delete the review `resume-env-dispatch` arm of
+    `Engine._finish_inflight` and the resume takes `resume-restart` instead; drop
+    its `resumed_loop=True` and the `unrecommending` case journals
+    `review-not-recommended` and runs no review session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=unrecommending, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    # Recast the cycle-1 pass as one that did not complete.
+    state = load_state(engine.run_dir)
+    (record,) = [s for s in state.tasks["1-1-a"].sessions if s.role == "review"]
+    record.status = "crashed"
+    record.result_json = None
+    save_state(engine.run_dir, state)
+    assert state.tasks["1-1-a"].followup_review_recommended is not unrecommending
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2 and task.attempt == 1
+    assert task.env_fault_site is None
+    (cleared,) = _rows(engine2, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:review"
+    (dispatched,) = _rows(engine2, "resume-env-dispatch")
+    assert dispatched["role"] == "review"
+    assert not _rows(engine2, "resume-verify")
+    assert not _rows(engine2, "resume-restart")
+    assert not _rows(engine2, "review-not-recommended")
+
+
+def test_isolated_review_dispatch_pause_after_a_non_completed_pass_reopens_unit(project, tmp_path):
+    """DW-529, worktree variant of the guard above (same fabricated, today-unreachable
+    shape: the cycle-1 record recast as crashed). The resume REOPENS the kept unit —
+    the next review session runs in it — and merges it, with no restart discard.
+
+    Ablation, performed: delete the review `resume-env-dispatch` arm of
+    `Engine._finish_inflight` and the restart arm discards the unit and re-drives
+    dev in a fresh one; the scripted review effect then runs as that dev session
+    with no spec and the run crashes."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+
+    def dev_in_the_unit(spec):
+        return dev_effect(project.rebased(spec.cwd), "1-1-a")(spec)
+
+    def review_in_the_unit(*, clean, finalized=True, dies=False):
+        def effect(spec):
+            return review_effect(
+                project.rebased(spec.cwd), "1-1-a", clean=clean, finalized=finalized
+            )(spec)
+
+        return rig.dies_during(effect) if dies else effect
+
+    engine, adapter = make_engine(
+        project,
+        [dev_in_the_unit, review_in_the_unit(clean=False, finalized=False, dies=True)],
+        policy=_env_policy(
+            rig, limits=LimitsPolicy(max_review_cycles=3), scm=ScmPolicy(isolation="worktree")
+        ),
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    task = _dispatch_paused(engine, "review")
+    assert task.phase == Phase.REVIEW_VERIFY and task.review_cycle == 1
+    unit_path = task.worktree_path
+    assert unit_path and Path(unit_path).is_dir()
+    state = load_state(engine.run_dir)
+    (record,) = [s for s in state.tasks["1-1-a"].sessions if s.role == "review"]
+    record.status = "crashed"
+    record.result_json = None
+    save_state(engine.run_dir, state)
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(project, engine, [review_in_the_unit(clean=True)])
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    assert Path(adapter2.sessions[0].cwd) == Path(unit_path)
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    (dispatched,) = _rows(engine2, "resume-env-dispatch")
+    assert dispatched["role"] == "review"
+    assert len(_rows(engine2, "worktree-opened")) == 1  # over both runs: reopened
+    assert _rows(engine2, "unit-merged")
     assert not _rows(engine2, "resume-restart")
 
 
@@ -16356,6 +16663,32 @@ def test_resume_with_epic_filter_stays_in_scoped_epic(project):
     assert "5-1-map" not in resumed.state.tasks
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "epic-boundary" not in kinds
+
+
+def test_replay_run_loop_processes_only_its_seeded_unit(project, monkeypatch):
+    """DW-525: a replay run (`RunState.replay_of` set, `unitreplay`) owns only the
+    unit `_finish_inflight` drives — `_loop` returns right after in-flight recovery,
+    so an actionable story on the board is never picked, no run-end retrospective or
+    auto-sweep runs, and `_run_inner` still records the run finished.
+
+    Ablation: delete the `replay_of` early return in `Engine._loop` and `_pick_next`
+    is called (and the story dispatched)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [])
+    engine.state.replay_of = "20260101-000000-beef"
+    picked, ends = [], []
+    real_pick = engine._pick_next
+    monkeypatch.setattr(engine, "_pick_next", lambda: picked.append(True) or real_pick())
+    monkeypatch.setattr(engine, "_run_end_retrospective", lambda: ends.append("retro"))
+    monkeypatch.setattr(engine, "_maybe_auto_sweep", lambda *a: ends.append("sweep"))
+
+    summary = engine.run()
+
+    assert picked == [] and ends == []
+    assert adapter.sessions == []
+    assert "1-1-a" not in engine.state.tasks
+    assert engine.state.finished and not summary.paused and not summary.crashed
+    assert "story-start" not in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
@@ -24807,15 +25140,20 @@ def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project,
     commit, and the spec/board finish at done."""
     engine, marker, baseline = _deferred_in_place(project, tmp_path)
     kinds = [e["kind"] for e in engine.journal.entries()]
-    # Which pause fired on the defer: NOT manual-recovery shape (c) but the
-    # owned-spec one — `_defer` stashes the spec into the run dir BEFORE its
-    # rollback, so `rollback_or_pause` finds the attempt-bound spec missing and
-    # pauses through `pause_for_owned_spec_recovery` (which tells the operator to
-    # reset — exactly what --reverify must steer them away from).
-    assert "rollback-owned-spec-manual-required" in kinds
-    assert "rollback-manual-required" not in kinds
-    assert "attempt-owned spec needs manual recovery" in engine.state.paused_reason
+    # Which pause fired on the defer: manual-recovery shape (c), committed work
+    # present (DW-528). The stash follows the rollback's decision, so the
+    # attempt-bound spec is still live when `rollback_or_pause` looks for it and
+    # the owned-spec pause never fires; the paused tree keeps the spec live.
+    assert "rollback-manual-required" in kinds
+    assert "rollback-owned-spec-unavailable" not in kinds
+    assert "rollback-owned-spec-manual-required" not in kinds
+    assert "deferred-artifacts-stashed" not in kinds
+    assert "manual recovery needed (committed work present)" in engine.state.paused_reason
     assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+    live = spec_path(project, "1-1-a")
+    assert live.is_file()
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert not stash.parent.exists() or list(stash.parent.iterdir()) == []  # nothing staged
 
     marker.write_text("up\n")  # the operator restarts the container
     runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
@@ -24843,10 +25181,89 @@ def test_reverify_deferred_in_place_story_commits_without_a_dev_session(project,
     assert [(e["verification_stage"], e["returncode"]) for e in replay] == [("dev", 0)]
 
 
+def test_in_place_defer_with_rollback_on_auto_recovers_and_stashes(project, tmp_path):
+    """DW-528, rollback ON: the same deferred in-place story auto-rolls back — its
+    commits parked, the bound spec restored — and the attempt's spec lands in the
+    run-dir stash. The run never pauses for owned-spec recovery.
+
+    Ablation, performed: stash the spec before `_rollback_or_pause` again (the old
+    `_defer` order) and the rollback finds the bound spec missing, journals
+    `rollback-owned-spec-unavailable` and pauses the run."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    policy = dataclasses.replace(_reverify_policy(marker), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt"),
+            _committing_dev(project, "1-1-a", "e2e-2.txt"),
+        ],
+        policy=policy,
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.preserve_ref is not None
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" in kinds and "deferred-artifacts-stashed" in kinds
+    assert "rollback-owned-spec-unavailable" not in kinds
+    assert "rollback-owned-spec-manual-required" not in kinds
+    assert "rollback-manual-required" not in kinds
+    live = spec_path(project, "1-1-a")
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert stash.is_file()
+    assert list(stash.parent.iterdir()) == [stash]  # no staging residue
+    # the rollback restored the attempt's pre-launch spec, and that stays live
+    assert live.is_file() and live.read_bytes() == task.dispatched_spec_snapshot
+
+
+def test_in_place_defer_fault_after_the_reset_still_lands_the_stash(project, tmp_path, monkeypatch):
+    """DW-528: the stash lands last, so a fault between the reset and that landing
+    (here the ledger reopen, whose write faults propagate) must not leave the
+    attempt's spec only as an unjournaled staging copy that `--reverify` cannot
+    find. The reset already replaced the live spec, so the copy is landed and
+    journaled on the way out.
+
+    Ablation, performed: drop the `except BaseException` arm around the ledger
+    repair in `_defer` and only `<name>.tmp` remains, with no stash row."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "container-up"
+    policy = dataclasses.replace(_reverify_policy(marker), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(
+        project,
+        [
+            _committing_dev(project, "1-1-a", "e2e-1.txt"),
+            _committing_dev(project, "1-1-a", "e2e-2.txt"),
+        ],
+        policy=policy,
+    )
+
+    def ledger_fault(task):
+        raise OSError("ledger write refused")
+
+    monkeypatch.setattr(engine, "_reopen_ledger_after_defer", ledger_fault)
+    assert engine.run().crashed
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" in kinds and "deferred-artifacts-stashed" in kinds
+    live = spec_path(project, "1-1-a")
+    stash = runs.deferred_stash_path(engine.run_dir, "1-1-a", live.name)
+    assert stash.is_file()
+    assert list(stash.parent.iterdir()) == [stash]  # no staging residue
+
+
 def test_reverify_runs_the_recommended_review(project, tmp_path):
     """DW-522: a passing replay hands the kept work to the review loop under normal
     policy — the dev result recommended a follow-up review, so exactly one review
-    session runs (and still no dev session) before the commit."""
+    session runs (and still no dev session) before the commit. The commit spends the
+    post-replay latch (DW-527), so a DONE task never carries it.
+
+    Ablation, performed: drop the `reverify_replayed` reset from
+    `_finalize_commit_phase` and the DONE task keeps `"deferred"`."""
     engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
     marker.write_text("up\n")
     runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
@@ -24856,7 +25273,135 @@ def test_reverify_runs_the_recommended_review(project, tmp_path):
     engine2.run()
 
     assert [s.role for s in adapter2.sessions] == ["review"]
-    assert engine2.state.tasks["1-1-a"].phase == Phase.DONE
+    task = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.reverify_replayed == ""
+
+
+def test_reverify_crash_mid_review_after_a_passing_replay_re_verifies(project, tmp_path):
+    """DW-527: the replay PROCEEDs, spending `reverify_from`, and the host dies
+    inside the review session it led to. The task is now neither DEFERRED nor
+    ESCALATED (so no second `--reverify` can be issued) and no review record exists,
+    so without the post-replay marker the resume falls to resume-restart — under
+    rollback OFF a manual-recovery pause over kept work. Instead the resume re-latches
+    the replay: verify runs again on the tree the dead session left, then exactly one
+    review session runs and the story commits.
+
+    Ablation, performed: delete the `elif task.reverify_replayed:` arm of
+    `Engine._finish_inflight` and the resume takes `resume-restart`, pauses for
+    manual recovery, and the story never reaches DONE."""
+    engine, marker, baseline = _deferred_in_place(project, tmp_path, followup_review=True)
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+
+    def crash_mid_review(spec):
+        (project.project / "half-review.txt").write_text("left by the dead review\n")
+        raise RuntimeError("host died mid-review")
+
+    engine2, adapter2 = resume_engine(project, engine, [crash_mid_review])
+    assert engine2.run().crashed
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    crashed = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_RUNNING
+    assert crashed.reverify_from == ""
+    assert crashed.reverify_replayed == "deferred"
+    assert not [s for s in crashed.sessions if s.role == "review"]
+    crashed_generation = crashed.generation
+
+    engine3, adapter3 = resume_engine(
+        project, engine2, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine3.run()
+
+    assert not summary.paused
+    assert [s.role for s in adapter3.sessions] == ["review"]  # no dev session
+    task = engine3.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.reverify_from == "" and task.reverify_replayed == ""
+    assert task.generation == crashed_generation + 1  # #705: no re-minted session id
+    assert task.review_cycle == 1
+    assert len(verify.commits_above(project.project, baseline)) == 1  # squashed
+    assert (project.project / "half-review.txt").is_file()  # re-verified, then kept
+    (post_replay,) = [e for e in _rows(engine3, "resume-reverify") if e.get("replay")]
+    assert post_replay["replay"] == "post-proceed" and post_replay["origin"] == "deferred"
+    decisions = _rows(engine3, "reverify-decision")
+    assert [d["action"] for d in decisions] == ["proceed", "proceed"]
+    assert not _rows(engine3, "resume-restart")
+
+
+def test_reverify_crash_mid_followup_review_gets_a_fresh_damping_grant(project, tmp_path):
+    """DW-527: the replayed review loop spends its damping grant (a finalized pass
+    recommending a follow-up), then the host dies inside that granted follow-up. The
+    post-replay arm opens a fresh review loop, so the re-run replay's first pass earns
+    the grant again: the follow-up review runs rather than being damped, and the
+    grant ends spent exactly once.
+
+    Ablation, performed: delete the arm's `followup_reviews_spent = 0` reset and the
+    resumed loop starts with the grant already spent, damps the follow-up
+    (`review-followup-damped`), and runs one review session, not two."""
+    engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+    policy = dataclasses.replace(
+        engine.policy,
+        limits=LimitsPolicy(max_dev_attempts=2, max_review_cycles=3, max_followup_reviews=1),
+    )
+
+    def crash_mid_review(spec):
+        raise RuntimeError("host died mid-follow-up")
+
+    engine2, adapter2 = resume_engine(
+        project,
+        engine,
+        [review_effect(project, "1-1-a", clean=False), crash_mid_review],
+        policy=policy,
+    )
+    assert engine2.run().crashed
+    assert [s.role for s in adapter2.sessions] == ["review", "review"]
+    crashed = load_state(engine2.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_RUNNING and crashed.review_cycle == 2
+    assert crashed.followup_reviews_spent == 1 and crashed.reverify_replayed == "deferred"
+
+    engine3, adapter3 = resume_engine(
+        project,
+        engine2,
+        [review_effect(project, "1-1-a", clean=False), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    assert engine3.run().done == 1
+
+    assert [s.role for s in adapter3.sessions] == ["review", "review"]  # the granted follow-up
+    task = engine3.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.review_cycle == 2
+    assert task.followup_reviews_spent == 1
+    assert not _rows(engine3, "review-followup-damped")
+    assert not _rows(engine3, "resume-restart")
+
+
+def test_reverify_post_replay_re_run_that_fails_re_defers_and_clears_marker(project, tmp_path):
+    """DW-527: the re-latched replay is an ordinary replay — when verify now fails
+    (the container went down again while the run was dead), a DEFERRED origin
+    re-defers without a session and the post-replay marker is spent with it."""
+    engine, marker, _ = _deferred_in_place(project, tmp_path, followup_review=True)
+    marker.write_text("up\n")
+    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
+
+    def crash_mid_review(spec):
+        raise RuntimeError("host died mid-review")
+
+    engine2, _ = resume_engine(project, engine, [crash_mid_review])
+    assert engine2.run().crashed
+    marker.unlink()
+
+    engine3, adapter3 = resume_engine(project, engine2, [])
+    engine3.run()
+
+    assert adapter3.sessions == []
+    task = load_state(engine3.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.reverify_from == "" and task.reverify_replayed == ""
+    assert [d["action"] for d in _rows(engine3, "reverify-decision")] == ["proceed", "defer"]
+    assert not _rows(engine3, "resume-restart")
 
 
 def test_reverify_with_the_environment_still_down_re_defers_without_a_session(project, tmp_path):
