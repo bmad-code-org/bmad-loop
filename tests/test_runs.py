@@ -35,7 +35,7 @@ from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import RunState, StoryTask
+from bmad_loop.model import Phase, RunState, StoryTask
 from bmad_loop.process_host import ProcessHost
 
 
@@ -4167,6 +4167,22 @@ def test_adopt_clears_env_fault_site(tmp_path):
     assert task.env_fault_site is None
 
 
+def test_adopt_clears_a_post_replay_marker(tmp_path):
+    """DW-527: the adopted branch is finalized as-is, so a `--reverify`
+    continuation's post-replay marker must not survive onto the COMMITTING task.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `adopt_escalated_branch` and this reddens."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_replayed = "escalated"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
+
+
 def _adoptable(tmp_path):
     """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
     wt = tmp_path / "wt"
@@ -4677,6 +4693,24 @@ def test_rearm_clears_a_stale_reverify_latch(tmp_path):
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
+
+
+def test_rearm_clears_a_post_replay_marker(tmp_path):
+    """DW-527: a `--reverify` continuation that escalated in review leaves
+    `reverify_replayed` on the escalated task. A plain re-arm re-implements from the
+    baseline, so it clears the marker; left set, a mid-review crash of the re-drive
+    would re-latch a verify replay instead of taking resume-restart.
+
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
+    reddens on the surviving marker."""
+    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_replayed = "deferred"
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
 
 
 # --------------------------------------------- #90: abandoned restore-latch residue
@@ -9918,6 +9952,25 @@ def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     assert _reverify_rows(run_dir)[0]["origin"] == "escalated"
 
 
+def test_rearm_for_reverify_clears_a_prior_post_replay_marker(tmp_path):
+    """DW-527: a prior replay's post-PROCEED marker belongs to that continuation;
+    the new re-arm latches `reverify_from` and clears the marker.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `_rearm_for_reverify_locked` and this reddens."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.reverify_replayed = "escalated"
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.reverify_from == "deferred" and task.reverify_replayed == ""
+
+
 def test_rearm_for_reverify_skips_plugin_workflow_sessions(tmp_path):
     """A plugin workflow declaring `role = "dev"` (a post_dev_phase or
     pre_commit_gate gate) is recorded under the dev role with no result payload;
@@ -9957,6 +10010,45 @@ def test_rearm_for_reverify_restores_the_stashed_spec_byte_exact(tmp_path):
     row = _reverify_rows(run_dir)[0]
     assert row["spec_restored"] is True
     assert row["spec_file"] == str(spec_path)
+
+
+def test_rearm_for_reverify_restores_from_a_staged_copy_whose_landing_failed(tmp_path):
+    """DW-528: `Engine._defer` stages the spec beside its stash target before the
+    rollback and lands it after. When that landing fails after the reset took the live
+    spec, the staged copy is kept as the attempt's only version; the refusal gate
+    accepts it and the re-arm restores the spec from it, byte-exact.
+
+    Ablation, performed: read only the landed stash in `_deferred_stash_source` and
+    the re-arm refuses with "neither at"."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    stash.rename(staged)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert staged.read_bytes() == _REVERIFY_SPEC_BYTES  # kept, like a landed stash
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
+
+
+def test_rearm_for_reverify_prefers_a_failed_landing_over_an_older_stash(tmp_path):
+    """A story that defers twice can hold the first defer's landed stash beside the
+    second defer's staged copy, kept because its landing failed after the reset. The
+    staged copy is the newer attempt, so the re-arm restores from it.
+
+    Ablation, performed: check the landed stash first in `_deferred_stash_source`
+    and the older stash's bytes are restored."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    staged.write_bytes(_REVERIFY_SPEC_BYTES)
+    stash.write_bytes(b"---\nstatus: in-review\n---\nthe first defer's copy\n")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
 
 
 def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
@@ -10189,6 +10281,214 @@ def test_rearm_for_reverify_locked_body_holds_the_run_lock_through_save(tmp_path
     monkeypatch.setattr(runs, "save_state", checked_save)
 
     runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+
+# --------------------------- standalone_replay_refusal: finished runs (DW-525)
+
+
+def _finished_mounted_run(tmp_path):
+    """`_reverify_run`'s attempt moved into a kept worktree unit of a FINISHED
+    isolated run: a registered worktree on the unit branch under the run dir, holding
+    a committed change above the baseline and the spec — the shape a deferred unit
+    leaves behind under `scm.keep_failed`. Returns (run_dir, project, worktree)."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = run_dir / "worktrees" / _REVERIFY_KEY
+    wt.parent.mkdir(parents=True)
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit or "")
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / _REVERIFY_SPEC_REL
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes(_REVERIFY_SPEC_BYTES)
+    _write_board(project, "review")
+    task.worktree_path = str(wt)
+    task.branch = branch
+    state.clear_pause()
+    state.finished = True
+    state.target_branch = "main"
+    save_state(run_dir, state)
+    return run_dir, project, wt
+
+
+def _write_board(project, status):
+    """The main checkout's sprint board, holding `_REVERIFY_KEY` at `status`."""
+    board = project / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
+    board.write_text(
+        f"development_status:\n  epic-1: in-progress\n  {_REVERIFY_KEY}: {status}\n",
+        encoding="utf-8",
+    )
+    return board
+
+
+def _standalone_refusal(run_dir, project):
+    state = load_state(run_dir)
+    return runs.standalone_replay_refusal(
+        state,
+        state.tasks[_REVERIFY_KEY],
+        _REVERIFY_KEY,
+        run_dir=run_dir,
+        project_root=project,
+    )
+
+
+def test_standalone_replay_admits_a_finished_runs_kept_unit(tmp_path):
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def _remove_worktree(run_dir, project):
+    wt = Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path)
+    git(project, "worktree", "remove", "--force", str(wt))
+
+
+def _detach_worktree(run_dir, _project):
+    git(Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path), "checkout", "-q", "--detach")
+
+
+# Each row: (id, arrange, expected refusal fragment). The first six gate the shape
+# only a finished isolated story run can hand over; the rest are the shared
+# `_reverify_task_refusal` / `_mounted_reverify_refusal` arms, reached with the
+# finished-run remedy.
+_STANDALONE_REFUSALS = [
+    ("not_finished", _state_edit(lambda s, _t: setattr(s, "finished", False)), "is not finished"),
+    ("sweep_run", _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")), "sweep run"),
+    ("stories_mode", _state_edit(lambda s, _t: setattr(s, "source", "stories")), "stories-mode"),
+    (
+        "not_deferred",
+        _state_edit(lambda _s, t: setattr(t, "phase", Phase.DONE)),
+        "is not deferred (phase: done)",
+    ),
+    ("in_place", _state_edit(lambda _s, t: setattr(t, "worktree_path", "")), "deferred in place"),
+    (
+        "no_target_branch",
+        _state_edit(lambda s, _t: setattr(s, "target_branch", "")),
+        "no target branch",
+    ),
+    (
+        "no_completed_dev_result",
+        _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
+        "no completed dev session result",
+    ),
+    (
+        "plan_review_owed",
+        _state_edit(lambda _s, t: setattr(t, "plan_review_owed", True)),
+        "still owes a plan review",
+    ),
+    ("worktree_gone", _remove_worktree, "is gone"),
+    ("detached", _detach_worktree, "detached HEAD"),
+]
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [pytest.param(*row[1:], id=row[0]) for row in _STANDALONE_REFUSALS],
+)
+def test_standalone_replay_refuses(tmp_path, arrange, fragment):
+    """Every refusal row names its reason; none tells the operator to run a bare
+    `bmad-loop resolve <run>` (resolve refuses a finished run) — the remedy points at
+    recovering the work by hand.
+
+    Ablation: delete the `wt.is_dir()` check in `runs._mounted_reverify_refusal` and
+    the worktree-gone row fails (it falls to the registration check's message);
+    delete the `current_branch` check there and the detached row is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    arrange(run_dir, project)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and fragment in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+def test_standalone_replay_remedy_names_the_branch_and_saved_patch(tmp_path):
+    """A torn-down unit's refusal points at the branch and the diff the teardown
+    saved, not at a re-arm."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    patch = run_dir / "failed" / _REVERIFY_KEY / "changes.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff\n", encoding="utf-8")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert "recover the work by hand" in refusal
+    assert f"bmad-loop/r1/{_REVERIFY_KEY}" in refusal and str(patch) in refusal
+
+
+def test_standalone_replay_refusal_says_an_unreadable_journal_skipped_the_handoff_check(
+    tmp_path,
+):
+    """An undecodable journal cannot rule out an earlier replay hand-off, so a
+    torn-down-unit refusal says so rather than passing for a plain teardown.
+
+    Ablation: drop the `entries is None` clause in `runs.standalone_replay_refusal`
+    and the refusal no longer mentions the journal."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    with (run_dir / "journal.jsonl").open("ab") as f:
+        f.write(b"\xff\xfe not utf-8\n")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and "is gone" in refusal
+    assert "journal could not be read" in refusal
+
+
+@pytest.mark.parametrize("status", ["backlog", "in-progress", "review", "awaiting-operator"])
+def test_standalone_replay_admits_a_story_not_done_on_the_board(tmp_path, status):
+    """Only a done row refuses (DW-533); any earlier row leaves the replay admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, status)
+
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def test_standalone_replay_refuses_a_story_already_done_on_the_board(tmp_path):
+    """A later run re-drove and finished the story, so the kept unit is superseded work
+    a replay must not merge (DW-533).
+
+    Ablation: delete the `board_status == "done"` check in
+    `runs.standalone_replay_refusal` and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, "done")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"story {_REVERIFY_KEY} is already done on the sprint board" in refusal
+    assert "recover the work by hand" in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda board: board.unlink(), id="missing"),
+        pytest.param(lambda board: board.write_bytes(b"\xff\xfe not utf-8\n"), id="undecodable"),
+        pytest.param(lambda board: board.write_text("[1, 2]\n", encoding="utf-8"), id="no-map"),
+    ],
+)
+def test_standalone_replay_refuses_when_the_board_cannot_be_read(tmp_path, corrupt):
+    """A board that cannot be read cannot rule out a done row, so the replay fails
+    closed with a refusal naming the board (DW-533).
+
+    Ablation: make the `except` arm in `runs.standalone_replay_refusal` fall through
+    and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    board = _write_board(project, "review")
+    corrupt(board)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"cannot read the sprint board at {board}" in refusal
+    assert "recover the work by hand" in refusal
 
 
 # ------------------------------------- by-name operations in a shared registry (#729)

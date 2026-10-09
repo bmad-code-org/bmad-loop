@@ -973,15 +973,15 @@ def make_dev_adapter(tmp_path, profile_name="claude", policy=None, mux=None):
 
 
 def test_artifact_dirs_is_identity_in_place_under_a_nested_repo_root(tmp_path):
-    """DW-379, `isolation = "none"` beside a nested `repo_root:` override: the session
-    cwd is the CODE root `<repo>`, while the project (and its artifacts) sit at
-    `<repo>/app`. `_artifact_dirs(cwd)` rebases onto that cwd, which must be the
-    identity in place — the scan searches the project's REAL implementation-artifacts
-    dir, and only it.
+    """DW-379/DW-484, `isolation = "none"` beside a nested `repo_root:` override: the
+    code root is `<repo>`, while the project (its artifacts, and the session cwd)
+    sit at `<repo>/app`. `_artifact_dirs(cwd)` rebases onto that cwd as the mount
+    project, which must be the identity in place — the scan searches the project's
+    REAL implementation-artifacts dir, and only it.
 
-    Ablation: restore the pre-DW-379 `project=new_root` in `ProjectPaths.rebased` and
-    this fails — the primary becomes `<repo>/_bmad-output/impl`, the OUTER tree's
-    path, with the real dir demoted to the fallback."""
+    Ablation: read the cwd as the code root again (`self.paths.rebased(cwd)`, the
+    pre-DW-484 form) and this fails — the primary becomes `<repo>/app/app/...`, with
+    the real dir demoted to the fallback."""
     repo = tmp_path / "repo"
     app = repo / "app"
     impl = app / "_bmad-output" / "impl"
@@ -1000,7 +1000,38 @@ def test_artifact_dirs_is_identity_in_place_under_a_nested_repo_root(tmp_path):
         mux=_UnitMux(),
     )
 
-    assert adapter._artifact_dirs(repo) == [impl]
+    assert adapter._artifact_dirs(app) == [impl]
+
+
+def test_artifact_dirs_never_scans_the_main_checkout_from_a_worktree_mount(tmp_path):
+    """DW-484, worktree isolation under a nested `repo_root:`: the session cwd is the
+    mount project `<worktree>/app`, so the scan reads the mount's rebased artifacts
+    dir and nothing else. The main checkout's dir is never where the session writes;
+    a marker another writer drops there after launch would otherwise be read back as
+    this session's result.
+
+    Ablation, performed: re-append the configured dir as a fallback and the scan
+    lists the main checkout's `impl` second."""
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    impl = app / "_bmad-output" / "impl"
+    impl.mkdir(parents=True)
+    mount = tmp_path / "wt" / "app"
+    paths = ProjectPaths(
+        project=app,
+        implementation_artifacts=impl,
+        planning_artifacts=app / "_bmad-output" / "plan",
+        repo_root=repo,
+    )
+    adapter = GenericDevAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        paths=paths,
+        mux=_UnitMux(),
+    )
+
+    assert adapter._artifact_dirs(mount) == [(mount / "_bmad-output" / "impl").resolve()]
 
 
 class _ScriptedWatcher:
@@ -1272,14 +1303,16 @@ def test_stories_readback_resolves_by_id_not_mtime_scan(tmp_path, monkeypatch):
 
 
 def test_stories_readback_anchors_on_the_project_under_a_nested_repo_root(tmp_path):
-    """DW-379: `BMAD_LOOP_SPEC_FOLDER` is project-relative and
+    """DW-379/DW-484: `BMAD_LOOP_SPEC_FOLDER` is project-relative and
     `StoriesEngine._stories_folder` joins it on the project, so with a nested
-    `repo_root` (session cwd = the code root `<repo>`, the project `<repo>/app`) the
-    read-back must look under `<cwd>/app/<folder>` — the same place the engine reads.
-    An outer-tree decoy at `<cwd>/<folder>` is planted to separate the two by value.
+    `repo_root` (the code root `<repo>`, the project and session cwd `<repo>/app`)
+    the read-back must look under `<cwd>/<folder>` — the same place the engine
+    reads. A decoy at `<cwd>/app/<folder>` (where re-joining the project's offset
+    onto the cwd lands) and one in the outer tree separate the anchors by value.
 
-    Ablation: anchor a relative folder on `spec.cwd` again and this reddens on the
-    decoy's baseline."""
+    Ablation: anchor a relative folder on
+    `rebased_project(project, repo_root, spec.cwd)` again (the pre-DW-484 reading
+    of the cwd as the code root) and this reddens on the nested decoy's baseline."""
     repo = tmp_path / "repo"
     app = repo / "app"
     impl = app / "_bmad-output" / "impl"
@@ -1299,8 +1332,9 @@ def test_stories_readback_anchors_on_the_project_under_a_nested_repo_root(tmp_pa
     done = "---\nstatus: done\nbaseline_revision: {}\n---\n\n## Auto Run Result\n\nStatus: done\n"
     _write_story_spec(app, "1", "real", done.format("projectbase"))
     _write_story_spec(repo, "1", "decoy", done.format("outerbase"))
+    _write_story_spec(app / "app", "1", "decoy", done.format("nestedbase"))
 
-    rj = adapter._result_json(_dev_handle(), _stories_spec(repo), wait=True)
+    rj = adapter._result_json(_dev_handle(), _stories_spec(app), wait=True)
 
     assert rj is not None and rj["baseline_commit"] == "projectbase"
 

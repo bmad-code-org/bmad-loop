@@ -15,10 +15,10 @@ TOP-LEVEL key; every other key, and key order, is preserved. The write is atomic
 symlinked settings file followed) and leaves no lock or temp file beside it.
 
 **Root-trust rule.** ``.bmad-loop/profiles/*.toml`` arrives with a clone, so a
-declared home path is untrusted input. A worktree is seeded ONLY when the main
-checkout root (the in-place session cwd) is already in the same list, under its
-as-passed or resolved spelling: the worktree inherits trust the operator granted
-and never creates trust from nothing. Root not trusted, or file/key missing, is
+declared home path is untrusted input. A worktree's mount project (its session
+cwd, DW-484) is seeded ONLY when the main project (the in-place session cwd) is
+already in the same list, under its as-passed or resolved spelling: the worktree
+inherits trust the operator granted and never creates trust from nothing. Root not trusted, or file/key missing, is
 a reported outcome (the caller journals it), not a fault.
 
 **Faults.** A malformed file (not JSON, not an object, the key present but not a

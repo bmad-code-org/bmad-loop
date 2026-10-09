@@ -95,6 +95,7 @@ from .runs import (
     clear_graceful_stop,
     consume_stop_request,
     deferred_stash_path,
+    deferred_stash_staged_path,
     drain_refused_kills,
     events_dir_for,
     graceful_stop_requested,
@@ -702,6 +703,17 @@ class _ArmedClose(NamedTuple):
     ledger: Path
     ids: tuple[str, ...]
     exact: bool
+
+
+class _StagedStash(NamedTuple):
+    """A deferred spec copied into the run dir but not yet landed (DW-528).
+
+    ``staged`` is the copy beside ``target`` in the stash dir; ``spec`` is the live
+    spec it was copied from, left in place for the rollback to judge."""
+
+    spec: Path
+    staged: Path
+    target: Path
 
 
 class _LedgerAnchor(StrEnum):
@@ -1566,6 +1578,12 @@ class Engine:
     def _loop(self) -> None:
         self._finish_inflight()
         self._clear_accept_baseline()
+        if self.state.replay_of:
+            # DW-525: a replay run (`unitreplay`) owns only its seeded unit, which
+            # `_finish_inflight`'s reverify arm just drove — no `_pick_next`, no
+            # run-end retrospective, no auto-sweep. `_run_inner` still GCs, runs the
+            # DW-386 escalation check and records `finished`.
+            return
         while True:
             # First statement of the loop body: one site covers every story
             # boundary this base loop reaches — between stories, right after
@@ -2376,9 +2394,10 @@ class Engine:
                 # attempt, the baseline, or anything else moved — so NO rollback:
                 # the tree (and any commit the operator made while paused) is the
                 # one the story starts from. The story gate was asked above, before
-                # the site cleared. A review-dispatch pause needs no arm of its own:
-                # it sits at DEV_VERIFY + spec_file (first cycle) or at
-                # REVIEW_VERIFY with the completed pass on record (later cycles).
+                # the site cleared. A review-dispatch pause at DEV_VERIFY + spec_file
+                # (first cycle) or at REVIEW_VERIFY with the completed pass on record
+                # resumes through the spec-approval or completed-pass replay arms;
+                # the remaining REVIEW_VERIFY shape has its own arm below (DW-529).
                 self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
                 if mounted:
                     unit = self._reopen_unit(task)
@@ -2392,6 +2411,70 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._drive_story(task)
+            elif env_role == "review" and task.phase == Phase.REVIEW_VERIFY:
+                # DW-529: the review loop paused at its dispatch gate after a cycle
+                # whose pass did not complete (a crashed/stalled session the decision
+                # retried), so the completed-pass replay arm above found nothing to
+                # replay. As with the dev dispatch arm, nothing ran past the pause:
+                # no rollback — re-enter the loop, whose gate dispatches the next
+                # cycle (REVIEW_VERIFY -> REVIEW_RUNNING is legal). No damping spend
+                # is pending: only a completed pass earns one. The loop is already
+                # running, so its entry gate is not re-asked (DW-531).
+                self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._review_and_commit(task, resumed_loop=True)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._review_and_commit(task, resumed_loop=True)
+            elif task.reverify_replayed:
+                # DW-527: a `resolve --reverify` replay PROCEEDed, then the host died
+                # mid-review/fix of that continuation. The task is neither DEFERRED
+                # nor ESCALATED, so the operator cannot issue the second `--reverify`
+                # this arm stands in for; it reproduces that re-arm's counter and
+                # generation resets (fresh review loop, bumped generation so the reset
+                # cycle never re-mints the crashed session's id — #705). The other
+                # latches that re-arm clears cannot be set on a task reaching here: the
+                # mounted defer arm, the COMMITTING arm and dispatch-site consumption
+                # all precede this arm, and an in-place `_defer` advances to DEFERRED
+                # before any save. It then re-runs the verify replay, which
+                # re-vouches for whatever tree the dead session left before any
+                # review. Saved after the re-latch, so the next crash lands on the
+                # ordinary reverify arm above. Every earlier finishing arm
+                # (spec-approval, completed-pass replay, COMMITTING) still wins.
+                origin = task.reverify_replayed
+                self.journal.append(
+                    "resume-reverify",
+                    story_key=task.story_key,
+                    origin=origin,
+                    replay="post-proceed",
+                )
+                task.phase = Phase.DEV_VERIFY  # deliberate reset, not a normal transition
+                task.reverify_from = origin
+                task.reverify_replayed = ""
+                task.generation += 1
+                task.review_cycle = 0
+                task.followup_reviews_spent = 0
+                task.salvage_refile_pending = False
+                self._save()
+                if mounted:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._resume_reverify(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._release_orphaned_mount(task)
+                    self._resume_reverify(task)
             else:
                 # This arm is the one that does not finish work: it discards the
                 # worktree or resets the tree to baseline and re-runs the story
@@ -3545,7 +3628,11 @@ class Engine:
             task.spec_file = str(spec_path)
 
     def _review_and_commit(
-        self, task: StoryTask, resume_result: SessionResult | None = None
+        self,
+        task: StoryTask,
+        resume_result: SessionResult | None = None,
+        *,
+        resumed_loop: bool = False,
     ) -> None:
         # A replayed REVIEW result finalized at `awaiting-operator` under
         # on_review_demotion = "park" is a review demotion (DW-383), not a dev park
@@ -3582,8 +3669,18 @@ class Engine:
         # scored the flag; kept as the orchestrator-side bound): once the damping
         # grant is spent, such a round converges + refiles instead of burning
         # cycles to the outer cap.
+        #
+        # The gate decides whether to START the loop, so it applies only on a fresh
+        # entry (DW-531). A resume that re-enters a loop already in progress — the
+        # completed-pass replay (`resume_result`) or a caller passing `resumed_loop`
+        # (the DW-529 review dispatch arm, a post-fix DEV_VERIFY resume) — carries
+        # the last pass's flag, which the uninterrupted loop never re-checks: a
+        # done/followup-False pass whose verify gate failed fixably re-reviews
+        # after its fix, and a non-terminal pass loops regardless of the flag.
         if (
-            self.policy.review.trigger == "recommended"
+            resume_result is None
+            and not resumed_loop
+            and self.policy.review.trigger == "recommended"
             and not task.followup_review_recommended
             and not task.salvage_refile_pending
         ):
@@ -4496,6 +4593,9 @@ class Engine:
             task.restore_patch = None
             # An adopted branch (DW-386) is likewise committed; its latch is spent.
             task.adopt_pending = False
+            # So is a replay continuation (DW-527): the post-replay resume arm
+            # re-latches only a continuation that has not committed yet.
+            task.reverify_replayed = ""
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
         except verify.GitError as e:
@@ -4753,8 +4853,8 @@ class Engine:
         ``dev_primitive_or_default`` maps to the legacy name.
 
         Resolved against the WORKSPACE, never the main checkout: the session runs
-        with ``cwd=self.workspace.root``, so the tree deciding whether the spelled
-        name is a command at all is the worktree's. The two agree on a freshly
+        with ``cwd=self.workspace.paths.project``, so the tree deciding whether the
+        spelled name is a command at all is the worktree's. The two agree on a freshly
         provisioned unit — ``provision_worktree`` copies the primitive in from the
         main repo — but NOT on resume: ``reopen_unit`` re-mounts an existing
         worktree without re-provisioning it, so a main checkout upgraded across the
@@ -6733,10 +6833,21 @@ class Engine:
         """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
         Base: the spec-approval-gate resume — run the review loop + commit.
         StoriesEngine overrides this to re-drive the implement leg of a
-        plan-checkpoint-paused story (leg-2) instead."""
+        plan-checkpoint-paused story (leg-2) instead.
+
+        A spent review cycle means the DEV_VERIFY being resumed is a fix-phase
+        repair inside the review loop whose next step the host died before
+        launching (no dispatch pause lands there: the fix's verify preflight
+        leaves the probes fresh), so the loop is re-entered past its entry gate
+        (DW-531). A green fix gets the re-review it owed. A failed fix with budget
+        left resumes into a review of the failing tree, whose verify gate then
+        routes back to repair: one extra pass, the same as with the flag set.
+        Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
+        re-drive. That re-drive keeps its counters and so reviews once instead of
+        skipping, which is the conservative direction."""
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
-        self._review_and_commit(task)
+        self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
 
     def _resume_reverify(self, task: StoryTask) -> None:
         """Replay dev verification against the kept attempt product (DW-522).
@@ -6755,11 +6866,17 @@ class Engine:
         action makes persists it cleared: a crash mid-defer then replays through
         the defer arm, never through a second verify replay. The accepted-session
         latch is deliberately not stamped: the generation the re-arm bumped means
-        no record matches the current attempt, and story runs never read it."""
+        no record matches the current attempt, and story runs never read it.
+
+        A PROCEED leaves `reverify_replayed` set to the origin in the same save that
+        spends the latch (DW-527): a host death mid-review/fix of the continuation then
+        re-latches the replay through `_finish_inflight`'s post-replay arm instead of
+        falling to resume-restart. Every other outcome clears it."""
         origin = task.reverify_from
         record = latest_completed_dev_record(task)
         if record is None or record.result_json is None:
             task.reverify_from = ""
+            task.reverify_replayed = ""
             self._escalate(task, "reverify: no completed dev result to re-verify")
             return
         result_json = record.result_json
@@ -6793,6 +6910,7 @@ class Engine:
             verification_sequence=verified.sequence,
         )
         task.reverify_from = ""
+        task.reverify_replayed = origin if decision.action == Action.PROCEED else ""
         if decision.action == Action.PROCEED:
             self._save()
             self._emit("post_dev_phase", task)
@@ -8058,7 +8176,8 @@ class Engine:
 
             # The marker path lands in the same implementation-artifacts dir the
             # dev adapter already searches — correct in place and under worktree
-            # isolation alike, because spec.cwd is self.workspace.root either way.
+            # isolation alike, because spec.cwd is self.workspace.paths.project
+            # either way.
             # This is the PRODUCER of the marker name. ``role``, not the default:
             # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
             # runs on THAT adapter, whose skill tree can be a different one at a
@@ -8084,7 +8203,12 @@ class Engine:
             task_id=task_id,
             role=role,
             prompt=prompt,
-            cwd=self.workspace.root,
+            # The mount project, not the checkout root: every coding CLI discovers
+            # its hook config and skill tree from its cwd (or upward from it), and
+            # provisioning and `init` put them in the project, which a nested
+            # `repo_root:` puts BELOW the root — from there no probed CLI loaded the
+            # Stop relay (DW-484). Code and git work still answer to the root.
+            cwd=self.workspace.paths.project,
             env=env,
             model=cfg.model,
             effort=cfg.effort,
@@ -9251,7 +9375,12 @@ class Engine:
             return
         advance(task, Phase.DEFERRED)
         if task.baseline_commit:
-            self._stash_deferred_artifacts(task)
+            # The stash follows the rollback's decision (DW-528). Moving the spec out
+            # first left an attempt-bound spec missing, so `rollback_or_pause` paused
+            # on owned-spec recovery whatever `rollback_on_failure` said. Only a copy
+            # is staged now — a reset that deletes the spec cannot take the work with
+            # it — and the live spec stays for the rollback to judge.
+            staged = self._stage_deferred_stash(task)
             deferred_work = self.workspace.paths.deferred_work
             # REPAIR/WRITE (DW-146), absence preserved: this snapshot is the input
             # to `_restore_defer_ledger`, so a snapshot taken from bytes nobody
@@ -9280,11 +9409,14 @@ class Engine:
                 # Narrow, deliberate catch of the unwind-to-the-top pause (#342):
                 # the pause already persisted Phase.DEFERRED (terminal), so resume
                 # will never re-enter this method — the defer record is emitted
-                # now or never. Every pause path fires BEFORE safe_reset, so the
-                # tree is untouched: the standard recovery note's parked/destroyed
-                # claims would be wrong here — the ACTION REQUIRED notice just
-                # above this one in ATTENTION is the authoritative pointer.
-                # Re-raised untouched: the run still pauses.
+                # now or never. A pause fires before the reset the recovery note
+                # describes, so its parked/destroyed claims would be wrong here —
+                # the ACTION REQUIRED notice just above this one in ATTENTION is the
+                # authoritative pointer. Re-raised untouched: the run still pauses.
+                # The spec normally stays live, so the staged stash copy is dropped;
+                # a pause after a post-reset spec restore is why the discard
+                # compares bytes before dropping it.
+                self._discard_deferred_stash(task, staged)
                 self._record_defer(
                     task,
                     reason,
@@ -9293,6 +9425,9 @@ class Engine:
                     "attempt's work is); if only the environment was broken, `bmad-loop "
                     f"resolve {self.state.run_id} --reverify` re-verifies the kept work",
                 )
+                raise
+            except BaseException:
+                self._discard_deferred_stash(task, staged)
                 raise
             # The reset reverts a *tracked* ledger's uncommitted edits, so the
             # review-found entries it erased are real knowledge worth putting
@@ -9304,13 +9439,22 @@ class Engine:
             # that landed BEFORE the reset is the reset's casualty, not the
             # restore's: the snapshot predates both, so nothing here can tell
             # that write apart from the session's own erased edits.
-            if snapshot is not None:
-                self._restore_defer_ledger(task, snapshot)
-            # The restore deliberately keeps review-found ledger knowledge, but
-            # it also replays this bundle's accepted close after the code was
-            # discarded. Let the mode undo only the close it can identify as its
-            # own; the base path has no bundle close and is a no-op.
-            self._reopen_ledger_after_defer(task)
+            try:
+                if snapshot is not None:
+                    self._restore_defer_ledger(task, snapshot)
+                # The restore deliberately keeps review-found ledger knowledge, but
+                # it also replays this bundle's accepted close after the code was
+                # discarded. Let the mode undo only the close it can identify as its
+                # own; the base path has no bundle close and is a no-op.
+                self._reopen_ledger_after_defer(task)
+            except BaseException:
+                # The reset already ran: the staged copy may be the attempt's only
+                # version, so it must not stay behind as an unjournaled `.tmp`.
+                self._discard_deferred_stash(task, staged)
+                raise
+            # Last, so a stash fault after the reset cannot cost the ledger repair
+            # above: the snapshot it restores from exists only in memory.
+            self._finish_deferred_stash(task, staged)
         self._record_defer(task, reason)
 
     def _restore_defer_ledger(self, task: StoryTask, snapshot: str) -> None:
@@ -10343,10 +10487,32 @@ class Engine:
             status=landed,
         )
 
-    def _stash_deferred_artifacts(self, task: StoryTask) -> None:
-        """Move the deferred story's spec out of the artifacts dir into the run
-        dir: a leftover in-review spec would confuse the next attempt, but the
-        work in it is worth keeping for the human.
+    def _stage_deferred_stash(self, task: StoryTask) -> _StagedStash | None:
+        """First half of moving a deferred story's spec out of the artifacts dir into
+        the run dir: a leftover in-review spec would confuse the next attempt, but
+        the work in it is worth keeping for the human. None when there is no spec.
+
+        Only a copy is made, beside the stash target, and the live spec and any
+        earlier stash of it stay untouched. `_defer` stages before its rollback,
+        so a reset that deletes the spec cannot take the work with it, then hands
+        the copy to `_finish_deferred_stash` once the rollback completes or to
+        `_discard_deferred_stash` when it pauses (DW-528). Staging inside the
+        stash dir keeps the later replace same-filesystem, preserving
+        `shutil.move`'s cross-device tolerance."""
+        if not task.spec_file:
+            return None
+        spec_path = Path(task.spec_file)
+        if not spec_path.is_file():
+            return None
+        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = deferred_stash_staged_path(target)
+        shutil.copy2(spec_path, tmp)
+        return _StagedStash(spec_path, tmp, target)
+
+    def _land_deferred_stash(self, task: StoryTask, staged: _StagedStash) -> bytes:
+        """`atomic_replace` the staged copy onto its stash target, journal it, and
+        return the stashed bytes.
 
         A story that defers twice re-stashes the same filename, so the target may
         exist. `shutil.move` survived that on Windows only by accident: `os.rename`
@@ -10355,39 +10521,64 @@ class Engine:
         (#101) — it re-fails outright when an AV/indexer handle turns the rename into
         a sharing violation (WinError 5/32) and `copy2` then cannot open the same
         locked target, and it is non-atomic, so a crash mid-copy leaves a truncated
-        stash. Staging a copy inside `dest` and `atomic_replace`-ing it onto the
-        target overwrites in one step, carries #98's win32 retry, and — because the
-        staging copy lives in `dest` — keeps the replace same-filesystem, preserving
-        `shutil.move`'s cross-device tolerance.
+        stash. The replace overwrites in one step and carries #98's win32 retry.
 
-        Both halves of the move are retried: Windows denies a delete against an open
-        handle just as it denies a rename-over, so an unretried `unlink` would fail
-        the run on the very hazard the replace now rides out. The order is
-        replace-then-unlink because `_defer` calls this before the rollback and the
-        `story-deferred` journal append — a failure here aborts the deferral, so it
-        must be able to leave a duplicate spec, never a hole where the work was."""
-        if not task.spec_file:
-            return
-        spec_path = Path(task.spec_file)
-        if not spec_path.is_file():
-            return
-        target = deferred_stash_path(self.run_dir, task.story_key, spec_path.name)
-        dest = target.parent
-        dest.mkdir(parents=True, exist_ok=True)
-        tmp = dest / (spec_path.name + ".tmp")
-        shutil.copy2(spec_path, tmp)
+        On failure the staged copy is dropped only while the live spec still holds
+        the same work: after a reset it may be the only copy left, and a stash must
+        be able to leave a duplicate spec, never a hole where the work was. A kept
+        copy is what `runs.rearm_for_reverify` restores the spec from when the
+        landed stash is absent."""
         try:
-            atomic_replace(tmp, target)
+            stashed = staged.staged.read_bytes()
+            atomic_replace(staged.staged, staged.target)
         except BaseException:
-            with contextlib.suppress(OSError):  # the copy is disposable; keep the real error
-                tmp.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                if staged.spec.read_bytes() == staged.staged.read_bytes():
+                    staged.staged.unlink(missing_ok=True)
             raise
-        retrying_unlink(spec_path)
         self.journal.append(
             "deferred-artifacts-stashed",
             story_key=task.story_key,
-            stashed_to=str(target),
+            stashed_to=str(staged.target),
         )
+        return stashed
+
+    def _finish_deferred_stash(self, task: StoryTask, staged: _StagedStash | None) -> None:
+        """Land a staged copy and take the attempt's spec out of the artifacts dir.
+
+        The live spec is unlinked only while it still holds the staged bytes. After
+        a rollback, different bytes are something the rollback put back (a tracked
+        spec reset to its baseline, or an attempt-owned spec restored to its
+        pre-launch snapshot), and those stay. An unchanged spec that equals the
+        attempt's pre-launch snapshot is the attempt's input, not its output, so it
+        stays too. The unlink is retried like the replace: Windows denies a delete
+        against an open handle just as it denies a rename-over."""
+        if staged is None:
+            return
+        stashed = self._land_deferred_stash(task, staged)
+        try:
+            live = staged.spec.read_bytes()
+        except FileNotFoundError:
+            live = None
+        if live == stashed and live != task.dispatched_spec_snapshot:
+            retrying_unlink(staged.spec)
+
+    def _discard_deferred_stash(self, task: StoryTask, staged: _StagedStash | None) -> None:
+        """Drop a staged copy whose spec is staying live: the rollback paused, or the
+        defer failed, before the stash could land. Only while the live spec still
+        holds the staged bytes — a pause can follow a byte-exact restore of an
+        attempt-owned spec, and a fault can follow the reset, and then the copy is
+        the attempt's only version, so it is landed on the stash target (and
+        journaled) instead. Best-effort: it runs while a pause or fault is
+        propagating, and a leftover copy beside the stash costs nothing."""
+        if staged is None:
+            return
+        with contextlib.suppress(OSError):
+            if staged.spec.read_bytes() == staged.staged.read_bytes():
+                retrying_unlink(staged.staged)
+                return
+        with contextlib.suppress(OSError):
+            self._land_deferred_stash(task, staged)
 
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)

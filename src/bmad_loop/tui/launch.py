@@ -1415,14 +1415,26 @@ def resume_detached(project: Path, run_id: str) -> str | None:
     return _reachable_window(project, run_id, win_id)
 
 
-def start_resolve_detached(project: Path, run_id: str) -> str | None:
+def start_resolve_detached(
+    project: Path, run_id: str, *, reverify: bool = False, story: str | None = None
+) -> str | None:
     """Run `bmad-loop resolve <run_id>` in a ctl-session window. The caller
     attaches to it: the resolve agent is interactive, and the post-session
     confirm + resume happen in that same window. Returns the window id so the
-    caller attaches to exactly this window, not a stale same-run_id window."""
-    return start_detached(
-        project, ["resolve", "--project", str(project), run_id], run_id, "resolve"
-    )
+    caller attaches to exactly this window, not a stale same-run_id window.
+
+    `reverify` appends `--reverify` (DW-524): the CLI's statement of what the
+    replay will claim (HEAD/baseline, the squash-in warning), its confirm, the
+    liveness re-check under the run lock and the resume all run in that same
+    window — the TUI decides nothing about the target beyond naming it.
+    `story` appends `--story <key>`; omitted, the CLI defaults to the paused
+    story."""
+    tail = ["resolve", "--project", str(project), run_id]
+    if reverify:
+        tail.append("--reverify")
+    if story is not None:
+        tail += ["--story", story]
+    return start_detached(project, tail, run_id, "resolve")
 
 
 def run_captured_streams(argv_tail: list[str]) -> tuple[int, str, str]:

@@ -15707,6 +15707,191 @@ def test_validate_render_probe_is_silent_when_policy_is_unloadable(
     assert not marker.exists()
 
 
+# ------------------- DW-526: validate --probes -------------------------------
+
+
+def _probe_policy(*probes: str) -> str:
+    return CLAUDE_ONLY_POLICY + f"[environment]\nprobes = {json.dumps(list(probes))}\n"
+
+
+def _marker_probe(marker) -> str:
+    """A probe that leaves `marker` (outside the project) behind when it runs."""
+    return f"\"{sys.executable}\" -c \"open(r'{marker}', 'w').close()\""
+
+
+def _environment_findings(doc):
+    return [f for f in doc["findings"] if f["check"].startswith("environment.")]
+
+
+def test_validate_probes_pass_is_an_ok_finding(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0"))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    assert doc["schema_version"] == 1 and doc["ok"] is True
+    [probe] = _environment_findings(doc)
+    assert probe["check"] == "environment.probe" and probe["severity"] == "ok"
+    assert probe["detail"] == {
+        "command": "exit 0",
+        "index": 0,
+        "status": "pass",
+        "returncode": 0,
+        "reason": "",
+        "timeout_s": 60,
+        "cwd": str(project.project),
+    }
+
+
+def test_validate_probes_failure_is_a_problem_and_every_probe_reports(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0", "exit 6"))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert doc["ok"] is False
+    probes = _environment_findings(doc)
+    assert [(f["check"], f["severity"]) for f in probes] == [
+        ("environment.probe", "ok"),
+        ("environment.probe", "problem"),
+    ]
+    failed = probes[1]["detail"]
+    assert failed["command"] == "exit 6" and failed["index"] == 1
+    assert failed["status"] == "fail" and failed["returncode"] == 6
+    assert failed["reason"] == "rc=6"
+    # the probe is the only problem: every other gate stayed green
+    assert [f["check"] for f in doc["findings"] if f["severity"] == "problem"] == [
+        "environment.probe"
+    ]
+
+
+def test_validate_without_probes_flag_runs_nothing_and_notes_it(
+    project, capsys, monkeypatch, tmp_path
+):
+    """The opt-in. Ablation: run the probes regardless of the flag and the
+    marker appears."""
+    marker = tmp_path / "probe-ran"
+    probes = ("exit 0", _marker_probe(marker))
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy(*probes))
+
+    doc = machine_json(_validate_argv(project), capsys)
+
+    assert not marker.exists()
+    [note] = _environment_findings(doc)
+    assert note["check"] == "environment.probes-not-run" and note["severity"] == "ok"
+    assert note["detail"] == {"probes": list(probes), "run": False}
+    assert "2 [environment] probe(s)" in note["message"] and "--probes" in note["message"]
+
+    # and with the flag the same marker probe does run
+    machine_json(_validate_argv(project, "--probes"), capsys)
+    assert marker.exists()
+
+
+def test_validate_probes_flag_with_none_configured(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    assert doc["ok"] is True
+    assert [f["check"] for f in _environment_findings(doc)] == ["environment.probes-none"]
+
+
+def test_validate_without_probes_reports_no_environment_finding(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(_validate_argv(project), capsys)
+
+    assert _environment_findings(doc) == []
+
+
+def test_validate_probes_is_silent_when_policy_is_unloadable(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0"))
+    _write_policy(project.project, "[adapter]\nname = ")  # unparseable
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert _environment_findings(doc) == []
+
+
+def test_validate_probes_returncode_is_null_when_no_exit_status_exists(
+    project, capsys, monkeypatch
+):
+    """Timeout, spawn fault and hard stop carry runner sentinels (-1, SPAWN_FAULT_RC,
+    INTERRUPTED_RC), never an exit code, so the contract publishes null for each.
+    The interrupt also ends the pass: the probe after it is never reported."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=_probe_policy("hangs", "unstartable", "stopped", "never"),
+    )
+    legs = {
+        "hangs": verify.CommandResult("hangs", -1, "timed out"),
+        "unstartable": verify.CommandResult(
+            "unstartable", verify.SPAWN_FAULT_RC, "OSError: boom", spawn_error="OSError: boom"
+        ),
+        "stopped": verify.CommandResult(
+            "stopped", verify.INTERRUPTED_RC, "interrupted", interrupted=True
+        ),
+    }
+    monkeypatch.setattr(verify, "_run_shell_command", lambda command, cwd, timeout: legs[command])
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert [
+        (f["severity"], f["detail"]["status"], f["detail"]["returncode"])
+        for f in _environment_findings(doc)
+    ] == [
+        ("problem", "timeout", None),
+        ("problem", "fail", None),
+        ("problem", "interrupted", None),
+    ]
+    # the spawn fault's tail is already in its reason, so it is not repeated
+    spawn = _environment_findings(doc)[1]
+    assert spawn["detail"]["reason"] == "could not be started: OSError: boom"
+    assert "—" not in spawn["message"]
+
+
+def test_validate_probes_text_mode_prints_the_probe_lines(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy("exit 0", "exit 6"))
+
+    assert cli.main(["validate", "--project", str(project.project), "--probes"]) == 1
+    out, err = capsys.readouterr()
+
+    assert "  ok: environment probe passed: exit 0" in out
+    assert "FAIL: environment probe failed (rc=6): exit 6" in err
+
+
+def test_validate_probes_failure_message_carries_the_output_tail(project, capsys, monkeypatch):
+    """A failing probe's last non-empty output line is appended to its message."""
+    probe = f'"{sys.executable}" -c "print(\'db down\'); raise SystemExit(1)"'
+    _make_validate_pass(project, monkeypatch, capsys, policy=_probe_policy(probe))
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    [finding] = _environment_findings(doc)
+    assert finding["message"] == f"environment probe failed (rc=1): {probe} — db down"
+
+
+def test_validate_probes_run_in_the_code_root_under_a_repo_root_override(
+    project, monkeypatch, capsys
+):
+    """Probes run in `clean_root` (`repo_root`), not the project dir. The probe
+    passes only where an `app/` subdirectory exists — the nested repo root, never
+    the project itself. Ablation: probe `project` instead and it fails rc=1."""
+    probe = f'"{sys.executable}" -c "import os, sys; sys.exit(0 if os.path.isdir(\'app\') else 1)"'
+    paths = _nested_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=NO_ISOLATION_POLICY + f"\n[environment]\nprobes = {json.dumps([probe])}\n",
+    )
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json", "--probes"], capsys)
+
+    [finding] = _environment_findings(doc)
+    assert finding["severity"] == "ok" and finding["detail"]["status"] == "pass"
+    assert finding["detail"]["cwd"] == str(paths.repo_root)
+
+
 def test_a_forwarding_shim_install_fails_validate_and_aborts_the_run(project, capsys, monkeypatch):
     """The shim upstream's rename left behind is REFUSED, not driven.
 
@@ -19127,6 +19312,94 @@ def test_resolve_reverify_in_place_still_requires_the_escalation_pause(tmp_path,
     assert rc == 1
     err = capsys.readouterr().err
     assert "an in-place replay re-verifies only the story the run stopped on" in err
+    assert _state_bytes(run_dir) == before
+
+
+# -------------------------- resolve <finished-run> --reverify (DW-525) gates
+
+
+def _finished_reverify_project(tmp_path):
+    """`_reverify_project`'s run, recorded FINISHED (not paused) — the shape the
+    finished-run replay entry routes on."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    state.finished = True
+    save_state(run_dir, state)
+    return run_dir, project
+
+
+def _no_replay(monkeypatch):
+    from bmad_loop import unitreplay
+
+    monkeypatch.setattr(
+        unitreplay, "mint_replay_run", lambda **_k: pytest.fail("minted a replay run")
+    )
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("prompted"))
+
+
+def test_resolve_reverify_finished_run_needs_the_story_named(tmp_path, monkeypatch, capsys):
+    """A finished run is routed to the replay entry ahead of the pause gate, which
+    names `--story <key>` instead of the generic not-paused refusal.
+
+    Ablation: delete the `state.finished` routing in `cmd_resolve` and the pause
+    gate's "not paused at an escalation" refusal prints instead."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "is finished" in err and "--story <key>" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_in_place_story(tmp_path, monkeypatch, capsys):
+    """Only a worktree unit's kept worktree outlives a finished run; an in-place
+    deferred story is refused before any preflight or prompt."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "deferred in place" in err and "recover the work by hand" in err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_reverify_finished_run_refuses_an_unknown_story(tmp_path, monkeypatch, capsys):
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", "9-9-z", "--resume") == 1
+
+    assert "has no task for story 9-9-z" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("live", "fragment"),
+    [("alive", "still live"), ("unknown", "--force")],
+    ids=["alive", "unknown"],
+)
+def test_resolve_reverify_finished_run_gates_on_liveness(
+    tmp_path, monkeypatch, capsys, live, fragment
+):
+    """The liveness gate runs first: a provably-live engine refuses, an unverifiable
+    one needs --force."""
+    run_dir, project = _finished_reverify_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: live)
+    _no_replay(monkeypatch)
+
+    assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1
+
+    assert fragment in capsys.readouterr().err
     assert _state_bytes(run_dir) == before
 
 

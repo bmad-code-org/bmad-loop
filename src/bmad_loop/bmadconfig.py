@@ -103,21 +103,26 @@ class ProjectPaths:
         doesn't move (DW-379)."""
         new_root = new_root.resolve()
         new_project = rebased_project(self.project, self.repo_root, new_root)
-
-        def rebase(p: Path) -> Path:
-            try:
-                rel = p.relative_to(self.project)
-            except ValueError:
-                return p  # configured outside the project tree; doesn't move
-            return (new_project / rel).resolve()
-
         return ProjectPaths(
             project=new_project,
-            implementation_artifacts=rebase(self.implementation_artifacts),
-            planning_artifacts=rebase(self.planning_artifacts),
-            output_folder=rebase(self.output_folder),
+            implementation_artifacts=self.artifact_at(self.implementation_artifacts, new_project),
+            planning_artifacts=self.artifact_at(self.planning_artifacts, new_project),
+            output_folder=self.artifact_at(self.output_folder, new_project),
             repo_root=new_root,
         )
+
+    def artifact_at(self, artifact: Path, mount_project: Path) -> Path:
+        """Where `artifact` (one of this config's dirs) sits for the project mounted
+        at `mount_project`: re-joined there at its offset inside `project`, or
+        unmoved when configured outside the project tree, which is shared rather
+        than per-checkout (DW-379). The rule :meth:`rebased` applies to every
+        artifact dir, exposed for callers that hold the mount PROJECT rather than
+        the checkout root — the session cwd (DW-484)."""
+        try:
+            rel = artifact.relative_to(self.project)
+        except ValueError:
+            return artifact
+        return (mount_project / rel).resolve()
 
 
 def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | None:

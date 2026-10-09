@@ -1027,6 +1027,29 @@ def test_start_detached_returns_window_id(fake_run, tmp_path: Path):
     assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "extra"),
+    [
+        ({}, []),
+        ({"reverify": True}, ["--reverify"]),
+        ({"reverify": True, "story": "2-1-b"}, ["--reverify", "--story", "2-1-b"]),
+    ],
+    ids=["plain", "reverify", "reverify-story"],
+)
+def test_start_resolve_detached_argv_tail(monkeypatch, tmp_path: Path, kwargs, extra):
+    """DW-524: `--reverify` / `--story <key>` ride after the run id; the window
+    kind stays `resolve` and the plain call keeps its two-positional shape."""
+    seen: list[tuple[list[str], str, str]] = []
+
+    def fake_start_detached(project, argv_tail, run_id, kind):
+        seen.append((list(argv_tail), run_id, kind))
+        return "@7"
+
+    monkeypatch.setattr(launch, "start_detached", fake_start_detached)
+    assert launch.start_resolve_detached(tmp_path, "RID", **kwargs) == "@7"
+    assert seen == [(["resolve", "--project", str(tmp_path), "RID", *extra], "RID", "resolve")]
+
+
 def _make_run(project: Path, run_id: str = "RID") -> Path:
     """A run dir runs.is_run accepts — the state a resume/resolve launches over."""
     run_dir = runs.run_dir_for(project, run_id)

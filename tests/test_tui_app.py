@@ -64,7 +64,7 @@ from bmad_loop.model import (
 )
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data, launch, widgets
-from bmad_loop.tui.app import BmadLoopApp
+from bmad_loop.tui.app import BmadLoopApp, _deferred_units, _reverify_targets
 from bmad_loop.tui.screens.dashboard import (
     _MIN_DETAIL,
     _MIN_SIDEBAR,
@@ -78,6 +78,7 @@ from bmad_loop.tui.screens.modals import (
     DeferredEntryModal,
     EscalationModal,
     PauseReasonModal,
+    ReverifyModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -10155,35 +10156,512 @@ async def test_replan_on_a_spec_that_vanished_after_render_names_the_anchored_pa
         assert not any("could not reset" in m for m in notifications(app))
 
 
-@pytest.mark.parametrize("key", ["R", "p"], ids=["resolve", "review"])
-async def test_resolve_on_a_deferred_pause_points_at_cli_reverify(project_tree, monkeypatch, key):
-    """DW-522: a run paused for manual recovery on a DEFERRED story has no
-    escalation to resolve — both the resolve verb and the pause viewer notify the
-    CLI's `resolve --reverify` / `resume` choice instead of launching the agent or
-    opening the escalation modal. Ablation, performed: drop the
-    `_deferred_pause_notified` check from either path and its row fails."""
-    launched: list[str] = []
+# ------------------------------------------- DW-524: TUI resolve --reverify
+
+
+_REVERIFY_RUN = "20260611-100000-aaaa"
+
+
+def _reverify_stubs(monkeypatch, *, liveness: str = "dead", win_id: str | None = "@7"):
+    """Stub every seam the re-verify launch crosses, recording what reaches
+    `start_resolve_detached`: (run_id, kwargs) per call. The stub accepts the
+    plain two-positional shape too, so a wrong-arm call is recorded, not
+    crashed."""
+    launched: list[tuple[str, dict]] = []
+    selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
-    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: launched.append(rid))
-    run_id = "20260611-100000-aaaa"
+    monkeypatch.setattr(data, "liveness", lambda run_dir: liveness)
+
+    def fake_start_resolve(proj, rid, **kw):
+        launched.append((rid, kw))
+        return win_id
+
+    monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: True)
+    calls, stamps = _patch_attach_exec(monkeypatch)
+    return launched, selected, calls, stamps
+
+
+def _deferred_task(key: str, *, unit: bool = False) -> StoryTask:
+    return StoryTask(
+        story_key=key,
+        epic=int(key.split("-")[0]),
+        phase=Phase.DEFERRED,
+        worktree_path=f"/wt/{key}" if unit else "",
+    )
+
+
+def _select_values(app) -> list[str]:
+    select = app.screen.query_one("#target", Select)
+    return [value for _prompt, value in select._options]
+
+
+async def _at_dashboard(app, pilot) -> None:
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+
+
+def test_reverify_targets_order_and_exclusions():
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "3-1-c": _deferred_task("3-1-c", unit=True),
+            "1-1-a": _deferred_task("1-1-a", unit=True),  # paused AND a unit: listed once
+            "2-1-b": _deferred_task("2-1-b"),  # deferred in place — not a unit
+            "4-1-d": StoryTask(
+                story_key="4-1-d", epic=4, phase=Phase.ESCALATED, worktree_path="/wt/4-1-d"
+            ),
+            "5-1-e": _deferred_task("5-1-e", unit=True),
+        },
+    )
+    assert _reverify_targets(state) == ["1-1-a", "3-1-c", "5-1-e"]
+    assert _deferred_units(state) == ["3-1-c", "5-1-e"]
+
+
+def test_reverify_targets_skip_a_paused_escalation_without_a_replayable_env_fault():
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.ESCALATED),
+            "2-1-b": _deferred_task("2-1-b", unit=True),
+        },
+    )
+    assert _reverify_targets(state) == ["2-1-b"]
+    empty = dataclasses.replace(state, tasks={})
+    assert _reverify_targets(empty) == []
+
+
+def _escalated_task(
+    key: str, site: str | None, *, dev_status: str | None = None, unit: bool = False
+) -> StoryTask:
+    sessions = [SessionRecord(task_id=key, role="dev", status=dev_status)] if dev_status else []
+    return StoryTask(
+        story_key=key,
+        epic=int(key.split("-")[0]),
+        phase=Phase.ESCALATED,
+        env_fault_site=site,
+        sessions=sessions,
+        worktree_path=f"/wt/{key}" if unit else "",
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "listed"),
+    [
+        (_escalated_task("1-1-a", "verify:dev"), True),
+        (_escalated_task("1-1-a", "probe:decision:review"), True),
+        (_escalated_task("1-1-a", "probe:decision:dev", dev_status="completed"), True),
+        (_escalated_task("1-1-a", "probe:decision:dev", dev_status="crashed"), False),
+        (_escalated_task("1-1-a", "probe:dispatch:dev"), False),
+        (_escalated_task("1-1-a", None), False),
+    ],
+    ids=[
+        "verify-site",
+        "review-decision-site",
+        "dev-decision-completed",
+        "dev-decision-crashed",
+        "dispatch-site",
+        "no-env-fault",
+    ],
+)
+def test_reverify_targets_list_an_escalated_paused_story_at_a_replayable_site(task, listed):
+    """DW-532: the paused story is a target when it is ESCALATED and
+    `env_fault_site_reverifiable` holds — what `runs.reverify_refusal` accepts —
+    and never at a dispatch site, without an env fault, or at a decision site whose
+    leg did not complete. Ablation, performed: drop the ESCALATED arm and every
+    `True` row fails."""
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task, "2-1-b": _deferred_task("2-1-b", unit=True)},
+    )
+    assert _reverify_targets(state) == (["1-1-a", "2-1-b"] if listed else ["2-1-b"])
+
+
+def test_reverify_targets_skip_an_escalated_unit_that_is_not_paused():
+    """Only the PAUSED escalated story qualifies (it launches without `--story`,
+    under the CLI's in-place rule): an escalated replayable worktree unit under
+    another pause is not listed. Ablation, performed: build the head from every
+    escalated replayable task and this fails."""
+    state = RunState(
+        run_id="r",
+        project="/p",
+        started_at="2026-06-11T10:00:00",
+        paused_stage="escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.ESCALATED),
+            "2-1-b": _escalated_task("2-1-b", "verify:dev", unit=True),
+        },
+    )
+    assert _reverify_targets(state) == []
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+@pytest.mark.parametrize("key", ["R", "p"], ids=["resolve", "review"])
+async def test_deferred_pause_opens_reverify_and_launches(project_tree, monkeypatch, key):
+    """DW-522/524: a run paused for manual recovery on a DEFERRED story has no
+    escalation to resolve — both the resolve verb and the pause viewer open the
+    re-verify picker (not the resolve confirm / escalation modal), and confirming
+    launches `resolve --reverify` WITHOUT `--story` (the CLI's paused-story
+    default keeps its in-place rule) and attaches. Ablation, performed: drop the
+    `_deferred_pause_reverify` check from either path and its row fails."""
+    launched, selected, calls, stamps = _reverify_stubs(monkeypatch)
     make_run(
         project_tree.project,
-        run_id,
+        _REVERIFY_RUN,
         paused_stage="escalation",
         paused_reason="ACTION REQUIRED — manual recovery",
         paused_story_key="1-1-a",
-        tasks={"1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)},
+        tasks={"1-1-a": _deferred_task("1-1-a")},
     )
-    hint = f"bmad-loop resolve {run_id} --reverify"
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
-        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
-        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await _at_dashboard(app, pilot)
         await pilot.press(key)
-        await until(pilot, lambda: any(hint in m for m in notifications(app)))
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await ready(pilot, "#ok")
+        assert _select_values(app) == ["1-1-a"]
+        assert app.screen.query_one("#target", Select).value == "1-1-a"
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": None})]
+    assert selected == ["@7"]
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
+    assert stamps == [("@7", "=main:%9")]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_reverify_a_unit_under_another_pause(project_tree, monkeypatch):
+    """A DEFERRED worktree unit under a spec-approval pause had no TUI pointer at
+    all (DW-524): `V` offers it, and confirming names it with `--story`."""
+    launched, selected, calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="spec-approval",
+        paused_reason="spec approval",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.PENDING),
+            "2-1-b": _deferred_task("2-1-b", unit=True),
+        },
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await ready(pilot, "#ok")
+        assert _select_values(app) == ["2-1-b"]
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": "2-1-b"})]
+    assert selected == ["@7"]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_reverify_an_escalated_env_fault_paused_story(project_tree, monkeypatch):
+    """DW-532: `V` on a run paused at the escalation of a story whose environment
+    fault left a replayable product offers that story, and confirming launches
+    `resolve --reverify` WITHOUT `--story` (the CLI's in-place rule) and attaches.
+    `R` still opens the resolve agent's confirm, not the picker. Ablation,
+    performed: drop the ESCALATED arm of `_reverify_targets` and `V` toasts
+    "no story to re-verify" instead."""
+    launched, selected, calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": _escalated_task("1-1-a", "verify:dev")},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#cancel"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await ready(pilot, "#ok")
+        assert _select_values(app) == ["1-1-a"]
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": None})]
+    assert selected == ["@7"]
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_reverify_lists_the_paused_story_first_then_units(project_tree, monkeypatch):
+    launched, _selected, calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="ACTION REQUIRED — manual recovery",
+        paused_story_key="3-1-c",
+        tasks={
+            "2-1-b": _deferred_task("2-1-b", unit=True),
+            "3-1-c": _deferred_task("3-1-c"),
+            "4-1-d": _deferred_task("4-1-d", unit=True),
+        },
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await ready(pilot, "#ok")
+        assert _select_values(app) == ["3-1-c", "2-1-b", "4-1-d"]
+        select = app.screen.query_one("#target", Select)
+        assert select.value == "3-1-c"
+        # the labels say which kind each target is
+        labels = [str(prompt) for prompt, _value in select._options]
+        assert "(paused story)" in labels[0]
+        assert all("(worktree unit)" in label for label in labels[1:])
+        select.value = "4-1-d"
+        await pilot.pause()
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": "4-1-d"})]
+
+
+async def test_reverify_with_nothing_deferred_launches_nothing(project_tree, monkeypatch):
+    """Ablation, performed: drop the empty-targets refusal and the picker is
+    pushed with no target to preselect (it crashes composing) — the toast
+    assertion fails."""
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.ESCALATED),
+            "2-1-b": _deferred_task("2-1-b"),  # deferred in place, no unit
+        },
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        want = f"no story to re-verify in run {_REVERIFY_RUN}"
+        await until(pilot, lambda: want in notifications(app))
         assert isinstance(app.screen, DashboardScreen)
     assert launched == []
-    [message] = [m for m in notifications(app) if hint in m]
-    assert "1-1-a was deferred, not escalated" in message
-    assert f"bmad-loop resume {run_id}" in message
+
+
+async def test_reverify_on_an_unpaused_run_launches_nothing(project_tree, monkeypatch):
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        tasks={"2-1-b": _deferred_task("2-1-b", unit=True)},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        want = "run is not paused — nothing to re-verify"
+        await until(pilot, lambda: want in notifications(app))
+        assert isinstance(app.screen, DashboardScreen)
+    assert launched == []
+
+
+async def test_reverify_on_unreadable_state_launches_nothing(project_tree, monkeypatch):
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    run_dir = make_run(project_tree.project, _REVERIFY_RUN, paused_stage="escalation")
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        (run_dir / "state.json").write_text("{not json", encoding="utf-8")
+        await pilot.press("V")
+        want = f"state for run {_REVERIFY_RUN} is unreadable"
+        await until(pilot, lambda: (want, "error") in notifications_with_severity(app))
+    assert launched == []
+
+
+@pytest.mark.parametrize("liveness", ["alive", "unknown"])
+async def test_reverify_refused_when_engine_may_be_live_at_confirm(
+    project_tree, monkeypatch, liveness
+):
+    """The liveness gate runs at CONFIRM time, like the escalation viewer's
+    Resolve verb — an engine that came up while the picker was open is still
+    refused. Ablation, performed: drop `_resolve_blocked_by_liveness` from the
+    picker's callback and both rows launch."""
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch, liveness=liveness)
+    run_dir = make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="ACTION REQUIRED — manual recovery",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": _deferred_task("1-1-a")},
+    )
+    (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        want = f"run {_REVERIFY_RUN} may still be live — stop it first"
+        await until(pilot, lambda: want in notifications(app))
+    assert launched == []
+
+
+async def test_reverify_cancel_launches_nothing(project_tree, monkeypatch):
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="ACTION REQUIRED — manual recovery",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": _deferred_task("1-1-a")},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await click(pilot, await ready(pilot, "#cancel"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    assert launched == []
+
+
+@pytest.mark.parametrize(
+    ("win_id", "boom", "want"),
+    [
+        (None, None, "re-verify launched but its window id was not captured"),
+        ("@7", "multiplexer backend unavailable", "multiplexer backend unavailable"),
+    ],
+    ids=["uncaptured", "launch-error"],
+)
+async def test_reverify_launch_failures_toast_errors(project_tree, monkeypatch, win_id, boom, want):
+    launched, selected, calls, _stamps = _reverify_stubs(monkeypatch, win_id=win_id)
+    if boom is not None:
+
+        def raising(proj, rid, **kw):
+            launched.append((rid, kw))
+            raise launch.LaunchError(boom)
+
+        monkeypatch.setattr(launch, "start_resolve_detached", raising)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="ACTION REQUIRED — manual recovery",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": _deferred_task("1-1-a")},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("V")
+        await until(pilot, lambda: isinstance(app.screen, ReverifyModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(pilot, lambda: (want, "error") in notifications_with_severity(app))
+    assert launched == [(_REVERIFY_RUN, {"reverify": True, "story": None})]
+    assert selected == [] and calls == []  # nothing attached
+
+
+@pytest.mark.parametrize(
+    ("stage", "refusal"),
+    [
+        (PAUSE_ENVIRONMENT, "an environment pause needs no resolve"),
+        ("spec-approval", "resolve is only available for a run paused at an escalation"),
+    ],
+    ids=["environment", "non-escalation"],
+)
+async def test_resolve_refusal_points_at_deferred_units(project_tree, monkeypatch, stage, refusal):
+    """R's refusals keep their wording and add a pointer naming the deferred
+    worktree unit(s) and `V` — the only verb that reaches them."""
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage=stage,
+        paused_reason="paused",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.PENDING),
+            "2-1-b": _deferred_task("2-1-b", unit=True),
+            "3-1-c": _deferred_task("3-1-c", unit=True),
+        },
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("R")
+        await until(pilot, lambda: any(refusal in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)
+    [message] = [m for m in notifications(app) if refusal in m]
+    assert "deferred worktree units 2-1-b, 3-1-c: press V" in message
+    assert launched == []
+
+
+async def test_resolve_refusal_without_units_has_no_pointer(project_tree, monkeypatch):
+    launched, _selected, _calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="spec-approval",
+        paused_reason="paused",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.PENDING)},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("R")
+        await until(pilot, lambda: any("only available" in m for m in notifications(app)))
+    assert not any("press V" in m for m in notifications(app))
+    assert launched == []
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_resolve_confirm_names_deferred_units(project_tree, monkeypatch):
+    """An escalated paused story still gets the resolve agent from R — the
+    confirm body only adds the `V` pointer for a deferred unit beside it, and
+    the plain resolve launch is unchanged (two positionals, no kwargs)."""
+    launched, _selected, calls, _stamps = _reverify_stubs(monkeypatch)
+    make_run(
+        project_tree.project,
+        _REVERIFY_RUN,
+        paused_stage="escalation",
+        paused_reason="CRITICAL escalation",
+        paused_story_key="1-1-a",
+        tasks={
+            "1-1-a": StoryTask(story_key="1-1-a", epic=1, phase=Phase.ESCALATED),
+            "2-1-b": _deferred_task("2-1-b", unit=True),
+        },
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _at_dashboard(app, pilot)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await ready(pilot, "#ok")
+        body = " ".join(render(s.content) for s in app.screen.query("#body Static").results(Static))
+        assert "open the resolve agent for 1-1-a" in body
+        assert "deferred worktree unit 2-1-b: press V" in body
+        await click(pilot, "#ok")
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(_REVERIFY_RUN, {})]

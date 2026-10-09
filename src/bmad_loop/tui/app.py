@@ -50,6 +50,7 @@ from ..model import (
     Phase,
     RunState,
     StoryTask,
+    env_fault_site_reverifiable,
 )
 from ..platform_util import LockUnavailableError, resolve_or_lexical
 from ..policy import POLICY_FILE
@@ -63,6 +64,7 @@ from .screens.modals import (
     DecisionModal,
     EscalationModal,
     PauseReasonModal,
+    ReverifyModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -82,6 +84,51 @@ def _engine_possibly_live(run_dir: Path) -> bool:
     # whose pid exists but is unreadable). A legacy pid-less run's 'unknown' just
     # means no session was found — it must not flag every old finished run.
     return live == "unknown" and runs.read_pid(run_dir) is not None
+
+
+def _deferred_units(state: RunState) -> list[str]:
+    """DEFERRED worktree units other than the paused story, in `state.tasks`
+    order (DW-524). A unit is a task with a mounted `worktree_path`; the CLI's
+    `resolve --reverify --story <key>` accepts one under any pause, so these are
+    the targets nothing else in the TUI points at. No refusal logic: what the CLI
+    refuses (sweep runs, a missing dev result, …) it refuses in its own window."""
+    return [
+        key
+        for key, task in state.tasks.items()
+        if key != state.paused_story_key and task.phase == Phase.DEFERRED and task.worktree_path
+    ]
+
+
+def _reverify_targets(state: RunState) -> list[str]:
+    """Every story `resolve --reverify` could be pointed at from the TUI: the
+    paused story first when it is DEFERRED, or ESCALATED at an environment-fault
+    site a replay can clear (`model.env_fault_site_reverifiable`, the test
+    `runs.reverify_refusal` applies — DW-532), then `_deferred_units`. Only the
+    PAUSED escalated story qualifies: it launches without `--story`, so the CLI
+    keeps its in-place rule. Any other escalation is never a target — its remedy
+    is the resolve agent (`R`), which stays available for this one too."""
+    key = state.paused_story_key
+    task = state.tasks.get(key) if key else None
+    head = (
+        [key]
+        if key
+        and task is not None
+        and (
+            task.phase == Phase.DEFERRED
+            or (task.phase == Phase.ESCALATED and env_fault_site_reverifiable(task))
+        )
+        else []
+    )
+    return head + _deferred_units(state)
+
+
+def _units_pointer(state: RunState) -> str:
+    """The `V` pointer for deferred worktree units, or "" when there are none."""
+    units = _deferred_units(state)
+    if not units:
+        return ""
+    noun = "unit" if len(units) == 1 else "units"
+    return f"deferred worktree {noun} {', '.join(units)}: press V to re-verify kept work"
 
 
 _T = TypeVar("_T")
@@ -148,6 +195,7 @@ class BmadLoopApp(App[None]):
         Binding("e", "resume_run", "resume"),
         Binding("p", "review_pause", "review"),
         Binding("R", "resolve_run", "resolve"),
+        Binding("V", "reverify_run", "re-verify"),
         Binding("d", "answer_decisions", "decisions"),
         Binding("a", "attach", "attach"),
         Binding("x", "stop_run", "stop"),
@@ -686,21 +734,27 @@ class BmadLoopApp(App[None]):
         except (OSError, KeyError, ValueError):
             self.notify(f"state for run {run_id} is unreadable", severity="error")
             return
+        # DW-524: a deferred worktree unit under ANOTHER story's pause is reached
+        # by `V`, never by this verb — the pause refusals and the confirm name it.
+        pointer = _units_pointer(state)
         if state.paused_stage == PAUSE_ENVIRONMENT:
             # DW-523: nothing ran and nothing was charged — resume lifts it.
             self.notify(
                 "an environment pause needs no resolve: fix the environment, then "
-                f"resume (`bmad-loop resume {run_id}`)",
+                f"resume (`bmad-loop resume {run_id}`)" + (f"\n{pointer}" if pointer else ""),
                 severity="warning",
+                markup=False,
             )
             return
         if state.paused_stage != "escalation":
             self.notify(
-                "resolve is only available for a run paused at an escalation",
+                "resolve is only available for a run paused at an escalation"
+                + (f"\n{pointer}" if pointer else ""),
                 severity="warning",
+                markup=False,
             )
             return
-        if self._deferred_pause_notified(run_id, state):
+        if self._deferred_pause_reverify(run_id, run_dir, state):
             return
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
@@ -711,41 +765,97 @@ class BmadLoopApp(App[None]):
             ConfirmModal(
                 "resolve escalation",
                 f"open the resolve agent for {story}?\n"
-                "converse to fix the frozen spec, then confirm re-arm + resume in that window.",
+                "converse to fix the frozen spec, then confirm re-arm + resume in that window."
+                + (f"\n{pointer}" if pointer else ""),
                 confirm_label="resolve",
             ),
             lambda ok: self._launch_resolve(run_id) if ok else None,
         )
 
-    def _deferred_pause_notified(self, run_id: str, state: RunState) -> bool:
-        """Point a pause on a DEFERRED story at the CLI (DW-522) and say so.
+    def action_reverify_run(self) -> None:
+        """`V`: re-verify a story's kept work (DW-524) — the paused story when it
+        is DEFERRED or ESCALATED at a replayable environment-fault site (DW-532),
+        or a DEFERRED worktree unit under any pause. The TUI
+        only picks the target and launches `bmad-loop resolve --reverify`; the CLI
+        states the claim, confirms, re-checks liveness under the run lock and
+        refuses what it refuses, all in the control window."""
+        if self._mux_missing():
+            return
+        run_id = self._dashboard.selected_run_id
+        if run_id is None:
+            self.notify("no run selected", severity="warning")
+            return
+        run_dir = self.project / RUNS_DIR / run_id
+        try:
+            state = load_state(run_dir)
+        except (OSError, KeyError, ValueError):
+            self.notify(f"state for run {run_id} is unreadable", severity="error")
+            return
+        if not state.paused:
+            self.notify("run is not paused — nothing to re-verify", severity="warning")
+            return
+        targets = _reverify_targets(state)
+        if not targets:
+            self.notify(f"no story to re-verify in run {run_id}", severity="warning")
+            return
+        self._open_reverify(run_id, run_dir, state, targets)
+
+    def _open_reverify(
+        self, run_id: str, run_dir: Path, state: RunState, targets: list[str]
+    ) -> None:
+        """Push the target picker; on a chosen key gate on the multiplexer and on
+        liveness (at confirm time, like the escalation viewer's Resolve verb) and
+        launch. `--story` is passed for every target except the paused story, so
+        the CLI's own default keeps its in-place pause rule."""
+        paused_key = state.paused_story_key
+
+        def done(key: str | None) -> None:
+            if key is None:
+                return
+            if self._mux_missing() or self._resolve_blocked_by_liveness(run_id, run_dir):
+                return
+            self._launch_resolve(run_id, reverify=True, story=None if key == paused_key else key)
+
+        self.push_screen(ReverifyModal(run_id, targets, paused_key), done)
+
+    def _deferred_pause_reverify(self, run_id: str, run_dir: Path, state: RunState) -> bool:
+        """Take over `R`/`p` on a pause whose story is DEFERRED (DW-522/524).
 
         A deferred story pauses at the escalation stage (manual recovery), but
         there is no escalation to resolve: the resolve agent and the re-arm would
         both re-drive it from scratch. Its kept work is re-verified by
-        `bmad-loop resolve --reverify`, which the TUI does not drive."""
+        `bmad-loop resolve --reverify`, so this opens the re-verify picker
+        instead. Returns True when it took over."""
         story_key = state.paused_story_key
         task = state.tasks.get(story_key) if story_key else None
         if task is None or task.phase != Phase.DEFERRED:
             return False
-        self.notify(
-            f"{story_key} was deferred, not escalated: run `bmad-loop resolve {run_id} "
-            f"--reverify` (re-verify kept work) or `bmad-loop resume {run_id}` (move on)",
-            severity="warning",
-        )
+        self._open_reverify(run_id, run_dir, state, _reverify_targets(state))
         return True
 
-    def _launch_resolve(self, run_id: str) -> None:
+    def _launch_resolve(
+        self, run_id: str, *, reverify: bool = False, story: str | None = None
+    ) -> None:
         """Open the interactive resolve agent for run_id in a ctl window and
         attach — the same path `bmad-loop resolve` drives. The caller has already
-        confirmed and (for the escalation viewer) gated on liveness."""
+        confirmed and (for the escalation viewer) gated on liveness. With
+        `reverify` the window runs `resolve --reverify [--story <key>]` instead
+        (DW-524), whose own statement, confirm and resume happen there."""
+        what = "re-verify" if reverify else "resolve"
         try:
-            win_id = launch.start_resolve_detached(self.project, run_id)
+            if reverify:
+                win_id = launch.start_resolve_detached(
+                    self.project, run_id, reverify=True, story=story
+                )
+            else:
+                # Two positionals only: the plain resolve call shape is a contract
+                # existing callers and stubs rely on.
+                win_id = launch.start_resolve_detached(self.project, run_id)
         except launch.LaunchError as e:
             self.notify(str(e), severity="error")
             return
         if not win_id:
-            self.notify("resolve launched but its window id was not captured", severity="error")
+            self.notify(f"{what} launched but its window id was not captured", severity="error")
             return
         if not launch.ctl_window_recorded(self.project, run_id, win_id):
             # Not an error and not a reason to abort: this attach targets the id
@@ -753,7 +863,7 @@ class BmadLoopApp(App[None]):
             # is lost is the record *later* verbs read, so `a`/`x` after this
             # window is minted may answer an older one (#482's symptom).
             self.notify(
-                "resolve launched but its window id was not recorded or its tag did "
+                f"{what} launched but its window id was not recorded or its tag did "
                 "not land — later attach/stop may miss it or target an older window "
                 "for this run",
                 severity="warning",
@@ -933,7 +1043,7 @@ class BmadLoopApp(App[None]):
         self.push_screen(modal, done)
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        if self._deferred_pause_notified(run_id, state):
+        if self._deferred_pause_reverify(run_id, run_dir, state):
             return
         story_key = state.paused_story_key or "?"
         task = state.tasks.get(story_key)
