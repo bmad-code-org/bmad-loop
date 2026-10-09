@@ -1261,6 +1261,10 @@ JOURNAL_KINDS = frozenset(
         # `replay_of` is benign, and `path` (the board) and `error` are presence-only
         # in `diagnostics._JOURNAL_DROP_FIELDS`.
         "replay-merge-refused",
+        # A worktree unit's merge paused because the main checkout is not on the
+        # run's pinned target (`WorktreeFlow.require_target_checked_out`). `story_key`,
+        # `branch`, `target_branch` and `checked_out_branch` alias by name.
+        "merge-target-not-checked-out",
         # DW-523. A dispatch-site `environment` pause whose resume re-probe passed
         # (`env-fault-cleared`, from `Engine._take_env_dispatch_pause`), and the
         # no-rollback dev re-dispatch that follows (`resume-env-dispatch`, from

@@ -11986,6 +11986,51 @@ def test_merge_local_asks_the_replay_board_gate_only_before_a_merge_starts(
         flow.merge_local(task, unit, replay=replay, first_integration=first_integration)
 
 
+def test_replay_run_pauses_while_the_main_checkout_is_off_its_target(
+    project, tmp_path, monkeypatch
+):
+    """A replay minted with `--no-resume` pins the target branch the mint checked;
+    the operator then checks out another branch before resuming. `merge_branch`
+    merges into whatever is checked out, so the merge pauses instead, the unit kept
+    and the task still DONE, and once the target is back a plain resume merges it.
+
+    Ablation: drop the `require_target_checked_out` call from `merge_local` and the
+    unit lands on the other branch."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    target = engine.state.target_branch
+    assert target
+
+    def check_out_another_branch():
+        git(project.project, "checkout", "-q", "-b", "elsewhere")
+        (project.project / "other.txt").write_text("work on another branch\n", encoding="utf-8")
+
+    replay_dir = _mint_replay_then_resume(
+        project, engine, marker, monkeypatch, check_out_another_branch
+    )
+
+    replay = load_state(replay_dir)
+    a = replay.tasks["1-1-a"]
+    assert not replay.finished and replay.paused_stage == PAUSE_ESCALATION
+    assert a.phase == Phase.DONE and Path(a.worktree_path).is_dir()
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    rows = Journal(replay_dir).entries()
+    assert "unit-merged" not in [e["kind"] for e in rows]
+    [refused] = [e for e in rows if e["kind"] == "merge-target-not-checked-out"]
+    assert refused["target_branch"] == target and refused["checked_out_branch"] == "elsewhere"
+    assert f"`git checkout {target}`" in replay.paused_reason
+
+    from bmad_loop import cli
+
+    git(project.project, "checkout", "-q", target)
+    # the first resume ran in this process, so its engine.pid reads as live
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    cli.main(["resume", "--project", str(project.project), replay_dir.name])
+    replay = load_state(replay_dir)
+    assert replay.finished and replay.tasks["1-1-a"].phase == Phase.DONE
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert "change for 1-1-a" not in git(project.project, "show", "elsewhere:src.txt")
+
+
 def test_replay_run_still_merges_a_story_not_done_on_the_board(project, tmp_path, monkeypatch):
     """Control: another run's commit lands while the replay waits but leaves 1-1-a
     short of done on the main board, so the resumed replay still merges (DW-534

@@ -10032,6 +10032,25 @@ def test_rearm_for_reverify_restores_from_a_staged_copy_whose_landing_failed(tmp
     assert _reverify_rows(run_dir)[0]["spec_restored"] is True
 
 
+def test_rearm_for_reverify_prefers_a_failed_landing_over_an_older_stash(tmp_path):
+    """A story that defers twice can hold the first defer's landed stash beside the
+    second defer's staged copy, kept because its landing failed after the reset. The
+    staged copy is the newer attempt, so the re-arm restores from it.
+
+    Ablation, performed: check the landed stash first in `_deferred_stash_source`
+    and the older stash's bytes are restored."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    staged.write_bytes(_REVERIFY_SPEC_BYTES)
+    stash.write_bytes(b"---\nstatus: in-review\n---\nthe first defer's copy\n")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
+
+
 def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
     """A spec the operator already put back wins over the stash: it may carry their
     own edits, and the replay verifies what is on the tree."""

@@ -6542,11 +6542,13 @@ def deferred_stash_staged_path(stash: Path) -> Path:
 
 
 def _deferred_stash_source(run_dir: Path, story_key: str, spec_name: str) -> Path | None:
-    """The stashed spec a reverify re-arm restores from: the landed stash, else a
-    staged copy whose landing failed, else None."""
+    """The stashed spec a reverify re-arm restores from: a staged copy whose landing
+    failed, else the landed stash, else None. The staged copy wins when both exist:
+    a landing consumes it and each defer's staging overwrites it, so a surviving
+    one is never older than the landed stash, which may be an earlier defer's."""
     stash = deferred_stash_path(run_dir, story_key, spec_name)
     staged = deferred_stash_staged_path(stash)
-    return stash if stash.is_file() else staged if staged.is_file() else None
+    return staged if staged.is_file() else stash if stash.is_file() else None
 
 
 def latest_completed_dev_record(task: StoryTask) -> SessionRecord | None:

@@ -49,6 +49,9 @@ breaking changes may land in a minor release.
 - Launch sessions in the BMAD project, not the `repo_root` checkout root. With
   the project nested inside `repo_root`, Claude Code, Codex and agy found neither
   its hooks nor its skills, so sessions never reported completion.
+- Pause a worktree unit's merge when the main checkout is not on the run's target
+  branch; a run resumed after the operator checked out another branch merged the
+  unit into that branch instead.
 - Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
   was moved out before the rollback, so every such defer paused for spec recovery.
 - Hand each TUI-launched engine the TUI's own state root, and its registry root

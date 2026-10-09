@@ -130,6 +130,9 @@ _JOURNAL_ALIAS_FIELDS = {
     "bundle": "bundle",
     "branch": "branch",
     "target_branch": "branch",
+    # The branch the main checkout had instead of the target, when a merge paused
+    # (`merge-target-not-checked-out`).
+    "checked_out_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
     # The baseline a re-arm's re-stamp replaced (`rearm-baseline-restamped`). Its

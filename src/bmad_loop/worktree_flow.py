@@ -3417,6 +3417,7 @@ class WorktreeFlow:
         first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
+        self.require_target_checked_out(task)
         if first_integration:
             self._emit("pre_integrate", task)
         if not replay or first_integration:
@@ -4891,6 +4892,46 @@ class WorktreeFlow:
             "bmad-loop relay hook entries out (#352) — then `git worktree remove --force "
             f"{worktree}`, delete branch {task.branch} if you do not keep it, and "
             f"`bmad-loop resume {self.state.run_id}`",
+            task.story_key,
+        )
+
+    def require_target_checked_out(self, task: StoryTask) -> None:
+        """Pause unless the main checkout is on the run's pinned target branch.
+
+        `verify.merge_branch` merges into whatever the main checkout has checked out,
+        and `ensure_target_branch` checks the target only once, at run start. A run
+        paused before integration (a replay minted with `--no-resume` included) can be
+        resumed after the operator checked out another branch, and the unit would land
+        there. Asked before any hook, write-ahead record or target mutation, so the
+        pause leaves nothing to undo: check the target out and a plain
+        `bmad-loop resume` replays the merge. A run with no pinned target (persisted
+        before target_branch existed) keeps merging into the checkout as it did."""
+        target = self.state.target_branch
+        if not target:
+            return
+        repo = self.paths.repo_root
+        try:
+            on = verify.current_branch(repo)
+        except verify.GitError as e:
+            self._pause(
+                f"cannot read the main checkout's branch before merging {task.branch} "
+                f"into {target}: {e}",
+                task.story_key,
+                cause=e,
+            )
+        if on == target:
+            return
+        self.journal.append(
+            "merge-target-not-checked-out",
+            story_key=task.story_key,
+            branch=task.branch,
+            target_branch=target,
+            checked_out_branch=on,
+        )
+        self._pause(
+            f"the main checkout {repo} is on {on!r}, not this run's target branch "
+            f"{target!r}, so unit {task.branch} was not merged; `git checkout {target}` "
+            "there, then `bmad-loop resume`",
             task.story_key,
         )
 
