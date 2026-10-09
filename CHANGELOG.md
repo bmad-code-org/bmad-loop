@@ -9,15 +9,6 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Add `bmad-loop validate --probes`: run every `[environment] probe` (not
-  fail-fast, each bounded by `probe_timeout_s`) and report one
-  `environment.probe` finding per probe; a probe that fails, times out or
-  cannot be started fails validate. Plain `validate` only notes configured
-  probes as not run (DW-526).
-- Add `resolve <finished-run> --reverify --story <key>`: replay a finished
-  run's kept deferred worktree unit in a new replay run that takes the
-  worktree over and merges it on a pass; the finished run stays finished
-  (DW-525).
 - Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
   absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
   session registry instead of the derived per-project root; `bmad-loop mux`
@@ -29,58 +20,33 @@ breaking changes may land in a minor release.
   an ambient `PSMUX_DATA_DIR` stays in force; a teardown kill it refuses is
   journalled (`session-kill-refused`). A running TUI refuses launches after
   the switch is flipped either way, until restarted.
-- Add `[environment] probes` (+ `probe_timeout_s`): operator health checks run
-  before `[verify]` commands, before each dev and review session launch, and
-  before a failed attempt is charged; a failing, hanging or unrunnable probe
-  pauses the run as an environment fault and charges nothing (DW-523).
+- Add `[environment] probes` (+ `probe_timeout_s`): health checks run before
+  `[verify]` and before each session launch. A failing probe pauses the run as an
+  environment fault without charging the story an attempt, and `bmad-loop resume`
+  re-probes and relaunches. A session reporting `Environment fault: <text>`
+  triggers the probes; `bmad-loop validate --probes` runs them all.
 - Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
-  exiting with it declares an environment fault, not a code failure (DW-523).
-- Add the `environment` pause stage: a probe failing before a session launch
-  pauses there, and a plain `bmad-loop resume` re-probes and launches the same
-  session with no rollback (DW-523).
-- Treat an `Environment fault: <text>` line in a session's Auto Run Result as a
-  probe trigger: the run pauses only when a probe confirms it (DW-523).
-- Add `bmad-loop resolve <run> --reverify`: replay `[verify]` on a DEFERRED
-  story's kept work, or an environment-fault escalated one's when the fault left
-  finished work to verify — HEAD in place, or the kept
-  worktree unit — then review per policy and commit or merge, with no dev
-  session and no resolve agent; a worktree unit is accepted under any pause
-  when `--story` names it, and sweep runs are refused (DW-522).
-- Add a TUI re-verify action: `V` (and `R`/`p` on a deferred pause) picks a
-  DEFERRED story or worktree unit and opens `bmad-loop resolve <run> --reverify`
-  in a control window; `R` points at `V` when deferred units exist (DW-524).
-- List the paused story in the TUI's `V` re-verify picker when it is ESCALATED
-  at a replayable environment-fault site, as `resolve --reverify` accepts; `R`
-  still opens the resolve agent (DW-532).
+  exiting with it is an environment fault, not a code failure.
+- Add `bmad-loop resolve <run> --reverify`: re-run `[verify]` on a deferred or
+  environment-fault story's kept work, then review and commit or merge it with no
+  new dev session. Deferred and environment-fault pause notices point at it.
+- Add `bmad-loop resolve <finished-run> --reverify --story <key>`: replay a
+  finished run's kept worktree unit in a new run that merges it on a pass. A story
+  already `done` on the sprint board is refused.
+- Add `V` to the TUI: pick a re-verifiable story and run `resolve --reverify` on it.
 
 ### Changed
 
 - Reword the rc 126/127 environment-fault pause to name the shell convention
-  instead of asserting "command not found / not executable" (DW-523).
-- Point deferred-story and environment-fault pause notices at
-  `bmad-loop resolve <run> --reverify` (DW-522).
+  instead of asserting "command not found / not executable".
 
 ### Fixed
 
-- Launch dev, review and workflow sessions in the project (the mount project
-  under worktree isolation), not the `repo_root` checkout root. With a project
-  nested in `repo_root`, Claude Code, Codex and agy loaded neither the project's
-  hook config nor its skills from the root, so no Stop hook ever fired. agy
-  workspace trust now grants the mount project, inherited from the main
-  project's grant (DW-484).
-- Refuse `resolve <finished-run> --reverify --story <key>` when the story is
-  already `done` on the main checkout's sprint board (a later run re-drove and
-  finished it), so the replay cannot merge superseded work; an unreadable board
-  refuses too (DW-533).
-- Re-read the main checkout's board right before a replay run merges its unit, so a
-  replay minted with `--no-resume`, or resumed after another run finished the story,
-  keeps the branch and escalates (`replay-merge-refused`) instead of merging
-  superseded work; an unreadable board refuses too (DW-534).
-- Stop an in-place defer from stashing the spec before its rollback decides
-  (DW-528). Moving the spec out first made the rollback pause on owned-spec
-  recovery: with `rollback_on_failure` off it now pauses with the
-  committed-work manual-recovery notice and keeps the spec live; with it on it
-  auto-rolls back and stashes the spec.
+- Launch sessions in the BMAD project, not the `repo_root` checkout root. With
+  the project nested inside `repo_root`, Claude Code, Codex and agy found neither
+  its hooks nor its skills, so sessions never reported completion.
+- Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
+  was moved out before the rollback, so every such defer paused for spec recovery.
 - Refuse to open a psmux window or create a psmux session when `pwsh` is older
   than 7.3, whose argument passing corrupts a command's arguments (a path with a
   space and a trailing backslash swallowed the next one); checked once per
@@ -101,15 +67,8 @@ breaking changes may land in a minor release.
   `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots and the
   `tmux set-environment` remedy, with its limits on a server shared by several
   projects, instead of letting the run read as gone (#731).
-- Escalate an environment fault at the review-budget rescue gate instead of
-  deferring the story as unconverged (DW-523).
-- Resume a `resolve --reverify` story whose review or fix died with the host by
-  re-running the verify replay, not resume-restart (DW-527).
-- Guard a review-dispatch environment pause with no completed prior pass: it now
-  resumes into the next review cycle, outside sweep runs (DW-529).
-- Resume a review loop interrupted mid-loop into its next review pass instead of
-  re-asking the `followup_review_recommended` entry gate, which skipped the
-  re-review a stale `false` flag owed (DW-531).
+- Resume a review loop interrupted after a fix into its next review pass; it
+  re-checked `followup_review_recommended` and could skip the re-review.
 - Reach only control-session windows carrying this project's tag from `a`/`x`,
   so a reused window id or a forged `ctl-window` record can no longer steer
   them onto a neighbour's window; the record now only breaks ties among tagged
