@@ -75,7 +75,20 @@ def test_e2e_parked_engine_resolves_the_launchers_root_on_a_stale_server(
             text=True,
         ).stdout
         assert "[bmad-loop exited" in captured.stdout, (captured.stderr, windows)
-        assert f"{win} run-RID" in windows, "the window did not park after its command"
+        # The banner prints just before the park's `read`, so a window seen
+        # right after it may still be on its way out. The pane must still be
+        # alive across a settle interval: only a blocked reader keeps it.
+        for _ in range(2):
+            time.sleep(0.5)
+            pane = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", win, "#{pane_dead}"],
+                capture_output=True,
+                text=True,
+            )
+            assert (pane.returncode, pane.stdout.strip()) == (0, "0"), (
+                "the window did not park after its command",
+                pane.stderr,
+            )
         screen = captured.stdout
         assert "BMAD_LOOP_EVENTS_DIR=" in screen, screen
         (line,) = [ln for ln in screen.splitlines() if "BMAD_LOOP_EVENTS_DIR=" in ln]
