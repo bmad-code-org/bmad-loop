@@ -63,6 +63,9 @@ breaking changes may land in a minor release.
   space and a trailing backslash swallowed the next one); checked once per
   process, forced backend included, and an unrecognized version answer is
   refused too (#861).
+- Launch psmux windows and the pipe-pane log sink with the same absolute `pwsh`
+  path whose version was checked, instead of letting the psmux server's PATH pick
+  one; a `pwsh` that does not resolve is refused (#863).
 - Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
   shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
   intact; batch launchers have remaining argument limits, tracked separately.

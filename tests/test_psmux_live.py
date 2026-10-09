@@ -52,11 +52,16 @@ pytestmark = pytest.mark.skipif(not HAVE_PSMUX, reason="requires Windows with ps
 
 PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks on read
 
+# The real resolver, captured before conftest pins it for every test.
+_REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
+
 
 @pytest.fixture(autouse=True)
 def _probe_the_real_pwsh(monkeypatch):
-    """Drop conftest's seeded PowerShell answer, so every window launch here runs
-    the backend's real version probe against the installed pwsh."""
+    """Drop conftest's pinned pwsh path and seeded PowerShell answer, so every
+    window launch here resolves the installed pwsh and runs the backend's real
+    version probe against it."""
+    monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
     monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
 
 
@@ -834,6 +839,74 @@ def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe,
     assert not log.with_name(log.name + ".sink.ps1").exists()  # no sidecar, ever again
 
 
+def test_a_pinned_pwsh_path_with_shell_syntax_launches_and_pipes(probe, tmp_path, monkeypatch):
+    """The window and the pipe-pane sink run the absolute pwsh path the version
+    probe read (#863), even when that path holds what psmux's own command
+    tokenizer cannot carry: a space, `( )` as in `Program Files (x86)`, an
+    apostrophe and a doubled space. A junction so named stands in for such an
+    install, so the row holds wherever pwsh is installed; Windows reports a
+    process launched through it under the junction path, so counting images
+    there counts only the pinned pwsh itself, never a wrapper shell that merely
+    names it in its arguments.
+
+    A red here means psmux stopped running a `&`-led command under its own
+    PowerShell verbatim, so the call-operator line no longer reaches pwsh."""
+    mux, session, _windows = probe
+    installed = Path(_REAL_PWSH_PATH(mux))
+    link = tmp_path / "pinned (x86) pwsh's  dir"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(installed.parent)],
+        capture_output=True,
+        text=True,
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert made.returncode == 0, f"probe setup: junction failed: {made.stderr.strip()!r}"
+    pinned_images = (
+        "@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "
+        f"{psmux_backend._pwsh_quote(str(link) + chr(92) + '*')} }}).Count"
+    )
+
+    def await_images(at_least: int) -> int:
+        deadline = time.monotonic() + 7.5
+        count = int(_powershell(pinned_images).strip())
+        while count < at_least and time.monotonic() < deadline:
+            time.sleep(0.25)
+            count = int(_powershell(pinned_images).strip())
+        return count
+
+    try:
+        monkeypatch.setattr(mux, "_PWSH", str(link / installed.name))
+        assert mux._pwsh_path() == str(link / installed.name)
+        text = ""
+        for attempt in range(2):  # psmux/psmux#482's spawn race
+            before = await_images(0)
+            window = _mint_probe_window(mux, session, f"pinned-{attempt}", tmp_path)
+            # The parked window runs the pinned pwsh, before any sink exists.
+            assert await_images(before + 1) >= before + 1, "the window is not the pinned pwsh"
+            log = tmp_path / f"pinned log {attempt}.txt"
+            mux.pipe_pane(window, log)
+            # The sink is a second pinned image — read before the keystrokes
+            # below answer the park and close the window.
+            assert await_images(before + 2) >= before + 2, "the sink is not the pinned pwsh"
+            for argv in (
+                ["send-keys", "-t", window, "-l", "echo pinnedprobe"],
+                ["send-keys", "-t", window, "Enter"],
+            ):
+                sent = mux._run(argv, check=False)
+                assert sent.returncode == 0, f"probe setup: {argv[0]}: {sent.stderr.strip()!r}"
+            deadline = time.monotonic() + 7.5
+            while time.monotonic() < deadline:
+                text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+                if "pinnedprobe" in text:
+                    break
+                time.sleep(0.25)
+            if "pinnedprobe" in text:
+                break
+        assert "pinnedprobe" in text, f"no pane bytes through the pinned sink: {text[:200]!r}"
+    finally:
+        os.rmdir(link)  # the junction only, never the install it points at
+
+
 def test_adopted_select_window_focuses_a_qualified_window_id(probe):
     mux, session, windows = probe
     # Start focused on the OTHER window, so a green here is a move rather than a
@@ -1146,7 +1219,7 @@ def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe,
     with pytest.raises(tmux_base.TmuxError, match=r"PowerShell 7\.3 or later.*'5\.1\.") as refused:
         mux.new_parked_window(session, "legacy-shell", Path.cwd(), engine, "@r")
     assert "upgrade pwsh to 7.3 or later" in str(refused.value)
-    assert psmux_backend._PWSH_VERSIONS["powershell.exe"].startswith("5.1.")
+    assert psmux_backend._PWSH_VERSIONS[mux._pwsh_path()].startswith("5.1.")
     assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"
 
 
@@ -1178,7 +1251,7 @@ def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher
     the .cmd row fails on an embedded quote, a backslash-quote with a space
     and an empty argument unless the source opts into Standard mode first
     (`_shell_wrap`). No psmux server is involved: the window's shell command
-    is executed directly, exactly as psmux would spawn it."""
+    is run under pwsh `-Command`, exactly as psmux would spawn it."""
     mux = PsmuxMultiplexer()
     if not mux.available():
         pytest.skip("psmux present but not an admitted version")
@@ -1218,8 +1291,9 @@ def test_a_window_delivers_argv_intact_to_every_launcher_kind(tmp_path, launcher
         f"$env:ARGV_OUT = {psmux_backend._pwsh_quote(str(out))}; "
         + mux._join_argv([*target, *_ARGV_SHAPES])
     )
+    # psmux runs the window's one call-operator line under its own PowerShell.
     ran = subprocess.run(
-        command,
+        [mux._pwsh_path(), "-NoLogo", "-Command", *command],
         capture_output=True,
         text=True,
         encoding="utf-8",
