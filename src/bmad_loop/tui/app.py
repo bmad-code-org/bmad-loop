@@ -6,7 +6,8 @@ tui.launch (bmad-loop-ctl on tmux; a per-registry name on psmux, which the
 launch toasts print). Dry runs are captured into a text modal; validate
 renders its `--json` document into a findings modal (falling back to the text
 one), so the verdict is the document's `ok` rather than an exit code.
-The g binding opens the policy.toml settings editor.
+The g binding opens the policy.toml settings editor. The ctrl+p command palette
+lists every key-bound command live on the current screen or modal (tui.commands).
 """
 
 from __future__ import annotations
@@ -15,15 +16,16 @@ import os
 import shlex
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, TypeVar
 
 from rich.markup import escape
 from rich.text import Text
 from textual import work
-from textual.app import App, SuspendNotSupported
+from textual.app import App, SuspendNotSupported, SystemCommand
 from textual.binding import Binding
+from textual.screen import Screen
 from tomlkit.exceptions import ParseError
 
 from .. import (
@@ -56,7 +58,7 @@ from ..platform_util import LockUnavailableError, resolve_or_lexical
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
-from . import data, launch, widgets
+from . import commands, data, launch, widgets
 from .screens.dashboard import DashboardScreen
 from .screens.modals import (
     ConfirmModal,
@@ -219,6 +221,10 @@ class BmadLoopApp(App[None]):
 
     def action_toggle_dark(self) -> None:
         self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        yield from super().get_system_commands(screen)
+        yield from commands.palette_commands(screen, self.run_action)
 
     # ------------------------------------------------------------ run control
 

@@ -396,30 +396,32 @@ producer kind that merely contains its spelling is not restyled:
 
 ## Key bindings
 
-| Key      | Action                                                                     |
-| -------- | -------------------------------------------------------------------------- |
-| `r`      | start a run (modal)                                                        |
-| `s`      | start a sweep (modal)                                                      |
-| `e`      | resume the selected paused/interrupted run (confirm modal)                 |
-| `p`      | review the selected paused run in the stage-appropriate HITL viewer        |
-| `R`      | resolve a run paused at an escalation (interactive, then re-arm)           |
-| `V`      | re-verify a story's kept work (`resolve --reverify`, pick target)          |
-| `d`      | answer deferred-work decisions past sweeps left unanswered (modal walk)    |
-| `a`      | attach to the selected run's live session or orchestrator window           |
-| `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)  |
-| `S`      | graceful stop: finish the in-flight item, then finalize & stop (confirm)   |
-| `D`      | delete the selected run's directory (confirm modal)                        |
-| `A`      | archive the selected run to `.bmad-loop/archive` (confirm modal)           |
-| `c`      | clean up tmux sessions/windows for finished & stopped runs (confirm modal) |
-| `v`      | run `bmad-loop validate`, findings in a modal (`d` toggles detail)         |
-| `g`      | settings editor for `.bmad-loop/policy.toml`                               |
-| `M`      | toggle theme (light/dark mode)                                             |
-| `y`      | copy the active Log/Attention pane to the clipboard                        |
-| `ctrl+w` | enter/leave pane **resize mode** (see below)                               |
-| `q`      | quit (running engines are unaffected)                                      |
+| Key      | Action                                                                                        |
+| -------- | --------------------------------------------------------------------------------------------- |
+| `r`      | start a run (modal)                                                                           |
+| `s`      | start a sweep (modal)                                                                         |
+| `e`      | resume the selected paused/interrupted run (confirm modal)                                    |
+| `p`      | review the selected paused run in the stage-appropriate HITL viewer                           |
+| `R`      | resolve a run paused at an escalation (interactive, then re-arm)                              |
+| `V`      | re-verify a story's kept work (`resolve --reverify`, pick target)                             |
+| `d`      | answer deferred-work decisions past sweeps left unanswered (modal walk)                       |
+| `a`      | attach to the selected run's live session or orchestrator window                              |
+| `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)                     |
+| `S`      | graceful stop: finish the in-flight item, then finalize & stop (confirm)                      |
+| `D`      | delete the selected run's directory (confirm modal)                                           |
+| `A`      | archive the selected run to `.bmad-loop/archive` (confirm modal)                              |
+| `c`      | clean up tmux sessions/windows for finished & stopped runs (confirm modal)                    |
+| `v`      | run `bmad-loop validate`, findings in a modal (`d` toggles detail)                            |
+| `g`      | settings editor for `.bmad-loop/policy.toml`                                                  |
+| `M`      | toggle theme (light/dark mode)                                                                |
+| `y`      | copy the active Log/Attention pane to the clipboard                                           |
+| `ctrl+w` | enter/leave pane **resize mode** (see below)                                                  |
+| `q`      | quit (running engines are unaffected)                                                         |
+| `ctrl+p` | command palette: every command above, filtered to what is live on the current screen or modal |
 
 In the settings editor: `ctrl+s` saves, `ctrl+e` expands/collapses all
 sections, `escape` goes back without saving. In any modal: `escape` cancels.
+These are in the command palette too, listed only inside the editor or modal.
 
 ### Resizing panes
 
