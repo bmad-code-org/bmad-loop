@@ -1397,6 +1397,12 @@ _PARKED_SH_SOURCE = (
         ("[bmad-loop exited 0 — press enter]\nlater output\n", False),
         ("[bmad-loop exited $ec — press enter]\n", False),
         ("[bmad-loop exited 0 — press enter] x\n", False),
+        # any other token in the dash's place is a live command's output, not
+        # our banner: no wildcard stands in for the dash
+        ("[bmad-loop exited 0 x press enter]\n", False),
+        ("[bmad-loop exited 0 - press enter]\n", False),
+        ("[bmad-loop exited 0 -- press enter]\n", False),
+        ("[bmad-loop exited 0 \\xe2 press enter]\n", False),
         # last output had no newline, so the banner shares its row
         ("partial output[bmad-loop exited 0 — press enter]\n", True),
         # a pane narrower than the banner wraps it; capture trims each row

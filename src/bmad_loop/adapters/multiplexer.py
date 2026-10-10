@@ -58,10 +58,17 @@ class MultiplexerError(Exception):
 # current command can: both name the parking shell either way (#876).
 PARKED_BANNER = "[bmad-loop exited {ec} — press enter]"
 # Matched against the screen with all whitespace removed (see parked_screen).
-# The dash may arrive mangled: as mojibake from a code page, or as the literal
-# escapes of a backslashreplace decode (`\xe2\x80\x94`, 12 characters, under
-# an ASCII locale), so any short token stands in for it.
-_PARKED_BANNER_TAIL_RE = re.compile(r"\[bmad-loopexited-?\d+\S{1,12}pressenter\]\Z")
+# The dash, and only these spellings of it: the real em dash; its UTF-8 bytes
+# read as cp1252 (`â€”`); the escapes of the capture's backslashreplace decode,
+# UTF-8 under an ASCII locale (`\xe2\x80\x94`) or a cp1252 dash under UTF-8
+# (`\x97`). No wildcard: any other token between the exit status and "press
+# enter" is not our banner, and reading it as one would kill a live window.
+_PARKED_DASHES = ("—", "â€”", r"\xe2\x80\x94", r"\x97")
+_PARKED_BANNER_TAIL_RE = re.compile(
+    r"\[bmad-loopexited-?\d+(?:"
+    + "|".join(re.escape(dash) for dash in _PARKED_DASHES)
+    + r")pressenter\]\Z"
+)
 
 
 def parked_screen(screen: str) -> bool:
