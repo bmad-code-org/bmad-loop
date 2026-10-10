@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    HAVE_PIDFD,
     RECORDED_CHILD_GLOB,
     bind_recorded_child,
     kill_recorded_child,
@@ -2065,9 +2066,10 @@ def test_kill_unknown_handle_is_a_noop(tmp_path):
 
 
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
+    not (sys.platform.startswith("linux") and HAVE_PIDFD),
     reason="the detached child is identified by its /proc start time and signalled "
-    "through os.pidfd_open — both Linux-only facilities",
+    "through os.pidfd_open — both Linux-only facilities, and the pidfd calls must "
+    "also exist in this Python build",
 )
 def test_kill_process_reaps_detached_descendant(tmp_path):
     """#183 mirror on the HTTP transport, deterministic without a real opencode
@@ -2200,11 +2202,13 @@ def test_detached_descendant_row_is_gated_to_linux_only():
     # agree everywhere for any platform-shaped condition, so it can never fail. This
     # form does: a gate hardcoded True, or one keyed to the wrong platform, is caught
     # on whichever leg it wrongly skips (CI runs ubuntu and windows).
+    # The second operand is a capability, not a platform: a Linux interpreter built
+    # without the pidfd calls must skip too, or the row dies on an AttributeError.
     skips_here = bool(marks[0].args[0])
-    if sys.platform.startswith("linux"):
-        assert not skips_here, "the gate skips the row on Linux, the one host it must run on"
+    if sys.platform.startswith("linux") and HAVE_PIDFD:
+        assert not skips_here, "the gate skips the row on a Linux host that has pidfds"
     else:
-        assert skips_here, "the gate admits a host with no /proc start times and no pidfd"
+        assert skips_here, "the gate admits a host with no /proc start times or no pidfd"
     reason = marks[0].kwargs["reason"]
     assert "/proc" in reason and "pidfd" in reason, reason
 
@@ -2212,14 +2216,14 @@ def test_detached_descendant_row_is_gated_to_linux_only():
     # cannot silently break these substring checks.
     source = "".join(inspect.getsource(test_kill_process_reaps_detached_descendant).split())
     gate = source.split("deftest_kill_process_reaps_detached_descendant")[0]
-    assert 'sys.platform.startswith("linux")' in gate, gate
+    assert 'sys.platform.startswith("linux")andHAVE_PIDFD' in gate, gate
     assert "psutil" not in gate, gate
 
 
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
+    not (sys.platform.startswith("linux") and HAVE_PIDFD),
     reason="plants a /proc-authenticated identity and reaps it through os.pidfd_open — "
-    "both Linux-only facilities",
+    "both Linux-only facilities, and the pidfd calls must also exist in this Python build",
 )
 def test_detached_descendant_row_sweeps_a_recorded_child_when_setup_fails(tmp_path, monkeypatch):
     """DW-136 mirror of the stories DW-137 row: the row above spawns a session-leader

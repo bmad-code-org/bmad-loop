@@ -400,6 +400,14 @@ Deliberate absences — decisions, not gaps:
   guard; macOS-specific traps found in the field get targeted unit tests (the psutil
   `create_time` trap being the canonical example). A macOS job would mostly re-run the Linux
   suite at 10× the queue time.
+- **No WSL2 runner.** Hosted runners cannot host WSL2, so run the suite there by hand
+  (#883), from a clone inside the WSL filesystem: a Windows worktree reached through
+  `/mnt/c` carries a `C:/` gitdir that WSL git cannot resolve. A stock install differs
+  from the ubuntu leg in two ways the tests already handle. Ubuntu ships only `python3`,
+  so a test that spawns an interpreter uses `sys.executable`, never a bare `python`.
+  uv's standalone CPython has no `os.pidfd_open`, so the pidfd reap rows skip via
+  `conftest.needs_pidfd`. To run them, build the venv on the distro Python with
+  `uv venv -p /usr/bin/python3`.
 - **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
   above), and faking the server would test the fake. psmux is the counter-example rather than
   the precedent: it is one zip on a GitHub release, so **test-windows-live** installs it and runs
