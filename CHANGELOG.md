@@ -7,42 +7,46 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-10-09
+
 ### Added
 
-- Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
-  absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
-  session registry instead of the derived per-project root; `bmad-loop mux`
-  says which source won (#729). Such a root can be shared by several projects,
-  so there a same-named session is killed, attached, read as live or adopted
-  by a launch only when its project tag proves it this project's; a refusal is
-  warned about, and a launch that would adopt one fails with the reason. The
-  same check applies without the opt-in when no state root can be derived and
-  an ambient `PSMUX_DATA_DIR` stays in force; a teardown kill it refuses is
-  journalled (`session-kill-refused`). A running TUI refuses launches after
-  the switch is flipped either way, until restarted.
 - Add `[environment] probes` (+ `probe_timeout_s`): health checks run before
   `[verify]` and before each session launch. A failing probe pauses the run as an
   environment fault without charging the story an attempt, and `bmad-loop resume`
   re-probes and relaunches. A session reporting `Environment fault: <text>`
-  triggers the probes; `bmad-loop validate --probes` runs them all.
-- Add `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command
-  exiting with it is an environment fault, not a code failure.
+  triggers the probes; `bmad-loop validate --probes` runs them all. Add
+  `[verify] env_fault_rc` (0 = disabled, 75 suggested): a verify command exiting
+  with it is an environment fault, not a code failure.
 - Add `bmad-loop resolve <run> --reverify`: re-run `[verify]` on a deferred or
   environment-fault story's kept work, then review and commit or merge it with no
-  new dev session. Deferred and environment-fault pause notices point at it.
-- Add `bmad-loop resolve <finished-run> --reverify --story <key>`: replay a
-  finished run's kept worktree unit in a new run that merges it on a pass. A story
-  already `done` on the sprint board is refused.
-- Add `V` to the TUI: pick a re-verifiable story and run `resolve --reverify` on it.
+  new dev session; pause notices point at it. On a finished run, `--story <key>`
+  replays its kept worktree unit in a new run that merges it on a pass (a story
+  already `done` on the sprint board is refused). `V` in the TUI picks a
+  re-verifiable story and runs it.
+- Add `[mux] honor_ambient_psmux_data_dir` (default off): on psmux, use an
+  absolute `PSMUX_DATA_DIR` your profile exports into every shell as the
+  session registry instead of the derived per-project root; `bmad-loop mux`
+  says which source won (#729). Since such a root can be shared by several
+  projects, a same-named session there is killed, attached, read as live or
+  adopted only when its project tag proves it this project's; a refusal is
+  warned about (a refused teardown kill is journalled as `session-kill-refused`).
+  The same check applies without the opt-in when no state root can be derived and
+  an ambient `PSMUX_DATA_DIR` stays in force. A running TUI refuses launches
+  after the switch is flipped either way, until restarted.
 
 ### Changed
 
-- Reword the rc 126/127 environment-fault pause to name the shell convention
-  instead of asserting "command not found / not executable".
 - Narrow the `PSMUX_BARE_ENV` support gap (#730): TUI-parked engine windows now
   land on the right state root, and on the right registry under
   `[mux] honor_ambient_psmux_data_dir`; window-0 shells and every other bare-env
   loss stay warned, and the TUI repeats the warning once its screen is up.
+- Reword the rc 126/127 environment-fault pause to name the shell convention
+  instead of asserting "command not found / not executable".
+- Type-check against the native Windows and macOS `os` surfaces: platform-gated
+  names are fetched with `getattr` inside their existing runtime checks, so
+  `uv run pyright` passes on Windows and macOS hosts, and CI's typecheck job also
+  runs `--pythonplatform Windows` and `Darwin` (#867).
 
 ### Fixed
 
@@ -54,74 +58,49 @@ breaking changes may land in a minor release.
   unit into that branch instead.
 - Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
   was moved out before the rollback, so every such defer paused for spec recovery.
-- Read `engine.pid` without blocking and only when it is a regular file: a FIFO
-  there hung `bmad-loop cleanup` and the TUI cleanup worker; it now reads as an
-  unverifiable pid (#868).
+- Resume a review loop interrupted after a fix into its next review pass; it
+  re-checked `followup_review_recommended` and could skip the re-review.
+- Surface why a sprint-mode dev session found no result (#780): `session-end`
+  carries the last resultless verdict, the `no-artifact` breadcrumb explains that
+  unpinned scans search only the configured artifact directories and names specs
+  found one level down, and `validate` warns `queue.nested-specs` on a nested
+  spec layout.
 - Hand each TUI-launched engine the TUI's own state root, and its registry root
   on psmux, on the parked window's command line, so a multiplexer server started
   under another state root no longer runs it where the TUI cannot see it; a TUI
-  with no derivable state root refuses the launch (#731)
-- Keep a TUI-launched tmux window open after its command exits on hosts whose
-  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
-  refuses at once, so the window closed with its exit status unread.
-- Refuse to open a psmux window or create a psmux session when `pwsh` is older
-  than 7.3, whose argument passing corrupts a command's arguments (a path with a
-  space and a trailing backslash swallowed the next one); checked once per
-  process, forced backend included, and an unrecognized version answer is
-  refused too (#861).
-- Launch psmux windows and the pipe-pane log sink with the same absolute `pwsh`
-  path whose version was checked, instead of letting the psmux server's PATH pick
-  one; a `pwsh` that does not resolve is refused (#863).
-- Pass a psmux window's arguments to a `.cmd`/`.bat` launcher (such as an npm
-  shim) in PowerShell's Standard mode, so an empty or quoted argument arrives
-  intact; batch launchers have remaining argument limits, tracked separately.
+  with no derivable state root refuses the launch. The TUI also notes once when
+  new shells in its tmux control session would resolve a different state root,
+  naming both, so a `bmad-loop` command typed there is not silently aimed
+  elsewhere (#731).
+- Reach only control-session windows carrying this project's tag from `a`/`x`,
+  so a reused window id or a forged `ctl-window` record can no longer steer them
+  onto a neighbour's window (#750). An untagged or unreadable window is left
+  alone and `x`, `a` and `bmad-loop attach` say so instead of reporting success;
+  a failed control listing is reported as a fault rather than "no window", and
+  `a`/`attach` still reach the run's agent session.
+- Read `engine.pid` without blocking and only when it is a regular file: a FIFO
+  there hung `bmad-loop cleanup` and the TUI cleanup worker; it now reads as an
+  unverifiable pid (#868).
 - Report an unavailable multiplexer in `bmad-loop cleanup` and the TUI cleanup
   instead of reading it as nothing to prune, when this project has a recorded
   control window or a live run: `ctl_windows.scan_error` and the new optional
-  `sessions.scan_error` say why, exit stays 0. A host without a multiplexer
-  and without such evidence sees no change. Records are sticky, so a project
+  `sessions.scan_error` say why, exit stays 0. Records are sticky, so a project
   that launched from the TUI keeps reporting it until its run dirs are removed
   (#864).
+- Keep a TUI-launched tmux window open after its command exits on hosts whose
+  `sh` is dash (Debian, Ubuntu): the park used a bare `read -r`, which dash
+  refuses at once, so the window closed with its exit status unread.
+- Refuse to open a psmux window or session when `pwsh` is older than 7.3, whose
+  argument passing corrupts a command's arguments, and launch windows and the
+  pipe-pane log sink with the same absolute `pwsh` whose version was checked
+  instead of the psmux server's PATH pick (#861, #863). Pass a window's
+  arguments to a `.cmd`/`.bat` launcher (such as an npm shim) in PowerShell's
+  Standard mode, so an empty or quoted argument arrives intact.
 - Kill a resumed run's stale psmux session in the registry it predates (the
   displaced or pre-#537 default root, or the derived one after opting in to
   your own), tag-proven only; a same-named survivor there made the resumed
   session's create fail on psmux's cross-registry name mutex. A registry that
   cannot be listed, or a session left standing, is journalled and warned about.
-  A TUI-launched resume sweeps the TUI's displaced root too (forwarded to the
-  child), except a share-root shape older PowerShell would corrupt.
-- Note once in the TUI when new shells in its tmux control session would
-  resolve a different state root than its own (a server started under another
-  `BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or `HOME`), naming both roots, so a
-  `bmad-loop` command typed into one is not silently aimed elsewhere; runs the
-  TUI launches are handed their root and are unaffected (#731).
-- Resume a review loop interrupted after a fix into its next review pass; it
-  re-checked `followup_review_recommended` and could skip the re-review.
-- Reach only control-session windows carrying this project's tag from `a`/`x`,
-  so a reused window id or a forged `ctl-window` record can no longer steer
-  them onto a neighbour's window; the record now only breaks ties among tagged
-  windows, and a window whose tag write failed is left alone until relaunched
-  (#750). When a window under the run's name is left alone because its tag reads
-  empty (never written, or unreadable — psmux's option probe can fail), `x`
-  warns that the control window was not closed instead of reporting a clean
-  stop, and `a` and `bmad-loop attach` say why they cannot reach it. A control
-  listing that fails outright is reported as such instead of reading as "no
-  window" (by `x`, `a`, `bmad-loop attach` and the window prune) — `a` and
-  `bmad-loop attach` then still reach the run's agent session — `x` checks
-  that the window it killed is gone, and a TUI run or sweep launch warns when
-  its new window cannot be confirmed as this project's.
-- Explain that unpinned result-artifact scans search only the configured artifact
-  directories themselves, so a nested story spec no longer produces an opaque
-  `no-artifact` breadcrumb (#780).
-- Surface why a sprint-mode dev session found no result: `session-end` carries
-  the last resultless verdict, the `no-artifact` crumb names specs found one level
-  down, and `validate` warns `queue.nested-specs` on a nested spec layout (#780).
-- Type-check clean against the native Windows and macOS `os` surfaces:
-  platform-gated POSIX/Linux-only names (`O_DIRECTORY`, `O_NOFOLLOW`,
-  `O_NONBLOCK`, `setxattr`/`getxattr`, `sysconf`) are fetched with `getattr`
-  inside their existing runtime checks in `platform_util`, `verify`,
-  `artifact_publication` and `events`, so `uv run pyright` passes on a Windows
-  or macOS host; CI's typecheck job now also runs `--pythonplatform Windows`
-  and `Darwin` (#867).
 
 ## [0.13.1] — 2026-10-01
 
@@ -6578,7 +6557,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.2
 [0.13.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.1
 [0.13.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.0
 [0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
