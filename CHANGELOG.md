@@ -7,6 +7,11 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
+  settings-editor, and dialog commands, each listed only where its key is live.
+
 ## [0.13.2] — 2026-10-09
 
 ### Added
