@@ -64,6 +64,11 @@ breaking changes may land in a minor release.
   closed only once its screen shows the park banner. A window whose screen cannot be
   read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
 
+### Fixed
+
+- Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
+  has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883)
+
 ## [0.13.2] — 2026-10-09
 
 ### Added

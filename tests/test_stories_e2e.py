@@ -80,6 +80,7 @@ from conftest import (
     install_dev_base_skills,
     install_sweep_skill,
     kill_recorded_child,
+    needs_pidfd,
     preflight_pidfd_support,
     proc_starttime,
     real_mux_e2e,
@@ -1195,6 +1196,7 @@ def test_recorded_child_rejects_malformed_zero_and_non_ascii_identities(tmp_path
         recorded_child(pid_file)
 
 
+@needs_pidfd
 def test_reap_identity_binds_a_live_child(tmp_path):
     proc, starttime = _live_child()
     try:
@@ -1218,6 +1220,7 @@ def test_reap_identity_returns_none_for_a_reaped_child():
     assert bind_recorded_child(proc.pid, starttime) is None
 
 
+@needs_pidfd
 def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1237,6 +1240,7 @@ def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
         _reap(proc)
 
 
+@needs_pidfd
 def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1260,6 +1264,7 @@ def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(mo
         _reap(proc)
 
 
+@needs_pidfd
 def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1291,6 +1296,7 @@ def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
         _reap(proc)
 
 
+@needs_pidfd
 def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1326,6 +1332,7 @@ def test_proc_starttime_propagates_non_disappearance_and_malformed_failures(monk
             proc_starttime(123)
 
 
+@needs_pidfd
 def test_kill_recorded_child_actually_kills_through_the_fd():
     proc, starttime = _live_child()
     try:
@@ -1337,6 +1344,7 @@ def test_kill_recorded_child_actually_kills_through_the_fd():
         _reap(proc)
 
 
+@needs_pidfd
 def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1358,6 +1366,7 @@ def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch
         _reap(proc)
 
 
+@needs_pidfd
 def test_kill_recorded_child_ignores_disappearance_and_closes_fd(monkeypatch):
     fd = os.pidfd_open(os.getpid())
 
@@ -1393,6 +1402,7 @@ def test_live_child_reaps_its_process_when_identity_observation_fails(monkeypatc
     assert spawned[0].poll() == -signal.SIGKILL
 
 
+@needs_pidfd
 def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1458,6 +1468,7 @@ def test_recorded_children_swept_leaves_a_clean_block_alone(tmp_path):
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
     proc, starttime = _live_child()
     try:
@@ -1470,6 +1481,7 @@ def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweeping(tmp_path):
     """One unparseable file must not end the sweep, nor get its number signalled.
 
@@ -1496,6 +1508,7 @@ def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweep
         _reap(survivor)
 
 
+@needs_pidfd
 def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
     """A start-time mismatch refuses the bind — silently, since nothing failed to parse.
 
@@ -1518,6 +1531,7 @@ def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monkeypatch):
     """The OSError arm: a parseable identity whose bind raises something that is NOT
     proven disappearance. Without this row the handler could narrow to AssertionError
@@ -1541,6 +1555,7 @@ def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monk
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping(tmp_path):
     """A non-UTF-8 record raises UnicodeDecodeError out of `read_text`, not
     AssertionError — a handler listing only parse-shaped types would let it REPLACE
@@ -1561,6 +1576,7 @@ def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_errors(tmp_path):
     doomed, doomed_start = _live_child()
     try:
@@ -1576,6 +1592,7 @@ def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_erro
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
     tmp_path, monkeypatch
 ):
@@ -1609,6 +1626,7 @@ def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_preserves_partial_glob_results(tmp_path, monkeypatch):
     doomed, doomed_start = _live_child()
     try:
@@ -1673,6 +1691,7 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
         "test_e2e_detached_writer_reaped_before_worktree_teardown",
     ],
 )
+@needs_pidfd
 def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypatch, surface_name):
     """DW-137: a failure anywhere in the pre-bind window must not leak the child.
 
@@ -1698,6 +1717,7 @@ def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypat
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
     observed, observed_start = _live_child()
     recorded, recorded_start = _live_child()
@@ -1716,6 +1736,7 @@ def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
         _reap(recorded)
 
 
+@needs_pidfd
 def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1754,6 +1775,7 @@ def _tmux_window_names(session: str) -> list[str]:
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
+@needs_pidfd
 def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_assertion):
     """#157 end to end through the real binary + real tmux: a dev session wedged
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
@@ -1927,6 +1949,7 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
+@needs_pidfd
 def test_e2e_detached_writer_reaped_before_worktree_teardown(
     tmp_path, monkeypatch, force_live_reap_assertion
 ):
@@ -2058,6 +2081,7 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
+@needs_pidfd
 def test_e2e_detached_writer_publication_fault_still_reaped(
     tmp_path, monkeypatch, force_live_reap_assertion
 ):
