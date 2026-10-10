@@ -12,6 +12,11 @@ breaking changes may land in a minor release.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 
+### Fixed
+
+- Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
+  has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883)
+
 ## [0.13.2] — 2026-10-09
 
 ### Added

@@ -151,6 +151,17 @@ REAL_MUX_HANG_CEILING_S = 90.0
 # Every function below is Linux-only AT CALL TIME (/proc, os.pidfd_open). Nothing here
 # touches either at import time, because this file also loads on Windows.
 
+# A pidfd-capable kernel does not imply a pidfd-capable interpreter: uv's standalone
+# CPython builds (3.13.2 measured on WSL2) ship without `os.pidfd_open` and
+# `signal.pidfd_send_signal`. So gate on the attributes, never on the platform. A KERNEL
+# refusal (ENOSYS/EPERM) on a build that has them still fails loudly in
+# `preflight_pidfd_support`.
+HAVE_PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+needs_pidfd = pytest.mark.skipif(
+    not HAVE_PIDFD,
+    reason="this Python build has no os.pidfd_open / signal.pidfd_send_signal",
+)
+
 
 def positive_ascii_decimal(token: str) -> bool:
     return bool(token) and token.isascii() and token.isdecimal() and any(ch != "0" for ch in token)
