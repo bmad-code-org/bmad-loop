@@ -5548,8 +5548,7 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
             "rearm-commits-probe-failed",
             story_key=key,
             old_baseline=baseline,
-            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: "
-            "not a git repository",
+            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: not a git repository",
         )
         return _journal_rearm_outcome(rd, key)
 
@@ -7003,6 +7002,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "survived": [],
         "unverifiable": [],
         "scan_error": None,
+        "undetermined": [],
     }
     assert dry_runs == [True]  # the kill stayed suppressed
 
@@ -7060,6 +7060,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "survived": [],
         "unverifiable": [],
         "scan_error": None,
+        "undetermined": [],
     }
 
 
@@ -7099,6 +7100,7 @@ def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
         "survived": [],
         "unverifiable": [],
         "scan_error": "tmux has-session failed: server gone",
+        "undetermined": [],
     }
 
 
@@ -7132,6 +7134,7 @@ def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatc
         "survived": [],
         "unverifiable": [],
         "scan_error": "tmux list-windows failed: timeout",
+        "undetermined": [],
     }
 
 
@@ -7211,7 +7214,52 @@ def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, c
         "survived": ["stuck-1"],
         "unverifiable": ["dunno-1"],
         "scan_error": None,
+        "undetermined": [],
     }
+
+
+def _scan_keeping_one_unread(_proj):
+    from bmad_loop.tui import launch
+
+    launch._UNDETERMINED_CTL_WINDOWS.append(("resolve-unread-1", "capture timed out"))
+    return (["gone-1"], [], [])
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_lists_windows_whose_command_state_is_unread(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    """A window the scan kept because it could not read whether its command
+    still runs (#876) travels in the receipt, outside the kill partition, and
+    JSON mode leaves stderr empty. Drop the drain in cmd_cleanup and the list
+    is empty."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", _scan_keeping_one_unread)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda p: _scan_keeping_one_unread(p)[0])
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys)
+
+    assert doc["ctl_windows"]["removed"] == ["gone-1"]
+    assert doc["ctl_windows"]["undetermined"] == ["resolve-unread-1"]
+
+
+def test_cleanup_text_names_a_window_whose_command_state_is_unread(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", _scan_keeping_one_unread)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert (
+        "ctl window resolve-unread-1 left open: cannot tell whether its command still runs "
+        "(capture timed out)"
+    ) in err
 
 
 def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
@@ -14296,7 +14344,7 @@ def test_reverify_runs_probes_first_and_names_the_environment(tmp_path, capsys):
     command = _sentinel_writer_cmd(tmp_path, sentinel, rc=0, stem="probed")
     _write_policy(
         tmp_path,
-        f"[verify]\ncommands = {json.dumps([command])}\n" '[environment]\nprobes = ["exit 6"]\n',
+        f'[verify]\ncommands = {json.dumps([command])}\n[environment]\nprobes = ["exit 6"]\n',
     )
 
     reason = cli._reverify(tmp_path, tmp_path)

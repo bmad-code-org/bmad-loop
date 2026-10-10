@@ -1376,6 +1376,44 @@ _PARKED_SH_SOURCE = (
 )
 
 
+@pytest.mark.parametrize(
+    ("screen", "parked"),
+    [
+        # the park banner the source above prints, as real tmux 3.4 captures it
+        ("hi\n[bmad-loop exited 0 — press enter]\n\n\n", True),
+        ("[bmad-loop exited 130 — press enter]", True),
+        ("[bmad-loop exited -1 — press enter]  \n", True),
+        ("[bmad-loop exited 1 â€” press enter]\n", True),  # a code page mangled the dash
+        # the capture's backslashreplace decode: UTF-8 under ASCII, cp1252 under UTF-8
+        (multiplexer.PARKED_BANNER.format(ec=0).encode().decode("ascii", "backslashreplace"), True),
+        (
+            multiplexer.PARKED_BANNER.format(ec=0)
+            .encode("cp1252")
+            .decode("utf-8", "backslashreplace"),
+            True,
+        ),
+        ("", False),  # nothing on screen yet: the command is starting
+        ("resolving...\n> ", False),  # the command is still running
+        ("[bmad-loop exited 0 — press enter]\nlater output\n", False),
+        ("[bmad-loop exited $ec — press enter]\n", False),
+        ("[bmad-loop exited 0 — press enter] x\n", False),
+        # last output had no newline, so the banner shares its row
+        ("partial output[bmad-loop exited 0 — press enter]\n", True),
+        # a pane narrower than the banner wraps it; capture trims each row
+        ("out\n[bmad-loop exite\nd 0 — press ente\nr]\n\n", True),
+        ("out\n[bmad-loop exited\n0 — press\nenter]\n", True),  # wrapped at the spaces
+    ],
+)
+def test_parked_screen_reads_only_a_screen_ending_on_the_park_banner(screen, parked):
+    assert multiplexer.parked_screen(screen) is parked
+
+
+def test_parked_screen_matches_the_banner_the_window_prints():
+    # The prune and the recipe share PARKED_BANNER; this pins that they agree.
+    assert multiplexer.parked_screen(multiplexer.PARKED_BANNER.format(ec=0))
+    assert multiplexer.PARKED_BANNER.format(ec="$ec") in _PARKED_SH_SOURCE
+
+
 def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)

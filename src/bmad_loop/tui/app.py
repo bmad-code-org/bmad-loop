@@ -2065,6 +2065,15 @@ class BmadLoopApp(App[None]):
                 self.notify, f"ctl window prune failed: {e}", severity="error", markup=False
             )
             windows, survived, unverifiable = [], [], []
+        # The cli cleanup arm's stderr line, as a toast (#876).
+        for name, reason in launch.drain_undetermined_ctl_windows():
+            self.call_from_thread(
+                self.notify,
+                f"ctl window {name} left open: cannot tell whether its command still "
+                f"runs ({reason})",
+                severity="warning",
+                markup=False,
+            )
         # A kill the shared-registry ownership gate refused is left out of the
         # count below and warned on stderr, which Textual swallows: say it here.
         for refusal in runs.drain_refused_kills():

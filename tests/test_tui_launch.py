@@ -22,7 +22,7 @@ import pytest
 
 from bmad_loop import envvars, runs
 from bmad_loop.adapters import tmux_base
-from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
+from bmad_loop.adapters.multiplexer import PARKED_BANNER, MultiplexerError, get_multiplexer
 from bmad_loop.tui import launch
 
 # Every test here asserts tmux-specific argv/behaviour through the multiplexer
@@ -1672,8 +1672,17 @@ def test_record_with_trailing_newline_still_matches(monkeypatch, tmp_path: Path)
     assert launch.ctl_window_id(tmp_path, "RID") == "@2"
 
 
+# What a window parked after its command exited shows (new_parked_window).
+_PARKED_SCREEN = "some output\n" + PARKED_BANNER.format(ec=0) + "\n\n"
+
+
 def _ctl_prune_fake(
-    monkeypatch, tmp_path: Path, *, kill: str = "lands", kill_boom: str | None = None
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    kill: str = "lands",
+    kill_boom: str | None = None,
+    screens: dict[str, str | BaseException] | None = None,
 ) -> tuple[list[list[str]], list[int]]:
     """Stand a fake ctl session up for the prune; returns (kill-argv log, liveness
     probe log) — the second is what proves the verdict costs ONE listing.
@@ -1693,6 +1702,10 @@ def _ctl_prune_fake(
     decode fault AFTER the command is recorded — the command may have reached
     the server, so the kill is "attempted" like any other and the listing still
     owns the verdict (#380 tracks the seam guard it escapes).
+
+    ``screens`` overrides what capture-pane shows per window id (default: the
+    park banner, so every window reads as parked); an exception there is
+    raised from that capture instead.
     """
     from bmad_loop import runs
 
@@ -1721,6 +1734,11 @@ def _ctl_prune_fake(
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if verb == "display-message":  # we are sitting in @4
             return subprocess.CompletedProcess(argv, 0, stdout="@4\n", stderr="")
+        if verb == "capture-pane":
+            screen = (screens or {}).get(argv[-1], _PARKED_SCREEN)
+            if isinstance(screen, BaseException):
+                raise screen
+            return subprocess.CompletedProcess(argv, 0, stdout=screen, stderr="")
         if verb == "list-windows":
             if argv[-1] == "#{window_id}":  # the post-kill liveness probe
                 # The session it asks about is half the verdict: tmux exits
@@ -1789,6 +1807,53 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     # is the kill count at probe time, so a per-window implementation would read
     # [1, 2] and a probe-before-kill 0.
     assert probes == [2]
+
+
+def test_prune_ctl_windows_keeps_a_window_whose_command_still_runs(monkeypatch, tmp_path: Path):
+    """A dead engine does not make a window parked (#876): an interactive resolve
+    runs in its window while engine.pid still names the engine that exited at
+    the pause, and a run window starts before its engine writes engine.pid.
+    Only a screen ending on the park banner is closed. Ablate the
+    `parked_screen` gate and `@3` is planned and killed."""
+    running = "resolving the escalation...\n> "
+    # the banner scrolled up by later output is not a park either
+    scrolled = _PARKED_SCREEN + "output after the banner\n"
+    killed, _probes = _ctl_prune_fake(
+        monkeypatch, tmp_path, screens={"@3": running, "@6": scrolled}
+    )
+    assert launch.prunable_ctl_windows(tmp_path) == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert killed == []
+    assert launch.drain_undetermined_ctl_windows() == []  # read, so not undetermined
+
+
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [
+        (OSError("capture timed out"), "capture timed out"),  # the seam's MultiplexerError
+        # a strict-POSIX decode fault the seam does not normalize (#380)
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "invalid start byte"),
+    ],
+)
+def test_prune_ctl_windows_keeps_and_reports_a_window_it_cannot_read(
+    monkeypatch, tmp_path: Path, fault, reason
+):
+    """A capture that fails says nothing about the window's command, so it is
+    kept and listed for the callers to surface — and the readable parked window
+    beside it is still pruned. Ablate the `except` arm and the scan raises; drop
+    the append and the drain is empty."""
+    killed, _probes = _ctl_prune_fake(monkeypatch, tmp_path, screens={"@3": fault})
+    assert launch.prune_ctl_windows(tmp_path) == (["run-20260101-000000-dead2"], [], [])
+    assert killed == [["tmux", "kill-window", "-t", "@6"]]
+    undetermined = launch.drain_undetermined_ctl_windows()
+    assert [name for name, _reason in undetermined] == ["sweep-20260101-000000-dead"]
+    assert reason in undetermined[0][1]
+    assert launch.drain_undetermined_ctl_windows() == []  # drained
+    # each scan reports its own: a stale entry from an earlier one never leaks
+    launch.prunable_ctl_windows(tmp_path)
+    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
+    launch.prunable_ctl_windows(tmp_path)
+    assert launch.drain_undetermined_ctl_windows() == []
 
 
 def test_prune_ctl_windows_kill_decode_fault_does_not_abort_the_fan_out(
@@ -1917,6 +1982,8 @@ def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
 
     def fake(argv, **kwargs):
         verb = argv[1]
+        if verb == "capture-pane":
+            return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "list-windows":
             return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
         if verb == "display-message":
@@ -1958,6 +2025,8 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
 
     def fake(argv, **kwargs):
         verb = argv[1]
+        if verb == "capture-pane":
+            return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "has-session":
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if verb == "display-message":  # current window is none of the rows
@@ -2014,6 +2083,8 @@ def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tm
 
     def fake(argv, **kwargs):
         verb = argv[1]
+        if verb == "capture-pane":
+            return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "has-session":
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if verb == "display-message":  # current window is none of the rows
@@ -2083,6 +2154,9 @@ class _NamespacedMux:
 
     def kill_window(self, win_id):
         self.killed.append(win_id)
+
+    def capture_pane(self, win_id):
+        return _PARKED_SCREEN
 
 
 def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path: Path):

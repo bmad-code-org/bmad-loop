@@ -3962,6 +3962,34 @@ async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, m
         )
 
 
+async def test_cleanup_warns_about_a_ctl_window_whose_command_state_is_unread(project, monkeypatch):
+    # The cli's stderr line for a window kept because the scan could not read
+    # whether its command still runs (#876); Textual swallows stderr.
+    from bmad_loop import runs
+
+    def scan(_p):
+        launch._UNDETERMINED_CTL_WINDOWS.append(("resolve-unread-1", "capture timed out"))
+        return ([], [], [])
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", scan)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "ctl window resolve-unread-1 left open" in m and "capture timed out" in m
+                for m in notifications(app)
+            ),
+        )
+
+
 async def test_resume_finished_run_refused(project_tree, monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     make_run(project_tree.project, "20260611-100000-aaaa", finished=True)

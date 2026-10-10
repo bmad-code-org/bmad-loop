@@ -393,6 +393,7 @@ def cleanup_document(
     windows_survived: list[str],
     windows_unverifiable: list[str],
     scan_error: str | None = None,
+    windows_undetermined: list[str] | None = None,
     legacy_leftovers: list[str] | None = None,
     legacy_unverified: list[str] | None = None,
     sessions_scan_error: str | None = None,
@@ -434,6 +435,13 @@ def cleanup_document(
     that one fault mode still reads as an empty scan. The same documented
     ceiling as prune_ctl_windows' post-kill probe; narrowing it is seam work,
     not a document field.
+
+    `ctl_windows.undetermined` holds the names of windows the scan kept open
+    because it could not read whether their own command is still running
+    (#876): a prune closes a window only once its screen shows the park banner,
+    so these are neither planned nor killed, and the next cleanup asks again.
+    Outside the three-way partition. Additive, no schema bump; the text mode
+    prints each with its reason on stderr.
 
     `sessions.legacy_leftovers` is the migration's remainder: session NAMES (not
     run ids — the control session has no run id) that a legacy multiplexer
@@ -481,6 +489,7 @@ def cleanup_document(
             "survived": list(windows_survived),
             "unverifiable": list(windows_unverifiable),
             "scan_error": scan_error,
+            "undetermined": list(windows_undetermined or []),
         },
     }
 

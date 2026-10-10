@@ -30,6 +30,7 @@ from ..adapters.multiplexer import (
     Unset,
     get_multiplexer,
     mux_usable,
+    parked_screen,
 )
 from ..journal import Journal
 from ..platform_util import (
@@ -876,8 +877,11 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
 
     A `<kind>-<run_id>` window parks on a `read` prompt that never closes on its
     own; it is a candidate once its run has finished/stopped/crashed (or its run
-    dir is gone). The current window is excluded so a prune triggered from inside
-    the ctl session never targets itself; live runs and the session's own shell
+    dir is gone) AND its screen shows the park banner (`parked_screen`): a dead
+    engine alone does not stop the window's own command, such as an interactive
+    resolve, from still running (#876). A window whose screen cannot be read is
+    kept and listed for drain_undetermined_ctl_windows. The current window is
+    excluded so a prune triggered from inside the ctl session never targets itself; live runs and the session's own shell
     window are excluded too.
 
     The control session is shared across projects, so its per-window PROJECT_OPTION
@@ -896,6 +900,7 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     answers `[]` — a host with no multiplexer and nothing of ours to reach is a
     clean scan, not a failure on every run.
     """
+    _UNDETERMINED_CTL_WINDOWS.clear()  # what the drain reports is this scan's
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
     if not mux_usable(mux):
@@ -941,8 +946,32 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
         # unknown warning from prunable_sessions covers the operator surface.
         if runs.engine_alive(run_dir):
             continue
-        candidates.append((win_id, name))
+        # A dead engine does not make the window parked: its own command may
+        # still be running (an interactive resolve, a run before its engine
+        # wrote engine.pid). The park banner is the evidence it exited (#876;
+        # parked_screen has the ceiling); a screen that cannot be read keeps the
+        # window and says so.
+        try:
+            parked = parked_screen(mux.capture_pane(win_id))
+        except (MultiplexerError, UnicodeError) as e:
+            _UNDETERMINED_CTL_WINDOWS.append((name, str(e)))
+            continue
+        if parked:
+            candidates.append((win_id, name))
     return candidates
+
+
+# Windows the last ctl-window scan kept because it could not read whether their
+# command still runs, as (name, reason). The CLI puts them in its receipt and the
+# TUI in a toast, draining after the scan.
+_UNDETERMINED_CTL_WINDOWS: list[tuple[str, str]] = []
+
+
+def drain_undetermined_ctl_windows() -> list[tuple[str, str]]:
+    """The windows the last ctl-window scan kept unread, and forget them."""
+    drained = list(_UNDETERMINED_CTL_WINDOWS)
+    del _UNDETERMINED_CTL_WINDOWS[: len(drained)]
+    return drained
 
 
 def prunable_ctl_windows(project: Path) -> list[str]:

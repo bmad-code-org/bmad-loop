@@ -6000,6 +6000,16 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         print(f"ctl window prune failed: {e}", file=sys.stderr)
         windows, survived, unverifiable = [], [], []
         scan_error = str(e)
+    # Kept open, not planned or killed: whether their command still runs could
+    # not be read (#876). In JSON mode the document carries them instead.
+    undetermined = launch.drain_undetermined_ctl_windows()
+    if not args.json:
+        for name, reason in undetermined:
+            print(
+                f"ctl window {name} left open: cannot tell whether its command still "
+                f"runs ({reason})",
+                file=sys.stderr,
+            )
     if args.json:
         machine.emit(
             cleanup_document(
@@ -6011,6 +6021,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 windows_survived=survived,
                 windows_unverifiable=unverifiable,
                 scan_error=scan_error,
+                windows_undetermined=[name for name, _reason in undetermined],
                 # Flattened: `sessions.legacy_leftovers` is a documented
                 # list of names and widening it would bump the schema. The
                 # grouping serves the text mode, which has room to say where.
