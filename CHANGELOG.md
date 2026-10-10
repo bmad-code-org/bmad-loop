@@ -54,6 +54,9 @@ breaking changes may land in a minor release.
   unit into that branch instead.
 - Honor `scm.rollback_on_failure` when an in-place story is deferred; the spec
   was moved out before the rollback, so every such defer paused for spec recovery.
+- Read `engine.pid` without blocking and only when it is a regular file: a FIFO
+  there hung `bmad-loop cleanup` and the TUI cleanup worker; it now reads as an
+  unverifiable pid (#868).
 - Hand each TUI-launched engine the TUI's own state root, and its registry root
   on psmux, on the parked window's command line, so a multiplexer server started
   under another state root no longer runs it where the TUI cannot see it; a TUI
