@@ -72,8 +72,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: A tmux-family leaf whose binary is not literally named ``tmux`` overrides
     #: this one name instead of any method body.
     _BINARY = "tmux"
-    #: Output decoding for captured tmux text. ``None`` (POSIX) = locale default,
-    #: byte-identical to a bare ``text=True``; a Windows leaf sets ``"utf-8"``.
+    #: Global flags placed between :attr:`_BINARY` and every verb :meth:`_run`
+    #: spawns. Empty here; the tmux leaf forces UTF-8 output with them (#881).
+    _CLIENT_FLAGS: tuple[str, ...] = ()
+    #: Output decoding for captured tmux text. ``None`` = locale default,
+    #: byte-identical to a bare ``text=True``; a leaf whose binary always emits
+    #: UTF-8 (psmux, and tmux under ``-u``) sets ``"utf-8"``.
     _ENCODING: str | None = None
     #: Decode error handling to pair with :attr:`_ENCODING`. ``"backslashreplace"``
     #: on every platform (#380): a stray byte the codec cannot decode degrades
@@ -135,7 +139,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         vars — not from scratch (on Windows the child needs ``SystemRoot`` etc.).
         """
         proc = subprocess.run(
-            [self._BINARY, *argv],
+            [self._BINARY, *self._CLIENT_FLAGS, *argv],
             capture_output=True,
             text=True,
             encoding=self._ENCODING,
@@ -903,8 +907,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
         try:
             raw = self._tmux("-V")
         # UnicodeError is in the list for a leaf that overrides _ERRORS back to a
-        # strict handler. _run still decodes with the LOCALE codec on POSIX
-        # (_ENCODING is None there), but no longer strictly on any platform
+        # strict handler. _run decodes with the leaf's _ENCODING (the LOCALE
+        # codec where that is None), but no longer strictly on any platform
         # (_ERRORS is backslashreplace, #380), so an undecodable byte — a corrupt
         # install, or a binary emitting text in another encoding, exactly what
         # this diagnostic exists for — now degrades to a \xNN escape rather than

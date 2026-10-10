@@ -12,6 +12,12 @@ breaking changes may land in a minor release.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 
+### Fixed
+
+- Spawn tmux with `-u` so window and session listings parse when bmad-loop runs
+  without a UTF-8 locale (`LANG` unset, `LC_ALL=C`, cron, systemd). tmux printed
+  each field tab as `_`, so every window read as nameless and untagged (#881).
+
 ## [0.13.2] — 2026-10-09
 
 ### Added

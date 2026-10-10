@@ -817,7 +817,7 @@ def test_tmux_window_pane_pids_parses_pane_pid_lines(monkeypatch):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert mux.window_pane_pids("@7") == [1234, 5678]
-    assert seen["argv"] == ["tmux", "list-panes", "-t", "@7", "-F", "#{pane_pid}"]
+    assert seen["argv"] == ["tmux", "-u", "list-panes", "-t", "@7", "-F", "#{pane_pid}"]
 
 
 def test_tmux_list_windows_keeps_tabs_inside_the_trailing_field(monkeypatch):
@@ -1033,9 +1033,9 @@ def _kill_fake(monkeypatch, *, kill_rc: int, kill_err: str = "", live: str = "",
 
     def fake(argv, **k):
         calls.append(argv)
-        if argv[1] == "list-windows":
+        if argv[2] == "list-windows":
             return subprocess.CompletedProcess(argv, probe_rc, stdout=live, stderr="")
-        if argv[1] == "list-panes":
+        if argv[2] == "list-panes":
             return subprocess.CompletedProcess(argv, probe_rc, stdout="", stderr="")
         return subprocess.CompletedProcess(argv, kill_rc, stdout="", stderr=kill_err)
 
@@ -1061,7 +1061,7 @@ def test_kill_window_warns_only_when_the_window_outlived_the_kill(monkeypatch, c
     assert "still alive" in err
     assert "server temporarily unavailable" in err  # verbatim: the reader judges it
     # The probe reads the session's own window list, not the failed target.
-    assert calls[1][1:] == ["list-windows", "-t", "=ctl", "-F", "#{window_id}"]
+    assert calls[1][2:] == ["list-windows", "-t", "=ctl", "-F", "#{window_id}"]
 
 
 def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, capsys):
@@ -1094,7 +1094,7 @@ def test_kill_window_is_silent_when_the_survivor_probe_cannot_answer(monkeypatch
     # Ablation: drop the `not self._window_survived_kill(target)` half of
     # kill_window's gate and both params fail on an unexpected warning.
     def fake(argv, **k):
-        if argv[1] in ("list-windows", "list-panes"):
+        if argv[2] in ("list-windows", "list-panes"):
             raise subprocess.TimeoutExpired(argv, 1)
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
 
@@ -1111,7 +1111,7 @@ def test_kill_window_unqualified_target_keeps_the_same_resolution_probe(monkeypa
     assert TmuxMultiplexer().kill_window("@7") is None
     err = capsys.readouterr().err
     assert "kill-window @7" in err and "still alive" in err
-    assert calls[1][1:] == ["list-panes", "-t", "@7"]
+    assert calls[1][2:] == ["list-panes", "-t", "@7"]
 
 
 def test_kill_window_warning_omits_a_bare_colon_on_empty_stderr(monkeypatch, capsys):
@@ -1310,20 +1310,24 @@ class _RecordRun:
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
-def test_run_posix_default_passes_no_encoding_and_no_env(monkeypatch):
+def test_run_tmux_forces_utf8_output_and_inherits_env(monkeypatch):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
 
     TmuxMultiplexer()._run(["list-windows"])
 
-    # The locale-default codec (encoding=None ≡ bare text=True) and the inherited
-    # parent env (env=None) are both unchanged; only strictness went away. errors is
-    # backslashreplace on every platform since #380, so an undecodable byte degrades
-    # to a visible \xNN escape instead of raising out of the one spawn primitive.
-    # This pins the KWARG; the decode it actually produces is pinned against a real
-    # child by test_run_decodes_an_undecodable_byte_instead_of_raising.
+    # `-u` sits ahead of every verb (#881): without it a client whose locale is
+    # not UTF-8 (LANG unset, LC_ALL=C) gets each tab of a `-F` reply printed as
+    # `_`, and every tab-joined listing row collapses into one field. The reply
+    # is then UTF-8 whatever the locale, so it is decoded as UTF-8. The parent
+    # env (env=None) is inherited unchanged. errors is backslashreplace on every
+    # platform since #380, so an undecodable byte degrades to a visible \xNN
+    # escape instead of raising out of the one spawn primitive. The parse under a
+    # real non-UTF-8 client is pinned by tests/test_tmux_locale_e2e.py.
+    # Ablation: drop TmuxMultiplexer._CLIENT_FLAGS and the argv assert fails.
+    assert rec.argv == ["tmux", "-u", "list-windows"]
     assert rec.kwargs["text"] is True
-    assert rec.kwargs["encoding"] is None
+    assert rec.kwargs["encoding"] == "utf-8"
     assert rec.kwargs["errors"] == "backslashreplace"
     assert rec.kwargs["env"] is None
 
@@ -1332,11 +1336,11 @@ def test_run_subclass_encoding_reaches_subprocess(monkeypatch):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
 
-    class Utf8Backend(TmuxMultiplexer):
-        _ENCODING = "utf-8"  # a Windows leaf forces UTF-8 without touching _run
+    class Latin1Backend(TmuxMultiplexer):
+        _ENCODING = "latin-1"  # a leaf picks its own codec without touching _run
 
-    Utf8Backend()._run(["list-windows"])
-    assert rec.kwargs["encoding"] == "utf-8"
+    Latin1Backend()._run(["list-windows"])
+    assert rec.kwargs["encoding"] == "latin-1"
 
 
 def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
@@ -1384,6 +1388,7 @@ def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):
 
     assert rec.argv == [
         "tmux",
+        "-u",
         "new-window",
         "-d",
         "-P",
@@ -1409,6 +1414,7 @@ def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
 
     assert rec.argv == [
         "tmux",
+        "-u",
         "new-session",
         "-d",
         "-s",
@@ -1428,6 +1434,7 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
 
     assert rec.argv == [
         "tmux",
+        "-u",
         "new-window",
         "-t",
         "=s:",
@@ -1465,8 +1472,9 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     command = shlex.join(["echo", "a b", "&&", "reboot"])
     TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
 
-    assert rec.argv[:11] == [
+    assert rec.argv[:12] == [
         "tmux",
+        "-u",
         "new-window",
         "-t",
         "=s:",
@@ -1479,7 +1487,7 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         "#{window_id}",
     ]
     assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
-    assert len(rec.argv) == 16
+    assert len(rec.argv) == 17
 
 
 _PID_PROBE = (
@@ -1608,8 +1616,9 @@ def test_dialect_leaf_parked_window_composes_from_hooks(monkeypatch, tmp_path):
     _FakeDialect().new_parked_window("s", "n", tmp_path, ["echo", "hi"], "%3")
 
     # the tmux scaffolding is the base's, unchanged
-    assert rec.argv[:12] == [
+    assert rec.argv[:13] == [
         "tmux",
+        "-u",
         "new-window",
         "-d",
         "-P",
@@ -1623,7 +1632,7 @@ def test_dialect_leaf_parked_window_composes_from_hooks(monkeypatch, tmp_path):
         str(tmp_path),
     ]
     # the shell source is composed prefix + inner + capture + banner + park + trailer
-    assert rec.argv[12:] == [
+    assert rec.argv[13:] == [
         "fakesh",
         "-enc",
         "PRELUDE; run <echo> <hi>; ec := EXITSTATUS; "
@@ -1640,6 +1649,7 @@ def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_pat
 
     assert rec.argv == [
         "tmux",
+        "-u",
         "new-window",
         "-t",
         "=s:",
@@ -1712,8 +1722,8 @@ class _EnvReplies:
 
     def __call__(self, argv, **_k):
         self.calls.append(list(argv))
-        assert argv[1] == "show-environment"
-        rc, out, err = self.by_scope[argv[2].lstrip("-")]
+        assert argv[2] == "show-environment"
+        rc, out, err = self.by_scope[argv[3].lstrip("-")]
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr=err)
 
 
@@ -1760,7 +1770,7 @@ def test_tmux_inherited_env_parses_show_environment(monkeypatch, replies, expect
     assert faults == []
     scopes = {"t": ["-t", "=ctl"], "g": ["-g"]}
     assert fake.calls == [
-        ["tmux", "show-environment", *scopes[s], "BMAD_LOOP_STATE_DIR"] for s in asked
+        ["tmux", "-u", "show-environment", *scopes[s], "BMAD_LOOP_STATE_DIR"] for s in asked
     ]
 
 
