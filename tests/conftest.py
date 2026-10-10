@@ -970,6 +970,9 @@ def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
 # The absolute pwsh the psmux backend resolves to under the suite (see
 # `_isolate_mux_registry`).
 PINNED_PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+# The absolute psmux the parked-window trailer calls under the suite: a space
+# and an apostrophe, so every trailer assertion exercises the quoting.
+PINNED_PSMUX = r"C:\Program Files\psmux's build\psmux.exe"
 
 
 @pytest.fixture(autouse=True)
@@ -1018,7 +1021,10 @@ def _isolate_mux_registry(monkeypatch):
     answer (or, on a host without pwsh, find nothing to resolve) and see every
     launch refused. The pinned path holds a space, as a default install under
     Program Files does. Tests of the gate itself, and the live module,
-    reset the answers to empty; the live module also restores real resolution."""
+    reset the answers to empty; the live module also restores real resolution.
+    The psmux path the parked-window trailer bakes in is pinned to
+    ``PINNED_PSMUX`` likewise, so trailer assertions do not depend on whether
+    the host has psmux installed."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -1027,6 +1033,7 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
     monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_pwsh_path", lambda self: PINNED_PWSH)
+    monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_psmux_path", lambda self: PINNED_PSMUX)
     monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {PINNED_PWSH: "7.6.6"})
     monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
     monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
