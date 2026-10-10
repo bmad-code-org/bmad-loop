@@ -1220,19 +1220,22 @@ def test_reap_identity_returns_none_for_a_reaped_child():
     assert bind_recorded_child(proc.pid, starttime) is None
 
 
-@needs_pidfd
 def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
+    # Capability-free: the refusal happens before any pidfd call, so the spy may stand
+    # in for an attribute this Python build does not have (raising=False).
     proc, starttime = _live_child()
     try:
         opened: list[int] = []
-        real_open = os.pidfd_open
+        real_open = getattr(os, "pidfd_open", None)
 
         def spy_open(pid: int) -> int:
             opened.append(pid)
+            if real_open is None:
+                raise ProcessLookupError(pid)  # the recorded call already fails the row
             return real_open(pid)
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", spy_open)
+            patch.setattr(os, "pidfd_open", spy_open, raising=False)
             assert bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
         assert opened == [], "a mismatched process must not be bound"
         assert proc.poll() is None, "a mismatched process must not be signalled"
@@ -1296,8 +1299,8 @@ def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
         _reap(proc)
 
 
-@needs_pidfd
 def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatch):
+    # Capability-free: the fake is the only pidfd_open this row calls (raising=False).
     proc, starttime = _live_child()
     try:
 
@@ -1305,7 +1308,7 @@ def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatc
             raise ProcessLookupError
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", disappeared)
+            patch.setattr(os, "pidfd_open", disappeared, raising=False)
             assert bind_recorded_child(proc.pid, starttime) is None
         assert proc.poll() is None, "the simulated open race must not signal the child"
     finally:
@@ -1531,11 +1534,12 @@ def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
         _reap(doomed)
 
 
-@needs_pidfd
 def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monkeypatch):
     """The OSError arm: a parseable identity whose bind raises something that is NOT
     proven disappearance. Without this row the handler could narrow to AssertionError
-    alone and every other sweeper row would stay green."""
+    alone and every other sweeper row would stay green.
+
+    Capability-free: the fake is the only pidfd_open the sweep reaches (raising=False)."""
     proc, starttime = _live_child()
     try:
         pid_file = _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
@@ -1544,7 +1548,7 @@ def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monk
             raise OSError(errno.ENOSYS, "pidfd_open not supported")
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", unsupported)
+            patch.setattr(os, "pidfd_open", unsupported, raising=False)
             with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
                 with pytest.raises(RuntimeError, match="pre-bind boom"):
                     with recorded_children_swept(tmp_path):
