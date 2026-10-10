@@ -3503,7 +3503,13 @@ def delete_run(
 
     ``warn`` is where the session guard reports that it could not ask the
     multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
-    on stderr. See :func:`live_session_may_be_ours`."""
+    on stderr. See :func:`live_session_may_be_ours`.
+
+    A run dir holding ``worktrees/`` (a paused isolated run's kept unit) is pruned
+    from git's worktree admin after the removal, against the run's own code root
+    (DW-538) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
+    that leaves an entry under the run dir, or a listing that cannot say, is
+    reported through ``warn`` too; the deletion itself has already happened."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -3532,10 +3538,55 @@ def delete_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
+        # Read before the rmtree takes them: a kept unit worktree under the run dir
+        # is registered with the run's code root, which the rmtree does not tell.
+        held_worktrees = os.path.lexists(run_dir / "worktrees")
+        state = _state_or_none(run_dir) if held_worktrees else None
+        run_res = run_dir.resolve()
         retrying_rmtree(run_dir)
+        if held_worktrees:
+            repo = state.code_root if state is not None else project
+            if (fault := _prune_deleted_run_worktrees(repo, run_res)) is not None:
+                note = f"run {run_dir.name} deleted, but {fault}"
+                if warn is None:
+                    print(f"warning: {note}", file=sys.stderr)
+                else:
+                    warn(note)
         # after the run dir, never before: a raise above leaves the run whole, and a
         # whole run keeps its control plane (see _discard_state_dir).
         _discard_state_dir(project, run_dir.name)
+
+
+def _prune_deleted_run_worktrees(repo: Path, run_res: Path) -> str | None:
+    """Drop git's admin entries for the worktrees a just-deleted run dir held
+    (DW-538), and return ``None`` — or an operator-facing line when an entry
+    under ``run_res`` is still registered or the listing cannot say.
+
+    ``verify.worktree_prune`` never raises, so the re-list is what makes its
+    failure visible. Non-raising itself: the run dir is already gone, and a
+    stale admin entry is what `git worktree prune` clears once git answers."""
+    verify.worktree_prune(repo)
+    try:
+        listed = verify.worktree_list(repo)
+    except verify.GitError as exc:
+        return (
+            f"cannot list the git worktrees of {repo} to confirm its worktrees were "
+            f"deregistered ({exc}); run `git worktree prune` there"
+        )
+    left: list[str] = []
+    for wt in listed:
+        try:
+            wt.resolve().relative_to(run_res)
+        except (ValueError, OSError):
+            continue
+        left.append(str(wt))
+    if left:
+        return (
+            "git still registers its worktree(s) "
+            + ", ".join(left)
+            + f"; if locked, `git worktree unlock` them, then `git worktree prune` in {repo}"
+        )
+    return None
 
 
 def archive_run(

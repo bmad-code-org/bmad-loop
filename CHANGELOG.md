@@ -68,6 +68,8 @@ breaking changes may land in a minor release.
   is still running, such as an interactive `resolve` of a paused run: a window is
   closed only once its screen shows the park banner. A window whose screen cannot be
   read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
+- Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
+  (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 
 ## [0.13.2] — 2026-10-09
 

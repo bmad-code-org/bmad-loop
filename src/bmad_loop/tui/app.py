@@ -1950,7 +1950,8 @@ class BmadLoopApp(App[None]):
 
     def _notify_guard_notes(self, notes: list[str]) -> None:
         # The #419 session guard's "could not ask the multiplexer" degrade
-        # (DW-466). Its default channel is stderr, which Textual captures for the
+        # (DW-466), and delete_run's stale-worktree prune fault (DW-538). Their
+        # default channel is stderr, which Textual captures for the
         # app's whole run (see run_tui), so the workers hand delete_run /
         # archive_run a sink and toast what it collected — after the call, never
         # from inside it, which holds the run's state lock. Shown whether or not

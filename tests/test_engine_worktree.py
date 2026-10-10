@@ -12412,6 +12412,112 @@ def test_abandon_parks_uncommitted_work_on_an_abandon_ref(project, tmp_path, mon
     assert git(project.project, "rev-parse", "--verify", "-q", ref).strip()
 
 
+def test_abandon_parks_the_kept_units_ignored_spec_and_board(
+    project, tmp_path, monkeypatch, capsys
+):
+    """DW-537: abandon's own arguments to the shared capture are pinned, not just the
+    capture. The kept worktree holds the run's spec and board as IGNORED files over a
+    clean tracked tree — what `WorktreeFlow`'s seeds leave behind — so only the
+    snapshot's `force_include` (`_orphan_owned_rels(wt, paths, spec_file)`) can park
+    them, and the `-abandon` ref must carry both.
+
+    Ablation: pass `None` for `task.spec_file` in `abandon_replay_run`'s
+    `preserve_abandoned_unit` call and the spec rel drops from the ref (the board
+    alone is forced in), failing the spec assertion."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    task = load_state(replay_dir).tasks["1-1-a"]
+    unit = Path(task.worktree_path)
+    spec_rel = task.spec_file
+    board_rel = project.sprint_status.relative_to(project.project).as_posix()
+    # On the unit branch the two are tracked; make them ignored files the clean
+    # tracked tree no longer names, as in a real mount.
+    gitignore = unit / ".gitignore"
+    gitignore.write_text(
+        gitignore.read_text(encoding="utf-8") + f"/{spec_rel}\n/{board_rel}\n", encoding="utf-8"
+    )
+    git(unit, "rm", "-q", "--cached", "--", spec_rel, board_rel)
+    git(unit, "commit", "-q", "-am", "untrack the seeded artifacts")
+    (unit / spec_rel).write_text("# the accepted spec, mount-only\n", encoding="utf-8")
+    assert git(unit, "status", "--porcelain").strip() == ""
+    assert (unit / board_rel).is_file()
+    head = git(unit, "rev-parse", "HEAD").strip()
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    assert Journal(replay_dir).entries()[-1]["ref"] == ref
+    parked = _ref_tree(project, ref)
+    assert spec_rel in parked and board_rel in parked
+    assert git(project.project, "show", f"{ref}:{spec_rel}") == "# the accepted spec, mount-only"
+
+
+def test_delete_deregisters_a_paused_runs_kept_worktree(project, tmp_path, monkeypatch):
+    """DW-538: deleting a paused (NOT abandoned) replay run that still holds its kept
+    worktree leaves no `.git/worktrees/<id>` admin entry behind — `delete_run` prunes
+    against the run's code root after the rmtree, silently, when that worked.
+
+    Ablation: drop the `_prune_deleted_run_worktrees` call from `delete_run` and
+    `git worktree list` still names the unit path (as prunable)."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    replay = load_state(replay_dir)
+    assert replay.paused and not replay.finished
+    unit = Path(replay.tasks["1-1-a"].worktree_path)
+    assert _registered_under(project, replay_dir) != []
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append)
+
+    assert not replay_dir.exists()
+    assert str(unit) not in git(project.project, "worktree", "list", "--porcelain")
+    assert _registered_under(project, replay_dir) == []
+    assert notes == []
+
+
+def test_delete_warns_when_a_kept_worktree_stays_registered(project, tmp_path, monkeypatch):
+    """DW-538's degrade is visible: `verify.worktree_prune` never raises, so a prune
+    that cleared nothing surfaces through `warn` from the re-list — and the run is
+    still deleted (the rmtree already happened).
+
+    Ablation: have `_prune_deleted_run_worktrees` return `None` after its re-list
+    and `notes == []`, failing the unpack."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    monkeypatch.setattr(verify, "worktree_prune", lambda _repo: None)
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append)
+
+    assert not replay_dir.exists()
+    [note] = notes
+    assert f"run {replay_dir.name} deleted" in note
+    assert str(unit) in note and "git worktree prune" in note
+
+
+def test_delete_warns_when_the_worktree_listing_fails(project, tmp_path, monkeypatch):
+    """The other DW-538 degrade: a re-list git cannot answer is not "nothing left
+    registered" — `warn` says so, and the delete still completes (run dir and its
+    control plane both gone).
+
+    Ablation: return `None` from the `except verify.GitError` branch of
+    `_prune_deleted_run_worktrees` and `notes == []`, failing the unpack."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+
+    def _unlistable(_repo):
+        raise verify.GitError("git worktree list: simulated fault")
+
+    monkeypatch.setattr(verify, "worktree_list", _unlistable)
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append)
+
+    assert not replay_dir.exists()
+    assert replay_dir.name not in {i.run_id for i in runs.discover_runs(project.project)[0]}
+    [note] = notes
+    assert "cannot list the git worktrees" in note and "simulated fault" in note
+    assert "git worktree prune" in note
+
+
 def test_abandon_refuses_a_run_that_is_not_a_replay(project, tmp_path, monkeypatch, capsys):
     """An ordinary run paused at an escalation has re-arm and adopt; abandon refuses
     it, naming replay runs and both gestures, and changes nothing.
