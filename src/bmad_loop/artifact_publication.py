@@ -284,8 +284,12 @@ def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
     )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_nofollow = getattr(os, "O_NOFOLLOW")
+    o_nonblock = getattr(os, "O_NONBLOCK")
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        fd = os.open(path.name, os.O_RDONLY | o_nofollow | o_nonblock, dir_fd=parent_fd)
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise PublicationError(f"artifact is not a regular file: {path}")
@@ -549,8 +553,12 @@ def _file_size(root: Path, path: Path) -> int | None:
     )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_nofollow = getattr(os, "O_NOFOLLOW")
+    o_nonblock = getattr(os, "O_NONBLOCK")
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        fd = os.open(path.name, os.O_RDONLY | o_nofollow | o_nonblock, dir_fd=parent_fd)
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
@@ -1162,11 +1170,15 @@ def _create_directories(
     try:
         for part in relative.parts:
             if DIR_FD_ANCHORED_WRITES:
+                # These flags exist only on the dir-fd arm; the native Windows
+                # type stubs lack them, so resolve them inside the gate.
+                o_directory = getattr(os, "O_DIRECTORY")
+                o_nofollow = getattr(os, "O_NOFOLLOW")
                 try:
                     os.mkdir(part, 0o777, dir_fd=fd)
                 except FileExistsError:
                     pass
-                nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                nested = os.open(part, os.O_RDONLY | o_directory | o_nofollow, dir_fd=fd)
             else:
                 nested = platform_util.open_at(
                     fd, part, os.O_RDONLY | os.O_CREAT | AT_DIRECTORY | AT_NOFOLLOW

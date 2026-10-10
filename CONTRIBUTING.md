@@ -81,7 +81,7 @@ git clone https://github.com/YOUR-USERNAME/bmad-loop.git
 cd bmad-loop
 uv sync --all-extras          # deps + all three extras (tui, non-linux, opencode) + dev tools
 uv run pytest -q              # unit + adapter scenarios + tmux integration (-n auto to parallelize)
-uv run pyright                # typecheck — CI runs this same pinned version as its own job
+uv run pyright                # typecheck — CI runs this same pinned version as its own job, also with --pythonplatform Windows/Darwin
 ```
 
 Never `pip install` — uv owns the environment. If you change dependencies, edit `pyproject.toml` and run `uv lock`; CI uses `uv sync --locked` and fails on a stale lock. The pyright version is pinned exactly in the `dev` group, so bump it deliberately — never with `uv lock --upgrade`.

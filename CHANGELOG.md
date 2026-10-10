@@ -112,6 +112,13 @@ breaking changes may land in a minor release.
 - Surface why a sprint-mode dev session found no result: `session-end` carries
   the last resultless verdict, the `no-artifact` crumb names specs found one level
   down, and `validate` warns `queue.nested-specs` on a nested spec layout (#780).
+- Type-check clean against the native Windows and macOS `os` surfaces:
+  platform-gated POSIX/Linux-only names (`O_DIRECTORY`, `O_NOFOLLOW`,
+  `O_NONBLOCK`, `setxattr`/`getxattr`, `sysconf`) are fetched with `getattr`
+  inside their existing runtime checks in `platform_util`, `verify`,
+  `artifact_publication` and `events`, so `uv run pyright` passes on a Windows
+  or macOS host; CI's typecheck job now also runs `--pythonplatform Windows`
+  and `Darwin` (#867).
 
 ## [0.13.1] — 2026-10-01
 

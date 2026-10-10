@@ -483,9 +483,12 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
         names = listxattr(src)
     except OSError:
         return
+    # Resolve optional Linux APIs only after the existing capability check.
+    setxattr = getattr(os, "setxattr")
+    getxattr = getattr(os, "getxattr")
     for name in names:
         try:
-            os.setxattr(dst, name, os.getxattr(src, name))
+            setxattr(dst, name, getxattr(src, name))
         except OSError:
             continue
 
@@ -1420,7 +1423,11 @@ def open_dir_confined(
     access = search_access if search_only else os.O_RDONLY
     try:
         if DIR_FD_ANCHORED_WRITES:
-            fd = os.open(root, access | os.O_DIRECTORY)
+            # ``O_DIRECTORY`` exists only on this arm: resolve it after the
+            # gate so the native Windows type surface, which has no such
+            # attribute, checks clean (the win32 arm never reaches it).
+            o_directory = getattr(os, "O_DIRECTORY")
+            fd = os.open(root, access | o_directory)
         else:
             fd = win32_at.open_directory(root)
     except OSError:
