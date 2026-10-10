@@ -18,6 +18,11 @@ breaking changes may land in a minor release.
 - Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
   stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
   (#496, #497).
+- Add `bmad-loop resolve <replay-run> --abandon` (DW-535): close a replay run that
+  escalated because its story was finished meanwhile. Uncommitted tracked and
+  untracked changes (plus the run's own spec/board/ledger copies) are parked on a
+  `refs/attempt-preserve-dirty/*-abandon` ref; other git-ignored files are removed
+  with the worktree. The branch is kept and the run is recorded finished.
 
 ### Changed
 

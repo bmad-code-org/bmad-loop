@@ -132,7 +132,8 @@ class ExitCode(IntEnum):
       backstop caught an unexpected exception; both print ``error: …`` to stderr.
     - ``USAGE`` — an argparse usage error (unknown subcommand, bad flag). argparse
       raises ``SystemExit(2)`` before dispatch, so this names its number rather than
-      being returned here.
+      being returned here. A handler returns it for a flag combination argparse
+      cannot express (`resolve --abandon` with `--resume`/`--no-resume`).
     - ``INTERRUPTED`` — Ctrl+C (SIGINT) escaped ``main()`` outside ``engine.run()``
       (config load, engine construction, a handler with no run loop). 130 = 128 +
       SIGINT(2), the shell's conventional code for an interrupt; uncaught this path
@@ -4621,6 +4622,15 @@ def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import PAUSE_ESCALATION, Phase
 
+    # DW-535: `--abandon` closes the run, so "resume after this?" has no meaning —
+    # pairing it with either answer is a usage error, refused before even the run lookup.
+    if getattr(args, "abandon", False) and args.resume is not None:
+        print(
+            "error: --abandon closes the run, so there is nothing to resume — drop "
+            "--resume/--no-resume (use --no-interactive to skip the confirm)",
+            file=sys.stderr,
+        )
+        return ExitCode.USAGE
     project = _project(args)
     try:
         run_dir = runs.resolve_run_dir(project, args.run_id)
@@ -4753,6 +4763,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # interactive session, which adopting never runs.
     if getattr(args, "adopt_branch", False):
         return _resolve_adopt(args, project, run_dir, state, task, story_key)
+
+    # DW-535: close an escalated replay run without merging its unit. Behind the same
+    # gates, and likewise ahead of the interactive session it never runs.
+    if getattr(args, "abandon", False):
+        return _resolve_abandon(args, project, run_dir, state, task, story_key)
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -5195,6 +5210,102 @@ def _resolve_adopt(
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
+
+
+def _resolve_abandon(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve <replay-run> --abandon` (DW-535): close an escalated replay run whose
+    unit is superseded, keeping its branch and removing its worktree.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation,
+    liveness, ESCALATED story, sweep ledger). This adds `unitreplay.abandon_refusal`,
+    confirms (skipped by `--no-interactive`; `--resume`/`--no-resume` were refused as
+    a usage error), re-checks pause, liveness, phase and generation under the run lock
+    and hands the transaction to `unitreplay.abandon_replay_run`. No session and no
+    engine run; the board, the ledger and the origin run are never written."""
+    from .model import PAUSE_ESCALATION, Phase
+    from .unitreplay import AbandonError, abandon_refusal, abandon_replay_run
+
+    if (refusal := abandon_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    try:
+        paths = bmadconfig.load_paths(project)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        print(
+            f"error: cannot read the BMAD config to abandon run {args.run_id}: {e}", file=sys.stderr
+        )
+        return 1
+    print(
+        f"warning: abandoning replay run {args.run_id} removes the kept worktree of "
+        f"{story_key} ({task.worktree_path}) and closes the run unmerged; branch "
+        f"{task.branch} is kept. Uncommitted tracked and untracked changes (plus the "
+        "run's own spec/board/ledger copies) are parked on a "
+        "refs/attempt-preserve-dirty/*-abandon ref first; other git-ignored files are "
+        "removed with the worktree",
+        file=sys.stderr,
+    )
+    if args.interactive and not _confirm(
+        f"abandon replay run {args.run_id} ({story_key}, branch {task.branch})?"
+    ):
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    try:
+        with state_lock(run_dir):
+            # The checks above ran lock-free: repeat them against the last writer's state.
+            fresh_state = load_state(run_dir)
+            if fresh_state.paused_stage != PAUSE_ESCALATION:
+                print(
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to abandon. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not abandoning",
+                    file=sys.stderr,
+                )
+                return 1
+            outcome = abandon_replay_run(run_dir, story_key, paths=paths)
+    except AbandonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if outcome.branch_kept:
+        print(f"abandoned replay run {args.run_id}: {story_key} kept on branch {outcome.branch}")
+    else:
+        print(
+            f"abandoned replay run {args.run_id}: branch {outcome.branch} of {story_key} "
+            "no longer exists"
+        )
+    if outcome.ref is not None:
+        print(
+            f"uncommitted work from its worktree is parked on {outcome.ref} (kept within "
+            "scm.preserve_keep; copy it to a branch to keep it longer)"
+        )
+    return 0
 
 
 def _resolve_pause_admits(paused_stage: str | None, *, reverify_named: bool) -> bool:
@@ -7475,7 +7586,8 @@ def main(argv: list[str] | None = None) -> int:
         "--no-interactive",
         dest="interactive",
         action="store_false",
-        help="skip the resolve agent (spec already fixed by hand); just re-arm + resume",
+        help="skip the resolve agent (spec already fixed by hand); just re-arm + resume. "
+        "With --abandon, skips its confirm",
     )
     resolve_mode = resolve_p.add_mutually_exclusive_group()
     resolve_mode.add_argument(
@@ -7507,6 +7619,16 @@ def main(argv: list[str] | None = None) -> int:
         "accepted under any pause; on a FINISHED run, --story names a kept deferred "
         "worktree unit to replay in a new replay run, and the finished run stays "
         "finished (not for stories-mode runs)",
+    )
+    resolve_mode.add_argument(
+        "--abandon",
+        action="store_true",
+        help="close an escalated REPLAY run (one minted by `resolve <finished-run> "
+        "--reverify`) whose unit is superseded: park uncommitted tracked and untracked "
+        "changes (plus the run's own spec/board/ledger copies) on a "
+        "refs/attempt-preserve-dirty/*-abandon ref, remove the kept worktree (other "
+        "git-ignored files go with it), keep its branch, and record the run finished. Never resumes (not combinable with "
+        "--resume/--no-resume); the sprint board and the replayed run are untouched",
     )
     resolve_p.add_argument(
         "--resume",

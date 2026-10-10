@@ -12274,3 +12274,380 @@ def test_resolve_finished_run_preflight_refusal_mints_nothing(
     assert _replay_dirs(engine) == []
     assert unit.is_dir()
     assert _state_bytes(engine.run_dir) == finished_before
+
+
+# ------------------------- resolve <replay-run> --abandon (DW-535)
+
+
+def _escalated_replay(project, tmp_path, monkeypatch):
+    """A replay run paused because DW-534 refused its merge (1-1-a done on the main
+    board since the mint), with engine liveness reading dead (the resume ran in this
+    process). Returns (origin engine, replay dir)."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    replay_dir = _mint_replay_then_resume(
+        project, engine, marker, monkeypatch, lambda: set_sprint(project, "1-1-a", "done")
+    )
+    _assert_replay_merge_refused(project, replay_dir)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    return engine, replay_dir
+
+
+def _abandon(project, run_dir, *extra):
+    from bmad_loop import cli
+
+    return cli.main(
+        ["resolve", "--project", str(project.project), run_dir.name, "--abandon", *extra]
+    )
+
+
+def _branch_sha(project, branch) -> str:
+    return git(project.project, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").strip()
+
+
+def _registered_under(project, root: Path) -> list[Path]:
+    resolved = root.resolve()
+    return [
+        p for p in verify.worktree_list(project.repo_root) if p.resolve().is_relative_to(resolved)
+    ]
+
+
+def _snapshot_untouched(project, replay_dir):
+    """Everything an abandon refusal must leave as it was, for a later compare."""
+    task = load_state(replay_dir).tasks["1-1-a"]
+    return (
+        _state_bytes(replay_dir),
+        len(Journal(replay_dir).entries()),
+        Path(task.worktree_path).is_dir(),
+        _branch_sha(project, task.branch),
+    )
+
+
+def test_abandon_closes_an_escalated_replay_run_and_keeps_its_branch(
+    project, tmp_path, monkeypatch, capsys
+):
+    """DW-535 happy path: the replay run escalated by the DW-534 done-row refusal is
+    closed by `resolve <replay> --abandon --no-interactive`: its worktree is removed
+    and unregistered, the branch stays at its commit, `replay-abandoned` is journaled
+    and the run is finished with the pause cleared, the task still ESCALATED. The
+    target, the board and the origin run are untouched. Afterwards `resume` refuses
+    it as finished, `discover_runs` classifies it FINISHED, a second abandon refuses
+    as not paused, and `delete` leaves no worktree registered under the run dir.
+
+    Ablation: drop the `_verify_worktree_gone` call — this still passes (the teardown
+    worked); see `test_abandon_refuses_when_the_teardown_leaves_the_worktree`."""
+    from bmad_loop import cli
+
+    engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    origin_before = _state_bytes(engine.run_dir)
+    task = load_state(replay_dir).tasks["1-1-a"]
+    unit, branch = Path(task.worktree_path), task.branch
+    sha = _branch_sha(project, branch)
+    src_before = (project.project / "src.txt").read_bytes()
+    board_before = project.sprint_status.read_bytes()
+    [escalated] = [e for e in Journal(replay_dir).entries() if e["kind"] == "story-escalated"]
+    assert f"`bmad-loop resolve {replay_dir.name} --abandon`" in escalated["reason"]
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    out = capsys.readouterr().out
+    assert f"kept on branch {branch}" in out
+    assert not unit.exists() and _registered_under(project, replay_dir) == []
+    assert _branch_sha(project, branch) == sha
+    replay = load_state(replay_dir)
+    assert replay.finished and not replay.paused and replay.paused_stage is None
+    assert replay.paused_story_key is None
+    a = replay.tasks["1-1-a"]
+    assert a.phase == Phase.ESCALATED and a.branch == branch and a.worktree_path == str(unit)
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned"
+    assert row["story_key"] == "1-1-a" and row["replay_of"] == engine.run_dir.name
+    assert row["branch"] == branch and row["branch_kept"] is True
+    assert row["worktree"] == str(unit)
+    assert row["ref"] is None and "parked on" not in out  # nothing uncommitted
+    assert (project.project / "src.txt").read_bytes() == src_before
+    assert project.sprint_status.read_bytes() == board_before
+    assert _state_bytes(engine.run_dir) == origin_before
+
+    # closed for good: resume refuses, listings say finished, a re-abandon refuses
+    capsys.readouterr()
+    assert cli.main(["resume", "--project", str(project.project), replay_dir.name]) == 1
+    assert "finished" in capsys.readouterr().err
+    infos, _ = runs.discover_runs(project.project)
+    [info] = [i for i in infos if i.run_id == replay_dir.name]
+    assert info.status == runs.FINISHED
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    assert "is not paused at an escalation" in capsys.readouterr().err
+
+    # delete leaves no registered worktree under the run dir; the branch survives
+    runs.delete_run(project.project, replay_dir)
+    assert not replay_dir.exists()
+    assert _registered_under(project, replay_dir) == []
+    assert _branch_sha(project, branch) == sha
+    assert _state_bytes(engine.run_dir) == origin_before
+
+
+def test_abandon_parks_uncommitted_work_on_an_abandon_ref(project, tmp_path, monkeypatch, capsys):
+    """An untracked file in the kept worktree is parked on
+    `refs/attempt-preserve-dirty/<run>-<head8>-abandon` before the removal, named in
+    the journal and on stdout, and the ref outlives `delete`.
+
+    Ablation: replace the `preserve_abandoned_unit` call in `abandon_replay_run` with
+    `ref = None` and the ref assertions fail (the file is lost with the worktree)."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    head = git(unit, "rev-parse", "HEAD").strip()
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    assert not unit.exists()
+    assert git(project.project, "show", f"{ref}:extra-notes.txt") == "unsaved operator notes"
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["ref"] == ref
+    assert ref in capsys.readouterr().out
+    runs.delete_run(project.project, replay_dir)
+    assert git(project.project, "rev-parse", "--verify", "-q", ref).strip()
+
+
+def test_abandon_refuses_a_run_that_is_not_a_replay(project, tmp_path, monkeypatch, capsys):
+    """An ordinary run paused at an escalation has re-arm and adopt; abandon refuses
+    it, naming replay runs and both gestures, and changes nothing.
+
+    Ablation: drop the `not state.replay_of` check in `unitreplay.abandon_refusal`
+    and the message assertion fails."""
+    engine, _ = _deferred_unit_then_escalation(project, tmp_path)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    before = _state_bytes(engine.run_dir)
+    rows = len(Journal(engine.run_dir).entries())
+
+    assert _abandon(project, engine.run_dir, "--no-interactive") == 1
+
+    err = capsys.readouterr().err
+    assert "closes replay runs only" in err
+    assert f"bmad-loop resolve {engine.run_dir.name}`" in err and "--adopt-branch" in err
+    assert _state_bytes(engine.run_dir) == before
+    assert len(Journal(engine.run_dir).entries()) == rows
+    assert Path(engine.state.tasks["1-1-a"].worktree_path).is_dir()
+
+
+def test_abandon_refuses_a_finished_run(project, tmp_path, monkeypatch, capsys):
+    """A finished run is not paused at an escalation: the existing message, rc 1."""
+    engine, _marker = _finished_kept_unit(project, tmp_path)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    before = _state_bytes(engine.run_dir)
+
+    assert _abandon(project, engine.run_dir, "--no-interactive") == 1
+
+    assert "is not paused at an escalation (stage: none)" in capsys.readouterr().err
+    assert _state_bytes(engine.run_dir) == before
+    assert Path(engine.state.tasks["1-1-a"].worktree_path).is_dir()
+
+
+def test_abandon_leaves_everything_when_the_snapshot_fails(project, tmp_path, monkeypatch, capsys):
+    """A snapshot failure raises before the teardown: rc 1, the error printed, and
+    the worktree, branch, state and journal untouched."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    (unit / "extra-notes.txt").write_text("unsaved\n", encoding="utf-8")
+    before = _snapshot_untouched(project, replay_dir)
+
+    def boom(*_a, **_k):
+        raise verify.GitError("snapshot refused (test fault)")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", boom)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "snapshot refused (test fault)" in capsys.readouterr().err
+    assert _snapshot_untouched(project, replay_dir) == before
+    assert (unit / "extra-notes.txt").is_file()
+
+
+@pytest.mark.parametrize("leftover", ["on-disk", "registered"])
+def test_abandon_refuses_when_the_teardown_leaves_the_worktree(
+    project, tmp_path, monkeypatch, capsys, leftover
+):
+    """`discard_worktree` is best effort: when the worktree is still on disk, or its
+    dir is gone but git still lists it, abandon raises naming the path and records
+    nothing — the run stays paused, the task and journal unchanged.
+
+    Ablation: drop the `_verify_worktree_gone` call in `abandon_replay_run` and the
+    run is recorded finished over the surviving worktree."""
+    from bmad_loop import unitreplay
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    state_before = _state_bytes(replay_dir)
+    rows = len(Journal(replay_dir).entries())
+
+    def partial(_repo, path, _branch, *, run_dir):
+        if leftover == "registered":
+            shutil.rmtree(path)  # the dir goes, git's admin entry stays
+
+    monkeypatch.setattr(unitreplay, "discard_worktree", partial)
+    monkeypatch.setattr(verify, "worktree_prune", lambda _repo: None)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    err = capsys.readouterr().err
+    assert str(unit) in err
+    assert ("still on disk" if leftover == "on-disk" else "still registered") in err
+    assert _state_bytes(replay_dir) == state_before
+    assert len(Journal(replay_dir).entries()) == rows
+
+
+@pytest.mark.parametrize("removal", ["git-remove", "rmtree"])
+@pytest.mark.parametrize("branch_gone", [False, True], ids=["branch-kept", "branch-gone"])
+def test_abandon_completes_when_the_worktree_is_already_gone(
+    project, tmp_path, monkeypatch, capsys, removal, branch_gone
+):
+    """An earlier abandon crashed after the teardown and before the save: the
+    worktree is gone and the run still paused. Re-running abandon skips straight to
+    the journal and state write, recording the `worktree` path. `rmtree` leaves git's
+    admin entry behind, which the already-gone arm prunes before its listing check.
+    With the unit branch deleted too, abandon still closes the run and says the
+    branch no longer exists (`branch_kept` false).
+
+    Ablation: drop the else-arm `verify.worktree_prune` in `abandon_replay_run` and
+    the `rmtree` rows fail ("still registered")."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    task = load_state(replay_dir).tasks["1-1-a"]
+    unit = Path(task.worktree_path)
+    if removal == "git-remove":
+        git(project.project, "worktree", "remove", "--force", str(unit))
+    else:
+        shutil.rmtree(unit)
+        assert _registered_under(project, replay_dir)  # the admin entry survives
+    if branch_gone:
+        # update-ref, not `branch -D`: a stale admin entry still "has it checked out"
+        git(project.project, "update-ref", "-d", f"refs/heads/{task.branch}")
+    assert not unit.exists()
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    replay = load_state(replay_dir)
+    assert replay.finished and not replay.paused
+    assert _registered_under(project, replay_dir) == []
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["worktree"] == str(unit)
+    assert row["ref"] is None and row["branch_kept"] is (not branch_gone)
+    out = capsys.readouterr().out
+    if branch_gone:
+        assert f"branch {task.branch} of 1-1-a no longer exists" in out
+    else:
+        assert f"kept on branch {task.branch}" in out
+
+
+def _bump_generation_then_confirm(replay_dir):
+    def confirm(_question):
+        state = load_state(replay_dir)
+        state.tasks["1-1-a"].generation += 1
+        save_state(replay_dir, state)
+        return True
+
+    return confirm
+
+
+def test_abandon_locked_recheck_refuses_a_changed_escalation(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The escalation changes between resolve's lock-free checks and the lock (the
+    task's generation moved while the prompt was open): abandon refuses and leaves
+    the worktree, branch and journal as they were.
+
+    Ablation: drop the `fresh_task.generation != task.generation` check in
+    `cli._resolve_abandon` and the run is abandoned (rc 0)."""
+    from bmad_loop import cli
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    before = _snapshot_untouched(project, replay_dir)
+    monkeypatch.setattr(cli, "_confirm", _bump_generation_then_confirm(replay_dir))
+
+    assert _abandon(project, replay_dir) == 1
+
+    assert "changed while resolve was in progress" in capsys.readouterr().err
+    assert _snapshot_untouched(project, replay_dir)[1:] == before[1:]
+    assert not load_state(replay_dir).finished
+
+
+def test_abandon_locked_recheck_refuses_an_engine_live_under_the_lock(
+    project, tmp_path, monkeypatch, capsys
+):
+    """Liveness reads dead at `cmd_resolve`'s gate but alive by the locked re-check:
+    abandon refuses "still live" and changes nothing.
+
+    Ablation: drop the `fresh_live == "alive"` refusal in `cli._resolve_abandon` and
+    the run is abandoned (rc 0)."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    before = _snapshot_untouched(project, replay_dir)
+    calls = []
+
+    def liveness(_run_dir):
+        calls.append(_run_dir)
+        return "dead" if len(calls) == 1 else "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", liveness)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "is still live" in capsys.readouterr().err
+    assert len(calls) == 2
+    assert _snapshot_untouched(project, replay_dir) == before
+
+
+def test_abandon_declined_prompt_changes_nothing(project, tmp_path, monkeypatch, capsys):
+    """Without `--no-interactive` abandon confirms; a declined prompt leaves the run
+    paused at the escalation, worktree and branch in place."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    before = _snapshot_untouched(project, replay_dir)
+    monkeypatch.setattr("builtins.input", lambda _q="": "n")
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir) == 0
+
+    captured = capsys.readouterr()
+    assert "cancelled — run is still paused at the escalation" in captured.out
+    assert "is kept" in captured.err  # the warning named what survives
+    assert _snapshot_untouched(project, replay_dir) == before
+
+
+@pytest.mark.parametrize("flag", ["--resume", "--no-resume"])
+def test_abandon_with_a_resume_flag_is_a_usage_error(project, tmp_path, monkeypatch, capsys, flag):
+    """Abandon never resumes, so either resume answer with it is a usage error,
+    refused before anything changes."""
+    from bmad_loop.cli import ExitCode
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    before = _snapshot_untouched(project, replay_dir)
+
+    assert _abandon(project, replay_dir, "--no-interactive", flag) == ExitCode.USAGE
+
+    assert "nothing to resume" in capsys.readouterr().err
+    assert _snapshot_untouched(project, replay_dir) == before
+
+
+def test_abandon_refuses_a_plain_directory_at_the_worktree_path(
+    project, tmp_path, monkeypatch, capsys
+):
+    """A plain directory where the kept worktree was registered cannot be snapshotted
+    (git inside it would address the project checkout), and the teardown's rmtree
+    fallback would delete it unsaved: abandon refuses and leaves it standing.
+
+    Ablation: drop the `not registered` refusal in `abandon_replay_run` and the
+    directory is deleted and the run recorded finished."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    git(project.project, "worktree", "remove", "--force", str(unit))
+    unit.mkdir()
+    (unit / "copied-by-hand.txt").write_text("operator copy\n", encoding="utf-8")
+    state_before = _state_bytes(replay_dir)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "is not a registered git worktree" in capsys.readouterr().err
+    assert (unit / "copied-by-hand.txt").is_file()
+    assert _state_bytes(replay_dir) == state_before

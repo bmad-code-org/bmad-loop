@@ -6955,8 +6955,9 @@ def standalone_replay_refusal(
     (`_reverify_task_refusal`, `_reverify_root_refusal`, `_mounted_reverify_refusal`)
     plus the shape only a finished isolated story run can hand over: the run is
     finished, a sprint-status story run (not a sweep, not stories mode), the story
-    DEFERRED (a finished run never holds an ESCALATED task — DW-386) in a kept
-    worktree unit on its own branch, with a target branch to merge into, and the
+    DEFERRED (a finished run never holds an ESCALATED task — DW-386 — except a
+    replay run closed by `resolve --abandon` (DW-535), whose ESCALATED task is a
+    record with no worktree left) in a kept worktree unit on its own branch, with a target branch to merge into, and the
     story not already done on the main checkout's sprint board (DW-533).
 
     No remedy here names `bmad-loop resolve <run>` without `--reverify`: resolve

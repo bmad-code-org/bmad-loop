@@ -41,21 +41,40 @@ story), so `WorktreeFlow.refuse_superseded_replay` re-reads the main checkout's 
 right before the replay run's merge starts: a done row or an unreadable board journals
 ``replay-merge-refused`` and keeps the branch and escalates, leaving the replay run paused
 (DW-534). No LLM call anywhere: this is deterministic orchestration.
+
+Closing a replay run whose unit escalated (DW-535): `bmad-loop resolve <replay-run>
+--abandon`. Plain ``resume`` re-pauses at the escalation, ``--adopt-branch`` meets the
+same board gate again and a re-arm re-drives a superseded story, so the operator
+vouches the work is superseded and `abandon_replay_run` closes the run instead. Scoped
+to a replay run paused at an escalation whose named task is ESCALATED
+(`abandon_refusal` holds the replay-run, phase and kept-work checks; the pause check
+stays with each caller). Under the replay run's state lock it parks any
+uncommitted state of the kept worktree on a ``refs/attempt-preserve-dirty/*-abandon``
+ref (`workspace.preserve_abandoned_unit`), removes the worktree with
+`workspace.discard_worktree` passing no branch — the kept branch always survives —
+verifies the worktree is gone from disk and from git's list (a repair write: a
+leftover raises and nothing is recorded), journals ``replay-abandoned``, then saves
+the run ``finished`` with its pause cleared. The task stays ESCALATED with its
+``branch`` and ``worktree_path`` as the record. A worktree already gone (an earlier
+abandon crashed after the teardown) skips straight to the state write. The sprint
+board, the deferred-work ledger, the finished origin run and the run's mux session are
+never touched; no engine runs.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import runs, runsetup, verify
 from .bmadconfig import ProjectPaths
 from .journal import Journal, load_state, save_state, state_lock
-from .model import RunState, StoryTask
+from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import root_identity_record, safe_segment
 from .policy import Policy
-from .workspace import unit_worktrees_dir
+from .workspace import discard_worktree, preserve_abandoned_unit, unit_worktrees_dir
 
 
 class ReplayError(Exception):
@@ -269,3 +288,153 @@ def _journal_handoff(
         from_worktree=str(src),
         worktree=str(dst),
     )
+
+
+# ------------------------------------------------- resolve --abandon (DW-535)
+
+
+class AbandonError(Exception):
+    """The replay run could not be abandoned. Raised before any write leaves state,
+    journal, worktree and branch untouched; raised after the teardown (the worktree
+    survived it) leaves the run paused and nothing journaled."""
+
+
+@dataclass(frozen=True)
+class AbandonOutcome:
+    """What `abandon_replay_run` kept: the unit branch (and whether it still exists
+    after the teardown) and the snapshot ref of uncommitted state, if any."""
+
+    branch: str
+    branch_kept: bool
+    ref: str | None
+
+
+def abandon_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
+    """Why `resolve --abandon` cannot close this run for ``story_key``, or None when it
+    can (DW-535).
+
+    Shared by `cli._resolve_abandon`'s early exit and `abandon_replay_run`'s locked
+    re-check, so the two cannot drift. The pause check stays with each caller, which
+    words it for its surface (as `runs.adopt_refusal` does)."""
+    if not state.replay_of:
+        return (
+            f"--abandon closes replay runs only, and run {state.run_id} is not one; "
+            f"re-arm the escalation with `bmad-loop resolve {state.run_id}`, or finish "
+            f"it from its kept branch with `bmad-loop resolve {state.run_id} "
+            "--adopt-branch`"
+        )
+    if task.phase != Phase.ESCALATED:
+        return f"story {story_key} is not escalated (phase: {task.phase})"
+    if not task.worktree_path or not task.branch:
+        return f"story {story_key} has no kept worktree unit to abandon"
+    return None
+
+
+def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) -> AbandonOutcome:
+    """Close the escalated replay run at ``run_dir`` without merging its unit, under
+    the run's state lock (reentrant, so a caller already holding it may call this).
+
+    Order: re-check → snapshot → teardown → verify gone → journal → save state. A
+    crash after the teardown leaves a paused run with no worktree; re-running abandon
+    completes it (after a crash between the journal and the save, with a second
+    ``replay-abandoned`` row). ``paths`` is the current config: ``paths.repo_root`` is the
+    repository the worktree is registered with (as `WorktreeFlow.reopen_unit` reads
+    it). Liveness and the task generation are the CLI caller's locked checks.
+    Raises AbandonError."""
+    with state_lock(run_dir):
+        state = load_state(run_dir)
+        if state.paused_stage != PAUSE_ESCALATION:
+            raise AbandonError(runs.not_escalation_pause_message(run_dir.name, state.paused_stage))
+        task = state.tasks.get(story_key)
+        if task is None:
+            raise AbandonError(f"run {run_dir.name} has no task for story {story_key}")
+        if (refusal := abandon_refusal(state, task, story_key)) is not None:
+            raise AbandonError(refusal)
+        repo_root = paths.repo_root
+        wt = Path(task.worktree_path)
+        ref: str | None = None
+        if os.path.lexists(wt):
+            try:
+                registered = verify.worktree_is_registered(repo_root, wt)
+            except verify.GitError as e:
+                raise AbandonError(
+                    f"cannot tell whether {wt} is a registered worktree ({e}); not abandoning"
+                ) from e
+            if not registered:
+                # Not git's linked worktree: git run inside it would address the
+                # project checkout, so nothing in it can be snapshotted — and the
+                # teardown's rmtree fallback would delete it unsaved.
+                raise AbandonError(
+                    f"the kept worktree path {wt} exists but is not a registered git "
+                    f"worktree of {repo_root}, so its contents cannot be preserved; "
+                    "inspect it, remove it by hand, then re-run abandon"
+                )
+            try:
+                ref = preserve_abandoned_unit(
+                    repo_root, wt, state.run_id, story_key, paths, task.spec_file
+                )
+            except verify.GitError as e:
+                raise AbandonError(f"{e}; nothing was abandoned") from e
+        try:
+            if os.path.lexists(wt):
+                discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
+            else:
+                # Gone already (a crashed earlier abandon, or removed by hand): drop
+                # any stale admin entry so the listing below can answer.
+                verify.worktree_prune(repo_root)
+            _verify_worktree_gone(repo_root, wt)
+            branch_kept = verify.branch_exists(repo_root, task.branch)
+        except verify.GitError as e:
+            raise AbandonError(
+                f"tearing down the kept worktree {wt} failed ({e}); the run is still "
+                "paused — re-run abandon"
+            ) from e
+        Journal(run_dir).append(
+            "replay-abandoned",
+            story_key=story_key,
+            replay_of=state.replay_of,
+            branch=task.branch,
+            branch_kept=branch_kept,
+            worktree=task.worktree_path,
+            ref=ref,
+        )
+        state.clear_pause()
+        state.finished = True
+        save_state(run_dir, state)
+        return AbandonOutcome(branch=task.branch, branch_kept=branch_kept, ref=ref)
+
+
+def _verify_worktree_gone(repo_root: Path, wt: Path) -> None:
+    """Raise AbandonError unless ``wt`` is off disk AND off ``repo_root``'s worktree
+    list. A repair write's check: `discard_worktree` is best effort (its rmtree
+    fallback and prune swallow failures), so the run is not recorded finished over a
+    worktree that survived it."""
+    if os.path.lexists(wt):
+        raise AbandonError(
+            f"the kept worktree {wt} is still on disk after its removal; the run is "
+            "still paused — remove it by hand, then re-run abandon"
+        )
+    try:
+        listed = verify.worktree_list(repo_root)
+    except verify.GitError as e:
+        raise AbandonError(
+            f"cannot list the worktrees of {repo_root} to confirm {wt} was removed ({e}); "
+            "the run is still paused — re-run abandon"
+        ) from e
+    target = _canonical(wt)
+    if any(_canonical(p) == target for p in listed):
+        raise AbandonError(
+            f"the kept worktree {wt} is still registered with git after its removal; "
+            f"the run is still paused — if it is locked, `git worktree unlock {wt}` "
+            "first; then `git worktree prune` and re-run abandon"
+        )
+
+
+def _canonical(path: Path) -> str:
+    """A comparable spelling of a path that may no longer exist: the existing prefix
+    resolved (symlinked tmp dirs), case-folded where the filesystem folds."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        resolved = path
+    return os.path.normcase(str(resolved))

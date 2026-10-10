@@ -106,7 +106,7 @@ def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
-def orphan_preserve_ref_name(run_id: str, head: str) -> str:
+def orphan_preserve_ref_name(run_id: str, head: str, *, kind: str = "orphan") -> str:
     """Canonical snapshot ref for the uncommitted state of an orphaned mount.
 
     Lives under ``refs/attempt-preserve-dirty/`` — the SAME family
@@ -115,8 +115,13 @@ def orphan_preserve_ref_name(run_id: str, head: str) -> str:
     the terms a rollback snapshot is, and no new unbounded ref family exists. The
     ``-orphan`` suffix keeps it from ever colliding with a rollback's
     ``{slug}-{baseline}-{attempt}`` shape, whose last segment is an integer.
+
+    ``kind`` sets that suffix: ``"abandon"`` names the snapshot
+    :func:`preserve_abandoned_unit` parks before `resolve --abandon` removes a
+    replay run's kept worktree (DW-535). Any non-integer word keeps the
+    no-collision property.
     """
-    return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-orphan"
+    return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-{kind}"
 
 
 def _orphan_owned_rels(wt: Path, paths: ProjectPaths, spec_file: str | None) -> tuple[str, ...]:
@@ -212,9 +217,13 @@ def _preserve_orphan_state(
     paths: ProjectPaths,
     spec_file: str | None,
     on_orphan_preserved: Callable[[str, str], None] | None,
+    *,
+    kind: str = "orphan",
 ) -> None:
     """Park the uncommitted work an orphaned mount at ``wt`` still holds before the
-    reclaim force-removes it. See the reclaim comment in :func:`open_unit_workspace`
+    reclaim force-removes it. ``kind`` is the ref suffix
+    (:func:`orphan_preserve_ref_name`); :func:`preserve_abandoned_unit` reuses this
+    whole capture, guard included, with ``"abandon"``. See the reclaim comment in :func:`open_unit_workspace`
     for why an orphan can stand at this path at all.
 
     Three-way guard before any git runs *in* ``wt``: the path exists, it is one of
@@ -255,7 +264,7 @@ def _preserve_orphan_state(
         return
     try:
         head = verify.rev_parse_head(wt)
-        base_ref = orphan_preserve_ref_name(run_id, head)
+        base_ref = orphan_preserve_ref_name(run_id, head, kind=kind)
         ref = base_ref
         serial = 2
         # Same bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a
@@ -288,6 +297,39 @@ def _preserve_orphan_state(
         ) from e
     if parked is not None and on_orphan_preserved is not None:
         on_orphan_preserved(str(wt), parked)
+
+
+def preserve_abandoned_unit(
+    repo_root: Path,
+    wt: Path,
+    run_id: str,
+    unit_key: str,
+    paths: ProjectPaths,
+    spec_file: str | None,
+) -> str | None:
+    """Park the uncommitted state of a replay run's kept worktree at ``wt`` before
+    `resolve --abandon` removes it (DW-535), and return the snapshot ref, or
+    ``None`` when there was nothing to park (or ``wt`` is not a registered linked
+    worktree of ``repo_root`` — the caller decides what that means).
+
+    The orphan capture verbatim (:func:`_preserve_orphan_state`): the same
+    three-way guard, the same ``force_include`` of the orchestrator's own ignored
+    artifacts, and a ref under ``refs/attempt-preserve-dirty/`` with the
+    ``-abandon`` suffix, so ``scm.preserve_keep`` bounds it like every snapshot.
+    A capture failure raises :class:`verify.GitError`, leaving ``wt`` standing.
+    The committed work needs no capture: the abandon keeps the unit branch."""
+    captured: list[str] = []
+    _preserve_orphan_state(
+        repo_root,
+        wt,
+        run_id,
+        unit_key,
+        paths,
+        spec_file,
+        lambda _wt, ref: captured.append(ref),
+        kind="abandon",
+    )
+    return captured[0] if captured else None
 
 
 def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:

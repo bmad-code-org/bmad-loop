@@ -268,12 +268,15 @@ SAVE_STATE_CALLERS = {
     ("runsetup.py", "compose_sweep"),
     # DW-525: the replay run's first publication, outside the finished run's lock
     ("unitreplay.py", "_publish_replay_run"),
+    # DW-535: the abandoned replay run's `finished` publication, under its own lock
+    ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
+    ("cli.py", "_resolve_abandon"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
@@ -287,6 +290,8 @@ RUN_STATE_TRANSACTIONS = {
     ("tui/app.py", "_do_rearm"),
     # DW-525: the locked re-check + worktree move under the FINISHED run's lock
     ("unitreplay.py", "mint_replay_run"),
+    # DW-535: the re-check, snapshot, teardown and `finished` write of an abandon
+    ("unitreplay.py", "abandon_replay_run"),
 }
 
 # The two refusal surfaces review iteration 6 kept re-finding by hand, enumerated so
@@ -515,6 +520,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "attempt",
         "blocked",
         "blocking",
+        # DW-535: whether `replay-abandoned`'s unit branch still existed after the
+        # teardown (a bare boolean; the branch name itself aliases as `branch`).
+        "branch_kept",
         "budget",
         "budget_mode",
         "budget_weighted",
@@ -1269,6 +1277,11 @@ JOURNAL_KINDS = frozenset(
         # `replay_of` is benign, and `path` (the board) and `error` are presence-only
         # in `diagnostics._JOURNAL_DROP_FIELDS`.
         "replay-merge-refused",
+        # DW-535. An escalated replay run closed by `resolve <replay-run> --abandon`,
+        # from `unitreplay.abandon_replay_run`. `story_key` and `branch` alias by name;
+        # `replay_of`, `worktree`, `ref` (the `-abandon` snapshot, or null) and
+        # `branch_kept` are benign.
+        "replay-abandoned",
         # A worktree unit's merge paused because the main checkout is not on the
         # run's pinned target (`WorktreeFlow.require_target_checked_out`). `story_key`,
         # `branch`, `target_branch` and `checked_out_branch` alias by name.
