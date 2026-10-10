@@ -5983,9 +5983,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     scan_error: str | None = None
     try:
         if args.dry_run:
-            windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
+            windows, undetermined = launch.prunable_ctl_windows(project)
+            survived, unverifiable = [], []
         else:
-            windows, survived, unverifiable = launch.prune_ctl_windows(project)
+            windows, survived, unverifiable, undetermined = launch.prune_ctl_windows(project)
     except (MultiplexerError, UnicodeError, ProcessHostError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
@@ -5998,11 +5999,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # backstop would empty stdout of the sessions receipt this arm protects.
         # ProcessHostError: the evidence gate reads engine liveness (#864).
         print(f"ctl window prune failed: {e}", file=sys.stderr)
-        windows, survived, unverifiable = [], [], []
+        windows, survived, unverifiable, undetermined = [], [], [], []
         scan_error = str(e)
     # Kept open, not planned or killed: whether their command still runs could
     # not be read (#876). In JSON mode the document carries them instead.
-    undetermined = launch.drain_undetermined_ctl_windows()
     if not args.json:
         for name, reason in undetermined:
             print(

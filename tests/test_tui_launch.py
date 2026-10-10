@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1682,7 +1683,7 @@ def _ctl_prune_fake(
     *,
     kill: str = "lands",
     kill_boom: str | None = None,
-    screens: dict[str, str | BaseException] | None = None,
+    screens: dict[str, str | BaseException | Callable[[], str]] | None = None,
 ) -> tuple[list[list[str]], list[int]]:
     """Stand a fake ctl session up for the prune; returns (kill-argv log, liveness
     probe log) — the second is what proves the verdict costs ONE listing.
@@ -1705,7 +1706,7 @@ def _ctl_prune_fake(
 
     ``screens`` overrides what capture-pane shows per window id (default: the
     park banner, so every window reads as parked); an exception there is
-    raised from that capture instead.
+    raised from that capture instead, and a callable is called for the screen.
     """
     from bmad_loop import runs
 
@@ -1738,6 +1739,8 @@ def _ctl_prune_fake(
             screen = (screens or {}).get(argv[-1], _PARKED_SCREEN)
             if isinstance(screen, BaseException):
                 raise screen
+            if callable(screen):
+                screen = screen()
             return subprocess.CompletedProcess(argv, 0, stdout=screen, stderr="")
         if verb == "list-windows":
             if argv[-1] == "#{window_id}":  # the post-kill liveness probe
@@ -1795,10 +1798,10 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     killed, probes = _ctl_prune_fake(monkeypatch, tmp_path)
 
     both = ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"]
-    assert launch.prunable_ctl_windows(tmp_path) == both
+    assert launch.prunable_ctl_windows(tmp_path)[0] == both
     assert killed == []  # dry-run view kills nothing
     assert probes == []  # ...and asks nothing about liveness either
-    assert launch.prune_ctl_windows(tmp_path) == (both, [], [])
+    assert launch.prune_ctl_windows(tmp_path) == (both, [], [], [])
     assert killed == [
         ["tmux", "kill-window", "-t", "@3"],
         ["tmux", "kill-window", "-t", "@6"],
@@ -1821,10 +1824,10 @@ def test_prune_ctl_windows_keeps_a_window_whose_command_still_runs(monkeypatch, 
     killed, _probes = _ctl_prune_fake(
         monkeypatch, tmp_path, screens={"@3": running, "@6": scrolled}
     )
-    assert launch.prunable_ctl_windows(tmp_path) == []
-    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert launch.prunable_ctl_windows(tmp_path)[0] == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [], [])
     assert killed == []
-    assert launch.drain_undetermined_ctl_windows() == []  # read, so not undetermined
+    assert launch.prune_ctl_windows(tmp_path)[3] == []  # read, so not undetermined
 
 
 @pytest.mark.parametrize(
@@ -1841,19 +1844,48 @@ def test_prune_ctl_windows_keeps_and_reports_a_window_it_cannot_read(
     """A capture that fails says nothing about the window's command, so it is
     kept and listed for the callers to surface — and the readable parked window
     beside it is still pruned. Ablate the `except` arm and the scan raises; drop
-    the append and the drain is empty."""
+    the append and the fourth list is empty."""
     killed, _probes = _ctl_prune_fake(monkeypatch, tmp_path, screens={"@3": fault})
-    assert launch.prune_ctl_windows(tmp_path) == (["run-20260101-000000-dead2"], [], [])
+    plan, plan_undetermined = launch.prunable_ctl_windows(tmp_path)
+    assert plan == ["run-20260101-000000-dead2"]
+    assert [name for name, _reason in plan_undetermined] == ["sweep-20260101-000000-dead"]
+    removed, survived, unverifiable, undetermined = launch.prune_ctl_windows(tmp_path)
+    assert (removed, survived, unverifiable) == (["run-20260101-000000-dead2"], [], [])
     assert killed == [["tmux", "kill-window", "-t", "@6"]]
-    undetermined = launch.drain_undetermined_ctl_windows()
     assert [name for name, _reason in undetermined] == ["sweep-20260101-000000-dead"]
     assert reason in undetermined[0][1]
-    assert launch.drain_undetermined_ctl_windows() == []  # drained
-    # each scan reports its own: a stale entry from an earlier one never leaks
-    launch.prunable_ctl_windows(tmp_path)
-    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
-    launch.prunable_ctl_windows(tmp_path)
-    assert launch.drain_undetermined_ctl_windows() == []
+
+
+def test_overlapping_ctl_scans_each_keep_their_own_undetermined_windows(
+    monkeypatch, tmp_path: Path
+):
+    """Two scans at once (two TUI cleanup workers) must not lose or swap each
+    other's unreadable windows: the outer scan's capture fault on `@3` stays
+    its own while an inner scan, started mid-way, reads `@3` fine. Ablate the
+    per-scan list into one shared, cleared-per-scan list and the inner scan
+    wipes the outer's fault: the outer reports nothing and the operator sees
+    a clean-looking result."""
+    captures_of_3 = 0
+    inner: list[tuple[str, str]] | None = None
+
+    def screen_3() -> str:
+        nonlocal captures_of_3
+        captures_of_3 += 1
+        if captures_of_3 == 1:
+            raise OSError("capture timed out")  # only the outer scan's read fails
+        return "still resolving...\n> "
+
+    def screen_6() -> str:
+        nonlocal inner
+        if inner is None:  # the outer scan, mid-way: the second scan runs now
+            inner = []
+            inner = launch.prunable_ctl_windows(tmp_path)[1]
+        return _PARKED_SCREEN
+
+    _ctl_prune_fake(monkeypatch, tmp_path, screens={"@3": screen_3, "@6": screen_6})
+    _plan, outer = launch.prunable_ctl_windows(tmp_path)
+    assert [name for name, _reason in outer] == ["sweep-20260101-000000-dead"]
+    assert inner == []
 
 
 def test_prune_ctl_windows_kill_decode_fault_does_not_abort_the_fan_out(
@@ -1868,7 +1900,7 @@ def test_prune_ctl_windows_kill_decode_fault_does_not_abort_the_fan_out(
     killed, probes = _ctl_prune_fake(monkeypatch, tmp_path, kill_boom="@3")
 
     both = ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"]
-    assert launch.prune_ctl_windows(tmp_path) == (both, [], [])
+    assert launch.prune_ctl_windows(tmp_path) == (both, [], [], [])
     assert [argv[-1] for argv in killed] == ["@3", "@6"]  # the fault did not stop @6
     assert probes == [2]  # and the verdict still cost ONE listing, after both
 
@@ -1883,6 +1915,7 @@ def test_prune_ctl_windows_reports_a_survivor_separately(monkeypatch, tmp_path: 
         [],
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
         [],
+        [],
     )
 
 
@@ -1896,6 +1929,7 @@ def test_prune_ctl_windows_unprobeable_liveness_claims_nothing(monkeypatch, tmp_
         [],
         [],
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
     )
 
 
@@ -1910,6 +1944,7 @@ def test_prune_ctl_windows_undecodable_liveness_is_a_transport_fault(monkeypatch
         [],
         [],
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
     )
 
 
@@ -1929,6 +1964,7 @@ def test_prune_ctl_windows_reads_an_empty_listing_as_the_session_going_with_it(
 
     assert launch.prune_ctl_windows(tmp_path) == (
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
         [],
         [],
     )
@@ -1955,6 +1991,7 @@ def test_prune_ctl_windows_unproven_nonzero_listing_claims_nothing(monkeypatch, 
         [],
         [],
         ["sweep-20260101-000000-dead", "run-20260101-000000-dead2"],
+        [],
     )
 
 
@@ -1966,7 +2003,7 @@ def test_prune_ctl_windows_with_no_candidates_never_probes(monkeypatch, tmp_path
     other = tmp_path / "elsewhere"
     other.mkdir()
 
-    assert launch.prune_ctl_windows(other) == ([], [], [])
+    assert launch.prune_ctl_windows(other) == ([], [], [], [])
     assert probes == []
 
 
@@ -1994,7 +2031,7 @@ def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
 
-    assert launch.prunable_ctl_windows(tmp_path) == ["run-20260101-000000-dead"]
+    assert launch.prunable_ctl_windows(tmp_path)[0] == ["run-20260101-000000-dead"]
     assert runs.project_tag(tmp_path) != legacy  # the shapes really are different
 
 
@@ -2047,8 +2084,8 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
 
-    assert launch.prunable_ctl_windows(tmp_path) == ["sweep-20260101-000000-dead"]
-    assert launch.prune_ctl_windows(tmp_path) == (["sweep-20260101-000000-dead"], [], [])
+    assert launch.prunable_ctl_windows(tmp_path)[0] == ["sweep-20260101-000000-dead"]
+    assert launch.prune_ctl_windows(tmp_path) == (["sweep-20260101-000000-dead"], [], [], [])
     assert killed == [["tmux", "kill-window", "-t", "@2"]]
 
 
@@ -2106,8 +2143,8 @@ def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tm
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     expected = ["run-ctl-foo", "run-ctl-0123456789abcde"]
-    assert launch.prunable_ctl_windows(tmp_path) == expected
-    assert launch.prune_ctl_windows(tmp_path) == (expected, [], [])
+    assert launch.prunable_ctl_windows(tmp_path)[0] == expected
+    assert launch.prune_ctl_windows(tmp_path) == (expected, [], [], [])
     assert killed == [
         ["tmux", "kill-window", "-t", "@2"],
         ["tmux", "kill-window", "-t", "@5"],
@@ -2186,7 +2223,7 @@ def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path
 
     assert launch.ctl_window_id(tmp_path, "20260101-000000-dead") == "@2"
     assert launch.ctl_target(tmp_path) == f"={expected}"
-    assert launch.prune_ctl_windows(tmp_path) == (["run-20260101-000000-dead"], [], [])
+    assert launch.prune_ctl_windows(tmp_path) == (["run-20260101-000000-dead"], [], [], [])
 
     assert mux.sessions and set(mux.sessions) == {expected}
 
@@ -2200,7 +2237,7 @@ def test_prune_ctl_windows_no_session(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [], [])
 
 
 def test_prune_ctl_windows_raises_when_a_false_has_session_proves_nothing(
@@ -3291,8 +3328,8 @@ def test_ctl_candidates_stay_empty_for_an_unavailable_backend_without_evidence(
     _make_run(tmp_path, "20260101-000000-fin")
     monkeypatch.setattr(launch, "mux_usable", lambda _m: False)
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
-    assert launch.prunable_ctl_windows(tmp_path) == []
-    assert launch.prune_ctl_windows(tmp_path) == ([], [], [])
+    assert launch.prunable_ctl_windows(tmp_path)[0] == []
+    assert launch.prune_ctl_windows(tmp_path) == ([], [], [], [])
     assert capsys.readouterr().err == ""
 
 
@@ -3306,7 +3343,7 @@ def test_ctl_candidates_ignore_evidence_for_a_usable_backend(monkeypatch, tmp_pa
     monkeypatch.setattr(
         launch, "_ctl_window_evidence", lambda _p: pytest.fail("evidence read for a usable mux")
     )
-    assert launch.prunable_ctl_windows(tmp_path) == [
+    assert launch.prunable_ctl_windows(tmp_path)[0] == [
         "sweep-20260101-000000-dead",
         "run-20260101-000000-dead2",
     ]
@@ -3361,7 +3398,7 @@ def test_a_verified_prune_keeps_the_record_and_a_later_unavailable_scan_reports(
     _ctl_prune_fake(monkeypatch, tmp_path, kill="lands")
     record = _make_run(tmp_path, "20260101-000000-dead2") / "ctl-window"
     record.write_text("@6", encoding="utf-8")
-    removed, _survived, _unverifiable = launch.prune_ctl_windows(tmp_path)
+    removed, _survived, _unverifiable, _undetermined = launch.prune_ctl_windows(tmp_path)
     assert "run-20260101-000000-dead2" in removed
     assert record.read_text(encoding="utf-8") == "@6"
     monkeypatch.setattr(launch, "mux_usable", lambda _m: False)

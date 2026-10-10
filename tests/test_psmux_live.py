@@ -136,18 +136,17 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         # here disturbs the verified-removal assertions below.
         with monkeypatch.context() as no_kill:
             no_kill.setattr(mux, "kill_window", lambda _t: None)
-            assert launch.prune_ctl_windows(proj_a) == ([], ["run-20260726-1"], [])
+            assert launch.prune_ctl_windows(proj_a) == ([], ["run-20260726-1"], [], [])
         assert mux.window_alive(session, win_a)  # the suppressed kill really was a no-op
 
         # Then for real: the kill lands, so the verdict is a verified removal
         # with both other arms empty.
-        assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [])
+        assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [], [])
 
         live = mux.list_window_ids(session)
         assert win_a not in live
         assert win_b in live
         assert win_c in live  # its command was still running
-        assert launch.drain_undetermined_ctl_windows() == []
         options = mux._scoped_options(session) or {}
         key_a = mux._scoped_option_key(runs.PROJECT_OPTION, digits_a)
         key_b = mux._scoped_option_key(runs.PROJECT_OPTION, win_b.rsplit("@", 1)[1])
