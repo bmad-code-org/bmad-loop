@@ -6603,17 +6603,24 @@ def test_path_clean_types_a_directory_in_no_repository(tmp_path, monkeypatch):
 
 def test_path_clean_leaves_a_broken_gitfile_untyped(tmp_path, monkeypatch):
     """A `.git` gitfile pointing at a missing gitdir answers `fatal: not a git
-    repository: <path>` — no `(or any `. That is a corrupt repository pointer, not an
-    absent repository, so it stays a plain `GitError` a ledger publish re-raises.
+    repository: <path>` (git 2.56+: `fatal: gitfile does not point to a valid
+    repository: <path>`) — no `(or any ` either way. That is a corrupt repository
+    pointer, not an absent repository, so it stays a plain `GitError` a ledger
+    publish re-raises.
 
     Ablation: widen the match to `fatal: not a git repository` and this fails on the
-    subtype."""
+    subtype — before git 2.56 only; from 2.56 the gitfile wording no longer carries
+    that phrase, and `..._pre_256_broken_gitfile_wording_untyped` pins the narrow
+    match on every git."""
     broken = tmp_path / "broken"
     broken.mkdir()
     (broken / ".git").write_text(f"gitdir: {tmp_path / 'missing'}\n", encoding="utf-8")
     (broken / "ledger.md").write_text("x\n", encoding="utf-8")
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    with pytest.raises(verify.GitError, match="not a git repository") as info:
+    with pytest.raises(
+        verify.GitError,
+        match="not a git repository|gitfile does not point to a valid repository",
+    ) as info:
         verify.path_clean(broken, "ledger.md")
     assert not isinstance(info.value, verify.GitNotARepositoryError)
 
@@ -6647,6 +6654,19 @@ def _stub_status_failure(monkeypatch, stderr):
         return subprocess.CompletedProcess(cmd, 128, stdout="", stderr=stderr)
 
     monkeypatch.setattr(verify, "_run_git", stub)
+
+
+def test_path_clean_leaves_the_pre_256_broken_gitfile_wording_untyped(tmp_path, monkeypatch):
+    """Git before 2.56 words a broken gitfile `fatal: not a git repository: <path>`
+    — the discovery stem without `(or any `. Stubbed so the narrow match stays
+    pinned on a git 2.56+ host, where the real-gitfile row sees the new wording.
+
+    Ablation: widen the match to `fatal: not a git repository` and this fails on the
+    subtype."""
+    _stub_status_failure(monkeypatch, "fatal: not a git repository: /x/broken/.git\n")
+    with pytest.raises(verify.GitError, match="not a git repository: /x/broken") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
 
 
 def test_path_clean_types_the_mount_point_discovery_failure(tmp_path, monkeypatch):

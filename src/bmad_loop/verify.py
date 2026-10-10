@@ -164,7 +164,9 @@ class GitNotARepositoryError(GitError):
 
 # Git's repository-discovery failure (`setup.c`), stable under `_run_git`'s
 # `LC_ALL=C`, matched at the START of a stderr line. The trailing "(or any " is
-# what excludes the gitfile form (`not a git repository: <path>`).
+# what excludes a broken gitfile's pre-2.56 form (`not a git repository: <path>`);
+# git 2.56+ words it `gitfile does not point to a valid repository: <path>`, which
+# the prefix misses outright.
 _NOT_A_REPOSITORY_PREFIX = "fatal: not a git repository (or any "
 
 
@@ -4819,7 +4821,8 @@ def path_clean(repo: Path, rel: str, *, env: dict[str, str] | None = None) -> bo
     `LC_ALL=C`, and it is matched at the start of a stderr line alone, so neither a
     porcelain record nor operator path text quoted mid-line (`cannot change to
     '<repo>'`) can forge it. The match is deliberately that narrow: a broken gitfile
-    (`not a git repository: <path>`) or a `safe.directory` refusal is a real
+    (`not a git repository: <path>`, or from git 2.56 `gitfile does not point to a
+    valid repository: <path>`) or a `safe.directory` refusal is a real
     repository's fault, which a caller that degrades on an absent repository must
     still see.
 
