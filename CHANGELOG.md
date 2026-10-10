@@ -12,6 +12,13 @@ breaking changes may land in a minor release.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 
+### Fixed
+
+- psmux: run the parked-window trailer's psmux calls through the absolute path
+  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
+  from the pane's `PATH` no longer silently skips the client return and leaks the
+  return-target key (#877).
+
 ## [0.13.2] — 2026-10-09
 
 ### Added

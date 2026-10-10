@@ -466,6 +466,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         return os.path.abspath(found)
 
+    def _psmux_path(self) -> str:
+        # The psmux `available` admits the backend on, resolved per trailer the
+        # way `_pwsh_path` is. Unresolvable falls back to the bare name, which
+        # leaves the lookup to the pane's PATH as before rather than refusing.
+        found = shutil.which(self._BINARY)
+        return os.path.abspath(found) if found else self._BINARY
+
     def _require_pwsh_floor(self) -> str:
         """Refuse a window launch under PowerShell older than 7.3 (#861), and
         return the absolute path of the pwsh that passed.
@@ -552,7 +559,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Both captures go through "$(...)".Trim(): a bare capture yields an
         # array when psmux emits more than one line, and `-eq` on an array
         # filters instead of comparing — silently taking neither branch.
-        mux = self._BINARY
+        #
+        # Every psmux call is a call-operator line on the absolute path the
+        # backend resolves (`_psmux_path`), because a bare name resolves on the
+        # pane's PATH, which psmux builds from the registry rather than from the
+        # server's environment (psmux/psmux#773): another build, or none at all,
+        # with every error going to $null (#877). The path is baked in when the
+        # window is minted, so a window parked before an upgrade keeps its own.
+        mux = "& " + _pwsh_quote(self._psmux_path())
         probe = (
             '"$(' + mux + " display-message -p -t $env:TMUX_PANE '#{window_id}' 2>$null)\".Trim()"
         )
