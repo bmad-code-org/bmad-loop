@@ -2010,10 +2010,15 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
             out = listing
         elif argv[1] == "has-session":
             out = ""
+        elif argv[1] == "capture-pane":
+            # the park banner, read through the qualified id the scan replays
+            captured.append(argv[-1])
+            out = "[bmad-loop exited 0 — press enter]\n\n"
         else:
             out = ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
+    captured: list[str] = []
     mux = PsmuxMultiplexer()
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(mux, "available", lambda: True)
@@ -2023,12 +2028,14 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
     monkeypatch.setattr(runs, "is_run", lambda _dir: True)
     monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
 
-    candidates = launch._ctl_window_candidates(tmp_path)
+    candidates, undetermined = launch._ctl_window_candidates(tmp_path)
     # The scan resolves the per-registry ctl name (runs.ctl_session_for) on a
     # namespacing backend, and the qualified candidate ids carry it.
     ctl = runs.ctl_session_for(tmp_path, mux)
     assert ctl.startswith("bmad-loop-ctl-")
     assert candidates == [(f"{ctl}:@2", "run-20260726-1")]
+    assert captured == [f"{ctl}:@2"]
+    assert undetermined == []
 
 
 # ---------------------------------------- client verbs: observed effect (#317)

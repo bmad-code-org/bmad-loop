@@ -2050,7 +2050,7 @@ class BmadLoopApp(App[None]):
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
         try:
-            windows, survived, unverifiable = launch.prune_ctl_windows(self.project)
+            windows, survived, unverifiable, undetermined = launch.prune_ctl_windows(self.project)
         except (MultiplexerError, UnicodeError, ProcessHostError) as e:
             # UnicodeError: a strict-POSIX decode fault from a scan probe that
             # does not normalize it to the seam type (#380) — the cli cleanup
@@ -2064,7 +2064,16 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(
                 self.notify, f"ctl window prune failed: {e}", severity="error", markup=False
             )
-            windows, survived, unverifiable = [], [], []
+            windows, survived, unverifiable, undetermined = [], [], [], []
+        # The cli cleanup arm's stderr line, as a toast (#876).
+        for name, reason in undetermined:
+            self.call_from_thread(
+                self.notify,
+                f"ctl window {name} left open: cannot tell whether its command still "
+                f"runs ({reason})",
+                severity="warning",
+                markup=False,
+            )
         # A kill the shared-registry ownership gate refused is left out of the
         # count below and warned on stderr, which Textual swallows: say it here.
         for refusal in runs.drain_refused_kills():

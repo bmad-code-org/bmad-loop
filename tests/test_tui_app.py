@@ -3488,7 +3488,7 @@ async def test_cleanup_says_which_kills_the_ownership_gate_refused(project, monk
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", prune)
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test(notifications=True) as pilot:
@@ -3512,7 +3512,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -3780,7 +3780,7 @@ async def test_cleanup_sessions_session_prune_error_notifies(project, monkeypatc
         raise fault
 
     monkeypatch.setattr(runs, "prune_sessions", boom)
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -3808,7 +3808,7 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
@@ -3856,7 +3856,7 @@ async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(pro
 
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
@@ -3941,7 +3941,7 @@ async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, m
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
     monkeypatch.setattr(
-        launch, "prune_ctl_windows", lambda _p: (["gone-1"], ["stuck-1"], ["dunno-1"])
+        launch, "prune_ctl_windows", lambda _p: (["gone-1"], ["stuck-1"], ["dunno-1"], [])
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -3959,6 +3959,33 @@ async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, m
         )
         await until(
             pilot, lambda: any("removed 0 session(s), 1 window(s)" in m for m in notifications(app))
+        )
+
+
+async def test_cleanup_warns_about_a_ctl_window_whose_command_state_is_unread(project, monkeypatch):
+    # The cli's stderr line for a window kept because the scan could not read
+    # whether its command still runs (#876); Textual swallows stderr.
+    from bmad_loop import runs
+
+    def scan(_p):
+        return ([], [], [], [("resolve-unread-1", "capture timed out")])
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", scan)
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                "ctl window resolve-unread-1 left open" in m and "capture timed out" in m
+                for m in notifications(app)
+            ),
         )
 
 

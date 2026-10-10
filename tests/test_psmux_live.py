@@ -44,6 +44,7 @@ import pytest
 
 from bmad_loop import runs
 from bmad_loop.adapters import psmux_backend, tmux_base
+from bmad_loop.adapters.multiplexer import parked_screen
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.tui import launch
 
@@ -51,6 +52,8 @@ HAVE_PSMUX = sys.platform == "win32" and shutil.which("psmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_PSMUX, reason="requires Windows with psmux on PATH")
 
 PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks on read
+# zero tokens, still running when the prune looks (an interactive resolve stand-in)
+RUNNING_ARGV = ["pwsh", "-NoProfile", "-Command", "Start-Sleep 120"]
 
 # The real resolver, captured before conftest pins it for every test.
 _REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
@@ -86,12 +89,14 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         mux.new_session(session, tmp_path)
         win_a = mux.new_parked_window(session, "run-20260726-1", proj_a, PARKED_ARGV, "@r")
         win_b = mux.new_parked_window(session, "run-20260726-2", proj_b, PARKED_ARGV, "@r")
+        win_c = mux.new_parked_window(session, "resolve-20260726-3", proj_a, RUNNING_ARGV, "@r")
         # A degraded mint hands back "" or a bare id — fail loud here rather
         # than let rsplit or a mis-scoped option write misdiagnose the prune.
         assert re.fullmatch(r"[^:]+:@\d+", win_a), win_a
         assert re.fullmatch(r"[^:]+:@\d+", win_b), win_b
         mux.set_window_option(win_a, runs.PROJECT_OPTION, runs.project_tag(proj_a))
         mux.set_window_option(win_b, runs.PROJECT_OPTION, runs.project_tag(proj_b))
+        mux.set_window_option(win_c, runs.PROJECT_OPTION, runs.project_tag(proj_a))
         # set_window_option declines silently (warn-only): prove the tags
         # landed before asserting anything about the prune's discrimination.
         assert mux.show_window_option(win_a, runs.PROJECT_OPTION) == runs.project_tag(proj_a)
@@ -112,6 +117,15 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         # target-less probe can resolve the test's own window and exclude it.
         monkeypatch.setattr(mux, "current_window_id", lambda: None)
         monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
+        # The prune closes a window only once its screen shows the park banner
+        # (#876): wait for the real one, so a slow pwsh start is not a skip.
+        deadline = time.monotonic() + 30
+        while not parked_screen(mux.capture_pane(win_a)):
+            assert time.monotonic() < deadline, mux.capture_pane(win_a)
+            time.sleep(0.25)
+        # Window C's command is still running with the same dead engine, so it is
+        # no candidate in either prune below and outlives both.
+        assert not parked_screen(mux.capture_pane(win_c))
 
         # First with the kill suppressed: the candidate is provably still alive,
         # so it must land in `survived`. This is the half that pins the id-form
@@ -122,16 +136,17 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         # here disturbs the verified-removal assertions below.
         with monkeypatch.context() as no_kill:
             no_kill.setattr(mux, "kill_window", lambda _t: None)
-            assert launch.prune_ctl_windows(proj_a) == ([], ["run-20260726-1"], [])
+            assert launch.prune_ctl_windows(proj_a) == ([], ["run-20260726-1"], [], [])
         assert mux.window_alive(session, win_a)  # the suppressed kill really was a no-op
 
         # Then for real: the kill lands, so the verdict is a verified removal
         # with both other arms empty.
-        assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [])
+        assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [], [])
 
         live = mux.list_window_ids(session)
         assert win_a not in live
         assert win_b in live
+        assert win_c in live  # its command was still running
         options = mux._scoped_options(session) or {}
         key_a = mux._scoped_option_key(runs.PROJECT_OPTION, digits_a)
         key_b = mux._scoped_option_key(runs.PROJECT_OPTION, win_b.rsplit("@", 1)[1])
