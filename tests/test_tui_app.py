@@ -4273,7 +4273,7 @@ async def test_attach_uses_the_recorded_ctl_window(project_tree, monkeypatch):
 
     def fake(argv, **kwargs):
         rows = f"@1\trun-{rid}\t{tag}\n@2\tresume-{rid}\t{tag}\n"
-        out = rows if argv[1] == "list-windows" else ""
+        out = rows if argv[2] == "list-windows" else ""
         return _subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)

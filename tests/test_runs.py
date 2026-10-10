@@ -6673,8 +6673,8 @@ def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert _discover(tmp_path)[0].status == runs.RUNNING
-    assert calls[0][:3] == ["tmux", "has-session", "-t"]
-    assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
+    assert calls[0][:4] == ["tmux", "-u", "has-session", "-t"]
+    assert calls[0][4] == f"=bmad-loop-{run_dir.name}"
 
 
 def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypatch):

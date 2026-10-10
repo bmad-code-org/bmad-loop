@@ -1181,7 +1181,9 @@ def test_select_window_sends_every_target_form_unrewritten(rec, target):
 
 def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):
     # The divergence is psmux-only: tmux ids are server-global, so qualifying
-    # them would produce targets its own verbs do not accept.
+    # them would produce targets its own verbs do not accept. tmux's `-u` (#881)
+    # is cleared because the shared fake reads the verb at argv[1].
+    monkeypatch.setattr(TmuxMultiplexer, "_CLIENT_FLAGS", ())
     _rows_fake(monkeypatch, "@1\tshell\n")
     mux = TmuxMultiplexer()
     assert mux.new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret") == "@2"
@@ -1361,7 +1363,9 @@ def test_list_windows_without_option_column_spawns_one_call(monkeypatch):
 
 def test_tmux_backend_keeps_real_window_options(monkeypatch):
     # The divergence is psmux-only. tmux has genuine per-window user options, so
-    # rewriting the key there would move state to a place nothing reads.
+    # rewriting the key there would move state to a place nothing reads. tmux's
+    # `-u` (#881) is cleared because the shared fake reads the verb at argv[1].
+    monkeypatch.setattr(TmuxMultiplexer, "_CLIENT_FLAGS", ())
     rec_ = _option_fake(monkeypatch, value="C:/p\n")
     mux = TmuxMultiplexer()
     mux.set_window_option("ctl:@3", "@bmad_project", "C:/p")

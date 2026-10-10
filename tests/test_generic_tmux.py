@@ -139,15 +139,16 @@ def test_ensure_session_tags_project(tmp_path, monkeypatch, force_tmux_backend):
 
     def fake_run(argv, **kwargs):
         calls.append(list(argv))
-        rc = 1 if argv[1] == "has-session" else 0  # session missing -> create it
+        rc = 1 if argv[2] == "has-session" else 0  # session missing -> create it
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     adapter._ensure_session(project)
 
-    assert [c for c in calls if c[1] == "set-option"] == [
+    assert [c for c in calls if c[2] == "set-option"] == [
         [
             "tmux",
+            "-u",
             "set-option",
             "-t",
             adapter.session_name,
@@ -334,7 +335,7 @@ def test_ensure_session_reports_a_silent_teardown_failure_on_the_real_backend(
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _b: "/usr/bin/tmux")
 
     def fake_run(argv, **kwargs):
-        verb = argv[1]
+        verb = argv[2]
         if verb == "has-session":
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         if verb in ("set-option", "kill-session"):
@@ -10527,4 +10528,4 @@ def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_back
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert get_multiplexer().capture_pane("@7") == BYPASS_FOOTER
-    assert calls == [["tmux", "capture-pane", "-p", "-t", "@7"]]
+    assert calls == [["tmux", "-u", "capture-pane", "-p", "-t", "@7"]]
