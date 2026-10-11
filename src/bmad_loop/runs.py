@@ -1231,16 +1231,19 @@ def write_plugin_grants_text(project: Path, text: str) -> None:
 
     A store over :data:`_MAX_GRANTS_BYTES` is refused here too: the read half
     refuses it at the next launch, so publishing it would report a grant that
-    every launch then treats as absent."""
+    every launch then treats as absent. The UTF-8 bytes land verbatim (the byte
+    writer, not the text one): win32's newline translation would publish more
+    bytes than this check counted, so the two caps would disagree again."""
     path = plugin_grants_path(project)
-    if (size := len(text.encode("utf-8"))) > _MAX_GRANTS_BYTES:
+    data = text.encode("utf-8")
+    if (size := len(data)) > _MAX_GRANTS_BYTES:
         raise OSError(
             errno.EFBIG,
             f"plugin grants would be {size} bytes, over the {_MAX_GRANTS_BYTES}-byte read cap",
             str(path),
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text_confined(path, text, confine_root=state_root())
+    atomic_write_bytes_confined(path, data, confine_root=state_root())
 
 
 # ---------------------------------------------------- run resolution / liveness
