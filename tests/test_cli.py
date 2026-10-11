@@ -59,6 +59,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
+from bmad_loop.plugins import GrantSet
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
 
@@ -3417,6 +3418,7 @@ def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, o
         max_bundles=None,
         trigger="cli",
         only_ids=only_ids,
+        plugin_grants=GrantSet.empty(),
     )
 
     assert rc == expected
@@ -16546,6 +16548,7 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(
         project.project,
         bmadconfig.load_paths(project.project),
         _config_pin(project),
+        plugin_grants=GrantSet.empty(),
     )
     with pytest.raises(RuntimeError, match=REFUSAL):
         factory("epic-boundary", started=_never_started)
@@ -16571,7 +16574,10 @@ def test_auto_sweep_launches_under_worktree_isolation_beside_a_nested_repo_root(
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
 
     factory = cli._sweep_factory(
-        paths.project, bmadconfig.load_paths(paths.project), _config_pin(paths)
+        paths.project,
+        bmadconfig.load_paths(paths.project),
+        _config_pin(paths),
+        plugin_grants=GrantSet.empty(),
     )
     factory("epic-boundary", started=lambda: None)
     assert len(launched) == 1
@@ -16644,7 +16650,9 @@ def _pin_profile(project, text=PIN_PROFILE) -> None:
     (profiles / "mycli.toml").write_text(text, encoding="utf-8")
 
 
-def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
+def _pinned_sweep_factory(
+    project, monkeypatch, *, policy_text=PIN_POLICY, plugin_grants=GrantSet.empty()
+):
     """A child-sweep factory pinned to the config as it stands right now — the
     launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
     is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
@@ -16667,7 +16675,10 @@ def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
     launched = []
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
     factory = cli._sweep_factory(
-        project.project, bmadconfig.load_paths(project.project), _config_pin(project)
+        project.project,
+        bmadconfig.load_paths(project.project),
+        _config_pin(project),
+        plugin_grants=plugin_grants,
     )
     return factory, launched
 
@@ -16816,7 +16827,12 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     monkeypatch.setattr(cli, "SweepEngine", _Recorder)
 
     signalled: list[str] = []
-    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
+    factory = cli._sweep_factory(
+        project.project,
+        bmadconfig.load_paths(project.project),
+        pin,
+        plugin_grants=GrantSet.empty(),
+    )
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
@@ -16836,6 +16852,350 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
         (role, "mycli", ["--yes"]) for role in ("triage", "dev", "review")
     ]
+
+
+# --- #496/#497: plugin grants are read ONCE at a human-present launch -------------
+#
+# Two layers refuse an untrusted project plugin: the launch preflight
+# (`cli._reject_plugin_trust`, ahead of every side effect) and the registry gate in
+# `PluginRegistry.build` (the engine's build). Each has rows below that bypass the
+# other: the run/sweep/resume refusals stub the engine out, so only the preflight
+# can refuse them; the auto-sweep child has no preflight, so only the registry can.
+
+TRUST_PLUGIN = "rogue"
+
+
+def _trust_marker(project) -> Path:
+    """An absolute marker beside (never inside) the plugin dir or its snapshot."""
+    return project.project.parent / f"{project.project.name}-{TRUST_PLUGIN}-ran"
+
+
+def _write_trust_plugin(project, *, tag: str = "ran") -> Path:
+    """A project-origin declarative plugin with one hook — an executable surface,
+    so it needs a grant. The hook writes `_trust_marker`, baked in before any
+    grant is taken."""
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+
+    pdir = project.project / USER_PLUGINS_REL / TRUST_PLUGIN
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "plugin.toml").write_text(
+        f'[plugin]\nname = "{TRUST_PLUGIN}"\napi_version = 1\n'
+        f'[hooks.pre_run]\ncmd = \'"{sys.executable}" "{{scripts}}/hook.py"\'\n',
+        encoding="utf-8",
+    )
+    (pdir / "hook.py").write_text(
+        f"from pathlib import Path\nPath({str(_trust_marker(project))!r}).write_text({tag!r})\n",
+        encoding="utf-8",
+    )
+    return pdir
+
+
+ENABLE_ROGUE = f'\n[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n'
+
+
+def _run_fixture(project, monkeypatch, *, policy_text=PIN_POLICY) -> None:
+    """A committed, launchable sprint project whose adapters are stubbed (zero
+    tokens, no multiplexer). The sweep skill is installed into the triage tree so
+    the run's auto-sweep factory can be driven too."""
+    from conftest import install_base_skills
+
+    from bmad_loop.adapters.profile import get_profile
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    _write_policy(project.project, policy_text)
+    _pin_profile(project)
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+
+def _no_run_dirs(project) -> bool:
+    runs_root = project.project / runs.RUNS_DIR
+    return not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def _count_grant_reads(monkeypatch, grants: GrantSet) -> list[Path]:
+    """Stub the grant store's one read: every call is recorded and answers
+    ``grants``, so a test can assert both the read count and object identity."""
+    from bmad_loop.plugins import store
+
+    reads: list[Path] = []
+
+    def load_grants(project):
+        reads.append(project)
+        return grants
+
+    monkeypatch.setattr(store, "load_grants", load_grants)
+    return reads
+
+
+def test_run_refuses_an_enabled_ungranted_project_plugin(project, monkeypatch, capsys):
+    """Decision 3 (#496): a name in `[plugins] enabled` with no grant is the operator
+    asking for a plugin nobody vouched for the bytes of — the launch fails loudly
+    with the verb that clears it, before the run dir exists. The engine is stubbed
+    to fail, so only the launch preflight can produce this refusal.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `cmd_run` and this fails —
+    composition reaches the (failing) engine and publishes a run dir first."""
+    _run_fixture(project, monkeypatch, policy_text=PIN_POLICY + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
+    assert _no_run_dirs(project)
+    assert not _trust_marker(project).exists()
+
+
+def test_run_notes_an_ungranted_inert_plugin_and_proceeds(project, monkeypatch, capsys):
+    """The other half of decision 3: never granted and not enabled is inert, not an
+    error. The run starts, says on stderr which plugin will not run and how to
+    grant it, and hands the engine the (empty) launch grants."""
+    _run_fixture(project, monkeypatch)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f'note: plugin "{TRUST_PLUGIN}"' in err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
+    assert captured["plugin_grants"].records == ()
+
+
+def test_run_threads_one_grant_read_to_compose_and_the_sweep_factory(project, monkeypatch):
+    """The read-once HARD CONSTRAINT: `cmd_run` reads the store once and the SAME
+    object reaches the engine and, through the factory closure, the auto-sweep
+    child — which never reads the store again. Identity, not equality: an equal
+    re-read would pass `==` and still be the check-then-use this forbids.
+
+    ABLATION: drop `plugin_grants=` from `cmd_run`'s `compose_run` call (the engine
+    gets the empty default) or from its `_sweep_factory` call (TypeError: the kw is
+    required) and this fails; a `load_grants` call inside `factory` fails the
+    read count."""
+    _run_fixture(project, monkeypatch)
+    _commit_all(project, "setup")
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    assert captured["plugin_grants"] is sentinel
+
+    launched: list = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
+    captured["sweep_factory"]("epic-boundary", started=lambda: None)
+
+    assert len(launched) == 1
+    assert launched[0]["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def test_sweep_refuses_an_enabled_ungranted_project_plugin(project, monkeypatch, capsys):
+    """`bmad-loop sweep` is the second human-present launch: same read, same
+    preflight, same refusal before any run dir.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `cmd_sweep` and this fails
+    (the stubbed `_start_sweep` is reached)."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 1
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert started == []
+    assert _no_run_dirs(project)
+
+
+def test_sweep_threads_grants(project, monkeypatch, capsys):
+    """`cmd_sweep` reads the store once and hands that object to `_start_sweep`.
+
+    ABLATION: drop `plugin_grants=` from `cmd_sweep`'s `_start_sweep` call and the
+    identity assert fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 0
+    assert started[0]["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def test_resume_refuses_a_mismatched_plugin_before_any_side_effect(project, monkeypatch, capsys):
+    """Resume has no unwind (`compose_resume`), so a plugin the registry build
+    would refuse must be refused BEFORE the resume's side effects: no `run-resume`
+    row, the out-of-tree pin left as the last real launch stamped it, the pause
+    intact so `status` still shows a resumable run. Decision 3: a granted plugin
+    whose bytes changed fails loudly, pointing at `plugins accept`.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `_prepare_resume_locked`
+    (or move it below the re-stamp/pause/save block) and this fails — the stubbed
+    engine is reached after the pin and the pause were rewritten."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    _write_trust_plugin(project, tag="swapped")  # the mismatch
+    runs.write_trusted_config_digest(project.project, run_dir.name, "launch-pin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert f"`bmad-loop plugins accept {TRUST_PLUGIN}`" in err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "launch-pin"
+    assert load_state(run_dir).paused_reason == "escalation"
+    assert not _trust_marker(project).exists()
+
+
+def test_resume_threads_its_grants_to_compose_and_the_sweep_factory(project, monkeypatch):
+    """The resume's one read reaches the engine and the re-armed factory closure.
+
+    ABLATION: drop `plugin_grants=` from `_resume_paused_run`'s `compose_resume`
+    call and the engine identity assert fails."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert captured["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def _real_child_sweep(monkeypatch) -> None:
+    """Let the auto-sweep factory run the REAL `_start_sweep` → `compose_sweep` →
+    `SweepEngine` build (so the registry gate runs), with mock adapters and an
+    engine `run` that drives nothing. Zero tokens, no multiplexer."""
+    from bmad_loop.adapters.mock import MockAdapter
+
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: {r: MockAdapter([]) for r in cli.ROLES}
+    )
+    monkeypatch.setattr(
+        cli.SweepEngine,
+        "run",
+        lambda self: types.SimpleNamespace(crashed=False, render=lambda: ""),
+    )
+
+
+def _granted_child_factory(project, monkeypatch):
+    """A pinned auto-sweep factory whose launch granted the rogue plugin as it
+    stands now, with the REAL child composition armed (`_real_child_sweep`)."""
+    from conftest import grant_plugin
+
+    real_start_sweep = cli._start_sweep
+    _write_trust_plugin(project)
+    grants = grant_plugin(project.project, TRUST_PLUGIN)
+    factory, _launched = _pinned_sweep_factory(project, monkeypatch, plugin_grants=grants)
+    monkeypatch.setattr(cli, "_start_sweep", real_start_sweep)
+    _real_child_sweep(monkeypatch)
+    return factory
+
+
+def test_auto_sweep_refuses_a_plugin_swapped_after_launch(project, monkeypatch):
+    """The mid-run swap #496 describes, on the one unattended path: a session
+    rewrites a granted plugin after launch, and the engine's next trigger launches a
+    child. There is no preflight on this path, so the registry gate in the child's
+    engine build must refuse — before `started`, so the parent records
+    `sweep-auto-not-started` — and the child's run dir is unwound.
+
+    ABLATION: delete the `if fatal: raise PluginTrustError(...)` in
+    `PluginRegistry.build` and this fails at `_never_started`."""
+    from bmad_loop.plugins import PluginTrustError
+
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_trust_plugin(project, tag="swapped")
+
+    with pytest.raises(PluginTrustError, match=f"plugins accept {TRUST_PLUGIN}"):
+        factory("epic-boundary", started=_never_started)
+    assert _no_run_dirs(project)
+    assert not _trust_marker(project).exists()
+
+
+def test_auto_sweep_holds_the_launch_grants_not_the_store(project, monkeypatch):
+    """The factory closure, not the store, is the child's grant set. Here the store
+    is made to bless the swapped bytes AFTER launch — what a session that can write
+    the state dir, or an operator acting on a different run, could do — and the
+    child still refuses, because no human launched under that grant.
+
+    ABLATION: replace `plugin_grants=plugin_grants` in `factory`'s `_start_sweep`
+    call with `plugin_grants=store.load_grants(project)` and this fails at
+    `_never_started`."""
+    from conftest import grant_plugin
+
+    from bmad_loop.plugins import PluginTrustError
+
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_trust_plugin(project, tag="swapped")
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+
+    with pytest.raises(PluginTrustError):
+        factory("epic-boundary", started=_never_started)
+    assert _no_run_dirs(project)
+
+
+def test_auto_sweep_proceeds_after_a_plugin_settings_edit(project, monkeypatch):
+    """`[plugins.<name>]` settings are outside the config digest (the TUI writes
+    them) and outside the grant (they live in policy.toml, not the plugin dir), so
+    a settings edit after launch neither trips the #461 pin nor un-grants the
+    plugin: the child composes for real and `started` fires."""
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + f'\n[plugins.{TRUST_PLUGIN}]\nlevel = "high"\n')
+    signalled: list[str] = []
+
+    factory("epic-boundary", started=lambda: signalled.append("started"))
+
+    assert signalled == ["started"]
+    assert not _no_run_dirs(project)
+
+
+def test_dry_run_banner_names_a_fatal_plugin_refusal(project, monkeypatch, capsys):
+    """`--dry-run` returns before the plugin preflight, so the banner mirrors its
+    fatal verdicts (only those — an inert plugin aborts nothing).
+
+    ABLATION: drop `_fatal_plugin_problems` from `_warn_preflight_would_abort` and
+    this fails — no banner."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, '[gates]\nmode = "none"\n' + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
 
 
 @pytest.mark.parametrize("how", ["deleted", "partial"])

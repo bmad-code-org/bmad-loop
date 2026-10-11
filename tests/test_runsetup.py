@@ -1936,3 +1936,105 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     assert "warning: could not remove the partially composed run" in warning
     assert "state dir removal failed" in warning
     assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
+
+
+# --- #496/#497: the launch's frozen plugin grants ----------------------------------
+
+
+def test_config_digest_is_unchanged_by_plugin_grants(pinned):
+    """Grants live out of the tree and are never part of the #461 payload: every pin
+    stamped before grants existed must stay byte-identical, and recording a grant
+    must not move a digest (a resume would otherwise report a host-exec change)."""
+    from bmad_loop.plugins import store
+    from bmad_loop.plugins.digest import read_tree
+    from bmad_loop.plugins.grants import GrantRecord
+
+    before = _digest(pinned)
+    plug = pinned / ".bmad-loop" / "plugins" / "rogue"
+    plug.mkdir(parents=True)
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "rogue"\napi_version = 1\n[hooks.pre_run]\ncmd = "true"\n',
+        encoding="utf-8",
+    )
+    record = GrantRecord.from_tree(
+        "rogue", ".bmad-loop/plugins/rogue", read_tree(plug), "2026-10-10T00:00:00Z"
+    )
+    store.save_grants(pinned, [record])
+
+    assert _digest(pinned) == before == _pre_session_id_flag_digest(pinned)
+
+
+def _compose(composer: str, tmp_path: Path, monkeypatch, **extra):
+    common = dict(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        make_adapters=_accepting_adapters,
+        **extra,
+    )
+    if composer == "run":
+        return runsetup.compose_run(
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            **common,
+        )
+    if composer == "sweep":
+        return runsetup.compose_sweep(
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            **common,
+        )
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+    return runsetup.compose_resume(
+        run_dir=run_dir,
+        state=RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now"),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+        **common,
+    )
+
+
+@pytest.mark.parametrize("composer", ["run", "sweep", "resume"])
+def test_compose_hands_the_launch_plugin_grants_to_the_engine(tmp_path, monkeypatch, composer):
+    """Each composer passes the caller's frozen grant set to the engine — the very
+    object, never a copy or a fresh read.
+
+    ABLATION: drop `plugin_grants=` from any composer's engine kwargs and its
+    parametrization fails."""
+    from bmad_loop.plugins import GrantSet
+
+    grants = GrantSet(snapshot_root=tmp_path / "snapshots")
+    composed = _compose(composer, tmp_path, monkeypatch, plugin_grants=grants)
+    assert composed.engine.kwargs["plugin_grants"] is grants
+
+
+@pytest.mark.parametrize("composer", ["run", "sweep", "resume"])
+def test_compose_defaults_to_no_grants_and_never_reads_the_store(tmp_path, monkeypatch, composer):
+    """A layer below a launch site never turns "no grants" into "read the store":
+    an omitted grant set is the empty one (fail closed)."""
+    from bmad_loop.plugins import store
+
+    monkeypatch.setattr(store, "load_grants", lambda _p: pytest.fail("store read"))
+    composed = _compose(composer, tmp_path, monkeypatch)
+    grants = composed.engine.kwargs["plugin_grants"]
+    assert grants.records == () and grants.fault is None and grants.snapshot_root is None

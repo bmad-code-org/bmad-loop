@@ -48,6 +48,7 @@ from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
 from .platform_util import atomic_replace, is_link_like, is_wsl_unc_path
+from .plugins.grants import GrantSet
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -351,29 +352,27 @@ def config_digest(
       main door is held open on purpose. Admitting it also widens the rule from
       the launch surface to the launch surface *plus safety knobs*, which is
       ``[limits]`` — the whole-file hash the second paragraph exists to reject.
-    * ``[plugins.<name>]`` settings — an enabled plugin's resolved settings do
+    * ``[plugins.<name>]`` settings — a running plugin's resolved settings do
       reach exec (``bus.py`` exports each as ``BMAD_LOOP_SETTING_*`` into a
       ``shell=True`` hook, and the Unity plugin turns one into an ``--editor-path``
       argv token), but the TUI settings screen writes those same tables, so
       pinning them would refuse an auto-sweep after a supported human edit. They
-      are inside an *already-enabled* plugin's blast radius — the trust boundary
-      the gap below is about — rather than a way past the allowlist.
+      steer only a plugin that is already trusted — a builtin named in
+      ``enabled``, or a project plugin whose exact bytes an operator granted — so
+      they act inside that plugin's blast radius rather than as a way past the
+      trust gate. A residual, documented as one, not a gap this digest closes.
 
-    Known gaps, tracked separately (#496, #497). This pins the plugin allowlist by
-    NAME only, and the allowlist is not the whole plugin exec surface:
-
-    * A project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named
-      builtin (``plugins/loader.py`` overlay precedence) and
-      ``trust.require_enabled`` gates on the name, so a session can swap the module
-      behind an *already* enabled plugin without moving this digest.
-    * Adding a plugin is caught only for one that declares ``[python]``. A
-      *declarative* manifest (no ``[python]``) loads on folder-drop by design
-      (``plugins/trust.py``) and ``registry.hooks_for`` hands its ``[hooks.<stage>]
-      cmd`` to the bus, which runs it with ``shell=True`` — with no ``enabled``
-      entry, and from a directory this digest never reads.
-
-    Closing either is a plugin-trust-model change rather than a wider hash, so
-    neither belongs here.
+    The plugin allowlist is pinned by NAME only, and on purpose. Names were never
+    the whole plugin exec surface — a project ``.bmad-loop/plugins/<name>/`` could
+    shadow an enabled builtin, and a declarative manifest's hooks ran from a dir
+    this digest never reads (#496, #497) — but those are closed by the plugin
+    trust model, not by a wider hash: a project plugin with any executable surface
+    runs only under an operator content grant kept out of the tree, read ONCE at
+    the human-present launch and held frozen by the auto-sweep child's factory
+    (``cli._sweep_factory``), and it executes from a verified out-of-tree snapshot
+    of the bytes that grant hashed (``plugins/registry.py``). So the payload below
+    is deliberately unchanged: every pin stamped before grants existed stays
+    byte-identical, and a grant never moves a digest.
 
     Tuples are normalized to lists before ``json.dumps(sort_keys=True)`` for the
     same reason ``cli._resume_paused_run``'s ``policy_changed`` compare does it:
@@ -1206,6 +1205,7 @@ def compose_run(
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
     profiles: dict[str, CLIProfile] | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1226,6 +1226,11 @@ def compose_run(
     ``make_adapters`` and the engine classes are injected (rather than imported
     here) so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "Engine"/"_make_adapters", ...)`` effective.
+
+    ``plugin_grants`` is the launch's frozen plugin grant set (#496/#497), read
+    once by the caller and handed to the engine's registry build. The default is
+    no grants (fail closed), never "read the store" — this layer does not read it.
+    A fatal plugin verdict raises out of the engine build and unwinds the run.
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
@@ -1290,6 +1295,7 @@ def compose_run(
             epic_filter=epic_filter,
             story_filter=story_filter,
             sweep_factory=sweep_factory,
+            plugin_grants=plugin_grants,
         )
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
         engine: Engine = (
@@ -1322,6 +1328,7 @@ def compose_sweep(
     min_severity: str | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -1339,6 +1346,12 @@ def compose_sweep(
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
     effective.
+
+    ``plugin_grants`` is the launch's frozen grant set, as in :func:`compose_run`.
+    For the auto-sweep child it is the set the PARENT's launch read, held by the
+    factory closure: a plugin changed or granted since then is judged against the
+    launch's grants, and a fatal verdict raises from the engine build — before
+    ``on_started`` — so the parent records ``sweep-auto-not-started``.
 
     ``on_started`` is the auto-sweep parent's latch (``engine.SweepFactory``'s
     ``started`` thunk, threaded through ``cli._start_sweep``): a parent run spends
@@ -1458,6 +1471,7 @@ def compose_sweep(
             max_cycles=max_cycles,
             only_ids=only_ids,
             min_severity=min_severity,
+            plugin_grants=plugin_grants,
         )
         if on_started is not None:
             on_started()
@@ -1482,6 +1496,7 @@ def compose_resume(
     sweep_engine_cls: type[SweepEngine],
     profiles: dict[str, CLIProfile] | None = None,
     sweep_options: SweepResumeOptions | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -1501,7 +1516,12 @@ def compose_resume(
     the one the re-stamped ``state.trusted_config_digest`` was computed from — so
     the new baseline describes the bytes these adapters are built from rather than
     a second read of an agent-writable file (#461 point 4). ``None`` resolves
-    fresh."""
+    fresh.
+
+    ``plugin_grants`` is the resume's frozen grant set, as in :func:`compose_run`.
+    Unlike the two launches this has no unwind, so the caller preflights the
+    grants before its first side effect (``cli._prepare_resume_locked``); the
+    engine build stays the gate."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
     resolved_sweep_options = (
@@ -1561,6 +1581,7 @@ def compose_resume(
             max_cycles=opts.get("max_cycles"),
             only_ids=resolved_sweep_options.only_ids,
             min_severity=resolved_sweep_options.min_severity,
+            plugin_grants=plugin_grants,
         )
     else:
         story_common = dict(
@@ -1578,6 +1599,7 @@ def compose_resume(
             story_filter=state.story_filter,
             max_stories=state.max_stories,
             sweep_factory=sweep_factory,
+            plugin_grants=plugin_grants,
         )
         # stories mode is pinned in run state at launch, so resume rebuilds the
         # same picker (StoriesEngine) without any flag.

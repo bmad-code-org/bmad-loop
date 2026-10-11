@@ -305,6 +305,10 @@ REFUSAL_HELPER_DEFS = {
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
     ("cli.py", "_reject_isolation_conflict"),
+    # #496/#497: the launch plugin-trust preflight; test_cli.py
+    # test_run_refuses_an_enabled_ungranted_project_plugin and
+    # test_resume_refuses_a_mismatched_plugin_before_any_side_effect
+    ("cli.py", "_reject_plugin_trust"),
     ("cli.py", "_reject_under_floor_git"),
     ("engine.py", "_refuse_gated_story"),
     ("platform_util.py", "_refuse_unwritable_target"),
@@ -602,6 +606,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "expired_clock",
         "failed",
         "fallback",
+        # `plugin-refused`'s abort discriminator (#496/#497): a bool — True when the
+        # refusal aborted the engine build, False for an inert plugin the run went
+        # on without. The plugin's name, reason and path are routed separately.
+        "fatal",
         "field",
         # `_commit_ledger`'s three rows (DW-192): WHICH of the two published files
         # the row is about, as a LEXICAL basename (`path.name`). Benign because it

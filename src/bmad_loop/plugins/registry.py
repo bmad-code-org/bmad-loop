@@ -164,6 +164,38 @@ def _memo_tree(root: Path) -> Callable[[], VerifiedTree]:
     return live
 
 
+def _judge(
+    manifests: Iterable[PluginManifest],
+    project: Path | None,
+    enabled: frozenset[str],
+    grants: GrantSet,
+) -> list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]]:
+    """Pass 1's verdicts: (manifest, verdict, memoized tree thunk, grant relpath)
+    per plugin. Hashes at most; never imports or runs anything."""
+    judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
+    for m in manifests:
+        rel = _rel_path(m, project)
+        live = _memo_tree(Path(m.scripts_dir))
+        verdict = classify(m, enabled=enabled, record=grants.get(m.name), rel_path=rel, live=live)
+        judged.append((m, verdict, live, rel))
+    return judged
+
+
+def preflight(
+    project: Path | None, policy, grants: GrantSet
+) -> list[tuple[PluginManifest, Verdict, str]]:
+    """The verdict `PluginRegistry.build` would reach for every discovered plugin,
+    without building: (manifest, verdict, grant relpath). A launch calls this to
+    refuse before its first side effect; ``build`` re-judges the same way and stays
+    the gate. Manifest discovery and hashing only — no plugin code runs. Raises
+    `PluginError` on a discovery fault."""
+    manifests = load_plugins(project)
+    enabled = trust.enabled_names(policy)
+    return [
+        (m, v, rel) for m, v, _live, rel in _judge(manifests.values(), project, enabled, grants)
+    ]
+
+
 def _resolve(
     manifest: PluginManifest,
     policy,
@@ -249,17 +281,12 @@ class PluginRegistry:
         manifests = load_plugins(project, journal=journal)
         enabled = trust.enabled_names(policy)
         # pass 1: verdicts only — nothing is imported or run until all are in.
-        judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
-        fatal: list[Refusal] = []
-        for m in manifests.values():
-            rel = _rel_path(m, project)
-            live = _memo_tree(Path(m.scripts_dir))
-            verdict = classify(
-                m, enabled=enabled, record=grants.get(m.name), rel_path=rel, live=live
-            )
-            if verdict.fatal:
-                fatal.append(Refusal(m.name, fatal_message(m.name, verdict), m.source, rel))
-            judged.append((m, verdict, live, rel))
+        judged = _judge(manifests.values(), project, enabled, grants)
+        fatal = [
+            Refusal(m.name, fatal_message(m.name, verdict), m.source, rel)
+            for m, verdict, _live, rel in judged
+            if verdict.fatal
+        ]
         if fatal:
             raise PluginTrustError(tuple(fatal))
 

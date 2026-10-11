@@ -86,6 +86,7 @@ from bmad_loop.model import (
     TokenUsage,
     VerifyOutcome,
 )
+from bmad_loop.plugins import GrantSet
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
@@ -6128,6 +6129,78 @@ def test_inplace_ready_gate_veto_defers_before_any_session(project):
     assert adapter.sessions == []  # gate vetoed before the dev session
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "plugin-veto" in kinds and "story-deferred" in kinds
+
+
+def _write_refusable_plugin(project, name: str = "rogue") -> None:
+    """A project-origin declarative plugin with a hook — an executable surface, so
+    it runs only under a grant (#497). The hook would fail loudly if ever run."""
+    plug = project.project / ".bmad-loop" / "plugins" / name
+    plug.mkdir(parents=True)
+    (plug / "plugin.toml").write_text(
+        f'[plugin]\nname = "{name}"\napi_version = 1\n'
+        "[hooks.pre_run]\ncmd = 'exit 1'\nblocking = true\n"
+    )
+
+
+def _plugin_refusals(journal: Journal) -> list[dict]:
+    return [e for e in journal.entries() if e["kind"] == "plugin-refused"]
+
+
+def test_zero_plugin_run_journal_has_no_plugin_refused(project):
+    """Refusals are journaled only when there is one: a stock run (the only
+    builtin is the data-only `example`) adds no `plugin-refused` line and no other
+    plugin line, so its journal is unchanged by the trust gate (#496/#497)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+    )
+    assert [e for e in engine.journal.entries() if e["kind"].startswith("plugin")] == []
+    engine.run()
+    assert _plugin_refusals(engine.journal) == []
+
+
+def test_engine_journals_each_inert_refusal_once(project):
+    """A never-granted, un-enabled project plugin is inert and the run goes on
+    (decision 3): the engine records exactly one non-fatal `plugin-refused` row for
+    it, naming the plugin, its origin and its grant path.
+
+    ABLATION: delete the post-build `registry.refusals` loop in `Engine.__init__`
+    and this fails (no row); also handing the journal to `PluginRegistry.build`
+    fails it the other way (two rows)."""
+    _write_refusable_plugin(project)
+    engine, _ = make_engine(project, [])
+
+    (row,) = _plugin_refusals(engine.journal)
+    assert row["plugin"] == "rogue"
+    assert row["fatal"] is False
+    assert row["origin"] == "project"
+    assert row["path"] == ".bmad-loop/plugins/rogue"
+
+
+def test_engine_journals_fatal_refusals_before_raising(project):
+    """A fatal verdict aborts the engine build before any plugin runs; the run dir
+    still says why — one `fatal=True` row per refusal, its reason the operator's
+    fix — so a resume or an auto-sweep child that never started is explicable from
+    its own journal.
+
+    ABLATION: delete the `except PluginTrustError` journaling arm in
+    `Engine.__init__` and this fails (the raise still happens; the row does not)."""
+    from bmad_loop.plugins import PluginTrustError
+    from bmad_loop.policy import PluginsPolicy
+
+    _write_refusable_plugin(project)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        plugins=PluginsPolicy(enabled=("rogue",)),
+    )
+    with pytest.raises(PluginTrustError):
+        make_engine(project, [], policy=policy)
+
+    (row,) = _plugin_refusals(Journal(project.project / ".bmad-loop" / "runs" / "test-run"))
+    assert row["plugin"] == "rogue"
+    assert row["fatal"] is True
+    assert "`bmad-loop plugins enable rogue`" in row["reason"]
 
 
 def test_review_disabled_skips_review_session(project):
@@ -16050,7 +16123,9 @@ def test_auto_sweep_config_digest_refusal_journals_and_spares_the_parent(project
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
     # A baseline no on-disk config can match — the shape of "a session rewrote
     # policy.toml/profiles between launch and this trigger".
-    factory = cli._sweep_factory(project.project, project, "not-the-launch-digest")
+    factory = cli._sweep_factory(
+        project.project, project, "not-the-launch-digest", plugin_grants=GrantSet.empty()
+    )
 
     engine, _ = make_engine(
         project,

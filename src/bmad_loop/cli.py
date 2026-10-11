@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     # Type-only: annotate the profile-lookup map without a module-level adapter
     # import (cli.py imports the adapter package lazily inside functions).
     from .adapters.profile import CLIProfile
+    from .plugins import GrantSet
 
 POLICY_FILE = policy_mod.POLICY_FILE
 
@@ -397,6 +398,69 @@ def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
         return runsetup.resolve_profiles(pol, project)
     except ProfileError as e:
         raise SystemExit(f"error: {e}") from e
+
+
+def _launch_plugin_grants(project: Path) -> GrantSet:
+    """Read the project's plugin grants ONCE, for a human-present launch (`cmd_run`,
+    `cmd_sweep`, resume) — #496/#497.
+
+    The returned set is frozen and threaded down: to the preflight, to `compose_*`
+    and the engine's registry build, and into the `_sweep_factory` closure, so the
+    auto-sweep child is judged against the grants this launch read and never
+    re-reads the store (a session could write it between launch and trigger as
+    easily as it writes the plugin dir). Nothing below a launch site reads the
+    store.
+
+    Observation, so it never raises: an unreadable or malformed store is warned
+    about and treated as no grants — which refuses every project plugin that
+    needs one (fail closed), never one that runs unverified."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); treating as none",
+            file=sys.stderr,
+        )
+    return grants
+
+
+def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) -> int | None:
+    """Refuse a launch whose plugins the registry gate would refuse fatally, before
+    the launch's first side effect (#496/#497).
+
+    Judges every discovered plugin exactly as `PluginRegistry.build` will
+    (`registry.preflight`: manifests and hashing only, no plugin code runs). A fatal
+    verdict — a granted plugin that changed, a name in `[plugins] enabled` with no
+    grant, a granted dir that cannot be read — prints its fix and returns
+    FAILURE. A never-granted, un-enabled plugin is inert, not an error: it gets a
+    `note:` and the launch goes on without it. Never prompts.
+
+    This is a preflight, not the gate: the engine's build re-judges and raises on
+    its own, so a path that skips this (or a plugin that changes after it) is still
+    refused."""
+    from .plugins import PluginError
+    from .plugins.grants import TrustState, fatal_message
+    from .plugins.registry import preflight
+
+    try:
+        verdicts = preflight(paths.repo_root, pol, grants)
+    except PluginError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return ExitCode.FAILURE
+    fatal = [(m, v) for m, v, _rel in verdicts if v.fatal]
+    for m, v in fatal:
+        print(f"error: {fatal_message(m.name, v)}", file=sys.stderr)
+    if fatal:
+        return ExitCode.FAILURE
+    for m, v, rel in verdicts:
+        if v.state is TrustState.REFUSED:
+            print(
+                f'note: plugin "{m.name}" ({rel}) is not granted and will not run; '
+                f"review it, then run `bmad-loop plugins enable {m.name}` to grant it",
+                file=sys.stderr,
+            )
+    return None
 
 
 def _trusted_config_digest(pol, project: Path, *, profiles=None) -> str:
@@ -1598,6 +1662,20 @@ def _warn_bypass_dropped(
                 )
 
 
+def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
+    """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
+    banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
+    from .plugins import PluginError, store
+    from .plugins.grants import fatal_message
+    from .plugins.registry import preflight
+
+    try:
+        verdicts = preflight(paths.repo_root, pol, store.load_grants(paths.project))
+    except PluginError as e:
+        return [str(e)]
+    return [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+
+
 def _warn_preflight_would_abort(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -1645,7 +1723,11 @@ def _warn_preflight_would_abort(
 
     ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
-    preview must not promise an abort over it."""
+    preview must not promise an abort over it.
+
+    The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
+    fatal verdicts only: an inert never-granted plugin does not abort the launch.
+    It reads the grant store the way the launch would, without its warning."""
     trees = _skill_trees(paths.project, pol)
     problems = [
         p.message
@@ -1667,6 +1749,7 @@ def _warn_preflight_would_abort(
     except verify.GitError as e:
         problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
+    problems += _fatal_plugin_problems(paths, pol)
     if not problems:
         return
     print(
@@ -2717,6 +2800,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
+    # #496/#497: the plugin grants are read ONCE, here, and refused against before
+    # the run dir exists; the same frozen set reaches the engine's registry build
+    # and the auto-sweep factory's closure, so no later layer reads the store.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+
     # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
     # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
     # both the factory's gate and the RunState stamp so the two cannot disagree.
@@ -2744,12 +2834,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_stories=args.max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
-        sweep_factory=_sweep_factory(project, paths, trusted_digest),
+        sweep_factory=_sweep_factory(project, paths, trusted_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         trusted_config_digest=trusted_digest,
         profiles=profiles,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
@@ -2965,6 +3056,7 @@ def _start_sweep(
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
+    plugin_grants: GrantSet,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -2979,6 +3071,11 @@ def _start_sweep(
     # `on_started` is the auto-sweep parent's latch, likewise absent for
     # `cmd_sweep`; `compose_sweep` fires it at the boundary where this child owns a
     # published, resumable run dir.
+    #
+    # `plugin_grants` is required, with no default, for the reason `_sweep_factory`
+    # requires it: the launch's frozen read (#496/#497). A default would let a new
+    # caller silently refuse every granted plugin — or tempt one to read the store
+    # here, below the launch.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -2997,6 +3094,7 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         on_started=on_started,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
@@ -3011,7 +3109,13 @@ def _start_sweep(
     return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
-def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
+def _sweep_factory(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    trusted_digest: str,
+    *,
+    plugin_grants: GrantSet,
+):
     """Child-sweep launcher injected into story-run engines. Auto-triggered
     sweeps are unattended: never prompt, never run decision bundles.
 
@@ -3024,7 +3128,18 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     Required, with no default: an omitted baseline would silently disable the
     refusal, which is the failure mode a security gate can least afford. The
     re-read happens once and is frozen, so the gate validates the bytes the child
-    actually launches from rather than a separate read of the same files."""
+    actually launches from rather than a separate read of the same files.
+
+    ``plugin_grants`` is the launch's plugin grant set (#496/#497), read once by the
+    human-present caller (`_launch_plugin_grants`) and held here, in the closure,
+    beside ``trusted_digest`` — required and keyword-only for the same reason.
+    Unlike policy.toml it is NEVER re-read in ``factory``: the grant store is what
+    vouches for plugin bytes, and a session that can write a plugin dir mid-run can
+    wait for the next trigger; a store read here would let a grant recorded after
+    launch (by anyone) bless code no human launched. The child's registry build
+    judges the plugins on disk against these launch grants, so a plugin swapped
+    after launch raises out of the engine build — before ``started`` — and the
+    parent records ``sweep-auto-not-started``."""
 
     def factory(trigger: str, *, started: Callable[[], None]) -> None:
         pol = policy_mod.load(_policy_path(project))
@@ -3084,6 +3199,11 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         triage_tree = profiles["triage"].skill_tree
         if sweep_problems := install.missing_sweep_skill(project, [triage_tree]):
             raise RuntimeError("; ".join(p.message for p in sweep_problems))
+        # The launch's grants, from the closure — never `store.load_grants` here.
+        # ABLATION GUARDS: re-reading the store in this factory must fail
+        # test_auto_sweep_holds_the_launch_grants_not_the_store, and deleting the
+        # registry's fatal gate must fail
+        # test_auto_sweep_refuses_a_plugin_swapped_after_launch, in tests/test_cli.py.
         _start_sweep(
             project,
             paths,
@@ -3096,6 +3216,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             min_severity=None,
             profiles=profiles,
             on_started=started,
+            plugin_grants=plugin_grants,
         )
 
     return factory
@@ -3166,6 +3287,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
+    # #496/#497: read once and refuse before the run dir exists, as in `cmd_run`.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+
     return _start_sweep(
         project,
         paths,
@@ -3179,6 +3305,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
+        plugin_grants=plugin_grants,
     )
 
 
@@ -3523,6 +3650,17 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # ahead of every journal/pin/stop-request side effect below.
     if state.run_type == "sweep" and not _require_sweep_skill(project, pol):
         return 1
+    # #496/#497: the resume's plugin grants, read ONCE and refused against here —
+    # the last gate ahead of `Journal(run_dir)` and every pin/pause/pid/state side
+    # effect below, because `compose_resume` has no unwind: a plugin the registry
+    # build would refuse must not leave a `run-resume` row, a re-stamped pin or a
+    # cleared pause behind for a resume that never armed. The engine build still
+    # re-judges (the gate); this only moves the refusal ahead of the side effects.
+    # ABLATION GUARD: moving this below `Journal(run_dir)` must fail
+    # test_resume_refuses_a_mismatched_plugin_before_any_side_effect.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
     journal = Journal(run_dir)
     # Read the outgoing weight BEFORE the re-stamp below replaces it: the
     # session-end entries this run already wrote were weighted at it, so without
@@ -3798,7 +3936,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options
+    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
@@ -3825,7 +3963,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -3837,13 +3975,14 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         state=state,
         policy=pol,
         journal=journal,
-        sweep_factory=_sweep_factory(project, paths, new_digest),
+        sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
