@@ -1564,7 +1564,7 @@ def _plugin_roster(root: Path, pol, grants: GrantSet):
     roster = []
     for m, v, rel in preflight(root, pol, grants):
         required = needs_grant(m)
-        record = grants.get(m.name) if required else None
+        record = grants.get(v.renamed_from or m.name) if required else None
         current = None
         if required:
             try:
@@ -1711,7 +1711,7 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
         print(f'error: plugin "{name}" {why}', file=sys.stderr)
         return ExitCode.FAILURE
 
-    record = grants.get(name)
+    record = grants.get(verdict.renamed_from or name)
     if accept and record is None:
         print(
             f'error: plugin "{name}" has no grant to accept; review it, then run '
@@ -1731,7 +1731,12 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
         return ExitCode.FAILURE
 
     tree = read_bound_tree(m)  # a PluginError is main()'s `error:` rc 1
+    base = grants
     if record is not None:
+        if record.name != name:
+            # re-key a grant whose manifest was renamed in place
+            print(f"renamed: {record.name} -> {name}")
+            base = store.remove(grants, record.name)
         if record.path != rel:
             print(f"moved: {record.path} -> {rel}")
         added, removed, changed = diff_files(record.file_map(), tree.file_map())
@@ -1739,7 +1744,7 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
             for r in rels:
                 print(f"{label}: {r}")
     granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    new = store.upsert(grants, GrantRecord.from_tree(name, rel, tree, granted_at))
+    new = store.upsert(base, GrantRecord.from_tree(name, rel, tree, granted_at))
     if not _save_grants_or_report(project, new, seen=grants):
         return ExitCode.FAILURE
     print(

@@ -96,6 +96,20 @@ class GrantSet:
                 return record
         return None
 
+    def match(self, name: str, rel_path: str, discovered: Iterable[str]) -> GrantRecord | None:
+        """The grant covering plugin ``name`` found at ``rel_path``: its own record,
+        else the record of a no-longer-discovered name granted at that same dir.
+        ``plugin.toml`` is part of the granted bytes, so a manifest renamed in
+        place is a changed grant (`classify` makes it fatal), never a fresh plugin
+        that is merely ungranted."""
+        record = self.get(name)
+        if record is not None:
+            return record
+        live_names = frozenset(discovered)
+        return next(
+            (r for r in self.records if r.path == rel_path and r.name not in live_names), None
+        )
+
     @classmethod
     def empty(cls) -> GrantSet:
         return cls()
@@ -203,11 +217,13 @@ _FATAL_STATES = frozenset(
 @dataclass(frozen=True)
 class Verdict:
     """What the gate decided for one plugin. ``changed`` lists the relpaths that
-    differ from the grant (FATAL_MISMATCH only)."""
+    differ from the grant (FATAL_MISMATCH only); ``renamed_from`` is the grant's
+    name when the plugin was granted under another one (`GrantSet.match`)."""
 
     state: TrustState
     reason: str
     changed: tuple[str, ...] = ()
+    renamed_from: str | None = None
 
     @property
     def active(self) -> bool:
@@ -248,6 +264,9 @@ def classify(
         return Verdict(TrustState.FATAL_UNREADABLE, str(e))
     reasons: list[str] = []
     differing: tuple[str, ...] = ()
+    renamed_from = record.name if record.name != m.name else None
+    if renamed_from is not None:
+        reasons.append(f'granted as "{renamed_from}", now named "{m.name}"')
     if record.path != rel_path:
         reasons.append(f"granted at {record.path}, now found at {rel_path}")
     if record.digest != tree.digest:
@@ -258,7 +277,7 @@ def classify(
         )
         differing = tuple(sorted({*added, *removed, *changed}, key=os.fsencode))
     if reasons:
-        return Verdict(TrustState.FATAL_MISMATCH, "; ".join(reasons), differing)
+        return Verdict(TrustState.FATAL_MISMATCH, "; ".join(reasons), differing, renamed_from)
     return Verdict(TrustState.GRANTED, f"granted sha256:{record.digest[:12]}")
 
 

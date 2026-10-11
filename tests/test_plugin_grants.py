@@ -9,6 +9,7 @@ grant — an unknown source must need one.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,19 @@ def test_grant_set_lookup():
     assert GrantSet.empty() == GrantSet((), None, None)
 
 
+def test_grant_set_match_falls_back_to_an_undiscovered_name_at_the_same_dir():
+    """A manifest renamed in place still meets its grant (by dir), so the rename
+    reads as a changed grant; a record whose name is still discovered elsewhere
+    is that plugin's, never borrowed by whoever now sits at its old dir."""
+    a = GrantRecord("a", "p", SHA, (), "t")
+    b = GrantRecord("b", "q", SHA, (), "t")
+    grants = GrantSet(records=(a, b))
+    assert grants.match("b", "p", ["b"]) is b  # own name first
+    assert grants.match("renamed", "p", ["renamed"]) is a
+    assert grants.match("renamed", "p", ["renamed", "a"]) is None  # a was moved, not renamed
+    assert grants.match("fresh", "elsewhere", ["fresh"]) is None
+
+
 # ------------------------------------------------------------ surface
 
 
@@ -201,6 +215,14 @@ def test_changed_contents_are_a_fatal_mismatch(tmp_path):
     assert verdict.state is TrustState.FATAL_MISMATCH and verdict.fatal
     assert verdict.changed == ("hook.sh", "new.py")
     assert "1 added, 0 removed, 1 changed" in verdict.reason
+
+
+def test_renamed_manifest_is_a_fatal_mismatch_naming_the_grant(tmp_path):
+    tree = make_tree(tmp_path)
+    verdict = run(record=replace(grant_for(tree), name="old-name"), live=lambda: tree)
+    assert verdict.state is TrustState.FATAL_MISMATCH
+    assert verdict.renamed_from == "old-name"
+    assert 'granted as "old-name", now named "rogue"' in verdict.reason
 
 
 def test_moved_plugin_dir_is_a_fatal_mismatch(tmp_path):

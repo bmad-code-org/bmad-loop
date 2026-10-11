@@ -403,6 +403,25 @@ def test_granted_then_edited_is_fatal_and_names_accept(tmp_path):
     assert not marker_for(tmp_path, "spy").exists()
 
 
+def test_granted_then_renamed_in_place_is_fatal_not_silently_dropped(tmp_path):
+    """plugin.toml is granted bytes: renaming a granted plugin in its own dir is a
+    changed grant, so the launch refuses with the accept pointer for the new name
+    rather than dropping the plugin as merely never granted.
+
+    ABLATION: look grants up by name only in `registry._judge` (`grants.get`) and
+    the build succeeds with the plugin inert."""
+    marker = tmp_path / "RAN-spy"
+    pdir = write_hook_plugin(tmp_path, "spy", marker)
+    grants = grant_plugin(tmp_path, "spy")
+    manifest = pdir / "plugin.toml"
+    manifest.write_text(manifest.read_text().replace('name = "spy"', 'name = "spy2"'))
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert 'granted as "spy", now named "spy2"' in str(exc.value)
+    assert "bmad-loop plugins accept spy2" in str(exc.value)
+    assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_granted_module_swapped_for_a_link_is_fatal_and_never_executed(tmp_path):
     # a link anywhere in a granted tree makes it unreadable: fatal, nothing runs

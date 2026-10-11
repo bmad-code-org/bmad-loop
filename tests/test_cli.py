@@ -20072,6 +20072,35 @@ def test_plugins_accept_lists_changed_files_then_repins(project, capsys):
     assert _stored_grants(project)[TRUST_PLUGIN]["digest"] == read_tree(pdir).digest
 
 
+def test_plugins_accept_rekeys_a_grant_renamed_in_place(project, capsys):
+    """A granted plugin renamed in its own dir is a changed grant: `enable` points
+    to `accept`, and `accept` re-pins it under the new name, dropping the old
+    record rather than leaving it to haunt the dir.
+
+    ABLATION: drop the `renamed_from` fallback in `_plugins_grant` and `accept`
+    refuses with "no grant to accept"."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    manifest = pdir / "plugin.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            f'name = "{TRUST_PLUGIN}"', 'name = "renamed"'
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    assert _plugins(project, "enable", "renamed") == 1
+    err = capsys.readouterr().err
+    assert f'granted as "{TRUST_PLUGIN}"' in err and "plugins accept renamed" in err
+
+    assert _plugins(project, "accept", "renamed") == 0
+    out = capsys.readouterr().out
+    assert f"renamed: {TRUST_PLUGIN} -> renamed" in out
+    assert "changed: plugin.toml" in out
+    assert set(_stored_grants(project)) == {"renamed"}
+
+
 def test_plugins_enable_refuses_a_manifest_swapped_after_discovery(project, capsys, monkeypatch):
     """The grant pins the manifest the operator's discovery parsed: a plugin.toml
     swapped in between that discovery and the hash is refused, never granted —

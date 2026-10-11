@@ -95,9 +95,10 @@ class PluginInfo:
     content grant (#496/#497), and its name never enters ``enabled``. Other
     plugins are always active and carry no toggle. ``grant_status`` is
     ``granted``/``ungranted``/``mismatch``/``unreadable``, or ``n/a`` when no
-    grant applies. ``fields`` are this plugin's settings under
-    ``plugins.<name>``; they render whether or not the plugin is enabled (the
-    screen greys them until enabled)."""
+    grant applies; ``granted_as`` is the grant's name when the plugin was
+    granted under another one (a manifest renamed in place). ``fields`` are this
+    plugin's settings under ``plugins.<name>``; they render whether or not the
+    plugin is enabled (the screen greys them until enabled)."""
 
     name: str
     description: str
@@ -107,6 +108,7 @@ class PluginInfo:
     origin: str = "builtin"
     grant_required: bool = False
     grant_status: str = "n/a"
+    granted_as: str | None = None
 
     @property
     def has_grant(self) -> bool:
@@ -301,6 +303,7 @@ def build_registry(
                 origin=manifest.source,
                 grant_required=needs_grant(manifest),
                 grant_status=grant_status(manifest, verdict),
+                granted_as=verdict.renamed_from,
             )
         )
         if manifest.settings:

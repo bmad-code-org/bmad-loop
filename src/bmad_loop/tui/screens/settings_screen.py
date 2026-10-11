@@ -621,7 +621,8 @@ class SettingsScreen(Screen[None]):
             if now and not was and info.grant_status == "ungranted":
                 to_grant.append(info.name)
             elif was and not now:
-                to_revoke.append(info.name)
+                # a grant under the plugin's pre-rename name is revoked by that name
+                to_revoke.append(info.granted_as or info.name)
         return to_grant, to_revoke
 
     def _candidate_grants(

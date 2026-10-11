@@ -1046,6 +1046,28 @@ async def test_toggle_off_revokes(project):
     assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
 
 
+async def test_toggle_off_revokes_a_grant_renamed_in_place(project):
+    """A granted plugin renamed in its own dir shows as changed under its new
+    name, and toggling it off revokes the grant it was recorded under.
+
+    ABLATION: revoke `info.name` in `_grant_flips` and the old grant survives."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("hooky", "hooky2"), encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen, "hooky2") == "changed — run `bmad-loop plugins accept hooky2`"
+        toggle = screen.query_one("#plugin-enabled-hooky2", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).records == ()
+
+
 async def test_toggle_off_drops_a_legacy_enabled_entry(project):
     """A granted project plugin still named in [plugins] enabled (the upgrade case)
     can be toggled off: its name leaves the list with its grant, or the revoked

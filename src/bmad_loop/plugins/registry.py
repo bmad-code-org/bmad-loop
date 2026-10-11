@@ -207,10 +207,13 @@ def _judge(
     """Pass 1's verdicts: (manifest, verdict, memoized tree thunk, grant relpath)
     per plugin. Hashes at most; never imports or runs anything."""
     judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
+    manifests = list(manifests)
+    discovered = [m.name for m in manifests]
     for m in manifests:
         rel = _rel_path(m, project)
         live = _memo_tree(m)
-        verdict = classify(m, enabled=enabled, record=grants.get(m.name), rel_path=rel, live=live)
+        record = grants.match(m.name, rel, discovered)
+        verdict = classify(m, enabled=enabled, record=record, rel_path=rel, live=live)
         judged.append((m, verdict, live, rel))
     return judged
 
