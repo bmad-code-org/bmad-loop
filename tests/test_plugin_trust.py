@@ -1,33 +1,62 @@
 """Trust gate, api_version compatibility, and failure isolation.
 
 The trust invariant is the most important property of the whole system: a
-folder-dropped plugin that declares an in-process [python] module must NEVER
-have that module imported or executed unless its name is in [plugins] enabled.
-These tests prove the gate (no allowlist -> no import), the api_version policy
-(builtin mismatch = hard error, third-party = skip-with-warning), and that a
-misbehaving in-process plugin is isolated instead of crashing the run.
+folder-dropped plugin must NEVER make anything run on its own say-so (#496/#497).
+A project plugin with an executable surface — hooks, workflows, ``[python]``,
+seeds — runs only under an operator content grant, from a verified snapshot,
+with its module compiled from the bytes that were hashed. A builtin's
+``[python]`` module runs only when its name is in ``[plugins] enabled``; an
+un-enabled one is wholly inert. These tests prove the gate, the api_version
+policy (builtin mismatch = hard error, third-party = skip-with-warning), and
+that a misbehaving in-process plugin is isolated instead of crashing the run.
+
+Every marker is an ABSOLUTE path outside both the live plugin dir and its
+snapshot, baked into the plugin's bytes before the grant is taken — a
+``__file__``-relative marker would land in the snapshot and prove nothing.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import marshal
 import os
+import shutil
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from conftest import grant_plugin
 
+from bmad_loop import policy as policy_mod
+from bmad_loop import runs
 from bmad_loop.plugins import (
+    GrantSet,
+    HookBus,
+    HookContext,
     PluginError,
     PluginRegistry,
+    PluginTrustError,
     is_enabled,
     load_plugins,
+)
+from bmad_loop.plugins import registry as registry_mod
+from bmad_loop.plugins import (
     require_enabled,
+)
+from bmad_loop.plugins import snapshot as snapshot_mod
+from bmad_loop.plugins import (
     trust,
 )
+from bmad_loop.plugins.grants import TrustState
 from bmad_loop.plugins.loader import USER_PLUGINS_REL
+from bmad_loop.plugins.manifest import load_manifest
 from bmad_loop.plugins.trust import PluginUntrusted
 from bmad_loop.policy import PluginsPolicy, Policy
 
-# A [python] plugin whose module touches a marker file the instant it is
+BUILTIN_UNITY = Path(registry_mod.__file__).resolve().parents[1] / "data" / "plugins" / "unity"
+
+# A [python] plugin whose module writes an absolute marker the instant it is
 # imported, so a test can assert it was (or was never) executed. Its Plugin
 # subclass is constructed by the registry only when trusted.
 PY_MANIFEST = """
@@ -43,11 +72,14 @@ PY_MODULE = """
 from pathlib import Path
 from bmad_loop.plugins import Plugin
 
-Path(__file__).with_name("IMPORTED").write_text("yes")
+Path({marker!r}).write_text({tag!r})
 
 class {cls}(Plugin):
     pass
 """
+
+# A declarative hook script writing an absolute marker; run as `python <script>`.
+HOOK_SCRIPT = "from pathlib import Path\nPath({marker!r}).write_text({tag!r})\n"
 
 
 class FakeJournal:
@@ -63,18 +95,58 @@ class FakeJournal:
         return [e["kind"] for e in self.entries]
 
 
+def marker_for(root: Path, name: str) -> Path:
+    """An absolute marker beside (never inside) the plugins dir."""
+    return root / f"IMPORTED-{name}"
+
+
 def write_py_plugin(
     root: Path, name: str, *, cls: str = "Plugin", module: str | None = None
 ) -> Path:
     pdir = root / USER_PLUGINS_REL / name
     pdir.mkdir(parents=True)
     (pdir / "plugin.toml").write_text(PY_MANIFEST.format(name=name, cls=cls))
-    (pdir / "hooks.py").write_text(module if module is not None else PY_MODULE.format(cls=cls))
+    body = PY_MODULE.format(cls=cls, marker=str(marker_for(root, name)), tag="yes")
+    (pdir / "hooks.py").write_text(module if module is not None else body)
+    return pdir
+
+
+def hook_cmd(script: str = "hook.py") -> str:
+    # a TOML literal string: the interpreter and `{scripts}` are both quoted
+    return f'\'"{sys.executable}" "{{scripts}}/{script}"\''
+
+
+def write_hook_plugin(root: Path, name: str, marker: Path, *, stage: str = "pre_run", extra=""):
+    pdir = root / USER_PLUGINS_REL / name
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        f'[plugin]\nname = "{name}"\napi_version = 1\n{extra}'
+        f"[hooks.{stage}]\ncmd = {hook_cmd()}\n"
+    )
+    (pdir / "hook.py").write_text(HOOK_SCRIPT.format(marker=str(marker), tag="ran"))
     return pdir
 
 
 def enable(*names: str) -> Policy:
     return Policy(plugins=PluginsPolicy(enabled=tuple(names)))
+
+
+def emit(reg: PluginRegistry, stage: str, root: Path) -> None:
+    """Dispatch ``stage`` through a real bus with the real subprocess runner."""
+    HookBus(reg).emit(stage, HookContext(stage, run_id="r", repo_root=str(root)))
+
+
+def record_instantiate(monkeypatch) -> list[str]:
+    """Record every plugin the registry tries to import/construct."""
+    calls: list[str] = []
+    real = registry_mod._instantiate
+
+    def spy(manifest, settings, tree):
+        calls.append(manifest.name)
+        return real(manifest, settings, tree)
+
+    monkeypatch.setattr(registry_mod, "_instantiate", spy)
+    return calls
 
 
 # ------------------------------------------------------------ allowlist
@@ -95,32 +167,64 @@ def test_enabled_helpers():
 
 
 def test_untrusted_python_module_is_never_imported(tmp_path):
-    pdir = write_py_plugin(tmp_path, "spy")
+    write_py_plugin(tmp_path, "spy")
     journal = FakeJournal()
-    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)  # not enabled
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)  # no grant
     lp = reg.get("spy")
     assert lp is not None
-    assert lp.instance is None and lp.trusted is False
+    assert lp.instance is None and lp.trusted is False and not lp.active
+    assert lp.verdict is not None and lp.verdict.state is TrustState.REFUSED
     # the smoking gun: the module's import-time side effect never happened
-    assert not (pdir / "IMPORTED").exists()
-    assert "plugin-untrusted" in journal.kinds()
+    assert not marker_for(tmp_path, "spy").exists()
+    refused = [e for e in journal.entries if e["kind"] == "plugin-refused"]
+    assert [(e["plugin"], e["origin"], e["path"]) for e in refused] == [
+        ("spy", "project", ".bmad-loop/plugins/spy")
+    ]
+    assert [r.name for r in reg.refusals] == ["spy"]
     assert reg.instances() == []
+
+
+def test_unenabled_builtin_python_is_untrusted_not_refused(tmp_path, monkeypatch):
+    # the builtin twin: an un-enabled builtin [python] plugin keeps the
+    # plugin-untrusted record, and is never a refusal (a stock run journals none)
+    calls = record_instantiate(monkeypatch)
+    journal = FakeJournal()
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)
+    lp = reg.get("unity")
+    assert lp is not None and lp.instance is None and lp.trusted is False and not lp.active
+    assert lp.verdict is not None and lp.verdict.state is TrustState.UNENABLED
+    untrusted = [e["plugin"] for e in journal.entries if e["kind"] == "plugin-untrusted"]
+    assert "unity" in untrusted
+    assert "plugin-refused" not in journal.kinds() and reg.refusals == ()
+    assert "unity" not in calls
+
+
+def test_ungranted_project_python_never_imports(tmp_path, monkeypatch):
+    write_py_plugin(tmp_path, "spy")
+    calls = record_instantiate(monkeypatch)
+    reg = PluginRegistry.build(tmp_path, policy=Policy())
+    assert "spy" not in calls and reg.instances() == []
+    assert not marker_for(tmp_path, "spy").exists()
 
 
 def test_enabled_python_module_is_constructed(tmp_path):
     pdir = write_py_plugin(tmp_path, "trusted")
     journal = FakeJournal()
-    reg = PluginRegistry.build(tmp_path, policy=enable("trusted"), journal=journal)
+    grants = grant_plugin(tmp_path, "trusted")
+    reg = PluginRegistry.build(tmp_path, policy=enable("trusted"), journal=journal, grants=grants)
     lp = reg.get("trusted")
-    assert lp.instance is not None and lp.trusted and not lp.disabled
+    assert lp.instance is not None and lp.trusted and not lp.disabled and lp.active
     assert lp.instance.name == "trusted"
-    assert (pdir / "IMPORTED").exists()  # now it ran
+    assert marker_for(tmp_path, "trusted").exists()  # now it ran
     assert "plugin-loaded" in journal.kinds()
     assert reg.instances() == [lp.instance]
+    # it ran from its verified snapshot, and the live dir is remembered
+    assert lp.live_dir == str(pdir)
+    assert Path(lp.manifest.scripts_dir).parent == runs.plugin_snapshots_root(tmp_path)
 
 
-def test_dataonly_plugin_loads_without_enable(tmp_path):
-    # no [python] => declarative; loads + is available with no allowlist entry
+def test_dataonly_plugin_hooks_are_refused_without_a_grant(tmp_path):
+    # no [python], but a hook is an executable surface: ungranted → inert (#497)
     (tmp_path / USER_PLUGINS_REL / "decl").mkdir(parents=True)
     (tmp_path / USER_PLUGINS_REL / "decl" / "plugin.toml").write_text(
         '[plugin]\nname = "decl"\napi_version = 1\n[hooks.pre_run]\ncmd = "true"\n'
@@ -128,9 +232,385 @@ def test_dataonly_plugin_loads_without_enable(tmp_path):
     journal = FakeJournal()
     reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)
     lp = reg.get("decl")
-    assert lp.instance is None and lp.trusted  # trusted-but-codeless
+    assert lp.instance is None and not lp.trusted and not lp.active
+    assert reg.hooks_for("pre_run") == []
+    by_kind = {(e["kind"], e["plugin"]) for e in journal.entries}
+    assert ("plugin-refused", "decl") in by_kind and ("plugin-loaded", "decl") not in by_kind
+
+
+def test_granted_dataonly_plugin_offers_its_hooks(tmp_path):
+    (tmp_path / USER_PLUGINS_REL / "decl").mkdir(parents=True)
+    (tmp_path / USER_PLUGINS_REL / "decl" / "plugin.toml").write_text(
+        '[plugin]\nname = "decl"\napi_version = 1\n[hooks.pre_run]\ncmd = "true"\n'
+    )
+    journal = FakeJournal()
+    grants = grant_plugin(tmp_path, "decl")
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal, grants=grants)
+    lp = reg.get("decl")
+    assert lp.instance is None and lp.trusted and lp.active  # trusted-but-codeless
     assert [h.stage for _, h in reg.hooks_for("pre_run")] == ["pre_run"]
-    assert "plugin-loaded" in journal.kinds()
+    assert "plugin-loaded" in journal.kinds() and reg.refusals == ()
+
+
+def test_settings_only_project_plugin_loads_without_grant(tmp_path):
+    pdir = tmp_path / USER_PLUGINS_REL / "knobs"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "knobs"\napi_version = 1\n'
+        '[[settings]]\nkey = "level"\ntype = "int"\ndefault = 3\n'
+    )
+    journal = FakeJournal()
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)
+    lp = reg.get("knobs")
+    assert lp is not None and lp.trusted and lp.active
+    assert lp.verdict is not None and lp.verdict.state is TrustState.NO_SURFACE
+    assert lp.manifest.scripts_dir == str(pdir)  # nothing to snapshot
+    assert ("knobs", lp.manifest.settings) in reg.settings_schema()
+    assert reg.refusals == () and "plugin-refused" not in journal.kinds()
+
+
+# ------------------------------------------- refused surfaces stay inert
+
+
+def test_ungranted_project_declarative_hook_never_runs(tmp_path):
+    # #497: a stock policy plus a dropped-in declarative plugin. The REAL bus
+    # with the REAL subprocess runner must never dispatch its hook.
+    marker = tmp_path / "ROGUE-RAN"
+    write_hook_plugin(tmp_path, "rogue", marker)
+    reg = PluginRegistry.build(tmp_path, policy=Policy())
+    bus = HookBus(reg)
+    assert not bus.active("pre_run") and bus.active_plugins() == []
+    emit(reg, "pre_run", tmp_path)
+    assert not marker.exists()
+
+
+def test_ungranted_project_seeds_never_apply(tmp_path):
+    pdir = tmp_path / USER_PLUGINS_REL / "seeder"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "seeder"\napi_version = 1\n'
+        'seed_files = [".env.local"]\nseed_globs = [".claude/skills/*"]\n'
+    )
+    reg = PluginRegistry.build(tmp_path, policy=Policy())
+    assert reg.seed_files() == [] and reg.seed_globs() == []
+    assert [r.name for r in reg.refusals] == ["seeder"]
+    # granted, the same seeds apply
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grant_plugin(tmp_path, "seeder"))
+    assert reg.seed_files() == [".env.local"] and reg.seed_globs() == [".claude/skills/*"]
+
+
+def _fake_builtin(tmp_path: Path, monkeypatch, marker: Path) -> Path:
+    """A builtin-origin [python] plugin that ALSO declares a hook, a workflow and
+    seeds — the shape whose hooks the bus used to run while un-enabled."""
+    bdir = tmp_path / "builtin" / "shipped"
+    bdir.mkdir(parents=True)
+    (bdir / "hook.py").write_text(HOOK_SCRIPT.format(marker=str(marker), tag="ran"))
+    (bdir / "mod.py").write_text("from bmad_loop.plugins import Plugin\n")
+    text = (
+        '[plugin]\nname = "shipped"\napi_version = 1\nseed_globs = [".shipped/*"]\n'
+        f"[hooks.pre_run]\ncmd = {hook_cmd()}\n"
+        '[workflows.doc]\nstage = "post_dev_phase"\nprompt = "/doc"\n'
+        '[python]\nmodule = "mod.py"\n'
+    )
+    m = load_manifest(text, "shipped/plugin.toml", str(bdir), origin="builtin")
+    monkeypatch.setattr(registry_mod, "load_plugins", lambda project, journal=None: {m.name: m})
+    return bdir
+
+
+def test_unenabled_builtin_python_is_wholly_inert(tmp_path, monkeypatch):
+    marker = tmp_path / "SHIPPED-HOOK-RAN"
+    _fake_builtin(tmp_path, monkeypatch, marker)
+    calls = record_instantiate(monkeypatch)
+    reg = PluginRegistry.build(tmp_path, policy=Policy())
+    lp = reg.get("shipped")
+    assert lp is not None and not lp.active and calls == []
+    assert reg.seed_globs() == [] and reg.workflow_stages() == frozenset()
+    assert reg.hooks_for("pre_run") == []
+    emit(reg, "pre_run", tmp_path)
+    assert not marker.exists()  # the third variant: its hook never runs either
+    # enabled, the same builtin is live — hooks, seeds and workflows alike
+    reg = PluginRegistry.build(tmp_path, policy=enable("shipped"))
+    assert reg.get("shipped").instance is not None
+    assert reg.seed_globs() == [".shipped/*"] and reg.workflow_stages() == {"post_dev_phase"}
+    emit(reg, "pre_run", tmp_path)
+    assert marker.read_text() == "ran"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_builtin_module_symlinked_out_of_the_plugin_is_never_executed(tmp_path, monkeypatch):
+    # `_parse_python` rejects an absolute, parent-climbing or root-naming module
+    # lexically, at manifest load. A perfectly ordinary relative name that happens
+    # to be a LINK out of the (builtin, imported-in-place) plugin dir passes all
+    # three, so the in-place path re-checks containment after resolution.
+    marker = tmp_path / "ESCAPED"
+    bdir = _fake_builtin(tmp_path, monkeypatch, tmp_path / "unused")
+    stray = tmp_path / "outside" / "evil.py"
+    stray.parent.mkdir()
+    stray.write_text(PY_MODULE.format(cls="Plugin", marker=str(marker), tag="yes"))
+    (bdir / "mod.py").unlink()
+    (bdir / "mod.py").symlink_to(stray)
+    journal = FakeJournal()
+    reg = PluginRegistry.build(tmp_path, policy=enable("shipped"), journal=journal)
+    lp = reg.get("shipped")
+    assert lp.instance is None and lp.disabled and "escapes" in lp.error
+    assert not marker.exists()
+    assert "plugin-error" in journal.kinds()
+
+
+# ------------------------------------------------------- fatal refusals
+
+
+def test_shadowing_an_enabled_builtin_name_is_fatal(tmp_path, monkeypatch):
+    # #496: a project dir named like an enabled builtin used to be exec'd on the
+    # builtin's say-so. Now it is a project plugin like any other: no grant → fatal.
+    pdir = tmp_path / USER_PLUGINS_REL / "unity"
+    pdir.mkdir(parents=True)
+    shutil.copy(BUILTIN_UNITY / "plugin.toml", pdir / "plugin.toml")
+    marker = marker_for(tmp_path, "unity")
+    (pdir / "unity_plugin.py").write_text(
+        PY_MODULE.format(cls="UnityPlugin", marker=str(marker), tag="yes")
+    )
+    calls = record_instantiate(monkeypatch)
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=enable("unity"))
+    assert "bmad-loop plugins enable unity" in str(exc.value)
+    assert [(r.name, r.origin, r.path) for r in exc.value.refusals] == [
+        ("unity", "project", ".bmad-loop/plugins/unity")
+    ]
+    assert not marker.exists()
+    assert calls == []  # the shadowed builtin's module was never imported either
+
+
+def test_enabled_but_not_yet_existing_then_dropped_in_is_fatal(tmp_path):
+    pol = enable("futureplug")
+    reg = PluginRegistry.build(tmp_path, policy=pol)  # no plugin yet: not fatal
+    assert reg.get("futureplug") is None
+    write_py_plugin(tmp_path, "futureplug")
+    with pytest.raises(PluginTrustError, match="plugins enable futureplug"):
+        PluginRegistry.build(tmp_path, policy=pol)
+    assert not marker_for(tmp_path, "futureplug").exists()
+
+
+def test_granted_then_edited_is_fatal_and_names_accept(tmp_path):
+    pdir = write_py_plugin(tmp_path, "spy")
+    grants = grant_plugin(tmp_path, "spy")
+    with (pdir / "hooks.py").open("a") as fh:
+        fh.write("# edited after the grant\n")
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert "bmad-loop plugins accept spy" in str(exc.value)
+    assert "1 changed" in str(exc.value)
+    assert not marker_for(tmp_path, "spy").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_granted_module_swapped_for_a_link_is_fatal_and_never_executed(tmp_path):
+    # a link anywhere in a granted tree makes it unreadable: fatal, nothing runs
+    pdir = write_py_plugin(tmp_path, "escapee")
+    grants = grant_plugin(tmp_path, "escapee")
+    stray = tmp_path / "outside" / "evil.py"
+    stray.parent.mkdir()
+    stray.write_text(PY_MODULE.format(cls="Plugin", marker=str(tmp_path / "EVIL"), tag="yes"))
+    (pdir / "hooks.py").unlink()
+    (pdir / "hooks.py").symlink_to(stray)
+    with pytest.raises(PluginTrustError, match="cannot be verified"):
+        PluginRegistry.build(tmp_path, policy=enable("escapee"), grants=grants)
+    assert not (tmp_path / "EVIL").exists()
+    assert not marker_for(tmp_path, "escapee").exists()
+
+
+def test_legacy_engine_fold_does_not_grant_a_project_unity_override(tmp_path):
+    # `[engine] name = "unity"` folds into [plugins] enabled — a name, which must
+    # not vouch for a project dir that happens to carry it.
+    pdir = tmp_path / USER_PLUGINS_REL / "unity"
+    pdir.mkdir(parents=True)
+    shutil.copy(BUILTIN_UNITY / "plugin.toml", pdir / "plugin.toml")
+    marker = marker_for(tmp_path, "unity")
+    (pdir / "unity_plugin.py").write_text(
+        PY_MODULE.format(cls="UnityPlugin", marker=str(marker), tag="yes")
+    )
+    policy_path = tmp_path / "policy.toml"
+    policy_path.write_text('[engine]\nname = "unity"\n')
+    with pytest.warns(DeprecationWarning, match=r"\[engine\]"):
+        pol = policy_mod.load(policy_path)
+    assert "unity" in pol.plugins.enabled
+    with pytest.raises(PluginTrustError, match="plugins enable unity"):
+        PluginRegistry.build(tmp_path, policy=pol)
+    assert not marker.exists()
+
+
+def test_build_refusal_raises_before_any_exec(tmp_path, monkeypatch):
+    # one fatal verdict stops the build before ANY plugin executes — a granted
+    # project module and an enabled builtin alike
+    write_py_plugin(tmp_path, "early")
+    grants = grant_plugin(tmp_path, "early")
+    write_py_plugin(tmp_path, "late")  # enabled, never granted → fatal
+    calls = record_instantiate(monkeypatch)
+    with pytest.raises(PluginTrustError, match="plugins enable late"):
+        PluginRegistry.build(tmp_path, policy=enable("early", "late", "tea"), grants=grants)
+    assert calls == []
+    assert not marker_for(tmp_path, "early").exists()
+
+
+def test_granted_plugin_without_a_snapshot_root_is_refused(tmp_path):
+    write_py_plugin(tmp_path, "spy")
+    grants = replace(grant_plugin(tmp_path, "spy"), snapshot_root=None)
+    with pytest.raises(PluginError, match="no snapshot root"):
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert not marker_for(tmp_path, "spy").exists()
+
+
+def test_build_defaults_to_no_grants(tmp_path):
+    write_py_plugin(tmp_path, "spy")
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=GrantSet.empty())
+    assert [r.name for r in reg.refusals] == ["spy"]
+
+
+# ------------------------------------------ granted plugins run the snapshot
+
+
+def test_granted_hook_runs_from_the_snapshot_not_the_live_dir(tmp_path):
+    marker = tmp_path / "HOOK-RAN"
+    pdir = write_hook_plugin(tmp_path, "hooked", marker)
+    grants = grant_plugin(tmp_path, "hooked")
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    # the agent rewrites the live script after the launch verified it
+    (pdir / "hook.py").write_text(HOOK_SCRIPT.format(marker=str(marker), tag="live"))
+    emit(reg, "pre_run", tmp_path)
+    assert marker.read_text() == "ran"  # the granted bytes ran, not the edit
+    lp = reg.get("hooked")
+    assert lp.live_dir == str(pdir) and lp.manifest.scripts_dir != str(pdir)
+
+
+def test_granted_module_executes_the_hashed_bytes(tmp_path, monkeypatch):
+    # the bytes compiled are the ones that were hashed: a swap after the hash —
+    # of the live module AND the published snapshot copy — never reaches exec
+    pdir = write_py_plugin(tmp_path, "spy")
+    grants = grant_plugin(tmp_path, "spy")
+    evil = PY_MODULE.format(cls="Plugin", marker=str(tmp_path / "EVIL"), tag="evil")
+    real = snapshot_mod.materialize
+
+    def materialize_then_swap(tree, root):
+        snap = real(tree, root)
+        (pdir / "hooks.py").write_text(evil)
+        (snap / "hooks.py").write_text(evil)
+        return snap
+
+    monkeypatch.setattr(snapshot_mod, "materialize", materialize_then_swap)
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert not (tmp_path / "EVIL").exists()
+    assert reg.get("spy").instance is not None
+    assert marker_for(tmp_path, "spy").read_text() == "yes"
+
+
+def test_planted_pycache_never_executes(tmp_path, monkeypatch):
+    # SourceFileLoader trusts a __pycache__ .pyc whose recorded source mtime and
+    # size match. Plant one in the snapshot after it verified: compile-from-bytes
+    # never consults it.
+    write_py_plugin(tmp_path, "spy")
+    grants = grant_plugin(tmp_path, "spy")
+    evil = PY_MODULE.format(cls="Plugin", marker=str(tmp_path / "EVIL"), tag="evil")
+    real = snapshot_mod.materialize
+
+    def materialize_then_plant(tree, root):
+        snap = real(tree, root)
+        source = snap / "hooks.py"
+        st = source.stat()
+        header = (
+            importlib.util.MAGIC_NUMBER
+            + (0).to_bytes(4, "little")
+            + (int(st.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little")
+            + (st.st_size & 0xFFFFFFFF).to_bytes(4, "little")
+        )
+        pyc = Path(importlib.util.cache_from_source(str(source)))
+        pyc.parent.mkdir(parents=True, exist_ok=True)
+        pyc.write_bytes(header + marshal.dumps(compile(evil, str(source), "exec")))
+        return snap
+
+    monkeypatch.setattr(snapshot_mod, "materialize", materialize_then_plant)
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert not (tmp_path / "EVIL").exists()
+    assert reg.get("spy").instance is not None
+    assert marker_for(tmp_path, "spy").read_text() == "yes"
+
+
+# ----------------------------------------------- failure isolation
+
+
+CONSTRUCT_RAISES = """
+from bmad_loop.plugins import Plugin as _Base
+class Plugin(_Base):
+    def __init__(self, manifest, settings):
+        raise RuntimeError("boom on construct")
+"""
+
+IMPORT_RAISES = "raise RuntimeError('boom on import')\n"
+
+BASEEXC_ON_IMPORT = "raise KeyboardInterrupt('sigint-like')\n"
+
+
+def test_construct_exception_disables_instance_run_survives(tmp_path):
+    write_py_plugin(tmp_path, "broken", module=CONSTRUCT_RAISES)
+    journal = FakeJournal()
+    grants = grant_plugin(tmp_path, "broken")
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal, grants=grants)
+    lp = reg.get("broken")
+    assert lp.instance is None and lp.disabled and "boom on construct" in lp.error
+    assert "plugin-error" in journal.kinds()
+    assert reg.instances() == []
+
+
+def test_import_exception_disables_instance_run_survives(tmp_path):
+    write_py_plugin(tmp_path, "badimport", module=IMPORT_RAISES)
+    journal = FakeJournal()
+    grants = grant_plugin(tmp_path, "badimport")
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal, grants=grants)
+    lp = reg.get("badimport")
+    assert lp.instance is None and lp.disabled
+    assert "plugin-error" in journal.kinds()
+
+
+def test_baseexception_propagates(tmp_path):
+    # RunStopped/SIGTERM (BaseException) must NEVER be swallowed by the isolation
+    write_py_plugin(tmp_path, "sig", module=BASEEXC_ON_IMPORT)
+    grants = grant_plugin(tmp_path, "sig")
+    with pytest.raises(KeyboardInterrupt):
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+
+
+def test_disabled_python_still_offers_declarative_hooks(tmp_path):
+    # a [python] plugin that also declares a shell hook: even if its module
+    # fails to construct, the out-of-process hook stays available to the bus.
+    pdir = tmp_path / USER_PLUGINS_REL / "mixed"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "mixed"\napi_version = 1\n'
+        '[hooks.pre_run]\ncmd = "true"\n'
+        '[python]\nmodule = "hooks.py"\n'
+    )
+    (pdir / "hooks.py").write_text(CONSTRUCT_RAISES)
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grant_plugin(tmp_path, "mixed"))
+    assert reg.get("mixed").disabled
+    assert [h.stage for _, h in reg.hooks_for("pre_run")] == ["pre_run"]
+
+
+def test_construct_error_keeps_declarative_hooks(tmp_path):
+    # the runtime half: the real bus still dispatches a disabled plugin's shell
+    # hook, while its workflows and seeds follow the failed module (inert)
+    marker = tmp_path / "MIXED-HOOK-RAN"
+    pdir = write_hook_plugin(
+        tmp_path,
+        "mixed",
+        marker,
+        extra='seed_globs = [".mixed/*"]\n[python]\nmodule = "mod.py"\n',
+    )
+    (pdir / "mod.py").write_text(CONSTRUCT_RAISES)
+    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grant_plugin(tmp_path, "mixed"))
+    lp = reg.get("mixed")
+    assert lp.disabled and lp.active and not lp.live_instance_or_declarative
+    assert reg.seed_globs() == []
+    emit(reg, "pre_run", tmp_path)
+    assert marker.read_text() == "ran"
 
 
 # --------------------------------------------------- api_version policy
@@ -154,85 +634,3 @@ def test_thirdparty_api_mismatch_is_skipped_with_warning(tmp_path):
     assert "future" not in plugins  # skipped, run survives
     assert "example" in plugins  # the compatible builtin still loaded
     assert "plugin-skipped" in journal.kinds()
-
-
-# ----------------------------------------------- failure isolation
-
-
-CONSTRUCT_RAISES = """
-from bmad_loop.plugins import Plugin as _Base
-class Plugin(_Base):
-    def __init__(self, manifest, settings):
-        raise RuntimeError("boom on construct")
-"""
-
-IMPORT_RAISES = "raise RuntimeError('boom on import')\n"
-
-BASEEXC_ON_IMPORT = "raise KeyboardInterrupt('sigint-like')\n"
-
-
-def test_construct_exception_disables_instance_run_survives(tmp_path):
-    write_py_plugin(tmp_path, "broken", module=CONSTRUCT_RAISES)
-    journal = FakeJournal()
-    reg = PluginRegistry.build(tmp_path, policy=enable("broken"), journal=journal)  # no raise
-    lp = reg.get("broken")
-    assert lp.instance is None and lp.disabled and "boom on construct" in lp.error
-    assert "plugin-error" in journal.kinds()
-    assert reg.instances() == []
-
-
-def test_import_exception_disables_instance_run_survives(tmp_path):
-    write_py_plugin(tmp_path, "badimport", module=IMPORT_RAISES)
-    journal = FakeJournal()
-    reg = PluginRegistry.build(tmp_path, policy=enable("badimport"), journal=journal)
-    lp = reg.get("badimport")
-    assert lp.instance is None and lp.disabled
-    assert "plugin-error" in journal.kinds()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_python_module_symlinked_out_of_the_plugin_is_never_executed(tmp_path):
-    # `_parse_python` rejects an absolute, parent-climbing or root-naming module
-    # lexically, at manifest load. A perfectly ordinary relative name that happens
-    # to be a LINK out of the plugin dir passes all three and used to reach
-    # exec_module — the one consumer where a slipped path is arbitrary code
-    # execution rather than a copy, so it re-checks after resolution.
-    pdir = write_py_plugin(tmp_path, "escapee")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    stray = outside / "evil.py"
-    stray.write_text(PY_MODULE.format(cls="Plugin"))
-    (pdir / "hooks.py").unlink()
-    (pdir / "hooks.py").symlink_to(stray)
-
-    journal = FakeJournal()
-    reg = PluginRegistry.build(tmp_path, policy=enable("escapee"), journal=journal)
-    lp = reg.get("escapee")
-
-    assert lp.instance is None and lp.disabled  # isolated, like any load failure
-    # the smoking gun: the linked module's import-time side effect never happened
-    assert not (pdir / "IMPORTED").exists()
-    assert "plugin-error" in journal.kinds()
-
-
-def test_baseexception_propagates(tmp_path):
-    # RunStopped/SIGTERM (BaseException) must NEVER be swallowed by the isolation
-    write_py_plugin(tmp_path, "sig", module=BASEEXC_ON_IMPORT)
-    with pytest.raises(KeyboardInterrupt):
-        PluginRegistry.build(tmp_path, policy=enable("sig"))
-
-
-def test_disabled_python_still_offers_declarative_hooks(tmp_path):
-    # a [python] plugin that also declares a shell hook: even if its module
-    # fails to construct, the out-of-process hook stays available to the bus.
-    pdir = tmp_path / USER_PLUGINS_REL / "mixed"
-    pdir.mkdir(parents=True)
-    (pdir / "plugin.toml").write_text(
-        '[plugin]\nname = "mixed"\napi_version = 1\n'
-        '[hooks.pre_run]\ncmd = "true"\n'
-        '[python]\nmodule = "hooks.py"\n'
-    )
-    (pdir / "hooks.py").write_text(CONSTRUCT_RAISES)
-    reg = PluginRegistry.build(tmp_path, policy=enable("mixed"))
-    assert reg.get("mixed").disabled
-    assert [h.stage for _, h in reg.hooks_for("pre_run")] == ["pre_run"]

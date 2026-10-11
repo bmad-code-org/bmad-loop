@@ -87,7 +87,7 @@ from .platform_util import (
     safe_segment,
     unlink_confined,
 )
-from .plugins import HookBus, HookContext, PluginRegistry
+from .plugins import GrantSet, HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import (
@@ -880,6 +880,7 @@ class Engine:
         sweep_factory: SweepFactory | None = None,
         registry: PluginRegistry | None = None,
         retro_adapter: CodingCLIAdapter | None = None,
+        plugin_grants: GrantSet = GrantSet.empty(),
     ):
         self.paths = paths
         # where code+git work + artifact reads happen. isolation="none" (today's
@@ -923,8 +924,13 @@ class Engine:
         # records the live plugins only when at least one binds a stage. The
         # game-engine layer (Unity) is now itself a plugin: enabling it in
         # [plugins] gives it lifecycle hooks that gate/manage the Editor.
+        # `plugin_grants` is the launch's frozen grant set (#496/#497); the
+        # default, none, refuses every project plugin with an executable surface
+        # — a layer this deep never reads the grant store itself.
         self._registry = (
-            registry if registry is not None else PluginRegistry.build(self.paths.repo_root, policy)
+            registry
+            if registry is not None
+            else PluginRegistry.build(self.paths.repo_root, policy, grants=plugin_grants)
         )
         # let every in-process plugin reject an incompatible config at startup
         # (e.g. the Unity plugin's editor_mode↔scm.isolation coupling) so the run

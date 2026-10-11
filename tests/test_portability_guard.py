@@ -1428,6 +1428,9 @@ JOURNAL_KINDS = frozenset(
         "plugin-skipped",
         # plugins/registry.py
         "plugin-loaded",
+        # #496/#497: a never-granted project plugin the gate left inert; carries
+        # `plugin`, `reason`, `origin` and `path` (the dir's relpath from the root).
+        "plugin-refused",
         "plugin-untrusted",
         # recovery_flow.py
         "attempt-commits-preserved",

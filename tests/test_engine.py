@@ -38,6 +38,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    grant_plugin,
     install_bmad_config,
     nested_repo_root_paths,
     plant_root_markers,
@@ -6117,7 +6118,9 @@ def test_inplace_ready_gate_veto_defers_before_any_session(project):
         '[plugin]\nname = "gate"\napi_version = 1\n'
         "[hooks.pre_ready_gate]\ncmd = 'exit 1'\nblocking = true\n"
     )
-    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    # a project hook runs only under an operator grant (#497)
+    grants = grant_plugin(project.project, "gate")
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")], plugin_grants=grants)
     summary = engine.run()
 
     assert summary.deferred == 1 and summary.done == 0 and not summary.paused

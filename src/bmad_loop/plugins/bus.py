@@ -19,6 +19,13 @@ plugins. It enforces the two invariants that keep plugins safe:
     and re-raises :class:`~bmad_loop.childrun.ChildInterrupted`, which the
     engine turns into a hard stop (``RunStopped``) — even under ``fail_closed``.
 
+  * **Trust is the registry's.** The bus dispatches only ``LoadedPlugin.active``
+    plugins — never a refused project plugin or an un-enabled builtin
+    ``[python]`` one, not even its declarative hooks (#496/#497) — and never
+    re-derives trust from a manifest's source. A granted plugin's ``{scripts}``
+    already points at its verified snapshot. Declarative hooks run with
+    ``PYTHONDONTWRITEBYTECODE=1`` so a Python hook never writes ``.pyc`` files.
+
 Dispatch order is registry order (manifest ``priority`` then load order).
 Mutations pipeline — a later plugin sees an earlier plugin's edits. Vetoes are
 collected without short-circuit so order can never hide a severer objection;
@@ -107,6 +114,9 @@ def _hook_env(ctx: HookContext, lp: LoadedPlugin) -> dict[str, str]:
         "BMAD_LOOP_PLUGIN": lp.name,
     }
     env.update({k: v for k, v in fields.items() if v != ""})
+    # a Python hook must not write __pycache__ into its (snapshot) dir: the next
+    # verify would refuse the snapshot and every launch would rebuild it.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     # the plugin's *resolved* settings (defaults overlaid by [plugins.<name>]),
     # not bare manifest defaults, so a declarative hook sees the operator's config.
     for key, value in lp.settings.items():
@@ -153,6 +163,8 @@ class HookBus:
         self._active: set[str] = set()
         self._py_stages: dict[str, set[str]] = {}
         for lp in registry.plugins():
+            if not lp.active:
+                continue  # refused / un-enabled: nothing of it runs (#496/#497)
             for hook in lp.manifest.hooks:
                 self._active.add(hook.stage)
             if lp.instance is not None:
@@ -176,6 +188,8 @@ class HookBus:
         run-start journal entry when (and only when) plugins are live."""
         out: list[str] = []
         for lp in self._registry.plugins():
+            if not lp.active:
+                continue
             if lp.manifest.hooks or lp.name in self._py_stages:
                 out.append(lp.name)
         return out
@@ -189,7 +203,7 @@ class HookBus:
         if stage not in self._active:
             return ctx
         for lp in self._registry.plugins():
-            if lp.name in self._disabled:
+            if not lp.active or lp.name in self._disabled:
                 continue
             hook = lp.manifest.hook_for(stage)
             if hook is not None:

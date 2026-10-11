@@ -34,6 +34,7 @@ from conftest import (
     fault_metadata_probe,
     fault_read_text,
     git,
+    grant_plugin,
     ignore_before_commit,
     install_bmad_config,
     install_build_auto_skill,
@@ -227,7 +228,9 @@ def make_engine(project, script, policy=None, run_id="test-run", **kwargs):
     return engine, adapter
 
 
-def resume_engine(project, engine, script=(), *, policy=None) -> tuple[Engine, MockAdapter]:
+def resume_engine(
+    project, engine, script=(), *, policy=None, plugin_grants=None
+) -> tuple[Engine, MockAdapter]:
     """Rebuild an Engine over the run's persisted state, as `cli.cmd_resume` does."""
     state = load_state(engine.run_dir)
     # `cli._resume_paused_run` refuses a finished run outright. Without the same
@@ -256,6 +259,8 @@ def resume_engine(project, engine, script=(), *, policy=None) -> tuple[Engine, M
         epic_filter=state.epic_filter,
         story_filter=state.story_filter,
         max_stories=state.max_stories,
+        # a real resume threads the launch's frozen grants (P4); none = fail closed
+        **({} if plugin_grants is None else {"plugin_grants": plugin_grants}),
     )
     return new_engine, adapter
 
@@ -6614,7 +6619,8 @@ def _write_stub_plugin(
     (no real Unity) — proving a generic data-only plugin can gate the engine's
     per_worktree flow. A blocking hook's non-zero exit vetoes (defers) the unit.
     Commands are TOML literal strings, so they may embed double quotes but not
-    single quotes. No [python], so it loads on folder-drop (no [plugins] enabled)."""
+    single quotes. No [python], but its hooks are an executable surface, so it runs
+    only under an operator grant (#497): returns the `GrantSet` to hand the engine."""
     plug_dir = project.project / ".bmad-loop" / "plugins" / name
     plug_dir.mkdir(parents=True)
     lines = ["[plugin]", f'name = "{name}"', "api_version = 1"]
@@ -6634,6 +6640,7 @@ def _write_stub_plugin(
     if post_story is not None:
         lines += ["[hooks.post_story]", f"cmd = '{post_story}'"]
     (plug_dir / "plugin.toml").write_text("\n".join(lines) + "\n")
+    return grant_plugin(project.project, name)
 
 
 def _pw_policy(**gates):
@@ -6671,7 +6678,7 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     (skill / "SKILL.md").write_text("tool", encoding="utf-8")
     # setup asserts the seed reached its cwd (the worktree) before marking ready;
     # the gate fails unless that marker exists -> proves seed+setup precede the gate.
-    _write_stub_plugin(
+    grants = _write_stub_plugin(
         project,
         "stub",
         setup=_seeded_then_touch(".claude/skills/gameobject-create/SKILL.md", "setup-done"),
@@ -6683,6 +6690,7 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
         project,
         [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=_pw_policy(),
+        plugin_grants=grants,
     )
     summary = engine.run()
 
@@ -6698,11 +6706,42 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     assert [s.role for s in adapter.sessions] == ["dev", "review"]
 
 
+def test_ungranted_project_seeds_never_reach_the_worktree(project):
+    """#497: the same stub plugin, never granted, is inert — its seed_globs never
+    copy the main repo's gitignored skill tree into the unit worktree, and its
+    hooks never run. The happy-path test above is the granted control."""
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + ".claude/skills/\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    skill = project.project / ".claude" / "skills" / "gameobject-create"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("tool", encoding="utf-8")
+    _write_stub_plugin(project, "stub", seed_globs=[".claude/skills/*"])  # grant withheld
+    seeded: list[bool] = []
+    dev = wt_dev_effect(project, "1-1-a")
+
+    def observing_dev(spec):
+        cwd = session_checkout_root(project, spec.cwd)
+        seeded.append((cwd / ".claude" / "skills" / "gameobject-create" / "SKILL.md").exists())
+        return dev(spec)
+
+    engine, _ = make_engine(
+        project,
+        [observing_dev, wt_review_effect(project, "1-1-a", clean=True)],
+        policy=_pw_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seeded == [False]  # the dev session ran in an unseeded worktree
+    assert _hook_stages(engine) == []
+
+
 def test_per_worktree_setup_failure_defers_and_skips_session(project):
     """A setup failure (Editor wouldn't launch) vetoes -> defers the unit, never
     starts a session, still tears down best-effort, and closes the (empty) worktree."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    _write_stub_plugin(
+    grants = _write_stub_plugin(
         project,
         "stub",
         setup="exit 3",
@@ -6712,6 +6751,7 @@ def test_per_worktree_setup_failure_defers_and_skips_session(project):
         project,
         [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=_pw_policy(),
+        plugin_grants=grants,
     )
     summary = engine.run()
 
@@ -6733,7 +6773,7 @@ def test_per_worktree_setup_failure_defers_and_skips_session(project):
 def test_per_worktree_ready_gate_failure_defers(project):
     """Setup succeeds but the Editor never reports ready -> defer + teardown."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    _write_stub_plugin(
+    grants = _write_stub_plugin(
         project,
         "stub",
         ready="exit 1",
@@ -6743,6 +6783,7 @@ def test_per_worktree_ready_gate_failure_defers(project):
         project,
         [wt_dev_effect(project, "1-1-a")],
         policy=_pw_policy(),
+        plugin_grants=grants,
     )
     summary = engine.run()
 
@@ -6760,7 +6801,7 @@ def test_per_worktree_teardown_runs_on_pause(project):
     """A spec-approval pause leaves the worktree mounted, but the teardown hook is
     still fired (teardown runs in the finally, even as RunPaused unwinds)."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    _write_stub_plugin(
+    grants = _write_stub_plugin(
         project,
         "stub",
         teardown=_touch_run("teardown-done"),
@@ -6769,6 +6810,7 @@ def test_per_worktree_teardown_runs_on_pause(project):
         project,
         [wt_dev_effect(project, "1-1-a")],
         policy=_pw_policy(mode="per-story-spec-approval"),
+        plugin_grants=grants,
     )
     summary = engine.run()
 
@@ -6787,11 +6829,12 @@ def test_post_story_hook_runs_from_repo_root_after_worktree_teardown(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     marker = "post-story-cwd"
     record = f'cd > "{_RUN}\\{marker}"' if sys.platform == "win32" else f'pwd > "{_RUN}/{marker}"'
-    _write_stub_plugin(project, "stub", post_story=record)
+    grants = _write_stub_plugin(project, "stub", post_story=record)
     engine, _ = make_engine(
         project,
         [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=_pw_policy(),
+        plugin_grants=grants,
     )
     summary = engine.run()
 
