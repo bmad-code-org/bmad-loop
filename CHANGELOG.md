@@ -39,6 +39,9 @@ breaking changes may land in a minor release.
 
 - Open the TUI settings screen when a toggled plugin's name is not a valid widget id
   (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+- Spawn tmux with `-u` so window and session listings parse when bmad-loop runs
+  without a UTF-8 locale (`LANG` unset, `LC_ALL=C`, cron, systemd). tmux printed
+  each field tab as `_`, so every window read as nameless and untagged (#881).
 - psmux: run the parked-window trailer's psmux calls through the absolute path
   bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
   from the pane's `PATH` no longer silently skips the client return and leaks the
