@@ -556,7 +556,20 @@ class SettingsScreen(Screen[None]):
             except (OSError, runs.StateRootError) as e:
                 self._show_errors(f"policy saved, but the plugin grant was not recorded: {e}")
                 return
-        self.app.notify(f"policy saved: {self._path}")
+        if candidate.fault is not None:
+            # Only reachable with no toggle flipped (a flip refuses a faulted store
+            # above), so the save is fine, but the store may have gone bad since the
+            # open-time banner: say so, or every project plugin silently goes inert.
+            # ABLATION (test_save_surfaces_a_grant_store_that_went_bad): drop this
+            # arm and the save reports plain success.
+            self.app.notify(
+                f"policy saved: {self._path} — but plugin grants could not be read "
+                f"({candidate.fault}); a launch treats this as no grants and refuses "
+                "every project plugin that needs one",
+                severity="warning",
+            )
+        else:
+            self.app.notify(f"policy saved: {self._path}")
         self.app.pop_screen()
 
     def _grant_flips(self) -> tuple[list[str], list[str]]:

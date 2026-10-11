@@ -1008,6 +1008,39 @@ async def test_toggle_on_refuses_to_overwrite_an_unreadable_store(project):
     assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
 
 
+async def test_save_surfaces_a_grant_store_that_went_bad(project, monkeypatch):
+    """A grant store that turns unreadable after the screen opened (no open-time
+    banner) and a save that flips no plugin toggle: the policy still saves — it
+    doesn't touch grants — but the success toast becomes a warning naming the
+    fault, since a launch will refuse every project plugin that needs a grant.
+
+    ABLATION: drop the fault arm in `action_save` and the toast is plain success."""
+    write_policy(project)
+    write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    toasts: list[tuple[str, str]] = []
+    real_notify = BmadLoopApp.notify
+
+    def notify(self, message, *, severity="information", **kwargs):
+        toasts.append((str(message), severity))
+        return real_notify(self, message, severity=severity, **kwargs)
+
+    monkeypatch.setattr(BmadLoopApp, "notify", notify)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert not screen.query("#plugin-grants-fault")
+        runs.plugin_grants_path(project.project).write_text("{not json", encoding="utf-8")
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    saved = [(m, s) for m, s in toasts if m.startswith("policy saved")]
+    assert len(saved) == 1
+    message, severity = saved[0]
+    assert severity == "warning"
+    assert "plugin grants could not be read" in message
+
+
 async def test_settings_screen_discovers_from_repo_root(project, tmp_path):
     """Plugins are discovered from the code root a run loads (`repo_root`), as
     `bmad-loop plugins` and a launch do, while the grant stays keyed by the
