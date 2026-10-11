@@ -2085,6 +2085,24 @@ def _run_git(
         raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
 
 
+def _snapshot_ident_env() -> dict[str, str]:
+    """``os.environ`` with the synthetic ``bmad-loop`` identity a preservation commit
+    is made under, so it succeeds with no git user configured, and WITHOUT an
+    inherited ``GIT_AUTHOR_DATE``/``GIT_COMMITTER_DATE``: preserve-ref retention ranks
+    refs by ``committerdate``, so a snapshot back-dated by the launching shell would
+    be the first one pruned however recently it was taken."""
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")
+    }
+    env.update(
+        GIT_AUTHOR_NAME="bmad-loop",
+        GIT_AUTHOR_EMAIL="bmad-loop@localhost",
+        GIT_COMMITTER_NAME="bmad-loop",
+        GIT_COMMITTER_EMAIL="bmad-loop@localhost",
+    )
+    return env
+
+
 def _git(repo: Path, *args: str) -> tuple[int, str]:
     proc = _run_git(["git", "-C", str(repo), *args], repo)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
@@ -6373,13 +6391,7 @@ def snapshot_worktree(
     # A synthetic identity (merged over os.environ) so the snapshot commit succeeds
     # with no git user.name/user.email configured — else the best-effort caller would
     # catch the GitError and reset past the very work this ref exists to preserve.
-    ident = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "bmad-loop",
-        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
-        "GIT_COMMITTER_NAME": "bmad-loop",
-        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
-    }
+    ident = _snapshot_ident_env()
     rc, snap, detail = _git_out(
         repo, "commit-tree", tree, "-p", head, "-m", "attempt worktree snapshot", env=ident
     )
@@ -6400,13 +6412,7 @@ def snapshot_commit(repo: Path, ref_name: str, head: str, message: str) -> str:
     ``bmad-loop`` identity as in :func:`snapshot_worktree`; the empty old-value
     refuses an existing ``ref_name`` rather than overwrite it. Raises
     :class:`GitError`."""
-    ident = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "bmad-loop",
-        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
-        "GIT_COMMITTER_NAME": "bmad-loop",
-        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
-    }
+    ident = _snapshot_ident_env()
     rc, snap, detail = _git_out(
         repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", message, env=ident
     )
@@ -7320,13 +7326,7 @@ def _preserve_collision_paths(repo: Path, paths: list[str]) -> str | None:
         raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
     if tree == head_tree:
         return None  # the working tree already matches HEAD at every path — no bytes to park
-    ident = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "bmad-loop",
-        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
-        "GIT_COMMITTER_NAME": "bmad-loop",
-        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
-    }
+    ident = _snapshot_ident_env()
     rc, snap, detail = _git_out(
         repo,
         "commit-tree",

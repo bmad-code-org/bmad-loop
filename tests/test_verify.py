@@ -14732,6 +14732,27 @@ def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, t
     assert git(repo, "show", f"{ref}:src.txt") == "edit with no identity"  # work captured
 
 
+@pytest.mark.parametrize("kind", ["worktree", "commit"])
+def test_snapshot_commits_ignore_an_inherited_commit_date(project, monkeypatch, kind):
+    """A launching shell's ``GIT_COMMITTER_DATE``/``GIT_AUTHOR_DATE`` does not reach a
+    preservation commit: retention ranks preserve refs by ``committerdate``, so a
+    snapshot back-dated to 2001 would be the first one pruned.
+
+    Ablation: build the env from ``os.environ`` unfiltered (the pre-fix
+    ``_snapshot_ident_env``) and both rows read 2001."""
+    repo = project.project
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+    ref = f"refs/attempt-preserve-dirty/run-dated-{kind}"
+    if kind == "worktree":
+        (repo / "src.txt").write_text("dirty\n")
+        assert verify.snapshot_worktree(repo, ref, baseline_untracked=[]) == ref
+    else:
+        verify.snapshot_commit(repo, ref, git(repo, "rev-parse", "HEAD"), "detached snapshot")
+    dates = git(repo, "show", "-s", "--format=%cI %aI", ref).split()
+    assert all(not d.startswith("2001") for d in dates), dates
+
+
 def test_snapshot_worktree_scopes_to_run_created_untracked(project):
     """A pre-existing untracked file (present in `baseline_untracked`) is NOT baked
     into the snapshot — safe_rollback never removes it, so capturing it would be a

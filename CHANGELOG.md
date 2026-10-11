@@ -51,6 +51,9 @@ breaking changes may land in a minor release.
   the project was moved, as if `repo_root` had changed (DW-525): the kept worktree and
   code root are now located on the live project, a `repo_root` above the project
   included when the whole repository was renamed.
+- Fix preservation snapshot commits inheriting `GIT_COMMITTER_DATE`/`GIT_AUTHOR_DATE`
+  from the environment, which let `scm.preserve_keep` retention prune a fresh snapshot
+  first.
 - Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
   (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 
