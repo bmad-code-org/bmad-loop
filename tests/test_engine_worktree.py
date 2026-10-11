@@ -12474,6 +12474,43 @@ def test_delete_deregisters_a_paused_runs_kept_worktree(project, tmp_path, monke
     assert notes == []
 
 
+def _record_launch_under(replay_dir, old_project: Path) -> None:
+    """Re-spell the run's launch-time records as if the project had been renamed
+    from ``old_project`` since: `project`, a project-owned `repo_root`, and every
+    task's `worktree_path`. Lexical only — git's own registration stays on the live
+    paths, the shape after a move plus `git worktree repair`."""
+    state = load_state(replay_dir)
+    live = Path(state.project)
+
+    def moved(path: str) -> str:
+        return str(old_project / Path(path).relative_to(live)) if path else path
+
+    state.project = str(old_project)
+    state.repo_root = moved(state.repo_root)
+    for task in state.tasks.values():
+        task.worktree_path = moved(task.worktree_path) if task.worktree_path else None
+    save_state(replay_dir, state)
+
+
+def test_delete_prunes_against_the_moved_projects_code_root(project, tmp_path, monkeypatch):
+    """After a project rename the persisted `code_root` names the launch-time tree,
+    which no longer exists; `delete_run` prunes the live repository instead, so the
+    kept unit is deregistered and nothing is warned.
+
+    Ablation: prune `state.code_root` unrebased and the unit stays registered, with a
+    warning aimed at the gone path."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    _record_launch_under(replay_dir, tmp_path / "renamed-away")
+    assert _registered_under(project, replay_dir) != []
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append)
+
+    assert not replay_dir.exists()
+    assert _registered_under(project, replay_dir) == []
+    assert notes == []
+
+
 def test_delete_warns_when_a_kept_worktree_stays_registered(project, tmp_path, monkeypatch):
     """DW-538's degrade is visible: `verify.worktree_prune` never raises, so a prune
     that cleared nothing surfaces through `warn` from the re-list — and the run is
@@ -12666,6 +12703,33 @@ def test_abandon_completes_when_the_worktree_is_already_gone(
         assert f"branch {task.branch} of 1-1-a no longer exists" in out
     else:
         assert f"kept on branch {task.branch}" in out
+
+
+def test_abandon_rebases_the_kept_worktree_of_a_moved_project(
+    project, tmp_path, monkeypatch, capsys
+):
+    """After a project rename the recorded `worktree_path` names the launch-time
+    tree. Abandon rebases it onto the live project, so the standing worktree is
+    snapshotted and removed — not taken for already gone, closed unsnapshotted and
+    its uncommitted work left for `delete` to destroy.
+
+    Ablation: use `Path(task.worktree_path)` unrebased in `abandon_replay_run` and the
+    worktree survives the abandon with no ref parked."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    head = git(unit, "rev-parse", "HEAD").strip()
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    _record_launch_under(replay_dir, tmp_path / "renamed-away")
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    assert not unit.exists() and _registered_under(project, replay_dir) == []
+    assert git(project.project, "show", f"{ref}:extra-notes.txt") == "unsaved operator notes"
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["ref"] == ref
+    assert row["worktree"] == str(unit)
 
 
 def test_abandon_retry_recovers_the_snapshot_an_earlier_attempt_parked(

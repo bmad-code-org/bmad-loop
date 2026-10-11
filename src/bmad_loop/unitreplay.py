@@ -362,7 +362,10 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
         if (refusal := abandon_refusal(state, task, story_key)) is not None:
             raise AbandonError(refusal)
         repo_root = paths.repo_root
-        wt = Path(task.worktree_path)
+        # The recorded mount is launch-time: after a project move, the bare path names
+        # a tree that is gone and would send a standing worktree down the
+        # already-gone arm — finished unsnapshotted, its contents left to `delete`.
+        wt = runs.rebase_recorded_project_path(Path(task.worktree_path), state, paths.project)
         ref: str | None = None
         if os.path.lexists(wt):
             try:
@@ -390,7 +393,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 Journal(run_dir).append(
                     "replay-abandon-snapshot",
                     story_key=story_key,
-                    worktree=task.worktree_path,
+                    worktree=str(wt),
                     ref=ref,
                 )
         try:
@@ -418,7 +421,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
             replay_of=state.replay_of,
             branch=task.branch,
             branch_kept=branch_kept,
-            worktree=task.worktree_path,
+            worktree=str(wt),
             ref=ref,
         )
         state.clear_pause()

@@ -3507,7 +3507,7 @@ def delete_run(
 
     A run dir holding ``worktrees/`` (a paused isolated run's kept unit) is pruned
     from git's worktree admin after the removal, against the run's own code root
-    (DW-538) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
+    (DW-538; a project-owned one rebased onto a renamed ``project``) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
     that leaves an entry under the run dir, or a listing that cannot say, is
     reported through ``warn`` too; the deletion itself has already happened. An
     unreadable state leaves the code root unknown: ``project`` is pruned as the
@@ -3548,7 +3548,10 @@ def delete_run(
         retrying_rmtree(run_dir)
         if held_worktrees:
             if state is not None:
-                fault = _prune_deleted_run_worktrees(state.code_root, run_res)
+                # A project-owned code root moves with a renamed project; an external
+                # `repo_root` override stays where it was recorded.
+                code_root = rebase_recorded_project_path(state.code_root, state, project)
+                fault = _prune_deleted_run_worktrees(code_root, run_res)
             else:
                 # No state, no code root: prune the usual one, but a clean listing
                 # there proves nothing for a run that recorded a `repo_root` override.
