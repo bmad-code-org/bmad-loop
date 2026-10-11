@@ -422,6 +422,25 @@ def test_granted_then_renamed_in_place_is_fatal_not_silently_dropped(tmp_path):
     assert not marker.exists()
 
 
+def test_granted_override_renamed_while_its_builtin_reappears_is_fatal(tmp_path):
+    """Renaming a granted project override of a builtin brings the builtin back
+    under the old name. The builtin never reads grants, so it must not hide the
+    override's record: the rename is still a changed grant, not a silent drop.
+
+    ABLATION: build the `_judge` claimants from every discovered name (drop the
+    `needs_grant` filter) and the build succeeds with the renamed override inert."""
+    marker = tmp_path / "RAN-unity"
+    pdir = write_hook_plugin(tmp_path, "unity", marker)
+    grants = grant_plugin(tmp_path, "unity")
+    manifest = pdir / "plugin.toml"
+    manifest.write_text(manifest.read_text().replace('name = "unity"', 'name = "custom-unity"'))
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert 'granted as "unity", now named "custom-unity"' in str(exc.value)
+    assert "bmad-loop plugins accept custom-unity" in str(exc.value)
+    assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_granted_module_swapped_for_a_link_is_fatal_and_never_executed(tmp_path):
     # a link anywhere in a granted tree makes it unreadable: fatal, nothing runs

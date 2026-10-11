@@ -96,19 +96,20 @@ class GrantSet:
                 return record
         return None
 
-    def match(self, name: str, rel_path: str, discovered: Iterable[str]) -> GrantRecord | None:
+    def match(self, name: str, rel_path: str, claimants: Iterable[str]) -> GrantRecord | None:
         """The grant covering plugin ``name`` found at ``rel_path``: its own record,
-        else the record of a no-longer-discovered name granted at that same dir.
+        else a record granted at that same dir under a name no discovered plugin
+        claims. ``claimants`` are the names of discovered plugins that consult a
+        grant (`needs_grant`) — a builtin reappearing under the old name of a
+        renamed project override never reads the record, so it cannot hide it.
         ``plugin.toml`` is part of the granted bytes, so a manifest renamed in
         place is a changed grant (`classify` makes it fatal), never a fresh plugin
         that is merely ungranted."""
         record = self.get(name)
         if record is not None:
             return record
-        live_names = frozenset(discovered)
-        return next(
-            (r for r in self.records if r.path == rel_path and r.name not in live_names), None
-        )
+        claimed = frozenset(claimants)
+        return next((r for r in self.records if r.path == rel_path and r.name not in claimed), None)
 
     @classmethod
     def empty(cls) -> GrantSet:

@@ -43,7 +43,7 @@ from pathlib import Path, PurePath
 
 from . import snapshot, trust
 from .digest import VerifiedTree, read_tree
-from .grants import GrantSet, TrustState, Verdict, classify, fatal_message
+from .grants import GrantSet, TrustState, Verdict, classify, fatal_message, needs_grant
 from .loader import PLUGIN_FILE, load_plugins
 from .manifest import load_manifest
 from .model import (
@@ -208,11 +208,11 @@ def _judge(
     per plugin. Hashes at most; never imports or runs anything."""
     judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
     manifests = list(manifests)
-    discovered = [m.name for m in manifests]
+    claimants = [m.name for m in manifests if needs_grant(m)]
     for m in manifests:
         rel = _rel_path(m, project)
         live = _memo_tree(m)
-        record = grants.match(m.name, rel, discovered)
+        record = grants.match(m.name, rel, claimants)
         verdict = classify(m, enabled=enabled, record=record, rel_path=rel, live=live)
         judged.append((m, verdict, live, rel))
     return judged
