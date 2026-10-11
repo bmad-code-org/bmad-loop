@@ -38,6 +38,7 @@ helpers private, as :mod:`bmad_loop.probe` and :mod:`bmad_loop.diagnostics` do.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import policy, runs
@@ -576,4 +577,77 @@ def clean_document(
         "listing_fault": listing_fault,
         "worktree_faults": list(worktree_faults or ()),
         "state_dir_fault": state_dir_fault,
+    }
+
+
+PLUGINS_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class PluginRow:
+    """One discovered plugin as `plugins --json` reports it (#496/#497).
+
+    ``status`` is the grant vocabulary: ``granted`` (the recorded digest matches
+    the dir), ``ungranted`` (no record), ``mismatch`` (the dir moved or changed
+    since the grant), ``unreadable`` (a granted dir that cannot be hashed), or
+    ``n/a`` (no grant applies: a builtin/entry-point plugin, or a project plugin
+    with no executable surface). ``enabled`` is literal membership in
+    ``[plugins] enabled``; ``active`` is whether a launch would run the plugin."""
+
+    name: str
+    origin: str
+    path: str
+    hooks: bool
+    workflows: bool
+    python: bool
+    seeds: bool
+    grant_required: bool
+    status: str
+    enabled: bool
+    active: bool
+    pinned_digest: str | None
+    current_digest: str | None
+    changed: tuple[str, ...] = ()
+
+
+def plugins_document(rows: list[PluginRow], store_fault: str | None = None) -> dict[str, object]:
+    """The `plugins --json` document: every discovered plugin and its trust grant.
+
+    Obeys the pure-document contract in machine.py (additive-only evolution;
+    anything breaking bumps PLUGINS_SCHEMA_VERSION). A pure projection of the
+    registry's launch verdicts (`registry.preflight`) plus the digests: no plugin
+    code runs to build it. ``path`` is the grant key — the plugin dir's POSIX
+    relpath from the code root. ``pinned_digest`` is the recorded grant's (``null``
+    without one); ``current_digest`` is the dir's digest now, for any plugin that
+    needs a grant (``null`` when it cannot be read, or none applies). ``changed``
+    lists the relpaths a ``mismatch`` differs in.
+
+    ``store_fault`` is ``null`` when the grant store read cleanly (or does not
+    exist), else what could not be read — every row is then judged as ungranted,
+    exactly as a launch would. Exit stays 0 either way: `validate` owns the verdict.
+    """
+    return {
+        "schema_version": PLUGINS_SCHEMA_VERSION,
+        "plugins": [
+            {
+                "name": r.name,
+                "origin": r.origin,
+                "path": r.path,
+                "surface": {
+                    "hooks": r.hooks,
+                    "workflows": r.workflows,
+                    "python": r.python,
+                    "seeds": r.seeds,
+                },
+                "grant_required": r.grant_required,
+                "status": r.status,
+                "enabled": r.enabled,
+                "active": r.active,
+                "pinned_digest": r.pinned_digest,
+                "current_digest": r.current_digest,
+                "changed": list(r.changed),
+            }
+            for r in rows
+        ],
+        "store_fault": store_fault,
     }

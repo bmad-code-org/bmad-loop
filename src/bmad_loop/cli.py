@@ -58,6 +58,7 @@ from .documents import CLEANUP_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import CONFIRM_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import DECISIONS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import LIST_SCHEMA_VERSION  # noqa: F401 — re-export
+from .documents import PLUGINS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import STATUS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import VALIDATE_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import (
@@ -66,6 +67,7 @@ from .documents import (
     confirm_document,
     decisions_document,
     list_document,
+    plugins_document,
     run_token_totals,
     status_document,
     validate_document,
@@ -653,7 +655,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # under isolation = "none" points it at another checkout), so read the manifests
     # that run will load. A failed BMAD config already failed above; fall back to
     # the project dir so the manifest check still reports something.
-    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
+    plugin_root = paths.repo_root if paths is not None else project
+    _validate_plugin_manifests(plugin_root, report)
+    _validate_plugin_trust(plugin_root, project, pol, report)
 
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
@@ -1503,6 +1507,268 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plugins(args: argparse.Namespace) -> int:
+    """List discovered plugins with their trust grants, or grant/re-pin/revoke a
+    project plugin (#496/#497): `plugins [list]`, `plugins enable <name>`,
+    `plugins accept <name>`, `plugins revoke <name>`.
+
+    A grant is the operator's record of the sha256 of a project plugin's whole
+    directory, kept OUT of the tree (`runs.plugin_grants_path`) because the tree
+    and its policy.toml are agent-writable. For a project plugin the grant
+    subsumes `[plugins] enabled`, so this verb never writes policy.toml; a
+    builtin's in-process module is still enabled there. Discovery reads the code
+    root a run loads (`paths.repo_root`); the store is keyed by the project.
+    Never prompts. `list` exits 0 whatever it finds — `validate` owns the verdict
+    (`plugins.trust`)."""
+    project = _project(args)
+    action = args.action or "list"
+    if action != "list":
+        if getattr(args, "json", False):
+            print(
+                f"error: --json applies to `bmad-loop plugins list`, not `plugins {action}`",
+                file=sys.stderr,
+            )
+            return ExitCode.USAGE
+        if not args.name:
+            print(
+                f"error: `plugins {action}` requires a plugin name "
+                "(run `bmad-loop plugins` to list)",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    elif args.name:
+        print("error: `plugins list` takes no plugin name", file=sys.stderr)
+        return ExitCode.FAILURE
+
+    if action == "revoke":
+        return _plugins_revoke(project, args.name)
+    root = bmadconfig.load_paths(project).repo_root
+    if action in ("enable", "accept"):
+        return _plugins_grant(project, root, args.name, accept=action == "accept")
+    return _plugins_list(project, root, args)
+
+
+def _plugin_roster(root: Path, pol, grants: GrantSet):
+    """(manifest, verdict, row) per discovered plugin: the verdict a launch would
+    reach (`registry.preflight`) plus the digests `plugins --json` reports.
+    Manifests and hashing only — no plugin code runs. Raises `PluginError` on a
+    discovery fault."""
+    from .documents import PluginRow
+    from .plugins import PluginError
+    from .plugins.digest import read_tree
+    from .plugins.grants import TRUSTED_SOURCES, TrustState, needs_grant
+    from .plugins.registry import preflight
+    from .plugins.trust import enabled_names
+
+    status_of = {
+        TrustState.GRANTED: "granted",
+        TrustState.REFUSED: "ungranted",
+        TrustState.FATAL_ENABLED_UNGRANTED: "ungranted",
+        TrustState.FATAL_MISMATCH: "mismatch",
+        TrustState.FATAL_UNREADABLE: "unreadable",
+    }
+    enabled = enabled_names(pol)
+    roster = []
+    for m, v, rel in preflight(root, pol, grants):
+        required = needs_grant(m)
+        record = grants.get(m.name) if required else None
+        current = None
+        if required:
+            try:
+                current = read_tree(Path(m.scripts_dir)).digest
+            except PluginError:
+                current = None  # the verdict (or the status column) names the fault
+        row = PluginRow(
+            name=m.name,
+            origin=m.source,
+            # the grant key for a project plugin; the install location for a builtin
+            path=Path(m.scripts_dir).as_posix() if m.source in TRUSTED_SOURCES else rel,
+            hooks=bool(m.hooks),
+            workflows=bool(m.workflows),
+            python=m.python is not None,
+            seeds=bool(m.seed_files or m.seed_globs),
+            grant_required=required,
+            status=status_of.get(v.state, "n/a") if required else "n/a",
+            enabled=m.name in enabled,
+            active=v.active,
+            pinned_digest=record.digest if record is not None else None,
+            current_digest=current,
+            changed=v.changed,
+        )
+        roster.append((m, v, row))
+    return roster
+
+
+def _plugins_list(project: Path, root: Path, args: argparse.Namespace) -> int:
+    from .plugins import store
+
+    pol = policy_mod.load(_policy_path(project))
+    grants = store.load_grants(project)
+    rows = [row for _m, _v, row in _plugin_roster(root, pol, grants)]
+    if getattr(args, "json", False):
+        machine.emit(plugins_document(rows, grants.fault))
+        return ExitCode.OK
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); "
+            "every project plugin is listed as ungranted",
+            file=sys.stderr,
+        )
+    header = ("NAME", "ORIGIN", "SURFACE", "GRANT", "ENABLED", "PATH")
+    table = [
+        (
+            r.name,
+            r.origin,
+            ",".join(
+                s
+                for s, on in (
+                    ("hooks", r.hooks),
+                    ("workflows", r.workflows),
+                    ("python", r.python),
+                    ("seeds", r.seeds),
+                )
+                if on
+            )
+            or "-",
+            r.status,
+            "yes" if r.enabled else "no",
+            r.path,
+        )
+        for r in rows
+    ]
+    if not table:
+        print("no plugins discovered")
+        return ExitCode.OK
+    widths = [max(len(str(c)) for c in col) for col in zip(header, *table, strict=False)]
+    for line in (header, *table):
+        print("  ".join(str(c).ljust(w) for c, w in zip(line, widths, strict=True)).rstrip())
+    return ExitCode.OK
+
+
+def _load_grants_for_write(project: Path) -> GrantSet | None:
+    """The store a grant verb rewrites, or None (after the error line) when it
+    exists but cannot be read: rewriting it then would silently discard every
+    grant it holds, so the operator fixes or removes it first."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"error: plugin grants could not be read ({grants.fault}); fix or remove "
+            "the grant store, then re-run — rewriting it now would discard every grant "
+            "it holds",
+            file=sys.stderr,
+        )
+        return None
+    return grants
+
+
+def _save_grants_or_report(project: Path, grants: GrantSet) -> bool:
+    from .plugins import store
+
+    try:
+        store.save_grants(project, grants.records)
+    except (OSError, runs.StateRootError) as e:
+        print(
+            f"error: could not write the plugin grants to {runs.plugin_grants_path(project)}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int:
+    """`plugins enable <name>` (first grant) / `plugins accept <name>` (re-pin a
+    changed one). Hashes the plugin dir — never imports or runs it — and records
+    the digest in the out-of-tree store. Never writes policy.toml."""
+    from .plugins import store
+    from .plugins.digest import diff_files, read_tree
+    from .plugins.grants import TRUSTED_SOURCES, GrantRecord, TrustState, needs_grant
+    from .plugins.registry import preflight
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    found = [(m, v, rel) for m, v, rel in preflight(root, None, grants) if m.name == name]
+    if not found:
+        print(
+            f'error: no plugin named "{name}" discovered under {root} '
+            "(run `bmad-loop plugins` to list)",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    [(m, verdict, rel)] = found
+    if not needs_grant(m):
+        if m.source in TRUSTED_SOURCES:
+            why = (
+                f"is a {m.source} plugin, trusted by provenance and never granted; "
+                "its in-process module is enabled by naming it in [plugins] enabled "
+                "(.bmad-loop/policy.toml) or toggling it in the TUI settings screen"
+            )
+        else:
+            why = (
+                "has no executable surface (no hooks, workflows, [python] or seeds), "
+                "so it loads without a grant"
+            )
+        print(f'error: plugin "{name}" {why}', file=sys.stderr)
+        return ExitCode.FAILURE
+
+    record = grants.get(name)
+    if accept and record is None:
+        print(
+            f'error: plugin "{name}" has no grant to accept; review it, then run '
+            f"`bmad-loop plugins enable {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    if record is not None and verdict.state is TrustState.GRANTED:
+        print(f'plugin "{name}" unchanged: sha256:{record.digest[:12]} is already granted')
+        return ExitCode.OK
+    if not accept and record is not None:
+        print(
+            f'error: plugin "{name}" changed since it was granted ({verdict.reason}); '
+            f"review it, then run `bmad-loop plugins accept {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+
+    tree = read_tree(Path(m.scripts_dir))  # a PluginError is main()'s `error:` rc 1
+    if record is not None:
+        if record.path != rel:
+            print(f"moved: {record.path} -> {rel}")
+        added, removed, changed = diff_files(record.file_map(), tree.file_map())
+        for label, rels in (("added", added), ("removed", removed), ("changed", changed)):
+            for r in rels:
+                print(f"{label}: {r}")
+    granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    new = store.upsert(grants, GrantRecord.from_tree(name, rel, tree, granted_at))
+    if not _save_grants_or_report(project, new):
+        return ExitCode.FAILURE
+    print(
+        f'plugin "{name}" granted: sha256:{tree.digest[:12]} ({len(tree.files)} files) '
+        f"in {runs.plugin_grants_path(project)}"
+    )
+    return ExitCode.OK
+
+
+def _plugins_revoke(project: Path, name: str) -> int:
+    """`plugins revoke <name>`: drop the grant, so the plugin is inert again (or,
+    still named in `[plugins] enabled`, fails the next launch). Needs no plugin
+    dir — a deleted plugin's grant can still be revoked."""
+    from .plugins import store
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    if grants.get(name) is None:
+        print(f'error: plugin "{name}" has no grant to revoke', file=sys.stderr)
+        return ExitCode.FAILURE
+    if not _save_grants_or_report(project, store.remove(grants, name)):
+        return ExitCode.FAILURE
+    print(f'plugin "{name}" grant revoked in {runs.plugin_grants_path(project)}')
+    return ExitCode.OK
+
+
 def _skill_trees(project: Path, pol) -> list[str]:
     """The skill trees this run's dev-primitive adapters read, one per distinct name.
 
@@ -2031,6 +2297,76 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
             "plugins.manifests",
             f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
             {"plugins": names},
+        )
+
+
+def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationReport) -> None:
+    """Judge every discovered plugin against the operator's grants, as a launch
+    will (#496/#497) — `plugins.trust`.
+
+    `root` is the same code root `_validate_plugin_manifests` read; the grant
+    store is keyed by `project`. Uses `registry.preflight`, the verdict the
+    registry build reaches, so validate and a launch cannot disagree — and it
+    never builds the registry: manifests and hashing only, no plugin code runs.
+
+    A project plugin a launch would refuse is a problem whether the refusal is
+    fatal (changed since its grant, named in `[plugins] enabled` without one, a
+    granted dir that cannot be read) or inert (never granted: it silently would
+    not run). An unreadable store is a problem too — a launch treats it as no
+    grants. A discovery fault is skipped here: `plugins.manifests` already failed
+    on it, and the manifest warnings it reports are not repeated."""
+    import warnings
+
+    from .plugins import PluginError, store
+    from .plugins.grants import TrustState, fatal_message
+
+    grants = store.load_grants(project)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # plugins.manifests reports a skipped manifest
+        try:
+            roster = _plugin_roster(root, pol, grants)
+        except PluginError:
+            return  # plugins.manifests already failed on this discovery fault
+    failed = False
+    if grants.fault is not None:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            f"plugin grants could not be read ({grants.fault}); a launch treats this as "
+            "no grants and refuses every project plugin that needs one — fix or remove "
+            "the grant store",
+            {"fault": grants.fault},
+        )
+    for m, v, row in roster:
+        if not row.grant_required or v.state is TrustState.GRANTED:
+            continue
+        failed = True
+        if v.fatal:
+            msg = fatal_message(m.name, v)
+        else:
+            msg = (
+                f'plugin "{m.name}" ({row.path}) is not granted and will not run; review '
+                f"it, then run `bmad-loop plugins enable {m.name}` to grant it"
+            )
+        report.fail(
+            "plugins.trust",
+            msg,
+            {
+                "plugin": m.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": row.current_digest,
+                "changed": list(row.changed),
+            },
+        )
+    if not failed:
+        granted = sorted(row.name for _m, _v, row in roster if row.status == "granted")
+        report.ok(
+            "plugins.trust",
+            f"plugin grants OK: {len(granted)} granted ({', '.join(granted) or 'none'})",
+            {"plugins": granted},
         )
 
 
@@ -6875,6 +7211,23 @@ def main(argv: list[str] | None = None) -> int:
         help="with set: persist a name not registered in this process (e.g. a plugin "
         "backend that only registers on the target machine)",
     )
+
+    plugins_p = add(
+        "plugins",
+        cmd_plugins,
+        "list plugins + trust grants; `plugins enable|accept|revoke <name>` manages a "
+        "project plugin's out-of-tree grant",
+    )
+    plugins_p.add_argument(
+        "action",
+        nargs="?",
+        choices=("list", "enable", "accept", "revoke"),
+        help="list (default); enable: grant a project plugin's current contents; "
+        "accept: re-pin a granted plugin that changed (lists what changed); "
+        "revoke: drop a grant",
+    )
+    plugins_p.add_argument("name", nargs="?", help="plugin name (see the listing)")
+    machine.add_json_flag(plugins_p, "plugin roster and trust grants")
 
     add(
         "adapters",

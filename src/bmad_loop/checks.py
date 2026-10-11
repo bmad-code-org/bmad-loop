@@ -99,6 +99,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # `validate --probes` with no [environment] probes configured (DW-526)
         "environment.probes-none",
         "plugins.manifests",
+        # project plugins with an executable surface need an operator content grant (#496/#497)
+        "plugins.trust",
         "skills.base",
         "skills.base-missing",
         "skills.base-incomplete",
