@@ -237,15 +237,17 @@ def preflight(
     the gate. Manifest discovery and hashing only — no plugin code runs. Raises
     `PluginError` on a discovery fault.
 
-    With ``materialize`` (a launch, never a dry-run) and no fatal verdict, every
-    granted plugin's snapshot is also published now — the copy ``build`` then
-    reuses — so a snapshot that cannot be written (read-only or full state dir)
-    raises here, ahead of the launch's side effects, rather than from ``build``
-    after a resume has already re-armed its run. Raises `PluginError` then too."""
+    With ``materialize`` (a launch, never a dry-run) and nothing fatal (no fatal
+    verdict, no `unclaimed` grant), every granted plugin's snapshot is also
+    published now — the copy ``build`` then reuses — so a snapshot that cannot be
+    written (read-only or full state dir) raises here, ahead of the launch's side
+    effects, rather than from ``build`` after a resume has already re-armed its
+    run. Raises `PluginError` then too."""
     manifests = load_plugins(project)
     enabled = trust.enabled_names(policy)
     judged = _judge(manifests.values(), project, enabled, grants)
-    if materialize and not any(v.fatal for _m, v, _live, _rel in judged):
+    verdicts = [v for _m, v, _live, _rel in judged]
+    if materialize and not any(v.fatal for v in verdicts) and not unclaimed(grants, verdicts):
         for m, v, live, _rel in judged:
             if v.state is TrustState.GRANTED:
                 if grants.snapshot_root is None:

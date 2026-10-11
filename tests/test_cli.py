@@ -17197,6 +17197,47 @@ def test_resume_refuses_an_unwritable_plugin_snapshot_before_any_side_effect(
     assert not _trust_marker(project).exists()
 
 
+def test_resume_publishes_no_snapshot_when_another_grant_is_unclaimed(project, monkeypatch, capsys):
+    """An unclaimed grant (its plugin dir deleted) is as fatal as a fatal verdict,
+    so the preflight must not publish a snapshot for the OTHER, valid granted
+    plugin before refusing: the refused launch writes no plugin state, and a
+    snapshot write fault cannot mask the missing-plugin refusal.
+
+    ABLATION: drop the `unclaimed` term from `preflight`'s materialize guard and
+    this fails — the valid plugin's snapshot is published before the refusal."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+    from bmad_loop.plugins.store import save_grants
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    gone = project.project / USER_PLUGINS_REL / "gone"
+    shutil.copytree(project.project / USER_PLUGINS_REL / TRUST_PLUGIN, gone)
+    toml = gone / "plugin.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8").replace(f'"{TRUST_PLUGIN}"', '"gone"'), encoding="utf-8"
+    )
+    records = [
+        *grant_plugin(project.project, TRUST_PLUGIN).records,
+        *grant_plugin(project.project, "gone").records,
+    ]
+    save_grants(project.project, records, expected=None)
+    shutil.rmtree(gone)
+    snapshots = runs.plugin_snapshots_root(project.project)
+    if snapshots.is_dir():
+        shutil.rmtree(snapshots)
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "`bmad-loop plugins revoke gone`" in err
+    assert not snapshots.exists() or not any(snapshots.iterdir())
+    assert _resume_entries(run_dir) == []
+    assert load_state(run_dir).paused_reason == "escalation"
+
+
 def test_resume_threads_its_grants_to_compose_and_the_sweep_factory(project, monkeypatch):
     """The resume's one read reaches the engine and the re-armed factory closure.
 
