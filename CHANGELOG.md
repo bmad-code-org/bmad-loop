@@ -11,6 +11,44 @@ breaking changes may land in a minor release.
 
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
+- Add `bmad-loop plugins [list|enable|accept|revoke] [name]`: list plugins with origin,
+  surface and grant status; grant, re-pin or revoke a project plugin. Hashes only, never
+  prompts, never writes policy.toml (#496, #497).
+- Add `bmad-loop plugins --json`, a schema-versioned plugin roster (#496, #497).
+- Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
+  stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
+  (#496, #497).
+
+### Changed
+
+- Make an un-enabled builtin `[python]` plugin wholly inert: its hooks, workflows and
+  seeds no longer run without its module (#496, #497).
+- Run granted project plugins from a verified out-of-tree snapshot: `{scripts}` points
+  at it, `[python]` modules compile from the hashed bytes (no `.pyc`), and hooks run
+  with `PYTHONDONTWRITEBYTECODE=1` (#496, #497).
+- Show a project plugin's grant status in the TUI settings screen; toggling it on
+  records its grant after a successful save, toggling it off revokes it (#496, #497).
+
+### Fixed
+
+- Open the TUI settings screen when a toggled plugin's name is not a valid widget id
+  (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+
+### Security
+
+- Trust plugins by origin and pin project plugins by content (#496, #497). A project
+  plugin with hooks, workflows, seeds or `[python]` now runs only under an operator
+  grant — a sha256 of its whole directory, stored out of tree and read once per launch.
+  Builtins stay trusted by provenance. Grants are per machine and keyed by project path.
+- **Upgrade:** a project plugin listed in `[plugins] enabled` without a grant now fails
+  startup; run `bmad-loop plugins enable <name>`. This includes a project copy of
+  `unity`.
+- **Upgrade:** an ungranted project plugin with hooks, workflows or seeds is inert (a
+  `note:` and a `plugin-refused` journal row) until `bmad-loop plugins enable <name>`.
+- Fail startup when a granted project plugin changed since its grant, naming
+  `bmad-loop plugins accept <name>`; refuse before any plugin code runs (#496, #497).
+- Fail startup when a granted project plugin loses its whole executable surface or its
+  dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
 
 ## [0.13.2] — 2026-10-09
 

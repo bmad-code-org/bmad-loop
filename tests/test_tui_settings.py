@@ -8,22 +8,26 @@ make substring checks lie."""
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tomllib
 
 import pytest
+from conftest import grant_plugin, write_repo_root_override
 from test_tui_app import until
 from textual.widgets import Collapsible, Input, Select, Switch
 
 from bmad_loop import platform_util
 from bmad_loop import policy as policy_mod
-from bmad_loop.plugins import load_plugins
+from bmad_loop import runs
+from bmad_loop.plugins import GrantSet, load_plugins, store
+from bmad_loop.plugins.digest import read_tree
 from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
 from bmad_loop.tui import settings as settings_mod
 from bmad_loop.tui.app import BmadLoopApp
 from bmad_loop.tui.screens.dashboard import DashboardScreen
-from bmad_loop.tui.screens.settings_screen import SettingsScreen
+from bmad_loop.tui.screens.settings_screen import SettingsScreen, plugin_wid
 from bmad_loop.tui.settings import PolicyDoc
 
 
@@ -783,3 +787,510 @@ def test_save_refuses_a_readonly_policy_toml(tmp_path):
         path.chmod(0o644)
 
     assert path.read_bytes() == before  # the edit never landed
+
+
+# ---------------------------------------- project plugin grants (#496/#497)
+#
+# A project plugin's toggle is its out-of-tree content grant, not [plugins]
+# enabled: toggling it on records a grant after a successful save, toggling it
+# off revokes it, and a plugin changed since its grant is only ever re-pinned by
+# `bmad-loop plugins accept`. Grants never touch policy.toml.
+
+HOOK_PLUGIN = '[plugin]\nname = "hooky"\napi_version = 1\n[hooks.pre_run]\ncmd = "echo hi"\n'
+
+
+def write_hook_plugin(root, name="hooky"):
+    pdir = root / USER_PLUGINS_REL / name
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("hooky", name), encoding="utf-8")
+    return pdir
+
+
+def _errors(screen) -> str:
+    from textual.widgets import Static
+
+    return str(screen.query_one("#errors", Static).content)
+
+
+def _status(screen, name="hooky") -> str:
+    from textual.widgets import Static
+
+    return str(screen.query_one(f"#plugin-status-{name}", Static).content)
+
+
+async def test_toggle_on_records_a_grant_after_a_successful_save(project):
+    """Toggling an ungranted project plugin on and saving records a grant of the
+    dir as it is at save, in the out-of-tree store keyed by the project — and its
+    name never enters [plugins] enabled (the grant subsumes it for project origin).
+
+    ABLATION: let `_save_enabled` manage project toggles too and "hooky" lands in
+    [plugins] enabled."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen) == "not granted"
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is False
+        toggle.value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    record = store.load_grants(project.project).get("hooky")
+    assert record is not None
+    assert record.digest == read_tree(pdir).digest
+    assert record.path == (USER_PLUGINS_REL / "hooky").as_posix()
+    assert policy_mod.load(project.project / POLICY_FILE).plugins.enabled == ()
+
+
+async def test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants(project):
+    """A manifest name is any non-empty string, so a hooks-only project plugin
+    named with a space, a dot and an underscore still opens the screen, and its
+    encoded toggle grants it under its real name.
+
+    ABLATION: return ``name`` unchanged from `plugin_wid` and the screen fails to
+    open (Textual rejects the id)."""
+    name = "acme tools.v2_x"
+    assert plugin_wid(name) == "acme_20tools_2ev2_5fx"
+    assert plugin_wid("a.b") != plugin_wid("a_2eb")  # the escape is itself escaped
+    write_policy(project)
+    pdir = project.project / USER_PLUGINS_REL / "acme"
+    pdir.mkdir(parents=True)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("hooky", name), encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen, plugin_wid(name)) == "not granted"
+        screen.query_one(f"#plugin-enabled-{plugin_wid(name)}", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get(name) is not None
+
+
+async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, monkeypatch):
+    """The save's grant binds the manifest its discovery parsed: a plugin.toml
+    swapped in before the hash blocks the save instead of granting those bytes.
+
+    ABLATION: grant from a bare `read_tree` in `_candidate_grants` and the
+    swapped manifest is stored as the grant."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    manifest = pdir / PLUGIN_FILE
+    swapped = manifest.read_text(encoding="utf-8") + "# swapped\n[hooks.post_run]\ncmd = 'x'\n"
+    real = registry_mod.read_tree
+
+    def swap_then_read(root, **kw):
+        manifest.write_text(swapped, encoding="utf-8")
+        return real(root, **kw)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        monkeypatch.setattr(registry_mod, "read_tree", swap_then_read)
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "changed while it was being verified" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)  # save blocked
+
+    assert store.load_grants(project.project).get("hooky") is None
+
+
+@pytest.mark.parametrize("change", ["settings-only", "override-removed"])
+async def test_toggle_on_refuses_a_plugin_that_no_longer_needs_a_grant(project, change):
+    """A plugin toggled on, then changed before Save so its name no longer needs a
+    grant (it lost its exec surface, or the project override of a builtin was
+    removed and the builtin now answers), blocks the save instead of recording a
+    grant that activates nothing and later fails as a mismatch.
+
+    ABLATION: drop the `needs_grant` check in `_candidate_grants` and a grant of
+    the settings-only dir / the builtin's tree is stored."""
+    import shutil
+
+    name = "hooky" if change == "settings-only" else "tea"
+    write_policy(project)
+    pdir = write_hook_plugin(project.project, name)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        if change == "settings-only":
+            (pdir / PLUGIN_FILE).write_text(
+                f'[plugin]\nname = "{name}"\napi_version = 1\n', encoding="utf-8"
+            )
+        else:
+            shutil.rmtree(pdir)
+        screen.query_one(f"#plugin-enabled-{plugin_wid(name)}", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "no longer needs a grant" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)  # save blocked
+
+    assert store.load_grants(project.project).get(name) is None
+
+
+async def test_toggle_on_never_erases_a_grant_recorded_while_it_saved(project, monkeypatch):
+    """A grant recorded by another writer while the save is hashing survives: the
+    save, built on the store it read first, is refused rather than replacing it.
+
+    ABLATION: save without `expected=base` in `action_save` and "other"'s grant
+    is erased by the toggle's write."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    write_policy(project)
+    write_hook_plugin(project.project)
+    write_hook_plugin(project.project, "other")
+    real = registry_mod.read_tree
+
+    def grant_other_then_read(root, **kw):
+        monkeypatch.setattr(registry_mod, "read_tree", real)
+        grant_plugin(project.project, "other", store_project=project.project)
+        return real(root, **kw)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        monkeypatch.setattr(registry_mod, "read_tree", grant_other_then_read)
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "changed while this was being decided" in _errors(screen))
+
+    grants = store.load_grants(project.project)
+    assert grants.get("other") is not None
+    assert grants.get("hooky") is None
+
+
+async def test_failed_validate_records_no_grant(project):
+    """A save the validate round-trip blocks writes nothing — neither policy.toml
+    nor the grant the toggle asked for.
+
+    ABLATION: record the grant before `PolicyDoc.validate` in `action_save` and the
+    blocked save leaves it in the store."""
+    write_policy_enabling_unity(project)
+    before = (project.project / POLICY_FILE).read_bytes()
+    write_hook_plugin(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        screen.query_one("#plugins-unity-editor_mode", Select).value = "shared"
+        screen.query_one("#scm-isolation", Select).value = "worktree"  # invalid with shared
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "isolation" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)  # save blocked
+
+    assert not runs.plugin_grants_path(project.project).exists()
+    assert store.load_grants(project.project).records == ()
+    assert (project.project / POLICY_FILE).read_bytes() == before
+
+
+async def test_unrelated_save_never_reblesses_a_changed_plugin(project):
+    """A granted plugin edited afterwards keeps its old grant through a save that
+    only touches a core field. The save is judged against the grants as stored,
+    so it is refused with the accept pointer, the same refusal a launch gives —
+    and nothing is re-pinned or written.
+
+    ABLATION: treat every toggled-on project plugin whose status isn't `granted`
+    as one to grant in `_grant_flips` and the save re-pins the edited bytes."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    old = grant_plugin(project.project, "hooky", store_project=project.project).records[0]
+    (pdir / "extra.py").write_text("print('new')\n", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert screen.query_one("#plugin-enabled-hooky", Switch).value is True
+        screen.query_one("#limits-max_review_cycles", Input).value = "5"
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "plugins accept hooky" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)
+
+    assert store.load_grants(project.project).get("hooky") == old
+    assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
+
+
+async def test_mismatched_plugin_shows_accept_pointer(project):
+    """A plugin changed since its grant says so on its row and names the CLI verb
+    that re-pins it; its toggle stays on, so toggling it off still revokes."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("echo hi", "echo bye"), encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen) == "changed — run `bmad-loop plugins accept hooky`"
+        assert screen.query_one("#plugin-status-hooky").has_class("-attention")
+        assert screen.query_one("#plugin-enabled-hooky", Switch).value is True
+
+
+async def test_toggle_off_revokes(project):
+    """Toggling a granted project plugin off and saving drops its grant, leaving
+    policy.toml's [plugins] enabled alone.
+
+    ABLATION: drop the revoke arm of `_grant_flips` and the grant survives."""
+    write_policy(project)
+    write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen) == "granted"
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get("hooky") is None
+    assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
+
+
+async def test_toggle_off_revokes_a_grant_renamed_in_place(project):
+    """A granted plugin renamed in its own dir shows as changed under its new
+    name, and toggling it off revokes the grant it was recorded under.
+
+    ABLATION: revoke `info.name` in `_grant_flips` and the old grant survives."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("hooky", "hooky2"), encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen, "hooky2") == "changed — run `bmad-loop plugins accept hooky2`"
+        toggle = screen.query_one("#plugin-enabled-hooky2", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).records == ()
+
+
+async def test_toggle_off_revokes_the_grant_of_a_plugin_stripped_of_its_hooks(project):
+    """A granted plugin that lost its whole surface keeps a toggle (on), so the
+    stale grant a launch refuses on can be revoked here; left on, the save is
+    blocked with the same refusal.
+
+    ABLATION: build `grant_required` from `needs_grant` alone in `build_registry`
+    and the plugin has no toggle to turn off."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    (pdir / PLUGIN_FILE).write_text('[plugin]\nname = "hooky"\napi_version = 1\n')
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert "`bmad-loop plugins revoke hooky`" in _status(screen)
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert "no longer has any hooks" in _errors(screen)
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).records == ()
+
+
+async def test_a_grant_whose_plugin_is_gone_is_named_and_blocks_the_save(project):
+    """A grant no discovered plugin claims has no row to toggle: the screen names
+    it with the revoke that clears it, and a save is refused as a launch would be.
+
+    ABLATION: drop the `missing_grants` banner in `_compose_plugins` and the
+    screen never mentions the grant."""
+    from textual.widgets import Static
+
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    shutil.rmtree(pdir)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        [banner] = screen.query(".plugin-grant-missing").results(Static)
+        assert "`bmad-loop plugins revoke hooky`" in str(banner.content)
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert "no longer discovered" in _errors(screen)
+        assert not isinstance(app.screen, DashboardScreen)
+
+    assert store.load_grants(project.project).get("hooky") is not None
+
+
+async def test_toggle_off_drops_a_legacy_enabled_entry(project):
+    """A granted project plugin still named in [plugins] enabled (the upgrade case)
+    can be toggled off: its name leaves the list with its grant, or the revoked
+    grant would read as "enabled but never granted" and block the save. Names the
+    UI doesn't manage stay.
+
+    ABLATION: drop `revoked` from `_save_enabled`'s dropped set and the save is
+    blocked with the `plugins enable hooky` pointer, the grant still recorded."""
+    path = project.project / POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[plugins]\nenabled = ["ghost", "hooky"]\n', encoding="utf-8")
+    write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get("hooky") is None
+    assert policy_mod.load(path).plugins.enabled == ("ghost",)
+
+
+async def test_toggle_off_clears_an_ungranted_legacy_entry(project):
+    """A project plugin named in [plugins] enabled but never granted (the upgrade
+    case before any grant) starts on, with a row pointing at `plugins enable`, so
+    toggling it off drops the legacy entry and the save goes through. Left off,
+    the fatal "enabled but never granted" state would block every save with no
+    toggle to clear it. Nothing is granted.
+
+    ABLATION: drop the ``info.enabled`` arm of `_initial_toggle` and the toggle
+    starts off, so there is nothing to flip and the save stays blocked."""
+    path = project.project / POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[plugins]\nenabled = ["ghost", "hooky"]\n', encoding="utf-8")
+    write_hook_plugin(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen) == (
+            "enabled, not granted — run `bmad-loop plugins enable hooky` or toggle off"
+        )
+        assert screen.query_one("#plugin-status-hooky").has_class("-attention")
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get("hooky") is None
+    assert policy_mod.load(path).plugins.enabled == ("ghost",)
+
+
+async def test_toggle_on_refuses_to_overwrite_an_unreadable_store(project):
+    """A grant store that exists but can't be read is never rewritten — its
+    grants would be lost — so the toggle's save is blocked and both files stay.
+
+    ABLATION: drop the fault arm of `_candidate_grants` and the store is replaced."""
+    write_policy(project)
+    write_hook_plugin(project.project)
+    path = runs.plugin_grants_path(project.project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert screen.query("#plugin-grants-fault")
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "could not be read" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)
+
+    assert path.read_text(encoding="utf-8") == "{not json"
+    assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
+
+
+async def test_save_surfaces_a_grant_store_that_went_bad(project, monkeypatch):
+    """A grant store that turns unreadable after the screen opened (no open-time
+    banner) and a save that flips no plugin toggle: the policy still saves — it
+    doesn't touch grants — but the success toast becomes a warning naming the
+    fault, since a launch will refuse every project plugin that needs a grant.
+
+    ABLATION: drop the fault arm in `action_save` and the toast is plain success."""
+    write_policy(project)
+    write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    toasts: list[tuple[str, str]] = []
+    real_notify = BmadLoopApp.notify
+
+    def notify(self, message, *, severity="information", **kwargs):
+        toasts.append((str(message), severity))
+        return real_notify(self, message, severity=severity, **kwargs)
+
+    monkeypatch.setattr(BmadLoopApp, "notify", notify)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert not screen.query("#plugin-grants-fault")
+        runs.plugin_grants_path(project.project).write_text("{not json", encoding="utf-8")
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    saved = [(m, s) for m, s in toasts if m.startswith("policy saved")]
+    assert len(saved) == 1
+    message, severity = saved[0]
+    assert severity == "warning"
+    assert "plugin grants could not be read" in message
+
+
+async def test_settings_screen_discovers_from_repo_root(project, tmp_path):
+    """Plugins are discovered from the code root a run loads (`repo_root`), as
+    `bmad-loop plugins` and a launch do, while the grant stays keyed by the
+    project. A plugin only the project dir holds is not what a run loads.
+
+    ABLATION: build the registry from `project` instead of the code root and the
+    code root's plugin has no row."""
+    write_policy(project)
+    write_hook_plugin(project.project, "ignored")
+    code_root = tmp_path / "code"
+    pdir = write_hook_plugin(code_root)
+    write_repo_root_override(project, code_root)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert not screen.query("#plugin-enabled-ignored")
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    record = store.load_grants(project.project).get("hooky")
+    assert record is not None and record.digest == read_tree(pdir).digest
+    assert record.path == (USER_PLUGINS_REL / "hooky").as_posix()
+
+
+PY_PLUGIN_MANIFEST = (
+    '[plugin]\nname = "pyplug"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n'
+)
+PY_PLUGIN_MODULE = (
+    "from pathlib import Path\nfrom bmad_loop.plugins import Plugin\n"
+    "Path({marker!r}).write_text('ran')\n"
+    "class P(Plugin):\n    pass\n"
+)
+
+
+def test_validate_never_execs_an_ungranted_project_module(tmp_path):
+    """`PolicyDoc.validate` builds the registry against the grants it is handed:
+    an ungranted project module named in [plugins] enabled fails with the verb
+    that grants it, before anything executes. Granted, the same module runs —
+    which is the human-present enable moment of a TUI toggle.
+
+    ABLATION: drop `grants=` from validate's `PluginRegistry.build` call and the
+    granted leg is refused too; delete the registry's fatal raise and the
+    ungranted leg runs the module."""
+    marker = tmp_path / "marker.txt"  # absolute, outside the plugin dir and its snapshot
+    pdir = tmp_path / USER_PLUGINS_REL / "pyplug"
+    pdir.mkdir(parents=True)
+    (pdir / PLUGIN_FILE).write_text(PY_PLUGIN_MANIFEST, encoding="utf-8")
+    (pdir / "hooks.py").write_text(PY_PLUGIN_MODULE.format(marker=str(marker)), encoding="utf-8")
+    doc = PolicyDoc.load(tmp_path / "missing.toml")
+    doc.set("plugins", "enabled", ["pyplug"])
+
+    error = doc.validate(project=tmp_path, grants=GrantSet.empty())
+    assert error is not None and "bmad-loop plugins enable pyplug" in error
+    assert not marker.exists()
+    error = doc.validate(project=tmp_path)  # no grants given: fail closed
+    assert error is not None and "bmad-loop plugins enable pyplug" in error
+    assert not marker.exists()
+
+    assert doc.validate(project=tmp_path, grants=grant_plugin(tmp_path, "pyplug")) is None
+    assert marker.read_text() == "ran"

@@ -2949,6 +2949,200 @@ def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
     assert not digest.exists()
 
 
+# ------------------------------------------- plugin grant store (#496/#497)
+
+
+def test_plugin_grants_absent_is_silent_and_fault_is_reported(tmp_path, monkeypatch):
+    """Absence is the one silent answer — no grants were ever recorded — and the
+    store lives out of the project tree. Every other unreadable shape carries a
+    fault: a grant store nobody can read must not look like one nobody wrote, or a
+    tampered path would quietly launch with no grants and no word said.
+
+    ABLATION: fold `FileNotFoundError` into the generic open-fault arm and the
+    first assert fails; return `(None, None)` from the path arm and the last
+    fails."""
+    project = tmp_path / "proj"
+    (project / ".bmad-loop").mkdir(parents=True)
+
+    assert runs.read_plugin_grants_text(project) == (None, None)
+
+    runs.write_plugin_grants_text(project, '{"plugins": {}, "version": 1}\n')
+    path = runs.plugin_grants_path(project)
+    assert path == runs.project_state_root(project) / "plugin-grants.json"
+    # byte-exact on every platform: no win32 newline translation (the size cap counts these bytes)
+    assert runs.read_plugin_grants_text(project) == ('{"plugins": {}, "version": 1}\n', None)
+    assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
+
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+    text, fault = runs.read_plugin_grants_text(project)
+    assert text is None
+    assert fault is not None and "state root" in fault and "no root" in fault
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_plugin_grants_read_refuses_a_fifo(tmp_path):
+    """A FIFO planted at the store would wedge a foreground launch on an open for
+    reading, and a fed one would hand the launch session-chosen grants. Both are
+    refused on the descriptor's shape. Alarm-guarded: the failure mode is a hang.
+
+    ABLATION: drop `O_NONBLOCK` and the alarm fires; drop the `S_ISREG` check and
+    the fed FIFO's text comes back as the store."""
+    import signal
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the read blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert runs.read_plugin_grants_text(project) == (None, f"{path}: not a regular file")
+        holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(holder, b'{"plugins": {}, "version": 1}\n')
+            assert runs.read_plugin_grants_text(project) == (
+                None,
+                f"{path}: not a regular file",
+            )
+        finally:
+            os.close(holder)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_plugin_grants_read_is_bounded(tmp_path):
+    """A link to an endless source would read until `MemoryError`; the cap removes
+    the condition. Over the cap is refused outright, never truncated — a cut-off
+    JSON document would only fail to decode one layer up. The bound is asserted ON
+    THE READ (the requested counts), not on what comes back.
+
+    ABLATION: slurp the file with no bound and the requested total exceeds the
+    cap; drop the over-cap refusal and the fault assert fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"a" * (runs._MAX_GRANTS_BYTES + 4096))
+
+    requested: list[int] = []
+    real_read = os.read
+
+    def _spy(fd: int, n: int) -> bytes:
+        requested.append(n)
+        return real_read(fd, n)
+
+    with mock.patch.object(runs.os, "read", _spy):
+        text, fault = runs.read_plugin_grants_text(project)
+
+    assert text is None
+    assert fault == f"{path}: larger than {runs._MAX_GRANTS_BYTES} bytes"
+    assert requested, "the spy saw no read at all — the assertion below would be vacuous"
+    assert sum(requested) <= runs._MAX_GRANTS_BYTES + 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_read_does_not_follow_a_planted_symlink(tmp_path):
+    """`O_NOFOLLOW`: a link at the store's name is a fault, not a redirect to
+    grants a session wrote somewhere else.
+
+    ABLATION: drop `O_NOFOLLOW` and the target's text comes back as the store."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"plugins": {}, "version": 1}\n')
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(elsewhere)
+
+    text, fault = runs.read_plugin_grants_text(project)
+    assert text is None
+    assert fault is not None and fault.startswith(f"{path}: cannot open: ")
+
+
+def test_plugin_grants_read_reports_undecodable_bytes(tmp_path):
+    """Garbage bytes are a named fault, never absence and never the bytes
+    themselves (they are session-chosen, headed for an operator's terminal).
+
+    ABLATION: return `(None, None)` from the decode arm and this fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00garbage")
+
+    assert runs.read_plugin_grants_text(project) == (None, f"{path}: not UTF-8 text")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_writer_replaces_a_planted_symlink(tmp_path):
+    """A link planted at the store's name is replaced, never written through: the
+    store sits beside the state dirs whose paths sessions are handed.
+
+    ABLATION: swap the writer for `atomic_write_text(path, ...)` at its
+    follow-the-link default and the target below is what gets written."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = tmp_path / "outside.json"
+    target.write_text("untouched")
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    runs.write_plugin_grants_text(project, "{}\n")
+
+    assert target.read_text() == "untouched"
+    assert not path.is_symlink()
+    assert runs.read_plugin_grants_text(project) == ("{}\n", None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_writer_refuses_a_symlinked_state_component(tmp_path, monkeypatch):
+    """#593 at this site: the `mkdir` accepts a symlinked `<project key>/`, so the
+    write itself must refuse it, or the grants land wherever the link points. The
+    confinement root is the STATE ROOT — rooted at the store's own parent, the walk
+    would check no component a session can reach.
+
+    ABLATION: revert the call to `atomic_write_text(path, text,
+    follow_symlinks=False)`, or root it at `path.parent`, and this fails `DID NOT
+    RAISE` with the store published in `outside/`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / runs.project_tag(project)).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs.write_plugin_grants_text(project, "{}\n")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_plugin_grants_writer_refuses_a_store_its_reader_would_refuse(tmp_path, monkeypatch):
+    """The write and read caps agree: a store the next launch would refuse as
+    oversized is never published, so a grant that reported success is readable.
+
+    ABLATION: drop the writer's size check and the over-cap text is written, then
+    read back as a fault."""
+    monkeypatch.setattr(runs, "_MAX_GRANTS_BYTES", 8)
+    project = tmp_path / "proj"
+    project.mkdir()
+    runs.write_plugin_grants_text(project, "{}\n")
+
+    with pytest.raises(OSError, match="over the 8-byte read cap"):
+        runs.write_plugin_grants_text(project, '{"plugins": {}}\n')
+
+    assert runs.read_plugin_grants_text(project) == ("{}\n", None)
+
+
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
     """A pre-digest tag stays ours; another project's path or digest stays foreign."""
     legacy = str(tmp_path.resolve())
@@ -8146,6 +8340,36 @@ def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_pa
     assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
     assert not orphan.exists()
     assert runs.mux_registry_root(tmp_path).exists()
+
+
+def test_reconcile_orphan_state_dirs_never_reaps_plugin_snapshots(tmp_path):
+    """Live runs execute plugin hooks and modules from the snapshots root, and its
+    name is never a live run dir's, so without its own arm the sweep reaps it as an
+    orphan — pulling the code out from under a hook the bus is about to spawn. The
+    real orphan beside it is the other half: the arm must not stop the sweep.
+
+    ABLATION: drop the PLUGIN_SNAPSHOTS_DIR arm in `reconcile_orphan_state_dirs`
+    and this fails with the snapshots root among the reaped."""
+    snap = runs.plugin_snapshots_root(tmp_path) / ("ab" * 32)
+    snap.mkdir(parents=True)
+    (snap / "plugin.toml").write_text('[plugin]\nname = "p"\n')
+    orphan = _seed_state_dir(tmp_path, "20260101-000000-dead")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
+    assert (snap / "plugin.toml").is_file()
+    assert not orphan.exists()
+
+
+def test_plugin_snapshots_dir_can_never_collide_with_a_run(tmp_path):
+    """`--run-id` is caller-supplied, so a run whose id spelled the snapshots dir
+    would key its state dir onto the code live runs execute. The leading
+    underscore makes that unreachable: RUN_ID_RE requires an alphanumeric first
+    character. Ablate it (name the dir `plugin-snapshots`) and this fails."""
+    assert not runs.is_valid_run_id(runs.PLUGIN_SNAPSHOTS_DIR)
+    assert runs.is_valid_run_id(runs.PLUGIN_SNAPSHOTS_DIR.lstrip("_"))
+    assert runs.plugin_snapshots_root(tmp_path) == (
+        runs.project_state_root(tmp_path) / runs.PLUGIN_SNAPSHOTS_DIR
+    )
 
 
 def _healthy_leftovers(project, **kw):

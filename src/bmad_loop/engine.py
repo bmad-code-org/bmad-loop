@@ -87,7 +87,7 @@ from .platform_util import (
     safe_segment,
     unlink_confined,
 )
-from .plugins import HookBus, HookContext, PluginRegistry
+from .plugins import GrantSet, HookBus, HookContext, PluginRegistry, PluginTrustError, Refusal
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import (
@@ -880,6 +880,7 @@ class Engine:
         sweep_factory: SweepFactory | None = None,
         registry: PluginRegistry | None = None,
         retro_adapter: CodingCLIAdapter | None = None,
+        plugin_grants: GrantSet = GrantSet.empty(),
     ):
         self.paths = paths
         # where code+git work + artifact reads happen. isolation="none" (today's
@@ -923,9 +924,26 @@ class Engine:
         # records the live plugins only when at least one binds a stage. The
         # game-engine layer (Unity) is now itself a plugin: enabling it in
         # [plugins] gives it lifecycle hooks that gate/manage the Editor.
-        self._registry = (
-            registry if registry is not None else PluginRegistry.build(self.paths.repo_root, policy)
-        )
+        # `plugin_grants` is the launch's frozen grant set (#496/#497); the
+        # default, none, refuses every project plugin with an executable surface
+        # — a layer this deep never reads the grant store itself.
+        #
+        # Refusals are journaled HERE, not by the registry (it gets no journal, see
+        # above), one `plugin-refused` per refused plugin and only when there is
+        # one, so a zero-plugin run's journal is unchanged. A fatal verdict
+        # (granted-then-changed, enabled-but-ungranted) aborts the engine before any
+        # plugin ran; it is recorded with `fatal=True` first, so the run dir — a
+        # resume, or the auto-sweep child's own — says why it never started.
+        if registry is None:
+            try:
+                registry = PluginRegistry.build(self.paths.repo_root, policy, grants=plugin_grants)
+            except PluginTrustError as e:
+                for refusal in e.refusals:
+                    self._journal_plugin_refusal(refusal, fatal=True)
+                raise
+            for refusal in registry.refusals:
+                self._journal_plugin_refusal(refusal, fatal=False)
+        self._registry = registry
         # let every in-process plugin reject an incompatible config at startup
         # (e.g. the Unity plugin's editor_mode↔scm.isolation coupling) so the run
         # fails fast rather than mid-unit.
@@ -1053,6 +1071,19 @@ class Engine:
             f"warning: notify.desktop is set but no desktop notifier is available "
             f"on {sys.platform}; desktop alerts are silently skipped — {channel}.",
             file=sys.stderr,
+        )
+
+    def _journal_plugin_refusal(self, refusal: Refusal, *, fatal: bool) -> None:
+        """One `plugin-refused` row for a plugin the registry gate refused (#496/#497).
+        ``fatal`` separates a refusal that aborts the engine from an inert plugin the
+        run goes on without; ``reason`` is the operator-facing message."""
+        self.journal.append(
+            "plugin-refused",
+            plugin=refusal.name,
+            reason=refusal.reason,
+            origin=refusal.origin,
+            path=refusal.path,
+            fatal=fatal,
         )
 
     def run(self) -> RunSummary:

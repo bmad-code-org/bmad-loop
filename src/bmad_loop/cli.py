@@ -58,6 +58,7 @@ from .documents import CLEANUP_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import CONFIRM_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import DECISIONS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import LIST_SCHEMA_VERSION  # noqa: F401 — re-export
+from .documents import PLUGINS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import STATUS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import VALIDATE_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import (
@@ -66,6 +67,7 @@ from .documents import (
     confirm_document,
     decisions_document,
     list_document,
+    plugins_document,
     run_token_totals,
     status_document,
     validate_document,
@@ -112,6 +114,7 @@ if TYPE_CHECKING:
     # Type-only: annotate the profile-lookup map without a module-level adapter
     # import (cli.py imports the adapter package lazily inside functions).
     from .adapters.profile import CLIProfile
+    from .plugins import GrantSet
 
 POLICY_FILE = policy_mod.POLICY_FILE
 
@@ -399,6 +402,85 @@ def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
         raise SystemExit(f"error: {e}") from e
 
 
+def _launch_plugin_grants(project: Path) -> GrantSet:
+    """Read the project's plugin grants ONCE, for a human-present launch (`cmd_run`,
+    `cmd_sweep`, resume) — #496/#497.
+
+    The returned set is frozen and threaded down: to the preflight, to `compose_*`
+    and the engine's registry build, and into the `_sweep_factory` closure, so the
+    auto-sweep child is judged against the grants this launch read and never
+    re-reads the store (a session could write it between launch and trigger as
+    easily as it writes the plugin dir). Nothing below a launch site reads the
+    store.
+
+    Observation, so it never raises: an unreadable or malformed store is warned
+    about and treated as no grants — which refuses every project plugin that
+    needs one (fail closed), never one that runs unverified."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); treating as none",
+            file=sys.stderr,
+        )
+    return grants
+
+
+def _fatal_trust_messages(verdicts, grants: GrantSet) -> list[str]:
+    """Every fatal plugin-trust refusal in a `registry.preflight` result: each fatal
+    per-manifest verdict, then each grant no discovered plugin claims
+    (`grants.unclaimed`). Shared by the launch preflight and the dry-run banner so
+    the preview refuses on exactly what the real launch does."""
+    from .plugins.grants import fatal_message, missing_message, unclaimed
+
+    fatal = [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+    fatal += [
+        missing_message(r.name, r.path) for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return fatal
+
+
+def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) -> int | None:
+    """Refuse a launch whose plugins the registry gate would refuse fatally, before
+    the launch's first side effect (#496/#497).
+
+    Judges every discovered plugin exactly as `PluginRegistry.build` will
+    (`registry.preflight`: manifests and hashing only, no plugin code runs). A fatal
+    verdict — a granted plugin that changed or vanished, a name in `[plugins]
+    enabled` with no grant, a granted dir that cannot be read — prints its fix and returns
+    FAILURE. A never-granted, un-enabled plugin is inert, not an error: it gets a
+    `note:` and the launch goes on without it. Never prompts.
+
+    This is a preflight, not the gate: the engine's build re-judges and raises on
+    its own, so a path that skips this (or a plugin that changes after it) is still
+    refused."""
+    from .plugins import PluginError
+    from .plugins.grants import TrustState
+    from .plugins.registry import preflight
+
+    try:
+        # materialize: a granted plugin's snapshot write fails HERE, not from the
+        # engine's registry build after a resume has re-armed its run.
+        verdicts = preflight(paths.repo_root, pol, grants, materialize=True)
+    except PluginError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return ExitCode.FAILURE
+    fatal = _fatal_trust_messages(verdicts, grants)
+    for message in fatal:
+        print(f"error: {message}", file=sys.stderr)
+    if fatal:
+        return ExitCode.FAILURE
+    for m, v, rel in verdicts:
+        if v.state is TrustState.REFUSED:
+            print(
+                f'note: plugin "{m.name}" ({rel}) is not granted and will not run; '
+                f"review it, then run `bmad-loop plugins enable {m.name}` to grant it",
+                file=sys.stderr,
+            )
+    return None
+
+
 def _trusted_config_digest(pol, project: Path, *, profiles=None) -> str:
     """The launch-time integrity baseline the auto-sweep child is held to (#461
     point 4). Thin wrapper over :func:`runsetup.config_digest` for the two
@@ -589,7 +671,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # under isolation = "none" points it at another checkout), so read the manifests
     # that run will load. A failed BMAD config already failed above; fall back to
     # the project dir so the manifest check still reports something.
-    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
+    plugin_root = paths.repo_root if paths is not None else project
+    _validate_plugin_manifests(plugin_root, report)
+    _validate_plugin_trust(plugin_root, project, pol, report)
 
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
@@ -1439,6 +1523,294 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plugins(args: argparse.Namespace) -> int:
+    """List discovered plugins with their trust grants, or grant/re-pin/revoke a
+    project plugin (#496/#497): `plugins [list]`, `plugins enable <name>`,
+    `plugins accept <name>`, `plugins revoke <name>`.
+
+    A grant is the operator's record of the sha256 of a project plugin's whole
+    directory, kept OUT of the tree (`runs.plugin_grants_path`) because the tree
+    and its policy.toml are agent-writable. For a project plugin the grant
+    subsumes `[plugins] enabled`, so this verb never writes policy.toml; a
+    builtin's in-process module is still enabled there. Discovery reads the code
+    root a run loads (`paths.repo_root`); the store is keyed by the project.
+    Never prompts. `list` exits 0 whatever it finds — `validate` owns the verdict
+    (`plugins.trust`)."""
+    project = _project(args)
+    action = args.action or "list"
+    if action != "list":
+        if getattr(args, "json", False):
+            print(
+                f"error: --json applies to `bmad-loop plugins list`, not `plugins {action}`",
+                file=sys.stderr,
+            )
+            return ExitCode.USAGE
+        if not args.name:
+            print(
+                f"error: `plugins {action}` requires a plugin name "
+                "(run `bmad-loop plugins` to list)",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    elif args.name:
+        print("error: `plugins list` takes no plugin name", file=sys.stderr)
+        return ExitCode.FAILURE
+
+    if action == "revoke":
+        return _plugins_revoke(project, args.name)
+    root = bmadconfig.load_paths(project).repo_root
+    if action in ("enable", "accept"):
+        return _plugins_grant(project, root, args.name, accept=action == "accept")
+    return _plugins_list(project, root, args)
+
+
+def _plugin_roster(root: Path, pol, grants: GrantSet):
+    """((manifest, verdict, row) per discovered plugin, missing rows): the verdict
+    a launch would reach (`registry.preflight`) plus the digests `plugins --json`
+    reports, then a ``missing`` row per grant no discovered plugin claims
+    (`grants.unclaimed`; a launch refuses on each). Manifests and hashing only —
+    no plugin code runs. Raises `PluginError` on a discovery fault."""
+    from .documents import PluginRow
+    from .plugins import PluginError
+    from .plugins.digest import read_tree
+    from .plugins.grants import TRUSTED_SOURCES, grant_status, needs_grant, unclaimed
+    from .plugins.registry import preflight
+    from .plugins.trust import enabled_names
+
+    enabled = enabled_names(pol)
+    roster = []
+    verdicts = preflight(root, pol, grants)
+    for m, v, rel in verdicts:
+        required = needs_grant(m)
+        record = grants.get(v.grant) if v.grant is not None else None
+        current = None
+        if required:
+            try:
+                current = read_tree(Path(m.scripts_dir)).digest
+            except PluginError:
+                current = None  # the verdict (or the status column) names the fault
+        row = PluginRow(
+            name=m.name,
+            origin=m.source,
+            # the grant key for a project plugin; the install location for a builtin
+            path=Path(m.scripts_dir).as_posix() if m.source in TRUSTED_SOURCES else rel,
+            hooks=bool(m.hooks),
+            workflows=bool(m.workflows),
+            python=m.python is not None,
+            seeds=bool(m.seed_files or m.seed_globs),
+            grant_required=required,
+            status=grant_status(m, v),
+            enabled=m.name in enabled,
+            active=v.active,
+            pinned_digest=record.digest if record is not None else None,
+            current_digest=current,
+            changed=v.changed,
+        )
+        roster.append((m, v, row))
+    missing = [
+        PluginRow(
+            name=r.name,
+            origin="project",
+            path=r.path,
+            hooks=False,
+            workflows=False,
+            python=False,
+            seeds=False,
+            grant_required=True,
+            status="missing",
+            enabled=r.name in enabled,
+            active=False,
+            pinned_digest=r.digest,
+            current_digest=None,
+        )
+        for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return roster, missing
+
+
+def _plugins_list(project: Path, root: Path, args: argparse.Namespace) -> int:
+    from .plugins import store
+
+    pol = policy_mod.load(_policy_path(project))
+    grants = store.load_grants(project)
+    roster, missing = _plugin_roster(root, pol, grants)
+    rows = [row for _m, _v, row in roster] + missing
+    if getattr(args, "json", False):
+        machine.emit(plugins_document(rows, grants.fault))
+        return ExitCode.OK
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); "
+            "every project plugin is listed as ungranted",
+            file=sys.stderr,
+        )
+    header = ("NAME", "ORIGIN", "SURFACE", "GRANT", "ENABLED", "PATH")
+    table = [
+        (
+            r.name,
+            r.origin,
+            ",".join(
+                s
+                for s, on in (
+                    ("hooks", r.hooks),
+                    ("workflows", r.workflows),
+                    ("python", r.python),
+                    ("seeds", r.seeds),
+                )
+                if on
+            )
+            or "-",
+            r.status,
+            "yes" if r.enabled else "no",
+            r.path,
+        )
+        for r in rows
+    ]
+    if not table:
+        print("no plugins discovered")
+        return ExitCode.OK
+    widths = [max(len(str(c)) for c in col) for col in zip(header, *table, strict=False)]
+    for line in (header, *table):
+        print("  ".join(str(c).ljust(w) for c, w in zip(line, widths, strict=True)).rstrip())
+    return ExitCode.OK
+
+
+def _load_grants_for_write(project: Path) -> GrantSet | None:
+    """The store a grant verb rewrites, or None (after the error line) when it
+    exists but cannot be read: rewriting it then would silently discard every
+    grant it holds, so the operator fixes or removes it first."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"error: plugin grants could not be read ({grants.fault}); fix or remove "
+            "the grant store, then re-run — rewriting it now would discard every grant "
+            "it holds",
+            file=sys.stderr,
+        )
+        return None
+    return grants
+
+
+def _save_grants_or_report(project: Path, grants: GrantSet, *, seen: GrantSet) -> bool:
+    """Write ``grants`` unless the store moved off ``seen``, the store this verb
+    read and decided against (a concurrent mutation would otherwise be erased)."""
+    from .plugins import store
+
+    try:
+        store.save_grants(project, grants.records, expected=seen)
+    except store.GrantStoreChanged as e:
+        print(f"error: {e}", file=sys.stderr)
+        return False
+    except (OSError, runs.StateRootError) as e:
+        print(
+            f"error: could not write the plugin grants to {runs.plugin_grants_path(project)}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int:
+    """`plugins enable <name>` (first grant) / `plugins accept <name>` (re-pin a
+    changed one). Hashes the plugin dir — never imports or runs it — and records
+    the digest in the out-of-tree store. Never writes policy.toml."""
+    from .plugins import store
+    from .plugins.digest import diff_files
+    from .plugins.grants import TRUSTED_SOURCES, GrantRecord, TrustState, needs_grant
+    from .plugins.registry import preflight, read_bound_tree
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    found = [(m, v, rel) for m, v, rel in preflight(root, None, grants) if m.name == name]
+    if not found:
+        print(
+            f'error: no plugin named "{name}" discovered under {root} '
+            "(run `bmad-loop plugins` to list)",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    [(m, verdict, rel)] = found
+    if not needs_grant(m):
+        if m.source in TRUSTED_SOURCES:
+            why = (
+                f"is a {m.source} plugin, trusted by provenance and never granted; "
+                "its in-process module is enabled by naming it in [plugins] enabled "
+                "(.bmad-loop/policy.toml) or toggling it in the TUI settings screen"
+            )
+        else:
+            why = (
+                "has no executable surface (no hooks, workflows, [python] or seeds), "
+                "so it loads without a grant"
+            )
+            if verdict.grant is not None:
+                why += f"; drop the grant it had with `bmad-loop plugins revoke {verdict.grant}`"
+        print(f'error: plugin "{name}" {why}', file=sys.stderr)
+        return ExitCode.FAILURE
+
+    record = grants.get(verdict.grant) if verdict.grant is not None else None
+    if accept and record is None:
+        print(
+            f'error: plugin "{name}" has no grant to accept; review it, then run '
+            f"`bmad-loop plugins enable {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    if record is not None and verdict.state is TrustState.GRANTED:
+        print(f'plugin "{name}" unchanged: sha256:{record.digest[:12]} is already granted')
+        return ExitCode.OK
+    if not accept and record is not None:
+        print(
+            f'error: plugin "{name}" changed since it was granted ({verdict.reason}); '
+            f"review it, then run `bmad-loop plugins accept {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+
+    tree = read_bound_tree(m)  # a PluginError is main()'s `error:` rc 1
+    base = grants
+    if record is not None:
+        if record.name != name:
+            # re-key a grant whose manifest was renamed in place
+            print(f"renamed: {record.name} -> {name}")
+            base = store.remove(grants, record.name)
+        if record.path != rel:
+            print(f"moved: {record.path} -> {rel}")
+        added, removed, changed = diff_files(record.file_map(), tree.file_map())
+        for label, rels in (("added", added), ("removed", removed), ("changed", changed)):
+            for r in rels:
+                print(f"{label}: {r}")
+    granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    new = store.upsert(base, GrantRecord.from_tree(name, rel, tree, granted_at))
+    if not _save_grants_or_report(project, new, seen=grants):
+        return ExitCode.FAILURE
+    print(
+        f'plugin "{name}" granted: sha256:{tree.digest[:12]} ({len(tree.files)} files) '
+        f"in {runs.plugin_grants_path(project)}"
+    )
+    return ExitCode.OK
+
+
+def _plugins_revoke(project: Path, name: str) -> int:
+    """`plugins revoke <name>`: drop the grant, so the plugin is inert again (or,
+    still named in `[plugins] enabled`, fails the next launch). Needs no plugin
+    dir — a deleted plugin's grant can still be revoked."""
+    from .plugins import store
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    if grants.get(name) is None:
+        print(f'error: plugin "{name}" has no grant to revoke', file=sys.stderr)
+        return ExitCode.FAILURE
+    if not _save_grants_or_report(project, store.remove(grants, name), seen=grants):
+        return ExitCode.FAILURE
+    print(f'plugin "{name}" grant revoked in {runs.plugin_grants_path(project)}')
+    return ExitCode.OK
+
+
 def _skill_trees(project: Path, pol) -> list[str]:
     """The skill trees this run's dev-primitive adapters read, one per distinct name.
 
@@ -1598,6 +1970,20 @@ def _warn_bypass_dropped(
                 )
 
 
+def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
+    """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
+    banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
+    from .plugins import PluginError, store
+    from .plugins.registry import preflight
+
+    grants = store.load_grants(paths.project)
+    try:
+        verdicts = preflight(paths.repo_root, pol, grants)
+    except PluginError as e:
+        return [str(e)]
+    return _fatal_trust_messages(verdicts, grants)
+
+
 def _warn_preflight_would_abort(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -1645,7 +2031,11 @@ def _warn_preflight_would_abort(
 
     ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
-    preview must not promise an abort over it."""
+    preview must not promise an abort over it.
+
+    The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
+    fatal verdicts only: an inert never-granted plugin does not abort the launch.
+    It reads the grant store the way the launch would, without its warning."""
     trees = _skill_trees(paths.project, pol)
     problems = [
         p.message
@@ -1667,6 +2057,7 @@ def _warn_preflight_would_abort(
     except verify.GitError as e:
         problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
+    problems += _fatal_plugin_problems(paths, pol)
     if not problems:
         return
     print(
@@ -1948,6 +2339,91 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
             "plugins.manifests",
             f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
             {"plugins": names},
+        )
+
+
+def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationReport) -> None:
+    """Judge every discovered plugin against the operator's grants, as a launch
+    will (#496/#497) — `plugins.trust`.
+
+    `root` is the same code root `_validate_plugin_manifests` read; the grant
+    store is keyed by `project`. Uses `registry.preflight`, the verdict the
+    registry build reaches, so validate and a launch cannot disagree — and it
+    never builds the registry: manifests and hashing only, no plugin code runs.
+
+    A project plugin a launch would refuse is a problem whether the refusal is
+    fatal (changed since its grant, granted but no longer discovered, named in
+    `[plugins] enabled` without one, a granted dir that cannot be read) or inert (never granted: it silently would
+    not run). An unreadable store is a problem too — a launch treats it as no
+    grants. A discovery fault is skipped here: `plugins.manifests` already failed
+    on it, and the manifest warnings it reports are not repeated."""
+    import warnings
+
+    from .plugins import PluginError, store
+    from .plugins.grants import TrustState, fatal_message, missing_message
+
+    grants = store.load_grants(project)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # plugins.manifests reports a skipped manifest
+        try:
+            roster, missing = _plugin_roster(root, pol, grants)
+        except PluginError:
+            return  # plugins.manifests already failed on this discovery fault
+    failed = False
+    if grants.fault is not None:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            f"plugin grants could not be read ({grants.fault}); a launch treats this as "
+            "no grants and refuses every project plugin that needs one — fix or remove "
+            "the grant store",
+            {"fault": grants.fault},
+        )
+    for m, v, row in roster:
+        if not v.fatal and (not row.grant_required or v.state is TrustState.GRANTED):
+            continue
+        failed = True
+        if v.fatal:
+            msg = fatal_message(m.name, v)
+        else:
+            msg = (
+                f'plugin "{m.name}" ({row.path}) is not granted and will not run; review '
+                f"it, then run `bmad-loop plugins enable {m.name}` to grant it"
+            )
+        report.fail(
+            "plugins.trust",
+            msg,
+            {
+                "plugin": m.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": row.current_digest,
+                "changed": list(row.changed),
+            },
+        )
+    for row in missing:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            missing_message(row.name, row.path),
+            {
+                "plugin": row.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": None,
+                "changed": [],
+            },
+        )
+    if not failed:
+        granted = sorted(row.name for _m, _v, row in roster if row.status == "granted")
+        report.ok(
+            "plugins.trust",
+            f"plugin grants OK: {len(granted)} granted ({', '.join(granted) or 'none'})",
+            {"plugins": granted},
         )
 
 
@@ -2717,6 +3193,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
+    # #496/#497: the plugin grants are read ONCE, here, and refused against before
+    # the run dir exists; the same frozen set reaches the engine's registry build
+    # and the auto-sweep factory's closure, so no later layer reads the store.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+
     # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
     # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
     # both the factory's gate and the RunState stamp so the two cannot disagree.
@@ -2744,12 +3227,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_stories=args.max_stories,
         stories_on=stories_on,
         spec_folder=spec_folder,
-        sweep_factory=_sweep_factory(project, paths, trusted_digest),
+        sweep_factory=_sweep_factory(project, paths, trusted_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         trusted_config_digest=trusted_digest,
         profiles=profiles,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
@@ -2965,6 +3449,7 @@ def _start_sweep(
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
+    plugin_grants: GrantSet,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -2979,6 +3464,11 @@ def _start_sweep(
     # `on_started` is the auto-sweep parent's latch, likewise absent for
     # `cmd_sweep`; `compose_sweep` fires it at the boundary where this child owns a
     # published, resumable run dir.
+    #
+    # `plugin_grants` is required, with no default, for the reason `_sweep_factory`
+    # requires it: the launch's frozen read (#496/#497). A default would let a new
+    # caller silently refuse every granted plugin — or tempt one to read the store
+    # here, below the launch.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -2997,6 +3487,7 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         on_started=on_started,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
@@ -3011,7 +3502,13 @@ def _start_sweep(
     return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
-def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
+def _sweep_factory(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    trusted_digest: str,
+    *,
+    plugin_grants: GrantSet,
+):
     """Child-sweep launcher injected into story-run engines. Auto-triggered
     sweeps are unattended: never prompt, never run decision bundles.
 
@@ -3024,7 +3521,18 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     Required, with no default: an omitted baseline would silently disable the
     refusal, which is the failure mode a security gate can least afford. The
     re-read happens once and is frozen, so the gate validates the bytes the child
-    actually launches from rather than a separate read of the same files."""
+    actually launches from rather than a separate read of the same files.
+
+    ``plugin_grants`` is the launch's plugin grant set (#496/#497), read once by the
+    human-present caller (`_launch_plugin_grants`) and held here, in the closure,
+    beside ``trusted_digest`` — required and keyword-only for the same reason.
+    Unlike policy.toml it is NEVER re-read in ``factory``: the grant store is what
+    vouches for plugin bytes, and a session that can write a plugin dir mid-run can
+    wait for the next trigger; a store read here would let a grant recorded after
+    launch (by anyone) bless code no human launched. The child's registry build
+    judges the plugins on disk against these launch grants, so a plugin swapped
+    after launch raises out of the engine build — before ``started`` — and the
+    parent records ``sweep-auto-not-started``."""
 
     def factory(trigger: str, *, started: Callable[[], None]) -> None:
         pol = policy_mod.load(_policy_path(project))
@@ -3084,6 +3592,11 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         triage_tree = profiles["triage"].skill_tree
         if sweep_problems := install.missing_sweep_skill(project, [triage_tree]):
             raise RuntimeError("; ".join(p.message for p in sweep_problems))
+        # The launch's grants, from the closure — never `store.load_grants` here.
+        # ABLATION GUARDS: re-reading the store in this factory must fail
+        # test_auto_sweep_holds_the_launch_grants_not_the_store, and deleting the
+        # registry's fatal gate must fail
+        # test_auto_sweep_refuses_a_plugin_swapped_after_launch, in tests/test_cli.py.
         _start_sweep(
             project,
             paths,
@@ -3096,6 +3609,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             min_severity=None,
             profiles=profiles,
             on_started=started,
+            plugin_grants=plugin_grants,
         )
 
     return factory
@@ -3166,6 +3680,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
+    # #496/#497: read once and refuse before the run dir exists, as in `cmd_run`.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+
     return _start_sweep(
         project,
         paths,
@@ -3179,6 +3698,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
+        plugin_grants=plugin_grants,
     )
 
 
@@ -3523,6 +4043,17 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # ahead of every journal/pin/stop-request side effect below.
     if state.run_type == "sweep" and not _require_sweep_skill(project, pol):
         return 1
+    # #496/#497: the resume's plugin grants, read ONCE and refused against here —
+    # the last gate ahead of `Journal(run_dir)` and every pin/pause/pid/state side
+    # effect below, because `compose_resume` has no unwind: a plugin the registry
+    # build would refuse must not leave a `run-resume` row, a re-stamped pin or a
+    # cleared pause behind for a resume that never armed. The engine build still
+    # re-judges (the gate); this only moves the refusal ahead of the side effects.
+    # ABLATION GUARD: moving this below `Journal(run_dir)` must fail
+    # test_resume_refuses_a_mismatched_plugin_before_any_side_effect.
+    plugin_grants = _launch_plugin_grants(project)
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
     journal = Journal(run_dir)
     # Read the outgoing weight BEFORE the re-stamp below replaces it: the
     # session-end entries this run already wrote were weighted at it, so without
@@ -3798,7 +4329,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options
+    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
@@ -3825,7 +4356,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -3837,13 +4368,14 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         state=state,
         policy=pol,
         journal=journal,
-        sweep_factory=_sweep_factory(project, paths, new_digest),
+        sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,
+        plugin_grants=plugin_grants,
     )
     _warn_bypass_dropped(
         pol,
@@ -4186,6 +4718,31 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
 
+    # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
+    # so judge it here — ahead of the reverify/adopt dispatches (each persists its
+    # transition before resuming) and of the interactive session (a refusal after it
+    # throws the conversation away). The post-confirm re-check below stays: a plugin
+    # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
+    # launches nothing, so it is not judged. An unreadable config skips this early
+    # exit only; the resume's own config read refuses it, as before.
+    if args.resume is not False:
+        try:
+            trust_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            trust_paths = None
+        if (
+            trust_paths is not None
+            and (
+                rc := _reject_plugin_trust(
+                    trust_paths,
+                    policy_mod.load(_policy_path(project)),
+                    _launch_plugin_grants(project),
+                )
+            )
+            is not None
+        ):
+            return rc
+
     # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
     # as --adopt-branch, and likewise ahead of the interactive session it never runs.
     if reverify:
@@ -4444,6 +5001,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # resolve still writes nothing, and an operator who declines is not owed a
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+            return rc
+        # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
+        # for the same reason — a refusal after it has already spent the escalation.
+        # A re-arm-only resolve (`--no-resume`) launches nothing, so it is not judged.
+        if (
+            args.resume is not False
+            and (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None
+        ):
             return rc
     before_entries = runs.journal_entries_or_none(run_dir)
     outcome: runs.RearmOutcome | None = None
@@ -4846,6 +5411,9 @@ def _resolve_reverify_finished(
         return rc
     if not _require_base_skills(project, pol):
         return 1
+    # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.
+    if (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None:
+        return rc
     target = state.target_branch
     try:
         clean = verify.worktree_clean(paths.repo_root, project=paths.project)
@@ -6736,6 +7304,23 @@ def main(argv: list[str] | None = None) -> int:
         help="with set: persist a name not registered in this process (e.g. a plugin "
         "backend that only registers on the target machine)",
     )
+
+    plugins_p = add(
+        "plugins",
+        cmd_plugins,
+        "list plugins + trust grants; `plugins enable|accept|revoke <name>` manages a "
+        "project plugin's out-of-tree grant",
+    )
+    plugins_p.add_argument(
+        "action",
+        nargs="?",
+        choices=("list", "enable", "accept", "revoke"),
+        help="list (default); enable: grant a project plugin's current contents; "
+        "accept: re-pin a granted plugin that changed (lists what changed); "
+        "revoke: drop a grant",
+    )
+    plugins_p.add_argument("name", nargs="?", help="plugin name (see the listing)")
+    machine.add_json_flag(plugins_p, "plugin roster and trust grants")
 
     add(
         "adapters",

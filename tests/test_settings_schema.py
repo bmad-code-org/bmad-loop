@@ -11,9 +11,11 @@ import dataclasses
 from importlib import resources
 
 import pytest
+from conftest import grant_plugin
 
 from bmad_loop import policy as policy_mod
 from bmad_loop.plugins import load_plugins
+from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.policy import (
     BRANCH_PER_MODES,
     GATE_MODES,
@@ -232,6 +234,11 @@ def test_every_discovered_plugin_is_listed_with_settings():
     assert example is not None
     assert example.enabled is False  # not in [plugins] enabled
     assert example.trust_needed is False  # data-only: no [python], no toggle
+    assert (example.origin, example.grant_required, example.grant_status) == (
+        "builtin",
+        False,
+        "n/a",
+    )
     assert [f.key for f in example.fields] == ["greeting"]
     greeting = example.fields[0]
     assert greeting.section == "plugins.example"
@@ -240,6 +247,53 @@ def test_every_discovered_plugin_is_listed_with_settings():
     # plugin_schemas cover every plugin contributing settings, so [plugins.<name>]
     # tables are typed on save even when the plugin is not enabled.
     assert "example" in reg.plugin_schemas
+
+
+def _write_project_plugin(root, name, body):
+    pdir = root / USER_PLUGINS_REL / name
+    pdir.mkdir(parents=True)
+    (pdir / PLUGIN_FILE).write_text(f'[plugin]\nname = "{name}"\napi_version = 1\n{body}')
+    return pdir
+
+
+def test_project_plugin_with_hooks_needs_a_grant(tmp_path):
+    """A project plugin with an executable surface carries a toggle — its grant —
+    even with no [python] module, and reports its grant status: ungranted, then
+    granted under a matching grant, then mismatch once its bytes move.
+
+    ABLATION: compute `trust_needed` as `python is not None` for every origin and
+    the declarative project plugin loses its toggle."""
+    pdir = _write_project_plugin(tmp_path, "hooky", '[hooks.pre_run]\ncmd = "echo hi"\n')
+    info = next(p for p in build_registry(tmp_path, Policy()).plugins if p.name == "hooky")
+    assert (info.origin, info.trust_needed, info.grant_required) == ("project", True, True)
+    assert info.grant_status == "ungranted" and not info.has_grant
+
+    grants = grant_plugin(tmp_path, "hooky")
+    reg = build_registry(tmp_path, Policy(), grants=grants)
+    assert next(p for p in reg.plugins if p.name == "hooky").grant_status == "granted"
+    (pdir / "extra.sh").write_text("echo new\n")
+    reg = build_registry(tmp_path, Policy(), grants=grants)
+    changed = next(p for p in reg.plugins if p.name == "hooky")
+    assert changed.grant_status == "mismatch" and changed.has_grant
+
+
+def test_settings_only_project_plugin_needs_no_grant(tmp_path):
+    """A project plugin with nothing executable loads freely: no toggle, no grant."""
+    _write_project_plugin(
+        tmp_path, "cfgonly", '[[settings]]\nkey = "k"\ntype = "str"\ndefault = "v"\n'
+    )
+    info = next(p for p in build_registry(tmp_path, Policy()).plugins if p.name == "cfgonly")
+    assert (info.origin, info.trust_needed, info.grant_required) == ("project", False, False)
+    assert info.grant_status == "n/a"
+    assert [f.key for f in info.fields] == ["k"]
+
+
+def test_build_registry_discovers_from_root(tmp_path):
+    """``root`` (the code root a run loads) is where plugins are discovered."""
+    _write_project_plugin(tmp_path / "code", "hooky", '[hooks.pre_run]\ncmd = "echo hi"\n')
+    names = {p.name for p in build_registry(tmp_path, Policy(), root=tmp_path / "code").plugins}
+    assert "hooky" in names
+    assert "hooky" not in {p.name for p in build_registry(tmp_path, Policy()).plugins}
 
 
 def test_enabled_state_reflects_policy():
@@ -317,6 +371,7 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     unity = next((p for p in reg.plugins if p.name == "unity"), None)
     assert unity is not None
     assert unity.trust_needed is True  # has [python] -> enabling grants trust
+    assert (unity.origin, unity.grant_required) == ("builtin", False)  # enabled, not granted
     assert unity.enabled is False
     keys = [f.key for f in unity.fields]
     assert keys == [

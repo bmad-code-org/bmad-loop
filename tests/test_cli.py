@@ -59,6 +59,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
+from bmad_loop.plugins import GrantSet
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
 
@@ -3417,6 +3418,7 @@ def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, o
         max_bundles=None,
         trigger="cli",
         only_ids=only_ids,
+        plugin_grants=GrantSet.empty(),
     )
 
     assert rc == expected
@@ -4818,6 +4820,71 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     state = load_state(run_dir)
     assert state.repo_root == str(recorded)  # the mirror was never re-pointed
     assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
+
+
+@pytest.mark.parametrize("resume", ["--resume", "--no-resume"])
+def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypatch, capsys, resume):
+    """#496/#497: the resume `resolve` ends in would refuse a fatal plugin verdict,
+    so the refusal is hoisted ahead of the re-arm — after the re-arm, the escalation
+    was already spent. A re-arm-only resolve launches nothing and is not judged.
+
+    `_resume_paused_run` is stubbed to 0, so the rc can only come from the hoist.
+    Ablation: delete the `_reject_plugin_trust` call in `cmd_resolve` and the
+    `--resume` leg re-arms."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", resume]
+    rc = cli.main(argv)
+
+    phase = load_state(run_dir).tasks["s1"].phase
+    if resume == "--resume":
+        assert rc == 1
+        assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+        assert phase == Phase.ESCALATED  # still armed once the plugin is granted
+    else:
+        assert rc == 0
+        assert phase != Phase.ESCALATED
+
+
+@pytest.mark.parametrize("mode", ["interactive", "--adopt-branch", "--reverify"])
+def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
+    project, monkeypatch, capsys, mode
+):
+    """#496/#497: the sibling above pins the refusal against the re-arm only. The
+    interactive arm reached it after a whole agent conversation, and `--adopt-branch`
+    / paused-run `--reverify` dispatch before it, persisting their transition and
+    only then meeting the resume's refusal. One preflight now precedes all three.
+
+    Each action is failed rather than stubbed, so the rc can only come from the
+    early refusal. Ablation: delete the `_reject_plugin_trust` call ahead of the
+    reverify dispatch in `cmd_resolve` and every row reddens on its action."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+    monkeypatch.setattr(cli, "_resolve_adopt", lambda *a, **k: pytest.fail("adopted"))
+    monkeypatch.setattr(cli, "_resolve_reverify", lambda *a, **k: pytest.fail("re-verified"))
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if mode != "interactive":
+        argv.append(mode)
+    assert cli.main(argv) == 1
+
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
 
 
 @pytest.mark.parametrize("shape", ["inside", "sibling"])
@@ -12752,14 +12819,16 @@ def test_validate_warns_on_an_api_mismatched_plugin_without_leaking_the_warning(
 def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypatch, tmp_path):
     """Validate is the command a user runs to decide whether a checkout is safe to
     run, so it reads manifests only. The plugin is even allowlisted in `[plugins]
-    enabled`, the one state in which `PluginRegistry.build` WOULD exec it — so a
-    regression to building the registry here writes the marker.
+    enabled` and granted, the one state in which `PluginRegistry.build` WOULD exec
+    it — so a regression to building the registry here writes the marker.
 
     The marker is the observable, and it is checked before the verdict: an import
     also drops `__pycache__` into the plugin dir, so the rc would redden too, but
     on `git.worktree-clean` — a symptom, not the cause. The `sys.modules` check
     is a backstop only: the registry execs through `module_from_spec` without
     registering the module there, so that line alone cannot see a regression."""
+    from conftest import grant_plugin
+
     marker = tmp_path / "IMPORTED"
     module = (
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"
@@ -12774,6 +12843,9 @@ def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypa
         files={"hooks.py": module},
         policy=CLAUDE_ONLY_POLICY + '[plugins]\nenabled = ["evil"]\n',
     )
+    # Granted as well (#496/#497): an enabled project plugin with no grant fails
+    # `plugins.trust`, and only enabled + granted is the state the build would exec.
+    grant_plugin(project.project, "evil", store_project=project.project)
 
     rc = cli.main(["validate", "--project", str(project.project), "--json"])
     out, err = capsys.readouterr()
@@ -16546,6 +16618,7 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(
         project.project,
         bmadconfig.load_paths(project.project),
         _config_pin(project),
+        plugin_grants=GrantSet.empty(),
     )
     with pytest.raises(RuntimeError, match=REFUSAL):
         factory("epic-boundary", started=_never_started)
@@ -16571,7 +16644,10 @@ def test_auto_sweep_launches_under_worktree_isolation_beside_a_nested_repo_root(
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
 
     factory = cli._sweep_factory(
-        paths.project, bmadconfig.load_paths(paths.project), _config_pin(paths)
+        paths.project,
+        bmadconfig.load_paths(paths.project),
+        _config_pin(paths),
+        plugin_grants=GrantSet.empty(),
     )
     factory("epic-boundary", started=lambda: None)
     assert len(launched) == 1
@@ -16644,7 +16720,9 @@ def _pin_profile(project, text=PIN_PROFILE) -> None:
     (profiles / "mycli.toml").write_text(text, encoding="utf-8")
 
 
-def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
+def _pinned_sweep_factory(
+    project, monkeypatch, *, policy_text=PIN_POLICY, plugin_grants=GrantSet.empty()
+):
     """A child-sweep factory pinned to the config as it stands right now — the
     launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
     is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
@@ -16667,7 +16745,10 @@ def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
     launched = []
     monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
     factory = cli._sweep_factory(
-        project.project, bmadconfig.load_paths(project.project), _config_pin(project)
+        project.project,
+        bmadconfig.load_paths(project.project),
+        _config_pin(project),
+        plugin_grants=plugin_grants,
     )
     return factory, launched
 
@@ -16816,7 +16897,12 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     monkeypatch.setattr(cli, "SweepEngine", _Recorder)
 
     signalled: list[str] = []
-    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
+    factory = cli._sweep_factory(
+        project.project,
+        bmadconfig.load_paths(project.project),
+        pin,
+        plugin_grants=GrantSet.empty(),
+    )
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
@@ -16836,6 +16922,472 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     assert [(e["role"], e["profile"], e["missing"]) for e in entries] == [
         (role, "mycli", ["--yes"]) for role in ("triage", "dev", "review")
     ]
+
+
+# --- #496/#497: plugin grants are read ONCE at a human-present launch -------------
+#
+# Two layers refuse an untrusted project plugin: the launch preflight
+# (`cli._reject_plugin_trust`, ahead of every side effect) and the registry gate in
+# `PluginRegistry.build` (the engine's build). Each has rows below that bypass the
+# other: the run/sweep/resume refusals stub the engine out, so only the preflight
+# can refuse them; the auto-sweep child has no preflight, so only the registry can.
+
+TRUST_PLUGIN = "rogue"
+
+
+def _trust_marker(project) -> Path:
+    """An absolute marker beside (never inside) the plugin dir or its snapshot."""
+    return project.project.parent / f"{project.project.name}-{TRUST_PLUGIN}-ran"
+
+
+def _write_trust_plugin(project, *, tag: str = "ran") -> Path:
+    """A project-origin declarative plugin with one hook — an executable surface,
+    so it needs a grant. The hook writes `_trust_marker`, baked in before any
+    grant is taken."""
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+
+    pdir = project.project / USER_PLUGINS_REL / TRUST_PLUGIN
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "plugin.toml").write_text(
+        f'[plugin]\nname = "{TRUST_PLUGIN}"\napi_version = 1\n'
+        f'[hooks.pre_run]\ncmd = \'"{sys.executable}" "{{scripts}}/hook.py"\'\n',
+        encoding="utf-8",
+    )
+    (pdir / "hook.py").write_text(
+        f"from pathlib import Path\nPath({str(_trust_marker(project))!r}).write_text({tag!r})\n",
+        encoding="utf-8",
+    )
+    return pdir
+
+
+ENABLE_ROGUE = f'\n[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n'
+
+
+def _run_fixture(project, monkeypatch, *, policy_text=PIN_POLICY) -> None:
+    """A committed, launchable sprint project whose adapters are stubbed (zero
+    tokens, no multiplexer). The sweep skill is installed into the triage tree so
+    the run's auto-sweep factory can be driven too."""
+    from conftest import install_base_skills
+
+    from bmad_loop.adapters.profile import get_profile
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    _write_policy(project.project, policy_text)
+    _pin_profile(project)
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+
+def _no_run_dirs(project) -> bool:
+    runs_root = project.project / runs.RUNS_DIR
+    return not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def _count_grant_reads(monkeypatch, grants: GrantSet) -> list[Path]:
+    """Stub the grant store's one read: every call is recorded and answers
+    ``grants``, so a test can assert both the read count and object identity."""
+    from bmad_loop.plugins import store
+
+    reads: list[Path] = []
+
+    def load_grants(project):
+        reads.append(project)
+        return grants
+
+    monkeypatch.setattr(store, "load_grants", load_grants)
+    return reads
+
+
+def test_run_refuses_an_enabled_ungranted_project_plugin(project, monkeypatch, capsys):
+    """Decision 3 (#496): a name in `[plugins] enabled` with no grant is the operator
+    asking for a plugin nobody vouched for the bytes of — the launch fails loudly
+    with the verb that clears it, before the run dir exists. The engine is stubbed
+    to fail, so only the launch preflight can produce this refusal.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `cmd_run` and this fails —
+    composition reaches the (failing) engine and publishes a run dir first."""
+    _run_fixture(project, monkeypatch, policy_text=PIN_POLICY + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
+    assert _no_run_dirs(project)
+    assert not _trust_marker(project).exists()
+
+
+def test_run_notes_an_ungranted_inert_plugin_and_proceeds(project, monkeypatch, capsys):
+    """The other half of decision 3: never granted and not enabled is inert, not an
+    error. The run starts, says on stderr which plugin will not run and how to
+    grant it, and hands the engine the (empty) launch grants."""
+    _run_fixture(project, monkeypatch)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f'note: plugin "{TRUST_PLUGIN}"' in err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
+    assert captured["plugin_grants"].records == ()
+
+
+def test_run_refuses_a_granted_plugin_whose_dir_was_deleted(project, monkeypatch, capsys):
+    """A grant no discovered plugin claims is the operator's plugin gone without a
+    word: the launch refuses before the run dir exists, naming the recorded path
+    and the verb that clears it. The engine is stubbed to fail, so only the launch
+    preflight can produce this refusal.
+
+    ABLATION: drop the `unclaimed` refusals from `_reject_plugin_trust` and the
+    run reaches the (failing) engine."""
+    from conftest import grant_plugin
+
+    _run_fixture(project, monkeypatch)
+    pdir = _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    shutil.rmtree(pdir)
+    _commit_all(project, "setup")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert f".bmad-loop/plugins/{TRUST_PLUGIN} but is no longer discovered" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
+    assert _no_run_dirs(project)
+
+
+def test_run_threads_one_grant_read_to_compose_and_the_sweep_factory(project, monkeypatch):
+    """The read-once HARD CONSTRAINT: `cmd_run` reads the store once and the SAME
+    object reaches the engine and, through the factory closure, the auto-sweep
+    child — which never reads the store again. Identity, not equality: an equal
+    re-read would pass `==` and still be the check-then-use this forbids.
+
+    ABLATION: drop `plugin_grants=` from `cmd_run`'s `compose_run` call (the engine
+    gets the empty default) or from its `_sweep_factory` call (TypeError: the kw is
+    required) and this fails; a `load_grants` call inside `factory` fails the
+    read count."""
+    _run_fixture(project, monkeypatch)
+    _commit_all(project, "setup")
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    assert captured["plugin_grants"] is sentinel
+
+    launched: list = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
+    captured["sweep_factory"]("epic-boundary", started=lambda: None)
+
+    assert len(launched) == 1
+    assert launched[0]["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def test_sweep_refuses_an_enabled_ungranted_project_plugin(project, monkeypatch, capsys):
+    """`bmad-loop sweep` is the second human-present launch: same read, same
+    preflight, same refusal before any run dir.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `cmd_sweep` and this fails
+    (the stubbed `_start_sweep` is reached)."""
+    _make_validate_pass(project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    _commit_all(project, "rogue plugin")
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 1
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert started == []
+    assert _no_run_dirs(project)
+
+
+def test_sweep_threads_grants(project, monkeypatch, capsys):
+    """`cmd_sweep` reads the store once and hands that object to `_start_sweep`.
+
+    ABLATION: drop `plugin_grants=` from `cmd_sweep`'s `_start_sweep` call and the
+    identity assert fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    started: list = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 0
+    assert started[0]["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def test_resume_refuses_a_mismatched_plugin_before_any_side_effect(project, monkeypatch, capsys):
+    """Resume has no unwind (`compose_resume`), so a plugin the registry build
+    would refuse must be refused BEFORE the resume's side effects: no `run-resume`
+    row, the out-of-tree pin left as the last real launch stamped it, the pause
+    intact so `status` still shows a resumable run. Decision 3: a granted plugin
+    whose bytes changed fails loudly, pointing at `plugins accept`.
+
+    ABLATION: delete the `_reject_plugin_trust` call in `_prepare_resume_locked`
+    (or move it below the re-stamp/pause/save block) and this fails — the stubbed
+    engine is reached after the pin and the pause were rewritten."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    _write_trust_plugin(project, tag="swapped")  # the mismatch
+    runs.write_trusted_config_digest(project.project, run_dir.name, "launch-pin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert f"`bmad-loop plugins accept {TRUST_PLUGIN}`" in err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "launch-pin"
+    assert load_state(run_dir).paused_reason == "escalation"
+    assert not _trust_marker(project).exists()
+
+
+def test_resume_refuses_an_unwritable_plugin_snapshot_before_any_side_effect(
+    project, monkeypatch, capsys
+):
+    """A granted, UNCHANGED plugin whose snapshot cannot be published (here a
+    regular file squats the snapshots root, as a read-only or full state dir
+    would) is refused by the preflight, not by the registry build inside
+    `compose_resume` after the run was re-armed.
+
+    ABLATION: drop `materialize=True` from `_reject_plugin_trust`'s preflight call
+    and this fails — the preflight passes, the resume journals `run-resume` and
+    clears the pause, and the snapshot write fails only afterwards."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    snapshots = runs.plugin_snapshots_root(project.project)
+    if snapshots.is_dir():
+        shutil.rmtree(snapshots)
+    snapshots.parent.mkdir(parents=True, exist_ok=True)
+    snapshots.write_text("not a dir", encoding="utf-8")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "launch-pin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "plugin snapshot" in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "launch-pin"
+    assert load_state(run_dir).paused_reason == "escalation"
+    assert not _trust_marker(project).exists()
+
+
+def test_resume_publishes_no_snapshot_when_another_grant_is_unclaimed(project, monkeypatch, capsys):
+    """An unclaimed grant (its plugin dir deleted) is as fatal as a fatal verdict,
+    so the preflight must not publish a snapshot for the OTHER, valid granted
+    plugin before refusing: the refused launch writes no plugin state, and a
+    snapshot write fault cannot mask the missing-plugin refusal.
+
+    ABLATION: drop the `unclaimed` term from `preflight`'s materialize guard and
+    this fails — the valid plugin's snapshot is published before the refusal."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+    from bmad_loop.plugins.store import save_grants
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    gone = project.project / USER_PLUGINS_REL / "gone"
+    shutil.copytree(project.project / USER_PLUGINS_REL / TRUST_PLUGIN, gone)
+    toml = gone / "plugin.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8").replace(f'"{TRUST_PLUGIN}"', '"gone"'), encoding="utf-8"
+    )
+    records = [
+        *grant_plugin(project.project, TRUST_PLUGIN).records,
+        *grant_plugin(project.project, "gone").records,
+    ]
+    save_grants(project.project, records, expected=None)
+    shutil.rmtree(gone)
+    snapshots = runs.plugin_snapshots_root(project.project)
+    if snapshots.is_dir():
+        shutil.rmtree(snapshots)
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "`bmad-loop plugins revoke gone`" in err
+    assert not snapshots.exists() or not any(snapshots.iterdir())
+    assert _resume_entries(run_dir) == []
+    assert load_state(run_dir).paused_reason == "escalation"
+
+
+def test_resume_threads_its_grants_to_compose_and_the_sweep_factory(project, monkeypatch):
+    """The resume's one read reaches the engine and the re-armed factory closure.
+
+    ABLATION: drop `plugin_grants=` from `_resume_paused_run`'s `compose_resume`
+    call and the engine identity assert fails."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    sentinel = GrantSet(snapshot_root=runs.plugin_snapshots_root(project.project))
+    reads = _count_grant_reads(monkeypatch, sentinel)
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert captured["plugin_grants"] is sentinel
+    assert reads == [project.project]
+
+
+def _real_child_sweep(monkeypatch) -> None:
+    """Let the auto-sweep factory run the REAL `_start_sweep` → `compose_sweep` →
+    `SweepEngine` build (so the registry gate runs), with mock adapters and an
+    engine `run` that drives nothing. Zero tokens, no multiplexer."""
+    from bmad_loop.adapters.mock import MockAdapter
+
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: {r: MockAdapter([]) for r in cli.ROLES}
+    )
+    monkeypatch.setattr(
+        cli.SweepEngine,
+        "run",
+        lambda self: types.SimpleNamespace(crashed=False, render=lambda: ""),
+    )
+
+
+def _granted_child_factory(project, monkeypatch):
+    """A pinned auto-sweep factory whose launch granted the rogue plugin as it
+    stands now, with the REAL child composition armed (`_real_child_sweep`)."""
+    from conftest import grant_plugin
+
+    real_start_sweep = cli._start_sweep
+    _write_trust_plugin(project)
+    grants = grant_plugin(project.project, TRUST_PLUGIN)
+    factory, _launched = _pinned_sweep_factory(project, monkeypatch, plugin_grants=grants)
+    monkeypatch.setattr(cli, "_start_sweep", real_start_sweep)
+    _real_child_sweep(monkeypatch)
+    return factory
+
+
+def test_auto_sweep_refuses_a_plugin_swapped_after_launch(project, monkeypatch):
+    """The mid-run swap #496 describes, on the one unattended path: a session
+    rewrites a granted plugin after launch, and the engine's next trigger launches a
+    child. There is no preflight on this path, so the registry gate in the child's
+    engine build must refuse — before `started`, so the parent records
+    `sweep-auto-not-started` — and the child's run dir is unwound.
+
+    ABLATION: delete the `if fatal: raise PluginTrustError(...)` in
+    `PluginRegistry.build` and this fails at `_never_started`."""
+    from bmad_loop.plugins import PluginTrustError
+
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_trust_plugin(project, tag="swapped")
+
+    with pytest.raises(PluginTrustError, match=f"plugins accept {TRUST_PLUGIN}"):
+        factory("epic-boundary", started=_never_started)
+    assert _no_run_dirs(project)
+    assert not _trust_marker(project).exists()
+
+
+def test_auto_sweep_holds_the_launch_grants_not_the_store(project, monkeypatch):
+    """The factory closure, not the store, is the child's grant set. Here the store
+    is made to bless the swapped bytes AFTER launch — what a session that can write
+    the state dir, or an operator acting on a different run, could do — and the
+    child still refuses, because no human launched under that grant.
+
+    ABLATION: replace `plugin_grants=plugin_grants` in `factory`'s `_start_sweep`
+    call with `plugin_grants=store.load_grants(project)` and this fails at
+    `_never_started`."""
+    from conftest import grant_plugin
+
+    from bmad_loop.plugins import PluginTrustError
+
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_trust_plugin(project, tag="swapped")
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+
+    with pytest.raises(PluginTrustError):
+        factory("epic-boundary", started=_never_started)
+    assert _no_run_dirs(project)
+
+
+def test_auto_sweep_proceeds_after_a_plugin_settings_edit(project, monkeypatch):
+    """`[plugins.<name>]` settings are outside the config digest (the TUI writes
+    them) and outside the grant (they live in policy.toml, not the plugin dir), so
+    a settings edit after launch neither trips the #461 pin nor un-grants the
+    plugin: the child composes for real and `started` fires."""
+    factory = _granted_child_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + f'\n[plugins.{TRUST_PLUGIN}]\nlevel = "high"\n')
+    signalled: list[str] = []
+
+    factory("epic-boundary", started=lambda: signalled.append("started"))
+
+    assert signalled == ["started"]
+    assert not _no_run_dirs(project)
+
+
+def test_dry_run_banner_names_a_fatal_plugin_refusal(project, monkeypatch, capsys):
+    """`--dry-run` returns before the plugin preflight, so the banner mirrors its
+    fatal verdicts (only those — an inert plugin aborts nothing).
+
+    ABLATION: drop `_fatal_plugin_problems` from `_warn_preflight_would_abort` and
+    this fails — no banner."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, '[gates]\nmode = "none"\n' + ENABLE_ROGUE)
+    _write_trust_plugin(project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
+
+
+def test_dry_run_banner_names_a_grant_whose_plugin_vanished(project, capsys):
+    """A grant no discovered plugin claims is fatal at launch (`grants.unclaimed`)
+    with no per-manifest verdict, so the banner must read it too.
+
+    ABLATION: drop the `unclaimed` arm of `_fatal_trust_messages` and this fails —
+    no banner."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    shutil.rmtree(pdir)
+    capsys.readouterr()
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
 
 
 @pytest.mark.parametrize("how", ["deleted", "partial"])
@@ -19530,3 +20082,568 @@ def test_cleanup_text_reports_a_process_host_fault_and_exits_zero(tmp_path, monk
     assert "session prune failed: unknown process host" in captured.err
     assert "ctl window prune failed: unknown process host" in captured.err
     assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+
+
+# ------------------ #496/#497: the `plugins` grant verb ---------------------
+
+
+def _plugins(project, *argv: str) -> int:
+    return cli.main(["plugins", *argv, "--project", str(project.project)])
+
+
+def _plugins_project(project) -> Path:
+    """A project with a BMAD config and a policy, plus the `rogue` hook plugin
+    (an executable surface, so it needs a grant). Returns its dir."""
+    install_bmad_config(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    return _write_trust_plugin(project)
+
+
+def _stored_grants(project) -> dict:
+    return json.loads(runs.plugin_grants_path(project.project).read_text(encoding="utf-8"))[
+        "plugins"
+    ]
+
+
+def test_plugins_enable_persists_a_grant_out_of_tree_and_leaves_policy_untouched(project, capsys):
+    """The grant is the operator's out-of-tree record of the plugin dir's digest,
+    keyed by its relpath from the code root (the key the registry matches). For a
+    project plugin it subsumes `[plugins] enabled`, so policy.toml is never written."""
+    from bmad_loop.plugins import store
+    from bmad_loop.plugins.digest import read_tree
+    from bmad_loop.plugins.registry import preflight
+
+    pdir = _plugins_project(project)
+    policy_file = project.project / ".bmad-loop" / "policy.toml"
+    before = policy_file.read_bytes()
+
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    out = capsys.readouterr().out
+    store_path = runs.plugin_grants_path(project.project)
+    tree = read_tree(pdir)
+    assert (
+        f'plugin "{TRUST_PLUGIN}" granted: sha256:{tree.digest[:12]} (2 files) in {store_path}'
+        in out
+    )
+    assert not store_path.is_relative_to(project.project)
+    record = _stored_grants(project)[TRUST_PLUGIN]
+    assert record["path"] == f".bmad-loop/plugins/{TRUST_PLUGIN}"
+    assert record["digest"] == tree.digest
+    assert policy_file.read_bytes() == before
+    # the launch gate now accepts it
+    [(_m, verdict, _rel)] = [
+        v
+        for v in preflight(project.project, None, store.load_grants(project.project))
+        if v[0].name == TRUST_PLUGIN
+    ]
+    assert verdict.state == "granted"
+
+
+def test_plugins_enable_refuses_a_builtin(project, capsys):
+    """A builtin is trusted by provenance; its module is enabled in policy, never
+    granted. A project plugin with no executable surface needs no grant either.
+
+    ABLATION: drop the `needs_grant` refusal in `_plugins_grant` and both legs
+    write a grant store."""
+    _plugins_project(project)
+    quiet = project.project / ".bmad-loop" / "plugins" / "quiet"
+    quiet.mkdir(parents=True)
+    (quiet / "plugin.toml").write_text('[plugin]\nname = "quiet"\napi_version = 1\n')
+
+    assert _plugins(project, "enable", "tea") == 1
+    err = capsys.readouterr().err
+    assert "builtin plugin" in err and "[plugins] enabled" in err
+    assert _plugins(project, "enable", "quiet") == 1
+    assert "no executable surface" in capsys.readouterr().err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
+def test_plugins_unknown_name_is_rc1(project, capsys):
+    _plugins_project(project)
+
+    assert _plugins(project, "enable", "ghost") == 1
+    assert 'no plugin named "ghost"' in capsys.readouterr().err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
+@pytest.mark.parametrize("action", ["enable", "accept", "revoke"])
+def test_plugins_mutating_action_needs_a_name(project, capsys, action):
+    _plugins_project(project)
+
+    assert _plugins(project, action) == 1
+    assert f"`plugins {action}` requires a plugin name" in capsys.readouterr().err
+
+
+def test_plugins_accept_lists_changed_files_then_repins(project, capsys):
+    from bmad_loop.plugins.digest import read_tree
+
+    pdir = _plugins_project(project)
+    (pdir / "gone.txt").write_text("old")
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    (pdir / "gone.txt").unlink()
+    (pdir / "extra.txt").write_text("new")
+    _write_trust_plugin(project, tag="swapped")  # hook.py changes
+    capsys.readouterr()
+
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 0
+    out = capsys.readouterr().out
+    assert "added: extra.txt" in out
+    assert "removed: gone.txt" in out
+    assert "changed: hook.py" in out
+    assert "plugin.toml" not in out.split("granted:")[0]  # unchanged files aren't listed
+    assert _stored_grants(project)[TRUST_PLUGIN]["digest"] == read_tree(pdir).digest
+
+
+def test_plugins_accept_rekeys_a_grant_renamed_in_place(project, capsys):
+    """A granted plugin renamed in its own dir is a changed grant: `enable` points
+    to `accept`, and `accept` re-pins it under the new name, dropping the old
+    record rather than leaving it to haunt the dir.
+
+    ABLATION: drop the `renamed_from` fallback in `_plugins_grant` and `accept`
+    refuses with "no grant to accept"."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    manifest = pdir / "plugin.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            f'name = "{TRUST_PLUGIN}"', 'name = "renamed"'
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    assert _plugins(project, "enable", "renamed") == 1
+    err = capsys.readouterr().err
+    assert f'granted as "{TRUST_PLUGIN}"' in err and "plugins accept renamed" in err
+
+    assert _plugins(project, "accept", "renamed") == 0
+    out = capsys.readouterr().out
+    assert f"renamed: {TRUST_PLUGIN} -> renamed" in out
+    assert "changed: plugin.toml" in out
+    assert set(_stored_grants(project)) == {"renamed"}
+
+
+def test_plugins_enable_refuses_a_manifest_swapped_after_discovery(project, capsys, monkeypatch):
+    """The grant pins the manifest the operator's discovery parsed: a plugin.toml
+    swapped in between that discovery and the hash is refused, never granted —
+    the launch-side bind would only compare the swapped manifest with itself.
+
+    ABLATION: grant from a bare `read_tree` in `_plugins_grant` and the swapped
+    manifest's bytes are stored as the grant."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    pdir = _plugins_project(project)
+    manifest = pdir / "plugin.toml"
+    swapped = manifest.read_text(encoding="utf-8").replace("hook.py", "evil.py")
+    real = registry_mod.read_tree
+
+    def swap_then_read(root, **kw):
+        manifest.write_text(swapped, encoding="utf-8")
+        return real(root, **kw)
+
+    monkeypatch.setattr(registry_mod, "read_tree", swap_then_read)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 1
+    assert "changed while it was being verified" in capsys.readouterr().err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
+def test_plugins_accept_never_restores_a_grant_revoked_while_it_ran(project, capsys, monkeypatch):
+    """A revoke that lands while `accept` is hashing wins: the accept, decided on
+    the store it read before the revoke, is refused rather than writing the
+    revoked grant back.
+
+    ABLATION: save without `expected=seen` in `_save_grants_or_report` and the
+    accept re-grants the plugin the revoke just removed."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    (pdir / "hook.py").write_text("print('changed')\n", encoding="utf-8")
+    real = registry_mod.read_tree
+
+    def revoke_then_read(root, **kw):
+        monkeypatch.setattr(registry_mod, "read_tree", real)
+        assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+        return real(root, **kw)
+
+    monkeypatch.setattr(registry_mod, "read_tree", revoke_then_read)
+    capsys.readouterr()
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 1
+    assert "changed while this was being decided" in capsys.readouterr().err
+    assert _stored_grants(project) == {}
+
+
+def test_plugins_accept_unchanged_is_a_noop(project, capsys):
+    """Accepting a plugin whose bytes still match its grant rewrites nothing.
+
+    ABLATION: drop the GRANTED early return in `_plugins_grant` and the atomic
+    rewrite replaces the store (new inode / mtime)."""
+    _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    store_path = runs.plugin_grants_path(project.project)
+    before = store_path.stat()
+    capsys.readouterr()
+
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 0
+    assert "unchanged" in capsys.readouterr().out
+    after = store_path.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_plugins_accept_without_a_grant_points_to_enable(project, capsys):
+    _plugins_project(project)
+
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 1
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
+def test_plugins_enable_on_a_mismatch_points_to_accept(project, capsys):
+    """`enable` never silently re-pins a changed plugin: re-blessing new bytes is
+    `accept`'s job, which shows what changed first.
+
+    ABLATION: drop the mismatch refusal in `_plugins_grant` and the store is
+    re-pinned to the swapped bytes."""
+    _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    pinned = _stored_grants(project)[TRUST_PLUGIN]["digest"]
+    _write_trust_plugin(project, tag="swapped")
+    capsys.readouterr()
+
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 1
+    assert f"`bmad-loop plugins accept {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert _stored_grants(project)[TRUST_PLUGIN]["digest"] == pinned
+
+
+def test_plugins_revoke(project, capsys):
+    _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    capsys.readouterr()
+
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+    assert f'plugin "{TRUST_PLUGIN}" grant revoked' in capsys.readouterr().out
+    assert TRUST_PLUGIN not in _stored_grants(project)
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 1
+    assert "no grant to revoke" in capsys.readouterr().err
+
+
+def test_plugins_list_reports_a_missing_grant(project, capsys):
+    """A grant whose plugin dir is gone is listed as `missing` (a launch refuses on
+    it) until revoked, so `plugins` shows what blocks the launch."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    shutil.rmtree(pdir)
+    capsys.readouterr()
+    argv = ["plugins", "--json", "--project", str(project.project)]
+
+    rogue = {r["name"]: r for r in machine_json(argv, capsys)["plugins"]}[TRUST_PLUGIN]
+    assert (rogue["status"], rogue["active"], rogue["origin"]) == ("missing", False, "project")
+    assert rogue["path"] == f".bmad-loop/plugins/{TRUST_PLUGIN}"
+    assert rogue["pinned_digest"] and rogue["current_digest"] is None
+
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+    capsys.readouterr()
+    assert TRUST_PLUGIN not in {r["name"] for r in machine_json(argv, capsys)["plugins"]}
+
+
+def test_plugins_accept_on_a_stripped_plugin_points_to_revoke(project, capsys):
+    """A granted plugin whose last hook was dropped needs no grant now; `accept`
+    refuses it and names the revoke that clears its stale grant."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    (pdir / "plugin.toml").write_text(
+        f'[plugin]\nname = "{TRUST_PLUGIN}"\napi_version = 1\n', encoding="utf-8"
+    )
+    capsys.readouterr()
+
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 1
+    err = capsys.readouterr().err
+    assert "has no executable surface" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+
+
+def test_plugins_grant_verbs_refuse_to_overwrite_an_unreadable_store(project, capsys):
+    """A store that exists but cannot be decoded is reported, never rewritten: the
+    rewrite would silently discard every grant it holds.
+
+    ABLATION: drop the fault check in `_load_grants_for_write` and the garbage is
+    replaced by a fresh one-grant store."""
+    _plugins_project(project)
+    store_path = runs.plugin_grants_path(project.project)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text("{not json")
+
+    for action in ("enable", "revoke"):
+        assert _plugins(project, action, TRUST_PLUGIN) == 1
+        err = capsys.readouterr().err
+        assert "could not be read" in err and str(store_path) in err
+    assert store_path.read_text() == "{not json"
+
+
+@pytest.mark.parametrize("action", ["enable", "accept", "revoke"])
+def test_plugins_json_rejected_on_mutating_actions(project, capsys, action):
+    """`--json` is a read contract: a mutating action under it is a usage error
+    with nothing on stdout, and nothing is written."""
+    _plugins_project(project)
+
+    assert _plugins(project, action, TRUST_PLUGIN, "--json") == cli.ExitCode.USAGE == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "--json applies to `bmad-loop plugins list`" in err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
+def test_plugins_list_json_is_one_pure_object(project, capsys):
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    capsys.readouterr()
+    argv = ["plugins", "list", "--json", "--project", str(project.project)]
+
+    doc = machine_json(argv, capsys)
+    assert doc["schema_version"] == cli.PLUGINS_SCHEMA_VERSION == 1
+    assert doc["store_fault"] is None
+    rows = {r["name"]: r for r in doc["plugins"]}
+    rogue = rows[TRUST_PLUGIN]
+    assert rogue["origin"] == "project"
+    assert rogue["path"] == f".bmad-loop/plugins/{TRUST_PLUGIN}"
+    assert rogue["surface"] == {"hooks": True, "workflows": False, "python": False, "seeds": False}
+    assert (rogue["grant_required"], rogue["status"], rogue["active"]) == (True, "granted", True)
+    assert rogue["pinned_digest"] == rogue["current_digest"] is not None
+    assert (rows["tea"]["grant_required"], rows["tea"]["status"]) == (False, "n/a")
+
+    (pdir / "hook.py").write_text("print('swapped')\n")
+    doc = machine_json(argv[:1] + argv[2:], capsys)  # bare `plugins` lists too
+    rogue = {r["name"]: r for r in doc["plugins"]}[TRUST_PLUGIN]
+    assert (rogue["status"], rogue["active"], rogue["changed"]) == ("mismatch", False, ["hook.py"])
+    assert rogue["pinned_digest"] != rogue["current_digest"]
+
+
+def test_plugins_list_text_names_every_column(project, capsys):
+    _plugins_project(project)
+
+    assert _plugins(project) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].split() == ["NAME", "ORIGIN", "SURFACE", "GRANT", "ENABLED", "PATH"]
+    [row] = [line.split() for line in out.splitlines() if line.startswith(TRUST_PLUGIN)]
+    assert row == [TRUST_PLUGIN, "project", "hooks", "ungranted", "no", ".bmad-loop/plugins/rogue"]
+
+
+def test_plugins_list_never_imports_a_plugin_module(project, capsys, tmp_path):
+    """Listing reads manifests and hashes dirs; it never builds the registry. The
+    plugin is both granted AND named in `[plugins] enabled` — the one state in
+    which `PluginRegistry.build` WOULD exec it — so a regression writes the
+    absolute marker (outside the live dir and its snapshot).
+
+    ABLATION: build the roster from `PluginRegistry.build(root, pol, grants=...)`
+    instead of `registry.preflight` and the marker appears."""
+    from conftest import grant_plugin
+
+    install_bmad_config(project)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[plugins]\nenabled = ["evil"]\n')
+    marker = tmp_path / "IMPORTED"
+    pdir = project.project / ".bmad-loop" / "plugins" / "evil"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "evil"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n'
+    )
+    (pdir / "hooks.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"
+        "raise RuntimeError('imported')\n"
+    )
+    grant_plugin(project.project, "evil", store_project=project.project)
+
+    assert _plugins(project) == 0
+    capsys.readouterr()
+    doc = machine_json(["plugins", "--json", "--project", str(project.project)], capsys)
+    assert not marker.exists()
+    assert {r["name"]: r["status"] for r in doc["plugins"]}["evil"] == "granted"
+
+
+def test_plugins_document_schema():
+    """The `plugins --json` shape, exactly — adding a key is additive, but
+    renaming or dropping one breaks consumers and must bump the version."""
+    from bmad_loop.documents import PluginRow, plugins_document
+
+    row = PluginRow(
+        name="p",
+        origin="project",
+        path=".bmad-loop/plugins/p",
+        hooks=True,
+        workflows=False,
+        python=True,
+        seeds=False,
+        grant_required=True,
+        status="mismatch",
+        enabled=False,
+        active=False,
+        pinned_digest="a" * 64,
+        current_digest="b" * 64,
+        changed=("hook.py",),
+    )
+    assert plugins_document([row], "boom") == {
+        "schema_version": 1,
+        "plugins": [
+            {
+                "name": "p",
+                "origin": "project",
+                "path": ".bmad-loop/plugins/p",
+                "surface": {"hooks": True, "workflows": False, "python": True, "seeds": False},
+                "grant_required": True,
+                "status": "mismatch",
+                "enabled": False,
+                "active": False,
+                "pinned_digest": "a" * 64,
+                "current_digest": "b" * 64,
+                "changed": ["hook.py"],
+            }
+        ],
+        "store_fault": "boom",
+    }
+    assert plugins_document([]) == {"schema_version": 1, "plugins": [], "store_fault": None}
+
+
+# ------------------ #496/#497: the `plugins.trust` validate check -----------
+
+_HOOK_PLUGIN = '[plugin]\nname = "hooky"\napi_version = 1\n[hooks.pre_run]\ncmd = "echo hi"\n'
+
+
+def _trust_findings(doc):
+    return [f for f in doc["findings"] if f["check"] == "plugins.trust"]
+
+
+def test_plugins_trust_check_is_registered():
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "plugins.trust" in VALIDATE_CHECKS
+
+
+def test_validate_reports_an_ungranted_project_plugin_as_a_problem(project, capsys, monkeypatch):
+    """A never-granted hook plugin would silently not run, so validate reports it
+    with the verb that grants it; once granted the check passes. The pass fixture
+    makes the plugin the only variable.
+
+    ABLATION: delete the `_validate_plugin_trust` call in `cmd_validate` and the
+    problem leg finds no `plugins.trust` finding (and rc 0)."""
+    _validate_with_plugin(project, monkeypatch, capsys, "hooky", _HOOK_PLUGIN)
+    argv = ["validate", "--project", str(project.project), "--json"]
+
+    doc = machine_json(argv, capsys, rc=1)
+    [finding] = _trust_findings(doc)
+    assert finding["severity"] == "problem"
+    assert "`bmad-loop plugins enable hooky`" in finding["message"]
+    assert finding["detail"] == {
+        "plugin": "hooky",
+        "origin": "project",
+        "path": ".bmad-loop/plugins/hooky",
+        "status": "ungranted",
+        "pinned": None,
+        "current": finding["detail"]["current"],
+        "changed": [],
+    }
+    assert finding["detail"]["current"]
+
+    assert _plugins(project, "enable", "hooky") == 0
+    capsys.readouterr()
+    doc = machine_json(argv, capsys)
+    [finding] = _trust_findings(doc)
+    assert (finding["severity"], finding["detail"]) == ("ok", {"plugins": ["hooky"]})
+
+
+def test_validate_reports_a_mismatch_with_changed_files(project, capsys, monkeypatch):
+    """A granted plugin edited (and committed) since its grant fails the next
+    launch; validate says so first, naming what changed and pointing at `accept`.
+
+    ABLATION: delete the `_validate_plugin_trust` call in `cmd_validate` and this
+    finds no `plugins.trust` problem."""
+    from conftest import grant_plugin
+
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "hooky", _HOOK_PLUGIN)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    toml.write_text(_HOOK_PLUGIN.replace("echo hi", "echo bye"))
+    git(project.project, "commit", "-qam", "edit hooky")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _trust_findings(doc)
+    assert finding["severity"] == "problem"
+    assert "`bmad-loop plugins accept hooky`" in finding["message"]
+    detail = finding["detail"]
+    assert (detail["status"], detail["changed"]) == ("mismatch", ["plugin.toml"])
+    assert detail["pinned"] and detail["current"] and detail["pinned"] != detail["current"]
+
+
+@pytest.mark.parametrize("change", ["deleted", "stripped"])
+def test_validate_reports_a_grant_whose_plugin_vanished(project, capsys, monkeypatch, change):
+    """A granted plugin deleted, or stripped of its whole surface, fails the next
+    launch; validate says so first, pointing at `revoke`.
+
+    ABLATION: drop the `missing` loop (deleted) or the `v.fatal` arm of the skip
+    (stripped) in `_validate_plugin_trust` and validate reports the plugin OK."""
+    from conftest import grant_plugin
+
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "hooky", _HOOK_PLUGIN)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    if change == "deleted":
+        git(project.project, "rm", "-rq", ".bmad-loop/plugins/hooky")
+    else:
+        toml.write_text('[plugin]\nname = "hooky"\napi_version = 1\n')
+    git(project.project, "commit", "-qam", f"{change} hooky")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _trust_findings(doc)
+    assert finding["severity"] == "problem"
+    assert "`bmad-loop plugins revoke hooky`" in finding["message"]
+    status = {"deleted": "missing", "stripped": "stale"}[change]
+    assert (finding["detail"]["plugin"], finding["detail"]["status"]) == ("hooky", status)
+
+
+def test_validate_reports_an_unreadable_grant_store(project, capsys, monkeypatch):
+    """A launch treats an unreadable store as no grants (fail closed); validate
+    reports the store itself rather than folding it into "nothing granted".
+
+    ABLATION: drop the store-fault arm of `_validate_plugin_trust` and the
+    no-plugin project passes with an ok finding."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    store_path = runs.plugin_grants_path(project.project)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text("{not json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _trust_findings(doc)
+    assert finding["severity"] == "problem"
+    assert "malformed" in finding["detail"]["fault"]
+
+
+def test_validate_trust_reads_the_configured_repo_root(project, capsys, monkeypatch, tmp_path):
+    """Grants are judged against the code root a run loads (`paths.repo_root`),
+    while the store stays keyed by the project. An ungranted plugin only the
+    project dir holds is not what the run loads, so it is not reported; the code
+    root's is, until `plugins enable` (which discovers from the same root) grants it.
+
+    ABLATION: pass `project` instead of the code root to `_validate_plugin_trust`
+    and both legs flip."""
+    _validate_with_plugin(
+        project,
+        monkeypatch,
+        capsys,
+        "ignored",
+        _HOOK_PLUGIN.replace("hooky", "ignored"),
+        policy=CLAUDE_ONLY_POLICY + '[scm]\nisolation = "none"\n',
+    )
+    code_root = tmp_path / "code"
+    pdir = code_root / ".bmad-loop" / "plugins" / "hooky"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(_HOOK_PLUGIN)
+    _configure_repo_root(project, code_root)
+    argv = ["validate", "--project", str(project.project), "--json"]
+
+    cli.main(argv)  # rc is not this check's: the config.yaml edit dirties the tree
+    [finding] = _trust_findings(json.loads(capsys.readouterr().out))
+    assert finding["severity"] == "problem", finding
+    assert finding["detail"]["plugin"] == "hooky"
+
+    assert _plugins(project, "enable", "hooky") == 0
+    capsys.readouterr()
+    cli.main(argv)
+    [finding] = _trust_findings(json.loads(capsys.readouterr().out))
+    assert (finding["severity"], finding["detail"]) == ("ok", {"plugins": ["hooky"]})

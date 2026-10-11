@@ -7,9 +7,15 @@ byte-identical. Validation is policy.loads() itself via PolicyDoc.validate(),
 plus — on save — each enabled in-process plugin's coupling check (e.g. unity
 editor_mode↔scm.isolation), the same check the engine runs at startup; errors
 block the save and land in the strip above the buttons. A dedicated Plugins
-section is a roster of discovered plugins with enable toggles (their name in
-[plugins] enabled); a plugin's settings appear as a sub-collapsible only once it
-is enabled. Cleared fields
+section is a roster of discovered plugins with enable toggles; a plugin's
+settings appear as a sub-collapsible only once it is enabled. A builtin's toggle
+is its name in [plugins] enabled. A project plugin's toggle is its out-of-tree
+content grant (#496/#497): toggling it on records a grant of the plugin dir as
+it is at save, toggling it off revokes it, and its row shows the grant status.
+The grant is recorded only after the policy validated — against the candidate
+grants — and saved, so a blocked save records nothing. A plugin that changed
+since its grant is never re-pinned here, by a toggle or by an unrelated save:
+that is `bmad-loop plugins accept`, which its row names. Cleared fields
 delete their keys (unset = default / inherit); the adapter extra_args fields
 distinguish "use profile defaults" (override off → key absent) from "replace
 with this list" (override on, possibly empty — None ≠ []).
@@ -18,6 +24,7 @@ with this list" (override on, possibly empty — None ≠ []).
 from __future__ import annotations
 
 import shlex
+import time
 from pathlib import Path
 
 from rich.text import Text
@@ -41,13 +48,33 @@ from textual.widgets import (
     TextArea,
 )
 
+from ... import bmadconfig
 from ... import policy as policy_mod
+from ... import runs
+from ...plugins import store
+from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet, missing_message, needs_grant
+from ...plugins.model import PluginError
+from ...plugins.registry import preflight, read_bound_tree
 from ...policy import POLICY_FILE
 from ...settings_schema import PluginInfo, SettingSpec, build_registry
 from ..settings import PolicyDoc
 
 # collect() sentinel for a field whose widget holds an unusable value
 _INVALID = object()
+
+
+def plugin_wid(name: str) -> str:
+    """A plugin name as a widget-id fragment. A manifest name is any non-empty
+    string, but a Textual id takes only ``[A-Za-z0-9_-]``, so an unsafe name
+    would stop the screen from opening. ASCII letters, digits and ``-`` pass
+    through; every other character's UTF-8 bytes (``_`` included, which keeps the
+    encoding injective) become ``_xx`` hex.
+    ABLATION (test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants):
+    return ``name`` unchanged and the screen fails to open."""
+    return "".join(
+        c if c.isascii() and (c.isalnum() or c == "-") else "".join(f"_{b:02x}" for b in c.encode())
+        for c in name
+    )
 
 
 class SettingsScreen(Screen[None]):
@@ -99,6 +126,13 @@ class SettingsScreen(Screen[None]):
     SettingsScreen .plugin-name {
         padding: 1 1;
     }
+    SettingsScreen .plugin-status {
+        padding: 1 1;
+        color: $text-muted;
+    }
+    SettingsScreen .plugin-status.-attention {
+        color: $warning;
+    }
     SettingsScreen .plugin-divider {
         padding: 1 1 0 1;
         color: $text-muted;
@@ -149,7 +183,18 @@ class SettingsScreen(Screen[None]):
             pol = policy_mod.loads(doc.dumps())
         except policy_mod.PolicyError:
             pol = policy_mod.Policy()
-        self._registry = build_registry(project, pol)
+        # Plugins are discovered from the code root a run loads, as `bmad-loop
+        # plugins` and a launch do, while the grant store stays keyed by the
+        # project. A project whose BMAD config can't be read still edits its
+        # policy, discovering from the project itself.
+        try:
+            self._root = bmadconfig.load_paths(project).repo_root
+        except bmadconfig.BmadConfigError:
+            self._root = project
+        self._grants = store.load_grants(project)
+        self._registry = build_registry(project, pol, root=self._root, grants=self._grants)
+        # Toggle states at open: a project plugin's grant changes only on a flip.
+        self._initial_on = {p.name: self._initial_toggle(p) for p in self._registry.plugins}
         # The TextArea currently in cursor-edit mode (None = navigation mode).
         self._editing: Widget | None = None
 
@@ -235,42 +280,106 @@ class SettingsScreen(Screen[None]):
         settings. A plugin's settings are revealed only while it is active (data-
         only always; trust-gated once enabled); inactive ones are hidden by
         on_mount and toggled live by on_switch_changed, so the roster stays clean."""
+        if self._grants.fault is not None:
+            yield Static(
+                Text(
+                    f"plugin grants could not be read ({self._grants.fault}); "
+                    "project plugins show as not granted"
+                ),
+                classes="plugin-status -attention",
+                id="plugin-grants-fault",
+            )
+        for name, path in self._registry.missing_grants:
+            # no row to toggle off: the grant's plugin is gone, so the CLI revokes it
+            yield Static(
+                Text(missing_message(name, path)),
+                classes="plugin-status -attention plugin-grant-missing",
+            )
         for info in self._registry.plugins:
             with Horizontal(classes="plugin-row"):
                 if info.trust_needed:
                     yield Switch(
-                        value=info.enabled,
-                        id=f"plugin-enabled-{info.name}",
+                        value=self._initial_on[info.name],
+                        id=f"plugin-enabled-{plugin_wid(info.name)}",
                         classes="plugin-enable",
                     )
                 else:
                     yield Static("on", classes="plugin-always")
                 label = f"{info.name} — {info.description}" if info.description else info.name
                 yield Static(label, classes="plugin-name")
+                if info.grant_required:
+                    status, attention = self._grant_label(info)
+                    yield Static(
+                        Text(status),
+                        classes="plugin-status -attention" if attention else "plugin-status",
+                        id=f"plugin-status-{plugin_wid(info.name)}",
+                    )
         configurable = [p for p in self._registry.plugins if p.fields]
         if configurable:
             yield Static("configure", classes="plugin-divider")
             for info in configurable:
                 title = f"{info.name} — {info.description}" if info.description else info.name
                 with Collapsible(
-                    title=title, collapsed=True, id=f"plugin-cfg-{info.name}", classes="plugin-cfg"
+                    title=title,
+                    collapsed=True,
+                    id=f"plugin-cfg-{plugin_wid(info.name)}",
+                    classes="plugin-cfg",
                 ):
                     for spec in info.fields:
                         yield from self._compose_field(spec)
+
+    @staticmethod
+    def _initial_toggle(info: PluginInfo) -> bool:
+        """A builtin's toggle is its [plugins] enabled membership; a project
+        plugin's is whether a grant is recorded (matching or not, so a changed
+        plugin can still be toggled off to revoke it) or its name is still in
+        [plugins] enabled — the upgrade case with no grant starts on too, so
+        toggling it off drops the legacy entry; left off, that fatal state could
+        never be cleared and would block every save.
+        ABLATION (test_toggle_off_clears_an_ungranted_legacy_entry): drop the
+        ``info.enabled`` arm and the toggle can't be turned off."""
+        if info.grant_required:
+            return info.has_grant or info.enabled
+        return info.enabled
+
+    @staticmethod
+    def _grant_label(info: PluginInfo) -> tuple[str, bool]:
+        """A project plugin's grant status for its roster row, and whether it
+        needs the operator's attention. Re-pinning is the CLI's: the row names it."""
+        accept = f"run `bmad-loop plugins accept {info.name}`"
+        if info.grant_status == "granted":
+            return "granted", False
+        if info.grant_status == "ungranted" and info.enabled:
+            return (
+                f"enabled, not granted — run `bmad-loop plugins enable {info.name}` "
+                "or toggle off",
+                True,
+            )
+        if info.grant_status == "mismatch":
+            return f"changed — {accept}", True
+        if info.grant_status == "stale":
+            return (
+                "granted, but no hooks, workflows, [python] or seeds left — toggle off "
+                f"or run `bmad-loop plugins revoke {info.granted_as or info.name}`",
+                True,
+            )
+        if info.grant_status == "unreadable":
+            return f"unreadable — fix the plugin dir, then {accept}", True
+        return "not granted", False
 
     def _plugin_active(self, info: PluginInfo) -> bool:
         """A data-only plugin is always active; a trust-gated one is active only
         while its enable toggle is on (its module is what trust gates)."""
         if not info.trust_needed:
             return True
-        return self.query_one(f"#plugin-enabled-{info.name}", Switch).value
+        return self.query_one(f"#plugin-enabled-{plugin_wid(info.name)}", Switch).value
 
     def on_mount(self) -> None:
         # Hide the settings of every plugin that isn't active yet, so a fresh open
         # shows only the roster plus the active plugins' settings.
         for info in self._registry.plugins:
             if info.fields and not self._plugin_active(info):
-                self.query_one(f"#plugin-cfg-{info.name}", Collapsible).display = False
+                self.query_one(f"#plugin-cfg-{plugin_wid(info.name)}", Collapsible).display = False
         self._show_errors(self._doc.validate(self._registry.plugin_schemas))
 
     # ------------------------------------------------------------ keyboard
@@ -334,9 +443,9 @@ class SettingsScreen(Screen[None]):
         elif event.switch.has_class("plugin-enable") and event.switch.id:
             # Reveal/hide the plugin's settings live (a plugin with no settings has
             # no config collapsible). Expand on reveal so they're immediately seen.
-            name = event.switch.id.removeprefix("plugin-enabled-")
-            if self.query(f"#plugin-cfg-{name}"):
-                cfg = self.query_one(f"#plugin-cfg-{name}", Collapsible)
+            wid = event.switch.id.removeprefix("plugin-enabled-")
+            if self.query(f"#plugin-cfg-{wid}"):
+                cfg = self.query_one(f"#plugin-cfg-{wid}", Collapsible)
                 cfg.display = event.value
                 if event.value:
                     cfg.collapsed = False
@@ -410,21 +519,31 @@ class SettingsScreen(Screen[None]):
             ] != desired
         return current != desired
 
-    def _save_enabled(self) -> None:
-        """Reconcile [plugins] enabled with the enable toggles. Only trust-gated
-        plugins carry a toggle; any other name already in the list (a data-only
-        plugin, or a plugin this checkout can't discover) is preserved so the
-        save never silently drops trust the UI doesn't manage. An absent key
-        stays absent when nothing is enabled (unset = nothing trusted)."""
-        toggles = {p.name for p in self._registry.plugins if p.trust_needed}
+    def _builtin_toggles(self) -> list[PluginInfo]:
+        return [p for p in self._registry.plugins if p.trust_needed and p.origin in TRUSTED_SOURCES]
+
+    def _save_enabled(self, revoked: list[str]) -> None:
+        """Reconcile [plugins] enabled with the builtin enable toggles. Only a
+        builtin's in-process module is gated by that list; a project plugin's
+        toggle is its grant, so its name is never written here. Any other name
+        already in the list (a data-only plugin, a project plugin, or a plugin
+        this checkout can't discover) is preserved so the save never silently
+        drops trust the UI doesn't manage — except a project plugin toggled off
+        (``revoked``): a legacy entry left behind would make its revoked grant a
+        fatal "enabled but never granted", so the toggle-off could never save.
+        An absent key stays absent when nothing is enabled (unset = nothing
+        trusted)."""
+        managed = self._builtin_toggles()
+        toggles = {p.name for p in managed}
         on = [
             p.name
-            for p in self._registry.plugins
-            if p.trust_needed and self.query_one(f"#plugin-enabled-{p.name}", Switch).value
+            for p in managed
+            if self.query_one(f"#plugin-enabled-{plugin_wid(p.name)}", Switch).value
         ]
         current = self._doc.get("plugins", "enabled")
         current_names = None if current is None else [str(x) for x in current]
-        preserved = [n for n in (current_names or []) if n not in toggles]
+        dropped = toggles | set(revoked)
+        preserved = [n for n in (current_names or []) if n not in dropped]
         desired = preserved + on
         if current_names is None:
             if desired:
@@ -451,11 +570,25 @@ class SettingsScreen(Screen[None]):
         for spec, value in desired.items():
             if self._changed(spec, self._doc.get(spec.section, spec.key), value):
                 self._doc.set(spec.section, spec.key, value)
-        self._save_enabled()
-        # Pass the project so the round-trip also runs every enabled in-process
+        to_grant, to_revoke = self._grant_flips()
+        self._save_enabled(to_revoke)
+        # Re-read, so a `bmad-loop plugins` change made while the screen was open
+        # survives; the grant write below is refused if the store moves off it.
+        base = store.load_grants(self._project)
+        candidate = self._candidate_grants(base, to_grant, to_revoke)
+        if isinstance(candidate, str):
+            self._show_errors(candidate)
+            return
+        # Pass the code root so the round-trip also runs every enabled in-process
         # plugin's coupling check (e.g. unity editor_mode↔scm.isolation), blocking
-        # an incompatible save the same way the engine fails fast at startup.
-        error = self._doc.validate(self._registry.plugin_schemas, project=self._project)
+        # an incompatible save the same way the engine fails fast at startup — and
+        # judge plugin trust against the grants this save would leave, so a plugin
+        # a launch would refuse blocks it too. Nothing is written before this:
+        # ABLATION (test_failed_validate_records_no_grant) — record the grant
+        # first and a blocked save leaves it behind.
+        error = self._doc.validate(
+            self._registry.plugin_schemas, project=self._root, grants=candidate
+        )
         if error:
             self._show_errors(error)
             return
@@ -464,8 +597,89 @@ class SettingsScreen(Screen[None]):
         except OSError as e:
             self._show_errors(f"save failed: {e}")
             return
-        self.app.notify(f"policy saved: {self._path}")
+        if to_grant or to_revoke:
+            try:
+                store.save_grants(self._project, candidate.records, expected=base)
+            except (OSError, runs.StateRootError, store.GrantStoreChanged) as e:
+                self._show_errors(f"policy saved, but the plugin grant was not recorded: {e}")
+                return
+        if candidate.fault is not None:
+            # Only reachable with no toggle flipped (a flip refuses a faulted store
+            # above), so the save is fine, but the store may have gone bad since the
+            # open-time banner: say so, or every project plugin silently goes inert.
+            # ABLATION (test_save_surfaces_a_grant_store_that_went_bad): drop this
+            # arm and the save reports plain success.
+            self.app.notify(
+                f"policy saved: {self._path} — but plugin grants could not be read "
+                f"({candidate.fault}); a launch treats this as no grants and refuses "
+                "every project plugin that needs one",
+                severity="warning",
+            )
+        else:
+            self.app.notify(f"policy saved: {self._path}")
         self.app.pop_screen()
+
+    def _grant_flips(self) -> tuple[list[str], list[str]]:
+        """Project plugins toggled on since open (to grant) and off (to revoke).
+        An untouched toggle changes nothing — so an unrelated save never
+        re-blesses a plugin whose contents moved since its grant."""
+        to_grant: list[str] = []
+        to_revoke: list[str] = []
+        for info in self._registry.plugins:
+            if not info.grant_required:
+                continue
+            now = self.query_one(f"#plugin-enabled-{plugin_wid(info.name)}", Switch).value
+            was = self._initial_on[info.name]
+            if now and not was and info.grant_status == "ungranted":
+                to_grant.append(info.name)
+            elif was and not now:
+                # a grant under the plugin's pre-rename name is revoked by that name
+                to_revoke.append(info.granted_as or info.name)
+        return to_grant, to_revoke
+
+    def _candidate_grants(
+        self, grants: GrantSet, to_grant: list[str], to_revoke: list[str]
+    ) -> GrantSet | str:
+        """The grants this save would leave: ``grants`` (the store as it is now)
+        plus a fresh record of each newly toggled plugin's dir, minus the revoked.
+        A string is the error that blocks the save. Hashes only — nothing runs."""
+        if not (to_grant or to_revoke):
+            return grants
+        if grants.fault is not None:
+            # never overwrite a store that exists but can't be read: its grants would be lost
+            return (
+                f"plugin grants could not be read ({grants.fault}); not changing them — "
+                "fix or remove the file, or use `bmad-loop plugins`"
+            )
+        if to_grant:
+            try:
+                found = {
+                    m.name: (m, rel)
+                    for m, _verdict, rel in preflight(self._root, None, GrantSet.empty())
+                }
+            except PluginError as e:
+                return str(e)
+            granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for name in to_grant:
+                if name not in found:
+                    return f'plugin "{name}" is no longer discovered under {self._root}'
+                manifest, rel = found[name]
+                if not needs_grant(manifest):
+                    # the toggled override was removed (a builtin now answers to the
+                    # name) or lost its exec surface: a grant would pin bytes nothing runs
+                    return (
+                        f'plugin "{name}" no longer needs a grant (now a {manifest.source} '
+                        "plugin with this name, or no hooks, workflows, [python] or seeds); "
+                        "reopen settings to see it as it is"
+                    )
+                try:
+                    tree = read_bound_tree(manifest)
+                except PluginError as e:
+                    return str(e)
+                grants = store.upsert(grants, GrantRecord.from_tree(name, rel, tree, granted_at))
+        for name in to_revoke:
+            grants = store.remove(grants, name)
+        return grants
 
     def _show_errors(self, message: str | None) -> None:
         strip = self.query_one("#errors", Static)

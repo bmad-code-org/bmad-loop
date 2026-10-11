@@ -134,6 +134,40 @@ def test_declarative_env_carries_delivery_id_only_when_set():
     assert "BMAD_LOOP_DELIVERY_ID" not in seen[1]
 
 
+def test_inactive_plugins_never_dispatch():
+    # trust is the registry's verdict, read through LoadedPlugin.active: an
+    # untrusted plugin (an un-enabled builtin [python]) contributes no hook, no
+    # active stage, no live-plugin name — its declarative hooks included
+    ran: list[str] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        ran.append(cmd)
+        return 0, ""
+
+    gated = LoadedPlugin(
+        manifest=manifest("gated", hooks=(HookSpec(stage="pre_story", cmd="X"),)), trusted=False
+    )
+    bus = HookBus(registry_of(gated), runner=runner)
+    assert not bus.active("pre_story") and bus.active_plugins() == []
+    bus.emit("pre_story", ctx("pre_story"))
+    assert ran == []
+
+
+def test_declarative_env_disables_bytecode(monkeypatch):
+    # a Python hook must never write __pycache__ into its (snapshot) dir — even
+    # when the operator's own environment allows bytecode writes
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("pre_story")), runner=runner)
+    bus.emit("pre_story", ctx("pre_story"))
+    assert seen[0]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
 def test_rollback_outcome_is_readonly_and_defaults_to_none():
     assert ctx().rollback_outcome is None
     assert ctx("pre_rollback").rollback_outcome is None

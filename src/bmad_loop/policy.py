@@ -664,18 +664,20 @@ class ScmPolicy:
 
 @dataclass(frozen=True)
 class PluginsPolicy:
-    # Trust allowlist for the plugin system. A plugin folder dropped under
-    # .bmad-loop/plugins/ (or shipped under bmad_loop/data/plugins/) loads its
-    # declarative manifest — settings + out-of-process shell hooks — regardless.
-    # A plugin that declares an in-process [python] module is NEVER imported or
-    # executed unless its name appears here. Absent table = no plugins trusted,
-    # which reproduces today's behavior exactly.
+    # Trust allowlist for BUILTIN plugins: a shipped plugin's in-process
+    # [python] module is imported only when its name appears here; an
+    # un-enabled one is wholly inert (hooks, workflows and seeds too). A project
+    # plugin under .bmad-loop/plugins/ with any executable surface runs only
+    # under an operator content grant kept OUT of this agent-writable file
+    # (#496/#497) — the grant subsumes this list for project origin, and a name
+    # listed here with no grant fails startup rather than vouching for whatever
+    # dir carries it. Absent table = no builtin [python] plugin trusted.
     enabled: tuple[str, ...] = ()
     # Per-plugin settings, parsed from the [plugins.<name>] sub-tables. Each
     # value is the raw settings dict for that plugin; the plugin's own schema
     # gives the keys meaning. Read through Policy.plugin_setting(). A plugin
-    # need not be in `enabled` to carry settings here (settings are data, only
-    # in-process [python] is trust-gated), but the settings UI renders a
+    # need not be in `enabled` to carry settings here (settings are data; the
+    # trust gate is on code), but the settings UI renders a
     # plugin's section only when it is enabled.
     settings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -1591,11 +1593,14 @@ seed_adapter_defaults = true # seed each loaded adapter's default gitignored con
 worktree_seed = []           # extra gitignored files to copy into each worktree, on top of adapter defaults
 
 [plugins]
-# Plugin trust allowlist. A plugin dropped under .bmad-loop/plugins/<name>/ loads
-# its declarative manifest (settings + out-of-process shell hooks) automatically.
-# A plugin that ships an in-process [python] module is NEVER imported or run
-# unless its name is listed here. Empty = no plugins trusted (today's behavior).
-enabled = []                 # e.g. ["unity", "my-lint-plugin"]
+# Trust allowlist for BUILTIN plugins: a shipped plugin's in-process [python]
+# module is imported only when its name is listed here. Empty = none trusted.
+# A project plugin under .bmad-loop/plugins/<name>/ with hooks, workflows, seeds
+# or [python] is NOT enabled here: it runs only under a content grant recorded
+# outside this file with `bmad-loop plugins enable <name>` (re-pin a changed one
+# with `bmad-loop plugins accept <name>`). Until granted it is inert; a project
+# plugin named here without a grant fails startup. Settings-only plugins load freely.
+enabled = []                 # e.g. ["unity"]
 
 # The game-engine layer is a plugin. For a Unity project whose dev/sweep cycle
 # drives a live Editor via an Editor MCP, enable it above and configure it here:

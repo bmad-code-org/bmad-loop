@@ -1,14 +1,22 @@
 """Plugin trust + api_version compatibility.
 
-Two tiers, per the design:
+Trust is by ORIGIN, then by CONTENT (#496/#497; the verdict itself is
+`grants.classify`, enforced once in `PluginRegistry.build`):
 
-  * Data-only / declarative plugins (no ``[python]``) carry no executable Python
-    — they load on folder-drop. Their shell hooks are the same risk surface as
-    today's ``engine.toml *_cmd`` and run through the bus like any command.
-  * A plugin that declares a ``[python]`` module is **never imported or
-    executed** unless its name is in ``policy.toml [plugins] enabled = [...]``.
-    Dropping a folder must never auto-run code — the registry calls
-    ``require_enabled`` before ``exec_module``.
+  * builtin and entry-point plugins ship with the installed package and are
+    trusted by provenance. A builtin's in-process ``[python]`` module is
+    imported only when its name is in ``policy.toml [plugins] enabled``; an
+    un-enabled one is wholly inert — its hooks, workflows and seeds too.
+  * a project-origin plugin (``.bmad-loop/plugins/``) with any executable
+    surface — hooks, workflows, ``[python]``, seeds — runs only under an
+    operator content GRANT recorded out of the tree. Never granted and not in
+    ``enabled``: inert, and the run goes on. Granted but changed since, or
+    named in ``enabled`` without a grant: the build raises `PluginTrustError`
+    before any plugin executes. A granted plugin runs from a verified snapshot.
+    A settings-only project plugin loads freely.
+
+Dropping a folder never auto-runs anything, and a name in ``enabled`` no longer
+vouches for whatever dir happens to carry it.
 
 Compatibility is separate from trust: a manifest's ``api_version`` must be in
 the framework's ``SUPPORTED_API``. The loader decides the *consequence* of a
@@ -17,6 +25,7 @@ mismatch (hard error for a builtin we ship, skip-with-warning for third-party).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from .model import SUPPORTED_API, PluginError, PluginManifest
@@ -34,6 +43,28 @@ class PluginUntrusted(PluginError):
     """Raised when in-process Python is requested for a plugin that is not in
     ``[plugins] enabled``. Caught by the registry, which records the instance as
     untrusted (not constructed) rather than crashing the run."""
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """One plugin the registry gate refused: its name, why, its discovery origin
+    (``manifest.source``) and its dir (POSIX relpath from the discovery root)."""
+
+    name: str
+    reason: str
+    origin: str
+    path: str
+
+
+class PluginTrustError(PluginError):
+    """Raised by `PluginRegistry.build` when any plugin's verdict is fatal (a
+    granted plugin that changed, an ``enabled`` name with no grant, a granted dir
+    that can't be read) — before any plugin, builtins included, executes.
+    ``refusals`` carries every fatal one; the message carries their fixes."""
+
+    def __init__(self, refusals: tuple[Refusal, ...]):
+        self.refusals = refusals
+        super().__init__("\n".join(r.reason for r in refusals))
 
 
 def enabled_names(policy: _HasPlugins | None) -> frozenset[str]:

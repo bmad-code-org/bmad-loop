@@ -28,6 +28,7 @@ from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
 from bmad_loop.journal import STATE_FILE, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
+from bmad_loop.plugins.grants import GrantSet
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
@@ -1095,6 +1096,29 @@ def copy_project(template: Path, root: Path) -> ProjectPaths:
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
         planning_artifacts=root / "_bmad-output" / "planning-artifacts",
     )
+
+
+def grant_plugin(root: Path, name: str, *, store_project: Path | None = None) -> GrantSet:
+    """An operator grant for the project plugin ``name`` discovered under ``root``
+    (``root/.bmad-loop/plugins/<name>``), as the frozen `GrantSet` a launch would
+    thread to `PluginRegistry.build` / `Engine(plugin_grants=...)`.
+
+    The digest is taken NOW, so write the plugin's final bytes (absolute markers
+    included) first. Snapshots land under the autouse-isolated state root. With
+    ``store_project`` the grant is also persisted to that project's out-of-tree
+    store, for code paths that read the store themselves."""
+    from bmad_loop.plugins.digest import read_tree
+    from bmad_loop.plugins.grants import GrantRecord
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+    from bmad_loop.plugins.store import save_grants
+
+    tree = read_tree(root / USER_PLUGINS_REL / name)
+    rel = (USER_PLUGINS_REL / name).as_posix()
+    record = GrantRecord.from_tree(name, rel, tree, "2026-10-10T00:00:00Z")
+    owner = store_project if store_project is not None else root
+    if store_project is not None:
+        save_grants(store_project, [record], expected=None)
+    return GrantSet(records=(record,), snapshot_root=runs.plugin_snapshots_root(owner))
 
 
 @pytest.fixture

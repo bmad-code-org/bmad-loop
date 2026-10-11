@@ -38,11 +38,23 @@ A project-local plugin with the **same name** overrides the bundled one. The
 plugin's directory is its `{scripts}` dir, so its manifest and helper scripts sit
 together.
 
-Enable it in `.bmad-loop/policy.toml`:
+How you switch it on depends on where it lives
+([trust](plugin-authoring-guide.md#trust--safety)):
+
+- **Bundled** (the shipped `unity`): list it in `[plugins] enabled`, as below.
+- **Project-local** (your own engine plugin, or a copy of `unity` under
+  `.bmad-loop/plugins/unity/`): `[plugins] enabled` does **not** cover it. Review
+  the folder, then grant it with `bmad-loop plugins enable <name>`. The grant
+  pins the sha256 of the whole directory, so after each edit run
+  `bmad-loop plugins accept <name>`, or the next launch fails. A project name
+  listed in `enabled` without a grant also fails startup, and a refused override
+  of `unity` never falls back to the bundled copy.
+
+Enable the bundled plugin and configure it in `.bmad-loop/policy.toml`:
 
 ```toml
 [plugins]
-enabled = ["unity"]          # or your engine's name
+enabled = ["unity"]          # bundled plugins only
 
 [plugins.unity]
 editor_mode = "shared"
@@ -54,8 +66,9 @@ mcp = "ivanmurzak"
 > plus a `[plugins.unity]` table. The _policy block_ is the only thing folded,
 > though — project-local plugin overrides are now discovered under
 > `.bmad-loop/plugins/<name>/`, so move an old `.bmad-loop/engines/unity/`
-> override dir to `.bmad-loop/plugins/unity/`. Migrate to `[plugins]` when
-> convenient.
+> override dir to `.bmad-loop/plugins/unity/`, and grant it there with
+> `bmad-loop plugins enable unity` — the folded allowlist does not grant a
+> project override. Migrate to `[plugins]` when convenient.
 
 ## Mapping the Editor lifecycle onto hook stages
 
@@ -190,12 +203,15 @@ while time.time() < deadline:
 sys.exit(1)                                       # never came up → unit deferred
 ```
 
-Then enable it — and keep `[scm] isolation = "none"` (the default) for `shared`:
+Then grant it — it is a project plugin, so this replaces `[plugins] enabled` —
+and keep `[scm] isolation = "none"` (the default) for `shared`:
 
-```toml
-[plugins]
-enabled = ["godot"]
+```bash
+bmad-loop plugins enable godot
 ```
+
+Until it is granted, a run notes that `godot` is not granted and runs without it.
+Edit either file afterwards and run `bmad-loop plugins accept godot`.
 
 That's a complete engine plugin. To give each unit its own Editor, add
 `[hooks.pre_worktree_setup]` + `[hooks.pre_worktree_teardown]` and switch
@@ -204,11 +220,11 @@ port-isolation and seeding mechanics. If you need the `editor_mode`↔isolation
 validation or MCP agent routing the Unity plugin does, reach for a `[python]`
 module (see the [authoring guide](plugin-authoring-guide.md#in-process-hooks)).
 
-> A **declarative** engine plugin activates as soon as its folder is present (the
-> declarative trust tier). For an engine that's usually what you want. If you'd
-> rather require explicit opt-in via `[plugins] enabled`, give the plugin a
-> `[python]` module — that's trust-gated and won't run until listed. The bundled
-> Unity plugin is in-process for exactly this reason.
+> A **project** engine plugin, declarative or not, activates only once it is
+> granted, and it then runs from a verified out-of-tree snapshot of the bytes you
+> granted. A **bundled** declarative plugin activates as soon as it is discovered;
+> the bundled Unity plugin ships a `[python]` module, so it stays inert until
+> `unity` is in `[plugins] enabled`.
 
 ## Reference: the bundled Unity plugin
 

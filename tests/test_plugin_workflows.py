@@ -20,7 +20,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from conftest import committing_crash_state, dev_effect, git, review_effect, write_sprint
+from conftest import (
+    committing_crash_state,
+    dev_effect,
+    git,
+    grant_plugin,
+    review_effect,
+    write_sprint,
+)
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
@@ -123,8 +130,9 @@ def test_unenabled_python_workflow_is_inert():
     # ran, so its workflow must not inject a session either.
     m = wf_manifest("gated", python=True)
     reg = PluginRegistry([LoadedPlugin(manifest=m, trusted=False)])
-    assert reg.workflow_stages() == frozenset({"post_dev_phase"})  # declared...
-    assert reg.workflows_for("post_dev_phase") == []  # ...but not active
+    assert m.workflows_for("post_dev_phase")  # declared...
+    assert reg.workflow_stages() == frozenset()  # ...but no stage guard (#496/#497)
+    assert reg.workflows_for("post_dev_phase") == []  # ...and not active
 
 
 def test_provided_workflows_names():
@@ -481,6 +489,23 @@ def test_no_workflow_no_extra_session(project):
     assert not any(e["kind"].startswith("workflow") for e in engine.journal.entries())
 
 
+def test_ungranted_project_workflow_never_injects(project):
+    # #497: a dropped-in project plugin providing a workflow would inject an
+    # agent session into every story. Without a grant it is inert.
+    pdir = project.project / ".bmad-loop" / "plugins" / "rogue"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "rogue"\napi_version = 1\n'
+        '[workflows.doc]\nstage = "post_dev_phase"\nrole = "review"\nprompt = "/doc {story_key}"\n'
+    )
+    engine, adapter = make_engine(project, one_story(project))  # the engine builds, no grants
+    summary = engine.run()
+    assert summary.done == 1
+    assert len(adapter.sessions) == 2  # dev + review only: nothing injected
+    assert not any(e["kind"].startswith("workflow") for e in engine.journal.entries())
+    assert [r.name for r in engine._registry.refusals] == ["rogue"]
+
+
 # ============================================= board ownership (#437, phase 3)
 #
 # A workflow session is dispatched in the window between the orchestrator's own
@@ -650,7 +675,9 @@ def test_example_plugin_full_cycle(project):
     install_example(project)
     setup_story(project)
     policy = example_policy(trailer="Automated-by: guardrails", forbid_epic=0)
-    reg = PluginRegistry.build(project.project, policy)
+    # a project plugin named in `enabled` runs only under an operator grant
+    grants = grant_plugin(project.project, "guardrails")
+    reg = PluginRegistry.build(project.project, policy, grants=grants)
     # the in-process module was trusted (enabled) and constructed
     assert reg.get("guardrails").instance is not None
 
@@ -678,8 +705,9 @@ def test_example_plugin_veto_gate_skips_parked_epic(project):
     setup_story(project)
     # park epic 1 -> the pre_dev_phase gate skips story 1-1-a before any session
     policy = example_policy(forbid_epic=1)
-    reg = PluginRegistry.build(project.project, policy)
-    engine, adapter = make_engine(project, [], reg, policy)  # empty script: no session launches
+    grants = grant_plugin(project.project, "guardrails")
+    # the engine builds the registry itself from the launch's grants
+    engine, adapter = make_engine(project, [], None, policy, plugin_grants=grants)  # no session
     summary = engine.run()
     assert summary.deferred == 1 and summary.done == 0
     assert not adapter.sessions  # vetoed before the dev session

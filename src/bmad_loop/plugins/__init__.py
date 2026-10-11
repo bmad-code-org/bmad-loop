@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from .bus import HookBus
 from .context import VETO_ACTIONS, HookContext, Veto
+from .grants import GrantSet
 from .loader import (
     ENTRY_POINT_GROUP,
     USER_PLUGINS_REL,
@@ -35,7 +36,7 @@ from .model import (
     SettingSpec,
 )
 from .registry import PluginRegistry
-from .trust import PluginUntrusted, is_enabled, require_enabled
+from .trust import PluginTrustError, PluginUntrusted, Refusal, is_enabled, require_enabled
 
 __all__ = [
     "API_VERSION",
@@ -51,6 +52,9 @@ __all__ = [
     "LoadedPlugin",
     "PluginError",
     "PluginUntrusted",
+    "PluginTrustError",
+    "Refusal",
+    "GrantSet",
     "PluginRegistry",
     "HookBus",
     "HookContext",
