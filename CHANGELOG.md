@@ -38,6 +38,16 @@ breaking changes may land in a minor release.
 
 - Open the TUI settings screen when a toggled plugin's name is not a valid widget id
   (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+- psmux: run the parked-window trailer's psmux calls through the absolute path
+  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
+  from the pane's `PATH` no longer silently skips the client return and leaks the
+  return-target key (#877).
+- Keep `cleanup` (and the TUI's cleanup) from closing a control window whose command
+  is still running, such as an interactive `resolve` of a paused run: a window is
+  closed only once its screen shows the park banner. A window whose screen cannot be
+  read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
+- Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
+  (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 
 ### Security
 
@@ -54,22 +64,6 @@ breaking changes may land in a minor release.
   `bmad-loop plugins accept <name>`; refuse before any plugin code runs (#496, #497).
 - Fail startup when a granted project plugin loses its whole executable surface or its
   dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
-
-### Fixed
-
-- psmux: run the parked-window trailer's psmux calls through the absolute path
-  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
-  from the pane's `PATH` no longer silently skips the client return and leaks the
-  return-target key (#877).
-
-### Fixed
-
-- Keep `cleanup` (and the TUI's cleanup) from closing a control window whose command
-  is still running, such as an interactive `resolve` of a paused run: a window is
-  closed only once its screen shows the park banner. A window whose screen cannot be
-  read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
-- Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
-  (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 
 ## [0.13.2] — 2026-10-09
 
