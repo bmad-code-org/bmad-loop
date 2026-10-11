@@ -4973,7 +4973,8 @@ class WorktreeFlow:
             reason = (
                 f"story {key} is already done on the sprint board, so replay run "
                 f"{self.state.run_id}'s unit (replaying run {self.state.replay_of}) is "
-                f"superseded work and was not merged; {by_hand}"
+                f"superseded work and was not merged; {by_hand}; then close the "
+                f"replay run with `bmad-loop resolve {self.state.run_id} --abandon`"
             )
         self.journal.append(
             "replay-merge-refused",

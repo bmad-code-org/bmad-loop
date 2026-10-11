@@ -6603,17 +6603,24 @@ def test_path_clean_types_a_directory_in_no_repository(tmp_path, monkeypatch):
 
 def test_path_clean_leaves_a_broken_gitfile_untyped(tmp_path, monkeypatch):
     """A `.git` gitfile pointing at a missing gitdir answers `fatal: not a git
-    repository: <path>` — no `(or any `. That is a corrupt repository pointer, not an
-    absent repository, so it stays a plain `GitError` a ledger publish re-raises.
+    repository: <path>` (git 2.56+: `fatal: gitfile does not point to a valid
+    repository: <path>`) — no `(or any ` either way. That is a corrupt repository
+    pointer, not an absent repository, so it stays a plain `GitError` a ledger
+    publish re-raises.
 
     Ablation: widen the match to `fatal: not a git repository` and this fails on the
-    subtype."""
+    subtype — before git 2.56 only; from 2.56 the gitfile wording no longer carries
+    that phrase, and `..._pre_256_broken_gitfile_wording_untyped` pins the narrow
+    match on every git."""
     broken = tmp_path / "broken"
     broken.mkdir()
     (broken / ".git").write_text(f"gitdir: {tmp_path / 'missing'}\n", encoding="utf-8")
     (broken / "ledger.md").write_text("x\n", encoding="utf-8")
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    with pytest.raises(verify.GitError, match="not a git repository") as info:
+    with pytest.raises(
+        verify.GitError,
+        match="not a git repository|gitfile does not point to a valid repository",
+    ) as info:
         verify.path_clean(broken, "ledger.md")
     assert not isinstance(info.value, verify.GitNotARepositoryError)
 
@@ -6647,6 +6654,19 @@ def _stub_status_failure(monkeypatch, stderr):
         return subprocess.CompletedProcess(cmd, 128, stdout="", stderr=stderr)
 
     monkeypatch.setattr(verify, "_run_git", stub)
+
+
+def test_path_clean_leaves_the_pre_256_broken_gitfile_wording_untyped(tmp_path, monkeypatch):
+    """Git before 2.56 words a broken gitfile `fatal: not a git repository: <path>`
+    — the discovery stem without `(or any `. Stubbed so the narrow match stays
+    pinned on a git 2.56+ host, where the real-gitfile row sees the new wording.
+
+    Ablation: widen the match to `fatal: not a git repository` and this fails on the
+    subtype."""
+    _stub_status_failure(monkeypatch, "fatal: not a git repository: /x/broken/.git\n")
+    with pytest.raises(verify.GitError, match="not a git repository: /x/broken") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
 
 
 def test_path_clean_types_the_mount_point_discovery_failure(tmp_path, monkeypatch):
@@ -14607,6 +14627,35 @@ def test_ref_exists_sees_full_refnames_outside_heads(project):
     assert verify.ref_exists(repo / "no-such-repo", ref) is False  # git failure -> absent
 
 
+def test_branch_exists_checked_raises_on_an_unreadable_repo(project):
+    """`branch_exists_checked` answers True/False for a readable repo — matching the
+    exact branch, not a ref nested beneath it — and RAISES where `branch_exists`
+    folds a git failure into False.
+
+    Ablation: return `rc == 0 and ...` instead of raising and the last row fails."""
+    repo = project.project
+    assert verify.branch_exists_checked(repo, "main") is True
+    assert verify.branch_exists_checked(repo, "no-such-branch") is False
+    git(repo, "branch", "nest/inner")
+    assert verify.branch_exists_checked(repo, "nest") is False  # pattern prefix, not a match
+    assert verify.branch_exists(repo / "no-such-repo", "main") is False
+    with pytest.raises(verify.GitError):
+        verify.branch_exists_checked(repo / "no-such-repo", "main")
+
+
+def test_create_ref_refuses_to_overwrite(project):
+    """`create_ref` writes a new full ref and refuses one that already exists."""
+    repo = project.project
+    ref = "refs/attempt-preserve-dirty/run-abc12345-abandon"
+    head = git(repo, "rev-parse", "HEAD").strip()
+    verify.create_ref(repo, ref, head)
+    assert git(repo, "rev-parse", ref).strip() == head
+    git(repo, "commit", "-q", "--allow-empty", "-m", "next")
+    with pytest.raises(verify.GitError):
+        verify.create_ref(repo, ref, "HEAD")
+    assert git(repo, "rev-parse", ref).strip() == head
+
+
 def test_snapshot_worktree_noop_clean_tree(project):
     """A clean tree (identical to HEAD) has nothing uncommitted to park: returns
     None and creates no ref, so a plain reset proceeds unchanged."""
@@ -14681,6 +14730,27 @@ def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, t
     assert ref == "refs/attempt-preserve-dirty/run-noident"
     assert git(repo, "show", "-s", "--format=%an", ref) == "bmad-loop"  # synthetic author used
     assert git(repo, "show", f"{ref}:src.txt") == "edit with no identity"  # work captured
+
+
+@pytest.mark.parametrize("kind", ["worktree", "commit"])
+def test_snapshot_commits_ignore_an_inherited_commit_date(project, monkeypatch, kind):
+    """A launching shell's ``GIT_COMMITTER_DATE``/``GIT_AUTHOR_DATE`` does not reach a
+    preservation commit: retention ranks preserve refs by ``committerdate``, so a
+    snapshot back-dated to 2001 would be the first one pruned.
+
+    Ablation: build the env from ``os.environ`` unfiltered (the pre-fix
+    ``_snapshot_ident_env``) and both rows read 2001."""
+    repo = project.project
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+    ref = f"refs/attempt-preserve-dirty/run-dated-{kind}"
+    if kind == "worktree":
+        (repo / "src.txt").write_text("dirty\n")
+        assert verify.snapshot_worktree(repo, ref, baseline_untracked=[]) == ref
+    else:
+        verify.snapshot_commit(repo, ref, git(repo, "rev-parse", "HEAD"), "detached snapshot")
+    dates = git(repo, "show", "-s", "--format=%cI %aI", ref).split()
+    assert all(not d.startswith("2001") for d in dates), dates
 
 
 def test_snapshot_worktree_scopes_to_run_created_untracked(project):
