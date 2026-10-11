@@ -483,20 +483,24 @@ class SettingsScreen(Screen[None]):
     def _builtin_toggles(self) -> list[PluginInfo]:
         return [p for p in self._registry.plugins if p.trust_needed and p.origin in TRUSTED_SOURCES]
 
-    def _save_enabled(self) -> None:
+    def _save_enabled(self, revoked: list[str]) -> None:
         """Reconcile [plugins] enabled with the builtin enable toggles. Only a
         builtin's in-process module is gated by that list; a project plugin's
         toggle is its grant, so its name is never written here. Any other name
         already in the list (a data-only plugin, a project plugin, or a plugin
         this checkout can't discover) is preserved so the save never silently
-        drops trust the UI doesn't manage. An absent key stays absent when
-        nothing is enabled (unset = nothing trusted)."""
+        drops trust the UI doesn't manage — except a project plugin toggled off
+        (``revoked``): a legacy entry left behind would make its revoked grant a
+        fatal "enabled but never granted", so the toggle-off could never save.
+        An absent key stays absent when nothing is enabled (unset = nothing
+        trusted)."""
         managed = self._builtin_toggles()
         toggles = {p.name for p in managed}
         on = [p.name for p in managed if self.query_one(f"#plugin-enabled-{p.name}", Switch).value]
         current = self._doc.get("plugins", "enabled")
         current_names = None if current is None else [str(x) for x in current]
-        preserved = [n for n in (current_names or []) if n not in toggles]
+        dropped = toggles | set(revoked)
+        preserved = [n for n in (current_names or []) if n not in dropped]
         desired = preserved + on
         if current_names is None:
             if desired:
@@ -523,8 +527,8 @@ class SettingsScreen(Screen[None]):
         for spec, value in desired.items():
             if self._changed(spec, self._doc.get(spec.section, spec.key), value):
                 self._doc.set(spec.section, spec.key, value)
-        self._save_enabled()
         to_grant, to_revoke = self._grant_flips()
+        self._save_enabled(to_revoke)
         candidate = self._candidate_grants(to_grant, to_revoke)
         if isinstance(candidate, str):
             self._show_errors(candidate)

@@ -929,6 +929,32 @@ async def test_toggle_off_revokes(project):
     assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
 
 
+async def test_toggle_off_drops_a_legacy_enabled_entry(project):
+    """A granted project plugin still named in [plugins] enabled (the upgrade case)
+    can be toggled off: its name leaves the list with its grant, or the revoked
+    grant would read as "enabled but never granted" and block the save. Names the
+    UI doesn't manage stay.
+
+    ABLATION: drop `revoked` from `_save_enabled`'s dropped set and the save is
+    blocked with the `plugins enable hooky` pointer, the grant still recorded."""
+    path = project.project / POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[plugins]\nenabled = ["ghost", "hooky"]\n', encoding="utf-8")
+    write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get("hooky") is None
+    assert policy_mod.load(path).plugins.enabled == ("ghost",)
+
+
 async def test_toggle_on_refuses_to_overwrite_an_unreadable_store(project):
     """A grant store that exists but can't be read is never rewritten — its
     grants would be lost — so the toggle's save is blocked and both files stay.
