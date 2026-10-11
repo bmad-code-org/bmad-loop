@@ -4822,6 +4822,37 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
 
 
+@pytest.mark.parametrize("resume", ["--resume", "--no-resume"])
+def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypatch, capsys, resume):
+    """#496/#497: the resume `resolve` ends in would refuse a fatal plugin verdict,
+    so the refusal is hoisted ahead of the re-arm — after the re-arm, the escalation
+    was already spent. A re-arm-only resolve launches nothing and is not judged.
+
+    `_resume_paused_run` is stubbed to 0, so the rc can only come from the hoist.
+    Ablation: delete the `_reject_plugin_trust` call in `cmd_resolve` and the
+    `--resume` leg re-arms."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", resume]
+    rc = cli.main(argv)
+
+    phase = load_state(run_dir).tasks["s1"].phase
+    if resume == "--resume":
+        assert rc == 1
+        assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+        assert phase == Phase.ESCALATED  # still armed once the plugin is granted
+    else:
+        assert rc == 0
+        assert phase != Phase.ESCALATED
+
+
 @pytest.mark.parametrize("shape", ["inside", "sibling"])
 def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     project, monkeypatch, capsys, shape

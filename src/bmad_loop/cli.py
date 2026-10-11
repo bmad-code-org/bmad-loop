@@ -4913,6 +4913,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
             return rc
+        # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
+        # for the same reason — a refusal after it has already spent the escalation.
+        # A re-arm-only resolve (`--no-resume`) launches nothing, so it is not judged.
+        if (
+            args.resume is not False
+            and (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None
+        ):
+            return rc
     before_entries = runs.journal_entries_or_none(run_dir)
     outcome: runs.RearmOutcome | None = None
     try:
@@ -5314,6 +5322,9 @@ def _resolve_reverify_finished(
         return rc
     if not _require_base_skills(project, pol):
         return 1
+    # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.
+    if (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None:
+        return rc
     target = state.target_branch
     try:
         clean = verify.worktree_clean(paths.repo_root, project=paths.project)

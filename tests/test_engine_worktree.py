@@ -12238,10 +12238,25 @@ def _under_floor_git(_project, monkeypatch):
     monkeypatch.setattr(verify, "git_bytes", fake)
 
 
+def _ungranted_enabled_plugin(project, _monkeypatch):
+    # #496/#497: an `enabled` project plugin with no grant is a fatal verdict
+    pdir = project.project / ".bmad-loop" / "plugins" / "rogue"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "rogue"\napi_version = 1\n[hooks.pre_run]\ncmd = "echo hi"\n',
+        encoding="utf-8",
+    )
+    # committed, so the clean-checkout gate behind the mint cannot refuse in its place
+    git(project.project, "add", str(pdir))
+    git(project.project, "commit", "-q", "-m", "rogue plugin")
+    with (project.project / ".bmad-loop" / "policy.toml").open("a", encoding="utf-8") as fh:
+        fh.write('[plugins]\nenabled = ["rogue"]\n')
+
+
 @pytest.mark.parametrize(
     "arrange",
-    [_drop_base_skills, _isolation_conflict, _under_floor_git],
-    ids=["missing-skill", "isolation", "git-floor"],
+    [_drop_base_skills, _isolation_conflict, _under_floor_git, _ungranted_enabled_plugin],
+    ids=["missing-skill", "isolation", "git-floor", "plugin-trust"],
 )
 def test_resolve_finished_run_preflight_refusal_mints_nothing(
     project, tmp_path, monkeypatch, arrange
