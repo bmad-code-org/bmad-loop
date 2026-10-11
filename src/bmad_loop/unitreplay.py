@@ -49,14 +49,17 @@ vouches the work is superseded and `abandon_replay_run` closes the run instead. 
 to a replay run paused at an escalation whose named task is ESCALATED
 (`abandon_refusal` holds the replay-run, phase and kept-work checks; the pause check
 stays with each caller). Under the replay run's state lock it parks any
-uncommitted state of the kept worktree on a ``refs/attempt-preserve-dirty/*-abandon``
-ref (`workspace.preserve_abandoned_unit`), removes the worktree with
+uncommitted state of the kept worktree (or a detached HEAD's commits the unit branch
+lacks) on a ``refs/attempt-preserve-dirty/*-abandon`` ref
+(`workspace.preserve_abandoned_unit`) and journals it as ``replay-abandon-snapshot``,
+removes the worktree with
 `workspace.discard_worktree` passing no branch — the kept branch always survives —
 verifies the worktree is gone from disk and from git's list (a repair write: a
-leftover raises and nothing is recorded), journals ``replay-abandoned``, then saves
+leftover raises and the run stays paused), journals ``replay-abandoned``, then saves
 the run ``finished`` with its pause cleared. The task stays ESCALATED with its
 ``branch`` and ``worktree_path`` as the record. A worktree already gone (an earlier
-abandon crashed after the teardown) skips straight to the state write. The sprint
+abandon crashed after the teardown) skips straight to the state write, reporting the
+snapshot ref that attempt journaled. The sprint
 board, the deferred-work ledger, the finished origin run and the run's mux session are
 never touched; no engine runs.
 """
@@ -76,7 +79,6 @@ from .platform_util import root_identity_record, safe_segment
 from .policy import Policy
 from .workspace import (
     discard_worktree,
-    orphan_preserve_ref_name,
     preserve_abandoned_unit,
     unit_worktrees_dir,
 )
@@ -300,14 +302,16 @@ def _journal_handoff(
 
 class AbandonError(Exception):
     """The replay run could not be abandoned. Raised before any write leaves state,
-    journal, worktree and branch untouched; raised after the teardown (the worktree
-    survived it) leaves the run paused and nothing journaled."""
+    journal, worktree and branch untouched; raised after the snapshot or the teardown
+    leaves the run paused, with nothing journaled beyond the snapshot's
+    ``replay-abandon-snapshot`` row."""
 
 
 @dataclass(frozen=True)
 class AbandonOutcome:
     """What `abandon_replay_run` kept: the unit branch (and whether it still exists
-    after the teardown) and the snapshot ref of uncommitted state, if any."""
+    after the teardown) and the snapshot ref of uncommitted state (or of a detached
+    HEAD's commits), if any."""
 
     branch: str
     branch_kept: bool
@@ -339,11 +343,12 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
     """Close the escalated replay run at ``run_dir`` without merging its unit, under
     the run's state lock (reentrant, so a caller already holding it may call this).
 
-    Order: re-check → snapshot → teardown → verify gone → journal → save state. A
-    crash or fault after the teardown leaves a paused run with no worktree;
-    re-running abandon completes it, recovering the snapshot ref the earlier attempt
-    parked (after a crash between the journal and the save, with a second
-    ``replay-abandoned`` row). ``paths`` is the current config: ``paths.repo_root`` is the
+    Order: re-check → snapshot → journal the snapshot → teardown → verify gone →
+    journal → save state. The snapshot row is written BEFORE the teardown so the ref
+    is durably on record while the worktree that held the work still stands. A crash
+    or fault after the teardown leaves a paused run with no worktree; re-running
+    abandon completes it, reporting the newest snapshot row's ref (after a crash
+    between the journal and the save, with a second ``replay-abandoned`` row). ``paths`` is the current config: ``paths.repo_root`` is the
     repository the worktree is registered with (as `WorktreeFlow.reopen_unit` reads
     it). Liveness and the task generation are the CLI caller's locked checks.
     Raises AbandonError."""
@@ -377,10 +382,17 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 )
             try:
                 ref = preserve_abandoned_unit(
-                    repo_root, wt, state.run_id, story_key, paths, task.spec_file
+                    repo_root, wt, state.run_id, story_key, paths, task.spec_file, task.branch
                 )
             except verify.GitError as e:
                 raise AbandonError(f"{e}; nothing was abandoned") from e
+            if ref is not None:
+                Journal(run_dir).append(
+                    "replay-abandon-snapshot",
+                    story_key=story_key,
+                    worktree=task.worktree_path,
+                    ref=ref,
+                )
         try:
             if os.path.lexists(wt):
                 discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
@@ -390,9 +402,11 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 # the snapshot an earlier attempt parked before failing after its
                 # teardown — else the journal and stdout read as a clean abandon.
                 verify.worktree_prune(repo_root)
-                ref = _earlier_abandon_ref(repo_root, state.run_id)
+                ref = _earlier_abandon_ref(run_dir, story_key)
             _verify_worktree_gone(repo_root, wt)
-            branch_kept = verify.branch_exists(repo_root, task.branch)
+            # Checked, not `branch_exists`: an unreadable answer must not be journaled
+            # as `branch_kept: false` and printed as a deleted recovery branch.
+            branch_kept = verify.branch_exists_checked(repo_root, task.branch)
         except verify.GitError as e:
             raise AbandonError(
                 f"tearing down the kept worktree {wt} failed ({e}); the run is still "
@@ -413,18 +427,28 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
         return AbandonOutcome(branch=task.branch, branch_kept=branch_kept, ref=ref)
 
 
-def _earlier_abandon_ref(repo_root: Path, run_id: str) -> str | None:
-    """The newest ``-abandon`` snapshot ref `preserve_abandoned_unit` parked for
-    ``run_id``, or None. Matched against the canonical name rather than a glob, so a
-    run id that merely prefixes this one cannot lend its snapshot. Raises GitError
-    when the refs cannot be listed."""
-    prefix = orphan_preserve_ref_name(run_id, "", kind="abandon").removesuffix("-abandon")
-    for refname in verify.list_refs(repo_root, "refs/attempt-preserve-dirty/"):
-        if not refname.startswith(prefix):
-            continue
-        head = refname[len(prefix) :].removesuffix("-abandon")
-        if len(head) == 8 and refname == orphan_preserve_ref_name(run_id, head, kind="abandon"):
-            return refname
+def _earlier_abandon_ref(run_dir: Path, story_key: str) -> str | None:
+    """The ref of the newest ``replay-abandon-snapshot`` row an earlier abandon of
+    ``story_key`` journaled before its teardown, or None when no attempt parked
+    anything. Read from the journal rather than matched against ref names, so a
+    serialized ``-r<n>`` snapshot is found and a ref pruned since is still reported.
+    Raises AbandonError when the journal cannot be read — that is not "nothing was
+    parked"."""
+    try:
+        entries = Journal(run_dir).entries()
+    except (OSError, UnicodeDecodeError) as e:
+        raise AbandonError(
+            f"cannot read the journal of run {run_dir.name} to recover the snapshot an "
+            f"earlier abandon parked ({e}); the run is still paused — re-run abandon"
+        ) from e
+    for entry in reversed(entries):
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") == "replay-abandon-snapshot"
+            and entry.get("story_key") == story_key
+            and isinstance(entry.get("ref"), str)
+        ):
+            return entry["ref"]
     return None
 
 

@@ -14627,6 +14627,35 @@ def test_ref_exists_sees_full_refnames_outside_heads(project):
     assert verify.ref_exists(repo / "no-such-repo", ref) is False  # git failure -> absent
 
 
+def test_branch_exists_checked_raises_on_an_unreadable_repo(project):
+    """`branch_exists_checked` answers True/False for a readable repo — matching the
+    exact branch, not a ref nested beneath it — and RAISES where `branch_exists`
+    folds a git failure into False.
+
+    Ablation: return `rc == 0 and ...` instead of raising and the last row fails."""
+    repo = project.project
+    assert verify.branch_exists_checked(repo, "main") is True
+    assert verify.branch_exists_checked(repo, "no-such-branch") is False
+    git(repo, "branch", "nest/inner")
+    assert verify.branch_exists_checked(repo, "nest") is False  # pattern prefix, not a match
+    assert verify.branch_exists(repo / "no-such-repo", "main") is False
+    with pytest.raises(verify.GitError):
+        verify.branch_exists_checked(repo / "no-such-repo", "main")
+
+
+def test_create_ref_refuses_to_overwrite(project):
+    """`create_ref` writes a new full ref and refuses one that already exists."""
+    repo = project.project
+    ref = "refs/attempt-preserve-dirty/run-abc12345-abandon"
+    head = git(repo, "rev-parse", "HEAD").strip()
+    verify.create_ref(repo, ref, head)
+    assert git(repo, "rev-parse", ref).strip() == head
+    git(repo, "commit", "-q", "--allow-empty", "-m", "next")
+    with pytest.raises(verify.GitError):
+        verify.create_ref(repo, ref, "HEAD")
+    assert git(repo, "rev-parse", ref).strip() == head
+
+
 def test_snapshot_worktree_noop_clean_tree(project):
     """A clean tree (identical to HEAD) has nothing uncommitted to park: returns
     None and creates no ref, so a plain reset proceeds unchanged."""

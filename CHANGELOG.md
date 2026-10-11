@@ -20,9 +20,9 @@ breaking changes may land in a minor release.
   (#496, #497).
 - Add `bmad-loop resolve <replay-run> --abandon` (DW-535): close a replay run that
   escalated because its story was finished meanwhile. Uncommitted tracked and
-  untracked changes (plus the run's own spec/board/ledger copies) are parked on a
-  `refs/attempt-preserve-dirty/*-abandon` ref; other git-ignored files are removed
-  with the worktree. The branch is kept and the run is recorded finished.
+  untracked changes (plus the run's own spec/board/ledger copies), or commits on a
+  detached HEAD the branch lacks, are parked on a `refs/attempt-preserve-dirty/*-abandon`
+  ref; other git-ignored files are removed with the worktree. The branch is kept and the run is recorded finished.
 
 ### Changed
 

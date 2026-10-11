@@ -6758,6 +6758,28 @@ def branch_exists(repo: Path, name: str) -> bool:
     return rc == 0
 
 
+def branch_exists_checked(repo: Path, name: str) -> bool:
+    """:func:`branch_exists` for a caller that records the answer: a listing that
+    fails raises :class:`GitError` instead of reading as "gone". `show-ref --verify`
+    exits non-zero for a missing ref and for a repository it cannot read alike, so
+    this lists with `for-each-ref` (rc 0 with no line is a real "absent") and matches
+    the exact refname, since the pattern also matches refs nested beneath it."""
+    refname = f"refs/heads/{name}"
+    rc, out, detail = _git_out(repo, "for-each-ref", "--format=%(refname)", refname)
+    if rc != 0:
+        raise GitError(f"git for-each-ref {refname} failed in {repo}: {detail}")
+    return refname in out.splitlines()
+
+
+def create_ref(repo: Path, refname: str, revision: str) -> None:
+    """Create the FULL ref ``refname`` at ``revision``. The empty old-value makes
+    `update-ref` refuse a ref that already exists rather than overwrite it. Raises
+    :class:`GitError`."""
+    rc, out = _git(repo, "update-ref", refname, revision, "")
+    if rc != 0:
+        raise GitError(f"git update-ref {refname} {revision[:12]} failed in {repo}: {out}")
+
+
 def branch_checkout_path(repo: Path, branch: str) -> Path | None:
     """The worktree that has ``refs/heads/<branch>`` checked out, or ``None``.
 

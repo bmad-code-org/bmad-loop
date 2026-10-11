@@ -12704,6 +12704,114 @@ def test_abandon_retry_recovers_the_snapshot_an_earlier_attempt_parked(
     assert load_state(replay_dir).finished
 
 
+def test_abandon_retry_reports_the_newest_serialized_snapshot(
+    project, tmp_path, monkeypatch, capsys
+):
+    """Three attempts over one dirty HEAD: the first parks `-abandon` and its teardown
+    leaves the worktree on disk; the second parks `-abandon-r2` (the serial probe), then
+    removes the worktree and fails its gone-check; the third takes the already-gone arm
+    and must report `-r2`, the newest snapshot — read from the `replay-abandon-snapshot`
+    rows journaled before each teardown, not guessed from ref names.
+
+    Ablation: match `_earlier_abandon_ref` on the unsuffixed ref name (the pre-fix
+    shape) and the third attempt reports the older `-abandon` ref."""
+    from bmad_loop import unitreplay
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    head = git(unit, "rev-parse", "HEAD").strip()
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    real_discard, real_gone = unitreplay.discard_worktree, unitreplay._verify_worktree_gone
+
+    monkeypatch.setattr(unitreplay, "discard_worktree", lambda *_a, **_k: None)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    assert unit.is_dir()
+    (unit / "extra-notes.txt").write_text("later operator notes\n", encoding="utf-8")
+
+    def flaky_gone(repo_root, wt):
+        monkeypatch.setattr(unitreplay, "_verify_worktree_gone", real_gone)
+        raise unitreplay.AbandonError("cannot list the worktrees (simulated fault)")
+
+    monkeypatch.setattr(unitreplay, "discard_worktree", real_discard)
+    monkeypatch.setattr(unitreplay, "_verify_worktree_gone", flaky_gone)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    assert not unit.exists() and not load_state(replay_dir).finished
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    base = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    snaps = [
+        e["ref"] for e in Journal(replay_dir).entries() if e["kind"] == "replay-abandon-snapshot"
+    ]
+    assert snaps == [base, f"{base}-r2"]
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["ref"] == f"{base}-r2"
+    assert git(project.project, "show", f"{base}-r2:extra-notes.txt") == "later operator notes"
+    assert f"{base}-r2" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("on_branch", [False, True], ids=["new-commit", "branch-ancestor"])
+def test_abandon_parks_commits_on_a_detached_head(
+    project, tmp_path, monkeypatch, capsys, on_branch
+):
+    """A clean kept worktree on a detached HEAD: a commit the unit branch lacks is
+    reachable only from that HEAD, which goes with the worktree, so abandon points the
+    `-abandon` ref at it and the commit outlives `delete`. A detached HEAD the branch
+    already contains needs no ref.
+
+    Ablation: drop the detached-HEAD arm of `preserve_abandoned_unit` and the
+    new-commit row journals `ref: None`."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    git(unit, "checkout", "-q", "--detach")
+    if not on_branch:
+        (unit / "detached-work.txt").write_text("committed off-branch\n", encoding="utf-8")
+        git(unit, "add", "detached-work.txt")
+        git(unit, "commit", "-q", "-m", "detached work")
+    head = git(unit, "rev-parse", "HEAD").strip()
+    assert git(unit, "status", "--porcelain", "--untracked-files=all") == ""
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and not unit.exists()
+    if on_branch:
+        assert row["ref"] is None
+        return
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    assert row["ref"] == ref and ref in capsys.readouterr().out
+    runs.delete_run(project.project, replay_dir)
+    assert git(project.project, "rev-parse", ref).strip() == head
+
+
+def test_abandon_refuses_when_the_branch_check_cannot_answer(
+    project, tmp_path, monkeypatch, capsys
+):
+    """A branch-existence check that faults is not "the branch is gone": abandon
+    raises with the run still paused and no `replay-abandoned` row, and a retry once
+    the refs read again records `branch_kept` true.
+
+    Ablation: call the folding `verify.branch_exists` instead and the fault is
+    journaled as `branch_kept: false` with the run finished."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    real = verify.branch_exists_checked
+
+    def faulty(_repo, _name):
+        raise verify.GitError("git for-each-ref failed (simulated fault)")
+
+    monkeypatch.setattr(verify, "branch_exists_checked", faulty)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    assert "simulated fault" in capsys.readouterr().err
+    assert not load_state(replay_dir).finished
+    assert all(e["kind"] != "replay-abandoned" for e in Journal(replay_dir).entries())
+
+    monkeypatch.setattr(verify, "branch_exists_checked", real)
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+    assert Journal(replay_dir).entries()[-1]["branch_kept"] is True
+
+
 def _bump_generation_then_confirm(replay_dir):
     def confirm(_question):
         state = load_state(replay_dir)

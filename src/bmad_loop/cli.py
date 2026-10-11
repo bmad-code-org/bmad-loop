@@ -5247,9 +5247,9 @@ def _resolve_abandon(
         f"warning: abandoning replay run {args.run_id} removes the kept worktree of "
         f"{story_key} ({task.worktree_path}) and closes the run unmerged; branch "
         f"{task.branch} is kept. Uncommitted tracked and untracked changes (plus the "
-        "run's own spec/board/ledger copies) are parked on a "
-        "refs/attempt-preserve-dirty/*-abandon ref first; other git-ignored files are "
-        "removed with the worktree",
+        "run's own spec/board/ledger copies), or commits on a detached HEAD the branch "
+        "lacks, are parked on a refs/attempt-preserve-dirty/*-abandon ref first; other "
+        "git-ignored files are removed with the worktree",
         file=sys.stderr,
     )
     if args.interactive and not _confirm(
@@ -5303,7 +5303,7 @@ def _resolve_abandon(
         )
     if outcome.ref is not None:
         print(
-            f"uncommitted work from its worktree is parked on {outcome.ref} (kept within "
+            f"unmerged work from its worktree is parked on {outcome.ref} (kept within "
             "scm.preserve_keep; copy it to a branch to keep it longer)"
         )
     return 0

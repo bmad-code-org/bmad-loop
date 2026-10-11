@@ -264,25 +264,9 @@ def _preserve_orphan_state(
         return
     try:
         head = verify.rev_parse_head(wt)
-        base_ref = orphan_preserve_ref_name(run_id, head, kind=kind)
-        ref = base_ref
-        serial = 2
-        # Same bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a
-        # second orphaning of the same HEAD (flip, flip back, flip again with
-        # nothing committed in between) must not overwrite the first snapshot.
-        while verify.ref_exists(repo_root, ref):
-            if serial > PRESERVE_REF_PROBE_LIMIT:
-                raise verify.PreserveRefExhaustedError(
-                    f"no free snapshot refname for {base_ref}: "
-                    f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
-                    f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
-                    f"scm.preserve_keep to a positive value below that limit)"
-                )
-            ref = f"{base_ref}-r{serial}"
-            serial += 1
         parked = verify.snapshot_worktree(
             wt,
-            ref,
+            _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind=kind)),
             baseline_untracked=[],
             force_include=_orphan_owned_rels(wt, paths, spec_file),
         )
@@ -299,6 +283,27 @@ def _preserve_orphan_state(
         on_orphan_preserved(str(wt), parked)
 
 
+def _free_snapshot_ref(repo_root: Path, base_ref: str) -> str:
+    """``base_ref``, or its first free ``-r<n>`` serial when it is taken. The same
+    bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a second
+    orphaning of the same HEAD (flip, flip back, flip again with nothing committed
+    in between) must not overwrite the first snapshot. Raises
+    :class:`verify.PreserveRefExhaustedError` past ``PRESERVE_REF_PROBE_LIMIT``."""
+    ref = base_ref
+    serial = 2
+    while verify.ref_exists(repo_root, ref):
+        if serial > PRESERVE_REF_PROBE_LIMIT:
+            raise verify.PreserveRefExhaustedError(
+                f"no free snapshot refname for {base_ref}: "
+                f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
+                f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
+                f"scm.preserve_keep to a positive value below that limit)"
+            )
+        ref = f"{base_ref}-r{serial}"
+        serial += 1
+    return ref
+
+
 def preserve_abandoned_unit(
     repo_root: Path,
     wt: Path,
@@ -306,6 +311,7 @@ def preserve_abandoned_unit(
     unit_key: str,
     paths: ProjectPaths,
     spec_file: str | None,
+    branch: str,
 ) -> str | None:
     """Park the uncommitted state of a replay run's kept worktree at ``wt`` before
     `resolve --abandon` removes it (DW-535), and return the snapshot ref, or
@@ -317,7 +323,14 @@ def preserve_abandoned_unit(
     artifacts, and a ref under ``refs/attempt-preserve-dirty/`` with the
     ``-abandon`` suffix, so ``scm.preserve_keep`` bounds it like every snapshot.
     A capture failure raises :class:`verify.GitError`, leaving ``wt`` standing.
-    The committed work needs no capture: the abandon keeps the unit branch."""
+
+    Commits on the unit ``branch`` need no capture: the abandon keeps it. Commits
+    made on a DETACHED HEAD the branch does not contain do: the worktree's HEAD and
+    its reflog are the only things naming them, and both go with the worktree. A
+    dirty tree's snapshot is parented on that HEAD and so already keeps them; over a
+    clean tree the ``-abandon`` ref is pointed at the HEAD commit itself. An
+    ancestry check that cannot answer parks it too — an extra ref is the safe
+    error. A HEAD attached to some other branch is kept by that branch."""
     captured: list[str] = []
     _preserve_orphan_state(
         repo_root,
@@ -329,7 +342,18 @@ def preserve_abandoned_unit(
         lambda _wt, ref: captured.append(ref),
         kind="abandon",
     )
-    return captured[0] if captured else None
+    if captured:
+        return captured[0]
+    if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
+        return None
+    if verify.current_branch(wt) != "HEAD":
+        return None
+    head = verify.rev_parse_head(wt)
+    if verify.is_ancestor(wt, head, f"refs/heads/{branch}"):
+        return None
+    ref = _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind="abandon"))
+    verify.create_ref(repo_root, ref, head)
+    return ref
 
 
 def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:

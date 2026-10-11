@@ -1282,6 +1282,10 @@ JOURNAL_KINDS = frozenset(
         # `replay_of`, `worktree`, `ref` (the `-abandon` snapshot, or null) and
         # `branch_kept` are benign.
         "replay-abandoned",
+        # DW-535. The snapshot ref `unitreplay.abandon_replay_run` parked, journaled
+        # BEFORE the teardown so a retry after a post-teardown fault recovers it.
+        # `story_key` aliases by name; `worktree` and `ref` are benign.
+        "replay-abandon-snapshot",
         # A worktree unit's merge paused because the main checkout is not on the
         # run's pinned target (`WorktreeFlow.require_target_checked_out`). `story_key`,
         # `branch`, `target_branch` and `checked_out_branch` alias by name.
