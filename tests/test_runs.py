@@ -2969,7 +2969,12 @@ def test_plugin_grants_absent_is_silent_and_fault_is_reported(tmp_path, monkeypa
     runs.write_plugin_grants_text(project, '{"plugins": {}, "version": 1}\n')
     path = runs.plugin_grants_path(project)
     assert path == runs.project_state_root(project) / "plugin-grants.json"
-    assert runs.read_plugin_grants_text(project) == ('{"plugins": {}, "version": 1}\n', None)
+    text, fault = runs.read_plugin_grants_text(project)
+    # the text-mode writer emits CRLF on Windows; the store is JSON, so either reads back
+    assert (text.replace("\r\n", "\n") if text else text, fault) == (
+        '{"plugins": {}, "version": 1}\n',
+        None,
+    )
     assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
 
     monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
