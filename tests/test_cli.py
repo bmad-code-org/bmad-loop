@@ -17042,6 +17042,30 @@ def test_run_notes_an_ungranted_inert_plugin_and_proceeds(project, monkeypatch, 
     assert captured["plugin_grants"].records == ()
 
 
+def test_run_refuses_a_granted_plugin_whose_dir_was_deleted(project, monkeypatch, capsys):
+    """A grant no discovered plugin claims is the operator's plugin gone without a
+    word: the launch refuses before the run dir exists, naming the recorded path
+    and the verb that clears it. The engine is stubbed to fail, so only the launch
+    preflight can produce this refusal.
+
+    ABLATION: drop the `unclaimed` refusals from `_reject_plugin_trust` and the
+    run reaches the (failing) engine."""
+    from conftest import grant_plugin
+
+    _run_fixture(project, monkeypatch)
+    pdir = _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    shutil.rmtree(pdir)
+    _commit_all(project, "setup")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert f".bmad-loop/plugins/{TRUST_PLUGIN} but is no longer discovered" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
+    assert _no_run_dirs(project)
+
+
 def test_run_threads_one_grant_read_to_compose_and_the_sweep_factory(project, monkeypatch):
     """The read-once HARD CONSTRAINT: `cmd_run` reads the store once and the SAME
     object reaches the engine and, through the factory closure, the auto-sweep
@@ -20205,6 +20229,42 @@ def test_plugins_revoke(project, capsys):
     assert "no grant to revoke" in capsys.readouterr().err
 
 
+def test_plugins_list_reports_a_missing_grant(project, capsys):
+    """A grant whose plugin dir is gone is listed as `missing` (a launch refuses on
+    it) until revoked, so `plugins` shows what blocks the launch."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    shutil.rmtree(pdir)
+    capsys.readouterr()
+    argv = ["plugins", "--json", "--project", str(project.project)]
+
+    rogue = {r["name"]: r for r in machine_json(argv, capsys)["plugins"]}[TRUST_PLUGIN]
+    assert (rogue["status"], rogue["active"], rogue["origin"]) == ("missing", False, "project")
+    assert rogue["path"] == f".bmad-loop/plugins/{TRUST_PLUGIN}"
+    assert rogue["pinned_digest"] and rogue["current_digest"] is None
+
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+    capsys.readouterr()
+    assert TRUST_PLUGIN not in {r["name"] for r in machine_json(argv, capsys)["plugins"]}
+
+
+def test_plugins_accept_on_a_stripped_plugin_points_to_revoke(project, capsys):
+    """A granted plugin whose last hook was dropped needs no grant now; `accept`
+    refuses it and names the revoke that clears its stale grant."""
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    (pdir / "plugin.toml").write_text(
+        f'[plugin]\nname = "{TRUST_PLUGIN}"\napi_version = 1\n', encoding="utf-8"
+    )
+    capsys.readouterr()
+
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 1
+    err = capsys.readouterr().err
+    assert "has no executable surface" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
+    assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+
+
 def test_plugins_grant_verbs_refuse_to_overwrite_an_unreadable_store(project, capsys):
     """A store that exists but cannot be decoded is reported, never rewritten: the
     rewrite would silently discard every grant it holds.
@@ -20412,6 +20472,31 @@ def test_validate_reports_a_mismatch_with_changed_files(project, capsys, monkeyp
     detail = finding["detail"]
     assert (detail["status"], detail["changed"]) == ("mismatch", ["plugin.toml"])
     assert detail["pinned"] and detail["current"] and detail["pinned"] != detail["current"]
+
+
+@pytest.mark.parametrize("change", ["deleted", "stripped"])
+def test_validate_reports_a_grant_whose_plugin_vanished(project, capsys, monkeypatch, change):
+    """A granted plugin deleted, or stripped of its whole surface, fails the next
+    launch; validate says so first, pointing at `revoke`.
+
+    ABLATION: drop the `missing` loop (deleted) or the `v.fatal` arm of the skip
+    (stripped) in `_validate_plugin_trust` and validate reports the plugin OK."""
+    from conftest import grant_plugin
+
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "hooky", _HOOK_PLUGIN)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    if change == "deleted":
+        git(project.project, "rm", "-rq", ".bmad-loop/plugins/hooky")
+    else:
+        toml.write_text('[plugin]\nname = "hooky"\napi_version = 1\n')
+    git(project.project, "commit", "-qam", f"{change} hooky")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _trust_findings(doc)
+    assert finding["severity"] == "problem"
+    assert "`bmad-loop plugins revoke hooky`" in finding["message"]
+    status = {"deleted": "missing", "stripped": "stale"}[change]
+    assert (finding["detail"]["plugin"], finding["detail"]["status"]) == ("hooky", status)
 
 
 def test_validate_reports_an_unreadable_grant_store(project, capsys, monkeypatch):

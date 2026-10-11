@@ -52,7 +52,7 @@ from ... import bmadconfig
 from ... import policy as policy_mod
 from ... import runs
 from ...plugins import store
-from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet, needs_grant
+from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet, missing_message, needs_grant
 from ...plugins.model import PluginError
 from ...plugins.registry import preflight, read_bound_tree
 from ...policy import POLICY_FILE
@@ -289,6 +289,12 @@ class SettingsScreen(Screen[None]):
                 classes="plugin-status -attention",
                 id="plugin-grants-fault",
             )
+        for name, path in self._registry.missing_grants:
+            # no row to toggle off: the grant's plugin is gone, so the CLI revokes it
+            yield Static(
+                Text(missing_message(name, path)),
+                classes="plugin-status -attention plugin-grant-missing",
+            )
         for info in self._registry.plugins:
             with Horizontal(classes="plugin-row"):
                 if info.trust_needed:
@@ -351,6 +357,12 @@ class SettingsScreen(Screen[None]):
             )
         if info.grant_status == "mismatch":
             return f"changed — {accept}", True
+        if info.grant_status == "stale":
+            return (
+                "granted, but no hooks, workflows, [python] or seeds left — toggle off "
+                f"or run `bmad-loop plugins revoke {info.granted_as or info.name}`",
+                True,
+            )
         if info.grant_status == "unreadable":
             return f"unreadable — fix the plugin dir, then {accept}", True
         return "not granted", False

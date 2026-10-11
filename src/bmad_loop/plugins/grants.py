@@ -22,11 +22,14 @@ manifest plus its grant record to a `Verdict` without touching the store.
 
 `classify` refuses by intent. A plugin nobody granted and nobody named in
 ``enabled`` is inert (REFUSED) and the run goes on; a granted plugin whose bytes
-moved, or an ``enabled`` name with no grant, is fatal — the operator asked for
-it, so silently dropping it would be the surprise. A never-granted plugin is
-never hashed: the `live` thunk is only called when there is a record to compare.
-An ``enabled`` name with no discovered plugin has no manifest to classify and is
-not fatal.
+moved, a granted plugin that lost its whole executable surface, or an
+``enabled`` name with no grant, is fatal — the operator asked for it, so
+silently dropping it would be the surprise. For the same reason a grant no
+discovered plugin claims (its dir deleted or moved out of discovery, or a builtin
+answering to a removed override's name) is fatal too (`unclaimed`). A
+never-granted plugin is never hashed: the `live` thunk is only called when there
+is a record to compare. An ``enabled`` name with no discovered plugin has no
+manifest to classify and is not fatal.
 """
 
 from __future__ import annotations
@@ -100,7 +103,7 @@ class GrantSet:
         """The grant covering plugin ``name`` found at ``rel_path``: its own record,
         else a record granted at that same dir under a name no discovered plugin
         claims. ``claimants`` are the names of discovered plugins that consult a
-        grant (`needs_grant`) — a builtin reappearing under the old name of a
+        grant (every non-`TRUSTED_SOURCES` one) — a builtin reappearing under the old name of a
         renamed project override never reads the record, so it cannot hide it.
         ``plugin.toml`` is part of the granted bytes, so a manifest renamed in
         place is a changed grant (`classify` makes it fatal), never a fresh plugin
@@ -201,6 +204,7 @@ class TrustState(StrEnum):
     UNENABLED = "unenabled"
     REFUSED = "refused"
     FATAL_MISMATCH = "fatal-mismatch"
+    FATAL_STALE = "fatal-stale"
     FATAL_ENABLED_UNGRANTED = "fatal-enabled-ungranted"
     FATAL_UNREADABLE = "fatal-unreadable"
 
@@ -209,6 +213,7 @@ _ACTIVE_STATES = frozenset({TrustState.PROVENANCE, TrustState.NO_SURFACE, TrustS
 _FATAL_STATES = frozenset(
     {
         TrustState.FATAL_MISMATCH,
+        TrustState.FATAL_STALE,
         TrustState.FATAL_ENABLED_UNGRANTED,
         TrustState.FATAL_UNREADABLE,
     }
@@ -219,12 +224,15 @@ _FATAL_STATES = frozenset(
 class Verdict:
     """What the gate decided for one plugin. ``changed`` lists the relpaths that
     differ from the grant (FATAL_MISMATCH only); ``renamed_from`` is the grant's
-    name when the plugin was granted under another one (`GrantSet.match`)."""
+    name when the plugin was granted under another one (`GrantSet.match`);
+    ``grant`` is the name of the grant record the verdict consulted, None when it
+    consulted none (`unclaimed` reads it)."""
 
     state: TrustState
     reason: str
     changed: tuple[str, ...] = ()
     renamed_from: str | None = None
+    grant: str | None = None
 
     @property
     def active(self) -> bool:
@@ -251,21 +259,32 @@ def classify(
         if m.python is not None and m.name not in enabled:
             return Verdict(TrustState.UNENABLED, "in-process module not in [plugins] enabled")
         return Verdict(TrustState.PROVENANCE, f"{m.source} plugin")
-    if not exec_surface(m):
-        return Verdict(TrustState.NO_SURFACE, "no executable surface")
     if record is None:
+        if not exec_surface(m):
+            return Verdict(TrustState.NO_SURFACE, "no executable surface")
         if m.name in enabled:
             return Verdict(
                 TrustState.FATAL_ENABLED_UNGRANTED, "listed in [plugins] enabled but never granted"
             )
         return Verdict(TrustState.REFUSED, "never granted")
+    grant = record.name
+    renamed_from = grant if grant != m.name else None
+    if not exec_surface(m):
+        # A grant is only ever recorded for a plugin with a surface, so its
+        # manifest changed; dropping its last hook must not be quieter than
+        # dropping one of two.
+        return Verdict(
+            TrustState.FATAL_STALE,
+            "granted, but it no longer has any hooks, workflows, [python] or seeds",
+            renamed_from=renamed_from,
+            grant=grant,
+        )
     try:
         tree = live()
     except PluginError as e:
-        return Verdict(TrustState.FATAL_UNREADABLE, str(e))
+        return Verdict(TrustState.FATAL_UNREADABLE, str(e), grant=grant)
     reasons: list[str] = []
     differing: tuple[str, ...] = ()
-    renamed_from = record.name if record.name != m.name else None
     if renamed_from is not None:
         reasons.append(f'granted as "{renamed_from}", now named "{m.name}"')
     if record.path != rel_path:
@@ -278,8 +297,28 @@ def classify(
         )
         differing = tuple(sorted({*added, *removed, *changed}, key=os.fsencode))
     if reasons:
-        return Verdict(TrustState.FATAL_MISMATCH, "; ".join(reasons), differing, renamed_from)
-    return Verdict(TrustState.GRANTED, f"granted sha256:{record.digest[:12]}")
+        return Verdict(
+            TrustState.FATAL_MISMATCH, "; ".join(reasons), differing, renamed_from, grant
+        )
+    return Verdict(TrustState.GRANTED, f"granted sha256:{record.digest[:12]}", grant=grant)
+
+
+def unclaimed(grants: GrantSet, verdicts: Iterable[Verdict]) -> tuple[GrantRecord, ...]:
+    """The grant records no discovered plugin consulted (`Verdict.grant`): the
+    granted dir was deleted or moved out of discovery, its manifest no longer
+    loads, or a builtin now answers to the name of a removed project override.
+    Each is fatal (`missing_message`) until restored or revoked: the plugin the
+    operator granted would otherwise vanish from the run without a word."""
+    used = {v.grant for v in verdicts}
+    return tuple(r for r in grants.records if r.name not in used)
+
+
+def missing_message(name: str, path: str) -> str:
+    """The operator-facing refusal for an `unclaimed` grant ``name`` recorded at ``path``."""
+    return (
+        f'plugin "{name}" was granted at {path} but is no longer discovered there; '
+        f"restore it, or run `bmad-loop plugins revoke {name}`."
+    )
 
 
 _GRANT_STATUS: dict[TrustState, str] = {
@@ -287,14 +326,19 @@ _GRANT_STATUS: dict[TrustState, str] = {
     TrustState.REFUSED: "ungranted",
     TrustState.FATAL_ENABLED_UNGRANTED: "ungranted",
     TrustState.FATAL_MISMATCH: "mismatch",
+    TrustState.FATAL_STALE: "stale",
     TrustState.FATAL_UNREADABLE: "unreadable",
 }
 
 
 def grant_status(m: PluginManifest, verdict: Verdict) -> str:
     """The operator-facing grant column for one plugin — ``granted``,
-    ``ungranted``, ``mismatch``, ``unreadable``, or ``n/a`` for a plugin that
-    needs no grant. One vocabulary for ``plugins --json`` and the TUI roster."""
+    ``ungranted``, ``mismatch``, ``stale`` (granted, but no executable surface
+    left), ``unreadable``, or ``n/a`` for a plugin that needs no grant and has
+    none. One vocabulary for ``plugins --json`` and the TUI roster (which add
+    ``missing`` for an `unclaimed` grant)."""
+    if verdict.state is TrustState.FATAL_STALE:
+        return "stale"
     if not needs_grant(m):
         return "n/a"
     return _GRANT_STATUS.get(verdict.state, "n/a")
@@ -306,6 +350,11 @@ def fatal_message(name: str, verdict: Verdict) -> str:
         return (
             f'plugin "{name}" changed since it was granted ({verdict.reason}); '
             f"review it, then run `bmad-loop plugins accept {name}`. {PER_MACHINE_NOTE}"
+        )
+    if verdict.state is TrustState.FATAL_STALE:
+        return (
+            f'plugin "{name}" changed since it was granted ({verdict.reason}); restore '
+            f"its executable surface, or run `bmad-loop plugins revoke {verdict.grant or name}`."
         )
     if verdict.state is TrustState.FATAL_ENABLED_UNGRANTED:
         return (

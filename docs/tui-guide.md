@@ -826,7 +826,11 @@ out-of-tree sha256 grant `bmad-loop plugins enable` records — never a
 plugins, and any other name already in it is preserved). Its row shows the grant
 status: `granted`, `not granted`, ``changed — run `bmad-loop plugins accept <name>` ``,
 ``enabled, not granted — run `bmad-loop plugins enable <name>` or toggle off ``,
-or `unreadable — …`.
+`granted, but no hooks, workflows, [python] or seeds left — …` (a granted plugin
+stripped of its surface keeps its switch, on, so toggling it off revokes the grant),
+or `unreadable — …`. A grant whose plugin dir is gone has no row; a line atop the
+roster names it with `bmad-loop plugins revoke <name>`, and it blocks every save
+until revoked or restored.
 
 - **Toggle on** an ungranted plugin and save: the grant is recorded **after** the
   save's validation passes and policy.toml is written. A failed validation writes
@@ -838,8 +842,8 @@ or `unreadable — …`.
   with no grant, and toggling it off drops that legacy entry too.
 - **An untouched toggle changes nothing.** An unrelated save never re-pins a
   plugin whose files changed since its grant. Saves are judged against the
-  grants as stored, so a changed, unreadable, or enabled-but-ungranted plugin
-  **blocks every save** with the same message a launch would print, until you
+  grants as stored, so a changed, stale, missing, unreadable, or
+  enabled-but-ungranted plugin **blocks every save** with the same message a launch would print, until you
   run `bmad-loop plugins accept <name>` / `enable <name>` or toggle the plugin
   off. Re-pinning a changed plugin is CLI-only.
 - If the grant store exists but can't be read, a line atop the roster says so,

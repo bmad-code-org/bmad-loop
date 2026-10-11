@@ -16,7 +16,8 @@ and failure is isolated. It runs in two passes:
 
   1. **Verdicts, no exec.** Every manifest is classified (`grants.classify`)
      against the launch's frozen `GrantSet`. Any fatal verdict — a granted
-     project plugin whose bytes changed, an ``enabled`` name with no grant, a
+     project plugin whose bytes changed or whose executable surface is gone, a
+     grant no discovered plugin claims, an ``enabled`` name with no grant, a
      granted dir that can't be read — raises `PluginTrustError` before ANY
      plugin executes, builtins included. A granted plugin's verified tree is
      copied to an out-of-tree snapshot (`snapshot.materialize`) and its
@@ -43,7 +44,16 @@ from pathlib import Path, PurePath
 
 from . import snapshot, trust
 from .digest import VerifiedTree, read_tree
-from .grants import GrantSet, TrustState, Verdict, classify, fatal_message, needs_grant
+from .grants import (
+    TRUSTED_SOURCES,
+    GrantSet,
+    TrustState,
+    Verdict,
+    classify,
+    fatal_message,
+    missing_message,
+    unclaimed,
+)
 from .loader import PLUGIN_FILE, load_plugins
 from .manifest import load_manifest
 from .model import (
@@ -208,7 +218,7 @@ def _judge(
     per plugin. Hashes at most; never imports or runs anything."""
     judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
     manifests = list(manifests)
-    claimants = [m.name for m in manifests if needs_grant(m)]
+    claimants = [m.name for m in manifests if m.source not in TRUSTED_SOURCES]
     for m in manifests:
         rel = _rel_path(m, project)
         live = _memo_tree(m)
@@ -323,6 +333,10 @@ class PluginRegistry:
             Refusal(m.name, fatal_message(m.name, verdict), m.source, rel)
             for m, verdict, _live, rel in judged
             if verdict.fatal
+        ]
+        fatal += [
+            Refusal(r.name, missing_message(r.name, r.path), "project", r.path)
+            for r in unclaimed(grants, (verdict for _m, verdict, _live, _rel in judged))
         ]
         if fatal:
             raise PluginTrustError(tuple(fatal))

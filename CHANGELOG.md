@@ -15,8 +15,9 @@ breaking changes may land in a minor release.
   surface and grant status; grant, re-pin or revoke a project plugin. Hashes only, never
   prompts, never writes policy.toml (#496, #497).
 - Add `bmad-loop plugins --json`, a schema-versioned plugin roster (#496, #497).
-- Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted or
-  unreadable project plugin, or an unreadable grant store, is a problem (#496, #497).
+- Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
+  stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
+  (#496, #497).
 
 ### Changed
 
@@ -46,6 +47,8 @@ breaking changes may land in a minor release.
   `note:` and a `plugin-refused` journal row) until `bmad-loop plugins enable <name>`.
 - Fail startup when a granted project plugin changed since its grant, naming
   `bmad-loop plugins accept <name>`; refuse before any plugin code runs (#496, #497).
+- Fail startup when a granted project plugin loses its whole executable surface or its
+  dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
 
 ## [0.13.2] — 2026-10-09
 

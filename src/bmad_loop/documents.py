@@ -589,9 +589,12 @@ class PluginRow:
 
     ``status`` is the grant vocabulary: ``granted`` (the recorded digest matches
     the dir), ``ungranted`` (no record), ``mismatch`` (the dir moved or changed
-    since the grant), ``unreadable`` (a granted dir that cannot be hashed), or
-    ``n/a`` (no grant applies: a builtin/entry-point plugin, or a project plugin
-    with no executable surface). ``enabled`` is literal membership in
+    since the grant), ``stale`` (granted, but its executable surface is gone),
+    ``missing`` (a grant no discovered plugin claims — its dir was deleted or
+    moved, or a builtin answers to its name; the surface flags are then all
+    false), ``unreadable`` (a granted dir that cannot be hashed), or ``n/a`` (no
+    grant applies: a builtin/entry-point plugin, or a project plugin with no
+    executable surface and no grant). ``enabled`` is literal membership in
     ``[plugins] enabled``; ``active`` is whether a launch would run the plugin."""
 
     name: str

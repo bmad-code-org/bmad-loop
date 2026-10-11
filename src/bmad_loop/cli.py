@@ -433,8 +433,8 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
 
     Judges every discovered plugin exactly as `PluginRegistry.build` will
     (`registry.preflight`: manifests and hashing only, no plugin code runs). A fatal
-    verdict — a granted plugin that changed, a name in `[plugins] enabled` with no
-    grant, a granted dir that cannot be read — prints its fix and returns
+    verdict — a granted plugin that changed or vanished, a name in `[plugins]
+    enabled` with no grant, a granted dir that cannot be read — prints its fix and returns
     FAILURE. A never-granted, un-enabled plugin is inert, not an error: it gets a
     `note:` and the launch goes on without it. Never prompts.
 
@@ -442,7 +442,7 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
     its own, so a path that skips this (or a plugin that changes after it) is still
     refused."""
     from .plugins import PluginError
-    from .plugins.grants import TrustState, fatal_message
+    from .plugins.grants import TrustState, fatal_message, missing_message, unclaimed
     from .plugins.registry import preflight
 
     try:
@@ -450,9 +450,12 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
     except PluginError as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
-    fatal = [(m, v) for m, v, _rel in verdicts if v.fatal]
-    for m, v in fatal:
-        print(f"error: {fatal_message(m.name, v)}", file=sys.stderr)
+    fatal = [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+    fatal += [
+        missing_message(r.name, r.path) for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    for message in fatal:
+        print(f"error: {message}", file=sys.stderr)
     if fatal:
         return ExitCode.FAILURE
     for m, v, rel in verdicts:
@@ -1549,22 +1552,24 @@ def cmd_plugins(args: argparse.Namespace) -> int:
 
 
 def _plugin_roster(root: Path, pol, grants: GrantSet):
-    """(manifest, verdict, row) per discovered plugin: the verdict a launch would
-    reach (`registry.preflight`) plus the digests `plugins --json` reports.
-    Manifests and hashing only — no plugin code runs. Raises `PluginError` on a
-    discovery fault."""
+    """((manifest, verdict, row) per discovered plugin, missing rows): the verdict
+    a launch would reach (`registry.preflight`) plus the digests `plugins --json`
+    reports, then a ``missing`` row per grant no discovered plugin claims
+    (`grants.unclaimed`; a launch refuses on each). Manifests and hashing only —
+    no plugin code runs. Raises `PluginError` on a discovery fault."""
     from .documents import PluginRow
     from .plugins import PluginError
     from .plugins.digest import read_tree
-    from .plugins.grants import TRUSTED_SOURCES, grant_status, needs_grant
+    from .plugins.grants import TRUSTED_SOURCES, grant_status, needs_grant, unclaimed
     from .plugins.registry import preflight
     from .plugins.trust import enabled_names
 
     enabled = enabled_names(pol)
     roster = []
-    for m, v, rel in preflight(root, pol, grants):
+    verdicts = preflight(root, pol, grants)
+    for m, v, rel in verdicts:
         required = needs_grant(m)
-        record = grants.get(v.renamed_from or m.name) if required else None
+        record = grants.get(v.grant) if v.grant is not None else None
         current = None
         if required:
             try:
@@ -1589,7 +1594,25 @@ def _plugin_roster(root: Path, pol, grants: GrantSet):
             changed=v.changed,
         )
         roster.append((m, v, row))
-    return roster
+    missing = [
+        PluginRow(
+            name=r.name,
+            origin="project",
+            path=r.path,
+            hooks=False,
+            workflows=False,
+            python=False,
+            seeds=False,
+            grant_required=True,
+            status="missing",
+            enabled=r.name in enabled,
+            active=False,
+            pinned_digest=r.digest,
+            current_digest=None,
+        )
+        for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return roster, missing
 
 
 def _plugins_list(project: Path, root: Path, args: argparse.Namespace) -> int:
@@ -1597,7 +1620,8 @@ def _plugins_list(project: Path, root: Path, args: argparse.Namespace) -> int:
 
     pol = policy_mod.load(_policy_path(project))
     grants = store.load_grants(project)
-    rows = [row for _m, _v, row in _plugin_roster(root, pol, grants)]
+    roster, missing = _plugin_roster(root, pol, grants)
+    rows = [row for _m, _v, row in roster] + missing
     if getattr(args, "json", False):
         machine.emit(plugins_document(rows, grants.fault))
         return ExitCode.OK
@@ -1708,10 +1732,12 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
                 "has no executable surface (no hooks, workflows, [python] or seeds), "
                 "so it loads without a grant"
             )
+            if verdict.grant is not None:
+                why += f"; drop the grant it had with `bmad-loop plugins revoke {verdict.grant}`"
         print(f'error: plugin "{name}" {why}', file=sys.stderr)
         return ExitCode.FAILURE
 
-    record = grants.get(verdict.renamed_from or name)
+    record = grants.get(verdict.grant) if verdict.grant is not None else None
     if accept and record is None:
         print(
             f'error: plugin "{name}" has no grant to accept; review it, then run '
@@ -2313,21 +2339,21 @@ def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationRep
     never builds the registry: manifests and hashing only, no plugin code runs.
 
     A project plugin a launch would refuse is a problem whether the refusal is
-    fatal (changed since its grant, named in `[plugins] enabled` without one, a
-    granted dir that cannot be read) or inert (never granted: it silently would
+    fatal (changed since its grant, granted but no longer discovered, named in
+    `[plugins] enabled` without one, a granted dir that cannot be read) or inert (never granted: it silently would
     not run). An unreadable store is a problem too — a launch treats it as no
     grants. A discovery fault is skipped here: `plugins.manifests` already failed
     on it, and the manifest warnings it reports are not repeated."""
     import warnings
 
     from .plugins import PluginError, store
-    from .plugins.grants import TrustState, fatal_message
+    from .plugins.grants import TrustState, fatal_message, missing_message
 
     grants = store.load_grants(project)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # plugins.manifests reports a skipped manifest
         try:
-            roster = _plugin_roster(root, pol, grants)
+            roster, missing = _plugin_roster(root, pol, grants)
         except PluginError:
             return  # plugins.manifests already failed on this discovery fault
     failed = False
@@ -2341,7 +2367,7 @@ def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationRep
             {"fault": grants.fault},
         )
     for m, v, row in roster:
-        if not row.grant_required or v.state is TrustState.GRANTED:
+        if not v.fatal and (not row.grant_required or v.state is TrustState.GRANTED):
             continue
         failed = True
         if v.fatal:
@@ -2362,6 +2388,21 @@ def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationRep
                 "pinned": row.pinned_digest,
                 "current": row.current_digest,
                 "changed": list(row.changed),
+            },
+        )
+    for row in missing:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            missing_message(row.name, row.path),
+            {
+                "plugin": row.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": None,
+                "changed": [],
             },
         )
     if not failed:

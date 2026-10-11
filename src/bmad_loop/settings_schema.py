@@ -35,7 +35,14 @@ from pathlib import Path
 from typing import Any
 
 from . import policy as policy_mod
-from .plugins.grants import TRUSTED_SOURCES, GrantSet, grant_status, needs_grant
+from .plugins.grants import (
+    TRUSTED_SOURCES,
+    GrantSet,
+    TrustState,
+    grant_status,
+    needs_grant,
+    unclaimed,
+)
 from .plugins.model import SettingSpec as PluginSettingSpec
 from .plugins.registry import preflight
 from .policy import STAGES
@@ -91,11 +98,11 @@ class PluginInfo:
     ``trust_needed`` is True when the plugin carries a toggle. For a builtin or
     entry-point plugin that is an in-process ``[python]`` module — enabling it
     puts its name in ``[plugins] enabled``. For a project plugin it is any
-    executable surface (``grant_required``) — enabling it records an out-of-tree
-    content grant (#496/#497), and its name never enters ``enabled``. Other
-    plugins are always active and carry no toggle. ``grant_status`` is
-    ``granted``/``ungranted``/``mismatch``/``unreadable``, or ``n/a`` when no
-    grant applies; ``granted_as`` is the grant's name when the plugin was
+    executable surface, or a grant left from one (``grant_required``) — enabling
+    it records an out-of-tree content grant (#496/#497), and its name never
+    enters ``enabled``. Other plugins are always active and carry no toggle.
+    ``grant_status`` is ``granted``/``ungranted``/``mismatch``/``stale``/
+    ``unreadable``, or ``n/a`` when no grant applies; ``granted_as`` is the grant's name when the plugin was
     granted under another one (a manifest renamed in place). ``fields`` are this
     plugin's settings under ``plugins.<name>``; they render whether or not the
     plugin is enabled (the screen greys them until enabled)."""
@@ -113,7 +120,7 @@ class PluginInfo:
     @property
     def has_grant(self) -> bool:
         """A grant record exists (whether or not the plugin still matches it)."""
-        return self.grant_status in ("granted", "mismatch", "unreadable")
+        return self.grant_status in ("granted", "mismatch", "stale", "unreadable")
 
 
 @dataclass(frozen=True)
@@ -125,11 +132,14 @@ class SettingsRegistry:
     specs so the screen can pass them to ``policy.loads`` for typed validation of
     the ``[plugins.<name>]`` tables on save (every discovered plugin, since
     settings are data that may be set whether or not the plugin is enabled).
+    ``missing_grants`` is (name, recorded path) per grant no discovered plugin
+    claims (`grants.unclaimed`): a launch, and so a save, refuses on each.
     """
 
     sections: tuple[SectionSpec, ...]
     plugins: tuple[PluginInfo, ...] = ()
     plugin_schemas: dict[str, tuple[PluginSettingSpec, ...]] = field(default_factory=dict)
+    missing_grants: tuple[tuple[str, str], ...] = ()
 
     def fields(self) -> tuple[SettingSpec, ...]:
         core = tuple(f for s in self.sections for f in s.fields)
@@ -289,10 +299,13 @@ def build_registry(
     plugin_schemas: dict[str, tuple[PluginSettingSpec, ...]] = {}
     for manifest, verdict, _rel in sorted(judged, key=lambda j: j[0].name):
         name = manifest.name
+        # a grant left on a plugin that lost its surface is fatal; its toggle
+        # starts on so turning it off revokes the grant
+        required = needs_grant(manifest) or verdict.state is TrustState.FATAL_STALE
         if manifest.source in TRUSTED_SOURCES:
             toggled = manifest.python is not None
         else:
-            toggled = needs_grant(manifest)
+            toggled = required
         plugins.append(
             PluginInfo(
                 name=name,
@@ -301,13 +314,19 @@ def build_registry(
                 trust_needed=toggled,
                 fields=_plugin_fields(name, manifest.settings),
                 origin=manifest.source,
-                grant_required=needs_grant(manifest),
+                grant_required=required,
                 grant_status=grant_status(manifest, verdict),
                 granted_as=verdict.renamed_from,
             )
         )
         if manifest.settings:
             plugin_schemas[name] = manifest.settings
+    missing = unclaimed(
+        grants if grants is not None else GrantSet.empty(), (v for _m, v, _rel in judged)
+    )
     return SettingsRegistry(
-        sections=sections, plugins=tuple(plugins), plugin_schemas=plugin_schemas
+        sections=sections,
+        plugins=tuple(plugins),
+        plugin_schemas=plugin_schemas,
+        missing_grants=tuple((r.name, r.path) for r in missing),
     )

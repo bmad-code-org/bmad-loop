@@ -428,7 +428,7 @@ def test_granted_override_renamed_while_its_builtin_reappears_is_fatal(tmp_path)
     override's record: the rename is still a changed grant, not a silent drop.
 
     ABLATION: build the `_judge` claimants from every discovered name (drop the
-    `needs_grant` filter) and the build succeeds with the renamed override inert."""
+    `TRUSTED_SOURCES` filter) and the build succeeds with the renamed override inert."""
     marker = tmp_path / "RAN-unity"
     pdir = write_hook_plugin(tmp_path, "unity", marker)
     grants = grant_plugin(tmp_path, "unity")
@@ -439,6 +439,44 @@ def test_granted_override_renamed_while_its_builtin_reappears_is_fatal(tmp_path)
     assert 'granted as "unity", now named "custom-unity"' in str(exc.value)
     assert "bmad-loop plugins accept custom-unity" in str(exc.value)
     assert not marker.exists()
+
+
+def test_granted_plugin_stripped_of_its_last_hook_is_fatal(tmp_path):
+    """Dropping a granted plugin's only hook leaves it with no executable surface.
+    That is a changed grant like dropping one of two hooks, never a plugin that
+    quietly loads with its gates gone.
+
+    ABLATION: check `exec_surface` before the record in `grants.classify` and the
+    build succeeds with the plugin NO_SURFACE."""
+    pdir = write_hook_plugin(tmp_path, "gate", tmp_path / "RAN-gate")
+    grants = grant_plugin(tmp_path, "gate")
+    (pdir / "plugin.toml").write_text('[plugin]\nname = "gate"\napi_version = 1\n')
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert "no longer has any hooks" in str(exc.value)
+    assert "bmad-loop plugins revoke gate" in str(exc.value)
+
+
+@pytest.mark.parametrize("name", ["gate", "unity"], ids=["project-only", "builtin-override"])
+def test_granted_plugin_dir_deleted_is_fatal_not_silently_dropped(tmp_path, name):
+    """A granted plugin whose dir is gone leaves a grant nothing claims. The launch
+    refuses until it is restored or revoked; deleting a project override of a
+    builtin must not quietly hand the name back to the builtin either.
+
+    ABLATION: drop the `unclaimed` refusals from `PluginRegistry.build` and both
+    rows build, the plugin gone without a word."""
+    marker = tmp_path / f"RAN-{name}"
+    pdir = write_hook_plugin(tmp_path, name, marker)
+    grants = grant_plugin(tmp_path, name)
+    shutil.rmtree(pdir)
+    with pytest.raises(PluginTrustError) as exc:
+        PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+    assert f"{USER_PLUGINS_REL.as_posix()}/{name}" in str(exc.value)
+    assert f"bmad-loop plugins revoke {name}" in str(exc.value)
+    [refusal] = exc.value.refusals
+    assert (refusal.name, refusal.origin) == (name, "project")
+    # once revoked the launch builds again
+    PluginRegistry.build(tmp_path, policy=Policy(), grants=GrantSet.empty())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")

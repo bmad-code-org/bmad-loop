@@ -254,6 +254,8 @@ before.
    | named in `[plugins] enabled` but never granted                   | **startup fails**; the error points to `bmad-loop plugins enable <name>`                           |
    | granted, then a file added, removed or changed, or the dir moved | **startup fails** (`changed since it was granted`); review, then `bmad-loop plugins accept <name>` |
    | granted dir unreadable (a link inside it, over a cap)            | **startup fails**; fix the dir, then `bmad-loop plugins accept <name>`                             |
+   | granted, then stripped of every hook, workflow, module and seed  | **startup fails**; restore them, or `bmad-loop plugins revoke <name>`                              |
+   | granted dir deleted, or moved out of `.bmad-loop/plugins/`       | **startup fails** (`no longer discovered`); restore it, or `bmad-loop plugins revoke <name>`       |
    | granted and unchanged                                            | runs from a verified snapshot                                                                      |
 
    A fatal refusal is raised before **any** plugin code runs, builtins included.

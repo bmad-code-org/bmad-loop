@@ -26,7 +26,10 @@ from bmad_loop.plugins.grants import (
     encode_grants,
     exec_surface,
     fatal_message,
+    grant_status,
+    missing_message,
     needs_grant,
+    unclaimed,
 )
 from bmad_loop.plugins.model import HookSpec, PluginManifest, PythonSpec, WorkflowSpec
 
@@ -241,6 +244,40 @@ def test_unreadable_granted_tree_is_fatal(tmp_path):
     verdict = run(record=record, live=unreadable)
     assert verdict.state is TrustState.FATAL_UNREADABLE and verdict.fatal
     assert "cannot open" in verdict.reason
+
+
+@pytest.mark.parametrize("renamed", [False, True], ids=["same-name", "renamed-in-place"])
+def test_granted_plugin_that_lost_its_surface_is_fatal(tmp_path, renamed):
+    # dropping one of two hooks is a FATAL_MISMATCH; dropping the last must not be
+    # quieter (NO_SURFACE would run the plugin's remains with its gates gone)
+    record = grant_for(make_tree(tmp_path))
+    if renamed:
+        record = replace(record, name="old-name")
+    verdict = run(PluginManifest(name="rogue"), record=record)  # never hashed
+    assert verdict.state is TrustState.FATAL_STALE
+    assert verdict.fatal and not verdict.active
+    assert verdict.grant == record.name
+    assert grant_status(PluginManifest(name="rogue"), verdict) == "stale"
+    assert f"`bmad-loop plugins revoke {record.name}`" in fatal_message("rogue", verdict)
+
+
+def test_verdict_names_the_grant_it_consulted(tmp_path):
+    tree = make_tree(tmp_path)
+    assert run(record=grant_for(tree), live=lambda: tree).grant == "rogue"
+    assert run().grant is None
+    builtin = PluginManifest(name="rogue", hooks=HOOKED.hooks, source="builtin")
+    assert run(builtin, record=grant_for(tree)).grant is None
+
+
+def test_unclaimed_lists_grants_no_verdict_consulted(tmp_path):
+    tree = make_tree(tmp_path)
+    kept, gone = grant_for(tree), replace(grant_for(tree, "x/gone"), name="gone")
+    grants = GrantSet((gone, kept))
+    verdicts = [run(record=kept, live=lambda: tree), run(PluginManifest(name="other"))]
+    assert unclaimed(grants, verdicts) == (gone,)
+    assert unclaimed(GrantSet((kept,)), verdicts) == ()
+    message = missing_message(gone.name, gone.path)
+    assert "x/gone" in message and "`bmad-loop plugins revoke gone`" in message
 
 
 def test_unrecorded_plugin_is_never_hashed():

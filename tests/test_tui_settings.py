@@ -8,6 +8,7 @@ make substring checks lie."""
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tomllib
 
@@ -1066,6 +1067,58 @@ async def test_toggle_off_revokes_a_grant_renamed_in_place(project):
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
     assert store.load_grants(project.project).records == ()
+
+
+async def test_toggle_off_revokes_the_grant_of_a_plugin_stripped_of_its_hooks(project):
+    """A granted plugin that lost its whole surface keeps a toggle (on), so the
+    stale grant a launch refuses on can be revoked here; left on, the save is
+    blocked with the same refusal.
+
+    ABLATION: build `grant_required` from `needs_grant` alone in `build_registry`
+    and the plugin has no toggle to turn off."""
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    (pdir / PLUGIN_FILE).write_text('[plugin]\nname = "hooky"\napi_version = 1\n')
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert "`bmad-loop plugins revoke hooky`" in _status(screen)
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert "no longer has any hooks" in _errors(screen)
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).records == ()
+
+
+async def test_a_grant_whose_plugin_is_gone_is_named_and_blocks_the_save(project):
+    """A grant no discovered plugin claims has no row to toggle: the screen names
+    it with the revoke that clears it, and a save is refused as a launch would be.
+
+    ABLATION: drop the `missing_grants` banner in `_compose_plugins` and the
+    screen never mentions the grant."""
+    from textual.widgets import Static
+
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    grant_plugin(project.project, "hooky", store_project=project.project)
+    shutil.rmtree(pdir)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        [banner] = screen.query(".plugin-grant-missing").results(Static)
+        assert "`bmad-loop plugins revoke hooky`" in str(banner.content)
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert "no longer discovered" in _errors(screen)
+        assert not isinstance(app.screen, DashboardScreen)
+
+    assert store.load_grants(project.project).get("hooky") is not None
 
 
 async def test_toggle_off_drops_a_legacy_enabled_entry(project):
