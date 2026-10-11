@@ -6986,16 +6986,23 @@ def _reverify_task_refusal(
 
 
 def _reverify_root_refusal(
-    state: RunState, task: StoryTask, story_key: str, *, project_root: Path
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    project_root: Path,
+    code_root: Path | None = None,
 ) -> tuple[bmadconfig.ProjectPaths | None, str | None]:
     """``(paths, None)`` when the run's code root is still the live repository root
     and the story has a baseline, else ``(None, refusal)``. Shared by both replay
-    entries, like `_reverify_task_refusal`."""
+    entries, like `_reverify_task_refusal`. ``code_root`` is the run's code root as
+    the caller locates it — the finished-run replay rebases it onto a moved project;
+    ``None`` reads it as recorded."""
     try:
         paths = bmadconfig.load_paths(project_root)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot read the BMAD config to locate the code root ({e})"
-    if str(paths.repo_root) != str(state.code_root):
+    if str(paths.repo_root) != str(state.code_root if code_root is None else code_root):
         return None, (
             f"the code root in the BMAD config has changed since run {state.run_id} "
             "started; the attempt this replay would verify lives in the previous tree — "
@@ -7089,7 +7096,16 @@ def standalone_replay_refusal(
     )
     if refusal is not None:
         return refusal
-    paths, refusal = _reverify_root_refusal(state, task, story_key, project_root=project_root)
+    # The recorded paths are launch-time and a finished run is never re-stamped, so a
+    # project-owned code root (and below, the kept worktree and its spec) are located
+    # on the live project — else a moved project reads as a changed `repo_root`.
+    paths, refusal = _reverify_root_refusal(
+        state,
+        task,
+        story_key,
+        project_root=project_root,
+        code_root=rebase_recorded_project_path(state.code_root, state, project_root),
+    )
     if refusal is not None:
         return refusal
     assert paths is not None
@@ -7110,7 +7126,13 @@ def standalone_replay_refusal(
             f"kept unit is superseded work; {by_hand}"
         )
     refusal = _mounted_reverify_refusal(
-        state, task, story_key, run_dir=run_dir, paths=paths, remedy=by_hand
+        state,
+        task,
+        story_key,
+        run_dir=run_dir,
+        paths=paths,
+        remedy=by_hand,
+        live_project=project_root,
     )
     if refusal is not None and entries is None:
         refusal += (
@@ -7155,10 +7177,16 @@ def _mounted_reverify_refusal(
     run_dir: Path,
     paths: bmadconfig.ProjectPaths,
     remedy: str,
+    live_project: Path | None = None,
 ) -> str | None:
     """`reverify_refusal`'s worktree arm, shared with `standalone_replay_refusal`
     (DW-525): the kept unit must still be the attempt. ``remedy`` is the clause
     naming what the operator can do instead.
+
+    ``live_project`` locates the recorded worktree, code root and spec on the project
+    the caller acts in (`rebase_recorded_project_path`): a finished run is never
+    re-stamped, so after a project move its records name the launch-time tree.
+    ``None`` reads them as recorded.
 
     The engine's reverify arm reopens the mount through `reopen_unit`, which demands
     a registered worktree on the recorded branch, so the same shape is refused here
@@ -7166,6 +7194,13 @@ def _mounted_reverify_refusal(
     `branch_per = "run"`, one with nothing above the baseline, or a missing spec. The
     spec is never stashed for a mounted task — the defer leaves it in the kept tree."""
     wt = Path(task.worktree_path or "")
+    code_root = state.code_root
+    moved_hint = ""
+    if live_project is not None:
+        wt = rebase_recorded_project_path(wt, state, live_project)
+        code_root = rebase_recorded_project_path(code_root, state, live_project)
+        if live_project != Path(state.project):
+            moved_hint = " (after a project move, `git worktree repair` re-links it)"
     if not wt.is_dir():
         patch = run_dir / "failed" / safe_segment(story_key) / "changes.patch"
         kept = f"; its diff was saved at {patch}" if patch.is_file() else ""
@@ -7175,9 +7210,9 @@ def _mounted_reverify_refusal(
         )
     baseline = task.baseline_commit or ""
     try:
-        if not verify.worktree_is_registered(state.code_root, wt):
+        if not verify.worktree_is_registered(code_root, wt):
             return (
-                f"{wt} is no longer a worktree of {state.code_root}, so it is not "
+                f"{wt} is no longer a worktree of {code_root}{moved_hint}, so it is not "
                 f"story {story_key}'s kept unit; {remedy}"
             )
         branch = verify.current_branch(wt)
@@ -7197,7 +7232,11 @@ def _mounted_reverify_refusal(
                 "HEAD — the branch was reset or rewritten since the pause, so it is not "
                 "the attempt"
             )
-        spec_path = task_spec_path(task, state)
+        spec_path = (
+            task_spec_path(task, state)
+            if live_project is None
+            else live_spec_path(task, state, live_project)
+        )
         wt_paths = paths.rebased(wt)
         exclude = verify.verify_dev_exclude_relpaths(
             wt_paths, spec_path, task.restore_patch, root=wt_paths.repo_root

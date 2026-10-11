@@ -142,15 +142,22 @@ def mint_replay_run(
             except SystemExit as e:  # an id collision: the claim refuses, never adopts
                 new_dir = None
                 raise ReplayError(f"replay run id {run_id} already exists — retry") from e
-            src = Path(task.worktree_path)
+            # The finished run's records are launch-time and never re-stamped: after a
+            # project move the worktree and a project-owned code root live under the
+            # live project (`standalone_replay_refusal` located them there). The
+            # recorded mount stays the base the task's own absolute spellings re-home
+            # from — they were written while the run ran at the old path.
+            recorded_src = Path(task.worktree_path)
+            src = runs.rebase_recorded_project_path(recorded_src, finished, project)
+            code_root = runs.rebase_recorded_project_path(finished.code_root, finished, project)
             dst = unit_worktrees_dir(new_dir) / safe_segment(story_key)
             dst.parent.mkdir()
             # Recorded BEFORE the move: git renames the tree before it updates its
             # admin files, so a move that raises (a git die, a `_run_git` timeout, an
             # interrupt) can still have moved it — the except arm checks `dst`.
-            moved = (finished.code_root, src, dst)
+            moved = (code_root, src, dst)
             try:
-                verify.worktree_move(finished.code_root, src, dst)
+                verify.worktree_move(code_root, src, dst)
             except verify.GitError as e:
                 raise ReplayError(
                     f"cannot move the kept worktree of story {story_key} into the replay "
@@ -164,7 +171,7 @@ def mint_replay_run(
             project=project,
             paths=paths,
             policy=policy,
-            src=src,
+            src=recorded_src,
             mount=dst,
             trusted_config_digest=trusted_config_digest,
             run_dir_identity=runsetup._claim_identity(claim),

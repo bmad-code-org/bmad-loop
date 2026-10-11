@@ -11817,6 +11817,43 @@ def test_resolve_finished_run_replays_the_kept_unit_in_a_new_run(
     assert _state_bytes(engine.run_dir) == finished_before
 
 
+def test_resolve_finished_run_replays_the_kept_unit_of_a_moved_project(
+    project, tmp_path, monkeypatch, capsys
+):
+    """A finished run is never re-stamped, so after a project rename its records name
+    the launch-time tree. The replay locates the kept worktree and the project-owned
+    code root on the live project: it mints, moves the real worktree into the replay
+    run and merges — not refused as a changed `repo_root`, nor sent to `git worktree
+    move` a path that no longer exists.
+
+    Ablation, each rebase alone: the `code_root=` passed to `_reverify_root_refusal`
+    (refused as a changed `repo_root`); `live_project=` passed to
+    `_mounted_reverify_refusal` (refused as "gone"); the CLI's `wt` (HEAD unreadable);
+    `src` or `code_root` in `mint_replay_run` (the move fails); and re-homing from the
+    live `src` instead of `recorded_src` (the replay re-defers on a spec path it
+    cannot find)."""
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    unit = Path(engine.state.tasks["1-1-a"].worktree_path)
+    _record_launch_under(engine.run_dir, tmp_path / "renamed-away")
+    marker.write_text("up\n")
+    _mock_adapters(monkeypatch)
+
+    assert (
+        _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
+    ), capsys.readouterr().err
+
+    [replay_dir] = _replay_dirs(engine)
+    replay = load_state(replay_dir)
+    assert replay.finished and not replay.paused
+    assert replay.tasks["1-1-a"].phase == Phase.DONE
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert not unit.exists()
+    start = Journal(replay_dir).entries()[0]
+    assert start["kind"] == "unit-replay-start" and start["from_worktree"] == str(unit)
+    handoff = Journal(engine.run_dir).entries()[-1]
+    assert handoff["kind"] == "unit-replay-handoff" and handoff["from_worktree"] == str(unit)
+
+
 def test_resolve_finished_run_no_resume_leaves_the_replay_resumable(
     project, tmp_path, monkeypatch, capsys
 ):
@@ -12476,19 +12513,32 @@ def test_delete_deregisters_a_paused_runs_kept_worktree(project, tmp_path, monke
 
 def _record_launch_under(replay_dir, old_project: Path) -> None:
     """Re-spell the run's launch-time records as if the project had been renamed
-    from ``old_project`` since: `project`, a project-owned `repo_root`, and every
-    task's `worktree_path`. Lexical only — git's own registration stays on the live
-    paths, the shape after a move plus `git worktree repair`."""
+    from ``old_project`` since: `project`, a project-owned `repo_root`, every task's
+    `worktree_path`, and the absolute spec spellings a session reported in the tree
+    it ran in. Lexical only — git's own registration stays on the live paths, the
+    shape after a move plus `git worktree repair`."""
     state = load_state(replay_dir)
     live = Path(state.project)
 
     def moved(path: str) -> str:
         return str(old_project / Path(path).relative_to(live)) if path else path
 
+    def moved_abs(path: str | None) -> str | None:
+        if not path or not Path(path).is_absolute() or not Path(path).is_relative_to(live):
+            return path
+        return moved(path)
+
     state.project = str(old_project)
     state.repo_root = moved(state.repo_root)
     for task in state.tasks.values():
         task.worktree_path = moved(task.worktree_path) if task.worktree_path else None
+        task.spec_file = moved_abs(task.spec_file)
+        task.dispatched_spec_file = moved_abs(task.dispatched_spec_file)
+        for record in task.sessions:
+            if record.result_json is not None:
+                spec = record.result_json.get("spec_file")
+                if isinstance(spec, str):
+                    record.result_json["spec_file"] = moved_abs(spec)
     save_state(replay_dir, state)
 
 

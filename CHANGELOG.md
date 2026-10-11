@@ -47,6 +47,9 @@ breaking changes may land in a minor release.
   is still running, such as an interactive `resolve` of a paused run: a window is
   closed only once its screen shows the park banner. A window whose screen cannot be
   read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
+- Fix `bmad-loop resolve <finished-run> --reverify` refusing to replay a kept unit after
+  the project was moved, as if `repo_root` had changed (DW-525): the kept worktree and
+  code root are now located on the live project.
 - Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
   (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 

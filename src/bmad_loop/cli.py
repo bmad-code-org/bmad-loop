@@ -5555,7 +5555,8 @@ def _resolve_reverify_finished(
             file=sys.stderr,
         )
         return 1
-    wt = Path(task.worktree_path)
+    # Located on the live project, as `standalone_replay_refusal` checked it.
+    wt = runs.rebase_recorded_project_path(Path(task.worktree_path), state, project)
     try:
         head = verify.rev_parse_head(wt)
     except verify.GitError as e:
