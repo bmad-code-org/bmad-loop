@@ -119,6 +119,19 @@ CONFIG_DIGEST_FILE = "config-digest"
 # is merely wrong rather than hostile. The cap's real job is the hostile case —
 # see `read_trusted_config_digest` on why a bound, not a bigger buffer.
 _MAX_DIGEST_BYTES = 256
+# The operator's project-plugin grants (#496/#497), one JSON file per project
+# beside the run entries (see `plugin_grants_path`). A file, so the orphan-state
+# sweep — which only ever reaps directories — passes it by without an arm.
+PLUGIN_GRANTS_FILE = "plugin-grants.json"
+# Verified, content-addressed copies of granted plugin dirs (see
+# `plugin_snapshots_root`). The leading underscore is load-bearing for the same
+# reason as `MUX_REGISTRY_DIR`'s: `plugin-snapshots` matches `RUN_ID_RE`, so a run
+# could key its state dir onto it and the orphan sweep would reap it by name.
+PLUGIN_SNAPSHOTS_DIR = "_plugin-snapshots"
+# Read cap for the grant store. A record is a file map of at most
+# `digest.MAX_FILES` sha256 entries, so a few plugins fit in well under this; the
+# cap's job is the hostile case, as for `_MAX_DIGEST_BYTES`.
+_MAX_GRANTS_BYTES = 4 << 20
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
 # The identity half of ``(None, _PID_FILE_UNREADABLE)``: a pid file that could not
 # be proved absent but could not be read either (DW-465). Paired with a ``None``
@@ -1109,6 +1122,114 @@ def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None
     # process derives — not a path any session names. The trailing newline is for
     # the operator who cats the file.
     atomic_write_text_confined(path, digest + "\n", confine_root=state_root())
+
+
+def plugin_grants_path(project: Path) -> Path:
+    """The operator's project-plugin grants: ``<state root>/<project key>/``
+    :data:`PLUGIN_GRANTS_FILE` (#496/#497).
+
+    Out of the tree for the reason the config baseline moved (#498): the plugin
+    dirs a grant pins, and the ``policy.toml`` beside them, are agent-writable, so
+    a grant recorded there could be written by the very session it polices.
+
+    **What moving it buys, stated exactly.** It closes the *incidental* path: the
+    grants are no longer a project file, so nothing a session does in the ordinary
+    course of rewriting the tree can collaterally forge or blank one. It is **not**
+    a boundary against a deliberate one. Sessions run with permission bypass by
+    default — every shipped profile's ``bypass_args``, which
+    ``GenericAdapter.interactive_argv`` uses unless ``[adapter] extra_args``
+    overrides them; that is what an unattended loop is — and are handed
+    ``BMAD_LOOP_EVENTS_DIR``, whose grandparent is this file's directory. A session
+    that goes looking can rewrite this file, or the verified snapshots beside it
+    (:func:`plugin_snapshots_root`), at the orchestrator's own privilege, and
+    nothing at equal privilege can tell that write from the operator's. Closing it
+    needs privilege separation on the state root, not a better hiding place —
+    tracked in #571.
+
+    **Keyed by the project's path (#572).** A project that moves or is re-cloned
+    starts with no grants and fails closed until the operator re-accepts; one that
+    moves away and back finds its old grants waiting. Neither is a silent widening:
+    a grant still has to match the plugin dir's content digest to count."""
+    return project_state_root(project) / PLUGIN_GRANTS_FILE
+
+
+def plugin_snapshots_root(project: Path) -> Path:
+    """Where verified copies of granted plugin dirs are materialized:
+    ``<state root>/<project key>/`` :data:`PLUGIN_SNAPSHOTS_DIR`, one
+    ``<digest>/`` per content digest (``plugins.snapshot.materialize``).
+
+    Live runs execute plugin hooks and modules from here, so the orphan-state
+    sweep never reaps it (:func:`reconcile_orphan_state_dirs`)."""
+    return project_state_root(project) / PLUGIN_SNAPSHOTS_DIR
+
+
+def read_plugin_grants_text(project: Path) -> tuple[str | None, str | None]:
+    """``(text, fault)``: the grant store's text, or ``None`` when it cannot be
+    produced — paired with ``None`` for genuine absence (no grants were ever
+    recorded) or an operator-facing description of why it could not be read.
+
+    The hardened read of :func:`read_trusted_config_digest`, for the same hazard:
+    the file sits in a subtree the driven session can reach, so its shape is
+    established on the descriptor before any bytes are consumed — ``O_NOFOLLOW``
+    (the name, not its target), ``O_NONBLOCK`` + ``S_ISREG`` on the fd (a planted
+    FIFO costs a fault, not a wedged launch), and at most :data:`_MAX_GRANTS_BYTES`
+    (a link to an endless source costs a fault, not ``MemoryError``). A store over
+    the cap is refused outright rather than truncated: a cut-off JSON document
+    would only fail to decode one layer up, with a less useful message.
+
+    Observation, so it degrades rather than raising, and **only absence is
+    silent**: every other ``None`` carries the fault, which the caller turns into
+    "no grants" *and says so* — a grant store nobody can read must not look like
+    one nobody wrote. ``FileNotFoundError`` alone is absence;
+    ``NotADirectoryError`` means a file stands where a state-dir component belongs,
+    which is a tampered path. The write half raises
+    (:func:`write_plugin_grants_text`)."""
+    try:
+        path = plugin_grants_path(project)
+    except (StateRootError, OSError, RuntimeError) as exc:
+        return None, f"cannot name its path in the state root: {type(exc).__name__}: {exc}"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, None  # never written: no grants, and the only silent answer
+    except OSError as exc:
+        return None, f"{path}: cannot open: {type(exc).__name__}: {exc}"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, f"{path}: not a regular file"
+        chunks: list[bytes] = []
+        got = 0
+        while got <= _MAX_GRANTS_BYTES:
+            chunk = os.read(fd, _MAX_GRANTS_BYTES + 1 - got)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+    except OSError as exc:
+        return None, f"{path}: cannot read: {type(exc).__name__}: {exc}"
+    finally:
+        os.close(fd)
+    if got > _MAX_GRANTS_BYTES:
+        return None, f"{path}: larger than {_MAX_GRANTS_BYTES} bytes"
+    try:
+        return b"".join(chunks).decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, f"{path}: not UTF-8 text"
+
+
+def write_plugin_grants_text(project: Path, text: str) -> None:
+    """Replace the grant store with ``text``, creating the project's state subtree.
+
+    Raises rather than degrading — a repair write: an operator who ran ``plugins
+    enable`` and saw no error must find the grant there at the next launch.
+    Confined to the state root for the reason :func:`write_trusted_config_digest`
+    is (#593): a link planted at the file or at ``<project key>/`` is refused or
+    replaced, never written through."""
+    path = plugin_grants_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text_confined(path, text, confine_root=state_root())
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -3745,6 +3866,13 @@ def reconcile_orphan_state_dirs(
             # degrade to a no-op, and a transport probe cannot promise that).
             # psmux removes its own quartet on session shutdown, so what is left
             # behind is a directory of small files, not growth.
+            continue
+        if entry.name == PLUGIN_SNAPSHOTS_DIR:
+            # Not a run entry either (`plugin_snapshots_root`): live runs execute
+            # plugin hooks and modules from it, so reaping it mid-run pulls the
+            # code out from under a hook the bus is about to spawn. Content-
+            # addressed and reused across runs, so it grows only with distinct
+            # granted contents.
             continue
         try:
             entry.resolve().relative_to(root_res)
