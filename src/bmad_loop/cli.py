@@ -1656,11 +1656,16 @@ def _load_grants_for_write(project: Path) -> GrantSet | None:
     return grants
 
 
-def _save_grants_or_report(project: Path, grants: GrantSet) -> bool:
+def _save_grants_or_report(project: Path, grants: GrantSet, *, seen: GrantSet) -> bool:
+    """Write ``grants`` unless the store moved off ``seen``, the store this verb
+    read and decided against (a concurrent mutation would otherwise be erased)."""
     from .plugins import store
 
     try:
-        store.save_grants(project, grants.records)
+        store.save_grants(project, grants.records, expected=seen)
+    except store.GrantStoreChanged as e:
+        print(f"error: {e}", file=sys.stderr)
+        return False
     except (OSError, runs.StateRootError) as e:
         print(
             f"error: could not write the plugin grants to {runs.plugin_grants_path(project)}: {e}",
@@ -1735,7 +1740,7 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
                 print(f"{label}: {r}")
     granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     new = store.upsert(grants, GrantRecord.from_tree(name, rel, tree, granted_at))
-    if not _save_grants_or_report(project, new):
+    if not _save_grants_or_report(project, new, seen=grants):
         return ExitCode.FAILURE
     print(
         f'plugin "{name}" granted: sha256:{tree.digest[:12]} ({len(tree.files)} files) '
@@ -1756,7 +1761,7 @@ def _plugins_revoke(project: Path, name: str) -> int:
     if grants.get(name) is None:
         print(f'error: plugin "{name}" has no grant to revoke', file=sys.stderr)
         return ExitCode.FAILURE
-    if not _save_grants_or_report(project, store.remove(grants, name)):
+    if not _save_grants_or_report(project, store.remove(grants, name), seen=grants):
         return ExitCode.FAILURE
     print(f'plugin "{name}" grant revoked in {runs.plugin_grants_path(project)}')
     return ExitCode.OK

@@ -10,6 +10,16 @@ fault, and an unreadable or malformed store is an empty set WITH a fault, which 
 launch reports rather than folding into "no grants". `save_grants` is a repair
 write and raises. `upsert` and `remove` are pure.
 
+Every grant mutation is a read-modify-write, and two can overlap (`plugins
+revoke A` beside `plugins enable B`, or a CLI verb beside a TUI save). So
+`save_grants` is a compare-and-swap: under the store's lock it re-reads the file
+and refuses with `GrantStoreChanged` unless it still holds the records the
+caller started from. Without that the later writer silently erases the earlier
+one, and an enable that loaded before a revoke would restore the revoked grant.
+The lock spans only that re-read and the write — the plugin-tree hashing a grant
+needs runs before it, outside the hold (`platform_util.file_lock` gives up after
+~10 s on Windows).
+
 `runs` is imported inside the functions: it is a heavy module, and the plugin
 package must stay importable from it without a cycle.
 """
@@ -21,6 +31,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from .grants import GrantRecord, GrantSet, decode_grants, encode_grants
+
+
+class GrantStoreChanged(RuntimeError):
+    """The grant store no longer holds what a mutation started from: another
+    writer got there first. Nothing was written; re-run against the new store."""
 
 
 def load_grants(project: Path) -> GrantSet:
@@ -42,11 +57,29 @@ def load_grants(project: Path) -> GrantSet:
     return GrantSet(records=records, snapshot_root=snapshot_root)
 
 
-def save_grants(project: Path, records: Iterable[GrantRecord]) -> None:
-    """Replace the project's grant store with ``records``; raises on any fault."""
-    from .. import runs
+def save_grants(
+    project: Path, records: Iterable[GrantRecord], *, expected: GrantSet | None
+) -> None:
+    """Replace the project's grant store with ``records``; raises on any fault.
 
-    runs.write_plugin_grants_text(project, encode_grants(records))
+    ``expected`` is the store the caller read and derived ``records`` from: under
+    the store's lock the file is re-read, and unless it still holds exactly those
+    records (and still reads cleanly) :class:`GrantStoreChanged` is raised and
+    nothing is written (see module doc). ``None`` writes unconditionally, for
+    seeding a store no one else can be mutating."""
+    from .. import runs
+    from ..platform_util import file_lock
+
+    text = encode_grants(records)
+    with file_lock(runs.lock_path_for(runs.plugin_grants_path(project))):
+        if expected is not None:
+            current = load_grants(project)
+            if current.fault is not None or current.records != expected.records:
+                raise GrantStoreChanged(
+                    f"plugin grants in {runs.plugin_grants_path(project)} changed while "
+                    "this was being decided; nothing was written — re-run"
+                )
+        runs.write_plugin_grants_text(project, text)
 
 
 def upsert(grants: GrantSet, record: GrantRecord) -> GrantSet:

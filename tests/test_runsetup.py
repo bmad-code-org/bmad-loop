@@ -1959,7 +1959,7 @@ def test_config_digest_is_unchanged_by_plugin_grants(pinned):
     record = GrantRecord.from_tree(
         "rogue", ".bmad-loop/plugins/rogue", read_tree(plug), "2026-10-10T00:00:00Z"
     )
-    store.save_grants(pinned, [record])
+    store.save_grants(pinned, [record], expected=None)
 
     assert _digest(pinned) == before == _pre_session_id_flag_digest(pinned)
 

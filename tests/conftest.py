@@ -1117,7 +1117,7 @@ def grant_plugin(root: Path, name: str, *, store_project: Path | None = None) ->
     record = GrantRecord.from_tree(name, rel, tree, "2026-10-10T00:00:00Z")
     owner = store_project if store_project is not None else root
     if store_project is not None:
-        save_grants(store_project, [record])
+        save_grants(store_project, [record], expected=None)
     return GrantSet(records=(record,), snapshot_root=runs.plugin_snapshots_root(owner))
 
 

@@ -20062,6 +20062,32 @@ def test_plugins_enable_refuses_a_manifest_swapped_after_discovery(project, caps
     assert not runs.plugin_grants_path(project.project).exists()
 
 
+def test_plugins_accept_never_restores_a_grant_revoked_while_it_ran(project, capsys, monkeypatch):
+    """A revoke that lands while `accept` is hashing wins: the accept, decided on
+    the store it read before the revoke, is refused rather than writing the
+    revoked grant back.
+
+    ABLATION: save without `expected=seen` in `_save_grants_or_report` and the
+    accept re-grants the plugin the revoke just removed."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    (pdir / "hook.py").write_text("print('changed')\n", encoding="utf-8")
+    real = registry_mod.read_tree
+
+    def revoke_then_read(root, **kw):
+        monkeypatch.setattr(registry_mod, "read_tree", real)
+        assert _plugins(project, "revoke", TRUST_PLUGIN) == 0
+        return real(root, **kw)
+
+    monkeypatch.setattr(registry_mod, "read_tree", revoke_then_read)
+    capsys.readouterr()
+    assert _plugins(project, "accept", TRUST_PLUGIN) == 1
+    assert "changed while this was being decided" in capsys.readouterr().err
+    assert _stored_grants(project) == {}
+
+
 def test_plugins_accept_unchanged_is_a_noop(project, capsys):
     """Accepting a plugin whose bytes still match its grant rewrites nothing.
 

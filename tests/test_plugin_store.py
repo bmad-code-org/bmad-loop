@@ -36,7 +36,7 @@ def test_grants_round_trip_through_the_store(tmp_path):
     project.mkdir()
     b, a = _record(tmp_path, "beta"), _record(tmp_path, "alpha")
 
-    store.save_grants(project, [b, a])
+    store.save_grants(project, [b, a], expected=None)
     got = store.load_grants(project)
 
     assert got.fault is None
@@ -100,3 +100,64 @@ def test_upsert_and_remove_are_pure(tmp_path):
     assert {s.snapshot_root for s in (added, replaced, dropped)} == {tmp_path / "snaps"}
     with pytest.raises(FrozenInstanceError):
         base.records = ()  # type: ignore[misc]
+
+
+def test_save_refuses_a_store_that_moved_since_it_was_read(tmp_path):
+    """A grant write is a compare-and-swap: another writer's update between this
+    writer's read and its write is refused, never silently erased.
+
+    ABLATION: drop the `expected` comparison in `save_grants` and the stale
+    write replaces the store, losing "alpha"."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    seen = store.load_grants(project)
+    a, b = _record(tmp_path, "alpha"), _record(tmp_path, "beta")
+    store.save_grants(project, [a], expected=seen)  # the other writer lands first
+
+    with pytest.raises(store.GrantStoreChanged):
+        store.save_grants(project, [b], expected=seen)
+
+    assert store.load_grants(project).records == (a,)
+
+
+def test_save_refuses_a_store_that_went_unreadable_since_it_was_read(tmp_path):
+    """A store that became unreadable under the writer is a change too: replacing
+    it would discard whatever grants it holds."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    seen = store.load_grants(project)
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not json")
+
+    with pytest.raises(store.GrantStoreChanged):
+        store.save_grants(project, [_record(tmp_path, "alpha")], expected=seen)
+
+    assert path.read_bytes() == b"not json"
+
+
+def test_save_rechecks_and_writes_under_the_store_lock(tmp_path, monkeypatch):
+    """The re-read and the write share one hold of the store's lock, so two
+    writers cannot both pass the comparison and then both write.
+
+    ABLATION: move the write out of the `file_lock` block in `save_grants` and
+    the probe acquires the lock."""
+    from bmad_loop.platform_util import LockUnavailableError, file_lock
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    lock = runs.lock_path_for(runs.plugin_grants_path(project))
+    real = runs.write_plugin_grants_text
+    probed: list[bool] = []
+
+    def probe_then_write(p, text):
+        try:
+            with file_lock(lock, blocking=False):
+                probed.append(False)
+        except LockUnavailableError:
+            probed.append(True)
+        real(p, text)
+
+    monkeypatch.setattr(runs, "write_plugin_grants_text", probe_then_write)
+    store.save_grants(project, [_record(tmp_path, "alpha")], expected=store.load_grants(project))
+    assert probed == [True]

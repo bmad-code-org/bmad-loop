@@ -539,7 +539,10 @@ class SettingsScreen(Screen[None]):
                 self._doc.set(spec.section, spec.key, value)
         to_grant, to_revoke = self._grant_flips()
         self._save_enabled(to_revoke)
-        candidate = self._candidate_grants(to_grant, to_revoke)
+        # Re-read, so a `bmad-loop plugins` change made while the screen was open
+        # survives; the grant write below is refused if the store moves off it.
+        base = store.load_grants(self._project)
+        candidate = self._candidate_grants(base, to_grant, to_revoke)
         if isinstance(candidate, str):
             self._show_errors(candidate)
             return
@@ -563,8 +566,8 @@ class SettingsScreen(Screen[None]):
             return
         if to_grant or to_revoke:
             try:
-                store.save_grants(self._project, candidate.records)
-            except (OSError, runs.StateRootError) as e:
+                store.save_grants(self._project, candidate.records, expected=base)
+            except (OSError, runs.StateRootError, store.GrantStoreChanged) as e:
                 self._show_errors(f"policy saved, but the plugin grant was not recorded: {e}")
                 return
         if candidate.fault is not None:
@@ -600,12 +603,12 @@ class SettingsScreen(Screen[None]):
                 to_revoke.append(info.name)
         return to_grant, to_revoke
 
-    def _candidate_grants(self, to_grant: list[str], to_revoke: list[str]) -> GrantSet | str:
-        """The grants this save would leave: the store as it is now (re-read, so a
-        `bmad-loop plugins` change made while the screen was open survives) plus a
-        fresh record of each newly toggled plugin's dir, minus the revoked. A
-        string is the error that blocks the save. Hashes only — nothing runs."""
-        grants = store.load_grants(self._project)
+    def _candidate_grants(
+        self, grants: GrantSet, to_grant: list[str], to_revoke: list[str]
+    ) -> GrantSet | str:
+        """The grants this save would leave: ``grants`` (the store as it is now)
+        plus a fresh record of each newly toggled plugin's dir, minus the revoked.
+        A string is the error that blocks the save. Hashes only — nothing runs."""
         if not (to_grant or to_revoke):
             return grants
         if grants.fault is not None:

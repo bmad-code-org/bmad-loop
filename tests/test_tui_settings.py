@@ -873,6 +873,37 @@ async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, mon
     assert store.load_grants(project.project).get("hooky") is None
 
 
+async def test_toggle_on_never_erases_a_grant_recorded_while_it_saved(project, monkeypatch):
+    """A grant recorded by another writer while the save is hashing survives: the
+    save, built on the store it read first, is refused rather than replacing it.
+
+    ABLATION: save without `expected=base` in `action_save` and "other"'s grant
+    is erased by the toggle's write."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    write_policy(project)
+    write_hook_plugin(project.project)
+    write_hook_plugin(project.project, "other")
+    real = registry_mod.read_tree
+
+    def grant_other_then_read(root, **kw):
+        monkeypatch.setattr(registry_mod, "read_tree", real)
+        grant_plugin(project.project, "other", store_project=project.project)
+        return real(root, **kw)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        monkeypatch.setattr(registry_mod, "read_tree", grant_other_then_read)
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "changed while this was being decided" in _errors(screen))
+
+    grants = store.load_grants(project.project)
+    assert grants.get("other") is not None
+    assert grants.get("hooky") is None
+
+
 async def test_failed_validate_records_no_grant(project):
     """A save the validate round-trip blocks writes nothing — neither policy.toml
     nor the grant the toggle asked for.
