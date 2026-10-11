@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import errno
 import hashlib
 import json
 import math
@@ -1226,8 +1227,18 @@ def write_plugin_grants_text(project: Path, text: str) -> None:
     enable`` and saw no error must find the grant there at the next launch.
     Confined to the state root for the reason :func:`write_trusted_config_digest`
     is (#593): a link planted at the file or at ``<project key>/`` is refused or
-    replaced, never written through."""
+    replaced, never written through.
+
+    A store over :data:`_MAX_GRANTS_BYTES` is refused here too: the read half
+    refuses it at the next launch, so publishing it would report a grant that
+    every launch then treats as absent."""
     path = plugin_grants_path(project)
+    if (size := len(text.encode("utf-8"))) > _MAX_GRANTS_BYTES:
+        raise OSError(
+            errno.EFBIG,
+            f"plugin grants would be {size} bytes, over the {_MAX_GRANTS_BYTES}-byte read cap",
+            str(path),
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text_confined(path, text, confine_root=state_root())
 

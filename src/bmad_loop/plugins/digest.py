@@ -16,8 +16,9 @@ agent-writable and its answer is what later executes:
     name, so a swap between listing and open cannot feed a FIFO into the read;
   * ``__pycache__`` at any depth is skipped (``exclude``) or refused (``refuse``,
     the snapshot check) — a bytecode cache is not source and is never trusted;
-  * file count, per-file and total size are capped, so a tampered tree costs a
-    refusal rather than the orchestrator's memory.
+  * entry count (files, dirs and skipped caches alike, counted as they are
+    listed), file count, per-file and total size are capped, so a tampered tree
+    costs a refusal rather than the orchestrator's memory.
 
 Every fault is a `PluginError` and no partial tree is ever returned: a digest
 over the readable subset would be a digest of something nobody granted.
@@ -47,6 +48,7 @@ from ..platform_util import is_link_like
 from .model import PluginError
 
 MAX_FILES = 2048
+MAX_ENTRIES = 2 * MAX_FILES
 MAX_FILE_BYTES = 16 << 20
 MAX_TOTAL_BYTES = 64 << 20
 
@@ -171,13 +173,22 @@ def read_tree(root: Path, *, pycache: PycacheMode = "exclude") -> VerifiedTree:
     """Read a plugin dir whole and digest it, or raise PluginError (see module doc)."""
     files: list[TreeFile] = []
     total = 0
+    seen = 0
     pending: list[tuple[str, str]] = [(os.fspath(root), "")]
     while pending:
         dir_path, dir_rel = pending.pop()
         where = dir_rel or "."
         try:
             with os.scandir(dir_path) as it:
-                entries = sorted(it, key=lambda e: os.fsencode(e.name))
+                # counted while listing, before the sort: a dir of dirs (or one
+                # huge listing) costs a refusal, not an unbounded walk or sort
+                listed: list[os.DirEntry[str]] = []
+                for entry in it:
+                    seen += 1
+                    if seen > MAX_ENTRIES:
+                        raise PluginError(f"plugin dir {root}: more than {MAX_ENTRIES} entries")
+                    listed.append(entry)
+            entries = sorted(listed, key=lambda e: os.fsencode(e.name))
         except OSError as e:
             raise PluginError(
                 f"plugin dir {root}: cannot list {where}: {type(e).__name__}: {e}"

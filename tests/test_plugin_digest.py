@@ -183,6 +183,21 @@ def test_file_count_cap(tmp_path, monkeypatch):
         read_tree(over)
 
 
+def test_entry_cap_counts_directories(tmp_path, monkeypatch):
+    # a tree of empty dirs holds no files, so the file cap alone never fires
+    monkeypatch.setattr(digest, "MAX_ENTRIES", 4)
+    ok = tmp_path / "ok"
+    (ok / "a" / "b").mkdir(parents=True)
+    (ok / "c").mkdir()
+    (ok / "plugin.toml").write_text("")
+    assert len(read_tree(ok).files) == 1
+    over = tmp_path / "over"
+    for d in ("a", "b", "c", "d", "e"):
+        (over / d).mkdir(parents=True)
+    with pytest.raises(PluginError, match="more than 4 entries"):
+        read_tree(over)
+
+
 def test_file_size_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "MAX_FILE_BYTES", 8)
     ok = write_tree(tmp_path / "ok", {"a": b"x" * 8})

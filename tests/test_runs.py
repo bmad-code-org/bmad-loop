@@ -3130,6 +3130,23 @@ def test_plugin_grants_writer_refuses_a_symlinked_state_component(tmp_path, monk
     assert list(outside.iterdir()) == []
 
 
+def test_plugin_grants_writer_refuses_a_store_its_reader_would_refuse(tmp_path, monkeypatch):
+    """The write and read caps agree: a store the next launch would refuse as
+    oversized is never published, so a grant that reported success is readable.
+
+    ABLATION: drop the writer's size check and the over-cap text is written, then
+    read back as a fault."""
+    monkeypatch.setattr(runs, "_MAX_GRANTS_BYTES", 8)
+    project = tmp_path / "proj"
+    project.mkdir()
+    runs.write_plugin_grants_text(project, "{}\n")
+
+    with pytest.raises(OSError, match="over the 8-byte read cap"):
+        runs.write_plugin_grants_text(project, '{"plugins": {}}\n')
+
+    assert runs.read_plugin_grants_text(project) == ("{}\n", None)
+
+
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
     """A pre-digest tag stays ours; another project's path or digest stays foreign."""
     legacy = str(tmp_path.resolve())
