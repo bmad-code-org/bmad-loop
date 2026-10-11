@@ -782,6 +782,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "record",
         "redrive",
         "ref",
+        # DW-535: `replay-abandoned`'s flag that a retry's recovered `-abandon` ref
+        # was pruned since the earlier attempt parked it (a bare boolean).
+        "ref_pruned",
         "refiled",
         "refs",
         # `sweep-ledger-commit-refused` (DW-199/203/205): WHY `_commit_ledger`
@@ -1279,8 +1282,8 @@ JOURNAL_KINDS = frozenset(
         "replay-merge-refused",
         # DW-535. An escalated replay run closed by `resolve <replay-run> --abandon`,
         # from `unitreplay.abandon_replay_run`. `story_key` and `branch` alias by name;
-        # `replay_of`, `worktree`, `ref` (the `-abandon` snapshot, or null) and
-        # `branch_kept` are benign.
+        # `replay_of`, `worktree`, `ref` (the `-abandon` snapshot, or null),
+        # `ref_pruned` and `branch_kept` are benign.
         "replay-abandoned",
         # DW-535. The snapshot ref `unitreplay.abandon_replay_run` parked, journaled
         # BEFORE the teardown so a retry after a post-teardown fault recovers it.

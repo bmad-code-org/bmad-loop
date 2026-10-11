@@ -6791,7 +6791,13 @@ def branch_exists_checked(repo: Path, name: str) -> bool:
     exits non-zero for a missing ref and for a repository it cannot read alike, so
     this lists with `for-each-ref` (rc 0 with no line is a real "absent") and matches
     the exact refname, since the pattern also matches refs nested beneath it."""
-    refname = f"refs/heads/{name}"
+    return ref_exists_checked(repo, f"refs/heads/{name}")
+
+
+def ref_exists_checked(repo: Path, refname: str) -> bool:
+    """:func:`ref_exists` for a caller that records the answer, for any FULL
+    ``refname``: as :func:`branch_exists_checked`, a listing that fails raises
+    :class:`GitError` rather than reading as "absent"."""
     rc, out, detail = _git_out(repo, "for-each-ref", "--format=%(refname)", refname)
     if rc != 0:
         raise GitError(f"git for-each-ref {refname} failed in {repo}: {detail}")

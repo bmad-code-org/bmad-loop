@@ -75,7 +75,7 @@ from . import runs, runsetup, verify
 from .bmadconfig import ProjectPaths
 from .journal import Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
-from .platform_util import root_identity_record, safe_segment
+from .platform_util import pinned_root_identity, root_identity_record, safe_segment
 from .policy import Policy
 from .workspace import (
     discard_worktree,
@@ -316,6 +316,9 @@ class AbandonOutcome:
     branch: str
     branch_kept: bool
     ref: str | None
+    # A retry recovered ``ref`` from the journal but it no longer exists: pruned
+    # under ``scm.preserve_keep`` between the attempts, its work unrecoverable.
+    ref_pruned: bool = False
 
 
 def abandon_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
@@ -343,8 +346,9 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
     """Close the escalated replay run at ``run_dir`` without merging its unit, under
     the run's state lock (reentrant, so a caller already holding it may call this).
 
-    Order: re-check → snapshot → journal the snapshot → teardown → verify gone →
-    journal → save state. The snapshot row is written BEFORE the teardown so the ref
+    Order: re-check → registered and owned (`_foreign_worktree_refusal`) →
+    snapshot → journal the snapshot → teardown → verify gone → journal → save
+    state. The snapshot row is written BEFORE the teardown so the ref
     is durably on record while the worktree that held the work still stands. A crash
     or fault after the teardown leaves a paused run with no worktree; re-running
     abandon completes it, reporting the newest snapshot row's ref (after a crash
@@ -367,6 +371,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
         # already-gone arm — finished unsnapshotted, its contents left to `delete`.
         wt = runs.rebase_recorded_project_path(Path(task.worktree_path), state, paths.project)
         ref: str | None = None
+        ref_pruned = False
         if os.path.lexists(wt):
             try:
                 registered = verify.worktree_is_registered(repo_root, wt)
@@ -383,6 +388,8 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                     f"worktree of {repo_root}, so its contents cannot be preserved; "
                     "inspect it, remove it by hand, then re-run abandon"
                 )
+            if (foreign := _foreign_worktree_refusal(run_dir, wt, task)) is not None:
+                raise AbandonError(foreign)
             try:
                 ref = preserve_abandoned_unit(
                     repo_root, wt, state.run_id, story_key, paths, task.spec_file, task.branch
@@ -406,6 +413,9 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 # teardown — else the journal and stdout read as a clean abandon.
                 verify.worktree_prune(repo_root)
                 ref = _earlier_abandon_ref(run_dir, story_key)
+                # Journaled is not kept: another run's retention may have pruned it
+                # since, and reporting it as parked would point at nothing.
+                ref_pruned = ref is not None and not verify.ref_exists_checked(repo_root, ref)
             _verify_worktree_gone(repo_root, wt)
             # Checked, not `branch_exists`: an unreadable answer must not be journaled
             # as `branch_kept: false` and printed as a deleted recovery branch.
@@ -423,18 +433,51 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
             branch_kept=branch_kept,
             worktree=str(wt),
             ref=ref,
+            ref_pruned=ref_pruned,
         )
         state.clear_pause()
         state.finished = True
         save_state(run_dir, state)
-        return AbandonOutcome(branch=task.branch, branch_kept=branch_kept, ref=ref)
+        return AbandonOutcome(
+            branch=task.branch, branch_kept=branch_kept, ref=ref, ref_pruned=ref_pruned
+        )
+
+
+def _foreign_worktree_refusal(run_dir: Path, wt: Path, task: StoryTask) -> str | None:
+    """Why the standing tree at ``wt`` may not be this task's unit worktree, or None.
+
+    `verify.worktree_is_registered` proves only that ``wt`` is SOME linked worktree
+    of the repository, and the teardown removes whatever it is. So ``wt`` must sit
+    directly under this run's own worktrees dir, where the replay mint and the engine
+    mount units, and be the directory recorded at its mint (``task.worktree_identity``,
+    DW-446). The identity compare is inode-only, as the locked
+    `runs.reconcile_root_identities` re-bind is, so a reboot that renumbered
+    ``st_dev`` does not refuse. A ``None`` record (an unpinnable or zero-inode mount)
+    leaves nothing to compare; the placement check stands alone."""
+    if _canonical(wt.parent) != _canonical(unit_worktrees_dir(run_dir)):
+        return (
+            f"the kept worktree path {wt} is not under run {run_dir.name}'s worktrees "
+            "directory, so it may not be this run's unit; inspect it, remove it by hand "
+            "if it is, then re-run abandon"
+        )
+    if task.worktree_identity is None:
+        return None
+    info = pinned_root_identity(wt)
+    if info is None or info.st_ino != task.worktree_identity[1]:
+        return (
+            f"the kept worktree path {wt} no longer holds the directory this run "
+            "minted there (a link, or a different tree — possibly another worktree); "
+            "inspect it, remove it by hand if it is disposable, then re-run abandon"
+        )
+    return None
 
 
 def _earlier_abandon_ref(run_dir: Path, story_key: str) -> str | None:
     """The ref of the newest ``replay-abandon-snapshot`` row an earlier abandon of
     ``story_key`` journaled before its teardown, or None when no attempt parked
     anything. Read from the journal rather than matched against ref names, so a
-    serialized ``-r<n>`` snapshot is found and a ref pruned since is still reported.
+    serialized ``-r<n>`` snapshot is found and a ref pruned since is still named —
+    the caller checks it still exists and reports ``ref_pruned`` when it does not.
     Raises AbandonError when the journal cannot be read — that is not "nothing was
     parked"."""
     try:

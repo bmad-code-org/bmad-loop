@@ -3505,7 +3505,8 @@ def delete_run(
     multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
     on stderr. See :func:`live_session_may_be_ours`.
 
-    A run dir holding ``worktrees/`` (a paused isolated run's kept unit) is pruned
+    A run dir holding ``worktrees/`` (a paused isolated run's kept unit), or whose
+    state records a unit mount (``worktrees/`` already removed by hand), is pruned
     from git's worktree admin after the removal, against the run's own code root
     (DW-538; a project-owned one rebased onto a renamed ``project``) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
     that leaves an entry under the run dir, or a listing that cannot say, is
@@ -3541,9 +3542,13 @@ def delete_run(
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
         # Read before the rmtree takes them: a kept unit worktree under the run dir
-        # is registered with the run's code root, which the rmtree does not tell.
-        held_worktrees = os.path.lexists(run_dir / "worktrees")
-        state = _state_or_none(run_dir) if held_worktrees else None
+        # is registered with the run's code root, which the rmtree does not tell. A
+        # recorded mount counts even with `worktrees/` already gone by hand — its
+        # admin entry outlives the directory.
+        state = _state_or_none(run_dir)
+        held_worktrees = os.path.lexists(run_dir / "worktrees") or (
+            state is not None and any(t.worktree_path for t in state.tasks.values())
+        )
         run_res = run_dir.resolve()
         retrying_rmtree(run_dir)
         if held_worktrees:

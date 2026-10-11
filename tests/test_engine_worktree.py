@@ -12575,6 +12575,25 @@ def test_delete_warns_when_the_worktree_listing_fails(project, tmp_path, monkeyp
     assert "git worktree prune" in note
 
 
+def test_delete_deregisters_a_kept_worktree_whose_directory_is_gone(project, tmp_path, monkeypatch):
+    """The run's `worktrees/` was removed by hand, leaving git's admin entry: the
+    recorded mount still sends `delete_run` to prune, so no stale registration
+    outlives the run.
+
+    Ablation: key `held_worktrees` on `os.path.lexists(run_dir / "worktrees")` alone
+    and the unit stays registered."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    shutil.rmtree(replay_dir / "worktrees")
+    assert _registered_under(project, replay_dir) != []
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append)
+
+    assert not replay_dir.exists()
+    assert _registered_under(project, replay_dir) == []
+    assert notes == []
+
+
 def test_abandon_refuses_a_run_that_is_not_a_replay(project, tmp_path, monkeypatch, capsys):
     """An ordinary run paused at an escalation has re-arm and adopt; abandon refuses
     it, naming replay runs and both gestures, and changes nothing.
@@ -12765,6 +12784,45 @@ def test_abandon_retry_recovers_the_snapshot_an_earlier_attempt_parked(
     row = Journal(replay_dir).entries()[-1]
     assert row["kind"] == "replay-abandoned" and row["ref"] == ref
     assert ref in capsys.readouterr().out
+    assert load_state(replay_dir).finished
+
+
+def test_abandon_retry_reports_a_snapshot_pruned_since_the_earlier_attempt(
+    project, tmp_path, monkeypatch, capsys
+):
+    """As the recovery retry above, but the parked ref is pruned between the attempts
+    (another run's `scm.preserve_keep` retention): the retry still closes the run —
+    the ref cannot come back — but journals `ref_pruned` and warns that the work is
+    gone, rather than telling the operator it is parked on a ref that does not exist.
+
+    Ablation: drop the `ref_exists_checked` line in `abandon_replay_run` and the row
+    reads `ref_pruned: False` with "is parked on" printed."""
+    from bmad_loop import unitreplay
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    head = git(unit, "rev-parse", "HEAD").strip()
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    real_gone = unitreplay._verify_worktree_gone
+
+    def flaky_gone(repo_root, wt):
+        monkeypatch.setattr(unitreplay, "_verify_worktree_gone", real_gone)
+        raise unitreplay.AbandonError("cannot list the worktrees (simulated fault)")
+
+    monkeypatch.setattr(unitreplay, "_verify_worktree_gone", flaky_gone)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    git(project.project, "update-ref", "-d", ref)
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["ref"] == ref
+    assert row["ref_pruned"] is True
+    captured = capsys.readouterr()
+    assert "is parked on" not in captured.out
+    assert ref in captured.err and "has since been pruned" in captured.err
     assert load_state(replay_dir).finished
 
 
@@ -13025,3 +13083,57 @@ def test_abandon_refuses_a_plain_directory_at_the_worktree_path(
     assert "is not a registered git worktree" in capsys.readouterr().err
     assert (unit / "copied-by-hand.txt").is_file()
     assert _state_bytes(replay_dir) == state_before
+
+
+def test_abandon_refuses_another_worktree_registered_at_the_kept_path(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The kept unit was moved away and another linked worktree registered at its
+    recorded path: registered, under the run's worktrees dir, yet not the directory
+    minted there. Abandon refuses rather than snapshot and remove that unrelated
+    worktree, and leaves both trees and the run as they were.
+
+    Ablation: drop the `worktree_identity` compare in `_foreign_worktree_refusal` and
+    the other worktree is removed and the run recorded finished."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    # Moved, not removed: the original tree keeps its inode, so the new one cannot
+    # reuse it.
+    git(project.project, "worktree", "move", str(unit), str(tmp_path / "moved-unit"))
+    git(project.project, "worktree", "add", "--detach", str(unit), "HEAD")
+    (unit / "other-work.txt").write_text("someone else's work\n", encoding="utf-8")
+    before = _state_bytes(replay_dir)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "no longer holds the directory this run minted" in capsys.readouterr().err
+    assert (unit / "other-work.txt").is_file()
+    assert (tmp_path / "moved-unit").is_dir()
+    assert _state_bytes(replay_dir) == before
+
+
+def test_abandon_refuses_a_recorded_worktree_outside_the_runs_worktrees(
+    project, tmp_path, monkeypatch, capsys
+):
+    """A recorded `worktree_path` naming a linked worktree outside the run's own
+    worktrees dir — with an identity record that matches it — is refused on placement
+    alone: abandon removes only a unit this run mounted.
+
+    Ablation: drop the placement check in `_foreign_worktree_refusal` and the
+    outside worktree is removed."""
+    from bmad_loop.platform_util import root_identity_record
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    git(project.project, "worktree", "add", "--detach", str(elsewhere), "HEAD")
+    state = load_state(replay_dir)
+    state.tasks["1-1-a"].worktree_path = str(elsewhere)
+    state.tasks["1-1-a"].worktree_identity = root_identity_record(elsewhere)
+    save_state(replay_dir, state)
+    before = _state_bytes(replay_dir)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "is not under run" in capsys.readouterr().err
+    assert elsewhere.is_dir()
+    assert _state_bytes(replay_dir) == before

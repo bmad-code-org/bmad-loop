@@ -23,6 +23,7 @@ breaking changes may land in a minor release.
   untracked changes (plus the run's own spec/board/ledger copies), or commits on a
   detached HEAD the branch lacks, are parked on a `refs/attempt-preserve-dirty/*-abandon`
   ref; other git-ignored files are removed with the worktree. The branch is kept and the run is recorded finished.
+  A tree at the recorded path that is not the run's own unit worktree is refused, not removed.
 
 ### Changed
 

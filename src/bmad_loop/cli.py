@@ -5301,7 +5301,14 @@ def _resolve_abandon(
             f"abandoned replay run {args.run_id}: branch {outcome.branch} of {story_key} "
             "no longer exists"
         )
-    if outcome.ref is not None:
+    if outcome.ref is not None and outcome.ref_pruned:
+        print(
+            f"warning: an earlier abandon attempt parked the worktree's unmerged work on "
+            f"{outcome.ref}, but that ref has since been pruned (scm.preserve_keep); the "
+            "work is no longer recoverable from it",
+            file=sys.stderr,
+        )
+    elif outcome.ref is not None:
         print(
             f"unmerged work from its worktree is parked on {outcome.ref} (kept within "
             "scm.preserve_keep; copy it to a branch to keep it longer)"
