@@ -4853,6 +4853,40 @@ def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypat
         assert phase != Phase.ESCALATED
 
 
+@pytest.mark.parametrize("mode", ["interactive", "--adopt-branch", "--reverify"])
+def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
+    project, monkeypatch, capsys, mode
+):
+    """#496/#497: the sibling above pins the refusal against the re-arm only. The
+    interactive arm reached it after a whole agent conversation, and `--adopt-branch`
+    / paused-run `--reverify` dispatch before it, persisting their transition and
+    only then meeting the resume's refusal. One preflight now precedes all three.
+
+    Each action is failed rather than stubbed, so the rc can only come from the
+    early refusal. Ablation: delete the `_reject_plugin_trust` call ahead of the
+    reverify dispatch in `cmd_resolve` and every row reddens on its action."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+    monkeypatch.setattr(cli, "_resolve_adopt", lambda *a, **k: pytest.fail("adopted"))
+    monkeypatch.setattr(cli, "_resolve_reverify", lambda *a, **k: pytest.fail("re-verified"))
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if mode != "interactive":
+        argv.append(mode)
+    assert cli.main(argv) == 1
+
+    assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
 @pytest.mark.parametrize("shape", ["inside", "sibling"])
 def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     project, monkeypatch, capsys, shape

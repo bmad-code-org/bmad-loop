@@ -4659,6 +4659,31 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
 
+    # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
+    # so judge it here — ahead of the reverify/adopt dispatches (each persists its
+    # transition before resuming) and of the interactive session (a refusal after it
+    # throws the conversation away). The post-confirm re-check below stays: a plugin
+    # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
+    # launches nothing, so it is not judged. An unreadable config skips this early
+    # exit only; the resume's own config read refuses it, as before.
+    if args.resume is not False:
+        try:
+            trust_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            trust_paths = None
+        if (
+            trust_paths is not None
+            and (
+                rc := _reject_plugin_trust(
+                    trust_paths,
+                    policy_mod.load(_policy_path(project)),
+                    _launch_plugin_grants(project),
+                )
+            )
+            is not None
+        ):
+            return rc
+
     # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
     # as --adopt-branch, and likewise ahead of the interactive session it never runs.
     if reverify:
