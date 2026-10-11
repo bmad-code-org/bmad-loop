@@ -13187,3 +13187,30 @@ def test_abandon_refuses_a_recorded_worktree_outside_the_runs_worktrees(
     assert "is not under run" in capsys.readouterr().err
     assert elsewhere.is_dir()
     assert _state_bytes(replay_dir) == before
+
+
+def test_abandon_refuses_while_the_moved_kept_unit_is_registered_under_the_run(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The operator moved the kept unit with `git worktree move` to another path under
+    the replay run's directory: its recorded path is gone, which reads as already
+    torn down, but the tree still holds uncommitted work that a later `delete` would
+    rmtree. Abandon refuses while a worktree is registered under the run, and leaves
+    the tree and the run as they were.
+
+    Ablation: drop the `_refuse_worktrees_left_under_run` call in
+    `abandon_replay_run` and the run is recorded finished with no snapshot."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    moved = replay_dir / "moved-by-hand"
+    git(project.project, "worktree", "move", str(unit), str(moved))
+    (moved / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    before = _state_bytes(replay_dir)
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    err = capsys.readouterr().err
+    assert str(moved) in err and "git worktree move" in err
+    assert (moved / "extra-notes.txt").is_file()
+    assert _state_bytes(replay_dir) == before
+    assert all(e["kind"] != "replay-abandoned" for e in Journal(replay_dir).entries())

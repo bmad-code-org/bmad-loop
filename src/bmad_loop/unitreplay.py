@@ -354,8 +354,8 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
     the run's state lock (reentrant, so a caller already holding it may call this).
 
     Order: re-check → registered and owned (`_foreign_worktree_refusal`) →
-    snapshot → journal the snapshot → teardown → verify gone → journal → save
-    state. The snapshot row is written BEFORE the teardown so the ref
+    snapshot → journal the snapshot → teardown → verify gone, with no worktree left
+    under the run dir → journal → save state. The snapshot row is written BEFORE the teardown so the ref
     is durably on record while the worktree that held the work still stands. A crash
     or fault after the teardown leaves a paused run with no worktree; re-running
     abandon completes it, reporting the newest snapshot row's ref (after a crash
@@ -424,6 +424,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 # since, and reporting it as parked would point at nothing.
                 ref_pruned = ref is not None and not verify.ref_exists_checked(repo_root, ref)
             _verify_worktree_gone(repo_root, wt)
+            _refuse_worktrees_left_under_run(repo_root, run_dir, wt)
             # Checked, not `branch_exists`: an unreadable answer must not be journaled
             # as `branch_kept: false` and printed as a deleted recovery branch.
             branch_kept = verify.branch_exists_checked(repo_root, task.branch)
@@ -528,6 +529,34 @@ def _verify_worktree_gone(repo_root: Path, wt: Path) -> None:
             f"the kept worktree {wt} is still registered with git after its removal; "
             f"the run is still paused — if it is locked, `git worktree unlock {wt}` "
             "first; then `git worktree prune` and re-run abandon"
+        )
+
+
+def _refuse_worktrees_left_under_run(repo_root: Path, run_dir: Path, wt: Path) -> None:
+    """Raise AbandonError while any worktree registered with ``repo_root`` still sits
+    under ``run_dir``. A kept unit moved with `git worktree move` leaves its recorded
+    path absent, which reads as already gone, while the tree, registered at its new
+    path, still holds the work. Under the run dir, a later `delete`'s rmtree would
+    destroy it unsnapshotted."""
+    try:
+        listed = verify.worktree_list(repo_root)
+    except verify.GitError as e:
+        raise AbandonError(
+            f"cannot list the worktrees of {repo_root} to confirm none is left under run "
+            f"{run_dir.name} ({e}); the run is still paused — re-run abandon"
+        ) from e
+    root = _canonical(run_dir)
+    left = [
+        str(p)
+        for p in listed
+        if (c := _canonical(p)) == root or c.startswith(root.rstrip(os.sep) + os.sep)
+    ]
+    if left:
+        raise AbandonError(
+            f"worktree {', '.join(left)} is still registered under run {run_dir.name}'s "
+            "directory — the kept unit may have been moved there; the run is still "
+            f"paused — move it back to {wt} with `git worktree move` (or remove it), "
+            "then re-run abandon"
         )
 
 
