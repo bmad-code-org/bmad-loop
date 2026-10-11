@@ -825,6 +825,7 @@ out-of-tree sha256 grant `bmad-loop plugins enable` records — never a
 `[plugins] enabled` entry (that list is managed only for bundled `[python]`
 plugins, and any other name already in it is preserved). Its row shows the grant
 status: `granted`, `not granted`, ``changed — run `bmad-loop plugins accept <name>` ``,
+``enabled, not granted — run `bmad-loop plugins enable <name>` or toggle off ``,
 or `unreadable — …`.
 
 - **Toggle on** an ungranted plugin and save: the grant is recorded **after** the
@@ -832,7 +833,9 @@ or `unreadable — …`.
   nothing. Validation builds the plugin registry with the candidate grant, so a
   newly toggled `[python]` project plugin's module **executes during the save** —
   that is the human-present moment you enable it.
-- **Toggle off** a granted plugin and save: the grant is revoked.
+- **Toggle off** a granted plugin and save: the grant is revoked. A project
+  plugin still named in `[plugins] enabled` (from before grants) starts on even
+  with no grant, and toggling it off drops that legacy entry too.
 - **An untouched toggle changes nothing.** An unrelated save never re-pins a
   plugin whose files changed since its grant. Saves are judged against the
   grants as stored, so a changed, unreadable, or enabled-but-ungranted plugin

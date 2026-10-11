@@ -985,6 +985,36 @@ async def test_toggle_off_drops_a_legacy_enabled_entry(project):
     assert policy_mod.load(path).plugins.enabled == ("ghost",)
 
 
+async def test_toggle_off_clears_an_ungranted_legacy_entry(project):
+    """A project plugin named in [plugins] enabled but never granted (the upgrade
+    case before any grant) starts on, with a row pointing at `plugins enable`, so
+    toggling it off drops the legacy entry and the save goes through. Left off,
+    the fatal "enabled but never granted" state would block every save with no
+    toggle to clear it. Nothing is granted.
+
+    ABLATION: drop the ``info.enabled`` arm of `_initial_toggle` and the toggle
+    starts off, so there is nothing to flip and the save stays blocked."""
+    path = project.project / POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[plugins]\nenabled = ["ghost", "hooky"]\n', encoding="utf-8")
+    write_hook_plugin(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen) == (
+            "enabled, not granted — run `bmad-loop plugins enable hooky` or toggle off"
+        )
+        assert screen.query_one("#plugin-status-hooky").has_class("-attention")
+        toggle = screen.query_one("#plugin-enabled-hooky", Switch)
+        assert toggle.value is True
+        toggle.value = False
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get("hooky") is None
+    assert policy_mod.load(path).plugins.enabled == ("ghost",)
+
+
 async def test_toggle_on_refuses_to_overwrite_an_unreadable_store(project):
     """A grant store that exists but can't be read is never rewritten — its
     grants would be lost — so the toggle's save is blocked and both files stay.

@@ -309,9 +309,14 @@ class SettingsScreen(Screen[None]):
     def _initial_toggle(info: PluginInfo) -> bool:
         """A builtin's toggle is its [plugins] enabled membership; a project
         plugin's is whether a grant is recorded (matching or not, so a changed
-        plugin can still be toggled off to revoke it)."""
+        plugin can still be toggled off to revoke it) or its name is still in
+        [plugins] enabled — the upgrade case with no grant starts on too, so
+        toggling it off drops the legacy entry; left off, that fatal state could
+        never be cleared and would block every save.
+        ABLATION (test_toggle_off_clears_an_ungranted_legacy_entry): drop the
+        ``info.enabled`` arm and the toggle can't be turned off."""
         if info.grant_required:
-            return info.has_grant
+            return info.has_grant or info.enabled
         return info.enabled
 
     @staticmethod
@@ -321,6 +326,12 @@ class SettingsScreen(Screen[None]):
         accept = f"run `bmad-loop plugins accept {info.name}`"
         if info.grant_status == "granted":
             return "granted", False
+        if info.grant_status == "ungranted" and info.enabled:
+            return (
+                f"enabled, not granted — run `bmad-loop plugins enable {info.name}` "
+                "or toggle off",
+                True,
+            )
         if info.grant_status == "mismatch":
             return f"changed — {accept}", True
         if info.grant_status == "unreadable":
