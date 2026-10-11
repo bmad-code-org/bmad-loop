@@ -17163,6 +17163,40 @@ def test_resume_refuses_a_mismatched_plugin_before_any_side_effect(project, monk
     assert not _trust_marker(project).exists()
 
 
+def test_resume_refuses_an_unwritable_plugin_snapshot_before_any_side_effect(
+    project, monkeypatch, capsys
+):
+    """A granted, UNCHANGED plugin whose snapshot cannot be published (here a
+    regular file squats the snapshots root, as a read-only or full state dir
+    would) is refused by the preflight, not by the registry build inside
+    `compose_resume` after the run was re-armed.
+
+    ABLATION: drop `materialize=True` from `_reject_plugin_trust`'s preflight call
+    and this fails — the preflight passes, the resume journals `run-resume` and
+    clears the pause, and the snapshot write fails only afterwards."""
+    from conftest import grant_plugin
+
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_trust_plugin(project)
+    grant_plugin(project.project, TRUST_PLUGIN, store_project=project.project)
+    snapshots = runs.plugin_snapshots_root(project.project)
+    if snapshots.is_dir():
+        shutil.rmtree(snapshots)
+    snapshots.parent.mkdir(parents=True, exist_ok=True)
+    snapshots.write_text("not a dir", encoding="utf-8")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "launch-pin")
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "plugin snapshot" in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "launch-pin"
+    assert load_state(run_dir).paused_reason == "escalation"
+    assert not _trust_marker(project).exists()
+
+
 def test_resume_threads_its_grants_to_compose_and_the_sweep_factory(project, monkeypatch):
     """The resume's one read reaches the engine and the re-armed factory closure.
 

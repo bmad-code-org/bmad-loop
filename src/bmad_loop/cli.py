@@ -460,7 +460,9 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
     from .plugins.registry import preflight
 
     try:
-        verdicts = preflight(paths.repo_root, pol, grants)
+        # materialize: a granted plugin's snapshot write fails HERE, not from the
+        # engine's registry build after a resume has re-armed its run.
+        verdicts = preflight(paths.repo_root, pol, grants, materialize=True)
     except PluginError as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
