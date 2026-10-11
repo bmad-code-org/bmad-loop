@@ -33,6 +33,8 @@ breaking changes may land in a minor release.
 
 - Open the TUI settings screen when a toggled plugin's name is not a valid widget id
   (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+- Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
+  has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883).
 
 ### Security
 
@@ -63,11 +65,6 @@ breaking changes may land in a minor release.
   is still running, such as an interactive `resolve` of a paused run: a window is
   closed only once its screen shows the park banner. A window whose screen cannot be
   read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
-
-### Fixed
-
-- Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
-  has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883)
 
 ## [0.13.2] — 2026-10-09
 
