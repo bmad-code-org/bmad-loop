@@ -52,7 +52,7 @@ from ... import bmadconfig
 from ... import policy as policy_mod
 from ... import runs
 from ...plugins import store
-from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet
+from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet, needs_grant
 from ...plugins.model import PluginError
 from ...plugins.registry import preflight, read_bound_tree
 from ...policy import POLICY_FILE
@@ -651,6 +651,14 @@ class SettingsScreen(Screen[None]):
                 if name not in found:
                     return f'plugin "{name}" is no longer discovered under {self._root}'
                 manifest, rel = found[name]
+                if not needs_grant(manifest):
+                    # the toggled override was removed (a builtin now answers to the
+                    # name) or lost its exec surface: a grant would pin bytes nothing runs
+                    return (
+                        f'plugin "{name}" no longer needs a grant (now a {manifest.source} '
+                        "plugin with this name, or no hooks, workflows, [python] or seeds); "
+                        "reopen settings to see it as it is"
+                    )
                 try:
                     tree = read_bound_tree(manifest)
                 except PluginError as e:

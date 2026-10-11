@@ -898,6 +898,37 @@ async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, mon
     assert store.load_grants(project.project).get("hooky") is None
 
 
+@pytest.mark.parametrize("change", ["settings-only", "override-removed"])
+async def test_toggle_on_refuses_a_plugin_that_no_longer_needs_a_grant(project, change):
+    """A plugin toggled on, then changed before Save so its name no longer needs a
+    grant (it lost its exec surface, or the project override of a builtin was
+    removed and the builtin now answers), blocks the save instead of recording a
+    grant that activates nothing and later fails as a mismatch.
+
+    ABLATION: drop the `needs_grant` check in `_candidate_grants` and a grant of
+    the settings-only dir / the builtin's tree is stored."""
+    import shutil
+
+    name = "hooky" if change == "settings-only" else "tea"
+    write_policy(project)
+    pdir = write_hook_plugin(project.project, name)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        if change == "settings-only":
+            (pdir / PLUGIN_FILE).write_text(
+                f'[plugin]\nname = "{name}"\napi_version = 1\n', encoding="utf-8"
+            )
+        else:
+            shutil.rmtree(pdir)
+        screen.query_one(f"#plugin-enabled-{plugin_wid(name)}", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "no longer needs a grant" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)  # save blocked
+
+    assert store.load_grants(project.project).get(name) is None
+
+
 async def test_toggle_on_never_erases_a_grant_recorded_while_it_saved(project, monkeypatch):
     """A grant recorded by another writer while the save is hashing survives: the
     save, built on the store it read first, is refused rather than replacing it.
