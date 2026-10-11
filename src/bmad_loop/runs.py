@@ -3503,7 +3503,16 @@ def delete_run(
 
     ``warn`` is where the session guard reports that it could not ask the
     multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
-    on stderr. See :func:`live_session_may_be_ours`."""
+    on stderr. See :func:`live_session_may_be_ours`.
+
+    A run dir holding ``worktrees/`` (a paused isolated run's kept unit), or whose
+    state records a unit mount (``worktrees/`` already removed by hand), is pruned
+    from git's worktree admin after the removal, against the run's own code root
+    (DW-538; a project-owned one rebased onto a renamed ``project``) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
+    that leaves an entry under the run dir, or a listing that cannot say, is
+    reported through ``warn`` too; the deletion itself has already happened. An
+    unreadable state leaves the code root unknown: ``project`` is pruned as the
+    likely one, and ``warn`` always says the cleanup is unconfirmed."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -3532,10 +3541,71 @@ def delete_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
+        # Read before the rmtree takes them: a kept unit worktree under the run dir
+        # is registered with the run's code root, which the rmtree does not tell. A
+        # recorded mount counts even with `worktrees/` already gone by hand — its
+        # admin entry outlives the directory.
+        state = _state_or_none(run_dir)
+        held_worktrees = os.path.lexists(run_dir / "worktrees") or (
+            state is not None and any(t.worktree_path for t in state.tasks.values())
+        )
+        run_res = run_dir.resolve()
         retrying_rmtree(run_dir)
+        if held_worktrees:
+            if state is not None:
+                # A project-owned code root moves with a renamed project, an ancestor
+                # one with a renamed repository; an external one stays as recorded.
+                code_root = rebase_recorded_code_root(state, project)
+                fault = _prune_deleted_run_worktrees(code_root, run_res)
+            else:
+                # No state, no code root: prune the usual one, but a clean listing
+                # there proves nothing for a run that recorded a `repo_root` override.
+                fault = _prune_deleted_run_worktrees(project, run_res) or (
+                    "its run state was unreadable, so the repository its worktrees "
+                    f"were registered with is unknown; if that is not {project}, run "
+                    "`git worktree prune` there"
+                )
+            if fault is not None:
+                note = f"run {run_dir.name} deleted, but {fault}"
+                if warn is None:
+                    print(f"warning: {note}", file=sys.stderr)
+                else:
+                    warn(note)
         # after the run dir, never before: a raise above leaves the run whole, and a
         # whole run keeps its control plane (see _discard_state_dir).
         _discard_state_dir(project, run_dir.name)
+
+
+def _prune_deleted_run_worktrees(repo: Path, run_res: Path) -> str | None:
+    """Drop git's admin entries for the worktrees a just-deleted run dir held
+    (DW-538), and return ``None`` — or an operator-facing line when an entry
+    under ``run_res`` is still registered or the listing cannot say.
+
+    ``verify.worktree_prune`` never raises, so the re-list is what makes its
+    failure visible. Non-raising itself: the run dir is already gone, and a
+    stale admin entry is what `git worktree prune` clears once git answers."""
+    verify.worktree_prune(repo)
+    try:
+        listed = verify.worktree_list(repo)
+    except verify.GitError as exc:
+        return (
+            f"cannot list the git worktrees of {repo} to confirm its worktrees were "
+            f"deregistered ({exc}); run `git worktree prune` there"
+        )
+    left: list[str] = []
+    for wt in listed:
+        try:
+            wt.resolve().relative_to(run_res)
+        except (ValueError, OSError):
+            continue
+        left.append(str(wt))
+    if left:
+        return (
+            "git still registers its worktree(s) "
+            + ", ".join(left)
+            + f"; if locked, `git worktree unlock` them, then `git worktree prune` in {repo}"
+        )
+    return None
 
 
 def archive_run(
@@ -4300,6 +4370,39 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     if ".." in relative.parts:
         return path
     return project_root / relative
+
+
+def rebase_recorded_code_root(state: RunState, project_root: Path) -> Path:
+    """`state.code_root` located on the live project, for a run never re-stamped.
+
+    A project-owned code root (the default config, ``code_root == project``) moves
+    with the project through :func:`rebase_recorded_project_path`. A code root that
+    is an ANCESTOR of the recorded project — the monorepo `repo_root` override —
+    moves when the whole repository was renamed: the recorded offset of the project
+    inside it is kept, so the live project minus that offset is the live repository.
+    That holds only when the live project still ends in the recorded offset AND the
+    recorded root is no longer a directory; a project moved inside a repository that
+    stayed put keeps naming that repository. Anything else (an external root, an
+    offset the live project does not end in) is returned as recorded, so the caller's
+    own comparison refuses it rather than this guessing.
+    """
+    recorded = state.code_root
+    recorded_project = Path(state.project)
+    if project_root == recorded_project:
+        return recorded
+    try:
+        offset = recorded_project.relative_to(recorded)
+    except ValueError:
+        return rebase_recorded_project_path(recorded, state, project_root)
+    depth = len(offset.parts)
+    if (
+        depth == 0
+        or len(project_root.parts) <= depth
+        or project_root.parts[-depth:] != offset.parts
+        or recorded.is_dir()
+    ):
+        return recorded if depth else project_root
+    return Path(*project_root.parts[:-depth])
 
 
 def task_spec_path(task: StoryTask, state: RunState) -> Path:
@@ -6916,16 +7019,23 @@ def _reverify_task_refusal(
 
 
 def _reverify_root_refusal(
-    state: RunState, task: StoryTask, story_key: str, *, project_root: Path
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    project_root: Path,
+    code_root: Path | None = None,
 ) -> tuple[bmadconfig.ProjectPaths | None, str | None]:
     """``(paths, None)`` when the run's code root is still the live repository root
     and the story has a baseline, else ``(None, refusal)``. Shared by both replay
-    entries, like `_reverify_task_refusal`."""
+    entries, like `_reverify_task_refusal`. ``code_root`` is the run's code root as
+    the caller locates it — the finished-run replay rebases it onto a moved project;
+    ``None`` reads it as recorded."""
     try:
         paths = bmadconfig.load_paths(project_root)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot read the BMAD config to locate the code root ({e})"
-    if str(paths.repo_root) != str(state.code_root):
+    if str(paths.repo_root) != str(state.code_root if code_root is None else code_root):
         return None, (
             f"the code root in the BMAD config has changed since run {state.run_id} "
             "started; the attempt this replay would verify lives in the previous tree — "
@@ -6955,8 +7065,9 @@ def standalone_replay_refusal(
     (`_reverify_task_refusal`, `_reverify_root_refusal`, `_mounted_reverify_refusal`)
     plus the shape only a finished isolated story run can hand over: the run is
     finished, a sprint-status story run (not a sweep, not stories mode), the story
-    DEFERRED (a finished run never holds an ESCALATED task — DW-386) in a kept
-    worktree unit on its own branch, with a target branch to merge into, and the
+    DEFERRED (a finished run never holds an ESCALATED task — DW-386 — except a
+    replay run closed by `resolve --abandon` (DW-535), whose ESCALATED task is a
+    record with no worktree left) in a kept worktree unit on its own branch, with a target branch to merge into, and the
     story not already done on the main checkout's sprint board (DW-533).
 
     No remedy here names `bmad-loop resolve <run>` without `--reverify`: resolve
@@ -7018,7 +7129,16 @@ def standalone_replay_refusal(
     )
     if refusal is not None:
         return refusal
-    paths, refusal = _reverify_root_refusal(state, task, story_key, project_root=project_root)
+    # The recorded paths are launch-time and a finished run is never re-stamped, so the
+    # code root (and below, the kept worktree and its spec) are located on the live
+    # project — else a moved project reads as a changed `repo_root`.
+    paths, refusal = _reverify_root_refusal(
+        state,
+        task,
+        story_key,
+        project_root=project_root,
+        code_root=rebase_recorded_code_root(state, project_root),
+    )
     if refusal is not None:
         return refusal
     assert paths is not None
@@ -7039,7 +7159,13 @@ def standalone_replay_refusal(
             f"kept unit is superseded work; {by_hand}"
         )
     refusal = _mounted_reverify_refusal(
-        state, task, story_key, run_dir=run_dir, paths=paths, remedy=by_hand
+        state,
+        task,
+        story_key,
+        run_dir=run_dir,
+        paths=paths,
+        remedy=by_hand,
+        live_project=project_root,
     )
     if refusal is not None and entries is None:
         refusal += (
@@ -7084,10 +7210,17 @@ def _mounted_reverify_refusal(
     run_dir: Path,
     paths: bmadconfig.ProjectPaths,
     remedy: str,
+    live_project: Path | None = None,
 ) -> str | None:
     """`reverify_refusal`'s worktree arm, shared with `standalone_replay_refusal`
     (DW-525): the kept unit must still be the attempt. ``remedy`` is the clause
     naming what the operator can do instead.
+
+    ``live_project`` locates the recorded worktree, code root and spec on the project
+    the caller acts in (`rebase_recorded_project_path`, `rebase_recorded_code_root`):
+    a finished run is never re-stamped, so after a project move its records name the
+    launch-time tree.
+    ``None`` reads them as recorded.
 
     The engine's reverify arm reopens the mount through `reopen_unit`, which demands
     a registered worktree on the recorded branch, so the same shape is refused here
@@ -7095,6 +7228,13 @@ def _mounted_reverify_refusal(
     `branch_per = "run"`, one with nothing above the baseline, or a missing spec. The
     spec is never stashed for a mounted task — the defer leaves it in the kept tree."""
     wt = Path(task.worktree_path or "")
+    code_root = state.code_root
+    moved_hint = ""
+    if live_project is not None:
+        wt = rebase_recorded_project_path(wt, state, live_project)
+        code_root = rebase_recorded_code_root(state, live_project)
+        if live_project != Path(state.project):
+            moved_hint = " (after a project move, `git worktree repair` re-links it)"
     if not wt.is_dir():
         patch = run_dir / "failed" / safe_segment(story_key) / "changes.patch"
         kept = f"; its diff was saved at {patch}" if patch.is_file() else ""
@@ -7104,9 +7244,9 @@ def _mounted_reverify_refusal(
         )
     baseline = task.baseline_commit or ""
     try:
-        if not verify.worktree_is_registered(state.code_root, wt):
+        if not verify.worktree_is_registered(code_root, wt):
             return (
-                f"{wt} is no longer a worktree of {state.code_root}, so it is not "
+                f"{wt} is no longer a worktree of {code_root}{moved_hint}, so it is not "
                 f"story {story_key}'s kept unit; {remedy}"
             )
         branch = verify.current_branch(wt)
@@ -7126,7 +7266,11 @@ def _mounted_reverify_refusal(
                 "HEAD — the branch was reset or rewritten since the pause, so it is not "
                 "the attempt"
             )
-        spec_path = task_spec_path(task, state)
+        spec_path = (
+            task_spec_path(task, state)
+            if live_project is None
+            else live_spec_path(task, state, live_project)
+        )
         wt_paths = paths.rebased(wt)
         exclude = verify.verify_dev_exclude_relpaths(
             wt_paths, spec_path, task.restore_patch, root=wt_paths.repo_root

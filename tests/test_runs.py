@@ -11098,3 +11098,57 @@ def test_session_scan_error_sees_a_live_run_that_lost_its_state_file(tmp_path, m
     monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
     err = runs.session_scan_error(tmp_path)
     assert err is not None and "live run live-1" in err
+
+
+@pytest.mark.parametrize(
+    ("recorded_project", "recorded_root", "live_project", "expected"),
+    [
+        # default config: the code root is the project, so it follows the move
+        ("{gone}/repo", "{gone}/repo", "{tmp}/new/repo", "{tmp}/new/repo"),
+        # monorepo override, whole repository renamed: the recorded offset is kept
+        ("{gone}/repo/app", "{gone}/repo", "{tmp}/new/repo/app", "{tmp}/new/repo"),
+        ("{gone}/repo/a/b", "{gone}/repo", "{tmp}/x/a/b", "{tmp}/x"),
+        # the live project no longer ends in the recorded offset: left as recorded
+        ("{gone}/repo/app", "{gone}/repo", "{tmp}/new/repo/web", "{gone}/repo"),
+        # unmoved
+        ("{gone}/repo/app", "{gone}/repo", "{gone}/repo/app", "{gone}/repo"),
+        # an external root (neither ancestor nor descendant) is never moved
+        ("{gone}/repo/app", "{gone}/elsewhere", "{tmp}/new/repo/app", "{gone}/elsewhere"),
+        # a code root under the project follows it like any project-owned path
+        ("{gone}/proj", "{gone}/proj/code", "{tmp}/moved", "{tmp}/moved/code"),
+    ],
+)
+def test_rebase_recorded_code_root(
+    tmp_path, recorded_project, recorded_root, live_project, expected
+):
+    """A finished run's launch-time code root located on the live project. An ancestor
+    root (`repo_root` above the project) follows a renamed repository by the recorded
+    project offset; anything the live project cannot vouch for stays as recorded.
+
+    Ablation: return `rebase_recorded_project_path(recorded, …)` for every shape and
+    the two renamed-repository rows keep the gone root."""
+    gone = tmp_path / "gone"
+
+    def fill(spelling: str) -> str:
+        return spelling.format(gone=gone, tmp=tmp_path)
+
+    state = RunState(
+        run_id="r",
+        project=fill(recorded_project),
+        repo_root=fill(recorded_root),
+        started_at="now",
+    )
+    assert runs.rebase_recorded_code_root(state, Path(fill(live_project))) == Path(fill(expected))
+
+
+def test_rebase_recorded_code_root_keeps_an_ancestor_root_that_still_exists(tmp_path):
+    """The project moved INSIDE a repository that stayed put (``repo/app`` →
+    ``repo/sub/app``): the live project still ends in the recorded offset, but the
+    recorded root is still a directory, so it is kept rather than re-derived as
+    ``repo/sub``.
+
+    Ablation: drop the `recorded.is_dir()` clause and the answer is ``repo/sub``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = RunState(run_id="r", project=str(repo / "app"), repo_root=str(repo), started_at="now")
+    assert runs.rebase_recorded_code_root(state, repo / "sub" / "app") == repo

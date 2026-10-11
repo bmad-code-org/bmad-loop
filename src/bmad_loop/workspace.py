@@ -106,7 +106,7 @@ def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
-def orphan_preserve_ref_name(run_id: str, head: str) -> str:
+def orphan_preserve_ref_name(run_id: str, head: str, *, kind: str = "orphan") -> str:
     """Canonical snapshot ref for the uncommitted state of an orphaned mount.
 
     Lives under ``refs/attempt-preserve-dirty/`` — the SAME family
@@ -115,8 +115,13 @@ def orphan_preserve_ref_name(run_id: str, head: str) -> str:
     the terms a rollback snapshot is, and no new unbounded ref family exists. The
     ``-orphan`` suffix keeps it from ever colliding with a rollback's
     ``{slug}-{baseline}-{attempt}`` shape, whose last segment is an integer.
+
+    ``kind`` sets that suffix: ``"abandon"`` names the snapshot
+    :func:`preserve_abandoned_unit` parks before `resolve --abandon` removes a
+    replay run's kept worktree (DW-535). Any non-integer word keeps the
+    no-collision property.
     """
-    return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-orphan"
+    return f"refs/attempt-preserve-dirty/{safe_ref_segment(run_id)}-{head[:8]}-{kind}"
 
 
 def _orphan_owned_rels(wt: Path, paths: ProjectPaths, spec_file: str | None) -> tuple[str, ...]:
@@ -212,9 +217,14 @@ def _preserve_orphan_state(
     paths: ProjectPaths,
     spec_file: str | None,
     on_orphan_preserved: Callable[[str, str], None] | None,
+    *,
+    kind: str = "orphan",
 ) -> None:
     """Park the uncommitted work an orphaned mount at ``wt`` still holds before the
-    reclaim force-removes it. See the reclaim comment in :func:`open_unit_workspace`
+    reclaim force-removes it. ``kind`` is the ref suffix
+    (:func:`orphan_preserve_ref_name`); :func:`preserve_abandoned_unit` reuses the
+    capture (:func:`_snapshot_orphan`) with ``"abandon"`` behind a stricter guard
+    that raises. See the reclaim comment in :func:`open_unit_workspace`
     for why an orphan can stand at this path at all.
 
     Three-way guard before any git runs *in* ``wt``: the path exists, it is one of
@@ -253,27 +263,29 @@ def _preserve_orphan_state(
     """
     if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
         return
+    parked = _snapshot_orphan(repo_root, wt, run_id, unit_key, paths, spec_file, kind)
+    if parked is not None and on_orphan_preserved is not None:
+        on_orphan_preserved(str(wt), parked)
+
+
+def _snapshot_orphan(
+    repo_root: Path,
+    wt: Path,
+    run_id: str,
+    unit_key: str,
+    paths: ProjectPaths,
+    spec_file: str | None,
+    kind: str,
+) -> str | None:
+    """The capture half of :func:`_preserve_orphan_state`, without its guard: the
+    caller has already proved ``wt`` is a registered linked worktree. Returns the
+    snapshot ref, or ``None`` over a tree with nothing to park. Raises
+    :class:`verify.GitError`."""
     try:
         head = verify.rev_parse_head(wt)
-        base_ref = orphan_preserve_ref_name(run_id, head)
-        ref = base_ref
-        serial = 2
-        # Same bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a
-        # second orphaning of the same HEAD (flip, flip back, flip again with
-        # nothing committed in between) must not overwrite the first snapshot.
-        while verify.ref_exists(repo_root, ref):
-            if serial > PRESERVE_REF_PROBE_LIMIT:
-                raise verify.PreserveRefExhaustedError(
-                    f"no free snapshot refname for {base_ref}: "
-                    f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
-                    f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
-                    f"scm.preserve_keep to a positive value below that limit)"
-                )
-            ref = f"{base_ref}-r{serial}"
-            serial += 1
-        parked = verify.snapshot_worktree(
+        return verify.snapshot_worktree(
             wt,
-            ref,
+            _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind=kind)),
             baseline_untracked=[],
             force_include=_orphan_owned_rels(wt, paths, spec_file),
         )
@@ -286,8 +298,78 @@ def _preserve_orphan_state(
             f"cannot snapshot orphaned worktree {wt} for {unit_key} before reclaim "
             f"(left standing; recover by hand): {e}"
         ) from e
-    if parked is not None and on_orphan_preserved is not None:
-        on_orphan_preserved(str(wt), parked)
+
+
+def _free_snapshot_ref(repo_root: Path, base_ref: str) -> str:
+    """``base_ref``, or its first free ``-r<n>`` serial when it is taken. The same
+    bounded serial probe as RecoveryFlow.preserve_attempt_worktree: a second
+    orphaning of the same HEAD (flip, flip back, flip again with nothing committed
+    in between) must not overwrite the first snapshot. Raises
+    :class:`verify.PreserveRefExhaustedError` past ``PRESERVE_REF_PROBE_LIMIT``."""
+    ref = base_ref
+    serial = 2
+    while verify.ref_exists(repo_root, ref):
+        if serial > PRESERVE_REF_PROBE_LIMIT:
+            raise verify.PreserveRefExhaustedError(
+                f"no free snapshot refname for {base_ref}: "
+                f"{PRESERVE_REF_PROBE_LIMIT} candidates through -r{serial - 1} "
+                f"are all taken (prune refs/attempt-preserve-dirty/*, or set "
+                f"scm.preserve_keep to a positive value below that limit)"
+            )
+        ref = f"{base_ref}-r{serial}"
+        serial += 1
+    return ref
+
+
+def preserve_abandoned_unit(
+    repo_root: Path,
+    wt: Path,
+    run_id: str,
+    unit_key: str,
+    paths: ProjectPaths,
+    spec_file: str | None,
+    branch: str,
+) -> str | None:
+    """Park the uncommitted state of a replay run's kept worktree at ``wt`` before
+    `resolve --abandon` removes it (DW-535), and return the snapshot ref, or
+    ``None`` when there was nothing to park.
+
+    The orphan capture (:func:`_snapshot_orphan`): the same ``force_include`` of
+    the orchestrator's own ignored artifacts, and a ref under
+    ``refs/attempt-preserve-dirty/`` with the ``-abandon`` suffix, so
+    ``scm.preserve_keep`` bounds it like every snapshot. The orphan path's guard
+    is strict here: ``None`` authorizes the caller's teardown, whose rmtree
+    fallback deletes whatever is left, so a ``wt`` that is not (or can no longer
+    be shown to be) a registered linked worktree of ``repo_root`` raises rather
+    than reading as "nothing to park". Any failure raises
+    :class:`verify.GitError`, leaving ``wt`` standing.
+
+    Commits on the unit ``branch`` need no capture: the abandon keeps it. Commits
+    made on a DETACHED HEAD the branch does not contain do: the worktree's HEAD and
+    its reflog are the only things naming them, and both go with the worktree. A
+    dirty tree's snapshot is parented on that HEAD and so already keeps them; over a
+    clean tree the ``-abandon`` ref gets a fresh commit of the HEAD tree parented on
+    it (:func:`verify.snapshot_commit`) — not the HEAD commit itself, whose possibly
+    old committer date would rank the new ref last for ``scm.preserve_keep``
+    retention and get it pruned at the next run start. An ancestry check that
+    cannot answer parks it too — an extra ref is the safe error. A HEAD attached
+    to some other branch is kept by that branch."""
+    if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
+        raise verify.GitError(
+            f"{wt} is not a registered git worktree of {repo_root} (or git could not "
+            "confirm it), so its contents cannot be preserved"
+        )
+    captured = _snapshot_orphan(repo_root, wt, run_id, unit_key, paths, spec_file, "abandon")
+    if captured is not None:
+        return captured
+    if verify.current_branch(wt) != "HEAD":
+        return None
+    head = verify.rev_parse_head(wt)
+    if verify.is_ancestor(wt, head, f"refs/heads/{branch}"):
+        return None
+    ref = _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind="abandon"))
+    verify.snapshot_commit(wt, ref, head, "abandoned detached HEAD")
+    return ref
 
 
 def _refuse_foreign_checkout(repo_root: Path, branch: str, wt: Path) -> None:
