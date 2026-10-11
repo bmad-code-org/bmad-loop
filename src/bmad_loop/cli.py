@@ -1556,17 +1556,10 @@ def _plugin_roster(root: Path, pol, grants: GrantSet):
     from .documents import PluginRow
     from .plugins import PluginError
     from .plugins.digest import read_tree
-    from .plugins.grants import TRUSTED_SOURCES, TrustState, needs_grant
+    from .plugins.grants import TRUSTED_SOURCES, grant_status, needs_grant
     from .plugins.registry import preflight
     from .plugins.trust import enabled_names
 
-    status_of = {
-        TrustState.GRANTED: "granted",
-        TrustState.REFUSED: "ungranted",
-        TrustState.FATAL_ENABLED_UNGRANTED: "ungranted",
-        TrustState.FATAL_MISMATCH: "mismatch",
-        TrustState.FATAL_UNREADABLE: "unreadable",
-    }
     enabled = enabled_names(pol)
     roster = []
     for m, v, rel in preflight(root, pol, grants):
@@ -1588,7 +1581,7 @@ def _plugin_roster(root: Path, pol, grants: GrantSet):
             python=m.python is not None,
             seeds=bool(m.seed_files or m.seed_globs),
             grant_required=required,
-            status=status_of.get(v.state, "n/a") if required else "n/a",
+            status=grant_status(m, v),
             enabled=m.name in enabled,
             active=v.active,
             pinned_digest=record.digest if record is not None else None,

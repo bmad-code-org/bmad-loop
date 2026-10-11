@@ -17,12 +17,13 @@ Two shapes mirror the old screen vocabulary:
     label, description, its fields, and the owning plugin ("" for core).
 
 ``load_core_schema()`` parses the bundled core schema; ``build_registry(project,
-policy)`` returns it plus a ``PluginInfo`` for every *discovered* plugin — its
-enable state (membership in ``[plugins] enabled``), whether enabling it grants
-trust (a ``[python]`` module), and its ``[[settings]]`` fields. The screen groups
-these under a dedicated Plugins area; reading manifests never imports plugin
-Python. The registry is what the settings screen consumes — it never reaches
-back into this module's internals.
+policy, root=, grants=)`` returns it plus a ``PluginInfo`` for every *discovered*
+plugin — its origin, its enable state (membership in ``[plugins] enabled``),
+whether it carries a toggle (a builtin's ``[python]`` module, or a project plugin
+that needs a content grant), its grant status, and its ``[[settings]]`` fields.
+The screen groups these under a dedicated Plugins area; reading manifests and
+hashing plugin dirs never imports plugin Python. The registry is what the
+settings screen consumes — it never reaches back into this module's internals.
 """
 
 from __future__ import annotations
@@ -34,8 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from . import policy as policy_mod
-from .plugins import load_plugins
+from .plugins.grants import TRUSTED_SOURCES, GrantSet, grant_status, needs_grant
 from .plugins.model import SettingSpec as PluginSettingSpec
+from .plugins.registry import preflight
 from .policy import STAGES
 
 # plugin [[settings]] types -> settings-screen widget kinds. The screen knows
@@ -86,17 +88,30 @@ class PluginInfo:
     """One discovered plugin as the settings screen sees it: an enable toggle
     (when trust-gated) plus its settings fields.
 
-    ``trust_needed`` is True for a plugin that declares an in-process ``[python]``
-    module — enabling it grants trust (its name enters ``[plugins] enabled``).
-    Data-only plugins are always active and carry no toggle. ``fields`` are this
-    plugin's settings under ``plugins.<name>``; they render whether or not the
-    plugin is enabled (the screen greys them until enabled)."""
+    ``trust_needed`` is True when the plugin carries a toggle. For a builtin or
+    entry-point plugin that is an in-process ``[python]`` module — enabling it
+    puts its name in ``[plugins] enabled``. For a project plugin it is any
+    executable surface (``grant_required``) — enabling it records an out-of-tree
+    content grant (#496/#497), and its name never enters ``enabled``. Other
+    plugins are always active and carry no toggle. ``grant_status`` is
+    ``granted``/``ungranted``/``mismatch``/``unreadable``, or ``n/a`` when no
+    grant applies. ``fields`` are this plugin's settings under
+    ``plugins.<name>``; they render whether or not the plugin is enabled (the
+    screen greys them until enabled)."""
 
     name: str
     description: str
     enabled: bool
     trust_needed: bool
     fields: tuple[SettingSpec, ...] = ()
+    origin: str = "builtin"
+    grant_required: bool = False
+    grant_status: str = "n/a"
+
+    @property
+    def has_grant(self) -> bool:
+        """A grant record exists (whether or not the plugin still matches it)."""
+        return self.grant_status in ("granted", "mismatch", "unreadable")
 
 
 @dataclass(frozen=True)
@@ -243,30 +258,49 @@ def _inject_mux_backends(sections: tuple[SectionSpec, ...], policy: Any) -> tupl
     return tuple(out)
 
 
-def build_registry(project: Path | None = None, policy: Any = None) -> SettingsRegistry:
+def build_registry(
+    project: Path | None = None,
+    policy: Any = None,
+    *,
+    root: Path | None = None,
+    grants: GrantSet | None = None,
+) -> SettingsRegistry:
     """Core schema, plus a PluginInfo for every *discovered* plugin.
 
-    Every plugin found by discovery is surfaced so the screen can offer an enable
-    toggle (membership in ``[plugins] enabled``) and group its settings. Reading
-    manifests never imports/executes plugin Python — that stays trust-gated for
-    hooks. A plugin's settings are data that render whether or not it is enabled
-    (the screen greys them until enabled), so ``plugin_schemas`` covers every
-    plugin that contributes settings, making each ``[plugins.<name>]`` table
-    typed on save regardless of toggle state."""
+    Every plugin found by discovery (under ``root``, the code root a run loads,
+    else ``project``) is surfaced so the screen can offer an enable toggle and
+    group its settings. Each plugin's grant status is the verdict a launch would
+    reach under ``grants`` (`registry.preflight`; none given = no grants):
+    manifests and hashing only, never an import or exec of plugin Python. A
+    plugin's settings are data that render whether or not it is enabled (the
+    screen greys them until enabled), so ``plugin_schemas`` covers every plugin
+    that contributes settings, making each ``[plugins.<name>]`` table typed on
+    save regardless of toggle state."""
     sections = _inject_mux_backends(load_core_schema(), policy)
     enabled = set(getattr(getattr(policy, "plugins", None), "enabled", ()) or ())
-    manifests = load_plugins(project)
+    judged = preflight(
+        root if root is not None else project,
+        policy,
+        grants if grants is not None else GrantSet.empty(),
+    )
     plugins: list[PluginInfo] = []
     plugin_schemas: dict[str, tuple[PluginSettingSpec, ...]] = {}
-    for name in sorted(manifests):
-        manifest = manifests[name]
+    for manifest, verdict, _rel in sorted(judged, key=lambda j: j[0].name):
+        name = manifest.name
+        if manifest.source in TRUSTED_SOURCES:
+            toggled = manifest.python is not None
+        else:
+            toggled = needs_grant(manifest)
         plugins.append(
             PluginInfo(
                 name=name,
                 description=manifest.description,
                 enabled=name in enabled,
-                trust_needed=manifest.python is not None,
+                trust_needed=toggled,
                 fields=_plugin_fields(name, manifest.settings),
+                origin=manifest.source,
+                grant_required=needs_grant(manifest),
+                grant_status=grant_status(manifest, verdict),
             )
         )
         if manifest.settings:

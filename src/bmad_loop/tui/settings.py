@@ -16,6 +16,7 @@ import tomlkit
 
 from .. import policy as policy_mod
 from ..platform_util import atomic_write_text_confined
+from ..plugins.grants import GrantSet
 
 # STAGES now lives in policy.py (#679) so the settings schema can reach it
 # without importing this tomlkit-backed module. Re-exported here because
@@ -79,6 +80,7 @@ class PolicyDoc:
         self,
         plugin_schemas: dict[str, Any] | None = None,
         project: Path | None = None,
+        grants: GrantSet | None = None,
     ) -> str | None:
         """Authoritative validation via policy.loads(); None when valid.
 
@@ -88,8 +90,14 @@ class PolicyDoc:
         self-validates against the parsed policy (Plugin.validate) — the same
         coupling check the engine runs at startup (e.g. the Unity plugin's
         editor_mode↔scm.isolation rule) — so an incompatible combination is
-        caught at save time rather than mid-run. Building the registry imports
-        only the plugins already trusted in [plugins] enabled."""
+        caught at save time rather than mid-run. ``project`` is the discovery
+        root (the code root a run loads) and ``grants`` the plugin grants the
+        build is judged against (none given = no grants, fail closed), so a
+        plugin a launch would refuse — an ungranted project plugin named in
+        ``enabled``, or one changed since its grant — fails here with the same
+        message (`PluginTrustError` is a `PluginError`) before anything executes.
+        Building the registry imports only builtins trusted in [plugins] enabled
+        and project plugins granted in ``grants``."""
         try:
             pol = policy_mod.loads(self.dumps(), plugin_schemas=plugin_schemas)
         except policy_mod.PolicyError as e:
@@ -99,7 +107,9 @@ class PolicyDoc:
             from ..plugins.registry import PluginRegistry
 
             try:
-                PluginRegistry.build(project, pol).validate(pol)
+                PluginRegistry.build(
+                    project, pol, grants=grants if grants is not None else GrantSet.empty()
+                ).validate(pol)
             except (policy_mod.PolicyError, PluginError) as e:
                 return str(e)
         return None

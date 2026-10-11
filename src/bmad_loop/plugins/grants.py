@@ -262,6 +262,24 @@ def classify(
     return Verdict(TrustState.GRANTED, f"granted sha256:{record.digest[:12]}")
 
 
+_GRANT_STATUS: dict[TrustState, str] = {
+    TrustState.GRANTED: "granted",
+    TrustState.REFUSED: "ungranted",
+    TrustState.FATAL_ENABLED_UNGRANTED: "ungranted",
+    TrustState.FATAL_MISMATCH: "mismatch",
+    TrustState.FATAL_UNREADABLE: "unreadable",
+}
+
+
+def grant_status(m: PluginManifest, verdict: Verdict) -> str:
+    """The operator-facing grant column for one plugin — ``granted``,
+    ``ungranted``, ``mismatch``, ``unreadable``, or ``n/a`` for a plugin that
+    needs no grant. One vocabulary for ``plugins --json`` and the TUI roster."""
+    if not needs_grant(m):
+        return "n/a"
+    return _GRANT_STATUS.get(verdict.state, "n/a")
+
+
 def fatal_message(name: str, verdict: Verdict) -> str:
     """The operator-facing refusal for a fatal verdict, naming the verb that clears it."""
     if verdict.state is TrustState.FATAL_MISMATCH:
