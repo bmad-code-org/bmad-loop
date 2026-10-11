@@ -39,6 +39,14 @@ class TmuxMultiplexer(BaseTmuxBackend):
     in tests — mirroring how ``process_host._load_builtin_hosts`` registers its hosts.
     """
 
+    # tmux prints every non-printable byte of a reply, tab included, as `_` when
+    # the CLIENT locale is not UTF-8 (LANG unset, LC_ALL=C, cron, systemd), which
+    # collapses each tab-joined `-F` row into one field (#881). `-u` forces UTF-8
+    # output whatever the locale (measured on tmux 3.4: a no-op under C.UTF-8),
+    # so the reply is UTF-8 and is decoded as such.
+    _CLIENT_FLAGS = ("-u",)
+    _ENCODING = "utf-8"
+
     def _window_launch(self, env: dict[str, str], command: str) -> list[str]:
         """The base's ``-e`` flags, with the command behind the launch-pid prelude.
 

@@ -13,7 +13,7 @@ from test_engine_worktree import _finished_kept_unit, _state_bytes
 
 from bmad_loop import runs, unitreplay, verify
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import Phase
+from bmad_loop.model import Phase, RunState, StoryTask
 from bmad_loop.platform_util import root_identity_record
 
 _KEY = "1-1-a"
@@ -241,3 +241,46 @@ def test_mint_rehomes_an_absolute_restore_patch_into_the_moved_worktree(project,
 
     task = load_state(replay_dir).tasks[_KEY]
     assert task.restore_patch == str(Path(task.worktree_path) / "intent-gap.patch")
+
+
+# ------------------------------------------------- abandon_refusal (DW-535)
+
+
+def _abandon_subject(
+    *, replay_of="20261001-000000-aaaa", phase=Phase.ESCALATED, wt="/x/wt", branch="b"
+):
+    state = RunState(
+        run_id="20261010-000000-bbbb", project="/x", started_at="t", replay_of=replay_of
+    )
+    task = StoryTask(story_key=_KEY, epic=1, phase=phase)
+    task.worktree_path = wt
+    task.branch = branch
+    return state, task
+
+
+def test_abandon_refusal_refuses_a_run_that_is_not_a_replay():
+    state, task = _abandon_subject(replay_of="")
+    refusal = unitreplay.abandon_refusal(state, task, _KEY)
+    assert refusal is not None and "closes replay runs only" in refusal
+    assert f"bmad-loop resolve {state.run_id}`" in refusal and "--adopt-branch" in refusal
+
+
+@pytest.mark.parametrize("phase", [Phase.DEFERRED, Phase.DONE, Phase.PENDING])
+def test_abandon_refusal_refuses_a_task_that_is_not_escalated(phase):
+    state, task = _abandon_subject(phase=phase)
+    refusal = unitreplay.abandon_refusal(state, task, _KEY)
+    assert refusal is not None and "is not escalated" in refusal
+
+
+@pytest.mark.parametrize(
+    ("wt", "branch"), [("", "b"), ("/x/wt", "")], ids=["no-worktree", "no-branch"]
+)
+def test_abandon_refusal_refuses_a_task_without_a_kept_unit(wt, branch):
+    state, task = _abandon_subject(wt=wt, branch=branch)
+    refusal = unitreplay.abandon_refusal(state, task, _KEY)
+    assert refusal is not None and "no kept worktree unit" in refusal
+
+
+def test_abandon_refusal_admits_an_escalated_replay_unit():
+    state, task = _abandon_subject()
+    assert unitreplay.abandon_refusal(state, task, _KEY) is None

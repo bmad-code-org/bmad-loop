@@ -18,6 +18,12 @@ breaking changes may land in a minor release.
 - Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
   stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
   (#496, #497).
+- Add `bmad-loop resolve <replay-run> --abandon` (DW-535): close a replay run that
+  escalated because its story was finished meanwhile. Uncommitted tracked and
+  untracked changes (plus the run's own spec/board/ledger copies), or commits on a
+  detached HEAD the branch lacks, are parked on a `refs/attempt-preserve-dirty/*-abandon`
+  ref; other git-ignored files are removed with the worktree. The branch is kept and the run is recorded finished.
+  A tree at the recorded path that is not the run's own unit worktree is refused, not removed.
 
 ### Changed
 
@@ -33,6 +39,26 @@ breaking changes may land in a minor release.
 
 - Open the TUI settings screen when a toggled plugin's name is not a valid widget id
   (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+- Spawn tmux with `-u` so window and session listings parse when bmad-loop runs
+  without a UTF-8 locale (`LANG` unset, `LC_ALL=C`, cron, systemd). tmux printed
+  each field tab as `_`, so every window read as nameless and untagged (#881).
+- psmux: run the parked-window trailer's psmux calls through the absolute path
+  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
+  from the pane's `PATH` no longer silently skips the client return and leaks the
+  return-target key (#877).
+- Keep `cleanup` (and the TUI's cleanup) from closing a control window whose command
+  is still running, such as an interactive `resolve` of a paused run: a window is
+  closed only once its screen shows the park banner. A window whose screen cannot be
+  read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
+- Fix `bmad-loop resolve <finished-run> --reverify` refusing to replay a kept unit after
+  the project was moved, as if `repo_root` had changed (DW-525): the kept worktree and
+  code root are now located on the live project, a `repo_root` above the project
+  included when the whole repository was renamed.
+- Fix preservation snapshot commits inheriting `GIT_COMMITTER_DATE`/`GIT_AUTHOR_DATE`
+  from the environment, which let `scm.preserve_keep` retention prune a fresh snapshot
+  first.
+- Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
+  (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 - Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
   has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883).
 
@@ -51,20 +77,6 @@ breaking changes may land in a minor release.
   `bmad-loop plugins accept <name>`; refuse before any plugin code runs (#496, #497).
 - Fail startup when a granted project plugin loses its whole executable surface or its
   dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
-
-### Fixed
-
-- psmux: run the parked-window trailer's psmux calls through the absolute path
-  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
-  from the pane's `PATH` no longer silently skips the client return and leaks the
-  return-target key (#877).
-
-### Fixed
-
-- Keep `cleanup` (and the TUI's cleanup) from closing a control window whose command
-  is still running, such as an interactive `resolve` of a paused run: a window is
-  closed only once its screen shows the park banner. A window whose screen cannot be
-  read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
 
 ## [0.13.2] — 2026-10-09
 

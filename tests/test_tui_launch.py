@@ -63,20 +63,20 @@ class FakeRun:
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
-        if argv[1] == "show-environment":
+        if argv[2] == "show-environment":
             if self.env_stderr is not None:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr=self.env_stderr)
             name = argv[-1]
             env = os.environ if self.pane_env is None else self.pane_env
             out = f"{name}={env[name]}\n" if name in env else f"-{name}\n"
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-        rc = self.has_session_rc if argv[1] == "has-session" else 0
+        rc = self.has_session_rc if argv[2] == "has-session" else 0
         out = ""
-        if argv[1] == "new-window":
+        if argv[2] == "new-window":
             out = "@7\n"
-        elif argv[1:4] == ["set-option", "-w", "-t"] and argv[5:6] == [runs.PROJECT_OPTION]:
-            self.tags[argv[4]] = argv[6]  # tmux set-option -w -t <target> <option> <value>
-        elif argv[1] == "list-windows":
+        elif argv[2:5] == ["set-option", "-w", "-t"] and argv[6:7] == [runs.PROJECT_OPTION]:
+            self.tags[argv[5]] = argv[7]  # tmux -u set-option -w -t <target> <option> <value>
+        elif argv[2] == "list-windows":
             out = "".join(self._row(line) + "\n" for line in self.windows.splitlines())
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
 
@@ -86,7 +86,7 @@ class FakeRun:
         return f"{line}\t{tag}" if len(rest) == 1 and tag is not None else line
 
     def by_verb(self, verb: str) -> list[list[str]]:
-        return [c for c in self.calls if c[1] == verb]
+        return [c for c in self.calls if c[2] == verb]
 
 
 @pytest.fixture(autouse=True)
@@ -129,7 +129,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     # new-window, then the project tag is stamped on the new window so
     # cross-project cleanup never closes it, then the lookup `a`/`x` use
     # re-reads the window to confirm the tag landed (#750)
-    assert [c[1] for c in fake_run.calls] == [
+    assert [c[2] for c in fake_run.calls] == [
         "has-session",
         "new-session",
         *["show-environment"] * len(runs.state_root_inputs()),
@@ -139,6 +139,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     ]
     assert fake_run.by_verb("set-option")[0] == [
         "tmux",
+        "-u",
         "set-option",
         "-w",
         "-t",
@@ -149,6 +150,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     ns = fake_run.by_verb("new-session")[0]
     assert ns == [
         "tmux",
+        "-u",
         "new-session",
         "-d",
         "-s",
@@ -165,7 +167,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     assert launch._CTL_WINDOW_RE.match(ns[ns.index("-n") + 1]) is None
 
     nw = fake_run.by_verb("new-window")[0]
-    assert nw[:2] == ["tmux", "new-window"]
+    assert nw[:3] == ["tmux", "-u", "new-window"]
     assert "-d" in nw
     assert nw[nw.index("-t") + 1] == "=bmad-loop-ctl:"
     assert nw[nw.index("-n") + 1] == "run-RID"
@@ -259,7 +261,7 @@ def test_existing_ctl_session_reused(monkeypatch, tmp_path: Path):
     # list-windows is resume's own check that the lookup now names the window it
     # minted — the one launch that mints a second window under a run id pays for
     # the answer it warns on.
-    assert [c[1] for c in fake.calls] == [
+    assert [c[2] for c in fake.calls] == [
         "has-session",
         *["show-environment"] * len(runs.state_root_inputs()),
         "new-window",
@@ -300,7 +302,7 @@ def test_observers_follow_forced_backend(fake_run, monkeypatch):
 
 def test_new_window_failure_raises(monkeypatch, tmp_path: Path):
     def failing_run(argv, **kwargs):
-        rc = 1 if argv[1] in ("has-session", "new-window") else 0
+        rc = 1 if argv[2] in ("has-session", "new-window") else 0
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="boom")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", failing_run)
@@ -315,7 +317,7 @@ def test_ensure_ctl_session_probe_failure_raises_launch_error(monkeypatch, tmp_p
     # resolve handlers (which catch LaunchError) surface a toast instead of crashing
     # on the raw MultiplexerError that would otherwise slip past their except clause.
     def failing_run(argv, **kwargs):
-        if argv[1] == "has-session":
+        if argv[2] == "has-session":
             raise OSError("backend server not reachable")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -329,7 +331,7 @@ def test_session_exists(monkeypatch):
     fake = FakeRun(has_session_rc=0)
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     assert launch.session_exists("bmad-loop-x")
-    assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-loop-x"]
+    assert fake.calls[0] == ["tmux", "-u", "has-session", "-t", "=bmad-loop-x"]
 
 
 def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[list[str]]:
@@ -353,14 +355,14 @@ def _ctl_listing(monkeypatch, rows: str, project: Path | None = None) -> list[li
     def fake(argv, **kwargs):
         calls.append(list(argv))
         out = ""
-        if argv[1] == "kill-window":
+        if argv[2] == "kill-window":
             killed.add(argv[-1])
-        elif argv[1] == "list-windows" and argv[-1] == "#{window_id}":
+        elif argv[2] == "list-windows" and argv[-1] == "#{window_id}":
             # list_window_ids: the ids still alive, as a real server answers
             # after a kill (kill_ctl_window confirms its kill against this).
             ids = (line.split("\t")[0] for line in rows.splitlines())
             out = "".join(f"{i}\n" for i in ids if i and i not in killed)
-        elif argv[1] == "list-windows":
+        elif argv[2] == "list-windows":
             out = rows
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
@@ -476,7 +478,7 @@ def test_ctl_window_id_reads_the_record_after_the_listing(monkeypatch, tmp_path:
 
     def fake(argv, **kwargs):
         out = ""
-        if argv[1] == "list-windows":
+        if argv[2] == "list-windows":
             # the relaunch lands here: its window is listed and its record written
             _write_record(tmp_path, "RID", "@2")
             out = f"@1\trun-RID\t{tag}\n@2\tresume-RID\t{tag}\n"
@@ -582,11 +584,11 @@ def test_kill_ctl_window_reports_an_unproven_window_it_left(monkeypatch, tmp_pat
     # cannot be proven ours — but the count comes back for the TUI to report.
     calls = _ctl_listing(monkeypatch, "@4\tresume-RID\t\n", tmp_path)
     assert launch.kill_ctl_window(tmp_path, "RID") == 1
-    assert not any(c[1] == "kill-window" for c in calls)
+    assert not any(c[2] == "kill-window" for c in calls)
     # And a clean kill reports nothing left.
     calls = _ctl_listing(monkeypatch, "@4\tresume-RID\n", tmp_path)
     assert launch.kill_ctl_window(tmp_path, "RID") == 0
-    assert ["tmux", "kill-window", "-t", "@4"] in calls
+    assert ["tmux", "-u", "kill-window", "-t", "@4"] in calls
 
 
 class _ListingMux:
@@ -633,9 +635,9 @@ def test_ctl_window_lookup_raises_on_a_failed_listing(monkeypatch, tmp_path: Pat
     # a window. The lookup must raise, not answer (None, 0), or `x` reports a
     # clean stop over a live window and attach reports an ordinary absence.
     def fake(argv, **kwargs):
-        if argv[1] == "list-windows" and "#{window_name}" in argv[-1]:
+        if argv[2] == "list-windows" and "#{window_name}" in argv[-1]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="lost connection")
-        out = "@4\n" if argv[1] == "list-windows" else ""
+        out = "@4\n" if argv[2] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -684,7 +686,7 @@ def test_kill_ctl_window_raises_when_its_window_survives(monkeypatch, tmp_path: 
 
     def fake(argv, **kwargs):
         out = ""
-        if argv[1] == "list-windows":
+        if argv[2] == "list-windows":
             out = "@4\n" if argv[-1] == "#{window_id}" else f"@4\tresume-RID\t{tag}\n"
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")  # kill: no-op
 
@@ -859,7 +861,7 @@ def test_kill_ctl_window_kills_by_resolved_id_not_a_name_token(monkeypatch, tmp_
     # between two verbs cannot re-point the second.
     calls = _ctl_listing(monkeypatch, "@2\trun-x\n@7\tsweep-RID\n@9\tsweep-RID\n", tmp_path)
     launch.kill_ctl_window(tmp_path, "RID")
-    assert ["tmux", "kill-window", "-t", "@7"] in calls
+    assert ["tmux", "-u", "kill-window", "-t", "@7"] in calls
 
 
 def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_path: Path):
@@ -873,7 +875,7 @@ def test_attach_plan_selects_and_returns_the_recorded_window(monkeypatch, tmp_pa
     assert plan is not None and unproven == 0
     _argv, return_window = plan
     assert return_window == "@2"
-    assert ["tmux", "select-window", "-t", "@2"] in calls
+    assert ["tmux", "-u", "select-window", "-t", "@2"] in calls
 
 
 def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
@@ -882,7 +884,7 @@ def test_kill_ctl_window_follows_the_record(monkeypatch, tmp_path: Path):
     calls = _ctl_listing(monkeypatch, "@1\trun-RID\n@2\tresume-RID\n", tmp_path)
     _write_record(tmp_path, "RID", "@2")
     launch.kill_ctl_window(tmp_path, "RID")
-    assert ["tmux", "kill-window", "-t", "@2"] in calls
+    assert ["tmux", "-u", "kill-window", "-t", "@2"] in calls
 
 
 def test_ctl_window_id_no_session_or_tmux(monkeypatch, tmp_path: Path):
@@ -903,7 +905,16 @@ def test_ctl_window_id_no_session_or_tmux(monkeypatch, tmp_path: Path):
 def test_set_return_pane_argv(fake_run):
     launch.set_return_pane("=bmad-loop-ctl:sweep-RID", "%9")
     assert fake_run.calls == [
-        ["tmux", "set-option", "-w", "-t", "=bmad-loop-ctl:sweep-RID", "@bmad_return_pane", "%9"]
+        [
+            "tmux",
+            "-u",
+            "set-option",
+            "-w",
+            "-t",
+            "=bmad-loop-ctl:sweep-RID",
+            "@bmad_return_pane",
+            "%9",
+        ]
     ]
 
 
@@ -1730,7 +1741,7 @@ def _ctl_prune_fake(
     probes: list[int] = []
 
     def fake(argv, **kwargs):
-        verb = argv[1]
+        verb = argv[2]
         if verb == "has-session":
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if verb == "display-message":  # we are sitting in @4
@@ -1803,8 +1814,8 @@ def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
     assert probes == []  # ...and asks nothing about liveness either
     assert launch.prune_ctl_windows(tmp_path) == (both, [], [], [])
     assert killed == [
-        ["tmux", "kill-window", "-t", "@3"],
-        ["tmux", "kill-window", "-t", "@6"],
+        ["tmux", "-u", "kill-window", "-t", "@3"],
+        ["tmux", "-u", "kill-window", "-t", "@6"],
     ]
     # ONE listing for BOTH windows, and only after every kill: the recorded value
     # is the kill count at probe time, so a per-window implementation would read
@@ -1851,7 +1862,7 @@ def test_prune_ctl_windows_keeps_and_reports_a_window_it_cannot_read(
     assert [name for name, _reason in plan_undetermined] == ["sweep-20260101-000000-dead"]
     removed, survived, unverifiable, undetermined = launch.prune_ctl_windows(tmp_path)
     assert (removed, survived, unverifiable) == (["run-20260101-000000-dead2"], [], [])
-    assert killed == [["tmux", "kill-window", "-t", "@6"]]
+    assert killed == [["tmux", "-u", "kill-window", "-t", "@6"]]
     assert [name for name, _reason in undetermined] == ["sweep-20260101-000000-dead"]
     assert reason in undetermined[0][1]
 
@@ -2018,7 +2029,7 @@ def test_prune_ctl_windows_accepts_legacy_path_tag(monkeypatch, tmp_path: Path):
     )
 
     def fake(argv, **kwargs):
-        verb = argv[1]
+        verb = argv[2]
         if verb == "capture-pane":
             return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "list-windows":
@@ -2061,7 +2072,7 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
     killed: list[list[str]] = []
 
     def fake(argv, **kwargs):
-        verb = argv[1]
+        verb = argv[2]
         if verb == "capture-pane":
             return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "has-session":
@@ -2086,7 +2097,7 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
 
     assert launch.prunable_ctl_windows(tmp_path)[0] == ["sweep-20260101-000000-dead"]
     assert launch.prune_ctl_windows(tmp_path) == (["sweep-20260101-000000-dead"], [], [], [])
-    assert killed == [["tmux", "kill-window", "-t", "@2"]]
+    assert killed == [["tmux", "-u", "kill-window", "-t", "@2"]]
 
 
 def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tmp_path: Path):
@@ -2119,7 +2130,7 @@ def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tm
     killed: list[list[str]] = []
 
     def fake(argv, **kwargs):
-        verb = argv[1]
+        verb = argv[2]
         if verb == "capture-pane":
             return subprocess.CompletedProcess(argv, 0, stdout=_PARKED_SCREEN, stderr="")
         if verb == "has-session":
@@ -2146,8 +2157,8 @@ def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tm
     assert launch.prunable_ctl_windows(tmp_path)[0] == expected
     assert launch.prune_ctl_windows(tmp_path) == (expected, [], [], [])
     assert killed == [
-        ["tmux", "kill-window", "-t", "@2"],
-        ["tmux", "kill-window", "-t", "@5"],
+        ["tmux", "-u", "kill-window", "-t", "@2"],
+        ["tmux", "-u", "kill-window", "-t", "@5"],
     ]
 
 
@@ -2262,9 +2273,9 @@ def test_prune_ctl_windows_raises_when_the_candidate_listing_fails(monkeypatch, 
     # listing shows windows: the scan raises instead of reading nothing to
     # prune — revert it to a bare list_windows and this answers ([], [], []).
     def fake(argv, **kwargs):
-        if argv[1] == "list-windows" and argv[-1] != "#{window_id}":
+        if argv[2] == "list-windows" and argv[-1] != "#{window_id}":
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="lost connection")
-        out = "@3\n" if argv[1] == "list-windows" else ""
+        out = "@3\n" if argv[2] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -2277,7 +2288,7 @@ def test_prune_ctl_windows_raises_when_the_candidate_listing_fails(monkeypatch, 
 
 def test_select_ctl_window_id_argv(fake_run):
     launch.select_ctl_window_id("@7")
-    assert fake_run.calls == [["tmux", "select-window", "-t", "@7"]]
+    assert fake_run.calls == [["tmux", "-u", "select-window", "-t", "@7"]]
 
 
 def test_in_ctl_session(monkeypatch):
@@ -2311,7 +2322,7 @@ def test_in_ctl_session_outside_tmux(monkeypatch):
 
 def test_detach_client_argv(fake_run):
     launch.detach_client()
-    assert fake_run.calls == [["tmux", "detach-client"]]
+    assert fake_run.calls == [["tmux", "-u", "detach-client"]]
 
 
 def _return_fake(
@@ -2341,18 +2352,18 @@ def _return_fake(
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
-        verb = argv[1]
+        verb = argv[2]
         if verb == "display-message" and argv[-1] == "#{session_attached}":
             out, rc = (f"{attached}\n", 0) if attached is not None else ("", 1)
         elif verb == "display-message":
             out, rc = (f"{win}\n", 0) if win is not None else ("", 1)
         elif verb == "show-options":
             out, rc = (f"{option}\n" if option else "", 0)
-        elif verb == "switch-client" and argv[2] == "-t":
+        elif verb == "switch-client" and argv[3] == "-t":
             if switch_exc is not None:
                 raise switch_exc
             out, rc = "", switch_rc
-        elif verb == "switch-client" and argv[2] == "-l":
+        elif verb == "switch-client" and argv[3] == "-l":
             out, rc = "", fallback_rc
         elif verb == "detach-client":
             out, rc = "", detach_rc
@@ -2368,19 +2379,19 @@ def _return_fake(
 def test_return_attached_client_switches_to_pane(monkeypatch):
     calls = _return_fake(monkeypatch, option="=main:%9")
     assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
-    assert ["tmux", "switch-client", "-t", "=main:%9"] in calls
-    assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
-    assert ["tmux", "switch-client", "-l"] not in calls  # no fallback when -t works
-    assert not any(c[1] == "detach-client" for c in calls)
+    assert ["tmux", "-u", "switch-client", "-t", "=main:%9"] in calls
+    assert ["tmux", "-u", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
+    assert ["tmux", "-u", "switch-client", "-l"] not in calls  # no fallback when -t works
+    assert not any(c[2] == "detach-client" for c in calls)
 
 
 def test_return_attached_client_switch_fallback(monkeypatch):
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1)
     assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
-    assert ["tmux", "switch-client", "-l"] in calls
+    assert ["tmux", "-u", "switch-client", "-l"] in calls
     # the fallback returned a client too, so the option is consumed — without
     # this the unset could regress to primary-success-only and stay green
-    assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
+    assert ["tmux", "-u", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
 
 
 def test_return_attached_client_switch_fails_stays_attended(monkeypatch):
@@ -2393,8 +2404,8 @@ def test_return_attached_client_switch_fails_stays_attended(monkeypatch):
     tests below are the same rc with the count answering differently."""
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached="1")
     assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
-    assert ["tmux", "switch-client", "-l"] in calls  # fallback was attempted
-    assert not any(c[1] == "set-option" for c in calls)  # option survives
+    assert ["tmux", "-u", "switch-client", "-l"] in calls  # fallback was attempted
+    assert not any(c[2] == "set-option" for c in calls)  # option survives
 
 
 def test_return_attached_client_switch_fails_with_no_client_is_unreachable(monkeypatch):
@@ -2410,8 +2421,8 @@ def test_return_attached_client_switch_fails_with_no_client_is_unreachable(monke
     owed."""
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached="0")
     assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
-    assert ["tmux", "switch-client", "-l"] in calls  # the fallback still ran
-    assert not any(c[1] == "set-option" for c in calls)
+    assert ["tmux", "-u", "switch-client", "-l"] in calls  # the fallback still ran
+    assert not any(c[2] == "set-option" for c in calls)
 
 
 def test_return_attached_client_switch_fails_with_an_unreadable_count_is_unreachable(monkeypatch):
@@ -2421,7 +2432,7 @@ def test_return_attached_client_switch_fails_with_an_unreadable_count_is_unreach
     window."""
     calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached=None)
     assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
-    assert not any(c[1] == "set-option" for c in calls)
+    assert not any(c[2] == "set-option" for c in calls)
 
 
 def test_return_attached_client_unvouched_switch_is_unreachable(monkeypatch):
@@ -2440,9 +2451,9 @@ def test_return_attached_client_unvouched_switch_is_unreachable(monkeypatch):
         switch_exc=subprocess.TimeoutExpired(["tmux"], 30),
     )
     assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
-    assert ["tmux", "switch-client", "-t", "=main:%9"] in calls
-    assert ["tmux", "switch-client", "-l"] not in calls
-    assert not any(c[1] == "set-option" for c in calls)  # option survives
+    assert ["tmux", "-u", "switch-client", "-t", "=main:%9"] in calls
+    assert ["tmux", "-u", "switch-client", "-l"] not in calls
+    assert not any(c[2] == "set-option" for c in calls)  # option survives
 
 
 def test_return_attached_client_detach_fails_is_unreachable(monkeypatch):
@@ -2451,16 +2462,16 @@ def test_return_attached_client_detach_fails_is_unreachable(monkeypatch):
     failed switch, and NOT the same answer. RETURN_OPTION still survives."""
     calls = _return_fake(monkeypatch, option="detach", detach_rc=1)
     assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
-    assert ["tmux", "detach-client"] in calls
-    assert not any(c[1] == "set-option" for c in calls)
+    assert ["tmux", "-u", "detach-client"] in calls
+    assert not any(c[2] == "set-option" for c in calls)
 
 
 def test_return_attached_client_detaches(monkeypatch):
     calls = _return_fake(monkeypatch, option="detach")
     assert launch.return_attached_client() is launch.ReturnOutcome.RETURNED
-    assert ["tmux", "detach-client"] in calls
-    assert ["tmux", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
-    assert not any(c[1] == "switch-client" for c in calls)
+    assert ["tmux", "-u", "detach-client"] in calls
+    assert ["tmux", "-u", "set-option", "-wu", "-t", "@5", "@bmad_return_pane"] in calls
+    assert not any(c[2] == "switch-client" for c in calls)
 
 
 def test_return_attached_client_noop_when_unset(monkeypatch):
@@ -2469,7 +2480,7 @@ def test_return_attached_client_noop_when_unset(monkeypatch):
     conservative ATTENDED, never UNREACHABLE."""
     calls = _return_fake(monkeypatch, option="")
     assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
-    assert not any(c[1] in ("switch-client", "detach-client", "set-option") for c in calls)
+    assert not any(c[2] in ("switch-client", "detach-client", "set-option") for c in calls)
 
 
 def test_return_attached_client_noop_without_tmux(monkeypatch):
