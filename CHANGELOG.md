@@ -28,6 +28,11 @@ breaking changes may land in a minor release.
 - Show a project plugin's grant status in the TUI settings screen; toggling it on
   records its grant after a successful save, toggling it off revokes it (#496, #497).
 
+### Fixed
+
+- Open the TUI settings screen when a toggled plugin's name is not a valid widget id
+  (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+
 ### Security
 
 - Trust plugins by origin and pin project plugins by content (#496, #497). A project

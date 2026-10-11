@@ -63,6 +63,20 @@ from ..settings import PolicyDoc
 _INVALID = object()
 
 
+def plugin_wid(name: str) -> str:
+    """A plugin name as a widget-id fragment. A manifest name is any non-empty
+    string, but a Textual id takes only ``[A-Za-z0-9_-]``, so an unsafe name
+    would stop the screen from opening. ASCII letters, digits and ``-`` pass
+    through; every other character's UTF-8 bytes (``_`` included, which keeps the
+    encoding injective) become ``_xx`` hex.
+    ABLATION (test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants):
+    return ``name`` unchanged and the screen fails to open."""
+    return "".join(
+        c if c.isascii() and (c.isalnum() or c == "-") else "".join(f"_{b:02x}" for b in c.encode())
+        for c in name
+    )
+
+
 class SettingsScreen(Screen[None]):
     DEFAULT_CSS = """
     SettingsScreen #form {
@@ -280,7 +294,7 @@ class SettingsScreen(Screen[None]):
                 if info.trust_needed:
                     yield Switch(
                         value=self._initial_on[info.name],
-                        id=f"plugin-enabled-{info.name}",
+                        id=f"plugin-enabled-{plugin_wid(info.name)}",
                         classes="plugin-enable",
                     )
                 else:
@@ -292,7 +306,7 @@ class SettingsScreen(Screen[None]):
                     yield Static(
                         Text(status),
                         classes="plugin-status -attention" if attention else "plugin-status",
-                        id=f"plugin-status-{info.name}",
+                        id=f"plugin-status-{plugin_wid(info.name)}",
                     )
         configurable = [p for p in self._registry.plugins if p.fields]
         if configurable:
@@ -300,7 +314,10 @@ class SettingsScreen(Screen[None]):
             for info in configurable:
                 title = f"{info.name} — {info.description}" if info.description else info.name
                 with Collapsible(
-                    title=title, collapsed=True, id=f"plugin-cfg-{info.name}", classes="plugin-cfg"
+                    title=title,
+                    collapsed=True,
+                    id=f"plugin-cfg-{plugin_wid(info.name)}",
+                    classes="plugin-cfg",
                 ):
                     for spec in info.fields:
                         yield from self._compose_field(spec)
@@ -343,14 +360,14 @@ class SettingsScreen(Screen[None]):
         while its enable toggle is on (its module is what trust gates)."""
         if not info.trust_needed:
             return True
-        return self.query_one(f"#plugin-enabled-{info.name}", Switch).value
+        return self.query_one(f"#plugin-enabled-{plugin_wid(info.name)}", Switch).value
 
     def on_mount(self) -> None:
         # Hide the settings of every plugin that isn't active yet, so a fresh open
         # shows only the roster plus the active plugins' settings.
         for info in self._registry.plugins:
             if info.fields and not self._plugin_active(info):
-                self.query_one(f"#plugin-cfg-{info.name}", Collapsible).display = False
+                self.query_one(f"#plugin-cfg-{plugin_wid(info.name)}", Collapsible).display = False
         self._show_errors(self._doc.validate(self._registry.plugin_schemas))
 
     # ------------------------------------------------------------ keyboard
@@ -414,9 +431,9 @@ class SettingsScreen(Screen[None]):
         elif event.switch.has_class("plugin-enable") and event.switch.id:
             # Reveal/hide the plugin's settings live (a plugin with no settings has
             # no config collapsible). Expand on reveal so they're immediately seen.
-            name = event.switch.id.removeprefix("plugin-enabled-")
-            if self.query(f"#plugin-cfg-{name}"):
-                cfg = self.query_one(f"#plugin-cfg-{name}", Collapsible)
+            wid = event.switch.id.removeprefix("plugin-enabled-")
+            if self.query(f"#plugin-cfg-{wid}"):
+                cfg = self.query_one(f"#plugin-cfg-{wid}", Collapsible)
                 cfg.display = event.value
                 if event.value:
                     cfg.collapsed = False
@@ -506,7 +523,11 @@ class SettingsScreen(Screen[None]):
         trusted)."""
         managed = self._builtin_toggles()
         toggles = {p.name for p in managed}
-        on = [p.name for p in managed if self.query_one(f"#plugin-enabled-{p.name}", Switch).value]
+        on = [
+            p.name
+            for p in managed
+            if self.query_one(f"#plugin-enabled-{plugin_wid(p.name)}", Switch).value
+        ]
         current = self._doc.get("plugins", "enabled")
         current_names = None if current is None else [str(x) for x in current]
         dropped = toggles | set(revoked)
@@ -595,7 +616,7 @@ class SettingsScreen(Screen[None]):
         for info in self._registry.plugins:
             if not info.grant_required:
                 continue
-            now = self.query_one(f"#plugin-enabled-{info.name}", Switch).value
+            now = self.query_one(f"#plugin-enabled-{plugin_wid(info.name)}", Switch).value
             was = self._initial_on[info.name]
             if now and not was and info.grant_status == "ungranted":
                 to_grant.append(info.name)

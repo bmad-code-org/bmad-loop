@@ -26,7 +26,7 @@ from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
 from bmad_loop.tui import settings as settings_mod
 from bmad_loop.tui.app import BmadLoopApp
 from bmad_loop.tui.screens.dashboard import DashboardScreen
-from bmad_loop.tui.screens.settings_screen import SettingsScreen
+from bmad_loop.tui.screens.settings_screen import SettingsScreen, plugin_wid
 from bmad_loop.tui.settings import PolicyDoc
 
 
@@ -841,6 +841,31 @@ async def test_toggle_on_records_a_grant_after_a_successful_save(project):
     assert record.digest == read_tree(pdir).digest
     assert record.path == (USER_PLUGINS_REL / "hooky").as_posix()
     assert policy_mod.load(project.project / POLICY_FILE).plugins.enabled == ()
+
+
+async def test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants(project):
+    """A manifest name is any non-empty string, so a hooks-only project plugin
+    named with a space, a dot and an underscore still opens the screen, and its
+    encoded toggle grants it under its real name.
+
+    ABLATION: return ``name`` unchanged from `plugin_wid` and the screen fails to
+    open (Textual rejects the id)."""
+    name = "acme tools.v2_x"
+    assert plugin_wid(name) == "acme_20tools_2ev2_5fx"
+    assert plugin_wid("a.b") != plugin_wid("a_2eb")  # the escape is itself escaped
+    write_policy(project)
+    pdir = project.project / USER_PLUGINS_REL / "acme"
+    pdir.mkdir(parents=True)
+    (pdir / PLUGIN_FILE).write_text(HOOK_PLUGIN.replace("hooky", name), encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert _status(screen, plugin_wid(name)) == "not granted"
+        screen.query_one(f"#plugin-enabled-{plugin_wid(name)}", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert store.load_grants(project.project).get(name) is not None
 
 
 async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, monkeypatch):
