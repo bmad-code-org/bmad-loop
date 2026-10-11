@@ -143,13 +143,13 @@ def mint_replay_run(
                 new_dir = None
                 raise ReplayError(f"replay run id {run_id} already exists — retry") from e
             # The finished run's records are launch-time and never re-stamped: after a
-            # project move the worktree and a project-owned code root live under the
-            # live project (`standalone_replay_refusal` located them there). The
+            # project move the worktree and the code root follow the live project
+            # (`standalone_replay_refusal` located them there). The
             # recorded mount stays the base the task's own absolute spellings re-home
             # from — they were written while the run ran at the old path.
             recorded_src = Path(task.worktree_path)
             src = runs.rebase_recorded_project_path(recorded_src, finished, project)
-            code_root = runs.rebase_recorded_project_path(finished.code_root, finished, project)
+            code_root = runs.rebase_recorded_code_root(finished, project)
             dst = unit_worktrees_dir(new_dir) / safe_segment(story_key)
             dst.parent.mkdir()
             # Recorded BEFORE the move: git renames the tree before it updates its

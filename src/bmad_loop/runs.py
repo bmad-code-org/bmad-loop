@@ -3553,9 +3553,9 @@ def delete_run(
         retrying_rmtree(run_dir)
         if held_worktrees:
             if state is not None:
-                # A project-owned code root moves with a renamed project; an external
-                # `repo_root` override stays where it was recorded.
-                code_root = rebase_recorded_project_path(state.code_root, state, project)
+                # A project-owned code root moves with a renamed project, an ancestor
+                # one with a renamed repository; an external one stays as recorded.
+                code_root = rebase_recorded_code_root(state, project)
                 fault = _prune_deleted_run_worktrees(code_root, run_res)
             else:
                 # No state, no code root: prune the usual one, but a clean listing
@@ -4370,6 +4370,39 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     if ".." in relative.parts:
         return path
     return project_root / relative
+
+
+def rebase_recorded_code_root(state: RunState, project_root: Path) -> Path:
+    """`state.code_root` located on the live project, for a run never re-stamped.
+
+    A project-owned code root (the default config, ``code_root == project``) moves
+    with the project through :func:`rebase_recorded_project_path`. A code root that
+    is an ANCESTOR of the recorded project — the monorepo `repo_root` override —
+    moves when the whole repository was renamed: the recorded offset of the project
+    inside it is kept, so the live project minus that offset is the live repository.
+    That holds only when the live project still ends in the recorded offset AND the
+    recorded root is no longer a directory; a project moved inside a repository that
+    stayed put keeps naming that repository. Anything else (an external root, an
+    offset the live project does not end in) is returned as recorded, so the caller's
+    own comparison refuses it rather than this guessing.
+    """
+    recorded = state.code_root
+    recorded_project = Path(state.project)
+    if project_root == recorded_project:
+        return recorded
+    try:
+        offset = recorded_project.relative_to(recorded)
+    except ValueError:
+        return rebase_recorded_project_path(recorded, state, project_root)
+    depth = len(offset.parts)
+    if (
+        depth == 0
+        or len(project_root.parts) <= depth
+        or project_root.parts[-depth:] != offset.parts
+        or recorded.is_dir()
+    ):
+        return recorded if depth else project_root
+    return Path(*project_root.parts[:-depth])
 
 
 def task_spec_path(task: StoryTask, state: RunState) -> Path:
@@ -7096,15 +7129,15 @@ def standalone_replay_refusal(
     )
     if refusal is not None:
         return refusal
-    # The recorded paths are launch-time and a finished run is never re-stamped, so a
-    # project-owned code root (and below, the kept worktree and its spec) are located
-    # on the live project — else a moved project reads as a changed `repo_root`.
+    # The recorded paths are launch-time and a finished run is never re-stamped, so the
+    # code root (and below, the kept worktree and its spec) are located on the live
+    # project — else a moved project reads as a changed `repo_root`.
     paths, refusal = _reverify_root_refusal(
         state,
         task,
         story_key,
         project_root=project_root,
-        code_root=rebase_recorded_project_path(state.code_root, state, project_root),
+        code_root=rebase_recorded_code_root(state, project_root),
     )
     if refusal is not None:
         return refusal
@@ -7184,8 +7217,9 @@ def _mounted_reverify_refusal(
     naming what the operator can do instead.
 
     ``live_project`` locates the recorded worktree, code root and spec on the project
-    the caller acts in (`rebase_recorded_project_path`): a finished run is never
-    re-stamped, so after a project move its records name the launch-time tree.
+    the caller acts in (`rebase_recorded_project_path`, `rebase_recorded_code_root`):
+    a finished run is never re-stamped, so after a project move its records name the
+    launch-time tree.
     ``None`` reads them as recorded.
 
     The engine's reverify arm reopens the mount through `reopen_unit`, which demands
@@ -7198,7 +7232,7 @@ def _mounted_reverify_refusal(
     moved_hint = ""
     if live_project is not None:
         wt = rebase_recorded_project_path(wt, state, live_project)
-        code_root = rebase_recorded_project_path(code_root, state, live_project)
+        code_root = rebase_recorded_code_root(state, live_project)
         if live_project != Path(state.project):
             moved_hint = " (after a project move, `git worktree repair` re-links it)"
     if not wt.is_dir():
