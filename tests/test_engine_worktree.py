@@ -12760,15 +12760,22 @@ def test_abandon_parks_commits_on_a_detached_head(
     `-abandon` ref at it and the commit outlives `delete`. A detached HEAD the branch
     already contains needs no ref.
 
+    The ref holds a fresh commit of the HEAD tree parented on HEAD, not HEAD itself:
+    retention ranks refs by committer date, and the detached commit here is dated
+    2001, so a ref pointed straight at it would be pruned first.
+
     Ablation: drop the detached-HEAD arm of `preserve_abandoned_unit` and the
-    new-commit row journals `ref: None`."""
+    new-commit row journals `ref: None`; point the ref at HEAD itself and the
+    committer-date assertion fails."""
     _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
     unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
     git(unit, "checkout", "-q", "--detach")
     if not on_branch:
         (unit / "detached-work.txt").write_text("committed off-branch\n", encoding="utf-8")
         git(unit, "add", "detached-work.txt")
+        monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
         git(unit, "commit", "-q", "-m", "detached work")
+        monkeypatch.delenv("GIT_COMMITTER_DATE")
     head = git(unit, "rev-parse", "HEAD").strip()
     assert git(unit, "status", "--porcelain", "--untracked-files=all") == ""
     capsys.readouterr()
@@ -12783,7 +12790,40 @@ def test_abandon_parks_commits_on_a_detached_head(
     ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
     assert row["ref"] == ref and ref in capsys.readouterr().out
     runs.delete_run(project.project, replay_dir)
-    assert git(project.project, "rev-parse", ref).strip() == head
+    assert git(project.project, "rev-parse", f"{ref}^").strip() == head
+    assert git(project.project, "rev-parse", f"{ref}^{{tree}}") == git(
+        project.project, "rev-parse", f"{head}^{{tree}}"
+    )
+    assert int(git(project.project, "log", "-1", "--format=%ct", ref)) > 978307200
+
+
+def test_abandon_refuses_when_the_worktree_registration_is_lost(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The kept worktree reads registered at abandon's own check, then not at
+    `preserve_abandoned_unit`'s (a transient `git worktree list` refusal reads as
+    unregistered): abandon refuses with the run still paused and the dirty worktree
+    on disk, rather than reading "unregistered" as "nothing to park" and handing the
+    tree to the teardown's rmtree fallback.
+
+    Ablation: return `None` from the guard in `preserve_abandoned_unit` (the pre-fix
+    shape) and the abandon succeeds with the worktree and its notes deleted."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    real = verify.worktree_is_registered
+    answers = iter([True])
+
+    def flickering(repo, path):
+        return next(answers, False) and real(repo, path)
+
+    monkeypatch.setattr(verify, "worktree_is_registered", flickering)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+
+    assert "cannot be preserved" in capsys.readouterr().err
+    assert (unit / "extra-notes.txt").read_text(encoding="utf-8") == "unsaved operator notes\n"
+    assert not load_state(replay_dir).finished
+    assert all(e["kind"] != "replay-abandoned" for e in Journal(replay_dir).entries())
 
 
 def test_abandon_refuses_when_the_branch_check_cannot_answer(

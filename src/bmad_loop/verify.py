@@ -6391,6 +6391,33 @@ def snapshot_worktree(
     return ref_name
 
 
+def snapshot_commit(repo: Path, ref_name: str, head: str, message: str) -> str:
+    """Create the FULL ref ``ref_name`` at a fresh commit of ``head``'s tree parented
+    on ``head``, and return the new commit's sha. Same content and ancestry as
+    pointing the ref at ``head`` itself, but stamped with the current committer
+    date: preserve-ref retention ranks refs by ``committerdate``, so a ref at an
+    old commit would be pruned first however recently it was created. Synthetic
+    ``bmad-loop`` identity as in :func:`snapshot_worktree`; the empty old-value
+    refuses an existing ``ref_name`` rather than overwrite it. Raises
+    :class:`GitError`."""
+    ident = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "bmad-loop",
+        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
+        "GIT_COMMITTER_NAME": "bmad-loop",
+        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
+    }
+    rc, snap, detail = _git_out(
+        repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", message, env=ident
+    )
+    if rc != 0:
+        raise GitError(f"git commit-tree (snapshot of {head[:12]}) failed in {repo}: {detail}")
+    rc, out = _git(repo, "update-ref", ref_name, snap, "")
+    if rc != 0:
+        raise GitError(f"git update-ref {ref_name} {snap[:12]} failed in {repo}: {out}")
+    return snap
+
+
 class PreserveRefExhaustedError(GitError):
     """Every candidate snapshot refname in a probe's bounded range was already
     taken. A GitError so the preservation handlers that already guard

@@ -222,8 +222,9 @@ def _preserve_orphan_state(
 ) -> None:
     """Park the uncommitted work an orphaned mount at ``wt`` still holds before the
     reclaim force-removes it. ``kind`` is the ref suffix
-    (:func:`orphan_preserve_ref_name`); :func:`preserve_abandoned_unit` reuses this
-    whole capture, guard included, with ``"abandon"``. See the reclaim comment in :func:`open_unit_workspace`
+    (:func:`orphan_preserve_ref_name`); :func:`preserve_abandoned_unit` reuses the
+    capture (:func:`_snapshot_orphan`) with ``"abandon"`` behind a stricter guard
+    that raises. See the reclaim comment in :func:`open_unit_workspace`
     for why an orphan can stand at this path at all.
 
     Three-way guard before any git runs *in* ``wt``: the path exists, it is one of
@@ -262,9 +263,27 @@ def _preserve_orphan_state(
     """
     if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
         return
+    parked = _snapshot_orphan(repo_root, wt, run_id, unit_key, paths, spec_file, kind)
+    if parked is not None and on_orphan_preserved is not None:
+        on_orphan_preserved(str(wt), parked)
+
+
+def _snapshot_orphan(
+    repo_root: Path,
+    wt: Path,
+    run_id: str,
+    unit_key: str,
+    paths: ProjectPaths,
+    spec_file: str | None,
+    kind: str,
+) -> str | None:
+    """The capture half of :func:`_preserve_orphan_state`, without its guard: the
+    caller has already proved ``wt`` is a registered linked worktree. Returns the
+    snapshot ref, or ``None`` over a tree with nothing to park. Raises
+    :class:`verify.GitError`."""
     try:
         head = verify.rev_parse_head(wt)
-        parked = verify.snapshot_worktree(
+        return verify.snapshot_worktree(
             wt,
             _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind=kind)),
             baseline_untracked=[],
@@ -279,8 +298,6 @@ def _preserve_orphan_state(
             f"cannot snapshot orphaned worktree {wt} for {unit_key} before reclaim "
             f"(left standing; recover by hand): {e}"
         ) from e
-    if parked is not None and on_orphan_preserved is not None:
-        on_orphan_preserved(str(wt), parked)
 
 
 def _free_snapshot_ref(repo_root: Path, base_ref: str) -> str:
@@ -315,44 +332,43 @@ def preserve_abandoned_unit(
 ) -> str | None:
     """Park the uncommitted state of a replay run's kept worktree at ``wt`` before
     `resolve --abandon` removes it (DW-535), and return the snapshot ref, or
-    ``None`` when there was nothing to park (or ``wt`` is not a registered linked
-    worktree of ``repo_root`` — the caller decides what that means).
+    ``None`` when there was nothing to park.
 
-    The orphan capture verbatim (:func:`_preserve_orphan_state`): the same
-    three-way guard, the same ``force_include`` of the orchestrator's own ignored
-    artifacts, and a ref under ``refs/attempt-preserve-dirty/`` with the
-    ``-abandon`` suffix, so ``scm.preserve_keep`` bounds it like every snapshot.
-    A capture failure raises :class:`verify.GitError`, leaving ``wt`` standing.
+    The orphan capture (:func:`_snapshot_orphan`): the same ``force_include`` of
+    the orchestrator's own ignored artifacts, and a ref under
+    ``refs/attempt-preserve-dirty/`` with the ``-abandon`` suffix, so
+    ``scm.preserve_keep`` bounds it like every snapshot. The orphan path's guard
+    is strict here: ``None`` authorizes the caller's teardown, whose rmtree
+    fallback deletes whatever is left, so a ``wt`` that is not (or can no longer
+    be shown to be) a registered linked worktree of ``repo_root`` raises rather
+    than reading as "nothing to park". Any failure raises
+    :class:`verify.GitError`, leaving ``wt`` standing.
 
     Commits on the unit ``branch`` need no capture: the abandon keeps it. Commits
     made on a DETACHED HEAD the branch does not contain do: the worktree's HEAD and
     its reflog are the only things naming them, and both go with the worktree. A
     dirty tree's snapshot is parented on that HEAD and so already keeps them; over a
-    clean tree the ``-abandon`` ref is pointed at the HEAD commit itself. An
-    ancestry check that cannot answer parks it too — an extra ref is the safe
-    error. A HEAD attached to some other branch is kept by that branch."""
-    captured: list[str] = []
-    _preserve_orphan_state(
-        repo_root,
-        wt,
-        run_id,
-        unit_key,
-        paths,
-        spec_file,
-        lambda _wt, ref: captured.append(ref),
-        kind="abandon",
-    )
-    if captured:
-        return captured[0]
+    clean tree the ``-abandon`` ref gets a fresh commit of the HEAD tree parented on
+    it (:func:`verify.snapshot_commit`) — not the HEAD commit itself, whose possibly
+    old committer date would rank the new ref last for ``scm.preserve_keep``
+    retention and get it pruned at the next run start. An ancestry check that
+    cannot answer parks it too — an extra ref is the safe error. A HEAD attached
+    to some other branch is kept by that branch."""
     if not wt.exists() or not verify.worktree_is_registered(repo_root, wt):
-        return None
+        raise verify.GitError(
+            f"{wt} is not a registered git worktree of {repo_root} (or git could not "
+            "confirm it), so its contents cannot be preserved"
+        )
+    captured = _snapshot_orphan(repo_root, wt, run_id, unit_key, paths, spec_file, "abandon")
+    if captured is not None:
+        return captured
     if verify.current_branch(wt) != "HEAD":
         return None
     head = verify.rev_parse_head(wt)
     if verify.is_ancestor(wt, head, f"refs/heads/{branch}"):
         return None
     ref = _free_snapshot_ref(repo_root, orphan_preserve_ref_name(run_id, head, kind="abandon"))
-    verify.create_ref(repo_root, ref, head)
+    verify.snapshot_commit(wt, ref, head, "abandoned detached HEAD")
     return ref
 
 
