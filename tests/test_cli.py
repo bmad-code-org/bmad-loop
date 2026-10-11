@@ -5615,8 +5615,7 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
             "rearm-commits-probe-failed",
             story_key=key,
             old_baseline=baseline,
-            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: "
-            "not a git repository",
+            error=f"GitError: git rev-list {baseline}..HEAD failed in /code: not a git repository",
         )
         return _journal_rearm_outcome(rd, key)
 
@@ -6997,7 +6996,7 @@ def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
     from bmad_loop.tui import launch
 
-    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: (["sweep-fin-1"], []))
     dry_runs: list[bool] = []
     monkeypatch.setattr(
         runs,
@@ -7018,7 +7017,7 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     assert "removed 1 session(s), 1 ctl window(s)" in capsys.readouterr().out
@@ -7031,7 +7030,7 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     captured = capsys.readouterr()
@@ -7044,7 +7043,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
     from bmad_loop import runs
     from bmad_loop.tui import launch
 
-    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: (["sweep-fin-1"], []))
     # a real prune would have to go through prune_ctl_windows; leaving it
     # unpatched proves --dry-run never reaches it
     dry_runs: list[bool] = []
@@ -7070,6 +7069,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "survived": [],
         "unverifiable": [],
         "scan_error": None,
+        "undetermined": [],
     }
     assert dry_runs == [True]  # the kill stayed suppressed
 
@@ -7079,7 +7079,7 @@ def test_cleanup_json_real_run_reports_what_it_did(tmp_path, monkeypatch, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -7097,7 +7097,7 @@ def test_cleanup_json_carries_unverifiable_pid_with_empty_stderr(tmp_path, monke
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -7110,7 +7110,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -7127,6 +7127,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "survived": [],
         "unverifiable": [],
         "scan_error": None,
+        "undetermined": [],
     }
 
 
@@ -7166,6 +7167,7 @@ def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
         "survived": [],
         "unverifiable": [],
         "scan_error": "tmux has-session failed: server gone",
+        "undetermined": [],
     }
 
 
@@ -7199,6 +7201,7 @@ def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatc
         "survived": [],
         "unverifiable": [],
         "scan_error": "tmux list-windows failed: timeout",
+        "undetermined": [],
     }
 
 
@@ -7255,7 +7258,7 @@ def test_cleanup_schema_version_is_2_after_removed_narrowed(tmp_path, monkeypatc
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -7268,7 +7271,7 @@ def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
     monkeypatch.setattr(
-        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"], [])
     )
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
@@ -7278,7 +7281,51 @@ def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, c
         "survived": ["stuck-1"],
         "unverifiable": ["dunno-1"],
         "scan_error": None,
+        "undetermined": [],
     }
+
+
+def _scan_keeping_one_unread(_proj):
+    return (["gone-1"], [], [], [("resolve-unread-1", "capture timed out")])
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_json_lists_windows_whose_command_state_is_unread(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    """A window the scan kept because it could not read whether its command
+    still runs (#876) travels in the receipt, outside the kill partition, and
+    JSON mode leaves stderr empty. Drop it from the document and the list is
+    empty."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", _scan_keeping_one_unread)
+    monkeypatch.setattr(
+        launch, "prunable_ctl_windows", lambda p: (["gone-1"], _scan_keeping_one_unread(p)[3])
+    )
+    argv = ["cleanup", "--project", str(tmp_path), "--json"] + (["--dry-run"] if dry_run else [])
+
+    doc = machine_json(argv, capsys)
+
+    assert doc["ctl_windows"]["removed"] == ["gone-1"]
+    assert doc["ctl_windows"]["undetermined"] == ["resolve-unread-1"]
+
+
+def test_cleanup_text_names_a_window_whose_command_state_is_unread(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", _scan_keeping_one_unread)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert (
+        "ctl window resolve-unread-1 left open: cannot tell whether its command still runs "
+        "(capture timed out)"
+    ) in err
 
 
 def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
@@ -7291,7 +7338,7 @@ def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
     monkeypatch.setattr(
-        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"], [])
     )
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
@@ -14368,7 +14415,7 @@ def test_reverify_runs_probes_first_and_names_the_environment(tmp_path, capsys):
     command = _sentinel_writer_cmd(tmp_path, sentinel, rc=0, stem="probed")
     _write_policy(
         tmp_path,
-        f"[verify]\ncommands = {json.dumps([command])}\n" '[environment]\nprobes = ["exit 6"]\n',
+        f'[verify]\ncommands = {json.dumps([command])}\n[environment]\nprobes = ["exit 6"]\n',
     )
 
     reason = cli._reverify(tmp_path, tmp_path)
@@ -19180,7 +19227,7 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
             [],
         ),
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
@@ -19200,7 +19247,7 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
         "legacy_registry_leftovers",
         lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
-    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: ([], []))
 
     assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
     assert "bmad-loop-old-1" in capsys.readouterr().err
@@ -19230,8 +19277,8 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
         return {}, []
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
-    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: ([], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
     assert seen == [["old-1"]]
@@ -19252,7 +19299,7 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
         "legacy_registry_leftovers",
         lambda _p, announced=(): ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     captured = capsys.readouterr()
@@ -19291,7 +19338,7 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
             [],
         ),
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
@@ -19325,7 +19372,7 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
             [],
         ),
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     doc = json.loads(capsys.readouterr().out)
@@ -19339,7 +19386,7 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
     monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): ({}, []))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
@@ -19359,7 +19406,7 @@ def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys
         "legacy_registry_leftovers",
         lambda _p, announced=(): ({}, ["/reg/broken: could not be listed: no server"]),
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
+import re
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -48,6 +49,44 @@ class MultiplexerError(Exception):
     """A transport-backend operation failed. Backends raise a subclass (e.g.
     :class:`~.tmux_backend.TmuxError`) so call sites can catch the seam-level type
     without importing a backend."""
+
+
+# The line a :meth:`TerminalMultiplexer.new_parked_window` window prints once its
+# command has exited, right before it parks; ``{ec}`` is the exit status. The
+# ctl-window prune reads it back (:func:`parked_screen`) to tell a parked window
+# from one whose command is still running, which neither the pane's pid nor its
+# current command can: both name the parking shell either way (#876).
+PARKED_BANNER = "[bmad-loop exited {ec} — press enter]"
+# Matched against the screen with all whitespace removed (see parked_screen).
+# The dash, and only these spellings of it: the real em dash; its UTF-8 bytes
+# read as cp1252 (`â€”`); the escapes of the capture's backslashreplace decode,
+# UTF-8 under an ASCII locale (`\xe2\x80\x94`) or a cp1252 dash under UTF-8
+# (`\x97`). No wildcard: any other token between the exit status and "press
+# enter" is not our banner, and reading it as one would kill a live window.
+_PARKED_DASHES = ("—", "â€”", r"\xe2\x80\x94", r"\x97")
+_PARKED_BANNER_TAIL_RE = re.compile(
+    r"\[bmad-loopexited-?\d+(?:"
+    + "|".join(re.escape(dash) for dash in _PARKED_DASHES)
+    + r")pressenter\]\Z"
+)
+
+
+def parked_screen(screen: str) -> bool:
+    """True when a :meth:`TerminalMultiplexer.capture_pane` screen shows a parked
+    window: the visible text ENDS with :data:`PARKED_BANNER`. Anything else — a
+    running command, one not yet started, a banner followed by later output —
+    reads as not parked.
+
+    Whitespace, row breaks included, is dropped before matching, so the banner
+    still matches when a pane narrower than it wraps it across rows (capture
+    reports physical rows, trailing spaces trimmed) or when the command's last
+    output had no newline and the banner was printed onto the same row.
+
+    The ceiling, kept on purpose: a command that is still running and whose
+    visible screen ends with that exact text reads as parked. A flag the
+    wrapper sets after its command exits would close that, but psmux has no
+    per-window option to carry it (#310)."""
+    return _PARKED_BANNER_TAIL_RE.search("".join(screen.split())) is not None
 
 
 def parse_target(target: str) -> tuple[str, str | None] | None:
@@ -238,6 +277,12 @@ class TerminalMultiplexer(ABC):
         the exit status stays inspectable instead of the window closing the moment
         the process exits — and finally returns an attached client to its origin
         (keyed by the per-window ``return_opt``). Returns the native window id.
+
+        On reaching the park the window prints :data:`PARKED_BANNER` as its last
+        line, readable through :meth:`capture_pane`; that is what lets the
+        ctl-window prune close a parked window and leave a running one alone. A
+        backend that parks without it, or cannot capture, gets its windows kept
+        and reported, never closed.
 
         That id is **opaque to core** exactly as :meth:`new_window`'s is, so a
         backend MAY return an already-qualified target rather than a bare id

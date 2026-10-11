@@ -30,6 +30,7 @@ from ..adapters.multiplexer import (
     Unset,
     get_multiplexer,
     mux_usable,
+    parked_screen,
 )
 from ..journal import Journal
 from ..platform_util import (
@@ -870,15 +871,27 @@ def _ctl_window_evidence(project: Path) -> str | None:
     return runs.live_run_evidence(project)
 
 
-def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
+# (window_name, reason) for a window a scan kept because it could not read
+# whether the window's command still runs.
+Undetermined = tuple[str, str]
+
+
+def _ctl_window_candidates(
+    project: Path,
+) -> tuple[list[tuple[str, str]], list[Undetermined]]:
     """(window_id, window_name) for parked control-session run windows whose run
-    is no longer live — the kill candidates for a prune.
+    is no longer live — the kill candidates for a prune — and the windows this
+    scan kept undetermined.
 
     A `<kind>-<run_id>` window parks on a `read` prompt that never closes on its
     own; it is a candidate once its run has finished/stopped/crashed (or its run
-    dir is gone). The current window is excluded so a prune triggered from inside
-    the ctl session never targets itself; live runs and the session's own shell
-    window are excluded too.
+    dir is gone) AND its screen shows the park banner (`parked_screen`): a dead
+    engine alone does not stop the window's own command, such as an interactive
+    resolve, from still running (#876). A window whose screen cannot be read is
+    kept and returned in the second list, per scan: two scans running at once
+    (two TUI cleanup workers) must each report their own. The current window is
+    excluded so a prune triggered from inside the ctl session never targets
+    itself; live runs and the session's own shell window are excluded too.
 
     The control session is shared across projects, so its per-window PROJECT_OPTION
     accepts current and legacy project tags; untagged windows still require a run
@@ -901,7 +914,7 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     if not mux_usable(mux):
         evidence = _ctl_window_evidence(project)
         if evidence is None:
-            return []
+            return [], []
         raise MultiplexerError(
             f"multiplexer backend {type(mux).__name__} is unavailable, but this "
             f"project still has {evidence}; its control windows cannot be listed"
@@ -911,13 +924,14 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     # when list_window_ids agrees there is nothing — whose [] is a positive
     # claim, and which raises when its own listing cannot be taken (#750).
     if not session_exists(ctl) and not mux.list_window_ids(ctl):
-        return []
+        return [], []
     current = mux.current_window_id()
     # Fail loud on a listing that failed: both prune callers already report a
     # raise from this scan, and an empty answer would read as nothing to prune.
     rows = _list_ctl_windows(mux, ctl, ["window_id", "window_name", runs.PROJECT_OPTION])
     mine = runs.accepted_tags(project)
     candidates: list[tuple[str, str]] = []
+    undetermined: list[Undetermined] = []
     for win_id, name, tag in rows:
         if not win_id or win_id == current:
             continue
@@ -941,19 +955,36 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
         # unknown warning from prunable_sessions covers the operator surface.
         if runs.engine_alive(run_dir):
             continue
-        candidates.append((win_id, name))
-    return candidates
+        # A dead engine does not make the window parked: its own command may
+        # still be running (an interactive resolve, a run before its engine
+        # wrote engine.pid). The park banner is the evidence it exited (#876;
+        # parked_screen has the ceiling); a screen that cannot be read keeps the
+        # window and says so.
+        try:
+            parked = parked_screen(mux.capture_pane(win_id))
+        except (MultiplexerError, UnicodeError) as e:
+            undetermined.append((name, str(e)))
+            continue
+        if parked:
+            candidates.append((win_id, name))
+    return candidates, undetermined
 
 
-def prunable_ctl_windows(project: Path) -> list[str]:
-    """Names of the control-session windows a prune would close (dry-run view)."""
-    return [name for _, name in _ctl_window_candidates(project)]
+def prunable_ctl_windows(project: Path) -> tuple[list[str], list[Undetermined]]:
+    """Names of the control-session windows a prune would close (dry-run view),
+    and the windows the scan kept undetermined (see _ctl_window_candidates)."""
+    candidates, undetermined = _ctl_window_candidates(project)
+    return [name for _, name in candidates], undetermined
 
 
-def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
+def prune_ctl_windows(
+    project: Path,
+) -> tuple[list[str], list[str], list[str], list[Undetermined]]:
     """Close parked control-session windows whose run is no longer live; returns
-    (removed, survived, unverifiable) window names (see _ctl_window_candidates).
-    A three-list tuple like runs.prune_sessions, but do NOT read the arms across:
+    (removed, survived, unverifiable) window names (see _ctl_window_candidates)
+    and, fourth and outside that partition, the windows the scan kept open
+    undetermined — never killed, so they belong to no kill outcome.
+    The three lists are like runs.prune_sessions, but do NOT read the arms across:
     that one partitions BEFORE its kills, so its `killed` is still an attempted
     kill, its `live` is "deliberately not touched" rather than "survived", and its
     `unknown` is a pid question and a SUBSET of `killed`. These three are disjoint
@@ -986,9 +1017,9 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     phantom survivor for every future sweep to re-report.
     """
     mux = get_multiplexer()
-    candidates = _ctl_window_candidates(project)
+    candidates, undetermined = _ctl_window_candidates(project)
     if not candidates:
-        return [], [], []
+        return [], [], [], undetermined
     for win_id, _name in candidates:
         # kill_window is best-effort and reports nothing; a strict-POSIX decode
         # fault of the kill's own capture escapes its swallow tuple (#380) but
@@ -1006,10 +1037,10 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     except MultiplexerError:
         # The kills may well have landed; nothing here can say so. Claiming the
         # optimistic half is exactly the bug — the next cleanup pass retries.
-        return [], [], [name for _win_id, name in candidates]
+        return [], [], [name for _win_id, name in candidates], undetermined
     removed = [name for win_id, name in candidates if win_id not in live]
     survived = [name for win_id, name in candidates if win_id in live]
-    return removed, survived, []
+    return removed, survived, [], undetermined
 
 
 def ctl_session(project: Path) -> str:

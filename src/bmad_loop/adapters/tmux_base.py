@@ -37,7 +37,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .multiplexer import MultiplexerError, TerminalMultiplexer, fold_version
+from .multiplexer import PARKED_BANNER, MultiplexerError, TerminalMultiplexer, fold_version
 
 TMUX_TIMEOUT_S = 30
 # Per-window option value (vs a pane target) telling the parked trailer to detach
@@ -498,7 +498,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # client to where it came from.
         source = self._source_prefix() + (
             f"{self._join_argv(argv)}; {self._EXIT_CAPTURE}; "
-            f'{self._ECHO} "[bmad-loop exited $ec — press enter]"; '
+            f'{self._ECHO} "{PARKED_BANNER.format(ec="$ec")}"; '
             f"{self._PARK}; {self._parked_trailer(return_opt)}"
         )
         return self._tmux(

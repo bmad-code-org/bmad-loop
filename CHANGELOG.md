@@ -57,6 +57,13 @@ breaking changes may land in a minor release.
   from the pane's `PATH` no longer silently skips the client return and leaks the
   return-target key (#877).
 
+### Fixed
+
+- Keep `cleanup` (and the TUI's cleanup) from closing a control window whose command
+  is still running, such as an interactive `resolve` of a paused run: a window is
+  closed only once its screen shows the park banner. A window whose screen cannot be
+  read stays open and is reported (`ctl_windows.undetermined` in `--json`) (#876).
+
 ## [0.13.2] — 2026-10-09
 
 ### Added
