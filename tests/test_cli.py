@@ -20038,6 +20038,30 @@ def test_plugins_accept_lists_changed_files_then_repins(project, capsys):
     assert _stored_grants(project)[TRUST_PLUGIN]["digest"] == read_tree(pdir).digest
 
 
+def test_plugins_enable_refuses_a_manifest_swapped_after_discovery(project, capsys, monkeypatch):
+    """The grant pins the manifest the operator's discovery parsed: a plugin.toml
+    swapped in between that discovery and the hash is refused, never granted —
+    the launch-side bind would only compare the swapped manifest with itself.
+
+    ABLATION: grant from a bare `read_tree` in `_plugins_grant` and the swapped
+    manifest's bytes are stored as the grant."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    pdir = _plugins_project(project)
+    manifest = pdir / "plugin.toml"
+    swapped = manifest.read_text(encoding="utf-8").replace("hook.py", "evil.py")
+    real = registry_mod.read_tree
+
+    def swap_then_read(root, **kw):
+        manifest.write_text(swapped, encoding="utf-8")
+        return real(root, **kw)
+
+    monkeypatch.setattr(registry_mod, "read_tree", swap_then_read)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 1
+    assert "changed while it was being verified" in capsys.readouterr().err
+    assert not runs.plugin_grants_path(project.project).exists()
+
+
 def test_plugins_accept_unchanged_is_a_noop(project, capsys):
     """Accepting a plugin whose bytes still match its grant rewrites nothing.
 

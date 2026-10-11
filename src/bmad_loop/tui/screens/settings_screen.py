@@ -52,10 +52,9 @@ from ... import bmadconfig
 from ... import policy as policy_mod
 from ... import runs
 from ...plugins import store
-from ...plugins.digest import read_tree
 from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet
 from ...plugins.model import PluginError
-from ...plugins.registry import preflight
+from ...plugins.registry import preflight, read_bound_tree
 from ...policy import POLICY_FILE
 from ...settings_schema import PluginInfo, SettingSpec, build_registry
 from ..settings import PolicyDoc
@@ -605,7 +604,7 @@ class SettingsScreen(Screen[None]):
                     return f'plugin "{name}" is no longer discovered under {self._root}'
                 manifest, rel = found[name]
                 try:
-                    tree = read_tree(Path(manifest.scripts_dir))
+                    tree = read_bound_tree(manifest)
                 except PluginError as e:
                     return str(e)
                 grants = store.upsert(grants, GrantRecord.from_tree(name, rel, tree, granted_at))

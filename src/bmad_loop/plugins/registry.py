@@ -174,17 +174,25 @@ def _bind_manifest(m: PluginManifest, tree: VerifiedTree) -> None:
         )
 
 
+def read_bound_tree(m: PluginManifest) -> VerifiedTree:
+    """`read_tree` of ``m``'s dir, refused unless its hashed ``plugin.toml`` is
+    ``m`` (`_bind_manifest`). The one read for every path that grants a tree or
+    runs one: a grant written from an unbound read would pin a manifest swapped
+    in after the operator's discovery, and the launch-side bind would then only
+    compare that manifest with itself."""
+    tree = read_tree(Path(m.scripts_dir))
+    _bind_manifest(m, tree)
+    return tree
+
+
 def _memo_tree(m: PluginManifest) -> Callable[[], VerifiedTree]:
-    """A `read_tree` thunk that reads the dir at most once, so the tree the
-    verdict compared is the very tree the snapshot copies and exec compiles —
-    and that refuses a tree whose manifest is not ``m`` (`_bind_manifest`)."""
+    """A `read_bound_tree` thunk that reads the dir at most once, so the tree the
+    verdict compared is the very tree the snapshot copies and exec compiles."""
     cache: list[VerifiedTree] = []
 
     def live() -> VerifiedTree:
         if not cache:
-            tree = read_tree(Path(m.scripts_dir))
-            _bind_manifest(m, tree)
-            cache.append(tree)
+            cache.append(read_bound_tree(m))
         return cache[0]
 
     return live

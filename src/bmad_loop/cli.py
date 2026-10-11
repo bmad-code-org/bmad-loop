@@ -1675,9 +1675,9 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
     changed one). Hashes the plugin dir — never imports or runs it — and records
     the digest in the out-of-tree store. Never writes policy.toml."""
     from .plugins import store
-    from .plugins.digest import diff_files, read_tree
+    from .plugins.digest import diff_files
     from .plugins.grants import TRUSTED_SOURCES, GrantRecord, TrustState, needs_grant
-    from .plugins.registry import preflight
+    from .plugins.registry import preflight, read_bound_tree
 
     grants = _load_grants_for_write(project)
     if grants is None:
@@ -1725,7 +1725,7 @@ def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int
         )
         return ExitCode.FAILURE
 
-    tree = read_tree(Path(m.scripts_dir))  # a PluginError is main()'s `error:` rc 1
+    tree = read_bound_tree(m)  # a PluginError is main()'s `error:` rc 1
     if record is not None:
         if record.path != rel:
             print(f"moved: {record.path} -> {rel}")

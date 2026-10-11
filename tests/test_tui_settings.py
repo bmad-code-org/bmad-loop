@@ -843,6 +843,36 @@ async def test_toggle_on_records_a_grant_after_a_successful_save(project):
     assert policy_mod.load(project.project / POLICY_FILE).plugins.enabled == ()
 
 
+async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, monkeypatch):
+    """The save's grant binds the manifest its discovery parsed: a plugin.toml
+    swapped in before the hash blocks the save instead of granting those bytes.
+
+    ABLATION: grant from a bare `read_tree` in `_candidate_grants` and the
+    swapped manifest is stored as the grant."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    write_policy(project)
+    pdir = write_hook_plugin(project.project)
+    manifest = pdir / PLUGIN_FILE
+    swapped = manifest.read_text(encoding="utf-8") + "# swapped\n[hooks.post_run]\ncmd = 'x'\n"
+    real = registry_mod.read_tree
+
+    def swap_then_read(root, **kw):
+        manifest.write_text(swapped, encoding="utf-8")
+        return real(root, **kw)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        monkeypatch.setattr(registry_mod, "read_tree", swap_then_read)
+        screen.query_one("#plugin-enabled-hooky", Switch).value = True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: "changed while it was being verified" in _errors(screen))
+        assert isinstance(app.screen, SettingsScreen)  # save blocked
+
+    assert store.load_grants(project.project).get("hooky") is None
+
+
 async def test_failed_validate_records_no_grant(project):
     """A save the validate round-trip blocks writes nothing — neither policy.toml
     nor the grant the toggle asked for.
