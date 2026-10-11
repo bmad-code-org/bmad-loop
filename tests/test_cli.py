@@ -17292,6 +17292,29 @@ def test_dry_run_banner_names_a_fatal_plugin_refusal(project, monkeypatch, capsy
     assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in err
 
 
+def test_dry_run_banner_names_a_grant_whose_plugin_vanished(project, capsys):
+    """A grant no discovered plugin claims is fatal at launch (`grants.unclaimed`)
+    with no per-manifest verdict, so the banner must read it too.
+
+    ABLATION: drop the `unclaimed` arm of `_fatal_trust_messages` and this fails —
+    no banner."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pdir = _plugins_project(project)
+    assert _plugins(project, "enable", TRUST_PLUGIN) == 0
+    shutil.rmtree(pdir)
+    capsys.readouterr()
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert f"`bmad-loop plugins revoke {TRUST_PLUGIN}`" in err
+
+
 @pytest.mark.parametrize("how", ["deleted", "partial"])
 def test_auto_sweep_refuses_a_broken_sweep_skill_before_started(project, monkeypatch, how):
     """DW-367: the auto-sweep child dispatches `/bmad-loop-sweep` from the triage

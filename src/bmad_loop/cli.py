@@ -427,6 +427,20 @@ def _launch_plugin_grants(project: Path) -> GrantSet:
     return grants
 
 
+def _fatal_trust_messages(verdicts, grants: GrantSet) -> list[str]:
+    """Every fatal plugin-trust refusal in a `registry.preflight` result: each fatal
+    per-manifest verdict, then each grant no discovered plugin claims
+    (`grants.unclaimed`). Shared by the launch preflight and the dry-run banner so
+    the preview refuses on exactly what the real launch does."""
+    from .plugins.grants import fatal_message, missing_message, unclaimed
+
+    fatal = [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+    fatal += [
+        missing_message(r.name, r.path) for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return fatal
+
+
 def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) -> int | None:
     """Refuse a launch whose plugins the registry gate would refuse fatally, before
     the launch's first side effect (#496/#497).
@@ -442,7 +456,7 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
     its own, so a path that skips this (or a plugin that changes after it) is still
     refused."""
     from .plugins import PluginError
-    from .plugins.grants import TrustState, fatal_message, missing_message, unclaimed
+    from .plugins.grants import TrustState
     from .plugins.registry import preflight
 
     try:
@@ -450,10 +464,7 @@ def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) 
     except PluginError as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
-    fatal = [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
-    fatal += [
-        missing_message(r.name, r.path) for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
-    ]
+    fatal = _fatal_trust_messages(verdicts, grants)
     for message in fatal:
         print(f"error: {message}", file=sys.stderr)
     if fatal:
@@ -1961,14 +1972,14 @@ def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
     """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
     banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
     from .plugins import PluginError, store
-    from .plugins.grants import fatal_message
     from .plugins.registry import preflight
 
+    grants = store.load_grants(paths.project)
     try:
-        verdicts = preflight(paths.repo_root, pol, store.load_grants(paths.project))
+        verdicts = preflight(paths.repo_root, pol, grants)
     except PluginError as e:
         return [str(e)]
-    return [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+    return _fatal_trust_messages(verdicts, grants)
 
 
 def _warn_preflight_would_abort(
