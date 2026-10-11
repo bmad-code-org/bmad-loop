@@ -50,6 +50,13 @@ breaking changes may land in a minor release.
 - Fail startup when a granted project plugin loses its whole executable surface or its
   dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
 
+### Fixed
+
+- psmux: run the parked-window trailer's psmux calls through the absolute path
+  bmad-loop resolved, not by bare name on the pane's `PATH`, so a psmux missing
+  from the pane's `PATH` no longer silently skips the client return and leaks the
+  return-target key (#877).
+
 ## [0.13.2] — 2026-10-09
 
 ### Added

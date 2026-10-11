@@ -54,14 +54,17 @@ PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks
 
 # The real resolver, captured before conftest pins it for every test.
 _REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
+_REAL_PSMUX_PATH = PsmuxMultiplexer._psmux_path
 
 
 @pytest.fixture(autouse=True)
 def _probe_the_real_pwsh(monkeypatch):
     """Drop conftest's pinned pwsh path and seeded PowerShell answer, so every
     window launch here resolves the installed pwsh and runs the backend's real
-    version probe against it."""
+    version probe against it. The parked-window trailer's psmux path likewise
+    resolves the installed psmux."""
     monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
+    monkeypatch.setattr(PsmuxMultiplexer, "_psmux_path", _REAL_PSMUX_PATH)
     monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
 
 
@@ -903,6 +906,89 @@ def test_a_pinned_pwsh_path_with_shell_syntax_launches_and_pipes(probe, tmp_path
             if "pinnedprobe" in text:
                 break
         assert "pinnedprobe" in text, f"no pane bytes through the pinned sink: {text[:200]!r}"
+    finally:
+        os.rmdir(link)  # the junction only, never the install it points at
+
+
+def test_a_parked_trailer_runs_the_pinned_psmux_off_the_pane_path(probe, tmp_path, monkeypatch):
+    """The parked-window trailer calls the absolute psmux the backend resolved,
+    not whatever the pane's PATH finds (#877): psmux builds a pane's PATH from
+    the registry (psmux/psmux#773), so a psmux reachable only through the
+    launching shell's PATH is missing in the pane. Here the pane's PATH is cut
+    to System32, and the pinned path is a junction holding a space, an
+    apostrophe and a doubled space onto the directory of the running server's
+    own image. The trailer's last verb frees the return-target key, and every
+    trailer error goes to $null, so the key going away is the proof that the
+    pinned psmux ran; a bare `psmux` finds nothing and leaves it set."""
+    mux, session, _windows = probe
+    listing = _powershell(
+        "Get-CimInstance Win32_Process -Filter \"Name='psmux.exe'\" | "
+        'ForEach-Object { "$($_.ExecutablePath)`t$($_.CommandLine)" }'
+    )
+    images = {
+        image
+        for image, _, cmdline in (line.partition("	") for line in listing.splitlines())
+        if _server_session_of(cmdline) == session
+    }
+    assert len(images) == 1, f"probe setup: no single server image for {session}: {images}"
+    installed = Path(images.pop())
+    link = tmp_path / "pinned psmux's  dir"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(installed.parent)],
+        capture_output=True,
+        text=True,
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert made.returncode == 0, f"probe setup: junction failed: {made.stderr.strip()!r}"
+    try:
+        pinned = str(link / installed.name)
+        monkeypatch.setattr(mux, "_psmux_path", lambda: pinned)
+        system32 = os.path.join(os.environ["SystemRoot"], "System32")
+        prefix = mux._source_prefix()
+        monkeypatch.setattr(
+            mux,
+            "_source_prefix",
+            lambda: prefix + f"$env:PATH = {psmux_backend._pwsh_quote(system32)}; ",
+        )
+        before = set(mux.list_window_ids(session))
+        pwsh = _REAL_PWSH_PATH(mux)
+        mux.new_parked_window(
+            session, "pinned-psmux", tmp_path, [pwsh, "-NoProfile", "-Command", "exit 0"], "@r"
+        )
+        created = set(mux.list_window_ids(session)) - before
+        assert len(created) == 1, f"probe setup: window mint not observable: {sorted(created)}"
+        window = created.pop()
+        mux.set_window_option(window, "@r", "detach")
+        key = mux._scoped_option_key("@r", window.rsplit("@", 1)[1])
+        # A positive witness in every listing that counts: a failed read (None)
+        # or psmux's empty-with-success listing would otherwise read as the key
+        # freed without the trailer ever running.
+        witness = "@pinned_psmux_witness"
+        proc = mux._run(["set-option", "-t", session, witness, "present"], check=False)
+        assert proc.returncode == 0, f"probe setup: witness: {proc.stderr.strip()!r}"
+
+        def listing() -> dict[str, str] | None:
+            options = mux._scoped_options(session)
+            return options if options and options.get(witness) == "present" else None
+
+        options = listing()
+        assert options is not None and options.get(key) == "detach", "probe setup: key unset"
+        # Answer the park only once the window is parked on it.
+        deadline = time.monotonic() + 15
+        screen = ""
+        while "press enter" not in screen and time.monotonic() < deadline:
+            time.sleep(0.25)
+            screen = mux._run(["capture-pane", "-p", "-t", window], check=False).stdout
+        assert "press enter" in screen, f"probe setup: window never parked: {screen[-300:]!r}"
+        sent = mux._run(["send-keys", "-t", window, "Enter"], check=False)
+        assert sent.returncode == 0, f"probe setup: send-keys: {sent.stderr.strip()!r}"
+        deadline = time.monotonic() + 15
+        options = listing()
+        while (options is None or key in options) and time.monotonic() < deadline:
+            time.sleep(0.25)
+            options = listing()
+        assert options is not None, "no witnessed option listing after the park was answered"
+        assert key not in options, "the trailer's psmux did not run: the return key is still set"
     finally:
         os.rmdir(link)  # the junction only, never the install it points at
 

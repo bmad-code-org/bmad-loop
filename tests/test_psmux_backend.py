@@ -11,7 +11,7 @@ import re
 import subprocess
 
 import pytest
-from conftest import PINNED_PWSH
+from conftest import PINNED_PSMUX, PINNED_PWSH
 
 from bmad_loop.adapters import multiplexer, psmux_backend, tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, get_multiplexer
@@ -21,6 +21,7 @@ from bmad_loop.adapters.tmux_base import TmuxError
 
 # The real resolver, captured before conftest pins it for every test.
 _REAL_PWSH_PATH = PsmuxMultiplexer._pwsh_path
+_REAL_PSMUX_PATH = PsmuxMultiplexer._psmux_path
 
 
 class _RecordRun:
@@ -562,11 +563,13 @@ def test_parked_window_composes_pwsh_source(rec, tmp_path):
         'Write-Host "[bmad-loop exited $ec — press enter]"; Read-Host; ' in source
     )
     # trailer: same tmux-family verbs as the POSIX one, pwsh control flow,
-    # issued through the psmux binary. The read is session-scoped and keyed by
-    # the window id the trailer probes for itself (#310) — `-wqv` is dead here.
+    # issued through the pinned psmux path (#877), quoted for its space and
+    # apostrophe. The read is session-scoped and keyed by the window id the
+    # trailer probes for itself (#310) — `-wqv` is dead here.
+    mux = "& " + psmux_backend._pwsh_quote(PINNED_PSMUX)
     assert "-wqv" not in source
     assert (
-        '$wid = "$(psmux display-message -p -t $env:TMUX_PANE'
+        f'$wid = "$({mux} display-message -p -t $env:TMUX_PANE'
         " '#{window_id}' 2>$null)\".Trim(); " in source
     )
     assert "if ($wid) { " in source
@@ -576,11 +579,37 @@ def test_parked_window_composes_pwsh_source(rec, tmp_path):
     marker = PsmuxMultiplexer._SCOPE_MARKER
     assert marker.endswith("@")
     assert f"$key = '%3{marker[:-1]}' + $wid; " in source
-    assert '$ret = "$(psmux show-options -qv $key 2>$null)".Trim(); ' in source
-    assert "if ($ret -eq 'detach') { psmux detach-client 2>$null }" in source
-    assert "psmux switch-client -t $ret 2>$null" in source
-    assert "psmux switch-client -l 2>$null" in source
-    assert "psmux set-option -u $key 2>$null" in source
+    assert f'$ret = "$({mux} show-options -qv $key 2>$null)".Trim(); ' in source
+    assert f"if ($ret -eq 'detach') {{ {mux} detach-client 2>$null }}" in source
+    assert f"{mux} switch-client -t $ret 2>$null" in source
+    assert f"{mux} switch-client -l 2>$null" in source
+    assert f"{mux} set-option -u $key 2>$null" in source
+    # Every psmux call is the pinned one: none rides the pane's PATH.
+    trailer = source[source.index("$wid = ") :]
+    assert trailer.count(mux) == 6
+    assert re.search(r"\bpsmux ", trailer) is None
+
+
+def test_trailer_pins_the_psmux_which_resolves(monkeypatch, tmp_path):
+    # The real resolver: the absolute path `available` admits the backend on,
+    # whatever the pane's own PATH would find.
+    monkeypatch.setattr(PsmuxMultiplexer, "_psmux_path", _REAL_PSMUX_PATH)
+    found = str(tmp_path / "it's a dir" / "psmux.exe")
+    monkeypatch.setattr(
+        psmux_backend.shutil, "which", lambda name: found if name == "psmux" else None
+    )
+    trailer = PsmuxMultiplexer()._parked_trailer("@r")
+    pinned = "& " + psmux_backend._pwsh_quote(found) + " "
+    assert "''s a dir" in pinned
+    assert trailer.count(pinned) == 6
+
+
+def test_trailer_falls_back_to_the_bare_name_when_psmux_does_not_resolve(monkeypatch):
+    # No refusal: the call operator on the bare name is today's PATH lookup.
+    monkeypatch.setattr(PsmuxMultiplexer, "_psmux_path", _REAL_PSMUX_PATH)
+    monkeypatch.setattr(psmux_backend.shutil, "which", lambda name: None)
+    trailer = PsmuxMultiplexer()._parked_trailer("@r")
+    assert trailer.count("& 'psmux' ") == 6
 
 
 # ------------------------------------------------------------------ pipe_pane
