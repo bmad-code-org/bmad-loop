@@ -39,7 +39,9 @@ operator's already-open Editor + MCP are up. **`per_worktree` is IvanMurzak-only
 the bundled plugin**, because its per-path port derivation gives each worktree's
 Editor its own server with no manual wiring. For CoplayDev's single-shared-server
 model, point `worktree_setup_cmd` / `worktree_teardown_cmd` at your own scripts
-(override the plugin under `.bmad-loop/plugins/unity/`), or use `shared` mode.
+(override the plugin under `.bmad-loop/plugins/unity/` and grant the copy with
+`bmad-loop plugins enable unity` — `[plugins] enabled` does not cover a project
+override), or use `shared` mode.
 
 ## Writing an MCP-agnostic readiness probe
 
@@ -64,7 +66,9 @@ non-zero otherwise** (which defers the unit). Within that, a few things matter:
 > CLI subcommand names and MCP endpoints move between releases. Keep the
 > version-specific bits in the plugin (and document the version you verified
 > against), so an operator can override `ready_cmd` under `.bmad-loop/plugins/<name>/`
-> when their installed version differs.
+> when their installed version differs. The override is a project plugin: grant it
+> with `bmad-loop plugins enable <name>`, and re-run `bmad-loop plugins accept <name>`
+> after each edit, or the next launch fails.
 
 ## `per_worktree` isolation (IvanMurzak)
 

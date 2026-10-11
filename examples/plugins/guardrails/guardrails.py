@@ -5,7 +5,7 @@ extension point a plugin author is likely to use:
 
   * **a setting** — declared in plugin.toml as ``[[settings]]`` and read here via
     ``self.settings`` (manifest defaults overlaid by ``[plugins.guardrails]`` in
-    policy.toml). It renders in the settings TUI once the plugin is enabled.
+    policy.toml). It renders in the settings TUI once the plugin is granted.
   * **an observe hook** — ``on_pre_story`` reads the read-only context and records
     a running count in the cross-stage ``ctx.shared`` dict, which the engine
     persists in ``RunState.plugin_shared`` so it survives pause/resume.

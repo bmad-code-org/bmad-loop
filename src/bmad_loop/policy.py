@@ -1593,11 +1593,14 @@ seed_adapter_defaults = true # seed each loaded adapter's default gitignored con
 worktree_seed = []           # extra gitignored files to copy into each worktree, on top of adapter defaults
 
 [plugins]
-# Plugin trust allowlist. A plugin dropped under .bmad-loop/plugins/<name>/ loads
-# its declarative manifest (settings + out-of-process shell hooks) automatically.
-# A plugin that ships an in-process [python] module is NEVER imported or run
-# unless its name is listed here. Empty = no plugins trusted (today's behavior).
-enabled = []                 # e.g. ["unity", "my-lint-plugin"]
+# Trust allowlist for BUILTIN plugins: a shipped plugin's in-process [python]
+# module is imported only when its name is listed here. Empty = none trusted.
+# A project plugin under .bmad-loop/plugins/<name>/ with hooks, workflows, seeds
+# or [python] is NOT enabled here: it runs only under a content grant recorded
+# outside this file with `bmad-loop plugins enable <name>` (re-pin a changed one
+# with `bmad-loop plugins accept <name>`). Until granted it is inert; a project
+# plugin named here without a grant fails startup. Settings-only plugins load freely.
+enabled = []                 # e.g. ["unity"]
 
 # The game-engine layer is a plugin. For a Unity project whose dev/sweep cycle
 # drives a live Editor via an Editor MCP, enable it above and configure it here:

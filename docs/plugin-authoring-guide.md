@@ -10,8 +10,11 @@ Unity game-engine layer. A plugin can:
 
 Plugins are **folder-drop**: a directory with a `plugin.toml` manifest (plus any
 helper scripts) dropped under `.bmad-loop/plugins/<name>/`. No registration, no
-install step. A plugin that ships **in-process Python** is loaded only when you
-**trust** it by name — dropping a folder in never runs code.
+install step. Dropping a folder in **never runs code**: a project plugin with
+anything executable — shell hooks, workflows, seeds, or in-process Python — runs
+only after you **grant** it with `bmad-loop plugins enable <name>`, which records
+a sha256 of the whole plugin directory outside the repo. See
+[Trust & safety](#trust--safety).
 
 > Already wrote a [CLI adapter profile](../README.md#other-coding-clis) or the old
 > `[engine]` block? Same idea — declarative TOML + optional scripts, discovered and
@@ -37,21 +40,37 @@ key = "greeting"
 type = "str"
 default = "hi"
 label = "Greeting"
-help = "Shown in the settings UI once this plugin is enabled."
+help = "Shown in the settings UI."
 ```
 
 That's a complete, loadable plugin. It has no `[hooks]` and no `[python]`, so it
 runs no code and is byte-identical to "no plugin" at run time — it exists only to
 contribute a setting. This is the shape the bundled
 [`example`](../src/bmad_loop/data/plugins/example/plugin.toml) plugin ships in.
+A settings-only plugin needs no grant: it loads as soon as it is discovered, and
+its section always shows in the settings TUI.
 
-A setting-only section appears in the TUI only once the plugin is **enabled**:
+Now give it behavior. Append a hook:
 
 ```toml
-# .bmad-loop/policy.toml
-[plugins]
-enabled = ["hello"]
+[hooks.pre_story]
+cmd = 'python3 "{scripts}/hello.py"'
 ```
+
+and add `.bmad-loop/plugins/hello/hello.py` beside the manifest. The plugin now
+has an executable surface, so it is **inert until you grant it**. The next
+`bmad-loop run` prints a `note:` that `hello` is not granted, and runs without
+it. Review the folder, then grant it:
+
+```console
+$ bmad-loop plugins enable hello
+plugin "hello" granted: sha256:3f9a1c0b7d2e (2 files) in ~/.local/state/bmad-loop/<project-tag>/plugin-grants.json
+```
+
+The grant pins the bytes of every file in the folder. Edit any of them and the
+next launch stops with `plugin "hello" changed since it was granted`. Review the
+change, then re-pin it with `bmad-loop plugins accept hello`. `bmad-loop plugins`
+lists every discovered plugin with its grant status.
 
 ---
 
@@ -69,6 +88,13 @@ same-name plugin **overrides** an earlier one; a new name **extends** the set):
 Each plugin lives in its **own directory** — that directory is the plugin's
 `{scripts}` root (see [`{scripts}` substitution](#scripts-substitution)), so its
 manifest and helper scripts sit together.
+
+**Origin decides trust.** Builtin plugins (and, once they exist, entry-point
+plugins) are trusted by provenance: they ship with the installed package. A
+project-local plugin lives in the agent-writable repo, so it runs only under an
+operator grant (see [Trust & safety](#trust--safety)). A project plugin that
+overrides a builtin name gets no trust from the builtin: the override needs its
+own grant, and a refused override does **not** fall back to the builtin.
 
 **Entry points are a documented future seam.** `discover()` already yields an
 `entry_point` source between builtin and project, but `_discover_entry_points()`
@@ -143,8 +169,10 @@ module = "hooks.py"        # plugin-relative file
 class = "MyPlugin"         # subclass of bmad_loop.plugins.Plugin (default "Plugin")
 ```
 
-Declaring `[python]` makes the **whole plugin trust-gated**: the module is never
-imported unless the plugin is in `[plugins] enabled`. See [Trust](#trust--safety).
+The module is never imported until the plugin is trusted: a **builtin** by naming
+it in `[plugins] enabled`, a **project** plugin by granting it with
+`bmad-loop plugins enable <name>`. An un-enabled builtin `[python]` plugin is
+wholly inert (its hooks, workflows and seeds too). See [Trust](#trust--safety).
 
 ### `[workflows.<name>]` — provided workflows
 
@@ -172,27 +200,106 @@ that breaks across machines or between a builtin and a project-local copy.
 
 ## Trust & safety
 
-There are **two trust tiers**, by design:
+Trust is decided by **origin** and pinned by **content** (#496, #497). A name is
+not trusted on its own: a folder can be swapped under a name that was approved
+before.
 
-1. **Declarative tier (always runs).** A data-only or declarative plugin —
-   settings + `[hooks.<stage>]` shell commands — loads and runs as soon as it is
-   discovered. This is the same risk surface as the old `engine.toml *_cmd` hooks
-   or a project's verify commands: operator-authored shell, trusted by virtue of
-   living in the repo.
-
-2. **In-process tier (trust-gated).** A plugin that declares a `[python]` module
-   is **never imported or executed** unless its `name` is in:
+1. **Builtin and entry-point plugins — trusted by provenance.** They ship inside
+   the installed package. Their manifests, settings and declarative hooks load
+   when discovered. A builtin that declares an in-process `[python]` module runs
+   only when its name is in:
 
    ```toml
    [plugins]
-   enabled = ["my-plugin"]
+   enabled = ["unity"]
    ```
 
-   **Dropping a `[python]` plugin folder in never runs its code.** The module
-   (and anything it provides that depends on the module — its `on_<stage>`
-   handlers, its `validate`, and its provided **workflows**) stays inert until you
-   list it. An un-enabled `[python]` plugin is recorded `plugin-untrusted` in the
-   run journal.
+   An un-enabled builtin `[python]` plugin is **wholly inert**: its module, its
+   `[hooks.*]`, its workflows and its seeds all stay off, and the run's
+   `plugins-active` journal line leaves it out.
+
+2. **Project plugins (`.bmad-loop/plugins/<name>/`) — trusted by content grant.**
+   A project plugin with an **executable surface** runs only after the operator
+   grants it. An executable surface is any of: `[hooks.*]`, `[workflows.*]`,
+   `[python]`, `seed_files` or `seed_globs`. A settings-only project plugin needs
+   no grant.
+
+   ```console
+   $ bmad-loop plugins                   # list plugins, origin, surface, grant status
+   $ bmad-loop plugins enable <name>     # first grant
+   $ bmad-loop plugins accept <name>     # re-pin after reviewing a change
+   $ bmad-loop plugins revoke <name>     # drop the grant
+   ```
+
+   Toggling a project plugin on in the [settings TUI](tui-guide.md) grants it too.
+
+   **What a grant is.** A sha256 over **every file in the plugin directory** (the
+   manifest, scripts, modules and dotfiles; `__pycache__` excluded), plus the
+   directory's path relative to the repo. It is stored **outside the repo**, at
+   `<state root>/<project-tag>/plugin-grants.json`, because the repo and its
+   `policy.toml` are agent-writable and a grant kept there could be forged. For a
+   project plugin the grant replaces `[plugins] enabled`: `bmad-loop plugins`
+   never writes `policy.toml`. Grants are per machine and keyed by the project
+   path.
+
+   **What a launch does.** `bmad-loop run`, `sweep` and `resume` each read the
+   grants **once**, judge every plugin before their first side effect,
+   and hand the same frozen grants to the engine and to any auto-sweep child.
+   Nothing later re-reads the store. The outcome depends on what the operator
+   intended:
+
+   | Plugin state                                                     | Outcome                                                                                            |
+   | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+   | never granted, not in `[plugins] enabled`                        | **inert**: a `note:` at launch, a `plugin-refused` journal row, the run goes on without it         |
+   | named in `[plugins] enabled` but never granted                   | **startup fails**; the error points to `bmad-loop plugins enable <name>`                           |
+   | granted, then a file added, removed or changed, or the dir moved | **startup fails** (`changed since it was granted`); review, then `bmad-loop plugins accept <name>` |
+   | granted dir unreadable (a link inside it, over a cap)            | **startup fails**; fix the dir, then `bmad-loop plugins accept <name>`                             |
+   | granted and unchanged                                            | runs from a verified snapshot                                                                      |
+
+   A fatal refusal is raised before **any** plugin code runs, builtins included.
+   In an auto-sweep child it lands as `sweep-auto-not-started` plus a
+   notification. Nothing on a run, sweep or child path ever prompts: a refusal
+   never turns into a stall waiting for an answer.
+
+   **Snapshot execution.** A granted plugin does not run from its live folder. At
+   launch its verified files are copied to a content-addressed snapshot under
+   `<state root>/<project-tag>/_plugin-snapshots/<digest>/`, and that copy
+   becomes its `{scripts}` root. A `[python]` module is compiled from the exact
+   bytes the grant hashed; no `.pyc` is read or written. A session that edits
+   the live plugin folder mid-run therefore changes nothing until the next launch,
+   which refuses the edit. Hooks run with `PYTHONDONTWRITEBYTECODE=1`.
+
+   **Limits.** The plugin directory itself may be a symlink, but links (and
+   Windows junctions) inside it are refused. Caps: 2048 files, 16 MiB per file,
+   64 MiB total.
+
+   `bmad-loop validate` reports every refusal under the `plugins.trust` check.
+
+**What a grant does not cover.** These residuals are known and deliberate:
+
+- **Same-user tampering outside the repo.** The store and the snapshots live in
+  the user's state directory. A process running as the same user that sets out to
+  rewrite them can. Out-of-tree moves the trust record out of reach of a session
+  editing the repo; it is not a sandbox (the same boundary as the #571 config
+  digest).
+- **Moving the project loses its grants** (#572). They are keyed by the project
+  path, so a moved or re-cloned project starts ungranted. This fails closed:
+  re-grant after a move.
+- **Files a hook names outside `{scripts}`.** A hook `cmd` that runs a script
+  elsewhere in the repo runs that script unpinned. Keep everything a hook
+  executes inside the plugin folder.
+- **Settings steer a granted plugin.** `[plugins.<name>]` settings live in
+  `policy.toml` and are not part of the grant; a granted plugin reads whatever
+  values are there at launch.
+- **Builtin provenance follows the install.** In an editable install (a source
+  checkout set up with `uv sync`), the builtin plugins are files in a working
+  tree, and they are still trusted as builtins.
+- **Snapshot leftovers.** An interrupted snapshot build can leave
+  `<digest>.tmp-*` or `<digest>.stale-*` directories under `_plugin-snapshots/`.
+  They are never executed unverified; deleting them is safe when no run is live.
+- **A merged story that edits a tracked plugin folder** makes the next launch
+  fail with a mismatch. That is the gate working: review the change, then
+  `bmad-loop plugins accept <name>`.
 
 **Failure isolation.** Every hook — subprocess or Python — is wrapped. A Python
 handler that raises is caught (`except Exception` only — `RunStopped`/SIGTERM as
@@ -246,15 +353,12 @@ matches the core settings fields exactly:
 | `options`   | `select`      | Non-empty list of allowed string values.         |
 | `min`/`max` | `int`/`float` | Numeric bounds (widget hints).                   |
 
-**Rendering.** Once a plugin is enabled, its settings appear as their own section
-in the settings TUI (generated from the schema — see
-`src/bmad_loop/settings_schema.py`). They persist to a `[plugins.<name>]` table in
-`policy.toml`:
+**Rendering.** A plugin's settings appear as their own section in the settings
+TUI (generated from the schema — see `src/bmad_loop/settings_schema.py`): always
+for a settings-only plugin, and once it is enabled or granted for one with
+executable surface. They persist to a `[plugins.<name>]` table in `policy.toml`:
 
 ```toml
-[plugins]
-enabled = ["my-plugin"]
-
 [plugins.my-plugin]
 strict = true
 mode = "b"
@@ -269,8 +373,10 @@ mode = "b"
 - Anywhere with a `Policy`: `policy.plugin_setting("my-plugin", "strict", default)`.
 
 Settings are **data**, not code — a plugin can carry `[plugins.<name>]` settings
-without being in `enabled` (the settings UI just won't surface a disabled plugin's
-section). Only the in-process `[python]` module is trust-gated.
+without being enabled or granted (the settings UI just won't surface an inactive
+plugin's section). The trust gate is on code, so settings are not part of a
+grant: a granted plugin reads whatever `[plugins.<name>]` values are present at
+launch.
 
 ---
 
@@ -709,9 +815,10 @@ blocking = false           # true: a non-completed session defers the unit
   token budget. Its journal entries are `workflow-start` / `workflow-end`.
 - **`blocking`**: a blocking workflow whose session doesn't complete **defers the
   unit** (through the existing defer primitive). A non-blocking one is advisory.
-- A workflow from a `[python]` plugin is **trust-gated** along with the module: it
-  fires only when the plugin is enabled. A workflow from a pure-declarative plugin
-  fires whenever the plugin is discovered.
+- A workflow is **trust-gated** with the rest of its plugin. A project plugin's
+  workflow fires only once the plugin is granted, and its `{scripts}` resolves to
+  the verified snapshot. A builtin `[python]` plugin's workflow fires only when the
+  plugin is in `[plugins] enabled`. See [Trust & safety](#trust--safety).
 
 `registry.provided_workflows()` lists declared workflow names for introspection.
 
@@ -828,18 +935,28 @@ class GuardrailsPlugin(Plugin):
             ctx.proposed_commit_message = f"{base}\n\n{trailer}" if base else trailer
 ```
 
-**4. Enable + configure** in `.bmad-loop/policy.toml`:
+**4. Configure** in `.bmad-loop/policy.toml`:
 
 ```toml
-[plugins]
-enabled = ["guardrails"]
-
 [plugins.guardrails]
 trailer = "Automated-by: bmad-loop"
 forbid_epic = 0           # set to an epic number to park it
 ```
 
-**5. Run.** On the next `bmad-loop run`:
+**5. Grant it.** Review the folder, then record its content grant:
+
+```console
+$ bmad-loop plugins enable guardrails
+plugin "guardrails" granted: sha256:<12 hex> (2 files) in <state root>/<project-tag>/plugin-grants.json
+```
+
+Do **not** add `guardrails` to `[plugins] enabled`: that list trusts builtins, and
+a project plugin named there without a grant fails startup. The settings live in
+`policy.toml`, outside the plugin folder, so changing them never invalidates the
+grant. Editing `plugin.toml` or `guardrails.py` does: the next launch stops until
+you run `bmad-loop plugins accept guardrails`.
+
+**6. Run.** On the next `bmad-loop run`:
 
 - the settings TUI shows a **guardrails** section with `trailer` + `forbid_epic`;
 - each story increments `stories_seen` in the run's `plugin_shared`;
@@ -847,8 +964,9 @@ forbid_epic = 0           # set to an epic number to park it
 - after dev lands, the **doc-sync** workflow runs an extra review-role session;
 - each commit message gets the **trailer** appended.
 
-Drop `[python]` from the manifest and `guardrails` from `enabled`, and the plugin
-goes completely inert — proof of the trust gate.
+Run `bmad-loop plugins revoke guardrails`, and the plugin goes completely inert:
+the next launch prints a `note:` and journals `plugin-refused` — proof of the
+trust gate.
 
 ---
 
@@ -906,7 +1024,11 @@ scan. See it alongside `unity_setup.py` / `unity_cleanup.py` (and the
 - Model + base class: `src/bmad_loop/plugins/model.py`
 - Manifest parser: `src/bmad_loop/plugins/manifest.py`
 - Discovery + overlay + api-check: `src/bmad_loop/plugins/loader.py`
-- Trust gate: `src/bmad_loop/plugins/trust.py`
+- Trust gate: `src/bmad_loop/plugins/trust.py` (refusals),
+  `src/bmad_loop/plugins/grants.py` (the verdict),
+  `src/bmad_loop/plugins/digest.py` (directory hashing),
+  `src/bmad_loop/plugins/store.py` (the out-of-tree grant store),
+  `src/bmad_loop/plugins/snapshot.py` (verified snapshots)
 - Registry (the inter-pillar contract): `src/bmad_loop/plugins/registry.py`
 - Hook bus + dispatch: `src/bmad_loop/plugins/bus.py`
 - Hook context + veto: `src/bmad_loop/plugins/context.py`

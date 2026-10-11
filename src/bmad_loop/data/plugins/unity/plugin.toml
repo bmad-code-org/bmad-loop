@@ -14,7 +14,10 @@
 #   mcp = "ivanmurzak"           # ivanmurzak | coplaydev
 #
 # Override per project by copying this dir to .bmad-loop/plugins/unity/ and
-# editing it (the project-local copy wins, and its dir becomes {scripts}).
+# editing it (the project-local copy wins, and its dir becomes {scripts}). A
+# project copy is not covered by [plugins] enabled: grant it with
+# `bmad-loop plugins enable unity` (and `bmad-loop plugins accept unity` after
+# each edit), or startup fails. It then runs from a verified out-of-tree snapshot.
 #
 # Scene auto-save guard: Unity-MCP GameObject tools mark scenes dirty but never
 # save, so a shared editor's scene sits chronically dirty — and that dirty state

@@ -6,13 +6,16 @@
 # It lives under examples/ (NOT src/bmad_loop/data/plugins/) on purpose: builtins
 # are auto-discovered on every run, and a builtin with active hooks would break
 # the zero-plugin "byte-identical" guarantee. To try it, copy this folder into a
-# project's .bmad-loop/plugins/ and enable it:
+# project's .bmad-loop/plugins/ and grant it:
 #
-#   [plugins]
-#   enabled = ["guardrails"]
+#   bmad-loop plugins enable guardrails
 #
-# Because it declares a [python] module it is trust-gated: dropping the folder in
-# never runs the code — only [plugins] enabled does.
+# A project plugin is trust-gated on its content: dropping the folder in never
+# runs the code. The grant records the sha256 of this whole directory outside
+# the repo; editing any file afterwards stops the next launch until you review
+# it and run `bmad-loop plugins accept guardrails`. Do not list it in
+# [plugins] enabled — that list is for builtins, and a project name there
+# without a grant fails startup.
 
 [plugin]
 name = "guardrails"
@@ -21,13 +24,14 @@ api_version = 1
 description = "Worked example: a setting, an observe hook, a veto gate, a commit-message mutation, and a provided workflow."
 author = "bmad-loop"
 
-# In-process Python brain. Trust-gated: not imported unless guardrails is in
-# [plugins] enabled. Defaults class = "Plugin"; we name our subclass explicitly.
+# In-process Python brain. Trust-gated: not imported until the plugin is granted
+# (`bmad-loop plugins enable guardrails`), and then compiled from the bytes the
+# grant hashed. Defaults class = "Plugin"; we name our subclass explicitly.
 [python]
 module = "guardrails.py"
 class = "GuardrailsPlugin"
 
-# Settings render in the settings TUI (under a "guardrails" section) once enabled
+# Settings render in the settings TUI (under a "guardrails" section) once granted
 # and persist to [plugins.guardrails] in policy.toml. The plugin reads them via
 # self.settings (manifest defaults overlaid by the operator's policy table).
 [[settings]]

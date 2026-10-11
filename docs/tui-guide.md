@@ -815,8 +815,37 @@ referenced from the policy dataclasses, never duplicated), and every **enabled**
 persisting to `[plugins.<name>]`. So the `plugins.unity.*` rows above only appear once
 `unity` is listed in `[plugins] enabled` — the opt-in layer for game projects that drive a
 live Editor through an MCP, off by default. A custom plugin dropped at
-`.bmad-loop/plugins/<name>/` surfaces the same way. See [Writing a bmad-loop
-plugin](plugin-authoring-guide.md) for the settings schema, [Writing a Game Engine
+`.bmad-loop/plugins/<name>/` surfaces once it is granted (a settings-only plugin
+needs no grant and always shows).
+
+**Project plugins: the toggle is the grant** ([#496](https://github.com/bmad-code-org/bmad-loop/issues/496), [#497](https://github.com/bmad-code-org/bmad-loop/issues/497)). In the Plugins section, a
+project plugin with an executable surface (hooks, workflows, seeds, or `[python]`)
+gets an enable switch that records or drops its **content grant** — the same
+out-of-tree sha256 grant `bmad-loop plugins enable` records — never a
+`[plugins] enabled` entry (that list is managed only for bundled `[python]`
+plugins, and any other name already in it is preserved). Its row shows the grant
+status: `granted`, `not granted`, ``changed — run `bmad-loop plugins accept <name>` ``,
+or `unreadable — …`.
+
+- **Toggle on** an ungranted plugin and save: the grant is recorded **after** the
+  save's validation passes and policy.toml is written. A failed validation writes
+  nothing. Validation builds the plugin registry with the candidate grant, so a
+  newly toggled `[python]` project plugin's module **executes during the save** —
+  that is the human-present moment you enable it.
+- **Toggle off** a granted plugin and save: the grant is revoked.
+- **An untouched toggle changes nothing.** An unrelated save never re-pins a
+  plugin whose files changed since its grant. Saves are judged against the
+  grants as stored, so a changed, unreadable, or enabled-but-ungranted plugin
+  **blocks every save** with the same message a launch would print, until you
+  run `bmad-loop plugins accept <name>` / `enable <name>` or toggle the plugin
+  off. Re-pinning a changed plugin is CLI-only.
+- If the grant store exists but can't be read, a line atop the roster says so,
+  and a save that would change a grant is refused rather than overwrite it. If
+  policy.toml saves but the grant write fails, the screen says
+  "policy saved, but the plugin grant was not recorded: …" and stays open.
+
+See [Writing a bmad-loop
+plugin](plugin-authoring-guide.md) for the settings schema and trust model, [Writing a Game Engine
 plugin](game-engine-plugin-guide.md), and [Writing a plugin for a specific Editor
 MCP](game-engine-mcp-guide.md). The Unity plugin's `editor_mode` ↔ `scm.isolation`
 coupling is validated on save, so an invalid combo (e.g. `per_worktree` with
