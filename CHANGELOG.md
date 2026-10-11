@@ -18,6 +18,9 @@ breaking changes may land in a minor release.
 - Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
   stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
   (#496, #497).
+- Add psmux live-gate tripwires for psmux#773 (pane `PATH` rebuilt from the registry),
+  psmux#775 (`show-environment NAME` ignores the name) and psmux#774 (a case-only
+  duplicate session is refused) (#879).
 
 ### Changed
 
