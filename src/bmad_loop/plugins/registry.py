@@ -44,7 +44,8 @@ from pathlib import Path, PurePath
 from . import snapshot, trust
 from .digest import VerifiedTree, read_tree
 from .grants import GrantSet, TrustState, Verdict, classify, fatal_message
-from .loader import load_plugins
+from .loader import PLUGIN_FILE, load_plugins
+from .manifest import load_manifest
 from .model import (
     HookSpec,
     LoadedPlugin,
@@ -151,14 +152,39 @@ def _rel_path(manifest: PluginManifest, project: Path | None) -> str:
         return PurePath(manifest.scripts_dir).as_posix()
 
 
-def _memo_tree(root: Path) -> Callable[[], VerifiedTree]:
+def _bind_manifest(m: PluginManifest, tree: VerifiedTree) -> None:
+    """Raise `PluginError` unless ``m`` is what the tree's own ``plugin.toml``
+    parses to.
+
+    Discovery parsed ``m`` from an earlier read than the one `read_tree` hashed,
+    and the run executes ``m``'s hooks, not the tree's: a manifest swapped in for
+    discovery and restored before the hash would pass the digest check and run
+    hooks nobody granted. Re-parsing the hashed bytes closes that window."""
+    data = next((f.data for f in tree.files if f.relpath == PLUGIN_FILE), None)
+    if data is None:
+        raise PluginError(f"plugin dir {tree.root}: no {PLUGIN_FILE} in the hashed tree")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise PluginError(f"plugin dir {tree.root}: {PLUGIN_FILE} is not valid UTF-8") from e
+    hashed = load_manifest(text, str(tree.root / PLUGIN_FILE), m.scripts_dir, origin=m.source)
+    if hashed != m:
+        raise PluginError(
+            f"plugin dir {tree.root}: {PLUGIN_FILE} changed while it was being verified"
+        )
+
+
+def _memo_tree(m: PluginManifest) -> Callable[[], VerifiedTree]:
     """A `read_tree` thunk that reads the dir at most once, so the tree the
-    verdict compared is the very tree the snapshot copies and exec compiles."""
+    verdict compared is the very tree the snapshot copies and exec compiles —
+    and that refuses a tree whose manifest is not ``m`` (`_bind_manifest`)."""
     cache: list[VerifiedTree] = []
 
     def live() -> VerifiedTree:
         if not cache:
-            cache.append(read_tree(root))
+            tree = read_tree(Path(m.scripts_dir))
+            _bind_manifest(m, tree)
+            cache.append(tree)
         return cache[0]
 
     return live
@@ -175,7 +201,7 @@ def _judge(
     judged: list[tuple[PluginManifest, Verdict, Callable[[], VerifiedTree], str]] = []
     for m in manifests:
         rel = _rel_path(m, project)
-        live = _memo_tree(Path(m.scripts_dir))
+        live = _memo_tree(m)
         verdict = classify(m, enabled=enabled, record=grants.get(m.name), rel_path=rel, live=live)
         judged.append((m, verdict, live, rel))
     return judged

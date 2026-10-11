@@ -419,6 +419,30 @@ def test_granted_module_swapped_for_a_link_is_fatal_and_never_executed(tmp_path)
     assert not marker_for(tmp_path, "escapee").exists()
 
 
+def test_manifest_swapped_back_before_the_hash_is_fatal_and_never_runs(tmp_path, monkeypatch):
+    # discovery parses an ungranted hook, then the granted manifest is restored
+    # before the tree is hashed: the digest matches, but the manifest the run
+    # would execute is not the one that was hashed.
+    # ABLATION: drop `_bind_manifest` from `_memo_tree` and the evil hook runs.
+    marker = tmp_path / "HOOK-RAN"
+    pdir = write_hook_plugin(tmp_path, "hooked", marker)
+    granted = (pdir / "plugin.toml").read_text()
+    (pdir / "evil.py").write_text(HOOK_SCRIPT.format(marker=str(marker), tag="evil"))
+    grants = grant_plugin(tmp_path, "hooked")  # evil.py is granted inert bytes
+    (pdir / "plugin.toml").write_text(granted.replace("hook.py", "evil.py"))
+    real = registry_mod.read_tree
+
+    def restore_then_read(root, **kw):
+        (pdir / "plugin.toml").write_text(granted)
+        return real(root, **kw)
+
+    monkeypatch.setattr(registry_mod, "read_tree", restore_then_read)
+    with pytest.raises(PluginTrustError, match="changed while it was being verified"):
+        reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
+        emit(reg, "pre_run", tmp_path)
+    assert not marker.exists()
+
+
 def test_legacy_engine_fold_does_not_grant_a_project_unity_override(tmp_path):
     # `[engine] name = "unity"` folds into [plugins] enabled — a name, which must
     # not vouch for a project dir that happens to carry it.
