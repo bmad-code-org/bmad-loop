@@ -4733,9 +4733,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # transition before resuming) and of the interactive session (a refusal after it
     # throws the conversation away). The post-confirm re-check below stays: a plugin
     # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
-    # launches nothing, so it is not judged. An unreadable config skips this early
-    # exit only; the resume's own config read refuses it, as before.
-    if args.resume is not False:
+    # and an abandon (DW-535: it closes the run) launch nothing, so they are not
+    # judged. An unreadable config skips this early exit only; the resume's own
+    # config read refuses it, as before.
+    if args.resume is not False and not getattr(args, "abandon", False):
         try:
             trust_paths = bmadconfig.load_paths(project)
         except (bmadconfig.BmadConfigError, OSError):

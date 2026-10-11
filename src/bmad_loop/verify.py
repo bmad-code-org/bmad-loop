@@ -6420,6 +6420,21 @@ def ref_exists(repo: Path, refname: str) -> bool:
     return rc == 0
 
 
+def list_refs(repo: Path, prefix: str) -> list[str]:
+    """The FULL refnames under the ref hierarchy ``prefix`` (e.g.
+    ``refs/attempt-preserve-dirty/``), newest committer date first. ``prefix`` must
+    end at a ``/``: for-each-ref matches a plain pattern only up to a slash, so a
+    partial last component lists nothing. Reads stdout alone, as :func:`_prune_refs` does
+    (#442). Raises :class:`GitError` when the listing fails — an empty list is
+    always a real "none"."""
+    rc, out, detail = _git_out(
+        repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname)", prefix
+    )
+    if rc != 0:
+        raise GitError(f"git for-each-ref {prefix} failed in {repo}: {detail}")
+    return [line for line in out.splitlines() if line]
+
+
 @dataclass(frozen=True)
 class _RollbackCleanupTarget:
     """One canonical, confined untracked path and its canonical prune bounds."""

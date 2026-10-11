@@ -3509,7 +3509,9 @@ def delete_run(
     from git's worktree admin after the removal, against the run's own code root
     (DW-538) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
     that leaves an entry under the run dir, or a listing that cannot say, is
-    reported through ``warn`` too; the deletion itself has already happened."""
+    reported through ``warn`` too; the deletion itself has already happened. An
+    unreadable state leaves the code root unknown: ``project`` is pruned as the
+    likely one, and ``warn`` always says the cleanup is unconfirmed."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -3545,8 +3547,17 @@ def delete_run(
         run_res = run_dir.resolve()
         retrying_rmtree(run_dir)
         if held_worktrees:
-            repo = state.code_root if state is not None else project
-            if (fault := _prune_deleted_run_worktrees(repo, run_res)) is not None:
+            if state is not None:
+                fault = _prune_deleted_run_worktrees(state.code_root, run_res)
+            else:
+                # No state, no code root: prune the usual one, but a clean listing
+                # there proves nothing for a run that recorded a `repo_root` override.
+                fault = _prune_deleted_run_worktrees(project, run_res) or (
+                    "its run state was unreadable, so the repository its worktrees "
+                    f"were registered with is unknown; if that is not {project}, run "
+                    "`git worktree prune` there"
+                )
+            if fault is not None:
                 note = f"run {run_dir.name} deleted, but {fault}"
                 if warn is None:
                     print(f"warning: {note}", file=sys.stderr)

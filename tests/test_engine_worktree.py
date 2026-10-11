@@ -12494,6 +12494,26 @@ def test_delete_warns_when_a_kept_worktree_stays_registered(project, tmp_path, m
     assert str(unit) in note and "git worktree prune" in note
 
 
+def test_delete_warns_when_the_run_state_is_unreadable(project, tmp_path, monkeypatch):
+    """An unreadable state.json leaves the code root unknown: `delete_run` still
+    prunes `project` (the usual root, so the unit is deregistered here), but a clean
+    listing there is not reported as a confirmed cleanup — the run might have
+    recorded a `repo_root` override.
+
+    Ablation: make the state-is-None arm return `_prune_deleted_run_worktrees`'s
+    result alone and `notes == []`, failing the unpack."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    (replay_dir / "state.json").write_text("{not json", encoding="utf-8")
+    notes: list[str] = []
+
+    runs.delete_run(project.project, replay_dir, warn=notes.append, force=True)
+
+    assert not replay_dir.exists()
+    assert _registered_under(project, replay_dir) == []
+    [note] = notes
+    assert "run state was unreadable" in note and "git worktree prune" in note
+
+
 def test_delete_warns_when_the_worktree_listing_fails(project, tmp_path, monkeypatch):
     """The other DW-538 degrade: a re-list git cannot answer is not "nothing left
     registered" — `warn` says so, and the delete still completes (run dir and its
@@ -12646,6 +12666,42 @@ def test_abandon_completes_when_the_worktree_is_already_gone(
         assert f"branch {task.branch} of 1-1-a no longer exists" in out
     else:
         assert f"kept on branch {task.branch}" in out
+
+
+def test_abandon_retry_recovers_the_snapshot_an_earlier_attempt_parked(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The first abandon parks uncommitted work and removes the worktree, then fails
+    its gone-check (a transient listing fault): the run stays paused. The retry takes
+    the already-gone arm, and must still journal and print the parked ref — not
+    record a clean abandon over preserved work.
+
+    Ablation: drop the `_earlier_abandon_ref` call in `abandon_replay_run` and the
+    retry journals `ref: None`."""
+    from bmad_loop import unitreplay
+
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    unit = Path(load_state(replay_dir).tasks["1-1-a"].worktree_path)
+    head = git(unit, "rev-parse", "HEAD").strip()
+    (unit / "extra-notes.txt").write_text("unsaved operator notes\n", encoding="utf-8")
+    real_gone = unitreplay._verify_worktree_gone
+
+    def flaky_gone(repo_root, wt):
+        monkeypatch.setattr(unitreplay, "_verify_worktree_gone", real_gone)
+        raise unitreplay.AbandonError("cannot list the worktrees (simulated fault)")
+
+    monkeypatch.setattr(unitreplay, "_verify_worktree_gone", flaky_gone)
+    assert _abandon(project, replay_dir, "--no-interactive") == 1
+    assert not unit.exists() and not load_state(replay_dir).finished
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0
+
+    ref = f"refs/attempt-preserve-dirty/{replay_dir.name}-{head[:8]}-abandon"
+    row = Journal(replay_dir).entries()[-1]
+    assert row["kind"] == "replay-abandoned" and row["ref"] == ref
+    assert ref in capsys.readouterr().out
+    assert load_state(replay_dir).finished
 
 
 def _bump_generation_then_confirm(replay_dir):

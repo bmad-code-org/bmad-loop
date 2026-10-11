@@ -74,7 +74,12 @@ from .journal import Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import root_identity_record, safe_segment
 from .policy import Policy
-from .workspace import discard_worktree, preserve_abandoned_unit, unit_worktrees_dir
+from .workspace import (
+    discard_worktree,
+    orphan_preserve_ref_name,
+    preserve_abandoned_unit,
+    unit_worktrees_dir,
+)
 
 
 class ReplayError(Exception):
@@ -335,8 +340,9 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
     the run's state lock (reentrant, so a caller already holding it may call this).
 
     Order: re-check → snapshot → teardown → verify gone → journal → save state. A
-    crash after the teardown leaves a paused run with no worktree; re-running abandon
-    completes it (after a crash between the journal and the save, with a second
+    crash or fault after the teardown leaves a paused run with no worktree;
+    re-running abandon completes it, recovering the snapshot ref the earlier attempt
+    parked (after a crash between the journal and the save, with a second
     ``replay-abandoned`` row). ``paths`` is the current config: ``paths.repo_root`` is the
     repository the worktree is registered with (as `WorktreeFlow.reopen_unit` reads
     it). Liveness and the task generation are the CLI caller's locked checks.
@@ -380,8 +386,11 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
             else:
                 # Gone already (a crashed earlier abandon, or removed by hand): drop
-                # any stale admin entry so the listing below can answer.
+                # any stale admin entry so the listing below can answer, and recover
+                # the snapshot an earlier attempt parked before failing after its
+                # teardown — else the journal and stdout read as a clean abandon.
                 verify.worktree_prune(repo_root)
+                ref = _earlier_abandon_ref(repo_root, state.run_id)
             _verify_worktree_gone(repo_root, wt)
             branch_kept = verify.branch_exists(repo_root, task.branch)
         except verify.GitError as e:
@@ -402,6 +411,21 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
         state.finished = True
         save_state(run_dir, state)
         return AbandonOutcome(branch=task.branch, branch_kept=branch_kept, ref=ref)
+
+
+def _earlier_abandon_ref(repo_root: Path, run_id: str) -> str | None:
+    """The newest ``-abandon`` snapshot ref `preserve_abandoned_unit` parked for
+    ``run_id``, or None. Matched against the canonical name rather than a glob, so a
+    run id that merely prefixes this one cannot lend its snapshot. Raises GitError
+    when the refs cannot be listed."""
+    prefix = orphan_preserve_ref_name(run_id, "", kind="abandon").removesuffix("-abandon")
+    for refname in verify.list_refs(repo_root, "refs/attempt-preserve-dirty/"):
+        if not refname.startswith(prefix):
+            continue
+        head = refname[len(prefix) :].removesuffix("-abandon")
+        if len(head) == 8 and refname == orphan_preserve_ref_name(run_id, head, kind="abandon"):
+            return refname
+    return None
 
 
 def _verify_worktree_gone(repo_root: Path, wt: Path) -> None:

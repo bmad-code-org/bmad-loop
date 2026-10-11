@@ -4887,6 +4887,25 @@ def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
     assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
 
 
+def test_resolve_abandon_is_not_judged_by_plugin_trust(project, monkeypatch, capsys):
+    """DW-535: `--abandon` closes the run and launches nothing — no engine, session
+    or plugin — so an ungranted enabled plugin must not strand a superseded replay.
+
+    `_resolve_abandon` is stubbed to 0, so the rc can only come from reaching it.
+    Ablation: drop the `abandon` exemption from the trust preflight in
+    `cmd_resolve` and the rc is 1 with the plugin-enable steer."""
+    install_bmad_config(project)
+    _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_resolve_abandon", lambda *a, **k: 0)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--abandon"]
+    assert cli.main(argv) == 0
+
+    assert "plugins enable" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("shape", ["inside", "sibling"])
 def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     project, monkeypatch, capsys, shape
