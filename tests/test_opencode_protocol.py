@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,26 @@ def test_v2_config_without_a_skill_tree_still_denies_every_skill(tmp_path):
     assert [r for r in rules if r["action"] == "skill"] == [
         {"action": "skill", "resource": "*", "effect": "deny"}
     ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` and `?` are not legal in Windows names")
+def test_v2_config_never_reallows_a_wildcard_skill_id(tmp_path):
+    """V2 reads `*` and `?` in a rule resource as wildcards, and the last
+    match wins: an allow for a project directory named `*` would re-allow
+    every personal and built-in skill. Such ids stay denied, and the protocol
+    names them for the spawn crumb; the plain skill is still re-allowed."""
+    skill_dir = tmp_path / ".claude" / "skills"
+    for dirname in ("*", "bmad-?", "plain-skill"):
+        _skill(skill_dir, dirname, dirname)
+
+    rules = json.loads(V2Protocol().config_content(_spec(tmp_path), skill_dir))["permissions"]
+
+    assert [r for r in rules if r["action"] == "skill"] == [
+        {"action": "skill", "resource": "*", "effect": "deny"},
+        {"action": "skill", "resource": "plain-skill", "effect": "allow"},
+    ]
+    assert V2Protocol().refused_skill_ids(skill_dir) == ["*", "bmad-?"]
+    assert V1Protocol().refused_skill_ids(skill_dir) == []
 
 
 def test_v2_decode_frame_reads_data_envelope():

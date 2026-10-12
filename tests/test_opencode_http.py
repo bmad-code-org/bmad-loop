@@ -4212,6 +4212,24 @@ def _sse_data(frame: dict) -> str:
     return "data: " + json.dumps(frame)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` is not legal in a Windows name")
+def test_v2_spawn_crumbs_refused_wildcard_skill_ids(tmp_path, v2_fake):
+    """A project skill the V2 rules cannot re-allow (its id is a wildcard) is
+    left denied, and the spawn says so — a skill that silently fails to load
+    would read as a model mistake."""
+    launcher, rec = v2_fake
+    skill = tmp_path / ".claude" / "skills" / "*"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: star\n---\n", encoding="utf-8")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "completed"))
+
+    assert result.status == "completed"
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "skill-ids-refused"]
+    assert [c["ids"] for c in crumbs] == [["*"]]
+
+
 def test_v2_completed_scenario_end_to_end(tmp_path, v2_fake, monkeypatch):
     """A 2.x `--version` picks the V2 codec and one session runs to completion
     over `/api/*`: create with the task title and the project as its location,

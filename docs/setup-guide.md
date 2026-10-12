@@ -398,7 +398,9 @@ What differs on 2.x:
   (`~/.claude/skills`, `~/.agents/skills`) and its built-in ones. The adapter keeps sessions
   hermetic with permission rules instead: every skill is denied except the project's own,
   so the model is offered only those. (`GET /api/skill` still lists every skill it found;
-  the rules govern what a session can load.)
+  the rules govern what a session can load.) A project skill whose directory name contains
+  `*` or `?` stays denied, because 2.x reads those characters as rule wildcards; the spawn
+  records a `skill-ids-refused` event in the session lifecycle log.
 - **Logs:** a provider failure (rate limit, quota, refused connection) never reaches the
   server's stdout on 2.x, so the adapter records each one in
   `<task-id>.provider-errors.log`, which the environment-fault classifier scans beside

@@ -485,6 +485,11 @@ class OpencodeProtocol:
     def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
         raise NotImplementedError
 
+    def refused_skill_ids(self, skill_dir: Path) -> list[str]:
+        """Project skill ids :meth:`config_content` left out of this
+        session's hermetic skill set — the adapter crumbs them at spawn."""
+        return []
+
     def extra_env(self) -> dict[str, str]:
         raise NotImplementedError
 
@@ -944,20 +949,36 @@ class V2Protocol(OpencodeProtocol):
         id. V2 has no ``OPENCODE_DISABLE_EXTERNAL_SKILLS``, so these rules are
         the only thing hiding the operator's personal and the built-in skills.
         ``skills`` points discovery at the project tree; ``model`` is the
-        ``"provider/model"`` string when the policy sets one."""
+        ``"provider/model"`` string when the policy sets one. An id the rule
+        matcher would read as a pattern is never re-allowed
+        (:meth:`refused_skill_ids`)."""
         permissions: list[dict[str, str]] = [
             {"action": "*", "resource": "*", "effect": "allow"},
             {"action": "question", "resource": "*", "effect": "deny"},
             {"action": "skill", "resource": "*", "effect": "deny"},
         ]
+        refused = self.refused_skill_ids(skill_dir)
         permissions.extend(
             {"action": "skill", "resource": skill_id, "effect": "allow"}
             for skill_id in project_skill_ids(skill_dir)
+            if skill_id not in refused
         )
         config: dict[str, Any] = {"permissions": permissions, "skills": [str(skill_dir)]}
         if spec.model:
             config["model"] = spec.model
         return json.dumps(config)
+
+    def refused_skill_ids(self, skill_dir: Path) -> list[str]:
+        """Project skill ids holding a rule-pattern metacharacter. V2 matches
+        a rule's ``resource`` as a wildcard (``*`` any run, ``?`` one char,
+        no escape — pinned in the 2.0.27 bundle), so an allow for a directory
+        named ``*`` would come last and re-allow every personal and built-in
+        skill. Such a skill stays denied, fail-closed."""
+        return [
+            skill_id
+            for skill_id in project_skill_ids(skill_dir)
+            if not _V2_RULE_WILDCARDS.isdisjoint(skill_id)
+        ]
 
     def extra_env(self) -> dict[str, str]:
         return {}
@@ -1277,6 +1298,10 @@ def _any_completed_assistant(messages: Any) -> bool:
         if (msg.get("time") or {}).get("completed") and not aborted:
             return True
     return False
+
+
+# The characters V2's permission-rule matcher reads as wildcards.
+_V2_RULE_WILDCARDS = frozenset("*?")
 
 
 def project_skill_ids(skill_dir: Path) -> list[str]:

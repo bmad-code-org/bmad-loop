@@ -593,6 +593,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             major=protocol.major,
             verdict=support_verdict(version)[0],
         )
+        refused = protocol.refused_skill_ids(Path(spec.cwd) / self.profile.skill_tree)
+        if refused:
+            self._note_lifecycle(spec.task_id, "skill-ids-refused", ids=refused)
         password = secrets.token_urlsafe(16)
         env = self._session_env(spec, password, protocol)
         log_path = self.logs_dir / f"{spec.task_id}.log"
