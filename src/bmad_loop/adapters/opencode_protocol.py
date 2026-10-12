@@ -252,6 +252,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -476,6 +477,10 @@ class OpencodeProtocol:
     # ``logs/<task_id>.provider-errors.log`` (:meth:`provider_error_line`).
     provider_error_types: frozenset[str] = frozenset()
     event_path: str = ""
+    # Whether :meth:`usage` is computed FROM the transcript (V1's token sum) or
+    # read apart from it (V2's session aggregate): only the former loses the
+    # usage when the transcript read fails.
+    usage_reads_transcript: bool = True
 
     def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
         raise NotImplementedError
@@ -892,8 +897,19 @@ class V2Protocol(OpencodeProtocol):
     sessionless_types = frozenset()
     # The turn end. ``session.idle`` / ``session.status`` are deprecated in the
     # schema and never fired live — waiting on them would wait forever.
-    idle_types = frozenset({"session.execution.succeeded", "session.execution.interrupted"})
-    error_types = frozenset({"session.execution.failed"})
+    # ``session.execution.failed`` is one of them: it is published only once
+    # the provider retries are spent (each retry is ``session.retry.scheduled``),
+    # so it never precedes a retry the way V1's ``session.error`` can — and the
+    # server publishes it BEFORE dropping the session from
+    # ``/api/session/active``, so V1's settled-status gate on an error frame
+    # could read it busy and discard the sole turn end.
+    idle_types = frozenset(
+        {
+            "session.execution.succeeded",
+            "session.execution.interrupted",
+            "session.execution.failed",
+        }
+    )
     # The provider-error frames — V2's server log carries no line per retry, so
     # these are the env-fault classifier's evidence on 2.x.
     provider_error_types = frozenset(
@@ -911,6 +927,13 @@ class V2Protocol(OpencodeProtocol):
         }
     )
     event_path = "/api/event"
+    usage_reads_transcript = False
+    # How long a model missing from ``/api/model`` (or an absent default) is
+    # re-read before the effort check refuses it: the snapshot "may precede
+    # initial plugin settlement" (the 2.0.27 route contract), and every session
+    # queries it right after its fresh server turns healthy.
+    model_settle_s = 5.0
+    model_poll_s = 0.25
 
     def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
         """The OPENCODE_CONFIG_CONTENT JSON for this session, in V2's native
@@ -976,41 +999,26 @@ class V2Protocol(OpencodeProtocol):
         must be one of that model's ``variants``: V2 accepts any variant at
         create and only fails the turn at prompt time (``provider.no-route``
         "Variant unavailable"), so an unknown name is refused here, before any
-        session exists, rather than surfacing as a result-less turn end."""
-        location = {"location[directory]": str(spec.cwd)}
-        if spec.model:
-            provider_id, _, model_id = spec.model.partition("/")
-            resp = client.get("/api/model", params=location)
-            if resp.status_code != 200:
-                raise OpencodeServerError(
-                    f"GET /api/model failed: {resp.status_code} {resp.text[:200]}"
-                )
-            models = resp.json()["data"]
-            info = next(
-                (
-                    m
-                    for m in models
-                    if m.get("providerID") == provider_id and m.get("id") == model_id
-                ),
-                None,
+        session exists, rather than surfacing as a result-less turn end. A
+        model (or default) not yet listed is re-read for ``model_settle_s``
+        before that refusal — plugin-supplied models may land after the server
+        turns healthy."""
+        deadline = time.monotonic() + self.model_settle_s
+        while True:
+            info = self._effort_model_info(client, spec)
+            if info is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(self.model_poll_s)
+        if info is None and spec.model:
+            raise OpencodeServerError(
+                f"effort {spec.effort!r} needs the model's variants, but "
+                f"{spec.model!r} is not among the opencode server's models"
             )
-            if info is None:
-                raise OpencodeServerError(
-                    f"effort {spec.effort!r} needs the model's variants, but "
-                    f"{spec.model!r} is not among the opencode server's models"
-                )
-        else:
-            resp = client.get("/api/model/default", params=location)
-            if resp.status_code != 200:
-                raise OpencodeServerError(
-                    f"GET /api/model/default failed: {resp.status_code} {resp.text[:200]}"
-                )
-            info = resp.json()["data"]
-            if info is None:
-                raise OpencodeServerError(
-                    f"effort {spec.effort!r} is set but the opencode server has no "
-                    "default model to apply it to — set the adapter's model"
-                )
+        if info is None:
+            raise OpencodeServerError(
+                f"effort {spec.effort!r} is set but the opencode server has no "
+                "default model to apply it to — set the adapter's model"
+            )
         variants = [v.get("id") for v in info.get("variants") or []]
         if spec.effort not in variants:
             name = f"{info.get('providerID')}/{info.get('id')}"
@@ -1019,6 +1027,33 @@ class V2Protocol(OpencodeProtocol):
                 f"(available: {', '.join(str(v) for v in variants) or 'none'})"
             )
         return {"id": info["id"], "providerID": info["providerID"], "variant": spec.effort}
+
+    def _effort_model_info(self, client: Any, spec: SessionSpec) -> dict[str, Any] | None:
+        """One read of the effort's ``Model.Info``: the policy model off
+        ``/api/model``, else ``/api/model/default``; None when it is not
+        (yet) listed. A non-200 raises — that is no settling snapshot."""
+        location = {"location[directory]": str(spec.cwd)}
+        if spec.model:
+            provider_id, _, model_id = spec.model.partition("/")
+            resp = client.get("/api/model", params=location)
+            if resp.status_code != 200:
+                raise OpencodeServerError(
+                    f"GET /api/model failed: {resp.status_code} {resp.text[:200]}"
+                )
+            return next(
+                (
+                    m
+                    for m in resp.json()["data"]
+                    if m.get("providerID") == provider_id and m.get("id") == model_id
+                ),
+                None,
+            )
+        resp = client.get("/api/model/default", params=location)
+        if resp.status_code != 200:
+            raise OpencodeServerError(
+                f"GET /api/model/default failed: {resp.status_code} {resp.text[:200]}"
+            )
+        return resp.json()["data"]
 
     def prompt(self, client: Any, session_id: str, text: str, variant: str) -> None:
         """``POST /api/session/{id}/prompt``; raises unless the server accepts

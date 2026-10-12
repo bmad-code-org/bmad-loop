@@ -189,14 +189,20 @@ def test_v2_decode_frame_reads_data_envelope():
     assert v2.event_path == "/api/event"
 
 
-def test_v2_execution_events_map_to_idle_and_error():
-    """V2's turn end is `session.execution.*`; `session.idle` / `session.status`
-    are deprecated and never fired live, so neither may be waited on. The
+def test_v2_execution_events_map_to_idle():
+    """V2's turn end is `session.execution.*` — a failed execution included: it
+    follows the spent retries, never precedes one, so it skips V1's
+    settled-status gate on `error`. `session.idle` / `session.status` are
+    deprecated and never fired live, so neither may be waited on. The
     heartbeat is an SSE comment, leaving `server.connected` as the only
     liveness-only frame; no session-less frame is admitted."""
     v2 = V2Protocol()
-    assert v2.idle_types == {"session.execution.succeeded", "session.execution.interrupted"}
-    assert v2.error_types == {"session.execution.failed"}
+    assert v2.idle_types == {
+        "session.execution.succeeded",
+        "session.execution.interrupted",
+        "session.execution.failed",
+    }
+    assert v2.error_types == frozenset()
     assert v2.heartbeat_types == ("server.connected",)
     assert v2.sessionless_types == frozenset()
     for deprecated in ("session.idle", "session.status", "session.error"):
@@ -309,6 +315,56 @@ def test_v2_effort_ref_splits_the_model_on_the_first_slash(tmp_path):
         "providerID": "openrouter",
         "variant": "max",
     }
+
+
+class _SnapshotClient(_GetPostClient):
+    """`_GetPostClient` whose GET answers a scripted sequence per path (the
+    last answer repeats)."""
+
+    def __init__(self, resp: _Resp, gets: dict[str, list[_Resp]]):
+        super().__init__(resp, {})
+        self.snapshots = gets
+
+    def get(self, path: str, params=None) -> _Resp:
+        self.get_calls.append((path, params))
+        answers = self.snapshots[path]
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+
+def test_v2_effort_rereads_a_model_list_that_precedes_plugin_settlement(tmp_path, monkeypatch):
+    """`/api/model` "may precede initial plugin settlement" (the 2.0.27 route
+    contract): a configured model missing from the first snapshot is re-read
+    until it lands, never refused on that first read.
+
+    ABLATION: drop the re-read loop and the start raises "not among"."""
+    monkeypatch.setattr(V2Protocol, "model_poll_s", 0.0)
+    settled = {"data": [{"id": "m", "providerID": "p", "variants": [{"id": "high"}]}]}
+    client = _SnapshotClient(
+        _Resp(200, {"data": {"id": "ses_9"}}),
+        {"/api/model": [_Resp(200, {"data": []}), _Resp(200, settled)]},
+    )
+
+    assert V2Protocol().create_session(client, _spec(tmp_path, model="p/m", effort="high")) == (
+        "ses_9"
+    )
+
+    assert len(client.get_calls) == 2
+    _, body = client.calls[0]
+    assert body["model"] == {"id": "m", "providerID": "p", "variant": "high"}
+
+
+def test_v2_effort_refuses_a_model_still_absent_after_the_settle_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(V2Protocol, "model_settle_s", 0.05)
+    monkeypatch.setattr(V2Protocol, "model_poll_s", 0.01)
+    client = _SnapshotClient(
+        _Resp(200, {"data": {"id": "ses_9"}}), {"/api/model": [_Resp(200, {"data": []})]}
+    )
+    from bmad_loop.adapters.opencode_protocol import OpencodeServerError
+
+    with pytest.raises(OpencodeServerError, match="'p/m' is not among"):
+        V2Protocol().create_session(client, _spec(tmp_path, model="p/m", effort="high"))
+    assert len(client.get_calls) > 1
+    assert client.calls == []  # no session was created
 
 
 # ------------------------------------------------ V2 provider-errors log lines

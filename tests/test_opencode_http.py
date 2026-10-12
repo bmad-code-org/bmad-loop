@@ -109,6 +109,9 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   provider-quota     (V2) the provider refuses on quota: no retry, the turn
 #                      fails at once (`session.step.failed` + `session.execution.failed`,
 #                      `provider.quota` status 402 — the shapes captured from 2.0.27)
+#   provider-quota-settling  provider-quota in 2.0.27's real order: the session
+#                      stays on `/api/session/active` ~0.5s AFTER its
+#                      `session.execution.failed` is published
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
 # turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
@@ -293,16 +296,20 @@ def run_turn():
         finish_turn(); push_idle()
     elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
-    elif SCENARIO == "provider-quota":
+    elif SCENARIO in ("provider-quota", "provider-quota-settling"):
         error = {"type": "provider.quota", "status": 402,
                  "message": "You exceeded your current quota, please check your plan "
                             "and billing details.",
                  "response": {"body": '{"error": {"type": "insufficient_quota"}}'}}
         push(v2_frame("session.step.failed", sessionID=SESSION_ID,
                       assistantMessageID="msg_fakeasst1", error=error, files=[]))
+        if SCENARIO == "provider-quota-settling":
+            push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
+            time.sleep(0.5)
         with LOCK:
             STATE["busy"] = False  # the turn is over; nothing was spent
-        push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
+        if SCENARIO == "provider-quota":
+            push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
     elif SCENARIO in ("provider-outage", "provider-outage-after-work"):
         for attempt in (2, 3, 4):  # live, the first retry is attempt 2
             push(v2_frame("session.retry.scheduled", sessionID=SESSION_ID,
@@ -4393,8 +4400,8 @@ def test_sse_parser_reports_comments_and_yields_nothing_for_them():
 def test_v2_dispatch_filters_child_sessions_and_maps_execution_events(tmp_path):
     """`server.connected` is liveness only; a child session's turn end counts
     as activity but is not ours; V1's `session.idle` (deprecated, never emitted
-    on V2) queues nothing; `session.execution.{succeeded,interrupted}` queue
-    `idle` and `session.execution.failed` queues `error`."""
+    on V2) queues nothing; every `session.execution.*` turn end queues
+    `idle` — a failed execution included, since it never precedes a retry."""
     adapter = make_adapter(tmp_path)
     sess = _v2_sess()
     adapter._dispatch_sse(sess, _v2_frame("server.connected"))
@@ -4412,7 +4419,7 @@ def test_v2_dispatch_filters_child_sessions_and_maps_execution_events(tmp_path):
     for etype, queued in [
         ("session.execution.succeeded", "idle"),
         ("session.execution.interrupted", "idle"),
-        ("session.execution.failed", "error"),
+        ("session.execution.failed", "idle"),
     ]:
         adapter._dispatch_sse(sess, _v2_frame(etype, sessionID="ses_parent"))
         assert sess.events.get_nowait() == queued, etype
@@ -4884,6 +4891,7 @@ def test_v2_unusable_effort_fails_the_session_start(
 
     ABLATION: drop the `spec.effort not in variants` raise and the
     unknown-variant case reddens (the session would start and complete)."""
+    monkeypatch.setattr(V2Protocol, "model_settle_s", 0.3)
     launcher, rec = v2_fake
     adapter = make_adapter(tmp_path, binary=str(launcher))
     spec = make_spec(
@@ -4997,6 +5005,68 @@ def test_v2_provider_quota_failure_classifies_and_renders(tmp_path, v2_fake):
     assert_server_gone(rec)
 
 
+def test_v2_failed_execution_ends_the_turn_while_still_listed_active(tmp_path, v2_fake):
+    """2.0.27 publishes `session.execution.failed` BEFORE it drops the session
+    from `/api/session/active`. The failure is still the turn end — nudged like
+    any result-less Stop — never discarded because the busy probe read it
+    listed; the heartbeat comments keep the stream fresh, so nothing else
+    would recover it before the timeout.
+
+    ABLATION: map `session.execution.failed` back to `error_types` and the run
+    sends no nudge and times out."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota-settling", timeout_s=5.0))
+
+    assert result.status != "timeout", result.status
+    assert len(prompt_texts(rec)) >= 2  # the failed turn end was nudged
+    assert result.env_fault is True
+    assert_server_gone(rec)
+
+
+def test_v2_capture_usage_survives_a_failed_transcript_walk(tmp_path):
+    """V2 usage is the `Session.Info` aggregate, a read apart from the
+    transcript: a walk that fails on page 2 is crumbed (`stage=fetch`) and no
+    transcript is dumped, but the measured usage is still stashed.
+
+    ABLATION: return on the transcript fault unconditionally and nothing is
+    stashed."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(1), next_cursor="c1"), 503],
+            _V2_INFO: [_v2_info(input=7, output=3)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is None
+
+    assert adapter._usage[_V2_SID].total == 10
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "fetch" and crumb["error"] == "HTTP 503"
+    assert not (adapter.tasks_dir / "t-cap" / "messages.json").exists()
+
+
+def test_v2_capture_usage_zero_without_transcript_stays_untracked(tmp_path):
+    """Without the transcript a zero aggregate cannot be told from an in-flight
+    first step, so it stays untracked (None) — never a measured zero."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_MESSAGES: [RuntimeError("boom")], _V2_INFO: [_v2_info()]})
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is None
+
+    assert adapter._usage == {}
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["error"] == "RuntimeError: boom"
+
+
 def test_v2_provider_outage_after_work_is_overruled(tmp_path, v2_fake):
     """#764 on V2: the same outage lines in a session whose Session.Info reports
     tokens already spent are overruled — the session did real work, so it is
@@ -5070,7 +5140,7 @@ def test_provider_error_write_failure_is_crumbed_once(tmp_path):
     adapter._dispatch_sse(sess, failed)
     adapter._dispatch_sse(sess, failed)
 
-    assert [sess.events.get_nowait(), sess.events.get_nowait()] == ["error", "error"]
+    assert [sess.events.get_nowait(), sess.events.get_nowait()] == ["idle", "idle"]
     crumbs = [e for e in _lifecycle(tmp_path) if e["event"] == "provider-errors-write-failed"]
     assert len(crumbs) == 1
     assert crumbs[0]["frame"] == "session.execution.failed"

@@ -1418,8 +1418,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                 )
             if event == "error":
-                # session.error may precede a retry, not a turn-end (status
-                # "retry" exists); only a PROVABLY settled session reads as a
+                # V1 only (V2's terminal failure queues "idle"): session.error
+                # may precede a retry, not a turn-end (status "retry" exists);
+                # only a PROVABLY settled session reads as a
                 # result-less Stop — an errored turn may never get
                 # time.completed, so waiting on proof-of-work alone would burn
                 # the whole timeout. A dead server takes the crash path; an
@@ -1622,18 +1623,24 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         wrong shape: a malformed V1 message list or V2 session; ``dump`` — the
         transcript write) and
         ``error`` (DW-461). The tally is stashed before the dump, so an
-        unwritable transcript no longer costs the usage."""
+        unwritable transcript no longer costs the usage; nor does a failed
+        transcript read on a protocol whose usage is read apart from it (V2) —
+        that usage is still read, without the transcript (a zero total then
+        stays untracked), and only the dump is skipped."""
         if sess.client is None or not sess.session_id:
             return None
         messages, fault = sess.protocol.transcript(sess.client, sess.session_id)
         if fault is not None:
             self._note_usage_capture_failed(handle, "fetch", fault)
-            return None
+            if sess.protocol.usage_reads_transcript:
+                return None
         usage, usage_fault = sess.protocol.usage(sess.client, sess.session_id, messages)
         if usage is not None:
             self._stash_usage(sess.session_id, usage)
         elif usage_fault is not None:
             self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
+        if fault is not None:
+            return None
         try:
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
