@@ -30,7 +30,9 @@ breaking changes may land in a minor release.
 - opencode-http detects the OpenCode server API major from `opencode --version` and
   refuses unsupported versions with a clear error; `validate` reports it as
   `adapter.opencode-version`. It drives OpenCode 2.x sessions over the V2 `/api/*`
-  server API (#847).
+  server API, including usage, the token budget and the poll fallback. On 2.x the
+  `effort` rides the session's model as its variant, and an effort the model does not
+  offer fails the session start (#847).
 
 ### Changed
 

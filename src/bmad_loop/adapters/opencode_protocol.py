@@ -153,6 +153,53 @@ identical on every route below), zero tokens against a local mock provider
   interrupted}``; ``session.idle`` (deprecated in the schema) and
   ``session.status`` never fired. No session-less frame (no ``file.edited``)
   was seen.
+
+Poll fallback, usage, transcript and effort — pinned live against 2.0.27
+(2026-10-12), same zero-token mock setup:
+
+- ``GET /api/session/active`` → ``{"data": {<sid>: {"type": "running"}}}``;
+  ``running`` is the schema's only type. A session is listed from the prompt
+  until its turn ends — **including every ``session.retry.scheduled``
+  backoff** (a provider on a closed port retried ~10 times over ~86 s, listed
+  throughout) — and is absent before its first prompt and after any turn end
+  (no idle type). A retry run that gives up ends ``session.step.failed`` →
+  ``session.execution.failed {error}``.
+- ``GET /api/session/{id}/message`` → ``{"data": [...], "cursor": {"previous",
+  "next"}}``, newest-first, 50 per page by default. ``limit`` is 1..200 and
+  out-of-range is a 400 (never clamped); ``order`` is ``asc|desc`` only;
+  ``?cursor=<next>`` walks on (cursors encode their order — combining
+  ``cursor`` with ``order`` is a 400 ``InvalidCursorError``). A full last page
+  still carries a ``next``: the walk ends on an EMPTY page whose cursors are
+  both null. Message types seen: ``user`` (``text`` top-level), ``assistant``
+  (``time{created,streamed,completed}``, ``finish``, ``tokens``, ``error``?)
+  and ``idle`` (``outcome``). An unknown session is ``404
+  SessionNotFoundError`` here and on ``GET /api/session/{id}``.
+- ``Session.Info.tokens`` is the cumulative session aggregate (the sum over
+  steps), all zero until the first step ends — an in-flight first step is not
+  even listed as a message until its first chunk streams. The step an
+  interrupt cancels is stamped ``time.completed`` with ``finish: "error"``,
+  ``error: {"type": "aborted"}`` and no ``tokens``; a provider failure that
+  exhausts its retries is stamped the same way with the provider's error type
+  (e.g. ``provider.transport``). Interrupt itself adds no tokens.
+- Effort: the prompt body has no variant; the session's model ref
+  ``{"id", "providerID", "variant"}`` carries it, set at create. Create
+  accepts ANY variant (and any model) with a 200 and echoes it in
+  ``data.model.variant``; an unknown one fails only at prompt time, before
+  any provider request, as ``session.execution.failed`` with ``error.type
+  provider.no-route`` ("Variant unavailable for <provider>/<model>: <name>").
+  A known one changes the provider request (``high`` on the
+  openai-compatible package adds ``reasoning_effort: "high"``). Each model
+  lists its ``variants`` (``[{"id", "settings"?, "body"?}]``; the
+  openai-compatible package supplies ``low|medium|high`` when the model
+  declares none, and a declared list replaces them) on ``GET /api/model`` and
+  ``GET /api/model/default`` — both take the deepObject query
+  ``location[directory]=<abs>`` (a bare ``directory=`` is silently ignored)
+  and answer ``{"location", "data"}``, ``data`` being null on the default
+  route when no model is usable. The config's ``"provider/model#variant"``
+  form parses but is NOT applied to a session created without a model.
+- With no model configured, V2's default is the hosted ``opencode`` provider
+  (credential-free), not a failure — the operator's own config decides the
+  model, exactly as on V1.
 """
 
 from __future__ import annotations
@@ -348,10 +395,35 @@ class OpencodeProtocol:
         raise NotImplementedError
 
     def transcript(self, client: Any, session_id: str) -> tuple[Any, str | None]:
+        """``(messages, fault)``: the session's whole message history (dumped as
+        ``messages.json``), or None with ``fault`` naming why the read failed.
+        Never raises."""
         raise NotImplementedError
 
-    def tally(self, transcript: Any) -> tuple[TokenUsage | None, str | None]:
+    def usage(
+        self, client: Any, session_id: str, transcript: Any
+    ) -> tuple[TokenUsage | None, UsageFault | None]:
+        """The session's token usage at teardown, given the :meth:`transcript`
+        already read. None is "untracked" when ``fault`` is None and "unknown"
+        when it is not — never a zero standing in for a failed read (DW-461).
+        Never raises."""
         raise NotImplementedError
+
+    def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
+        """``(usage, fault)``: the mid-session cumulative usage the budget guard
+        samples on the heartbeat cadence; ``(None, None)`` when nothing is
+        tallied yet, ``fault`` when the sample failed. Never raises."""
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class UsageFault:
+    """Why a usage read failed, as the ``usage-capture-failed`` crumb reports it
+    (DW-461): ``stage`` is ``fetch`` (the request, its status or an undecodable
+    body) or ``payload`` (a body of the wrong shape)."""
+
+    stage: str
+    error: str
 
 
 # ``/event`` frame types that carry NO ``properties.sessionID`` but are still
@@ -619,27 +691,39 @@ class V1Protocol(OpencodeProtocol):
         except Exception as e:  # usage is metadata, never a gate
             return None, f"{type(e).__name__}: {e}"
 
-    def tally(self, transcript: Any) -> tuple[TokenUsage | None, str | None]:
-        return _tally_messages(transcript)
+    def usage(
+        self, client: Any, session_id: str, transcript: Any
+    ) -> tuple[TokenUsage | None, UsageFault | None]:
+        """The assistant-message token sum over the transcript (:func:`_sum_usage`)."""
+        usage, fault = _tally_messages(transcript)
+        return usage, None if fault is None else UsageFault("payload", fault)
+
+    def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
+        transcript, fault = self.transcript(client, session_id)
+        if fault is not None:
+            return None, fault
+        try:
+            return _tally_messages(transcript)
+        except Exception as e:  # sampling is advisory
+            return None, f"{type(e).__name__}: {e}"
 
 
-# The answer V2's not-yet-driven reads give (poll fallback, usage, transcript):
-# "unknown", with this as the fault the adapter crumbs — never a healthy-looking
-# empty value a caller could mistake for a measured one.
-_V2_UNREAD = "OpenCode 2.x usage/transcript reads are not implemented yet"
+# `GET /api/session/{id}/message` page size for the transcript walk: the
+# server's maximum — `limit=201` is a 400, never clamped (pinned 2.0.27).
+_V2_PAGE_LIMIT = 200
+# Bound on that walk, so a cursor that never runs dry is a fault, not a hang.
+_V2_MAX_PAGES = 1000
 
 
 class V2Protocol(OpencodeProtocol):
     """The ``@opencode/cli`` 2.x server API — the V2 section of this module's
     docstring, pinned against 2.0.21 and 2.0.27.
 
-    Drives the session lifecycle: config, health, create, prompt, the
-    ``/api/event`` envelope and the ``session.execution.*`` turn end, and
-    interrupt. The poll-fallback probes and the usage / transcript reads answer
-    "unknown" for now (``session_busy`` / ``latest_completed_ms`` None,
-    ``transcript`` a fault the adapter crumbs as ``usage-capture-failed``), and
-    the inline renderer renders nothing — the SSE turn end and server death
-    still complete every session."""
+    Drives the session lifecycle (config, health, create, prompt, the
+    ``/api/event`` envelope and the ``session.execution.*`` turn end,
+    interrupt), the poll fallback (``/api/session/active`` + assistant-message
+    proof-of-work), usage (the ``Session.Info`` aggregate) and the paginated
+    transcript. The inline renderer renders nothing yet."""
 
     major = 2
     # The heartbeat is an SSE comment line (``: heartbeat``), not a data frame:
@@ -696,20 +780,77 @@ class V2Protocol(OpencodeProtocol):
         return HealthProbe(healthy=parsed is not None and parsed[0] == self.major)
 
     def create_session(self, client: Any, spec: SessionSpec) -> str:
-        resp = client.post(
-            "/api/session",
-            json={"title": spec.task_id, "location": {"directory": str(spec.cwd)}},
-        )
+        """``POST /api/session`` with the project as its location. A reasoning
+        effort rides the session's ``model`` ref as its ``variant`` — the prompt
+        body has no variant field, and the config's ``model#variant`` form is
+        parsed but never applied to a session (both pinned). The session
+        keeps that model for every prompt, nudges included."""
+        body: dict[str, Any] = {"title": spec.task_id, "location": {"directory": str(spec.cwd)}}
+        if spec.effort:
+            body["model"] = self._effort_model_ref(client, spec)
+        resp = client.post("/api/session", json=body)
         if resp.status_code != 200:
             raise OpencodeServerError(
                 f"POST /api/session failed: {resp.status_code} {resp.text[:200]}"
             )
         return resp.json()["data"]["id"]
 
+    def _effort_model_ref(self, client: Any, spec: SessionSpec) -> dict[str, str]:
+        """The ``{"id", "providerID", "variant"}`` ref that carries the effort:
+        the policy model (``"provider/model"``, split on the first ``/``) or,
+        without one, the server's default model for the project. The effort
+        must be one of that model's ``variants``: V2 accepts any variant at
+        create and only fails the turn at prompt time (``provider.no-route``
+        "Variant unavailable"), so an unknown name is refused here, before any
+        session exists, rather than surfacing as a result-less turn end."""
+        location = {"location[directory]": str(spec.cwd)}
+        if spec.model:
+            provider_id, _, model_id = spec.model.partition("/")
+            resp = client.get("/api/model", params=location)
+            if resp.status_code != 200:
+                raise OpencodeServerError(
+                    f"GET /api/model failed: {resp.status_code} {resp.text[:200]}"
+                )
+            models = resp.json()["data"]
+            info = next(
+                (
+                    m
+                    for m in models
+                    if m.get("providerID") == provider_id and m.get("id") == model_id
+                ),
+                None,
+            )
+            if info is None:
+                raise OpencodeServerError(
+                    f"effort {spec.effort!r} needs the model's variants, but "
+                    f"{spec.model!r} is not among the opencode server's models"
+                )
+        else:
+            resp = client.get("/api/model/default", params=location)
+            if resp.status_code != 200:
+                raise OpencodeServerError(
+                    f"GET /api/model/default failed: {resp.status_code} {resp.text[:200]}"
+                )
+            info = resp.json()["data"]
+            if info is None:
+                raise OpencodeServerError(
+                    f"effort {spec.effort!r} is set but the opencode server has no "
+                    "default model to apply it to — set the adapter's model"
+                )
+        variants = [v.get("id") for v in info.get("variants") or []]
+        if spec.effort not in variants:
+            name = f"{info.get('providerID')}/{info.get('id')}"
+            raise OpencodeServerError(
+                f"effort {spec.effort!r} is not a variant of {name} "
+                f"(available: {', '.join(str(v) for v in variants) or 'none'})"
+            )
+        return {"id": info["id"], "providerID": info["providerID"], "variant": spec.effort}
+
     def prompt(self, client: Any, session_id: str, text: str, variant: str) -> None:
         """``POST /api/session/{id}/prompt``; raises unless the server accepts
         it (200 — a 409 ``ConflictError`` or anything else is a refusal). The
-        body has no model or variant field, so ``variant`` does not ride it."""
+        body has no model or variant field: the effort rode the session's model
+        ref at create (:meth:`create_session`), so ``variant`` is not sent."""
         resp = client.post(f"/api/session/{session_id}/prompt", json={"text": text})
         if resp.status_code != 200:
             raise OpencodeServerError(f"prompt failed: {resp.status_code} {resp.text[:200]}")
@@ -725,19 +866,139 @@ class V2Protocol(OpencodeProtocol):
         return None
 
     def session_busy(self, client: Any, session_id: str) -> bool | None:
-        return None
+        """Tri-state ``GET /api/session/active`` probe: True = listed (the map's
+        only type is ``running``, which covers a ``session.retry.scheduled``
+        backoff too — the V1 ``retry``-is-busy rule), False = absent (settled),
+        None = unknowable (unreachable server, non-200, a body without the
+        ``data`` map). Unknown is not settled — see :meth:`V1Protocol.session_busy`."""
+        try:
+            resp = client.get("/api/session/active")
+            if resp.status_code != 200:
+                return None
+            active = resp.json().get("data")
+            if not isinstance(active, dict):
+                return None
+            return session_id in active
+        except Exception:  # probe is advisory
+            return None
 
     def latest_completed_ms(self, client: Any, session_id: str) -> int | None:
-        return None
+        """The newest assistant message's ``time.completed`` (epoch ms; 0 when
+        none has completed) over the first page of messages, which is
+        newest-first — or None when the read failed. Advisory, never raises."""
+        try:
+            resp = client.get(f"/api/session/{session_id}/message")
+            if resp.status_code != 200:
+                return None
+            completed = 0
+            for msg in resp.json()["data"]:
+                if msg.get("type") != "assistant":
+                    continue
+                done_ms = (msg.get("time") or {}).get("completed") or 0
+                completed = max(completed, int(done_ms))
+        except Exception:  # probe is advisory
+            return None
+        return completed
 
     def abort(self, client: Any, session_id: str) -> None:
         client.post(f"/api/session/{session_id}/interrupt")
 
     def transcript(self, client: Any, session_id: str) -> tuple[Any, str | None]:
-        return None, _V2_UNREAD
+        """Every message, oldest first: ``order=asc`` at the server's maximum
+        page size, then ``cursor.next`` until a page comes back empty (a full
+        last page still carries a ``next``). A failed page, a body without a
+        ``data`` list, or a walk past ``_V2_MAX_PAGES`` is a fault — never a
+        partial history. Never raises."""
+        messages: list[Any] = []
+        params: dict[str, Any] = {"order": "asc", "limit": _V2_PAGE_LIMIT}
+        try:
+            for _ in range(_V2_MAX_PAGES):
+                resp = client.get(f"/api/session/{session_id}/message", params=params)
+                if resp.status_code != 200:
+                    return None, f"HTTP {resp.status_code}"
+                body = resp.json()
+                page = body.get("data")
+                if not isinstance(page, list):
+                    return None, f"message page is {type(page).__name__}, not a list"
+                messages.extend(page)
+                next_cursor = (body.get("cursor") or {}).get("next")
+                if not page or not next_cursor:
+                    return messages, None
+                # The cursor carries the order; repeating `order` is a 400.
+                params = {"cursor": next_cursor, "limit": _V2_PAGE_LIMIT}
+        except Exception as e:  # usage is metadata, never a gate
+            return None, f"{type(e).__name__}: {e}"
+        return None, f"message history did not end within {_V2_MAX_PAGES} pages"
 
-    def tally(self, transcript: Any) -> tuple[TokenUsage | None, str | None]:
-        return None, _V2_UNREAD
+    def usage(
+        self, client: Any, session_id: str, transcript: Any
+    ) -> tuple[TokenUsage | None, UsageFault | None]:
+        """``GET /api/session/{id}`` → ``data.tokens``, the cumulative session
+        aggregate (never also summed per step). Reasoning bills as output; the
+        cache read/write map as in V1. Untracked (None) when that total is zero
+        and the transcript holds no completed, un-interrupted assistant message
+        — the V1 rule (:func:`_sum_usage`): an in-flight first step reports
+        zeros, and the step an interrupt cancelled is stamped completed with
+        ``error.type == "aborted"`` and no tokens. Child (subagent) sessions
+        are not counted. Never raises."""
+        try:
+            resp = client.get(f"/api/session/{session_id}")
+            if resp.status_code != 200:
+                return None, UsageFault("fetch", f"HTTP {resp.status_code}")
+            body = resp.json()
+        except Exception as e:  # usage is metadata, never a gate
+            return None, UsageFault("fetch", f"{type(e).__name__}: {e}")
+        try:
+            usage = _session_tokens(body)
+            if usage.total == 0 and not _any_completed_assistant(transcript):
+                return None, None
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            return None, UsageFault("payload", f"malformed session: {type(e).__name__}: {e}")
+        return usage, None
+
+    def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
+        """The budget guard's sample: the same ``Session.Info`` aggregate, one
+        GET a tick (never the transcript walk). A zero total is inert, not a
+        sample — nothing has been spent yet."""
+        try:
+            resp = client.get(f"/api/session/{session_id}")
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}"
+            usage = _session_tokens(resp.json())
+        except Exception as e:  # sampling is advisory
+            return None, f"{type(e).__name__}: {e}"
+        return (usage if usage.total else None), None
+
+
+def _session_tokens(body: Any) -> TokenUsage:
+    """The ``{"data": Session.Info}`` body's ``tokens`` aggregate; raises on a
+    body of the wrong shape (no ``data`` / ``tokens`` object, a non-numeric
+    count) — a fault, never a zero."""
+    tokens = body["data"]["tokens"]
+    if not isinstance(tokens, dict):
+        raise TypeError(f"tokens is {type(tokens).__name__}, not an object")
+    cache = tokens.get("cache") or {}
+    return TokenUsage(
+        input_tokens=int(tokens.get("input") or 0),
+        output_tokens=int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0),
+        cache_read_tokens=int(cache.get("read") or 0),
+        cache_creation_tokens=int(cache.get("write") or 0),
+    )
+
+
+def _any_completed_assistant(messages: Any) -> bool:
+    """Whether a V2 transcript holds an assistant message that finished on its
+    own: ``time.completed`` set and not an interrupt's ``aborted`` error. A
+    provider failure counts (it completed, with ``finish: "error"``) — exactly
+    the measured zero the env-fault classifier is for."""
+    for msg in messages or []:
+        if msg.get("type") != "assistant":
+            continue
+        error = msg.get("error")
+        aborted = isinstance(error, dict) and error.get("type") == "aborted"
+        if (msg.get("time") or {}).get("completed") and not aborted:
+            return True
+    return False
 
 
 def project_skill_ids(skill_dir: Path) -> list[str]:

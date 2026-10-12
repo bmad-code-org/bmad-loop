@@ -270,13 +270,39 @@ def test_v2_create_prompt_and_interrupt_routes(tmp_path):
     assert interrupt.calls == [("/api/session/ses_9/interrupt", None)]
 
 
-def test_v2_unread_probes_answer_unknown_never_empty():
-    """Until the V2 poll/usage reads land, they answer "unknown" with a fault —
-    never a healthy-looking False / 0 / [] a caller would read as measured."""
-    v2 = V2Protocol()
-    assert v2.session_busy(None, "ses_1") is None
-    assert v2.latest_completed_ms(None, "ses_1") is None
-    transcript, fault = v2.transcript(None, "ses_1")
-    assert transcript is None and fault
-    usage, fault = v2.tally(None)
-    assert usage is None and fault
+class _GetPostClient(_PostClient):
+    """`_PostClient` plus scripted GETs keyed by path, recording their params."""
+
+    def __init__(self, resp: _Resp, gets: dict[str, _Resp]):
+        super().__init__(resp)
+        self.gets = gets
+        self.get_calls: list[tuple[str, object]] = []
+
+    def get(self, path: str, params=None) -> _Resp:
+        self.get_calls.append((path, params))
+        return self.gets[path]
+
+
+def test_v2_effort_ref_splits_the_model_on_the_first_slash(tmp_path):
+    """The policy model is `provider/model` where the model id may itself hold
+    a slash (aggregator providers): split on the FIRST one, look it up on
+    `/api/model` with the deepObject location, and create with its ref."""
+    models = {
+        "data": [
+            {"id": "anthropic/claude-x", "providerID": "openrouter", "variants": [{"id": "max"}]}
+        ]
+    }
+    client = _GetPostClient(
+        _Resp(200, {"data": {"id": "ses_9"}}), {"/api/model": _Resp(200, models)}
+    )
+    spec = _spec(tmp_path, model="openrouter/anthropic/claude-x", effort="max")
+
+    assert V2Protocol().create_session(client, spec) == "ses_9"
+
+    assert client.get_calls == [("/api/model", {"location[directory]": str(tmp_path)})]
+    _, body = client.calls[0]
+    assert body["model"] == {
+        "id": "anthropic/claude-x",
+        "providerID": "openrouter",
+        "variant": "max",
+    }

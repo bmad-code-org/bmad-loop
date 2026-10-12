@@ -27,11 +27,12 @@ Transport shape (the settled design drivers):
   deliberately does NOT ride the config: the config schema has no top-level
   ``variant``, and its only effort key (``agent.<name>.variant``) applies solely
   when that agent table also pins its own ``model`` — inert otherwise, which is
-  the measured negative result in #643. It is sent instead as the per-call
-  ``variant`` in every ``prompt_async`` body (``_prompt``), initial prompt and
-  nudges alike, and omitted entirely when empty. The value is passed through
-  unvalidated: bmad-loop does not reject an effort name the provider does not
-  know. A per-session
+  the measured negative result in #643. On V1 it is sent instead as the
+  per-call ``variant`` in every ``prompt_async`` body (``_prompt``), initial
+  prompt and nudges alike, omitted entirely when empty, and passed through
+  unvalidated. V2's prompt has no variant: the effort rides the session's
+  model ref at create, and an effort that is not one of that model's variants
+  fails the session start (see the protocol module). A per-session
   ``OPENCODE_SERVER_PASSWORD`` makes the health poll self-discriminating against
   a foreign server on a reused port and keeps other local processes from
   driving an allow-all server.
@@ -48,10 +49,11 @@ Transport shape (the settled design drivers):
   stall verdicts under a live server pin ``accept_result=False`` — the
   #48/#53 artifact-distrust invariant, unchanged.
 - **Usage is read over HTTP before teardown** (server state is sqlite, not a
-  readable file tree): assistant-message token sums, stashed by session id,
-  raw messages dumped to ``tasks/<task_id>/messages.json`` as the transcript.
-  Child-session (subagent) tokens are not counted — the API scopes messages
-  per session.
+  readable file tree): V1 sums assistant-message tokens, V2 reads the
+  session's own token aggregate; stashed by session id, the raw messages
+  (V2: every page, oldest first) dumped to ``tasks/<task_id>/messages.json``
+  as the transcript. Child-session (subagent) tokens are not counted — the
+  API scopes messages and usage per session.
 - ``opencode serve`` survives parent death, so teardown is
   authoritative: kill in ``run()``'s finally plus an atexit sweep. On Windows
   the binary is an npm ``.cmd`` shim, so the kill goes straight to the
@@ -374,7 +376,8 @@ class _ServerSession:
     # per-call `variant` on EVERY prompt_async body this session issues (initial
     # prompt and nudges — a nudge dropping back to the provider default mid-session
     # would be silent drift). "" = omit the key, so the body is byte-identical to
-    # an effort-less session's.
+    # an effort-less session's. V2 ignores it: the variant rides the session's
+    # model ref at create, which every later prompt inherits.
     variant: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
     sse_thread: threading.Thread | None = None
@@ -1495,7 +1498,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 continue
 
     def _session_status(self, sess: _ServerSession) -> bool | None:
-        """Tri-state busy probe — :meth:`V1Protocol.session_busy`: True =
+        """Tri-state busy probe — the protocol's ``session_busy``: True =
         busy/retrying, False = provably settled, None = unknowable. Unknown is
         not settled: callers must not treat a failed probe as proof a turn ended
         (the liveness-parity doctrine); the process poll settles real death."""
@@ -1540,13 +1543,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         streak."""
         if sess.client is None or not sess.session_id:
             return None, None
-        transcript, fault = sess.protocol.transcript(sess.client, sess.session_id)
-        if fault is not None:
-            return None, fault
-        try:
-            usage, fault = sess.protocol.tally(transcript)
-        except Exception as e:  # sampling is advisory
-            return None, f"{type(e).__name__}: {e}"
+        usage, fault = sess.protocol.sample_usage(sess.client, sess.session_id)
         if usage is None:
             return None, fault
         return usage.weighted_total(spec.cache_read_weight), None
@@ -1559,8 +1556,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
         A fault leaves nothing stashed, so read_usage() answers None (untracked)
         and never a zero; it is crumbed as `usage-capture-failed` with ``stage``
-        (``fetch`` — the GET, its status or its body; ``payload`` — a body that
-        is not a well-formed message list; ``dump`` — the transcript write) and
+        (``fetch`` — a GET, its status or its body; ``payload`` — a body of the
+        wrong shape: a malformed V1 message list or V2 session; ``dump`` — the
+        transcript write) and
         ``error`` (DW-461). The tally is stashed before the dump, so an
         unwritable transcript no longer costs the usage."""
         if sess.client is None or not sess.session_id:
@@ -1569,11 +1567,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if fault is not None:
             self._note_usage_capture_failed(handle, "fetch", fault)
             return None
-        usage, fault = sess.protocol.tally(messages)
+        usage, usage_fault = sess.protocol.usage(sess.client, sess.session_id, messages)
         if usage is not None:
             self._stash_usage(sess.session_id, usage)
-        elif fault is not None:
-            self._note_usage_capture_failed(handle, "payload", fault)
+        elif usage_fault is not None:
+            self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
         try:
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
