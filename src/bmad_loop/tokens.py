@@ -131,7 +131,13 @@ def tally(transcript_path: Path) -> TokenUsage | None:
             seen = True
             counts = {key: _int(usage.get(key)) for key in _CLAUDE_USAGE_KEYS}
             message = entry.get("message")
-            message_id = message.get("id") if isinstance(message, dict) else None
+            # Only a message-level usage block is keyed by its message's id; a
+            # top-level `usage` counts on its own even beside a `message.id`.
+            message_id = (
+                message.get("id")
+                if isinstance(message, dict) and message.get("usage") is usage
+                else None
+            )
             if not isinstance(message_id, str):
                 anon.append(counts)
                 continue

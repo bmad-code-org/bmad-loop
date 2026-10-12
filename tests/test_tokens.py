@@ -132,6 +132,19 @@ def test_tally_entries_without_message_id_each_count(tmp_path):
     assert usage.output_tokens == 15
 
 
+def test_tally_top_level_usage_beside_message_id_each_count(tmp_path):
+    # The id keys only a message-level usage block; a top-level `usage` next
+    # to a usage-less `message.id` is not deduped.
+    path = tmp_path / "sid.jsonl"
+    entry = {"message": {"id": "msg_1"}, "usage": {"input_tokens": 10, "output_tokens": 5}}
+    _write_jsonl(path, [entry, entry])
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 20
+    assert usage.output_tokens == 10
+
+
 def test_tally_includes_subagent_transcripts(tmp_path):
     path = tmp_path / "sid.jsonl"
     _write_jsonl(path, [_assistant("msg_p", input_tokens=100, output_tokens=10)])
