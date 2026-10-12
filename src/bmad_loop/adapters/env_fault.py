@@ -222,13 +222,13 @@ class EnvFaultMixin:
         (a file lock, a torn read) is gone by then, so ``session-end`` can carry
         real tokens beside a verdict this read could not overrule. An
         ``env-fault-usage-read-failed`` crumb (``error``) records the fold so the
-        post-mortem can tell "no work measured" from "never measured"."""
+        post-mortem can tell "no work measured" from "never measured". ``error``
+        is the exception class only, as on the engine's own unwinding
+        ``session-end``: a parser's message can quote transcript content."""
         try:
             usage = self.read_usage(result)
         except Exception as exc:  # usage is metadata, never a gate; journal the fold
-            self._note_lifecycle(
-                task_id, "env-fault-usage-read-failed", error=f"{type(exc).__name__}: {exc}"
-            )
+            self._note_lifecycle(task_id, "env-fault-usage-read-failed", error=type(exc).__name__)
             return None
         if usage is None or usage.total <= 0:
             return None
