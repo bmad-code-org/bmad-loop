@@ -28,6 +28,7 @@ everywhere else, and when psmux is absent or an unsupported version.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -810,6 +811,128 @@ def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(
         port_file.write_text(real, encoding="utf-8")
 
 
+def test_premise_pane_path_is_rebuilt_from_the_registry(tmp_path):
+    """A pane does not inherit the PATH of the process that started its server:
+    psmux rebuilds it from the registry (psmux/psmux#773). That is why the
+    parked-window trailer pins the absolute psmux path instead of trusting a
+    bare `psmux` inside the pane (#877).
+
+    Red means the pane kept the launcher's PATH entry, and the pin can retire,
+    but only behind the `_LAST_UNSUPPORTED` gate, set to the last release
+    WITHOUT the fix (the gate is exclusive), since an older admitted build
+    still rebuilds PATH.
+
+    Its own fresh registry root, so the session is a cold start from this
+    test's environment and never a claimed warm server whose first pane was
+    spawned before the claim. A launcher-only variable rides along as the
+    control: a pane missing THAT never saw this environment at all.
+    """
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    root = tmp_path / "registry"
+    root.mkdir()  # pre-created: see psmux_data_root for the measured cost
+    marker = tmp_path / "path-marker"
+    marker.mkdir()
+    report = tmp_path / "pane-env.txt"
+    staging = tmp_path / "pane-env.tmp"
+    mark = uuid.uuid4().hex
+    env = _new_session_env()
+    env["PSMUX_DATA_DIR"] = str(root)
+    env["PATH"] = f"{marker};{env.get('PATH', '')}"
+    env["BMAD_LOOP_PROBE_MARK"] = mark
+    # Staged then moved, so a poll never reads a half-written report. The
+    # source travels as -EncodedCommand: psmux re-parses a command line, and
+    # base64 is the one shape that survives it whatever the paths hold.
+    source = (
+        f"Set-Content -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
+        '-Value ("$env:BMAD_LOOP_PROBE_MARK|" + $env:PATH); '
+        f"Move-Item -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
+        f"-Destination {psmux_backend._pwsh_quote(str(report))}; Start-Sleep 60"
+    )
+    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
+    session = f"bmad-loop-path-probe-{uuid.uuid4().hex[:8]}"
+    seen = False
+    text = ""
+    try:
+        created = mux._run(
+            [
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-c",
+                str(tmp_path),
+                "pwsh",
+                "-NoProfile",
+                "-EncodedCommand",
+                encoded,
+            ],
+            check=False,
+            env=env,
+        )
+        assert (
+            created.returncode == 0
+        ), f"probe setup: probe session creation failed: {created.stderr.strip()!r}"
+        seen = _plain_has_session(mux, session, env=env)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not report.exists():
+            time.sleep(0.25)
+        assert report.exists(), "probe setup: the probe pane never reported its environment"
+        text = report.read_text(encoding="utf-8-sig").strip()
+    finally:
+        _teardown_probe_session(mux, session, env, known_created=seen)
+    got_mark, _, pane_path = text.partition("|")
+    assert got_mark == mark, (
+        "probe setup: the pane did not inherit the launcher's environment at all "
+        f"(control variable read {got_mark!r}) — it says nothing about PATH"
+    )
+    entries = [entry.rstrip("\\").lower() for entry in pane_path.split(";")]
+    assert str(marker).lower() not in entries, (
+        "psmux now gives a pane the launcher's PATH instead of rebuilding it from the "
+        "registry (psmux/psmux#773) — the pinned psmux path in the parked-window "
+        "trailer (#877, item 1 of #879) retires, but only through a _LAST_UNSUPPORTED "
+        "bump to the last release without the fix, never a deletion: an older admitted "
+        "build still rebuilds PATH"
+    )
+
+
+def test_premise_show_environment_ignores_the_name(probe):
+    """`show-environment -t <session> NAME` answers with the session server's
+    whole listing at rc 0, whatever NAME is (psmux/psmux#775). A tmux-style
+    named query cannot be asked, which is why the psmux backend keeps the
+    seam's `inherited_env -> None` default (#660).
+
+    Red means psmux answers for that one name, and a psmux `inherited_env`
+    can be adopted behind a `_LAST_UNSUPPORTED` bump to the last release
+    without the fix. Two adoption notes measured on the fixed build: an
+    untargeted `-g` answers from whichever session's server it lands on (one
+    server per session), and `-g PATH` answers `Path=...`, the spelling the
+    environment block stores.
+    """
+    mux, session, _ = probe
+    name = "BMAD_LOOP_PROBE_SES"
+    stored = mux._run(["set-environment", "-t", session, name, "session-val"], check=False)
+    assert stored.returncode == 0, f"probe setup: set-environment failed: {stored.stderr.strip()!r}"
+    asked = mux._run(["show-environment", "-t", session, name], check=False)
+    assert (
+        asked.returncode == 0
+    ), f"probe setup: the named show-environment failed: {asked.stderr.strip()!r}"
+    lines = [line.strip() for line in asked.stdout.splitlines() if line.strip()]
+    # Either shape carries the line; its absence means the write never landed
+    # or the reply came from another server, and neither is the premise.
+    assert (
+        f"{name}=session-val" in lines
+    ), f"probe setup: the reply does not carry the stored variable: {lines!r}"
+    assert lines != [f"{name}=session-val"], (
+        "psmux now answers show-environment NAME for that one name (psmux/psmux#775) — "
+        "a psmux inherited_env can be adopted (#660) behind a _LAST_UNSUPPORTED bump to "
+        "the last release without the fix: send `show-environment -g -t =<session> NAME` "
+        "(an untargeted -g answers from whichever session's server it lands on) and match "
+        "the returned name case-insensitively (`-g PATH` answers `Path=...`)"
+    )
+
+
 # ------------------------------------------------- adopted-behavior probes
 #
 # The mirror image of the premise probes above. Those guarded workarounds and
@@ -1060,6 +1183,43 @@ def test_adopted_kill_session_honors_the_exact_match_target(probe):
         "psmux no longer honors the `=name` form for kill-session (psmux/psmux#558) "
         "— the plain-name override dropped on the 3.3.8 floor is needed again"
     )
+
+
+def test_adopted_case_only_duplicate_session_is_refused(probe, tmp_path):
+    """A second session whose name differs only in case from a live one is
+    refused (psmux/psmux#774). The registry directory, the server mutex and
+    older clients all fold case, so psmux treats the two names as one slot by
+    design — the premise behind `PsmuxMultiplexer.session_name_key` folding to
+    lower case. Through the seam's own `new_session`, since what bmad-loop
+    relies on is that its create fails loudly rather than mints a twin.
+
+    Red means case-distinct sessions coexist, and the fold would merge two
+    real sessions: it becomes wrong, not merely redundant.
+    """
+    mux, session, _ = probe
+    variant = session.upper()
+    assert variant != session and mux.session_name_key(variant) == mux.session_name_key(
+        session
+    ), f"probe setup: {variant!r} is not a case-only variant of {session!r}"
+    try:
+        mux.new_session(variant, tmp_path)
+        refusal = ""
+    except tmux_base.TmuxError as exc:
+        refusal = str(exc)
+    assert refusal, (
+        f"psmux now creates {variant!r} beside the live {session!r} (psmux/psmux#774) — "
+        "case-distinct sessions coexist, so the lower-case fold in "
+        "PsmuxMultiplexer.session_name_key would merge two real sessions"
+    )
+    assert (
+        "duplicate session" in refusal
+    ), f"probe setup: the create failed for another reason than the name: {refusal!r}"
+    held = [
+        name
+        for name in mux.list_sessions()
+        if mux.session_name_key(name) == mux.session_name_key(session)
+    ]
+    assert held == [session], f"the refused create disturbed the live session: {held!r}"
 
 
 def test_adopted_unresolvable_kill_target_exits_nonzero_and_spares_live_windows(probe):
