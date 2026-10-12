@@ -151,6 +151,11 @@ POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
 # an operator flips in a REPL or a subclass, not in the run contract every
 # settings file has to carry. Off means the sink is never opened.
 SSE_TRACE = True
+# The adapter-authored provider-error lines (`_note_provider_error`), scanned by
+# the env-fault classifier beside `.server.out`. Created at spawn on every
+# protocol, so a session that saw no provider error leaves an empty file — a
+# clean answer — rather than a missing one, which the scan reads as a fault.
+PROVIDER_ERRORS_SUFFIX = ".provider-errors.log"
 
 # Capacity bound for the `_usage` stash (DW-117). `_usage` is written once per
 # session in `_capture_usage` and never popped, so without a ceiling it grows
@@ -420,6 +425,15 @@ class _ServerSession:
     # healthy in time" (an HTML answer: the wrong server API) — read by
     # `_spawn_server` for its give-up error.
     health_fault: str = ""
+    # The task this server runs (``spec.task_id``), naming the lifecycle file
+    # the reader thread's crumbs land in; empty for a bare session.
+    lifecycle_task: str = ""
+    # `logs/<task_id>.provider-errors.log`, created at spawn and appended by the
+    # reader (`_note_provider_error`); None for a bare session.
+    provider_errors_path: Path | None = None
+    # Whether a provider-errors append has failed this session: the first
+    # failure is crumbed (`provider-errors-write-failed`), the rest only lost.
+    provider_errors_write_failed: bool = False
 
 
 class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
@@ -431,6 +445,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # that a story quoting a provider error verbatim cannot reach the scanned
     # bytes. Point this at the transcript and both properties break at once.
     ENV_FAULT_LOG_SUFFIX = ".server.out"
+    # ...plus the provider-errors log: OpenCode 2.x logs no provider retry to
+    # stdout (one line only once it gives up, ~90 s in — after most session
+    # clocks have run out), so the adapter writes one line per provider-error SSE frame
+    # itself, from structured fields only (`format_provider_error`) — model-free
+    # by construction, which is what lets the profile anchor on its prefix.
+    ENV_FAULT_LOG_SUFFIXES = (".server.out", PROVIDER_ERRORS_SUFFIX)
 
     injection = "http"
     observation = "sse"
@@ -599,6 +619,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # give-up error below names this path, not log_path.
             server_path = self.logs_dir / f"{spec.task_id}.server.out"
             server_fh = server_path.open("ab")  # append: retries share one server log
+            provider_errors_path = self.logs_dir / f"{spec.task_id}{PROVIDER_ERRORS_SUFFIX}"
+            provider_errors_path.touch()  # kept, like the others, across spawn retries
         except BaseException:
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
@@ -624,6 +646,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     event_fh=event_fh,
                     protocol=protocol,
                     server_version=format_version(version),
+                    lifecycle_task=spec.task_id,
+                    provider_errors_path=provider_errors_path,
                 )
                 if self._await_healthy(sess):
                     sess.client = self._make_client(sess)
@@ -767,6 +791,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         log_paths = [
             self.logs_dir / f"{spec.task_id}.log",
             self.logs_dir / f"{spec.task_id}.server.out",
+            self.logs_dir / f"{spec.task_id}{PROVIDER_ERRORS_SUFFIX}",
         ]
         if self.sse_trace:
             log_paths.append(self.logs_dir / f"{spec.task_id}.sse.jsonl")
@@ -790,8 +815,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         #
         # Unlinked HERE and not in _spawn_server, which deliberately opens the file
         # "ab" so a spawn retry (free-port collision) keeps its predecessor's
-        # diagnostics inside the SAME session.
-        self._env_fault_log_path(spec.task_id).unlink(missing_ok=True)
+        # diagnostics inside the SAME session. Every scanned file, the
+        # provider-errors log included — its stale line pauses just the same.
+        for scanned in self._env_fault_log_paths(spec.task_id):
+            scanned.unlink(missing_ok=True)
 
         launched_ns = time.time_ns()
         sess = self._spawn_server(spec)
@@ -973,6 +1000,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # keeps a malformed frame out of the trace — it is not a frame the
             # adapter acted on. Liveness/activity above already counted it.
             return
+        # The env-fault evidence first, and outside the logging guard below: the
+        # classifier reads this file after the session settles, so the line must
+        # land before the turn end it may precede is queued.
+        self._note_provider_error(sess, etype, props)
         # Before the control queue: emit a structured trace record and render
         # one human-readable line into the run log. Both helpers no-op on
         # unknown types, so unhandled frames leave both sinks byte-identical to
@@ -999,6 +1030,35 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             sess.events.put("idle")
         elif etype in protocol.error_types:
             sess.events.put("error")
+
+    def _note_provider_error(self, sess: _ServerSession, etype: str, props: Any) -> None:
+        """Append this session's provider-error frame, as one adapter-authored
+        line (:func:`format_provider_error` — structured fields only, never the
+        provider's response body), to ``logs/<task_id>.provider-errors.log``:
+        the env-fault classifier's evidence on 2.x, whose server log carries no
+        line per retry. A frame of another type writes nothing.
+
+        Never raises — the reader must not die — but a lost line is a lost
+        classification, so a failure is visible: a payload that will not format
+        or an append that fails crumbs ``provider-errors-write-failed``
+        (``frame``, ``error``) once per session."""
+        if sess.provider_errors_path is None:
+            return  # bare session: no sink
+        try:
+            line = sess.protocol.provider_error_line(etype, props)
+            if line is None:
+                return
+            with sess.provider_errors_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as e:  # the reader must never die; the loss is crumbed
+            if not sess.provider_errors_write_failed:
+                sess.provider_errors_write_failed = True
+                self._note_lifecycle(
+                    sess.lifecycle_task,
+                    "provider-errors-write-failed",
+                    frame=etype,
+                    error=f"{type(e).__name__}: {e}",
+                )
 
     def _render_inline(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one human-readable progress line to the run log for the event

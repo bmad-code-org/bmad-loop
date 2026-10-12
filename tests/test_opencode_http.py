@@ -101,6 +101,14 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #                      shell a server of another major serves for its routes)
 #   sse-drop-once      completed, but the FIRST event stream closes right after
 #                      server.connected — the turn end arrives on the reconnect
+#   provider-outage    (V2) the turn never finishes: the provider is down, so the
+#                      stream carries `session.retry.scheduled` frames (the shape
+#                      captured live from 2.0.27 on a closed port) and nothing else
+#   provider-outage-after-work  the same, but Session.Info reports the tokens of
+#                      work already done (the #764 veto's measurement)
+#   provider-quota     (V2) the provider refuses on quota: no retry, the turn
+#                      fails at once (`session.step.failed` + `session.execution.failed`,
+#                      `provider.quota` status 402 — the shapes captured from 2.0.27)
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
 # turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
@@ -222,7 +230,7 @@ def turn_tokens():
                 "cache": {"read": 0, "write": 0}}
     with LOCK:
         done = STATE["completed_ms"]
-    if done:
+    if done or SCENARIO == "provider-outage-after-work":
         return {"input": 100, "output": 50, "reasoning": 5, "cache": {"read": 7, "write": 3}}
     return {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
 
@@ -285,6 +293,24 @@ def run_turn():
         finish_turn(); push_idle()
     elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
+    elif SCENARIO == "provider-quota":
+        error = {"type": "provider.quota", "status": 402,
+                 "message": "You exceeded your current quota, please check your plan "
+                            "and billing details.",
+                 "response": {"body": '{"error": {"type": "insufficient_quota"}}'}}
+        push(v2_frame("session.step.failed", sessionID=SESSION_ID,
+                      assistantMessageID="msg_fakeasst1", error=error, files=[]))
+        with LOCK:
+            STATE["busy"] = False  # the turn is over; nothing was spent
+        push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
+    elif SCENARIO in ("provider-outage", "provider-outage-after-work"):
+        for attempt in (2, 3, 4):  # live, the first retry is attempt 2
+            push(v2_frame("session.retry.scheduled", sessionID=SESSION_ID,
+                          assistantMessageID="msg_fakeasst1", attempt=attempt,
+                          at=now_ms() + 1000 * attempt,
+                          error={"type": "provider.transport",
+                                 "message": "ConnectionRefused: Unable to connect. "
+                                            "Is the computer able to access the url?"}))
     elif SCENARIO == "big-usage-then-complete":
         time.sleep(0.35)  # stay busy through several fast heartbeat samples
         write_result(); finish_turn(); push_idle()
@@ -4898,6 +4924,159 @@ def test_v2_zero_token_timeouts_classify_like_v1(tmp_path, v2_fake):
     assert_server_gone(rec)
 
 
+# ------------------------------- OpenCode 2.x (V2) provider faults (env fault)
+
+
+def test_v2_provider_error_log_classifies_transport_outage(tmp_path, v2_fake):
+    """The V2 env-fault path end to end: 2.x logs no provider error to its own
+    stdout, so the evidence is the adapter-authored `provider-errors.log` line
+    the reader writes for each `session.retry.scheduled`. A turn that only ever
+    retries a dead provider times out untracked (no tokens, no completed step —
+    the zero-token rule cannot see it) and must still classify, off that file.
+
+    ABLATION: drop `.provider-errors.log` from ENV_FAULT_LOG_SUFFIXES (or stop
+    `_note_provider_error` writing) and env_fault reads False."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-outage", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.result_json is None
+    assert adapter.read_usage(result) is None  # untracked: the pattern did this
+    assert result.env_fault is True
+    assert result.env_fault_evidence.startswith(
+        "provider-error event=session.retry.scheduled type=provider.transport"
+    )
+    logs = tmp_path / "run" / "logs"
+    lines = (logs / "t-1.provider-errors.log").read_text(encoding="utf-8").splitlines()
+    assert lines == [
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        f'attempt={n} message="ConnectionRefused: Unable to connect. Is the computer '
+        'able to access the url?"'
+        for n in (2, 3, 4)
+    ]
+    # The server log carries nothing (as on the real 2.x); the transcript is
+    # never the source.
+    assert "provider.transport" not in (logs / "t-1.server.out").read_text(encoding="utf-8")
+    events = _lifecycle(tmp_path)
+    assert [e["event"] for e in events][-1:] == ["env-fault-classified"]
+    assert not [e for e in events if e["event"] == "env-fault-scan-failed"]
+    assert_server_gone(rec)
+
+
+def test_v2_provider_quota_failure_classifies_and_renders(tmp_path, v2_fake):
+    """A quota refusal is not retried: the turn fails at once on
+    `session.execution.failed`. The provider-errors log carries both frames'
+    lines (never the response body), the failure is an environment fault, and
+    the transcript shows the prompt and the error as `[bmad]` lines."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota", timeout_s=5.0))
+
+    assert result.status in ("timeout", "stalled", "crashed"), result.status
+    assert result.result_json is None
+    assert result.env_fault is True
+    assert "type=provider.quota status=402" in result.env_fault_evidence
+    logs = tmp_path / "run" / "logs"
+    lines = (logs / "t-1.provider-errors.log").read_text(encoding="utf-8").splitlines()
+    # One pair per failed turn (the result-less turn end is nudged, and the
+    # nudged turn fails the same way).
+    events = [line.split(" type=")[0] for line in lines]
+    assert events and len(events) % 2 == 0
+    assert events == [
+        "provider-error event=session.step.failed",
+        "provider-error event=session.execution.failed",
+    ] * (len(events) // 2)
+    assert not any("insufficient_quota" in line for line in lines)
+    transcript = (logs / "t-1.log").read_text(encoding="utf-8")
+    assert "[bmad] user:" in transcript
+    assert "Use the bmad-loop-sweep skill now: run it" in transcript
+    assert "[bmad] error: provider.quota 402: You exceeded your current quota" in transcript
+    assert_server_gone(rec)
+
+
+def test_v2_provider_outage_after_work_is_overruled(tmp_path, v2_fake):
+    """#764 on V2: the same outage lines in a session whose Session.Info reports
+    tokens already spent are overruled — the session did real work, so it is
+    charged like any other failure rather than paused."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-outage-after-work", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result).total > 0
+    assert result.env_fault is False
+    assert result.env_fault_overruled is not None
+    assert "type=provider.transport" in result.env_fault_overruled
+    events = _lifecycle(tmp_path)
+    assert [e["event"] for e in events][-1:] == ["env-fault-overruled"]
+    assert_server_gone(rec)
+
+
+def test_provider_errors_log_is_created_at_spawn_on_v1(tmp_path, fake_opencode):
+    """Every protocol creates the provider-errors log at spawn — V1 never writes
+    a line to it — so a healthy V1 session's scan reads an empty file (a clean
+    answer), never a missing one (a read-fault crumb)."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.env_fault is False
+    assert (tmp_path / "run" / "logs" / "t-1.provider-errors.log").read_bytes() == b""
+    assert not [e for e in _lifecycle(tmp_path) if e["event"] == "env-fault-scan-failed"]
+    assert_server_gone(rec)
+
+
+def test_stale_provider_errors_log_is_dropped_at_session_start(tmp_path, v2_fake):
+    """The pause loop `test_env_fault_log_is_dropped_at_session_start` guards
+    against, for the second scanned file: a re-armed run reusing a task id must
+    not classify off the PREVIOUS cycle's provider-error line."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    stale = tmp_path / "run" / "logs" / "t-1.provider-errors.log"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=1 message="stale"\n',
+        encoding="utf-8",
+    )
+
+    result = adapter.run(make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.env_fault is False, f"classified off a stale log: {result.env_fault_evidence}"
+    assert stale.read_bytes() == b""
+
+
+def test_provider_error_write_failure_is_crumbed_once(tmp_path):
+    """A lost provider-error line is a lost classification, so the reader's
+    append failing is visible — one `provider-errors-write-failed` crumb per
+    session — and never kills the reader or the queue put behind it."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.lifecycle_task = "t-1"
+    sess.provider_errors_path = tmp_path / "missing-dir" / "t-1.provider-errors.log"
+    failed = _v2_frame(
+        "session.execution.failed",
+        sessionID="ses_parent",
+        error={"type": "provider.transport", "message": "down"},
+    )
+
+    adapter._dispatch_sse(sess, failed)
+    adapter._dispatch_sse(sess, failed)
+
+    assert [sess.events.get_nowait(), sess.events.get_nowait()] == ["error", "error"]
+    crumbs = [e for e in _lifecycle(tmp_path) if e["event"] == "provider-errors-write-failed"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["frame"] == "session.execution.failed"
+    assert crumbs[0]["error"].startswith("FileNotFoundError: ")
+
+
 def test_e2e_spawn_retry_survives_one_early_death(tmp_path, fake_opencode):
     launcher, rec = fake_opencode
     adapter = make_adapter(tmp_path, binary=str(launcher))
@@ -5399,7 +5578,13 @@ def _write_ef_log(adapter, text: str, task_id: str = _EF_TASK) -> None:
     suffix here would just restate the implementation. Pinning the wiring is
     test_e2e_env_fault_classified_through_run's job, and it is the only thing that
     caught the scan pointing at the wrong file after <task_id>.log became the
-    conversation transcript."""
+    conversation transcript.
+
+    The other scanned files are created empty, as the spawn creates them: a
+    missing one is a read fault (crumbed), not the clean answer these tests
+    are about."""
+    for scanned in adapter._env_fault_log_paths(task_id):
+        scanned.touch()
     adapter._env_fault_log_path(task_id).write_text(text, encoding="utf-8")
 
 
@@ -5480,16 +5665,20 @@ def test_opencode_env_fault_skips_completed_and_result_bearing(tmp_path):
 def test_opencode_env_fault_missing_log_declines_with_a_crumb(tmp_path):
     """Best-effort doctrine: an unreadable log leaves the verdict untouched — and
     says so (DW-460). This host reaches the crumb through the same
-    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names the file it
-    actually scans (`.server.out`), not the transcript."""
+    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names each file it
+    actually scans (`.server.out`, then `.provider-errors.log`), not the
+    transcript — one crumb per unreadable file."""
     adapter = make_adapter(tmp_path)
     result = _ef_classify(adapter, "timeout", task_id="never-ran")
     assert result.env_fault is False
     events = _lifecycle_lines(adapter, "never-ran")
-    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
-    assert events[0]["stage"] == "read"
-    assert events[0]["log"] == str(adapter.logs_dir / "never-ran.server.out")
-    assert events[0]["error"].startswith("FileNotFoundError: ")
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"] * 2
+    assert [e["stage"] for e in events] == ["read", "read"]
+    assert [e["log"] for e in events] == [
+        str(adapter.logs_dir / "never-ran.server.out"),
+        str(adapter.logs_dir / "never-ran.provider-errors.log"),
+    ]
+    assert all(e["error"].startswith("FileNotFoundError: ") for e in events)
 
 
 def test_opencode_env_fault_clean_scan_leaves_no_crumb(tmp_path):

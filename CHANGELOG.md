@@ -32,7 +32,9 @@ breaking changes may land in a minor release.
   `adapter.opencode-version`. It drives OpenCode 2.x sessions over the V2 `/api/*`
   server API, including usage, the token budget and the poll fallback. On 2.x the
   `effort` rides the session's model as its variant, and an effort the model does not
-  offer fails the session start (#847).
+  offer fails the session start. A 2.x session renders its `[bmad]` transcript and SSE
+  trace, writes each provider-error event to `logs/<task-id>.provider-errors.log`, and
+  a provider outage there classifies as an environment fault (#847).
 
 ### Changed
 

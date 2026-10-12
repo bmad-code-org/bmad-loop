@@ -200,6 +200,50 @@ Poll fallback, usage, transcript and effort — pinned live against 2.0.27
 - With no model configured, V2's default is the hosted ``opencode`` provider
   (credential-free), not a failure — the operator's own config decides the
   model, exactly as on V1.
+
+Inline transcript and provider faults — pinned live against 2.0.27
+(2026-10-12), same zero-token mock setup, the mock answering a 429 rate limit
+(with and without ``retry-after``), a 429 and a 402 ``insufficient_quota``,
+and a closed port:
+
+- Every session frame's payload is under ``data`` with its ``sessionID``
+  (``permission.*`` included). The user prompt is
+  ``session.inbox.enqueued {item: {type: "user", payload: {text}}}``. Text
+  and reasoning stream as ``session.{text,reasoning}.{started,delta,ended}``;
+  ``.ended`` carries the complete ``text`` once (``ordinal`` numbers the
+  parts). Reasoning fires for both the ``reasoning_content`` and the
+  ``reasoning`` stream keys.
+- A tool call is ``session.tool.input.started {id, name}`` →
+  ``.input.ended {id, text}`` (the raw argument JSON) → ``session.tool.called
+  {id, input}`` → ``session.tool.progress`` → exactly one of
+  ``session.tool.success {id, content, metadata}`` / ``session.tool.failed
+  {id, error {type, message}}``, joined by the call ``id``. A shell command
+  exiting non-zero is a SUCCESS with ``metadata.exit`` set; ``.failed`` was
+  seen only for a rejected permission (``error.type permission.rejected``,
+  the reply's message as ``error.message``), and that turn still ended
+  ``succeeded``.
+- An ``ask`` rule parks the call on ``permission.asked {id, sessionID,
+  action, resources, save, source {type: "tool", messageID, id}}`` (e.g.
+  ``action: "shell"``, ``resources: ["echo hi"]``); the reply is ``POST
+  /api/session/{id}/permission/{requestID}/reply {"decision":
+  "once"|"always"|"reject", "message"?}`` → 204, then ``permission.replied
+  {sessionID, requestID, reply}``. No ``form.*`` frame fired (the adapter's
+  ``question`` deny keeps forms away); none is rendered.
+- A provider failure surfaces ONLY as frames, each with a structured
+  ``error {type, message, status?, response? {body}}``: ``session.retry.
+  scheduled {attempt, at, error}`` per backoff (attempts 2..11, ~2/4/8 s then
+  ~10 s, ``retry-after`` ignored), then ``session.step.failed {error}`` and
+  ``session.execution.failed {error}``. Observed types: a 429 rate limit is
+  ``provider.rate-limit`` (``status 429``, retried 10 times, ~80–88 s); a
+  quota refusal is ``provider.quota`` (``status`` 429 or 402, NOT retried —
+  fails in ~0.3 s); a refused connection is ``provider.transport`` (no
+  ``status``, no ``response``; retried 10 times, ~87 s). ``error.message`` is
+  the provider's own message verbatim and ``response.body`` its raw body —
+  provider-written text, so the adapter copies only the bounded message, last
+  on its line (:func:`format_provider_error`), never the body. The server log
+  carries no line per retry; only the final give-up logs one ``level=ERROR
+  message="Failed to drain Session"`` line, too late for a run killed
+  mid-retry, so it is not what the classifier reads.
 """
 
 from __future__ import annotations
@@ -338,6 +382,74 @@ def _role_color(role: str) -> str:
     return _ROLE_COLORS.get(role, _ROLE_COLOR_DEFAULT)
 
 
+# The provider-errors log (`logs/<task_id>.provider-errors.log`): one line per
+# provider-error frame, authored by the adapter from the frame's STRUCTURED
+# fields — what the env-fault classifier scans on V2, whose server log logs no
+# retry at all (see the module docstring). Its patterns may anchor on the line's own prefix
+# only because every byte before `message=` is adapter-chosen: the event name
+# comes from the protocol's allowlist and each field is reduced to
+# `_FIELD_SAFE`. The message is the one provider-sourced text, so it goes last,
+# quoted, bounded, and escaped so it can never end the line (nor carry a CR the
+# scanner would split on, nor an ANSI escape it would strip) — a forged
+# `provider-error …` inside it stays mid-line, behind the anchor. The error's
+# `response.body` is never copied.
+PROVIDER_ERROR_MESSAGE_MAX = 400
+_PROVIDER_ERROR_FIELD_MAX = 80
+_FIELD_SAFE = re.compile(r"[^A-Za-z0-9._:/-]")
+
+
+def _provider_error_field(value: Any) -> str:
+    """One unquoted ``key=value`` value: an int or a string reduced to
+    ``_FIELD_SAFE`` characters, ``-`` when absent or of another type."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return "-"
+    text = _FIELD_SAFE.sub("_", str(value))[:_PROVIDER_ERROR_FIELD_MAX]
+    return text or "-"
+
+
+def _escape_message(text: str) -> str:
+    """Backslash-escape ``text`` for a double-quoted single-line value: the
+    quote, the backslash, and every control character (C0, DEL, C1 and the
+    Unicode line/paragraph separators)."""
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch in ('"', "\\"):
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif code < 0x20 or 0x7F <= code <= 0x9F or ch in "  ":
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def format_provider_error(etype: str, props: Any) -> str:
+    """``provider-error event=<etype> type=<error.type> status=<status>
+    attempt=<n> message="<message>"`` for one provider-error frame, ``-`` for
+    each absent field; the message is cut to ``PROVIDER_ERROR_MESSAGE_MAX``
+    characters before escaping. Raises on a payload that is not an object."""
+    error = props.get("error")
+    if not isinstance(error, dict):
+        error = {}
+    message = error.get("message")
+    message = message if isinstance(message, str) else ""
+    if len(message) > PROVIDER_ERROR_MESSAGE_MAX:
+        message = message[: PROVIDER_ERROR_MESSAGE_MAX - 1] + "…"
+    return (
+        f"provider-error event={_provider_error_field(etype)}"
+        f" type={_provider_error_field(error.get('type'))}"
+        f" status={_provider_error_field(error.get('status'))}"
+        f" attempt={_provider_error_field(props.get('attempt'))}"
+        f' message="{_escape_message(message)}"'
+    )
+
+
 class OpencodeProtocol:
     """One OpenCode server API: what the adapter sends and how it reads what
     comes back. One instance per server session, chosen by the major
@@ -358,6 +470,9 @@ class OpencodeProtocol:
     idle_types: frozenset[str] = frozenset()  # frame types that queue "idle"
     error_types: frozenset[str] = frozenset()  # frame types that queue "error"
     trace_skip_types: frozenset[str] = frozenset()  # never written to the SSE trace
+    # Frame types whose ``error`` the adapter copies into
+    # ``logs/<task_id>.provider-errors.log`` (:meth:`provider_error_line`).
+    provider_error_types: frozenset[str] = frozenset()
     event_path: str = ""
 
     def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
@@ -384,6 +499,14 @@ class OpencodeProtocol:
 
     def render_line(self, msg_roles: dict[Any, Any], etype: str, props: Any) -> str | None:
         raise NotImplementedError
+
+    def provider_error_line(self, etype: str, props: Any) -> str | None:
+        """The ``provider-errors.log`` line for one of this session's frames, or
+        None for a frame that carries no provider error. Raises on a payload
+        that is not an object."""
+        if etype not in self.provider_error_types:
+            return None
+        return format_provider_error(etype, props)
 
     def session_busy(self, client: Any, session_id: str) -> bool | None:
         raise NotImplementedError
@@ -708,6 +831,39 @@ class V1Protocol(OpencodeProtocol):
             return None, f"{type(e).__name__}: {e}"
 
 
+# The V2 tool-call frames the renderer joins by call `id` (see
+# `V2Protocol.render_line`); `session.tool.progress` and `.input.ended` carry
+# nothing the line shows.
+_V2_TOOL_TYPES = frozenset(
+    {
+        "session.tool.input.started",
+        "session.tool.called",
+        "session.tool.success",
+        "session.tool.failed",
+    }
+)
+
+
+def _speaker_block(role: str, text: Any) -> str | None:
+    """V1's speaker block (:meth:`V1Protocol.inline_line`): a blank line, the
+    role-colored ``[bmad] <role>:`` header, then the text; None for no text."""
+    body = text.strip() if isinstance(text, str) else ""
+    if not body:
+        return None
+    return f"\n{_role_color(role)}[bmad] {role}:{_RESET}\n{body}\n"
+
+
+def _error_summary(error: Any) -> str:
+    """``<type> [<status>]: <message>`` for a V2 structured error (never its
+    ``response.body``), bounded like every inline summary."""
+    if not isinstance(error, dict):
+        return _sum_args(error)
+    head = " ".join(str(error[key]) for key in ("type", "status") if error.get(key) is not None)
+    message = error.get("message")
+    text = f"{head}: {message}" if head and message else head or str(message or "")
+    return _sum_args(text)
+
+
 # `GET /api/session/{id}/message` page size for the transcript walk: the
 # server's maximum — `limit=201` is a 400, never clamped (pinned 2.0.27).
 _V2_PAGE_LIMIT = 200
@@ -723,7 +879,7 @@ class V2Protocol(OpencodeProtocol):
     ``/api/event`` envelope and the ``session.execution.*`` turn end,
     interrupt), the poll fallback (``/api/session/active`` + assistant-message
     proof-of-work), usage (the ``Session.Info`` aggregate) and the paginated
-    transcript. The inline renderer renders nothing yet."""
+    transcript, the inline renderer and the provider-errors log."""
 
     major = 2
     # The heartbeat is an SSE comment line (``: heartbeat``), not a data frame:
@@ -736,6 +892,22 @@ class V2Protocol(OpencodeProtocol):
     # schema and never fired live — waiting on them would wait forever.
     idle_types = frozenset({"session.execution.succeeded", "session.execution.interrupted"})
     error_types = frozenset({"session.execution.failed"})
+    # The provider-error frames — V2's server log carries no line per retry, so
+    # these are the env-fault classifier's evidence on 2.x.
+    provider_error_types = frozenset(
+        {"session.retry.scheduled", "session.step.failed", "session.execution.failed"}
+    )
+    # The per-token streams: each part's complete text arrives once on its
+    # `*.ended` frame (V1's `message.part.delta` rule — never traced, never
+    # rendered).
+    trace_skip_types = frozenset(
+        {
+            "session.text.delta",
+            "session.reasoning.delta",
+            "session.tool.input.delta",
+            "session.compaction.delta",
+        }
+    )
     event_path = "/api/event"
 
     def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
@@ -863,7 +1035,76 @@ class V2Protocol(OpencodeProtocol):
         return data, data.get("sessionID")
 
     def render_line(self, msg_roles: dict[Any, Any], etype: str, props: Any) -> str | None:
+        """The inline-log line for one V2 frame, or None for a frame that
+        renders nothing — the same lines V1 writes (:meth:`V1Protocol.inline_line`
+        / :meth:`V1Protocol.tool_line`), read off the V2 frames pinned in this
+        module's "Inline transcript" section. Never a ``*.delta``: each text's
+        complete form arrives once on its ``*.ended`` frame.
+
+        ``msg_roles`` is the per-session render state; V2 frames name their
+        speaker by type, so it keys each tool call by its ``id`` instead: the
+        name from ``session.tool.input.started``, the input from
+        ``session.tool.called``, and the line rendered once, on the terminal
+        ``session.tool.success`` / ``session.tool.failed``."""
+        if etype == "session.inbox.enqueued":
+            item = props.get("item") or {}
+            return _speaker_block("user", (item.get("payload") or {}).get("text"))
+        if etype in ("session.text.ended", "session.reasoning.ended"):
+            # Reasoning reads as prose under the assistant header, as V1
+            # renders a reasoning part.
+            return _speaker_block("assistant", props.get("text"))
+        if etype in _V2_TOOL_TYPES:
+            return self._tool_line(msg_roles, etype, props)
+        if etype == "permission.asked":
+            resources = _sum_args(props.get("resources"))
+            return (
+                f"{_TOOL_COLOR}[bmad] perm ask: {props.get('action') or '?'}"
+                f"{(' ' + resources) if resources else ''}{_RESET}\n"
+            )
+        if etype == "permission.replied":
+            return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
+        if etype == "session.retry.scheduled":
+            detail = _error_summary(props.get("error"))
+            return (
+                f"{_TOOL_COLOR}[bmad] retry {props.get('attempt') or '?'}:"
+                f"{(' ' + detail) if detail else ''}{_RESET}\n"
+            )
+        if etype in ("session.step.failed", "session.execution.failed"):
+            label = "step failed" if etype == "session.step.failed" else "error"
+            detail = _error_summary(props.get("error"))
+            return f"{_TOOL_COLOR}[bmad] {label}:{(' ' + detail) if detail else ''}{_RESET}\n"
         return None
+
+    @staticmethod
+    def _tool_line(calls: dict[Any, Any], etype: str, props: Any) -> str | None:
+        call_id = props.get("id")
+        if not isinstance(call_id, str):
+            return None
+        call = calls.setdefault(("tool", call_id), {})
+        if etype == "session.tool.input.started":
+            call["name"] = props.get("name")
+            return None
+        if etype == "session.tool.called":
+            call["input"] = props.get("input")
+            return None
+        if call.get("done"):
+            return None  # terminal-once: a call renders exactly one line
+        call["done"] = True
+        args = _sum_args(call.get("input"))
+        suffix = ""
+        if etype == "session.tool.failed":
+            detail = _error_summary(props.get("error"))
+            suffix = f" -> error{(': ' + detail) if detail else ''}"
+        else:
+            # A non-zero exit is a SUCCESS frame on V2 (pinned): the exit code
+            # is the only trace of the failure, so it goes on the line.
+            exit_code = (props.get("metadata") or {}).get("exit")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code:
+                suffix = f" -> exit {exit_code}"
+        return (
+            f"{_TOOL_COLOR}[bmad] tool: {call.get('name') or '?'}"
+            f"{(' ' + args) if args else ''}{suffix}{_RESET}\n"
+        )
 
     def session_busy(self, client: Any, session_id: str) -> bool | None:
         """Tri-state ``GET /api/session/active`` probe: True = listed (the map's

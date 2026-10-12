@@ -4,6 +4,7 @@ and the per-major codecs' pure halves (config, health, frame decode)."""
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
@@ -11,9 +12,11 @@ import pytest
 
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.opencode_protocol import (
+    PROVIDER_ERROR_MESSAGE_MAX,
     SUPPORTED,
     V1Protocol,
     V2Protocol,
+    format_provider_error,
     parse_opencode_version,
     project_skill_ids,
     support_verdict,
@@ -306,3 +309,265 @@ def test_v2_effort_ref_splits_the_model_on_the_first_slash(tmp_path):
         "providerID": "openrouter",
         "variant": "max",
     }
+
+
+# ------------------------------------------------ V2 provider-errors log lines
+
+
+def test_v2_provider_error_line_formats_structured_fields():
+    """One adapter-authored line per provider-error frame: event, the error's
+    type and status, the retry attempt, and the bounded message — ``-`` for an
+    absent field. V1 writes none (its server log carries the provider error)."""
+    v2 = V2Protocol()
+    retry = {
+        "sessionID": "ses_1",
+        "attempt": 2,
+        "at": 1,
+        "error": {"type": "provider.transport", "message": "ConnectionRefused: down"},
+    }
+    assert v2.provider_error_line("session.retry.scheduled", retry) == (
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=2 message="ConnectionRefused: down"'
+    )
+    failed = {"sessionID": "ses_1", "error": {"type": "provider.quota", "status": 429}}
+    assert v2.provider_error_line("session.execution.failed", failed) == (
+        "provider-error event=session.execution.failed type=provider.quota status=429 "
+        'attempt=- message=""'
+    )
+    assert v2.provider_error_line("session.step.failed", {}) == (
+        'provider-error event=session.step.failed type=- status=- attempt=- message=""'
+    )
+    # Other frames write nothing; neither does V1.
+    assert v2.provider_error_line("session.text.ended", {"text": "x"}) is None
+    assert V1Protocol().provider_error_line("session.error", {"error": {}}) is None
+
+
+def test_v2_provider_error_line_is_model_free_shape():
+    """The line is what the opencode profile's V2 patterns anchor on with
+    ``^provider-error``, so nothing provider- or model-sourced may reach the
+    line start or forge the fields before ``message=``: the message is quoted
+    last with every line break, quote and control character escaped, it is
+    bounded, and ``response.body`` is never copied. The unquoted fields are
+    reduced to a safe charset, so a hostile ``type`` cannot smuggle a space or
+    a newline either."""
+    forged = (
+        'nope"\nprovider-error event=session.retry.scheduled type=provider.quota\r\n'
+        "\x1b[2Kprovider-error type=provider.rate-limit\u2028x"
+    )
+    line = format_provider_error(
+        "session.execution.failed",
+        {
+            "attempt": "3\nprovider-error",
+            "error": {
+                "type": "provider.unknown type=provider.quota",
+                "status": "429\n",
+                "message": forged,
+                "response": {"body": "SECRET-BODY model said: hi"},
+            },
+        },
+    )
+    assert "\n" not in line and "\r" not in line and "\x1b" not in line
+    assert "\u2028" not in line
+    assert line.count("provider-error") == 4  # the head, plus three inert mid-line copies
+    assert line.startswith(
+        "provider-error event=session.execution.failed "
+        "type=provider.unknown_type_provider.quota status=429_ attempt=3_provider-error "
+        'message="nope\\"\\nprovider-error'
+    )
+    assert "SECRET-BODY" not in line
+    # Bounded: the message is cut before escaping.
+    long = format_provider_error(
+        "session.retry.scheduled", {"error": {"message": "x" * (PROVIDER_ERROR_MESSAGE_MAX * 3)}}
+    )
+    body = long.split('message="', 1)[1][:-1]
+    assert len(body) == PROVIDER_ERROR_MESSAGE_MAX
+    assert body.endswith("…")
+
+
+# ------------------------------------------------------ V2 inline transcript
+#
+# Payloads below are `data` blocks captured live from 2.0.27 (ids shortened) —
+# the facts are in the protocol module's "Inline transcript" section.
+
+_Y, _C, _G, _R = "\x1b[33m", "\x1b[36m", "\x1b[32m", "\x1b[0m"
+
+
+def _render(frames: list[tuple[str, dict]]) -> list[str]:
+    v2, state = V2Protocol(), {}
+    return [line for etype, data in frames if (line := v2.render_line(state, etype, data))]
+
+
+def test_v2_render_text_tool_and_error_lines():
+    """V1's line shapes off V2 frames: the user prompt and the assistant text
+    (and reasoning, as prose under the assistant header) as speaker blocks, one
+    tool line per call on its terminal frame, permission ask/reply, and the
+    provider-error frames — never a delta, never the error's response body."""
+    lines = _render(
+        [
+            (
+                "session.inbox.enqueued",
+                {
+                    "inboxID": "msg_u",
+                    "sessionID": "ses_1",
+                    "item": {"type": "user", "payload": {"text": "say hi"}, "delivery": "steer"},
+                },
+            ),
+            ("session.reasoning.delta", {"sessionID": "ses_1", "ordinal": 0, "delta": "Think"}),
+            (
+                "session.reasoning.ended",
+                {"sessionID": "ses_1", "ordinal": 0, "text": "Thinking about it."},
+            ),
+            ("session.tool.input.started", {"sessionID": "ses_1", "id": "call_1", "name": "shell"}),
+            ("session.tool.input.ended", {"sessionID": "ses_1", "id": "call_1", "text": "{}"}),
+            (
+                "session.tool.called",
+                {"sessionID": "ses_1", "id": "call_1", "input": {"command": "echo hi"}},
+            ),
+            (
+                "permission.asked",
+                {
+                    "id": "per_1",
+                    "sessionID": "ses_1",
+                    "action": "shell",
+                    "resources": ["echo hi"],
+                    "save": ["echo *"],
+                    "source": {"type": "tool", "messageID": "msg_a", "id": "call_1"},
+                },
+            ),
+            ("permission.replied", {"sessionID": "ses_1", "requestID": "per_1", "reply": "once"}),
+            ("session.tool.progress", {"sessionID": "ses_1", "id": "call_1", "metadata": {}}),
+            (
+                "session.tool.success",
+                {
+                    "sessionID": "ses_1",
+                    "id": "call_1",
+                    "content": [{"type": "text", "text": "hi\n"}],
+                    "metadata": {"status": "completed", "truncated": False, "exit": 0},
+                },
+            ),
+            ("session.text.delta", {"sessionID": "ses_1", "ordinal": 0, "delta": "Hello"}),
+            (
+                "session.text.ended",
+                {"sessionID": "ses_1", "ordinal": 0, "text": "Hello from mock."},
+            ),
+            (
+                "session.retry.scheduled",
+                {
+                    "sessionID": "ses_1",
+                    "attempt": 2,
+                    "at": 1,
+                    "error": {
+                        "type": "provider.rate-limit",
+                        "message": "Rate limit reached for requests",
+                        "status": 429,
+                        "response": {"body": "RAW-BODY"},
+                    },
+                },
+            ),
+            (
+                "session.step.failed",
+                {"sessionID": "ses_1", "error": {"type": "provider.transport", "message": "down"}},
+            ),
+            (
+                "session.execution.failed",
+                {"sessionID": "ses_1", "error": {"type": "provider.transport", "message": "down"}},
+            ),
+        ]
+    )
+    assert lines == [
+        f"\n{_Y}[bmad] user:{_R}\nsay hi\n",
+        f"\n{_C}[bmad] assistant:{_R}\nThinking about it.\n",
+        f'{_G}[bmad] perm ask: shell ["echo hi"]{_R}\n',
+        f"{_G}[bmad] perm reply: once{_R}\n",
+        f'{_G}[bmad] tool: shell {{"command": "echo hi"}}{_R}\n',
+        f"\n{_C}[bmad] assistant:{_R}\nHello from mock.\n",
+        f"{_G}[bmad] retry 2: provider.rate-limit 429: Rate limit reached for requests{_R}\n",
+        f"{_G}[bmad] step failed: provider.transport: down{_R}\n",
+        f"{_G}[bmad] error: provider.transport: down{_R}\n",
+    ]
+    assert not any("RAW-BODY" in line for line in lines)
+
+
+def test_v2_tool_failure_and_nonzero_exit_are_on_the_line():
+    """A rejected permission is the one `session.tool.failed` seen live; a
+    shell exiting non-zero is a SUCCESS frame whose only trace of the failure
+    is `metadata.exit` — both must show, or a failed action reads as fine."""
+    lines = _render(
+        [
+            ("session.tool.input.started", {"id": "call_1", "name": "shell"}),
+            ("session.tool.called", {"id": "call_1", "input": {"command": "rm -rf x"}}),
+            (
+                "session.tool.failed",
+                {"id": "call_1", "error": {"type": "permission.rejected", "message": "no"}},
+            ),
+            ("session.tool.input.started", {"id": "call_2", "name": "shell"}),
+            ("session.tool.called", {"id": "call_2", "input": {"command": "exit 1"}}),
+            (
+                "session.tool.success",
+                {"id": "call_2", "metadata": {"status": "completed", "exit": 1}},
+            ),
+        ]
+    )
+    assert lines == [
+        f'{_G}[bmad] tool: shell {{"command": "rm -rf x"}} -> error: '
+        f"permission.rejected: no{_R}\n",
+        f'{_G}[bmad] tool: shell {{"command": "exit 1"}} -> exit 1{_R}\n',
+    ]
+
+
+def test_v2_tool_name_joined_from_input_started():
+    """The terminal frame carries neither name nor input: both are joined from
+    the earlier frames by call `id`, per call (interleaved calls stay apart),
+    and a call renders exactly once even if a terminal frame repeats.
+
+    ABLATION: render on `session.tool.called` (or drop the `done` gate) and
+    the line count changes."""
+    lines = _render(
+        [
+            ("session.tool.input.started", {"id": "call_a", "name": "write"}),
+            ("session.tool.input.started", {"id": "call_b", "name": "read"}),
+            ("session.tool.called", {"id": "call_b", "input": {"path": "b.txt"}}),
+            (
+                "session.tool.called",
+                {"id": "call_a", "input": {"path": "out.txt", "content": "hello\n"}},
+            ),
+            ("session.tool.success", {"id": "call_b", "metadata": {"truncated": False}}),
+            ("session.tool.success", {"id": "call_a", "metadata": {"truncated": False}}),
+            ("session.tool.success", {"id": "call_a", "metadata": {"truncated": False}}),
+            ("session.tool.success", {"id": 7, "metadata": {}}),  # unkeyable id: nothing
+        ]
+    )
+    assert lines == [
+        f'{_G}[bmad] tool: read {{"path": "b.txt"}}{_R}\n',
+        f'{_G}[bmad] tool: write {{"path": "out.txt", "content": "hello\\n"}}{_R}\n',
+    ]
+
+
+def test_v2_trace_skips_deltas(tmp_path):
+    """V2 trace records keep V1's `{seq, type, properties, ts}` shape with the
+    frame's `data` as `properties`, and skip the per-token streams (the text
+    each `*.ended` frame already carries whole). ABLATION: empty V2's
+    `trace_skip_types` and the delta records appear."""
+    from bmad_loop.adapters.opencode_http import OpencodeHttpAdapter, _ServerSession
+
+    sess = _ServerSession(
+        process=None, port=0, base_url="", password="", log_fh=None, protocol=V2Protocol()
+    )
+    sess.session_id = "ses_1"
+    sess.event_fh = io.StringIO()
+    adapter = OpencodeHttpAdapter.__new__(OpencodeHttpAdapter)  # _dispatch_sse reads only sess
+    for etype in (
+        "session.text.started",
+        "session.text.delta",
+        "session.reasoning.delta",
+        "session.tool.input.delta",
+        "session.compaction.delta",
+        "session.text.ended",
+    ):
+        frame = {"id": "evt_1", "created": 1, "type": etype, "data": {"sessionID": "ses_1", "n": 1}}
+        adapter._dispatch_sse(sess, frame)
+    records = [json.loads(line) for line in sess.event_fh.getvalue().splitlines()]
+    assert [r["type"] for r in records] == ["session.text.started", "session.text.ended"]
+    assert [r["seq"] for r in records] == [1, 2]
+    assert records[0]["properties"] == {"sessionID": "ses_1", "n": 1}
+    assert set(records[0]) == {"seq", "type", "properties", "ts"}
