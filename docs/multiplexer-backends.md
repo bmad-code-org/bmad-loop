@@ -358,6 +358,23 @@ had in force. `cleanup` then refuses to claim an untagged session on run-directo
 that evidence only holds in a registry bmad-loop derived: a run id is unique within a project, not
 across the registry you are sharing with it.
 
+## Recovering a stranded session
+
+`bmad-loop delete` and `bmad-loop archive` refuse to remove a run while its agent session `bmad-loop-<run-id>` is still live, unless the session is tagged to another project: `run <run-id>: refusing to delete its directory while its agent session is still live — … (or pass --force)` (`archive` for archive). To clear the refusal:
+
+1. Confirm the session is this project's: `bmad-loop attach <run-id>`.
+2. `bmad-loop cleanup`, then run `delete` or `archive` again.
+3. Or pass `--force`. It stops a live engine first, then removes the run without checking for a session, and leaves any orphaned session running.
+
+A removal can still strand a session when the session listing misses it: the multiplexer binary is not on `PATH`, or on psmux a registry entry was briefly reaped. To clear a stranded session:
+
+1. Put the multiplexer back on `PATH`. On psmux after a reap, wait a few seconds for the server to republish the entry.
+2. Run `bmad-loop cleanup`. It prunes a session tagged to this project even when its run directory is gone.
+3. For an untagged session, inspect it by hand. `bmad-loop attach` cannot reach it, because it needs the run directory. On psmux, paste the `$env:PSMUX_DATA_DIR = …` line `bmad-loop mux` prints first ([why](#where-psmux-sessions-live-the-per-project-registry)). Then attach with `psmux attach -t bmad-loop-<run-id>` (`tmux attach -t …` on tmux).
+4. Once you have confirmed from its contents that it is yours (the name does not carry the project), kill it: `psmux kill-session -t bmad-loop-<run-id>` (or `tmux kill-session -t …`).
+
+Never kill a `bmad-loop-ctl…` control session this way: its windows can be live runs.
+
 ## External backends
 
 Every backend beyond the two bundled ones is a separate package that you co-install with bmad-loop; it

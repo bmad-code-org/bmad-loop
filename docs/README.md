@@ -7,6 +7,8 @@ guides below go deeper, roughly in the order you'll need them.
 
 - **[Setup guide](setup-guide.md)** — install the tools, pick a CLI, initialize a project, pass preflight, and uninstall.
 - **[TUI guide](tui-guide.md)** — the dashboard: layout, key bindings, the settings editor, and troubleshooting.
+- **[Deferred-work sweeps](sweep-guide.md)** — running a sweep, answering decisions, closing entries from stories, hard gates, and recovering from stale answers, publication refusals and an unreadable ledger.
+- **[Recovering paused runs](escalations-guide.md)** — escalations and `resolve` (re-arm, `--adopt-branch`, `--reverify`, `--abandon`), preserved attempts, plateau-defer, `confirm` for human-only actions, environment faults, and worktree merge-back failures.
 - **[Features & functionality](FEATURES.md)** — the full capability matrix and policy reference.
 - **[Terminal multiplexer backends](multiplexer-backends.md)** — which backend drives your agent sessions (tmux bundled; externals like the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr) install as packages), how selection works, and how external backends arrive.
 

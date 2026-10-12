@@ -344,6 +344,25 @@ them to whoever owns the machine:
   TUI Log tab. The server's own stdout lands beside it in `<task-id>.server.out`, and a
   structured trace of the raw SSE frames in `<task-id>.sse.jsonl`.
 
+#### Codex hook trust under worktrees
+
+Codex trusts hooks per directory, and an untrusted hook never fires, so a session would never report back. Check trust before the first run:
+
+1. In the project root, run `codex` and accept both prompts (workspace trust, then "Hooks need review → Trust all and continue").
+2. `bmad-loop validate`: the `hooks.trust` check must be ok. `bmad-loop probe-adapter codex` reports Codex's verdict for the project checkout as `hook_trust` and exits 1 unless it is `trusted`. It does not account for stage `extra_args` or worktree isolation, so always re-check with `validate`.
+3. If the verdict is not `trusted`:
+   - `untrusted`, trust is stale: open Codex in that checkout and accept the hook prompt again.
+   - `untrusted`, the relay is not usable or Codex omitted it: re-register it with `bmad-loop init --cli codex`.
+   - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox`, profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
+
+Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` for future worktree sessions, and the run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
+
+1. Read the escalation. It names the role, the worktree path, the status and the reason. For `unverifiable`, fix the cause first.
+2. `cd` into the named worktree (it stays mounted under `.bmad-loop/runs/<run-id>/worktrees/`), run `codex`, and accept the hook trust prompt.
+3. `bmad-loop resolve <run-id> --no-interactive` and answer yes: it re-arms the story and resumes the run. (With `--no-resume`, run `bmad-loop resume <run-id>` afterwards.)
+
+Expect one pause per unit: each worktree path needs its own grant. The re-armed story restarts from its baseline. bmad-loop never writes Codex's trust state itself.
+
 ### Skill location
 
 `claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`

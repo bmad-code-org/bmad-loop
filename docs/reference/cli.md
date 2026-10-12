@@ -207,7 +207,7 @@ bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
 
 ### `resolve`
 
-Resolves an escalated story, then re-arms it and resumes the run. Without a mode flag it launches an interactive resolve agent for a CRITICAL escalation. Procedures: [escalation recovery](../FEATURES.md#resolve-reverify).
+Resolves an escalated story, then re-arms it and resumes the run. Without a mode flag it launches an interactive resolve agent for a CRITICAL escalation. Procedures: [escalation recovery](../escalations-guide.md#resolve-reverify).
 
 ```text
 bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
