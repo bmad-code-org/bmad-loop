@@ -1169,6 +1169,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         last_seen = time.monotonic()
         # `activity` as of the last unresolved stream gap; None = no gap armed.
         gap_activity: int | None = None
+        # monotonic ts of the gap's next slow re-probe, once a frame has moved
+        # `activity` past the gap; None = not armed.
+        gap_recheck_at: float | None = None
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
         last_heartbeat: float | None = None
@@ -1465,21 +1468,29 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 )
                 # A gap's single probe can run before the turn settles, and the
                 # reconnected stream never replays a turn end it missed — while
-                # heartbeats keep `silent` False for good. So a gap keeps the
-                # probe armed until a substantive frame proves the stream live
-                # again (one probe after it, then disarm) or completion is seen.
+                # heartbeats keep `silent` False for good. So a gap probes every
+                # tick until a substantive frame arrives (one probe after it).
+                # That frame may be child or session-less traffic, and the probe
+                # after it may read busy or fail, so the gap then re-probes every
+                # `silence_threshold_s` until completion or this session's own
+                # turn end.
                 if event == "gap":
                     gap_activity = sess.activity
+                    gap_recheck_at = None
                 probe_activity = sess.activity
-                if (event == "gap" or silent or gap_activity is not None) and (
+                now = time.monotonic()
+                gap_due = gap_recheck_at is not None and now >= gap_recheck_at
+                if (event == "gap" or silent or gap_activity is not None or gap_due) and (
                     self._probe_completion(sess)
                 ):
                     event = "idle"  # fall through to the Stop path below
                     last_seen = time.monotonic()
-                    gap_activity = None
                 else:
                     if gap_activity is not None and probe_activity != gap_activity:
                         gap_activity = None
+                        gap_recheck_at = now + self.silence_threshold_s
+                    elif gap_due:
+                        gap_recheck_at = now + self.silence_threshold_s
                     if stall_deadline is not None:
                         # Re-arm on activity (any SSE traffic since arming) —
                         # a session streaming subagent work is working, not
@@ -1541,6 +1552,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     continue
 
             if event == "idle":
+                # A turn end, from the stream or the probe, resolves any gap.
+                gap_activity = gap_recheck_at = None
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
                     transcript = self._capture_usage(handle, sess)

@@ -3937,16 +3937,17 @@ def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, mo
     assert probes == []  # never entered the dispatch leg below the wait
 
 
-def test_gap_keeps_probing_through_heartbeats_until_a_frame_proves_the_stream(
-    tmp_path, monkeypatch
-):
+def test_gap_keeps_probing_through_heartbeats_until_completion(tmp_path, monkeypatch):
     """A gap's lone probe can read busy before the turn settles, and the
     reconnected stream never replays a turn end it missed; heartbeats then keep
     the silence fallback disarmed for good. So the gap re-probes every tick
-    until a substantive frame arrives, probes once after it, and disarms.
+    until a substantive frame arrives and probes once after it. That frame may
+    be child or session-less traffic and that probe may read busy, so the gap
+    then re-probes every `silence_threshold_s` until completion.
 
-    Ablation: drop `gap_activity` from the probe condition -> the gap tick is
-    the only probe (`probes == [1]`) and the finished turn waits out its timeout.
+    Ablation: drop `gap_activity` from the probe condition -> the fast ticks
+    2-4 vanish; drop `gap_due` -> the slow re-probes (10, 16) vanish and the
+    finished turn waits out its timeout.
     """
     adapter = make_adapter(tmp_path)
     clock = _install_clock(monkeypatch)
@@ -3979,12 +3980,61 @@ def test_gap_keeps_probing_through_heartbeats_until_a_frame_proves_the_stream(
 
     result = adapter.wait_for_completion(
         SessionHandle(task_id="t-1", native_id="ses_1"),
-        _timeout_spec(tmp_path, timeout_s=60.0),
+        _timeout_spec(tmp_path, timeout_s=90.0),
     )
 
     assert result.status == "timeout"
-    # gap tick, two heartbeat-only ticks, the tick that saw the frame — then none
-    assert probes == [1, 2, 3, 4]
+    # gap tick, two heartbeat-only ticks, the tick that saw the frame, then one
+    # re-probe per silence_threshold_s (30 s = 6 ticks)
+    assert probes == [1, 2, 3, 4, 10, 16]
+
+
+def test_gap_slow_reprobe_finds_the_missed_turn_end(tmp_path, monkeypatch):
+    """The slow re-probe after a gap is what ends the turn: the probe that
+    follows the post-gap frame reads busy, a later one reads settled, and the
+    session completes instead of timing out."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 30.0
+
+    ticks: list[int] = []
+    probes: list[int] = []
+
+    def probe(self, sess):
+        probes.append(len(ticks))
+        return len(ticks) >= 8  # settled only by the first slow re-probe
+
+    monkeypatch.setattr(type(adapter), "_probe_completion", probe)
+    monkeypatch.setattr(
+        type(adapter), "_result_json", lambda self, handle, spec, wait=False: {"status": "done"}
+    )
+
+    def advance():
+        clock["mono"] += 5.0
+        sess.last_frame_monotonic = clock["mono"]
+        if len(ticks) == 2:
+            sess.activity += 1  # e.g. a child session's frame after reconnect
+
+    sess = _timeout_driven_session(adapter, advance)
+    get_empty = sess.events.get
+
+    def get(timeout=None):
+        ticks.append(1)
+        if len(ticks) == 1:
+            advance()
+            return "gap"
+        return get_empty(timeout)
+
+    sess.events.get = get
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=90.0),
+    )
+
+    assert result.status == "completed"
+    assert probes == [1, 2, 8]
 
 
 def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
