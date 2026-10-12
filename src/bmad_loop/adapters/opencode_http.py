@@ -35,10 +35,12 @@ Transport shape (the settled design drivers):
   ``OPENCODE_SERVER_PASSWORD`` makes the health poll self-discriminating against
   a foreign server on a reused port and keeps other local processes from
   driving an allow-all server.
-- **SSE ``session.idle`` ≙ the Stop hook**, filtered to this session's id —
-  child/subagent sessions share the stream and emit their own idles. SSE is
-  lossy upstream, so a silent or reconnecting stream degrades to an HTTP poll
-  (``GET /session/status`` + message-level proof-of-work): an idle event alone
+- **The SSE turn end ≙ the Stop hook** (V1 ``session.idle``, V2
+  ``session.execution.*`` — the protocol's ``idle_types``), filtered to this
+  session's id — child/subagent sessions share the stream and emit their own
+  turn ends. SSE is lossy upstream, so a silent or reconnecting stream
+  degrades to an HTTP poll (the protocol's busy probe — V1
+  ``GET /session/status`` — + message-level proof-of-work): an idle event alone
   is NOT proof a turn ran (abort emits one on an idle session),
   so the fallback demands an assistant message completed *after* the last
   prompt this adapter sent. OpenCode timestamps are epoch **milliseconds**.
@@ -110,6 +112,7 @@ from .opencode_protocol import (
     OpencodeProtocol,
     OpencodeServerError,
     V1Protocol,
+    V2Protocol,
 )
 from .opencode_protocol import _role_color as _role_color
 from .opencode_protocol import _sum_args as _sum_args
@@ -171,6 +174,9 @@ AUTH_USER = "opencode"
 # The codec a caller with no session in hand reads (the name-stable delegators
 # below); stateless, so one instance serves every such call.
 _V1 = V1Protocol()
+
+# The codec per supported major (`opencode_protocol.SUPPORTED`'s keys).
+_PROTOCOLS: dict[int, type[OpencodeProtocol]] = {1: V1Protocol, 2: V2Protocol}
 
 # Where every version refusal sends the operator.
 _VERSION_REMEDY = "see docs/setup-guide.md (OpenCode section)"
@@ -302,14 +308,24 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _parse_sse_lines(lines, on_drop: Callable[[str], None] | None = None) -> Any:
+def _parse_sse_lines(
+    lines,
+    on_drop: Callable[[str], None] | None = None,
+    on_comment: Callable[[], None] | None = None,
+) -> Any:
     """Minimal SSE frame parser: accumulate ``data:`` lines until a blank line,
     then yield the JSON-decoded payload. Tolerates comments, unknown fields and
     undecodable payloads (skipped) — the stream is advisory, never trusted.
     A skipped payload is reported to ``on_drop`` as ``"<ExcType>: <message>"``
-    (DW-462), so the reader can count what the stream lost."""
+    (DW-462), so the reader can count what the stream lost. A comment line
+    (``:``-prefixed — V2's ``: heartbeat``) yields nothing but is reported to
+    ``on_comment``: it proves the stream alive."""
     data: list[str] = []
     for line in lines:
+        if line.startswith(":"):
+            if on_comment is not None:
+                on_comment()
+            continue
         if line == "":
             if data:
                 try:
@@ -651,12 +667,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         verdict, message = support_verdict(version)
         if verdict == "unsupported-major":
             raise OpencodeServerError(f"{message}; {_VERSION_REMEDY}")
-        if version[0] == 2:
-            raise OpencodeServerError(
-                f"OpenCode 2.x detected ({format_version(version)}); V2 server API "
-                f"support is not implemented yet (supported: 1.x); {_VERSION_REMEDY}"
-            )
-        return V1Protocol(), version
+        return _PROTOCOLS[version[0]](), version
 
     def _detect_version(self, resolved: str) -> tuple[int, int, int]:
         argv = [resolved, *self.profile.launch_args, "--version"]
@@ -880,6 +891,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         for event in _parse_sse_lines(
                             resp.iter_lines(),
                             lambda error: self._note_sse_drop(sess, task_id, error),
+                            lambda: self._note_sse_comment(sess),
                         ):
                             if sess.sse_stop.is_set():
                                 return
@@ -907,6 +919,14 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         sess.sse_frames_dropped += 1
         if sess.sse_frames_dropped == 1:
             self._note_lifecycle(task_id, "sse-frame-dropped", error=error)
+
+    @staticmethod
+    def _note_sse_comment(sess: _ServerSession) -> None:
+        """An SSE comment line — V2's ``: heartbeat`` — is liveness, not agent
+        activity: it keeps the stream fresh for the wait loop's silence check
+        and never bumps ``activity`` (V1's ``server.heartbeat`` frame drop, for
+        a heartbeat that is not a frame)."""
+        sess.last_frame_monotonic = time.monotonic()
 
     def _dispatch_sse(self, sess: _ServerSession, event: Any) -> None:
         if not isinstance(event, dict):

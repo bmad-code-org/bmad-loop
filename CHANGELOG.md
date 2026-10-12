@@ -29,7 +29,8 @@ breaking changes may land in a minor release.
   A tree at the recorded path that is not the run's own unit worktree is refused, not removed.
 - opencode-http detects the OpenCode server API major from `opencode --version` and
   refuses unsupported versions with a clear error; `validate` reports it as
-  `adapter.opencode-version` (#847).
+  `adapter.opencode-version`. It drives OpenCode 2.x sessions over the V2 `/api/*`
+  server API (#847).
 
 ### Changed
 
@@ -47,6 +48,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- opencode-http no longer fails every session start against OpenCode 2.x (#847).
 - Charge and retry a session whose log tail shows a provider error but whose tracked
   usage is nonzero, instead of pausing the run as an environment fault (#764).
 - Count Claude Code session usage once per API response and include subagent

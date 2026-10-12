@@ -102,6 +102,57 @@ static contract — worth re-dumping on any version bump:
   what ``action`` / ``resources`` actually hold.
 - There is **no ``tool.call`` / ``tool.response``** on this surface —
   confirmed both statically in the 89-variant union and live.
+
+V2 (``@opencode/cli`` 2.x) — :class:`V2Protocol`.
+
+A separate npm package whose installer replaces the V1 binary (``opencode``,
+plus ``opencode2``). API contract — pinned live against 2.0.27 (2.0.21
+identical on every route below), zero tokens against a local mock provider
+(2026-10-12):
+
+- ``opencode serve --port N --hostname 127.0.0.1 --print-logs`` is unchanged;
+  basic auth (username ``opencode``) still guards every ``/api/*`` route
+  (``401 {"_tag":"UnauthorizedError",…}``). Each major answers the OTHER
+  major's routes with the web-UI HTML shell (``200 text/html``), so each health
+  endpoint returns JSON only on its own major.
+- Health is ``GET /api/info`` → ``{"version":"2.0.27","pid",…}`` (a string
+  version). The OpenAPI is ``GET /openapi.json``.
+- ``OPENCODE_CONFIG_CONTENT`` is honored. Native keys: ``permissions`` (an
+  ordered rule list ``{action, resource, effect}``, **last match wins**),
+  ``skills`` (a list of paths), ``model`` (``"provider/model"``). V1 keys are
+  normalized in memory, but the adapter writes V2's own.
+- **No ``OPENCODE_DISABLE_EXTERNAL_SKILLS``**: the binary does not contain the
+  string, and config discovery always scans ``~/.claude`` and ``~/.agents``.
+  The only hermetic lever is the ``skill`` rules: deny ``*``, then allow each
+  project skill by **id = the skill's directory name** (``dir-x`` holding
+  ``name: name-y`` lists as ``{"id":"dir-x","name":"name-y",…}``; a rule naming
+  ``name-y`` re-allows nothing). With those rules the skills advertised to the
+  model are exactly the project's, and loading a personal or built-in
+  (``opencode``, ``report``) skill fails ``permission.rejected``. **``GET
+  /api/skill`` is NOT filtered by the rules** — it lists every discovered skill
+  either way (it loads lazily per ``location``: the first call can be ``[]``),
+  so hermeticity is checked on what the model is offered, never on that route.
+- A ``question`` deny removes the ``question`` tool from what the model is
+  offered, so an unattended session cannot park on a form. Reads are not
+  gated: under the allow-all config a ``read`` of a path outside the project
+  (``/etc/hostname``) and of ``.env`` both succeed with no ``permission.asked``
+  frame (``external_directory`` is a real action — an ``ask`` rule for it does
+  park the outside read — but nothing gates it by default).
+- Session create: ``POST /api/session {"title","location":{"directory"}}`` →
+  ``200 {"data": Session.Info}``, the id at ``data.id``.
+- Prompt: ``POST /api/session/{id}/prompt {"text"}`` → ``200 {"data": <user
+  inbox item>}``; the body has no model or variant field. An unknown session
+  is ``404 {"_tag":"SessionNotFoundError",…}``; ``409 ConflictError`` exists.
+- Interrupt: ``POST /api/session/{id}/interrupt`` → ``{"interrupted": bool}``
+  (``false`` on an idle session).
+- SSE ``GET /api/event``: frames are ``{"id","created","type","data":{…}}`` —
+  the session id is ``data.sessionID``. The first frame is
+  ``server.connected`` (``data: {}``). The heartbeat is an SSE **comment line**
+  ``: heartbeat``, once right after connect and then every 15 s — not a data
+  frame. The turn end is ``session.execution.{succeeded, failed,
+  interrupted}``; ``session.idle`` (deprecated in the schema) and
+  ``session.status`` never fired. No session-less frame (no ``file.edited``)
+  was seen.
 """
 
 from __future__ import annotations
@@ -570,6 +621,133 @@ class V1Protocol(OpencodeProtocol):
 
     def tally(self, transcript: Any) -> tuple[TokenUsage | None, str | None]:
         return _tally_messages(transcript)
+
+
+# The answer V2's not-yet-driven reads give (poll fallback, usage, transcript):
+# "unknown", with this as the fault the adapter crumbs — never a healthy-looking
+# empty value a caller could mistake for a measured one.
+_V2_UNREAD = "OpenCode 2.x usage/transcript reads are not implemented yet"
+
+
+class V2Protocol(OpencodeProtocol):
+    """The ``@opencode/cli`` 2.x server API — the V2 section of this module's
+    docstring, pinned against 2.0.21 and 2.0.27.
+
+    Drives the session lifecycle: config, health, create, prompt, the
+    ``/api/event`` envelope and the ``session.execution.*`` turn end, and
+    interrupt. The poll-fallback probes and the usage / transcript reads answer
+    "unknown" for now (``session_busy`` / ``latest_completed_ms`` None,
+    ``transcript`` a fault the adapter crumbs as ``usage-capture-failed``), and
+    the inline renderer renders nothing — the SSE turn end and server death
+    still complete every session."""
+
+    major = 2
+    # The heartbeat is an SSE comment line (``: heartbeat``), not a data frame:
+    # the reader's ``on_comment`` keeps the stream fresh without counting it as
+    # activity. ``server.connected`` is the one data frame that is liveness only.
+    heartbeat_types = ("server.connected",)
+    # No session-less frame was seen live (no ``file.edited`` on V2).
+    sessionless_types = frozenset()
+    # The turn end. ``session.idle`` / ``session.status`` are deprecated in the
+    # schema and never fired live — waiting on them would wait forever.
+    idle_types = frozenset({"session.execution.succeeded", "session.execution.interrupted"})
+    error_types = frozenset({"session.execution.failed"})
+    event_path = "/api/event"
+
+    def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
+        """The OPENCODE_CONFIG_CONTENT JSON for this session, in V2's native
+        keys. ``permissions`` is an ordered rule list where the LAST match
+        wins: allow everything (the bypass-flags analogue), deny ``question``
+        (an unattended session must never park on a form), then the hermetic
+        skills recipe — deny every skill, and re-allow each project skill by
+        id. V2 has no ``OPENCODE_DISABLE_EXTERNAL_SKILLS``, so these rules are
+        the only thing hiding the operator's personal and the built-in skills.
+        ``skills`` points discovery at the project tree; ``model`` is the
+        ``"provider/model"`` string when the policy sets one."""
+        permissions: list[dict[str, str]] = [
+            {"action": "*", "resource": "*", "effect": "allow"},
+            {"action": "question", "resource": "*", "effect": "deny"},
+            {"action": "skill", "resource": "*", "effect": "deny"},
+        ]
+        permissions.extend(
+            {"action": "skill", "resource": skill_id, "effect": "allow"}
+            for skill_id in project_skill_ids(skill_dir)
+        )
+        config: dict[str, Any] = {"permissions": permissions, "skills": [str(skill_dir)]}
+        if spec.model:
+            config["model"] = spec.model
+        return json.dumps(config)
+
+    def extra_env(self) -> dict[str, str]:
+        return {}
+
+    def health(self, client: Any) -> HealthProbe:
+        """``GET /api/info``: healthy only on a JSON object whose string
+        ``version`` is a 2.x — a V1 server answers this route with its web-UI
+        HTML, and a V1-shaped body is not V2's."""
+        resp = client.get("/api/info")
+        if _is_html(resp):
+            return HealthProbe(healthy=False, html=True)
+        if resp.status_code != 200:
+            return HealthProbe(healthy=False)
+        body = resp.json()
+        version = body.get("version") if isinstance(body, dict) else None
+        parsed = parse_opencode_version(version) if isinstance(version, str) else None
+        return HealthProbe(healthy=parsed is not None and parsed[0] == self.major)
+
+    def create_session(self, client: Any, spec: SessionSpec) -> str:
+        resp = client.post(
+            "/api/session",
+            json={"title": spec.task_id, "location": {"directory": str(spec.cwd)}},
+        )
+        if resp.status_code != 200:
+            raise OpencodeServerError(
+                f"POST /api/session failed: {resp.status_code} {resp.text[:200]}"
+            )
+        return resp.json()["data"]["id"]
+
+    def prompt(self, client: Any, session_id: str, text: str, variant: str) -> None:
+        """``POST /api/session/{id}/prompt``; raises unless the server accepts
+        it (200 — a 409 ``ConflictError`` or anything else is a refusal). The
+        body has no model or variant field, so ``variant`` does not ride it."""
+        resp = client.post(f"/api/session/{session_id}/prompt", json={"text": text})
+        if resp.status_code != 200:
+            raise OpencodeServerError(f"prompt failed: {resp.status_code} {resp.text[:200]}")
+
+    def frame_type(self, event: dict[str, Any]) -> Any:
+        return event.get("type")
+
+    def frame_payload(self, event: dict[str, Any]) -> tuple[Any, Any]:
+        data = event.get("data") or {}
+        return data, data.get("sessionID")
+
+    def render_line(self, msg_roles: dict[Any, Any], etype: str, props: Any) -> str | None:
+        return None
+
+    def session_busy(self, client: Any, session_id: str) -> bool | None:
+        return None
+
+    def latest_completed_ms(self, client: Any, session_id: str) -> int | None:
+        return None
+
+    def abort(self, client: Any, session_id: str) -> None:
+        client.post(f"/api/session/{session_id}/interrupt")
+
+    def transcript(self, client: Any, session_id: str) -> tuple[Any, str | None]:
+        return None, _V2_UNREAD
+
+    def tally(self, transcript: Any) -> tuple[TokenUsage | None, str | None]:
+        return None, _V2_UNREAD
+
+
+def project_skill_ids(skill_dir: Path) -> list[str]:
+    """The ids of the skills under ``skill_dir`` (one ``<dir>/SKILL.md`` each),
+    sorted — what V2's ``skill`` permission rules match on. The id is the
+    DIRECTORY name, not the frontmatter ``name`` (pinned live: a rule naming
+    the frontmatter name re-allows nothing)."""
+    if not skill_dir.is_dir():
+        return []
+    return sorted(entry.name for entry in skill_dir.iterdir() if (entry / "SKILL.md").is_file())
 
 
 def _sum_usage(messages: Any) -> TokenUsage | None:
