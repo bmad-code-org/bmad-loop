@@ -40,6 +40,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind the re-drive's own spec on a fixable repair when a resolved re-drive
+  began with no spec, instead of crashing the engine with "attempt-owned spec
+  became unreadable" (#860).
 - Open the TUI settings screen when a toggled plugin's name is not a valid widget id
   (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
 - Spawn tmux with `-u` so window and session listings parse when bmad-loop runs

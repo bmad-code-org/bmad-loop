@@ -506,6 +506,11 @@ class StoryTask:
     # never become the retained correction. Cleared after successful commit. None =
     # unbound attempt, retired chain, or legacy state.
     dispatched_spec_snapshot: bytes | None = None
+    # The current chain's fresh-baseline bind found no recorded spec (no
+    # ``spec_file``, no binding), so a resolved re-drive has no operator bytes to
+    # retain and a fixable repair binds the spec the chain created, as a plain
+    # chain does (#860). False = bound, degraded, or legacy state (fail closed).
+    dispatched_spec_absent: bool = False
     commit_sha: str | None = None
     # the external, human-only actions this story still owes when it parks at
     # Phase.AWAITING_OPERATOR — one free-text instruction per entry, as the dev
@@ -775,6 +780,7 @@ class StoryTask:
             "preserve_from_attempt": self.preserve_from_attempt,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
+            "dispatched_spec_absent": self.dispatched_spec_absent,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
             "plan_review_owed": self.plan_review_owed,
             "sentinel_kind": self.sentinel_kind,
@@ -848,6 +854,7 @@ class StoryTask:
         """
         self.dispatched_spec_file = None
         self.dispatched_spec_snapshot = None
+        self.dispatched_spec_absent = False
         self.spec_file = self._serialized_worktree_path(self.spec_file, mount_project)
 
     def release_mount_owned_state(self, mount_project: Path | None = None) -> None:
@@ -1057,6 +1064,7 @@ class StoryTask:
             preserve_from_attempt=bool(d.get("preserve_from_attempt", False)),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
+            dispatched_spec_absent=bool(d.get("dispatched_spec_absent", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
             plan_review_owed=bool(d.get("plan_review_owed", False)),
             sentinel_kind=str(d.get("sentinel_kind", "")),

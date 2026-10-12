@@ -911,6 +911,7 @@ class RecoveryFlow:
         """
         task.dispatched_spec_file = None
         task.dispatched_spec_snapshot = None
+        task.dispatched_spec_absent = False
         root = self._workspace_get().root
         # The paths are folded to one segment of their line wherever the notice
         # shows them (DW-492), like `problem` below (DW-417); the journal row keeps

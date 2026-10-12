@@ -700,6 +700,19 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
+def test_dispatched_spec_absent_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_absent=True)
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.dispatched_spec_absent is True
+
+
+def test_dispatched_spec_absent_defaults_false_for_legacy_state():
+    """A pre-#860 state.json loads fail-closed: no absence was ever observed."""
+    doc = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_absent=True).to_dict()
+    del doc["dispatched_spec_absent"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).dispatched_spec_absent is False
+
+
 def test_rebase_spec_paths_on_reanchors_both_ownership_fields(tmp_path):
     """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
 
