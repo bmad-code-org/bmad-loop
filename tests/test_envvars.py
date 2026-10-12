@@ -2,8 +2,8 @@
 
 `envvars` is the one place each core var is named, typed, and given a reader, so
 what is pinned here is the *contract* the call sites (`engine`,
-`adapters.multiplexer`, `cli`, `process_host`, `runs`) and the README's
-"Environment variables" table both depend on: the literal names, and each
+`adapters.multiplexer`, `cli`, `process_host`, `runs`) and the "Environment variables"
+table in `docs/reference/configuration.md` both depend on: the literal names, and each
 reader's parse and fallback. The two name readers pass their value through
 verbatim on purpose — validation lives downstream in the registry that resolves
 the name — so a test asserting rejection here would be asserting the wrong
@@ -29,7 +29,7 @@ from bmad_loop import envvars
 
 def test_constants_are_the_literal_env_var_names():
     """The constants ARE the public contract: call sites import the name rather
-    than spelling the string, and the README table documents these literals for
+    than spelling the string, and the configuration reference documents these literals for
     operators. Renaming one silently retires an override — the variable an
     operator exports simply stops being read, with no error anywhere — so the
     strings are pinned, not merely the readers that consume them."""

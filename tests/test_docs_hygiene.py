@@ -171,7 +171,7 @@ def test_slugger_matches_github_on_known_anchors():
     assert slug("[Linked](x.md) heading") == "linked-heading"
     real = {
         "docs/plugin-authoring-guide.md": "trust--safety",
-        "README.md": "policy-bmad-looppolicytoml",
+        "docs/reference/configuration.md": "environment-variables",
         "docs/multiplexer-backends.md": "psmux-native-windows-experimental",
         "docs/escalations-guide.md": "resolve-reverify",
     }

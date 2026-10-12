@@ -14,8 +14,7 @@ the three skills, so the simplest path is **pip + `bmad-loop init`**, which inst
 itself. Alternatively the **BMAD-method installer** copies them. Either way the
 `/bmad-loop-setup` skill installs the orchestrator tool, picks which coding CLIs to
 drive, and bootstraps the project. For the one-page summary,
-see the [Installing the skill module](../README.md#installing-the-skill-module) section
-of the README.
+see [Installing and upgrading](../README.md#installing-and-upgrading) in the README.
 
 ## Platform prerequisites
 
@@ -110,8 +109,10 @@ claude "/bmad-loop-setup accept all defaults"                   # install the to
 ```
 
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
-installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`,
-`bmad-loop-setup`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
+installs all the bundled skills together: `bmad-loop-resolve` (the interactive
+`/bmad-loop-resolve <story>` escalation workflow), `bmad-loop-sweep` (automation-only
+ledger triage) and `bmad-loop-setup` (installs the tool, then runs `init` and
+`validate`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-build-auto`
 (spelled `bmad-dev-auto` before the 6.10.1 rename — the orchestrator resolves
 whichever name is on disk and invokes that one) is
@@ -246,6 +247,10 @@ The `[tui]` extra pulls in the Textual dashboard (`textual` + `tomlkit` + `pyte`
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
 ```
 
+**A pinned release tag** (reproducible; recommended for day-to-day use): append the tag to the URL,
+as in `...bmad-loop.git@v<version>` (see the [releases](https://github.com/bmad-code-org/bmad-loop/releases) for tags).
+Without a tag the install tracks `main`.
+
 **Tool first, TUI later (separately):** install the core without the extra, then add the
 dashboard whenever you want it by re-running the same command **with** `[tui]`:
 
@@ -264,14 +269,35 @@ failing obscurely.
 `uv tool install` drops `bmad-loop` into uv's own managed tool environment, so there's no
 PEP 668 externally-managed conflict and no need for a virtualenv, `--user`, or `--break-system-packages`.
 
-To upgrade later, the simplest path is to re-run `/bmad-loop-setup` (or `/bmad-loop-setup
-upgrade`) — it detects the existing install, upgrades the tool with `uv tool upgrade
-bmad-loop --reinstall` (the `--reinstall` is **required** for a git source — a plain
-`uv tool upgrade` reuses the cached commit and won't pull new code), and re-lays the
-per-project skills with `bmad-loop init --force-skills`. To do it by hand, run those two
-commands yourself (see the [Upgrading](../README.md#upgrading) section of the README).
-
 Confirm with `bmad-loop --version`.
+
+### Upgrading
+
+Upgrading is two steps: the tool, and the per-project skill copies that `init` laid down
+(a tool upgrade does not touch them). The simplest path is to re-run the setup skill, which
+detects the existing install and runs both steps:
+
+```bash
+claude "/bmad-loop-setup upgrade"
+```
+
+By hand (non-Claude CLIs, CI, scripts):
+
+```bash
+# 1. upgrade the tool; --reinstall is required for a git source, or uv reuses the cached commit
+uv tool upgrade bmad-loop --reinstall
+#    to move to a newer tag instead, re-install with the new ref:
+#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<version>"
+
+# 2. re-lay the refreshed skills into each project that uses bmad-loop
+bmad-loop init --project /path/to/project --force-skills
+```
+
+`.bmad-loop/policy.toml` is left untouched: new keys are optional and take their defaults.
+`init` gitignores policy.toml because it is per-machine; if yours is already committed, run
+`git rm --cached .bmad-loop/policy.toml` once to stop sharing it (your local copy is kept).
+Read the [CHANGELOG](../CHANGELOG.md) or the
+[releases](https://github.com/bmad-code-org/bmad-loop/releases) for what changed between tags.
 
 ## Initializing CLIs other than claude
 
@@ -384,7 +410,7 @@ yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expecte
 output as a readiness checklist, not an install failure.
 
 For the dashboard itself, see [docs/tui-guide.md](tui-guide.md). For the full policy
-reference, see the [Policy section](../README.md#policy-bmad-looppolicytoml) of the README.
+reference, see the [configuration reference](reference/configuration.md).
 
 ## Uninstalling
 
@@ -410,9 +436,9 @@ bmad-loop cleanup --project <project-root>         # kill leftover tmux sessions
 `clean --hard` permanently deletes runs instead of archiving them (we're removing the tool, so
 there's nothing to keep). Running it **first** also matters for the out-of-tree half: each run's
 control-plane directory lives under the user-scoped state root, and `clean` is what collects it
-(step 2 covers what is left over). See the disk-reclamation coverage in
-[docs/FEATURES.md](FEATURES.md) and the [command reference](../README.md#command-reference) for
-what each command touches. Make sure no run is still live (Editor open, session attached) first.
+(step 2 covers what is left over). See
+[Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk) and the
+[CLI reference](reference/cli.md#subcommands) for what each command touches. Make sure no run is still live (Editor open, session attached) first.
 
 ### 2. Remove the orchestrator state
 

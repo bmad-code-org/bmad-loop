@@ -86,6 +86,8 @@ A story can close ledger entries when it commits.
 
 A non-list `closes_deferred` in `stories.yaml` stops the manifest from loading. In a spec it is only journaled. If the ledger cannot be read at commit time, the story still commits, nothing is closed, and you get a `declared deferred closes unapplied` notice. Repair the ledger, then run `bmad-loop sweep` to reconcile.
 
+If the ledger lives outside the repo (`implementation_artifacts` configured outside the project tree), the annotation is still written at the commit but is part of no commit; the run journals `deferred-close-external-ledger`. The `stories.yaml` channel is hand-authored: upstream Story Breakdown does not emit `closes_deferred`, so re-deriving `stories.yaml` drops it. Note the intent beside the story if you expect to re-derive.
+
 ## Hard gates
 
 A ledger entry can block stories until it is done.

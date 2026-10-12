@@ -146,7 +146,7 @@ psmux resolves every target through a **registry** — the directory named by `P
 holding one `.port`/`.key`/`.sid`/`.pid` set per session — and defaults it to
 `%USERPROFILE%\.psmux`. bmad-loop points it at a per-project root instead:
 `<state root>/<project key>/_mux`, where `<state root>` is the location
-[`BMAD_LOOP_STATE_DIR`](../README.md#environment-variables) resolves to and `<project key>` is
+[`BMAD_LOOP_STATE_DIR`](reference/configuration.md#environment-variables) resolves to and `<project key>` is
 the same digest of the project's resolved path that tags session ownership. The export happens
 once per bmad-loop process, before anything spawns psmux, so `run`, `cleanup`, `stop`, `attach`
 and the TUI all agree on one registry without any of them persisting it.

@@ -16483,8 +16483,8 @@ def test_validate_isolation_gate_needs_both_halves(
     project, monkeypatch, capsys, override, policy_text
 ):
     """Either half alone is a configuration this release supports and documents: a
-    `repo_root` override under `isolation = "none"` is the monorepo knob README's
-    "Worktree isolation" section documents, and
+    `repo_root` override under `isolation = "none"` is the monorepo knob the
+    FEATURES "Trust-nothing verification" entry documents, and
     worktree isolation without an override is the ordinary isolated setup. The
     gate stays silent on both, and validate still passes — the green rc is the second
     witness, since a gate that fired would take the whole verdict with it."""

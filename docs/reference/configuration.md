@@ -1,6 +1,6 @@
 # Configuration reference
 
-bmad-loop reads its policy from `.bmad-loop/policy.toml` in the project root. `bmad-loop init` writes a commented template there when the file is missing (it never overwrites an existing one) and adds the file to the project's `.gitignore`, so policy is per-machine. Every key is optional: an unset key takes the default listed below, unknown core keys are ignored, and a value of the wrong type or outside its allowed set is rejected with a policy error. The TUI settings screen edits the same file.
+bmad-loop reads its policy from `.bmad-loop/policy.toml` in the project root. `bmad-loop init` writes a commented template there when the file is missing (it never overwrites an existing one) and adds the file to the project's `.gitignore`, so policy is per-machine. Every key is optional: an unset key takes the default listed below, unknown core keys are ignored, and a value of the wrong type or outside its allowed set is rejected with a policy error. The TUI settings screen edits the same file. Each `run` and `sweep` snapshots the policy into its run state when it starts, and `resume` re-stamps that snapshot from the current file, so an edit applies to new runs and to the next resume of an existing one.
 
 Where a key can be set in more than one place, the first of these wins:
 
