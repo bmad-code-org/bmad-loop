@@ -1008,7 +1008,7 @@ def read_trusted_config_digest(project: Path, run_id: str) -> tuple[str | None, 
 
     **Known limit: a file at this key can be stale (#572).** The key is the
     project's resolved path, so a project that moves away and later returns finds
-    its old subtree still here — nothing can sweep it in between (FEATURES.md) —
+    its old subtree still here — nothing can sweep it in between (docs/reference/run-state.md) —
     holding the baseline blessed before it left, while the blessing it picked up
     in between is the one in ``state.json``. Preferring the file means that older
     pin wins for one resume, which re-stamps this key and heals it. Preferring the
@@ -3205,7 +3205,7 @@ def live_session_may_be_ours(
     multiplexer is unusable fires on every box that simply has no multiplexer,
     which is the noise ``BaseTmuxBackend._warn_unproven_listing`` already stays
     silent about. What is left is the accepted ceiling, written down here and in
-    docs/FEATURES.md so an operator meets it as a documented limit rather than a
+    docs/multiplexer-backends.md so an operator meets it as a documented limit rather than a
     surprise.
 
     The psmux half is a *defect*, not a design: four sibling reap sites in that
@@ -4062,7 +4062,7 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     The run's own read degrades rather than raising (`sweep._read_cycle_ledger`,
     DW-197), so the cost is not a crash but a wasted arm and a stop whose repair
     route this surface never offered: every repair steer in the product
-    (`sweep._notify_ledger_repair`, the ATTENTION line, docs/FEATURES.md) routes to
+    (`sweep._notify_ledger_repair`, the ATTENTION line, docs/sweep-guide.md) routes to
     a fresh `bmad-loop sweep`, and `resume` was the one that silently accepted the
     attempt instead.
 

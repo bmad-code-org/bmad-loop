@@ -8900,9 +8900,8 @@ def verify_dev(
     something, ``None`` when the probe could not answer. Read ``False`` as exactly
     that and no further — the residue the gate counts is not attributed to a
     session, here or in the gate itself, because under a shared checkout it cannot
-    be (see the newer-claim paragraph above, and `docs/FEATURES.md` on
-    ``isolation``). What separates "unknown" from "no skip happened" is
-    ``park_proof_skipped``, not this field — collapsing the two into
+    be (see the newer-claim paragraph above). What separates "unknown" from "no
+    skip happened" is ``park_proof_skipped``, not this field — collapsing the two into
     ``park_zero_diff is not None`` would make a park whose probe faulted look like
     a leg that never waived anything, and it would go unrecorded — the silence
     this record exists to end. ``None`` means "the probe could not answer", and

@@ -6661,7 +6661,7 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     waits (and only passes because setup ran first), the agent runs, teardown
     fires. Ordering is proven by the gate depending on a setup marker."""
     # The MCP-generated skill tree really is gitignored in a per_worktree project
-    # (docs/FEATURES.md), and this fixture has to say so itself: until #384 the
+    # (docs/game-engine-mcp-guide.md), and this fixture has to say so itself: until #384 the
     # git-add shield wrote its patterns into the repo-wide `.git/info/exclude`, so
     # the untracked dir below was hidden in the MAIN checkout too and the pre-merge
     # cleanliness gate never saw it. The shield is per-worktree now, so the gitignore

@@ -109,7 +109,9 @@ Transport shape (the settled design drivers):
   when that agent table also pins its own ``model`` — inert otherwise, which is
   the measured negative result in #643. It is sent instead as the per-call
   ``variant`` in every ``prompt_async`` body (``_prompt``), initial prompt and
-  nudges alike, and omitted entirely when empty. A per-session
+  nudges alike, and omitted entirely when empty. The value is passed through
+  unvalidated: bmad-loop does not reject an effort name the provider does not
+  know. A per-session
   ``OPENCODE_SERVER_PASSWORD`` makes the health poll self-discriminating against
   a foreign server on a reused port and keeps other local processes from
   driving an allow-all server.

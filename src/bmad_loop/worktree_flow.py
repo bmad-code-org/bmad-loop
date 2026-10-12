@@ -1946,8 +1946,8 @@ class WorktreeFlow:
         ``unverifiable`` verdict usually has a cause a prompt cannot fix, so that
         text names the likely fixes first. Both end with the remediation and leave
         out the recovery command: :meth:`escalate_unit` appends its own
-        "resolve, then resume" suffix, and docs/FEATURES.md spells out the exact
-        ``resolve --no-interactive`` + ``resume`` sequence.
+        "resolve, then resume" suffix, and docs/setup-guide.md spells out the
+        ``resolve --no-interactive`` recovery sequence.
         """
         head = (
             f"Codex hook trust is {status} for the {role} session's worktree {worktree} "

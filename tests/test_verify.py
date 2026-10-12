@@ -1272,8 +1272,8 @@ def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(projec
     one, so there is nothing to measure from and the observation never happens —
     yet the waiver did, and the record still has to say so.
 
-    All three causes are named in `verify_dev`'s docstring, in `VerifyOutcome`'s
-    field comment and in `docs/FEATURES.md`; the sibling rows cover the `GitError`
+    All three causes are named in `verify_dev`'s docstring and in `VerifyOutcome`'s
+    field comment; the sibling rows cover the `GitError`
     and the git refusal, and this one covers the missing baseline, so no claim
     rests on prose.
 

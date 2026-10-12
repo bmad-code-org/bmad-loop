@@ -517,7 +517,7 @@ predates that, or that the flag deliberately keeps around.
 
 `c` only reaps tmux artifacts, not disk. To reclaim run-dir **disk** — worktrees a
 mid-flight stop orphaned (each holding a Unity `Library/`), and old run dirs — use
-the `bmad-loop clean` CLI command (see [`[cleanup]`](FEATURES.md#disk-reclamation-cleanup));
+the `bmad-loop clean` CLI command (see [Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk));
 it is intentionally not bound to a TUI key since it deletes/archives run history.
 
 ## Resolving an escalation (`R`)
@@ -549,7 +549,7 @@ and `p` open the **re-verify** picker instead (below).
 ### Re-verifying kept work (`V`)
 
 `V` re-verifies a story's kept work with
-[`bmad-loop resolve <run> --reverify`](FEATURES.md#resolve-reverify). It opens a
+[`bmad-loop resolve <run> --reverify`](escalations-guide.md#resolve-reverify). It opens a
 small picker listing every target in the selected paused run: the paused story
 first when it is DEFERRED, or ESCALATED at an environment-fault site a replay can
 clear (marked `(paused story)`), then each DEFERRED worktree unit under any

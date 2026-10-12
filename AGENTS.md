@@ -1,6 +1,6 @@
 # AGENTS.md — bmad-loop
 
-bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. Never move orchestration into an LLM. User-facing overview: [README.md](README.md); behavior reference: [docs/FEATURES.md](docs/FEATURES.md).
+bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. Never move orchestration into an LLM. User-facing overview: [README.md](README.md); feature catalog: [docs/FEATURES.md](docs/FEATURES.md); config/CLI/run-state facts: [docs/reference/](docs/README.md#reference).
 
 ## Dev environment
 
@@ -87,7 +87,12 @@ These rules apply to code you are already touching — do not initiate refactors
 | Doc                                                                | Read when                                               |
 | ------------------------------------------------------------------ | ------------------------------------------------------- |
 | [docs/setup-guide.md](docs/setup-guide.md)                         | installing/initializing a target project                |
-| [docs/FEATURES.md](docs/FEATURES.md)                               | any behavior or policy question                         |
+| [docs/FEATURES.md](docs/FEATURES.md)                               | what the tool does — feature catalog                    |
+| [docs/reference/configuration.md](docs/reference/configuration.md) | a policy key, default, or env var                       |
+| [docs/reference/cli.md](docs/reference/cli.md)                     | a subcommand, flag, `--json` shape, or exit code        |
+| [docs/reference/run-state.md](docs/reference/run-state.md)         | run/task dir layout, sessions, stop, cleanup scope      |
+| [docs/sweep-guide.md](docs/sweep-guide.md)                         | running sweeps, answering decisions, ledger recovery    |
+| [docs/escalations-guide.md](docs/escalations-guide.md)             | recovering a paused or escalated run (`resolve`)        |
 | [docs/tui-guide.md](docs/tui-guide.md)                             | TUI work                                                |
 | [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md) | adding/finalizing a coding-CLI profile or adapter class |
 | [docs/multiplexer-backends.md](docs/multiplexer-backends.md)       | mux backend selection/porting                           |

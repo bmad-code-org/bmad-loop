@@ -8552,8 +8552,8 @@ def test_resume_warns_when_the_trusted_baseline_is_unreadable(project, monkeypat
 def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
     """The out-of-tree baseline is keyed by the project's RESOLVED PATH
     (`runs.project_tag`), so moving or renaming the project keys the run somewhere
-    new and orphans the subtree holding its `config-digest` — FEATURES.md documents
-    the GC half of the same fact. state.json travels with the run dir instead.
+    new and orphans the subtree holding its `config-digest` —
+    docs/reference/run-state.md documents the GC half of the same fact. state.json travels with the run dir instead.
 
     Stamping ONLY out of tree therefore made a rename silently retire the pin: the
     reader answers `None`, the in-tree copy was never written under that code, and

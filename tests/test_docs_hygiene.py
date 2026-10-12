@@ -173,7 +173,7 @@ def test_slugger_matches_github_on_known_anchors():
         "docs/plugin-authoring-guide.md": "trust--safety",
         "README.md": "policy-bmad-looppolicytoml",
         "docs/multiplexer-backends.md": "psmux-native-windows-experimental",
-        "docs/FEATURES.md": "resolve-reverify",
+        "docs/escalations-guide.md": "resolve-reverify",
     }
     missing = {rel: a for rel, a in real.items() if a not in anchors(rel)}
     assert not missing, f"slugger lost known real anchors: {missing}"

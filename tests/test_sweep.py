@@ -9032,7 +9032,7 @@ def test_a_new_run_re_evaluates_a_dropped_keep_open_answer(project):
     """DW-124's quarantine is run-scoped BY DESIGN: persisted so the SAME run does
     not re-announce a disposition it already made, but never project-scoped, so a
     NEW run re-evaluates every decision from scratch. That second half is the claim
-    the CHANGELOG, docs/FEATURES.md and both the `RunState` and `__init__` comments
+    the CHANGELOG and both the `RunState` and `__init__` comments
     all make, and the resume rows above cannot catch it — they share one run_dir,
     so a quarantine that leaked across runs would leave them green.
 
@@ -14273,7 +14273,7 @@ def test_a_faulted_close_is_reapplied_by_a_resume_off_the_cached_triage(project,
     would fail, and an empty prompter input, so re-asking DW-1 would raise
     `StopIteration`. Both are load-bearing: this is what makes the `plan.decisions`
     scoping meaningful, since the cached plan is where a suppressed decision actually
-    comes from, and it is what pins the FEATURES claim that a later cycle repairs the
+    comes from, and it is what pins the claim that a later cycle repairs the
     DW-166 degrade without needing a new run.
 
     Five claims: the first phase really did leave the limbo (open entry, stored
@@ -18621,8 +18621,8 @@ def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
     and `ledger-unreadable` ("a human has to repair the file") are opposite
     findings, and a dump could tell them apart only by inferring from other rows.
 
-    `stop_cause` is added BESIDE `reason`, never in place of it: the raw journal,
-    `docs/FEATURES.md` and the existing rows above all name `reason`, so both are
+    `stop_cause` is added BESIDE `reason`, never in place of it: the raw journal
+    and the existing rows above all name `reason`, so both are
     written and both carry the same token. Same closed-slug convention as
     `regen_cause` (DW-164) and `drop_cause`.
 

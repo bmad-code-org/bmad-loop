@@ -4283,7 +4283,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # ...and the in-tree secondary is re-stamped in the same breath, for the same
     # reason it is written at launch: the state root is keyed by the project's
     # RESOLVED PATH (`runs.project_tag`), so moving or renaming the project — a
-    # documented operation, FEATURES.md states the GC half of it — keys the run
+    # documented operation, docs/reference/run-state.md states the GC half of it — keys the run
     # somewhere new and the file above becomes unreachable. Leaving only that copy
     # made a move silently retire the pin, and the advisory this whole guard exists
     # to raise never fired again. Writing both keeps the warning alive across a move
