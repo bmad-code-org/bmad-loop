@@ -63,6 +63,166 @@ def test_tally_mixed_shapes(tmp_path):
     assert usage.total == 111 + 56 + 2000 + 300
 
 
+def _write_jsonl(path, entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+
+
+def _assistant(message_id, input_tokens=0, output_tokens=0, cache_read=0, cache_creation=0):
+    # Claude Code shape: one entry per content block, each repeating the
+    # response's usage under the same message.id.
+    message = {
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+        }
+    }
+    if message_id is not None:
+        message["id"] = message_id
+    return {"type": "assistant", "message": message}
+
+
+def test_tally_dedupes_content_blocks_by_message_id(tmp_path):
+    path = tmp_path / "sid.jsonl"
+    block = _assistant("msg_1", input_tokens=10, output_tokens=20, cache_read=300, cache_creation=4)
+    _write_jsonl(path, [block, block, block, _assistant("msg_2", input_tokens=1, output_tokens=2)])
+
+    usage = tally(path)
+    assert usage == TokenUsage(
+        input_tokens=11, output_tokens=22, cache_read_tokens=300, cache_creation_tokens=4
+    )
+
+
+def test_tally_dedupe_keeps_max_streamed_output(tmp_path):
+    # output_tokens grows while the response streams; the final count is the
+    # max, whatever order the blocks were written in.
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _assistant("msg_1", input_tokens=5, output_tokens=1),
+            _assistant("msg_1", input_tokens=5, output_tokens=340),
+            _assistant("msg_1", input_tokens=5, output_tokens=1),
+        ],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 5
+    assert usage.output_tokens == 340
+
+
+def test_tally_entries_without_message_id_each_count(tmp_path):
+    # Back-compat: id-less blocks and the top-level `usage` shape are not deduped.
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _assistant(None, input_tokens=10, output_tokens=5),
+            _assistant(None, input_tokens=10, output_tokens=5),
+            {"type": "message", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        ],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 30
+    assert usage.output_tokens == 15
+
+
+def test_tally_top_level_usage_beside_message_id_each_count(tmp_path):
+    # The id keys only a message-level usage block; a top-level `usage` next
+    # to a usage-less `message.id` is not deduped.
+    path = tmp_path / "sid.jsonl"
+    entry = {"message": {"id": "msg_1"}, "usage": {"input_tokens": 10, "output_tokens": 5}}
+    _write_jsonl(path, [entry, entry])
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 20
+    assert usage.output_tokens == 10
+
+
+def test_tally_includes_subagent_transcripts(tmp_path):
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [_assistant("msg_p", input_tokens=100, output_tokens=10)])
+    subagents = tmp_path / "sid" / "subagents"
+    _write_jsonl(
+        subagents / "agent-a.jsonl", [_assistant("msg_a", input_tokens=7, output_tokens=3)]
+    )
+    # sidecar metadata is not a transcript
+    (subagents / "agent-a.meta.json").write_text(
+        json.dumps({"usage": {"input_tokens": 999}}), encoding="utf-8"
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 107
+    assert usage.output_tokens == 13
+
+
+def test_tally_includes_nested_workflow_subagents(tmp_path):
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [_assistant("msg_p", input_tokens=100)])
+    _write_jsonl(
+        tmp_path / "sid" / "subagents" / "workflows" / "wf_x" / "agent-b.jsonl",
+        [_assistant("msg_b", input_tokens=40)],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 140
+
+
+def test_tally_dedupes_across_forked_subagents(tmp_path):
+    # A fork subagent copies its parent's history, message ids included, so
+    # the dedupe spans every file of the session.
+    shared = _assistant("msg_shared", input_tokens=50, output_tokens=5)
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [shared])
+    subagents = tmp_path / "sid" / "subagents"
+    _write_jsonl(subagents / "agent-a.jsonl", [shared, _assistant("msg_a", input_tokens=1)])
+    _write_jsonl(subagents / "agent-b.jsonl", [shared, _assistant("msg_b", input_tokens=2)])
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 53
+    assert usage.output_tokens == 5
+
+
+def test_tally_tracked_when_only_subagent_has_usage(tmp_path):
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [{"type": "user", "message": {"content": "hi"}}])
+    _write_jsonl(
+        tmp_path / "sid" / "subagents" / "agent-a.jsonl",
+        [_assistant("msg_a", input_tokens=9, output_tokens=1)],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 9
+    assert usage.output_tokens == 1
+
+
+def test_tally_no_subagent_dir_unchanged(tmp_path):
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _assistant("msg_1", input_tokens=10, output_tokens=2),
+            _assistant("msg_2", input_tokens=20, output_tokens=4),
+        ],
+    )
+    assert not (tmp_path / "sid").exists()
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.input_tokens == 30
+    assert usage.output_tokens == 6
+
+
 def test_tally_missing_file(tmp_path):
     # Untracked, not free (DW-364): no transcript is no usage signal.
     assert tally(tmp_path / "nope.jsonl") is None
