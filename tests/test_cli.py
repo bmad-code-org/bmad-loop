@@ -12204,9 +12204,9 @@ def test_validate_json_mode_and_spec_folder_reflect_the_flag(project, capsys, sp
 
 
 def test_validate_json_every_emitted_check_is_registered(project, capsys, monkeypatch):
-    """The `add` assert enforces this per call site; this proves it end-to-end over a
-    real run, so an id that only ever appears on an unexercised path still has to be
-    in the registry."""
+    """The `add` assert enforces registration per executed call site; this unions the
+    ids a real passing and failing run emit and asserts them registered. Exercised
+    paths only: an id on a branch neither run reaches is not seen."""
     from bmad_loop.checks import VALIDATE_CHECKS
 
     _make_validate_pass(project, monkeypatch, capsys)

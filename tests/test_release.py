@@ -2,7 +2,10 @@
 
 These cover the logic that decides versions, parses/extracts CHANGELOG sections,
 inserts link references, groups commits, and short-circuits a publish when the tag
-already exists. Anything touching real git/gh is exercised via monkeypatch.
+already exists. Anything touching real git/gh is exercised via monkeypatch. The
+`cmd_check` / `cmd_prepare` rows drive the release contract over fixture changelogs
+with `sync_version` stubbed; `sync_version.check()` itself is covered in
+test_sync_version.py.
 """
 
 from __future__ import annotations

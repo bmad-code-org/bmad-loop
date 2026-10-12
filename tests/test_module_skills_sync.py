@@ -3,8 +3,11 @@ bmad-loop skills (bundled into the wheel; `bmad-loop init` installs them).
 
 The forked skills are plain copies (not symlinks) in .claude/skills/ (read by
 Claude Code) and .agents/skills/ (read by codex/gemini). Edits must flow
-src/bmad_loop/data/skills/<skill> -> both trees; this test turns drift into a
-CI failure.
+src/bmad_loop/data/skills/<skill> -> both trees.
+
+Documented limitation: CI-inert. Both fork trees are gitignored and absent in CI,
+so every parametrization skips there and the guard bites on dev boxes only. The
+canonical-existence assertion runs before the skip and is the one CI-live check.
 """
 
 import filecmp

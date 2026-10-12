@@ -15,8 +15,8 @@ SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loo
 
 def _relay_module():
     """Import the relay by path. It ships as package DATA, not an importable
-    module (init copies it into the workspace), so the behavioral tests below
-    drive it as a subprocess — but the reparse-tag branch of `_is_link_like` is
+    module (init registers the console entry point's `relay` subcommand, not a
+    workspace copy), so the behavioral tests below drive it as a subprocess — but the reparse-tag branch of `_is_link_like` is
     reachable only on Windows, and shipping it unexercised is how a capability
     check silently becomes dead code."""
     spec = importlib.util.spec_from_file_location("_bmad_loop_hook_under_test", SCRIPT)

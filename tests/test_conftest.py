@@ -1209,7 +1209,9 @@ def _scan_reap_deadlines(src: str, rel: str) -> tuple[dict[str, int], list[str]]
     Unlike the SessionSpec scan this does NOT flag a gated test holding zero sites:
     most stories E2Es have no poll deadline at all. `_reap_inventory_offenders` is
     what keeps a scan that found nothing from passing vacuously. Subprocess `timeout=`
-    budgets in that file are a separate scope and are not inspected here.
+    budgets, the `teardown_s < 15.0` teardown-gap assertion and the
+    `time.time() - hb["ts"] < 120` heartbeat-freshness assertion in that file are
+    separate scopes and are not inspected by any of the three scanners.
 
     KNOWN BLIND SPOTS, deliberately not closed — the shape above is matched literally,
     so every one of these scans CLEAN and would carry a bare budget past the guard:

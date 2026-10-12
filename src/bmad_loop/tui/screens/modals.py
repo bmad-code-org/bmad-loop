@@ -905,8 +905,8 @@ class EscalationModal(BaseDialog):
             # Every arm stays within 3 rows at 35 columns, the content width of a
             # 39-column dialog: 2 border + title + 1 body row + hint + 1-row button
             # row must fit the 8-row (90%-of-9) dialog at the 39x9 pair (DW-414).
-            # The reasons behind each arm live in the comments and in
-            # docs/tui-guide.md, not in the hint.
+            # The reasons behind each arm live in the comments below, not in
+            # the hint.
             hint = Text()
             if self._unreadable:
                 # Precedence over both branches below: they explain when Re-arm

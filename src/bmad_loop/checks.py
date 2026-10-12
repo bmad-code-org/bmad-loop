@@ -16,9 +16,12 @@ This lives in its own module rather than in ``cli`` or ``machine``:
 
 :data:`VALIDATE_CHECKS` is the registry every id must be in, enforced by an
 assert in :meth:`ValidationReport.add`. That is what keeps "one printed line =
-exactly one Finding" true: a new check site cannot ship without first naming
-itself here. The assert only ever fires on a literal an author just wrote, never
-on runtime data, so it is a lint with a stack trace rather than a validation.
+exactly one Finding" true. The assert only ever fires on a literal an author just
+wrote, never on runtime data, so it is a lint with a stack trace rather than a
+validation. It and the end-to-end registry test in test_cli.py only see executed
+paths — there is no static call-site scan — so an id on a branch neither reaches
+ships unregistered and raises only when that branch first runs. A new check site
+therefore lands with a test that reaches it.
 """
 
 # Strict-checked under #245 Stage 2, with one rule relaxed for this file only:
