@@ -18,9 +18,10 @@ This lives in its own module rather than in ``cli`` or ``machine``:
 assert in :meth:`ValidationReport.add`. That is what keeps "one printed line =
 exactly one Finding" true. The assert only ever fires on a literal an author just
 wrote, never on runtime data, so it is a lint with a stack trace rather than a
-validation. It and the end-to-end registry test in test_cli.py only see executed
-paths — there is no static call-site scan — so an id on a branch neither reaches
-ships unregistered and raises only when that branch first runs. A new check site
+validation. The assert, the direct ``ValidationReport`` test and the
+validate-path registry test in test_cli.py all see only executed paths — there
+is no static call-site scan — so an id on a branch no test reaches can ship
+unregistered and raises only when that branch first runs. A new check site
 therefore lands with a test that reaches it.
 """
 

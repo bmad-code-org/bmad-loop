@@ -290,8 +290,10 @@ uv tool upgrade bmad-loop --reinstall
 #    to move to a newer tag instead, re-install with the new ref:
 #    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<version>"
 
-# 2. re-lay the refreshed skills into each project that uses bmad-loop
-bmad-loop init --project /path/to/project --force-skills
+# 2. re-lay the refreshed skills into each project that uses bmad-loop; without --cli this
+#    refreshes only the CLIs the policy selects (claude by default), so name every CLI
+#    you initialized the project for, e.g.:
+bmad-loop init --project /path/to/project --force-skills --cli claude --cli codex
 ```
 
 `.bmad-loop/policy.toml` is left untouched: new keys are optional and take their defaults.
@@ -381,7 +383,7 @@ Codex trusts hooks per directory, and an untrusted hook never fires, so a sessio
    - `untrusted`, the relay is not usable or Codex omitted it: re-register it with `bmad-loop init --cli codex`.
    - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox`, profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
 
-Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` for future worktree sessions, and the run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
+Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` under worktree isolation; that failure is expected, and `probe-adapter codex` still reports the project checkout. The run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
 
 1. Read the escalation. It names the role, the worktree path, the status and the reason. For `unverifiable`, fix the cause first.
 2. `cd` into the named worktree (it stays mounted under `.bmad-loop/runs/<run-id>/worktrees/`), run `codex`, and accept the hook trust prompt.
@@ -440,6 +442,11 @@ control-plane directory lives under the user-scoped state root, and `clean` is w
 (step 2 covers what is left over). See
 [Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk) and the
 [CLI reference](reference/cli.md#subcommands) for what each command touches. Make sure no run is still live (Editor open, session attached) first.
+
+`clean` never collects paused, crashed or interrupted runs. Run `bmad-loop list --project <project-root>`
+afterwards; for each run still listed, save any work you want from its worktree under
+`.bmad-loop/runs/<run-id>/worktrees/`, then `bmad-loop delete <run-id> --project <project-root>`
+(or `archive` to keep a tarball). Deleting `.bmad-loop/` by hand instead skips their worktree teardown.
 
 ### 2. Remove the orchestrator state
 

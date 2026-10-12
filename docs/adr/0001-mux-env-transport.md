@@ -198,7 +198,7 @@ Adopt **D**, preceded by **B** as the interim. Specify **C** now but **do not sc
 
 ## 6. Staged plan (separately mergeable)
 
-Nothing below is implemented yet. Each stage describes the change, files and tests of a future pull request.
+Stages 1 and 2 have shipped; Stage 3 is specified but not scheduled (§5). Each stage describes the change, files and tests of its pull request.
 
 ### Stage 1 (shipped): #731 interim warning (no released-signature change)
 
