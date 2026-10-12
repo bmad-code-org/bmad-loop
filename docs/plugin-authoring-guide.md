@@ -200,7 +200,7 @@ that breaks across machines or between a builtin and a project-local copy.
 
 ## Trust & safety
 
-Trust is decided by **origin** and pinned by **content** (#496, #497). A name is
+Trust is decided by **origin** and pinned by **content**. A name is
 not trusted on its own: a folder can be swapped under a name that was approved
 before.
 
@@ -282,9 +282,9 @@ before.
 - **Same-user tampering outside the repo.** The store and the snapshots live in
   the user's state directory. A process running as the same user that sets out to
   rewrite them can. Out-of-tree moves the trust record out of reach of a session
-  editing the repo; it is not a sandbox (the same boundary as the #571 config
+  editing the repo; it is not a sandbox (the same boundary as the run's config
   digest).
-- **Moving the project loses its grants** (#572). They are keyed by the project
+- **Moving the project loses its grants**. They are keyed by the project
   path, so a moved or re-cloned project starts ungranted. This fails closed:
   re-grant after a move.
 - **Files a hook names outside `{scripts}`.** A hook `cmd` that runs a script
@@ -318,20 +318,24 @@ kills the hook's process tree, and the run stops: the bus journals
 `plugin-hook-interrupted` (`plugin`, `stage`) instead of `plugin-hook-error`, and
 `fail_closed` never turns that into a veto, because an interrupted hook has not
 failed. If the interrupted hook is on `post_run`, the run still finishes. A hook
-timeout kills the tree the same way. The runner re-scans the tree under the
-hook's root once a second while that root runs, and again every 50 ms while the
-root winds down after its signal; at kill time it also takes in each surviving
-known process's current children. Only processes still alive with a matching
-recorded identity are signalled. A background job whose parent shell exited is
-killed if its parent chain was still under the live root at one of those scans,
-and a process forked in the root's TERM handler is killed if the root lived one
-50 ms re-scan after forking. These cannot be reached: a process that starts and
-is reparented away within one scan interval, a TERM handler that forks and exits
-at once, a descendant already reparented away from a surviving job once the root
-has exited, and a process that starts while the survivors are being reaped. On
-macOS without `psutil`, only the root is killed. Hooks that run as part of the
-stop's own unwind — `pre_worktree_teardown`/`post_worktree_teardown`,
+timeout kills the tree the same way. Hooks that run as part of the stop's own
+unwind — `pre_worktree_teardown`/`post_worktree_teardown`,
 `pre_rollback`/`post_rollback` — are not interrupted and still run to completion.
+
+What the kill reaches:
+
+- The runner re-scans the tree under the hook's root once a second while that root
+  runs, and every 50 ms while the root winds down after its signal. At kill time it
+  also takes in each surviving known process's current children.
+- Only processes still alive with a matching recorded identity are signalled.
+- A background job whose parent shell exited is killed if its parent chain was still
+  under the live root at one of those scans. A process forked in the root's TERM
+  handler is killed if the root lived one 50 ms re-scan after forking.
+- Out of reach: a process that starts and is reparented away within one scan
+  interval, a TERM handler that forks and exits at once, a descendant reparented
+  away from a surviving job after the root exited, and a process that starts while
+  the survivors are being reaped.
+- On macOS without `psutil`, only the root is killed.
 
 **Versioning.** Every manifest declares `api_version`. The framework supports a
 set of versions (`SUPPORTED_API`). A **builtin** with an unsupported version is a
@@ -537,7 +541,7 @@ reset) or an unexpected error escapes it. `ctx.rollback_outcome`
 It is `None` on every other stage, `pre_rollback` included. A plugin that
 quiesces in `pre_rollback` can therefore always rely on the matching release;
 one that does post-reset work (re-installing dependencies, re-applying state)
-should gate it on `completed`, since `post_rollback` no longer implies the reset
+should gate it on `completed`, since `post_rollback` does not imply the reset
 finished.
 Rollback paths that never emit `pre_rollback` (a clean tree, a policy pause with
 `[scm] rollback_on_failure` off, an owned-spec pause raised before the rollback
@@ -551,149 +555,102 @@ starts) emit neither stage.
 | `pre_dev_session`                  | before each dev session          | `proposed_prompt`, `proposed_env`, veto                                              |
 | `post_dev_verify`                  | after dev or repair verification | —                                                                                    |
 
-`post_dev_verify` fires on **both** legs of the dev phase — once after the dev
-session's verification, and again after each repair session's — so a handler sees
-it **more than once per story**, not once. The two legs share one `attempt`
-counter bounded by `[limits] max_dev_attempts`, which is also the bound on how
-many times the stage can fire for one story. Write handlers to be idempotent and
-to key on the correlation fields below rather than on the story alone. It also
-fires on the way to a pause: an attempt whose session reported a CRITICAL
-escalation emits before the run stops, on either leg — and so does a dev or repair
-leg whose `[environment]` probe preflight failed, with no command results. One
-emission falls outside that bound: a `bmad-loop resolve --reverify` replay fires
-the stage once more with **no session** — `ctx.session_status` is `None`,
-`ctx.result_json` is the latest completed dev session's result, and `attempt` does
-not advance — so a handler that assumes a session behind every emission must
-check `session_status` first.
+`post_dev_verify` fires more than once per story. Write handlers to be idempotent and
+to key on the correlation fields below, not on the story alone:
 
-`post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
-per-command `CommandResult` records core just executed. Each has `command`,
-`returncode`, the existing merged bounded `output_tail`, separate `stdout`
-and `stderr` strings, and `spawn_error` — normally `None`, and set when the child
-could not be started at all. The typical cause is the directory it was to run in
-(missing, not a directory, or unsearchable), which the message names, but any
-spawn-time `OSError` lands here — a missing shell, EMFILE, ENOMEM — so read the
-wrapped exception rather than assuming the directory. Such a result carries no
-real exit status (`verify.SPAWN_FAULT_RC`, deliberately outside the range a
-signal-killed child reports and distinct from the timeout leg's `-1`) and
-classifies as an environment fault, which pauses the run. The two stream strings
-are intended to be the streams essentially whole
-— they are not cut to `[verify] stream_capture_kb`, which bounds only what is
-written to disk — but they are not unbounded either: a hard 32 MiB per-stream
-ceiling applies, so a pathologically chatty command cannot grow the orchestrator's
-peak memory with the number of configured verify commands. When that ceiling cuts
-a stream the **tail** is what a plugin receives, and the matching journal record's
-`stdout_bytes` / `stderr_bytes` still report what the command emitted, so the cut
-is always detectable rather than silent. Ordinary suites never reach it. This is
-observation data only: a plugin cannot change the verifier's outcome or the commit
-decision. The run's `journal.jsonl` also records
-one `verify-command-result` entry per command with run/story/attempt/stage and
-verification-sequence correlation — note that `attempt` is the dev/repair counter, so every review
-cycle of one attempt shares a single value and only `verification_sequence` tells successive review
-passes apart — `output_tail`, `spawn_error`, byte counts, and run-relative `stdout_path` /
-`stderr_path` pointers under the run's `verify/` directory; full streams are not
-embedded in the journal. `spawn_error` rides the record because the record's
-readers are out-of-process and `returncode` alone cannot separate a child that
-never started from one that ran. A pass cut short by a hard `bmad-loop stop` (DW-353)
-records `interrupted: true` with `returncode` −1001 (`INTERRUPTED_RC`): the command
-the stop killed has `output_tail` `interrupted by a hard stop request`, and every later
-command, which was never started, still gets a record, with `output_tail`
-`not started: an earlier command was interrupted by a hard stop request`. The run
-stops right after journalling that pass, so no hook observes it and no decision is
-taken on it. The field is absent from every pass that ran through. That store is deliberately separate from `logs/`, which
-holds coding-CLI pane captures named after session task ids and is read as such
-by the TUI.
+- It fires after the dev session's verification and again after each repair session's. Both
+  legs share one `attempt` counter bounded by `[limits] max_dev_attempts`.
+- It also fires on the way to a pause: after a session that reported a CRITICAL escalation,
+  and after a dev or repair leg whose `[environment]` probe preflight failed (no command
+  results).
+- A `bmad-loop resolve --reverify` replay fires it once more with **no session**:
+  `ctx.session_status` is `None`, `ctx.result_json` is the latest completed dev session's
+  result, and `attempt` does not advance. Check `session_status` before assuming a session.
 
-Two more context fields say **which** verification the results came from, because
-nothing else on the context can: both the dev leg and the repair leg emit
-`post_dev_verify` from `Phase.DEV_VERIFY`, and `ctx.attempt` is one per-story
-counter the repair leg continues rather than restarts, so its value orders the
-two but names neither.
+`ctx.command_results` is an immutable tuple of the `CommandResult` records core just ran,
+one per `[verify] commands` entry:
+
+| Field         | Value                                                                                                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`     | the command line                                                                                                                                                                        |
+| `returncode`  | exit status; `verify.SPAWN_FAULT_RC` when the child never started, −1 on timeout                                                                                                        |
+| `output_tail` | merged, bounded tail of both streams                                                                                                                                                    |
+| `stdout`      | the stream essentially whole: not cut to `[verify] stream_capture_kb`, but capped at 32 MiB (the tail is kept; the journal's byte counts show the cut)                                  |
+| `stderr`      | as `stdout`                                                                                                                                                                             |
+| `spawn_error` | `None`, or why the child could not start (any spawn-time `OSError`, typically a missing or unsearchable directory). Such a result classifies as an environment fault and pauses the run |
+
+The results are observation only: a plugin cannot change the verifier's outcome or the
+commit decision. Treat verifier output as potentially sensitive.
+
+Two fields say which verification produced the results, since `attempt` orders the dev and
+repair legs but names neither:
 
 | Field                       | Value                                                                                  |
 | --------------------------- | -------------------------------------------------------------------------------------- |
 | `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
 | `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
 
-The review gate publishes the same pair on its own stage, [`post_review_verify`](#review),
-always as `"review"` (or `None`).
+The review gate publishes the same pair on [`post_review_verify`](#review), always as
+`"review"` (or `None`). The sequence is monotonic per story across pause/resume (unlike
+`attempt`, which a human re-arm reuses), so it is safe to persist as a correlation id.
 
-Together they are the join key: the `verify-command-result` entries carrying this
-`story_key` + `verification_stage` + `verification_sequence` are exactly this
-context's results, one per record, ordered by `command_index`. The sequence is
-monotonic per story **across a pause/resume** — unlike `attempt`, which a human
-re-arm reuses — so it is safe to persist as a correlation id.
+Read `ctx.command_results == ()` together with `verification_stage`:
 
-Read `ctx.command_results == ()` together with `verification_stage`; on its own it
-is ambiguous:
+- **`verification_stage is None`**: no verify pass ran. The session did not complete
+  (`ctx.session_status`), an earlier gate failed the attempt (`ctx.verify_reason`), an
+  `[environment]` probe failed the preflight (`ctx.verify_reason` names it), or stories mode
+  skipped the pass on a plan-halt leg.
+- **Stage set, `verification_sequence is None`**: the pass ran with `[verify] commands` empty.
+  No journal record exists.
+- **Stage set, sequence an int**: those commands ran, and each has a journal record.
 
-- **`verification_stage is None`** — no verify pass ran. Several causes land here
-  and the empty tuple names none of them: the session did not complete
-  (`ctx.session_status`), an earlier gate already failed the attempt — the
-  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — an
-  `[environment]` probe failed the preflight, so no command was started
-  (`ctx.verify_reason` names the probe) — or the engine
-  variant suppressed the pass for this leg (stories mode skips it on a plan-halt
-  leg, which has no implementation to build).
-- **stage set, `verification_sequence is None`** — the pass ran and executed
-  nothing, because `[verify] commands` is empty. No journal record exists either.
-- **stage set, sequence an int** — those commands ran, and each has a matching
-  journal record.
+#### `verify-command-result` journal records
 
-What lands on disk is bounded by `[verify] stream_capture_kb` (default 256 KiB per
-stream): the **tail** is retained, and the record stays explicit about the cut —
-`stdout_bytes` / `stderr_bytes` are what the command emitted, `stdout_captured_bytes` /
-`stderr_captured_bytes` how much of that reached disk, and `stdout_truncated` /
-`stderr_truncated` their inequality. Both counts are UTF-8 lengths of the decoded
-stream, **not** file sizes: the files are written in text mode, so Windows newline
-translation makes the file larger there. Set the knob to `0` to retain nothing at
-all — no files are written and the pointers are null, but the record still lands
-with the full byte counts, because "nothing was retained" and "the command was
-silent" are different facts. Retaining is observation and never fails a run: if the
-write raises (ENOSPC, a read-only run dir, or a `verify/` directory whose
-confinement cannot be established — the store refuses rather than write through
-a symlink a session planted), the pointer is null and `capture_error`
-carries the reason. A plugin reading these pointers must therefore treat both
-`None` and a missing file as normal, and consult `*_truncated` before assuming a
-file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
-or act on it only from an explicitly configured plugin.
+The run's `journal.jsonl` records one `verify-command-result` per command. The records with
+this context's `story_key` + `verification_stage` + `verification_sequence` are exactly its
+results, ordered by `command_index`. Each carries run/story/attempt/stage correlation,
+`output_tail`, `spawn_error`, byte counts, and run-relative `stdout_path` / `stderr_path`
+pointers under the run's `verify/` directory (not `logs/`, which holds session pane captures).
 
-**`post_dev_verify` covers the dev phase only.** `[verify] commands` also run at
-the _review_ gate — `verify_review` / `verify_review_stories` /
-`verify_review_bundle` end on the same core classifier — and those runs are
-journalled (`verification_stage: "review"`, sharing the story's one
-`verification_sequence` counter with the dev and fix passes) and published on
-their own stage, [`post_review_verify`](#review). They run in `repo_root`, the same root
-the dev phase uses (#695); only the gates' own artifact reads — the spec, the
-sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
-converged review pass, the review-budget-exhaustion rescue, the review-timeout
-salvage, and both passes inside the skip-review commit path (which runs the gate
-again after a repair). The records do not name which of the five ran — the
-neighbouring `review-result` / `review-skipped*` / `review-timeout-salvage*`
-entries and the sequence ordering say that. `bmad-loop confirm --reverify` runs
-the commands too, out of band by construction — the run that parked the story is
-finished, so there is no journal to write to and no hook bus to emit on.
+- `attempt` is the dev/repair counter, so every review pass of one attempt shares it; only
+  `verification_sequence` tells review passes apart.
+- **Hard stop.** A pass cut short by a hard `bmad-loop stop` records `interrupted: true` with
+  `returncode` −1001 (`INTERRUPTED_RC`). The killed command's `output_tail` is
+  `interrupted by a hard stop request`; every later command still gets a record with
+  `not started: an earlier command was interrupted by a hard stop request`. No hook observes
+  that pass. The field is absent from passes that ran through.
+- **On-disk capture** is bounded by `[verify] stream_capture_kb` (default 256 KiB per stream;
+  the tail is kept). `stdout_bytes` / `stderr_bytes` are what the command emitted,
+  `*_captured_bytes` what reached disk, and `*_truncated` their inequality. Counts are UTF-8
+  lengths of the decoded stream, not file sizes (Windows newline translation makes files
+  larger). `0` retains nothing: no files, null pointers, full byte counts.
+- **Capture never fails a run.** If the write raises (ENOSPC, read-only run dir, a `verify/`
+  directory whose confinement cannot be established), the pointer is null and
+  `capture_error` says why. Treat both `None` and a missing file as normal, and check
+  `*_truncated` before assuming a file holds the whole output.
 
-Two consequences a handler has to be written for:
+#### Review-gate verification
 
-- **`verify-command-result` entries are a complete census of a RUN's verifier
-  command invocations, but not of every gate visit or of a project's.** Every
-  command an in-run dev, fix or review pass executed lands a record. A pass cut
-  short by a hard stop also records each command it never started, marked
-  `interrupted: true` with a `not started:` `output_tail`, so the record count of
-  such a pass is its configured command count, not what actually ran. A pass
-  with no `[verify] commands` configured executes nothing and therefore records
-  nothing; `bmad-loop confirm --reverify` stays outside because it runs after the
-  run that parked the story is over. Count distinct `verification_sequence`
-  values to derive recorded passes, while preserving that zero-command caveat.
-- **One command record is not a pass verdict**, and an earlier red pass is not
-  evidence the commit was blocked: a failed pass can be followed by a green
-  review-gate pass and a commit. Group records by `verification_sequence`, then
-  correlate that group with its surrounding decision event instead of inferring
-  the decision from one command or from an older pass. The dev and fix legs use
-  `dev-decision` / `fix-decision`; review passes use the applicable neighbouring
-  `review-result`, `review-skipped*`, `review-timeout-salvage*`,
-  `review-budget-committed`, or `review-followup-damped` event described above.
+**`post_dev_verify` covers the dev phase only.** `[verify] commands` also run at the review
+gate, in the same `repo_root` as the dev phase, and are journalled with
+`verification_stage: "review"` (sharing the story's `verification_sequence` counter) and
+published on [`post_review_verify`](#review). Five engine gates reach them: the converged
+review pass, the review-budget-exhaustion rescue, the review-timeout salvage, and both passes
+of the skip-review commit path. The records do not name which gate ran; the neighbouring
+`review-result` / `review-skipped*` / `review-timeout-salvage*` entries do.
+`bmad-loop confirm --reverify` runs the commands out of band, with no journal and no hook bus.
+
+Two consequences for handlers:
+
+- **The records are a complete census of a run's in-run verifier invocations**, not of every
+  gate visit or of the project's. A hard-stopped pass records its full configured command
+  count; a pass with no commands records nothing; `confirm --reverify` records nothing.
+  Count distinct `verification_sequence` values to derive recorded passes.
+- **One command record is not a pass verdict**, and an earlier red pass does not mean the
+  commit was blocked. Group records by `verification_sequence`, then read the surrounding
+  decision event: `dev-decision` / `fix-decision` for the dev and fix legs; `review-result`,
+  `review-skipped*`, `review-timeout-salvage*`, `review-budget-committed` or
+  `review-followup-damped` for review passes.
 
 ### Review
 
@@ -706,20 +663,23 @@ Two consequences a handler has to be written for:
 | `post_review_verify`  | after each review verify gate  | —                                                 |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
-`post_review_verify` is the review leg's counterpart of `post_dev_verify`: its own
-stage, not a second meaning for that one. It fires once per review verify gate
-visit — the converged review pass, the review-budget-exhaustion rescue, the
-review-timeout salvage, and each of the (up to two) passes inside the skip-review
-commit path — in every run mode (sprint, stories, sweep). A gate visit ended by
-an exception (a hard stop, a repair pause, an engine error) is never published. A
-story can therefore see it **several times** (once per review cycle that reached
-the gate, plus a re-check after a verify-repair), so write handlers to be
-idempotent and key on `verification_sequence` when it is set (it is `None` when no
-commands ran). It fires after the gate itself has finished — including its own
-acceptance bookkeeping (binding the review artifact source, a sweep's ledger
-reclose) — and before the engine routes on the outcome (journals
-`review-verify-failed`, escalates, repairs, or commits). It is observation only: a
-handler cannot change the gate's outcome, the routing, or the journal.
+`post_review_verify` is the review leg's counterpart of `post_dev_verify`, as its
+own stage. It fires once per review verify gate visit, in every run mode (sprint,
+stories, sweep):
+
+- The gate visits are the converged review pass, the review-budget-exhaustion
+  rescue, the review-timeout salvage, and each of the (up to two) passes inside the
+  skip-review commit path. A visit ended by an exception (a hard stop, a repair
+  pause, an engine error) is never published.
+- A story can see it **several times** (once per review cycle that reached the gate,
+  plus a re-check after a verify-repair). Write handlers to be idempotent and key on
+  `verification_sequence` when it is set (`None` when no commands ran).
+- It fires after the gate has finished, including its acceptance bookkeeping
+  (binding the review artifact source, a sweep's ledger reclose), and before the
+  engine routes on the outcome (journals `review-verify-failed`, escalates, repairs,
+  or commits).
+- It is observation only: a handler cannot change the gate's outcome, the routing,
+  or the journal.
 
 The context carries the same payload as `post_dev_verify`:
 
@@ -808,7 +768,7 @@ blocking = false           # true: a non-completed session defers the unit
   prompt rewrite cannot strip them: a **`## Sprint board`** prohibition — the
   same one dev and review prompts carry, because a workflow session runs while
   the orchestrator's own `sprint-status.yaml` advance is still uncommitted and
-  must not be "fixed" or reverted (#437) — and the **`## Completion signal`**
+  must not be "fixed" or reverted — and the **`## Completion signal`**
   contract naming the marker file the session must write before ending its turn.
   Write `prompt` as a self-contained instruction; do not restate either. (Stories
   mode has no board, so the first section is absent there.)
@@ -976,10 +936,11 @@ trust gate.
 
 bmad-loop's core is portable Python, and the OS-specific work is quarantined behind
 seams (the tmux transport, the `ProcessHost` lifecycle, the hook interpreter — see
-[Porting bmad-loop to a new OS](porting-to-a-new-os.md)). Plugin **helper scripts**
-are spawned under the orchestrator's own interpreter (`sys.executable`), **not** a
-PATH-resolved `python3` — so a bundled script may `import bmad_loop` and reach those
-seams instead of re-implementing OS primitives. Follow this discipline:
+[Porting bmad-loop to a new OS](porting-to-a-new-os.md)). A helper script that an
+in-process plugin spawns with `sys.executable` (as the Unity plugin does) runs under the
+orchestrator's interpreter, so it may `import bmad_loop` and reach those seams instead of
+re-implementing OS primitives. A declarative hook `cmd` runs through the host shell, so a
+`python3` there is whatever is on `PATH` and may not see `bmad_loop`. Follow this discipline:
 
 - **Use the `ProcessHost` seam for pid lifecycle.** For terminate / force-kill /
   liveness, call `get_process_host()` rather than guarding `os.kill` /

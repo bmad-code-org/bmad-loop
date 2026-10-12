@@ -1,4 +1,5 @@
-"""Docs hygiene guard: links resolve, anchors resolve, generated tables are current.
+"""Docs hygiene guard: links and anchors resolve, generated tables are current,
+and the docs keep to their content policy.
 
 The docs are a cross-linked set — README, AGENTS, CONTRIBUTING and everything
 under ``docs/`` — and nothing else checks that a link still lands when a page is
@@ -10,6 +11,9 @@ split, a heading renamed, or a section moved. This guard holds that line:
   or ``](page.md#x)`` across pages) is a heading slug or ``<a id>`` of its target.
 * ``test_policy_reference_is_current`` — the generated settings tables in
   ``docs/reference/configuration.md`` match ``core.toml`` (``scripts/gen_policy_reference.py --check``).
+* ``test_no_tracker_tags_in_docs`` — no ``DW-<n>`` or ``#<nn>`` refs outside ``docs/adr/``.
+* ``test_doc_blocks_stay_short`` — paragraphs, list items and table cells stay under a word cap.
+* ``test_features_catalog_shape`` — every FEATURES.md entry has a valid Stability and a Description.
 
 The corpus is the tracked ``*.md`` files among README.md, CONTRIBUTING.md,
 AGENTS.md and ``docs/**``. Fenced code blocks and inline code spans are stripped
@@ -236,4 +240,169 @@ def test_policy_reference_is_current():
     assert proc.returncode == 0, (
         f"gen_policy_reference.py --check exited {proc.returncode}\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+# --- content policy: tracker tags, block length, FEATURES shape -------------
+
+_TRACKER = re.compile(r"\bDW-\d+\b|(?<!&)#\d{2,}\b")
+_LINK_TARGET = re.compile(r"\]\(\s*(?:<[^>]*>|[^)\s]*)[^)]*\)")
+_AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^>\s]*>")
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_TABLE_ROW = re.compile(r"^\s*\|")
+_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+_CELL_SPLIT = re.compile(r"(?<!\\)\|")
+_HTML_COMMENT = re.compile(r"<!--.*?-->")
+_GENERATED_BEGIN = "<!-- BEGIN GENERATED:"
+_GENERATED_END = "<!-- END GENERATED:"
+
+# Measured on the tree the guard landed on (ADRs excluded): the longest
+# paragraph/bullet was 131 words and the longest hand-written table cell 51.
+# The caps sit a little above those so a normal edit passes while a returning
+# essay or a table cell that grows into a paragraph fails.
+_MAX_BLOCK_WORDS = 150
+_MAX_CELL_WORDS = 60
+
+_STABILITY = ("stable", "in-progress", "experimental", "planned")
+
+
+def _prose_lines(rel: str):
+    """Yield ``(line_no, text)`` for each unfenced line with code spans, link
+    targets, autolinks and HTML comments removed: what a reader sees as prose."""
+    for no, line in enumerate(_unfenced(rel), start=1):
+        line = _CODE_SPAN.sub("", line)
+        line = _HTML_COMMENT.sub("", line)
+        line = _AUTOLINK.sub("", line)
+        line = _LINK_TARGET.sub("]", line)
+        yield no, line
+
+
+def _blocks(rel: str):
+    """Yield ``(kind, line_no, words)`` for every paragraph or list item
+    (``kind == "block"``) and every table cell (``kind == "cell"``) in ``rel``.
+
+    Fenced code is already blank; a heading or blank line ends a block, a new
+    list marker starts one, and an indented continuation line extends it.
+    Generated blocks (between BEGIN/END GENERATED markers) are skipped: their
+    text is owned by the source they are generated from."""
+    generated = False
+    start = 0
+    words = 0
+
+    def flush():
+        nonlocal words
+        if words:
+            yield "block", start, words
+        words = 0
+
+    raw = _unfenced(rel)
+    for (no, line), original in zip(_prose_lines(rel), raw):
+        if _GENERATED_BEGIN in original:
+            generated = True
+        if generated:
+            if _GENERATED_END in original:
+                generated = False
+            yield from flush()
+            continue
+        if not line.strip() or _HEADING.match(line):
+            yield from flush()
+            continue
+        if _TABLE_ROW.match(line):
+            yield from flush()
+            if not _TABLE_RULE.match(line):
+                for cell in _CELL_SPLIT.split(line.strip().strip("|")):
+                    yield "cell", no, len(cell.split())
+            continue
+        if _LIST_ITEM.match(line):
+            yield from flush()
+        if not words:
+            start = no
+        words += len(line.split())
+    yield from flush()
+
+
+def test_no_tracker_tags_in_docs():
+    """Docs describe current behavior; issue numbers and ledger ids are history.
+
+    No ``DW-<n>`` ledger id and no ``#<nn>`` issue/PR ref (bare, ``owner/repo#N``
+    or ``BMAD-METHOD#N``) in the corpus outside ``docs/adr/`` (ADRs keep their
+    refs; CHANGELOG is not in the corpus). Code spans, fenced blocks and link
+    targets are stripped first, so a placeholder id in an example command or a
+    ``](page.md#anchor)`` fragment is not a finding."""
+    offenders: list[str] = []
+    for rel in _corpus():
+        if rel.startswith("docs/adr/"):
+            continue
+        for no, line in _prose_lines(rel):
+            for m in _TRACKER.finditer(line):
+                offenders.append(f"  {rel}:{no}: {m.group(0)}")
+    assert not offenders, (
+        "tracker refs in the docs — state the current behavior instead "
+        "(history lives in git and the CHANGELOG):\n" + "\n".join(offenders)
+    )
+
+
+def test_doc_blocks_stay_short():
+    """No paragraph or list item over 150 words (``_MAX_BLOCK_WORDS``), and no
+    table cell over 60 (``_MAX_CELL_WORDS``), outside code fences, generated
+    blocks and ``docs/adr/`` (an ADR's rationale is its content).
+
+    The caps sit a little above the longest block (131 words) and cell (51
+    words) on the tree the guard landed on. A block that outgrows them is a
+    mechanism essay or incident narration: split it into steps or a table, or
+    move the guarantee into the implementing module's docstring."""
+    blocks = 0
+    offenders: list[str] = []
+    for rel in _corpus():
+        if rel.startswith("docs/adr/"):
+            continue
+        for kind, no, words in _blocks(rel):
+            blocks += 1
+            cap = _MAX_BLOCK_WORDS if kind == "block" else _MAX_CELL_WORDS
+            if words > cap:
+                offenders.append(f"  {rel}:{no}: {kind} of {words} words (cap {cap})")
+    assert blocks > 1000, f"premise: expected many blocks, scanned {blocks}"
+    assert not offenders, (
+        "doc blocks over the length cap — split, tabulate, or move mechanism "
+        "into a docstring:\n" + "\n".join(offenders)
+    )
+
+
+def test_features_catalog_shape():
+    """Every ``###`` feature under a FEATURES.md category carries a
+    ``- **Stability:** <value>`` line, value one of stable / in-progress /
+    experimental / planned, and a non-empty ``- **Description:**`` line
+    (the entry format in FEATURES.md's Overview)."""
+    rel = "docs/FEATURES.md"
+    entries: dict[str, tuple[int, list[str]]] = {}
+    category: str | None = None
+    current: str | None = None
+    for no, line in enumerate(_unfenced(rel), start=1):
+        m = _HEADING.match(line)
+        if m:
+            level = len(m.group(1))
+            if level == 2:
+                category = None if m.group(2).strip() == "Overview" else m.group(2).strip()
+                current = None
+            elif level == 3 and category is not None:
+                current = f"{category} / {m.group(2).strip()}"
+                entries[current] = (no, [])
+            elif level <= 3:
+                current = None
+            continue
+        if current is not None:
+            entries[current][1].append(line)
+    assert len(entries) > 20, f"premise: expected the feature catalog, found {len(entries)} entries"
+    stability = re.compile(r"^- \*\*Stability:\*\* (\S+)\s*$")
+    description = re.compile(r"^- \*\*Description:\*\* \S")
+    offenders: list[str] = []
+    for name, (no, body) in entries.items():
+        values = [m.group(1) for b in body if (m := stability.match(b))]
+        if len(values) != 1 or values[0] not in _STABILITY:
+            offenders.append(f"  {rel}:{no} {name}: Stability {values or 'missing'}")
+        if not any(description.match(b) for b in body):
+            offenders.append(f"  {rel}:{no} {name}: Description missing")
+    assert not offenders, (
+        f"FEATURES.md entries off the catalog shape (Stability in {_STABILITY}, "
+        "plus a Description):\n" + "\n".join(offenders)
     )

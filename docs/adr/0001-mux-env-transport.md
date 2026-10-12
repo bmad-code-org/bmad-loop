@@ -200,7 +200,7 @@ Adopt **D**, preceded by **B** as the interim. Specify **C** now but **do not sc
 
 Nothing below is implemented yet. Each stage describes the change, files and tests of a future pull request.
 
-### Stage 1 (planned): #731 interim warning (no released-signature change)
+### Stage 1 (shipped): #731 interim warning (no released-signature change)
 
 **Change:**
 
@@ -303,7 +303,7 @@ So "cannot tell" and "tried and failed" stay distinguishable to the caller, per 
 
 **Out-of-tree compatibility test (must exist):** `StubMux`, which implements only the released abstract set, goes through `_ensure_ctl_session` on both arms. It completes, `inherited_env` returns `None`, and no warning is emitted.
 
-### Stage 2 (planned): state root in parked-window argv (no seam change)
+### Stage 2 (implemented): state root in parked-window argv (no seam change)
 
 **Change:**
 

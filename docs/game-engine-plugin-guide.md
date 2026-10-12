@@ -335,8 +335,9 @@ untitled scene so **no tracked `.unity` file is open** when the reset rewrites i
 closing the "changed on disk" dialog's window before it can open. At
 `post_rollback` it refreshes assets so the Editor drops its stale in-memory copies
 and re-imports the reverted tree — including after a paused or failed rollback,
-where the tree may be only partially reset (the refresh is harmless there). The
-first call doubles as a **wedge probe**: if the Editor is already unresponsive it
+where the tree may be only partially reset (the refresh is harmless there).
+
+The first call doubles as a **wedge probe**: if the Editor is already unresponsive it
 fails fast and the quiesce is skipped, at the cost of one call timeout rather than
 the whole budget. Every call carries both the CLI's own `--timeout` and a
 subprocess-level kill, and the plugin hard-kills the whole helper past

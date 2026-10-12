@@ -255,13 +255,13 @@ Completes a story parked at `awaiting-operator` once the external actions it lis
 bmad-loop confirm [--project PROJECT] [--list] [--yes] [--reverify] [--json] [story_key]
 ```
 
-| Option       | Description                                                                                                 |
-| ------------ | ----------------------------------------------------------------------------------------------------------- |
-| `story_key`  | Parked story to confirm.                                                                                    |
-| `--list`     | List parked stories and their owed actions.                                                                 |
-| `--yes`      | Skip the per-action acknowledgment prompt.                                                                  |
-| `--reverify` | After the acknowledgments, run the environment probes and `[verify]` commands; any failure blocks (exit 1). |
-| `--json`     | Emit the parked set as one JSON document. Implies `--list`.                                                 |
+| Option       | Description                                                                                                                                                                |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `story_key`  | Parked story to confirm.                                                                                                                                                   |
+| `--list`     | List parked stories and their owed actions.                                                                                                                                |
+| `--yes`      | Skip the per-action acknowledgment prompt.                                                                                                                                 |
+| `--reverify` | After the acknowledgments, run the environment probes, then the `[verify]` commands; any failure blocks (exit 1). Nothing runs when no `[verify] commands` are configured. |
+| `--json`     | Emit the parked set as one JSON document. Implies `--list`.                                                                                                                |
 
 - After each action is acknowledged, appends an `## Operator Confirmation` section to the spec, sets the spec and board to `done`, removes the park record, and commits the result (best-effort). Declining any action changes nothing and exits 0.
 - Exits 2 without a `story_key`, `--list` or `--json`. Exits 1 when the story is not parked in this checkout or its park record disagrees with the committed state.
@@ -392,13 +392,13 @@ Reclaims disk from concluded runs according to `[cleanup]`. Scope: [cleanup vs c
 bmad-loop clean [--project PROJECT] [--dry-run] [--keep RUN_ID] [--retain N] [--hard] [--json]
 ```
 
-| Option          | Description                                                                                           |
-| --------------- | ----------------------------------------------------------------------------------------------------- |
-| `--dry-run`     | List what would be reclaimed; remove nothing.                                                         |
-| `--keep RUN_ID` | Never touch this run (full id, exact match). Repeatable.                                              |
-| `--retain N`    | Keep the newest N concluded runs whole. Overrides `[cleanup] run_retention`. `0` keeps none by count. |
-| `--hard`        | Delete runs past retention instead of archiving them.                                                 |
-| `--json`        | Emit one JSON document instead of text.                                                               |
+| Option          | Description                                                                                                                                                                 |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--dry-run`     | List what would be reclaimed; remove nothing.                                                                                                                               |
+| `--keep RUN_ID` | Never touch this run (full id, exact match). Repeatable.                                                                                                                    |
+| `--retain N`    | Keep the newest N concluded runs out of archive/delete (still trimmed when `[cleanup] trim_artifacts` is on). Overrides `[cleanup] run_retention`. `0` keeps none by count. |
+| `--hard`        | Delete runs past retention instead of archiving them.                                                                                                                       |
+| `--json`        | Emit one JSON document instead of text.                                                                                                                                     |
 
 - Exits 0 once the policy loads; per-run faults are warnings on stderr or fields in the JSON document.
 

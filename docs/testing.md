@@ -13,8 +13,9 @@ and every negative assertion proven by ablation.**
 ## The suite at a glance
 
 - Flat `tests/`: `test_*.py` files mirroring `src/bmad_loop` modules by name, no package
-  nesting, one `tests/conftest.py`, and one data file (`tests/fixtures/stories.yaml`, the
-  stories-mode contract).
+  nesting, one `tests/conftest.py`, and a small `tests/fixtures/` data dir (`stories.yaml`, the
+  stories-mode contract, plus the captured claude trust-prompt pane log that
+  `test_generic_tmux.py` replays).
 - Configuration is four settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
   `testpaths = ["tests"]`, `asyncio_mode = "auto"`, `addopts = "--dist loadgroup"`, and
   `filterwarnings`.
