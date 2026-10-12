@@ -3937,6 +3937,56 @@ def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, mo
     assert probes == []  # never entered the dispatch leg below the wait
 
 
+def test_gap_keeps_probing_through_heartbeats_until_a_frame_proves_the_stream(
+    tmp_path, monkeypatch
+):
+    """A gap's lone probe can read busy before the turn settles, and the
+    reconnected stream never replays a turn end it missed; heartbeats then keep
+    the silence fallback disarmed for good. So the gap re-probes every tick
+    until a substantive frame arrives, probes once after it, and disarms.
+
+    Ablation: drop `gap_activity` from the probe condition -> the gap tick is
+    the only probe (`probes == [1]`) and the finished turn waits out its timeout.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 30.0  # heartbeats below keep the stream fresh
+
+    ticks: list[int] = []
+    probes: list[int] = []
+    monkeypatch.setattr(
+        type(adapter), "_probe_completion", lambda self, sess: (probes.append(len(ticks)), False)[1]
+    )
+
+    def advance():
+        clock["mono"] += 5.0
+        sess.last_frame_monotonic = clock["mono"]  # a `: heartbeat` every tick
+        if len(ticks) == 4:
+            sess.activity += 1  # the reconnected stream carries a real frame
+
+    sess = _timeout_driven_session(adapter, advance)
+    get_empty = sess.events.get
+
+    def get(timeout=None):
+        ticks.append(1)
+        if len(ticks) == 1:
+            advance()
+            return "gap"
+        return get_empty(timeout)
+
+    sess.events.get = get
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=60.0),
+    )
+
+    assert result.status == "timeout"
+    # gap tick, two heartbeat-only ticks, the tick that saw the frame — then none
+    assert probes == [1, 2, 3, 4]
+
+
 def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
     """Graceful means *finish the in-flight item*, so a graceful request pending
     on the same channel must not touch a running session — only `hard` aborts.

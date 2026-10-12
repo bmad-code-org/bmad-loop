@@ -55,6 +55,9 @@ breaking changes may land in a minor release.
 
 - Stop failing every opencode-http session start against OpenCode 2.x with a health
   timeout (#847).
+- Keep probing an opencode-http session over HTTP after an event-stream reconnect
+  until a new frame arrives, so a turn end lost in the gap no longer runs to the
+  session timeout (#847).
 - Charge and retry a session whose log tail shows a provider error but whose tracked
   usage is nonzero, instead of pausing the run as an environment fault (#764).
 - Count Claude Code session usage once per API response and include subagent

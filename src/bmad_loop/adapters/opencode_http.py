@@ -1167,6 +1167,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # Loop-owned silence clock: updated on every dequeue, so a dead reader
         # thread degrades to the poll fallback instead of disabling it.
         last_seen = time.monotonic()
+        # `activity` as of the last unresolved stream gap; None = no gap armed.
+        gap_activity: int | None = None
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
         last_heartbeat: float | None = None
@@ -1461,10 +1463,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     time.monotonic() - max(last_seen, sess.last_frame_monotonic)
                     > self.silence_threshold_s
                 )
-                if (event == "gap" or silent) and self._probe_completion(sess):
+                # A gap's single probe can run before the turn settles, and the
+                # reconnected stream never replays a turn end it missed — while
+                # heartbeats keep `silent` False for good. So a gap keeps the
+                # probe armed until a substantive frame proves the stream live
+                # again (one probe after it, then disarm) or completion is seen.
+                if event == "gap":
+                    gap_activity = sess.activity
+                probe_activity = sess.activity
+                if (event == "gap" or silent or gap_activity is not None) and (
+                    self._probe_completion(sess)
+                ):
                     event = "idle"  # fall through to the Stop path below
                     last_seen = time.monotonic()
+                    gap_activity = None
                 else:
+                    if gap_activity is not None and probe_activity != gap_activity:
+                        gap_activity = None
                     if stall_deadline is not None:
                         # Re-arm on activity (any SSE traffic since arming) —
                         # a session streaming subagent work is working, not
