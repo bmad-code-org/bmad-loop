@@ -10568,7 +10568,7 @@ OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/cl
 
 def test_dry_run_renders_hookless_http_line(project, capsys):
     """A hookless adapter has no shell invocation — dry-run renders the honest
-    HTTP sequence (server spawn → session → prompt_async) instead of a fake
+    HTTP sequence (server spawn → session → prompt) instead of a fake
     argv that run would never execute."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     _write_policy(project.project, OPENCODE_QUALIFIED_POLICY)
@@ -10579,8 +10579,10 @@ def test_dry_run_renders_hookless_http_line(project, capsys):
     out = capsys.readouterr().out
     dev_line = next(line for line in out.splitlines() if "dev:" in line)
     assert "opencode serve --hostname 127.0.0.1 --port <auto>" in dev_line
-    assert "POST /session" in dev_line and "prompt_async" in dev_line
-    # the profile's codex-style template is rendered into the prompt_async body
+    # protocol-neutral: the server API major is only detected at spawn
+    assert "→ create session → prompt " in dev_line
+    assert "POST /session" not in dev_line and "prompt_async" not in dev_line
+    # the profile's codex-style template is rendered into the prompt body
     assert "Use the bmad-dev-auto skill now:" in dev_line
     assert "model=anthropic/claude-haiku-4-5" in dev_line
     assert "effort=" not in dev_line  # unset → absent, like model

@@ -12,9 +12,11 @@ Version detection. ``opencode --version`` prints the bare ``1.19.0`` on V1 and
 ``X.Y.Z`` either way. :data:`SUPPORTED` maps each major the adapter speaks to
 the earliest version probed live, and :func:`support_verdict` is the single
 judgement both the runtime (refuse at spawn) and ``bmad-loop validate`` (warn)
-derive from.
+derive from. Verified ranges: V1 1.18.2–1.19.x, V2 2.0.21–2.0.27 — the live
+gates (``tests/test_opencode_live*.py``) passed against 1.19.0 and 2.0.27 on
+2026-10-12.
 
-V1 (``opencode-ai`` 1.x) — :class:`V1Protocol`.
+V1 (``opencode-ai`` 1.x, verified 1.18.2–1.19.x) — :class:`V1Protocol`.
 
 API contract — every fact below was pinned live against the real 1.18.2
 binary (2026-07-16; the full probe record and the archived OpenAPI spec live
@@ -103,7 +105,7 @@ static contract — worth re-dumping on any version bump:
 - There is **no ``tool.call`` / ``tool.response``** on this surface —
   confirmed both statically in the 89-variant union and live.
 
-V2 (``@opencode/cli`` 2.x) — :class:`V2Protocol`.
+V2 (``@opencode/cli`` 2.x, verified 2.0.21–2.0.27) — :class:`V2Protocol`.
 
 A separate npm package whose installer replaces the V1 binary (``opencode``,
 plus ``opencode2``). API contract — pinned live against 2.0.27 (2.0.21

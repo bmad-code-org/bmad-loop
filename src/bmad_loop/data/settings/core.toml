@@ -265,7 +265,7 @@ placeholder = "CLI default model"
 key = "effort"
 kind = "str"
 placeholder = "provider default"
-description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the per-prompt variant, ignored by the tmux CLIs"
+description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the model variant (on 2.x it must be one of the model's variants), ignored by the tmux CLIs"
 [[section.field]]
 key = "extra_args"
 kind = "args"

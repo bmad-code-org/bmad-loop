@@ -8,8 +8,10 @@ drives sessions entirely over that API (``injection="http"``,
 The wire contract — what each OpenCode server API answers, pinned live per
 major — lives in :mod:`.opencode_protocol`'s module docstring, beside the
 codecs that implement it. The major is detected from ``opencode --version``
-before the server is spawned (:meth:`OpencodeHttpAdapter._protocol_for`);
-everything below is the transport every major shares.
+before the server is spawned (:meth:`OpencodeHttpAdapter._protocol_for`):
+1.x (``opencode-ai``, verified 1.18.2–1.19.x) and 2.x (``@opencode/cli``,
+verified 2.0.21–2.0.27) are driven; any other major is refused. Everything
+below is the transport every major shares.
 
 Transport shape (the settled design drivers):
 
@@ -186,7 +188,7 @@ _V1 = V1Protocol()
 _PROTOCOLS: dict[int, type[OpencodeProtocol]] = {1: V1Protocol, 2: V2Protocol}
 
 # Where every version refusal sends the operator.
-_VERSION_REMEDY = "see docs/setup-guide.md (OpenCode section)"
+_VERSION_REMEDY = "see docs/setup-guide.md#opencode-versions"
 
 # `opencode --version` budget for the pre-spawn protocol detection — probe's
 # `binary_runs` default, which bounds the same call in `bmad-loop validate`.

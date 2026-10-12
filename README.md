@@ -188,14 +188,14 @@ The bundled `unity` plugin (`[plugins] enabled = ["unity"]`) lets sessions drive
 
 Each coding CLI is a declarative TOML profile; built-ins ship in `bmad_loop/data/profiles/`. Per-CLI setup is in the [setup guide](docs/setup-guide.md#first-run-notes).
 
-| Profile       | Status                  | Notes                                                                                                                                |
-| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `claude`      | supported               | Reference implementation.                                                                                                            |
-| `codex`       | supported, E2E-verified | Codex ≥ 0.139. The prompt uses `$skill` mentions instead of slash commands. No SessionEnd hook; window death covers crashes.         |
-| `gemini`      | supported, E2E-verified | Gemini CLI ≥ 0.46. Launched with `-i`; `AfterAgent` maps to Stop.                                                                    |
-| `copilot`     | supported, E2E-verified | Copilot CLI (GA ≥ 2026-02), not the VS Code extension. Pin a capable model; the free default skips workflow steps.                   |
-| `antigravity` | experimental            | `agy` ≥ 1.1.3. Folder trust is exact-path, so worktree isolation needs the project root trusted. Reports no token usage.             |
-| `opencode`    | supported, E2E-verified | OpenCode ≥ 1.18 (profile `opencode-http`) over HTTP/SSE, no tmux window. Needs the `[opencode]` extra. Unverified on native Windows. |
+| Profile       | Status                  | Notes                                                                                                                                                                                |
+| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `claude`      | supported               | Reference implementation.                                                                                                                                                            |
+| `codex`       | supported, E2E-verified | Codex ≥ 0.139. The prompt uses `$skill` mentions instead of slash commands. No SessionEnd hook; window death covers crashes.                                                         |
+| `gemini`      | supported, E2E-verified | Gemini CLI ≥ 0.46. Launched with `-i`; `AfterAgent` maps to Stop.                                                                                                                    |
+| `copilot`     | supported, E2E-verified | Copilot CLI (GA ≥ 2026-02), not the VS Code extension. Pin a capable model; the free default skips workflow steps.                                                                   |
+| `antigravity` | experimental            | `agy` ≥ 1.1.3. Folder trust is exact-path, so worktree isolation needs the project root trusted. Reports no token usage.                                                             |
+| `opencode`    | supported, E2E-verified | OpenCode 1.x ≥ 1.18 or 2.x ≥ 2.0.21, detected from `--version` (profile `opencode-http`), over HTTP/SSE, no tmux window. Needs the `[opencode]` extra. Unverified on native Windows. |
 
 To add a CLI without Python, drop a profile in `.bmad-loop/profiles/<name>.toml` and finalize it with `bmad-loop probe-adapter <cli>`; see the [adapter authoring guide](docs/adapter-authoring-guide.md).
 

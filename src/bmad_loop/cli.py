@@ -3322,14 +3322,17 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
-        # effort rides the prompt_async body as `variant` (#643); shown under the
-        # policy's own key so the preview distinguishes the configurations.
+        # effort is sent as the model `variant` (#643: per prompt on 1.x, on the
+        # session's model ref on 2.x); shown under the policy's own key so the
+        # preview distinguishes the configurations. Protocol-neutral: the server
+        # API major is detected from `--version` at spawn, which a preview never
+        # runs.
         effort = f" effort={cfg.effort}" if cfg.effort else ""
         # launch_args sits between binary and `serve`, as `_serve_argv` builds it.
         launcher = " ".join((profile.binary, *profile.launch_args))
         return (
             f"{launcher} serve --hostname 127.0.0.1 --port <auto> "
-            f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
+            f'(cwd=<worktree>) → create session → prompt "{profile.render_prompt(prompt)}"'
             f"{model}{effort}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args

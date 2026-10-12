@@ -139,9 +139,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `bmad-loop resume` re-runs the probes; if they pass, the withheld session launches with no rollback, and otherwise the run pauses again unchanged.
   - A verify command exiting 126, 127 or `[verify] env_fault_rc` is an environment fault, not a code failure.
   - A non-completed session whose log tail matches its profile's `env_fault_patterns` pauses instead of spending a dev attempt.
+  - opencode is classified from model-free files only: the server's stdout, plus on OpenCode 2.x the adapter-written `provider-errors.log` (one line per provider-error event). Its 2.x patterns cover the `provider.rate-limit`, `provider.quota` and `provider.transport` error types.
   - A pattern match is overruled when the session's tracked token usage is nonzero; that session is charged like any failure.
 - **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`; profile key `env_fault_patterns`
-- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_generic_tmux.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`
 - **Docs:** [Environment faults](escalations-guide.md#environment-faults), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resumable runs and graceful stop
@@ -285,7 +286,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Properties:**
   - Bundled profiles: claude, codex, gemini, copilot, antigravity and opencode-http. The names `opencode` and `claude-code-tmux` resolve as aliases.
   - A `.bmad-loop/profiles/*.toml` file whose `name` matches a bundled profile overrides it; a new `name` adds a CLI. Project files win over packaged and entry-point profiles.
-  - opencode runs as a headless `opencode serve` over HTTP/SSE. It needs no tmux window and registers no hooks.
+  - opencode runs as a headless `opencode serve` over HTTP/SSE. It needs no tmux window and registers no hooks. It speaks both OpenCode server APIs, 1.x and 2.x, picked per session from `opencode --version`; an unsupported major fails the session start with a clear error, and `validate` reports it as `adapter.opencode-version`.
   - `bmad-loop probe-adapter <cli>` does a zero-launch scan by default. `--probe` opts in to one live, content-free turn. Every report is sanitized before it is printed.
   - Antigravity (experimental) never reports token usage. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
 - **Config:** `[adapter] name`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
@@ -300,7 +301,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `[adapter.dev]`, `[adapter.review]`, `[adapter.triage]` and `[adapter.retro]` override `name`, `model`, `effort` and `extra_args` per stage. A key left unset inherits from `[adapter]`.
   - A stage that switches to a different CLI does not inherit the base model, effort or extra_args. It uses that CLI's own defaults.
   - Naming an alias of the base CLI, such as `opencode` versus `opencode-http`, counts as the same CLI, not a switch.
-  - `effort` is free-form and only opencode sends it, as the per-prompt variant. `bmad-loop validate` warns when it is set on a tmux CLI.
+  - `effort` is free-form and only opencode sends it, as the model variant. On OpenCode 2.x it must be one of the model's variants, or the session refuses to start. `bmad-loop validate` warns when it is set on a tmux CLI.
   - `extra_args` replaces the profile's permission-bypass flags instead of adding to them. `validate` warns with `policy.bypass-dropped` when a bypass flag would go missing.
 - **Config:** `[adapter] name` / `model` / `effort` / `extra_args`; `[adapter.dev]`, `[adapter.review]`, `[adapter.triage]`, `[adapter.retro]` (same keys)
 - **Tested by:** `tests/test_policy.py`, `tests/test_opencode_http.py`, `tests/test_cli.py`

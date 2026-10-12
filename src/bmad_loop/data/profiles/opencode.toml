@@ -1,7 +1,9 @@
 # OpenCode (opencode.ai) driven over its local HTTP server (`opencode serve`) —
 # hookless: the adapter owns the server process and observes turn completion via
 # SSE + polling, so no hook scripts or config merges are ever written.
-# API facts pinned against opencode 1.18.2 (2026-07-16): see the adapters/opencode_http.py docstring.
+# Speaks both server APIs, picked from `opencode --version`: 1.x (`opencode-ai`, verified
+# 1.18.2–1.19.x) and 2.x (`@opencode/cli`, verified 2.0.21–2.0.27). The pinned API facts per
+# major live in the adapters/opencode_protocol.py docstring.
 name = "opencode-http"
 binary = "opencode"
 # Driven by the bundled HTTP/SSE adapter class (adapters/registry.py), not the

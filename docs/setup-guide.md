@@ -211,8 +211,8 @@ time or retro the epic before its runs are deleted.
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
 `antigravity` (Google's `agy`, experimental — worktree isolation needs the project root trusted; see [First-run notes](#first-run-notes)), and `opencode`
-(OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
-`bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
+(OpenCode 1.x ≥ 1.18 or 2.x ≥ 2.0.21 over HTTP/SSE, profile `opencode-http` — no tmux
+window; needs the `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
 
 There are **two layers** here, and confusing them is the usual stumbling block:
@@ -362,15 +362,51 @@ them to whoever owns the machine:
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.
 - **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
-  workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
+  workspace-trust dialog to answer). Supports OpenCode 1.x ≥ 1.18 and 2.x ≥ 2.0.21; see
+  [OpenCode versions](#opencode-versions). Set the model as
   `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). A reasoning
-  `effort` (e.g. `[adapter.review] effort = "max"`) is sent as the per-prompt variant and is
-  opencode-only — the tmux CLIs ignore it. No hooks are
+  `effort` (e.g. `[adapter.review] effort = "max"`) is sent as the model variant and is
+  opencode-only — the tmux CLIs ignore it. On 2.x the effort must be one of the model's
+  variants, or the session refuses to start and names the ones available. No hooks are
   registered — the adapter drives a headless `opencode serve` over HTTP/SSE, so there is no
   tmux window to attach to; watch a session via its `logs/<task-id>.log` — a curated
   transcript of the agent's prose, tool calls, file edits and permission decisions — or the
   TUI Log tab. The server's own stdout lands beside it in `<task-id>.server.out`, and a
   structured trace of the raw SSE frames in `<task-id>.sse.jsonl`.
+
+#### OpenCode versions
+
+OpenCode ships two server APIs from the same `opencode` binary name, and the adapter speaks
+both:
+
+- **1.x** is the `opencode-ai` npm package (verified 1.18.2–1.19.x).
+- **2.x** is a separate package, `@opencode/cli` (verified 2.0.21–2.0.27). Installing it
+  replaces the 1.x `opencode` binary on PATH.
+
+Nothing to configure: before each session the adapter runs `opencode --version`, picks the
+matching API, and confirms the choice against the running server's health endpoint. A
+major it has no codec for (or a `--version` it cannot parse) fails the session start with
+an error naming the version found and the supported ranges; `bmad-loop validate` reports
+the same verdict as `adapter.opencode-version` and warns below a major's earliest verified
+release.
+
+What differs on 2.x:
+
+- **Instructions:** 2.x reads only `AGENTS.md` — there is no `CLAUDE.md` fallback, so put
+  project instructions the agent must see in `AGENTS.md`.
+- **Skills:** 2.x has no switch to turn off the operator's personal skills
+  (`~/.claude/skills`, `~/.agents/skills`) and its built-in ones. The adapter keeps sessions
+  hermetic with permission rules instead: every skill is denied except the project's own,
+  so the model is offered only those. (`GET /api/skill` still lists every skill it found;
+  the rules govern what a session can load.)
+- **Logs:** a provider failure (rate limit, quota, refused connection) never reaches the
+  server's stdout on 2.x, so the adapter records each one in
+  `<task-id>.provider-errors.log`, which the environment-fault classifier scans beside
+  `<task-id>.server.out`.
+- **Going back to 1.x:** both majors keep their state in the same
+  `~/.local/share/opencode/opencode.db`. A 1.x server refuses to start on a database a 2.x
+  server created ("Database is not empty and has no session table"), so move that file
+  aside after downgrading.
 
 #### Codex hook trust under worktrees
 

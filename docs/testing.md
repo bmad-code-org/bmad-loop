@@ -52,7 +52,7 @@ layers, from cheapest to most expensive:
 | **L2 — seam**                 | Tests that drive one injection seam with a scripted double.                                                                                                                                                                                 | `MockAdapter`, TOML adapter profiles, the `force_tmux_backend` fixture, the injectable `make_adapters` and engine-class parameters of `runsetup.compose_run` (`engine_cls`, `stories_engine_cls`), `compose_sweep` (`sweep_engine_cls`), and `compose_resume` (all three) |
 | **L3 — sandbox integration**  | Engine/CLI flows over a real git repo, no multiplexer.                                                                                                                                                                                      | The `project` fixture (a copied template repo) plus the conftest effect helpers                                                                                                                                                                                           |
 | **L4 — real-mux integration** | A real tmux server drives a scripted shell script standing in for the CLI.                                                                                                                                                                  | The `HAVE_TMUX`-gated tests in `tests/test_generic_tmux.py`                                                                                                                                                                                                               |
-| **L5 — live gates**           | Real external binaries, still zero tokens.                                                                                                                                                                                                  | `tests/test_stories_e2e.py`, `tests/test_opencode_live.py`, `tests/test_psmux_live.py`                                                                                                                                                                                    |
+| **L5 — live gates**           | Real external binaries, still zero tokens.                                                                                                                                                                                                  | `tests/test_stories_e2e.py`, `tests/test_opencode_live.py`, `tests/test_opencode_live_turn.py`, `tests/test_psmux_live.py`                                                                                                                                                |
 
 Placement rules:
 
@@ -64,8 +64,9 @@ Placement rules:
   a mirror file is a smell; see [Gaps and deviations](#gaps-and-deviations).
 - **Suffix convention is the selection mechanism.** `*_e2e.py` and `*_live.py` name the modules
   with host requirements; each carries a module-level `pytestmark = pytest.mark.skipif(...)`
-  naming its requirement (`HAVE_TMUX`, `HAVE_OPENCODE`, `HAVE_PSMUX`). `HAVE_OPENCODE` runs the
-  binary's `--version`, so a resolvable but dead shim skips instead of failing. Ordinary runs
+  naming its requirement (`HAVE_TMUX`, `HAVE_OPENCODE`, `HAVE_OPENCODE_V2`, `HAVE_PSMUX`).
+  `HAVE_OPENCODE` runs the binary's `--version`, so a resolvable but dead shim skips instead
+  of failing; `HAVE_OPENCODE_V2` also requires that version to be 2.x. Ordinary runs
   collect and skip them; a capable host runs them with no extra flags. Do not add a marker, an
   env-var opt-in, or a separate pytest invocation for these.
 - **Prefer a lower layer over a broader one.** If a defect is expressible as a pure-core case,
@@ -199,20 +200,22 @@ Rules for adding or touching a guard:
 **No test, at any layer, ever spends an LLM token.** AGENTS.md states the hard invariant for
 the live/E2E gates; in practice it holds everywhere, and the mechanism differs per gate:
 
-| Gate                                 | Real component                                     | Zero-token mechanism                                                                                                                                                                               | Runs where                                                        |
-| ------------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `test_generic_tmux.py` (`HAVE_TMUX`) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                       | CI Linux job + any POSIX dev box with tmux                        |
-| `test_stories_e2e.py`                | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash string constants) wired in as a custom TOML profile; the fake writes its own SessionStart/Stop hook events                                                   | CI Linux job (the fakes use GNU coreutils + `setsid`)             |
-| `test_opencode_live.py`              | A real `opencode serve` HTTP server                | **Never sends a prompt**: only spawn/teardown and the health/doc/session/event endpoints; the prompt endpoint is checked against the OpenAPI schema, never called                                  | Manual: a POSIX box with a runnable `opencode`                    |
-| `test_psmux_live.py`                 | A real psmux on Windows                            | **Parked windows only**: every window runs `pwsh -NoProfile -Command exit 0`. `test_premise_*` probes are inverted (red means a workaround became droppable); `test_adopted_*` probes are ordinary | CI Windows job + any Windows dev box with psmux 3.3.8+ and `pwsh` |
+| Gate                                 | Real component                                     | Zero-token mechanism                                                                                                                                                                                                                                                                                                 | Runs where                                                        |
+| ------------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `test_generic_tmux.py` (`HAVE_TMUX`) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                                                         | CI Linux job + any POSIX dev box with tmux                        |
+| `test_stories_e2e.py`                | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash string constants) wired in as a custom TOML profile; the fake writes its own SessionStart/Stop hook events                                                                                                                                                                     | CI Linux job (the fakes use GNU coreutils + `setsid`)             |
+| `test_opencode_live.py`              | A real `opencode serve` HTTP server                | **Never sends a prompt**: only spawn/teardown and the health/OpenAPI/session/event endpoints of the detected major (1.x or 2.x); the prompt endpoint is checked against the OpenAPI schema, never called                                                                                                             | Manual: a POSIX box with a runnable `opencode`                    |
+| `test_opencode_live_turn.py`         | A real OpenCode 2.x server running one full turn   | **Prompts reach only a local fake**: the one test that prompts sends every LLM request to an in-process stdlib OpenAI-compatible server on 127.0.0.1, under a scrubbed env (scratch HOME/XDG, no credentials), a mock-only provider config and a deny on the hosted provider, and asserts the fake saw every request | Manual: a POSIX box with a runnable OpenCode 2.x `opencode`       |
+| `test_psmux_live.py`                 | A real psmux on Windows                            | **Parked windows only**: every window runs `pwsh -NoProfile -Command exit 0`. `test_premise_*` probes are inverted (red means a workaround became droppable); `test_adopted_*` probes are ordinary                                                                                                                   | CI Windows job + any Windows dev box with psmux 3.3.8+ and `pwsh` |
 
 Never "fix" a gate to call a real CLI, and never add a completion path that trusts LLM output:
 sessions complete only on hook Stop events or window death, and the fakes exercise exactly
 those paths.
 
-**Manual-gate cadence:** `test_opencode_live.py` is the one gate CI cannot run. Run it on a
-POSIX box with opencode installed before every release and after any change to the adapter it
-covers.
+**Manual-gate cadence:** the two `test_opencode_live*.py` modules are the gates CI cannot run.
+Run them on a POSIX box before every release and after any change to the adapter they cover,
+once with an OpenCode 1.x and once with a 2.x `opencode` first on PATH
+(`PATH=<dir>:$PATH uv run pytest tests/test_opencode_live.py tests/test_opencode_live_turn.py -q`).
 
 ## Ablation records
 
@@ -336,7 +339,8 @@ Deliberate absences, decisions rather than gaps:
   never a bare `python` (Ubuntu ships only `python3`). uv's standalone CPython has no
   `os.pidfd_open`, so the pidfd reap rows skip via `conftest.needs_pidfd`; to run them, build
   the venv on the distro Python with `uv venv -p /usr/bin/python3`.
-- **No opencode install in CI**, so `test_opencode_live.py` is the last manual gate (see
+- **No opencode install in CI**, so the `test_opencode_live*.py` modules are the last manual
+  gate (see
   [The zero-token invariant](#the-zero-token-invariant)); faking the server would test the
   fake. psmux, one zip on a GitHub release, is installed by **test-windows-live** instead.
 

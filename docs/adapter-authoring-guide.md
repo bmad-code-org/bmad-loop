@@ -391,9 +391,12 @@ session that ended `timeout`, `stalled` or `crashed`. A match stamps `env_fault`
 usage, which records the match in `env_fault_overruled` instead. What the engine does next
 is in [Environment faults](escalations-guide.md#environment-faults).
 
-- **Which log** is per adapter, named by `EnvFaultMixin.ENV_FAULT_LOG_SUFFIX`: the tmux
-  adapters scan the pane capture `logs/<task-id>.log`; `opencode-http` scans
-  `logs/<task-id>.server.out`.
+- **Which log** is per adapter, named by `EnvFaultMixin.ENV_FAULT_LOG_SUFFIX` (one file) or
+  `ENV_FAULT_LOG_SUFFIXES` (several, scanned in order; the last match across them wins,
+  and a missing file is a read fault). The tmux adapters scan the pane capture
+  `logs/<task-id>.log`; `opencode-http` scans `logs/<task-id>.server.out` plus
+  `logs/<task-id>.provider-errors.log`, the one adapter-written line per provider-error
+  event.
 - **A pane capture carries the model's own output**, so a pattern must reproduce the whole
   first sentence of one of the CLI's error messages, taken from captured output. An
   error-shaped token plus a cause is not enough; that is what a story writing about the
@@ -405,7 +408,8 @@ is in [Environment faults](escalations-guide.md#environment-faults).
 - Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
   and matched with the `regex` module under a per-pattern timeout.
 - Seeded for `claude` (connection loss and two captured provider 5xx errors) and
-  `opencode` (provider quota/rate-limit and connection). Empty means inert.
+  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
+  `provider.quota` and `provider.transport` events on 2.x). Empty means inert.
 
 ### Parked-session signals
 
@@ -530,8 +534,8 @@ the result:
   has settled liveness (see `GenericDevAdapter`).
 - `_classify_env_fault(handle, spec, result)`: identity by default; runs only for a
   non-`completed` result with `result_json is None`. Mix in `EnvFaultMixin` for the
-  profile-driven implementation, and set its `ENV_FAULT_LOG_SUFFIX` if your diagnostics do
-  not land in `logs/<task-id>.log`.
+  profile-driven implementation, and set its `ENV_FAULT_LOG_SUFFIX` (or
+  `ENV_FAULT_LOG_SUFFIXES`) if your diagnostics do not land in `logs/<task-id>.log`.
 - `_classify_zero_token_timeout(result)`: stamps `env_fault` on a `timeout` whose tracked
   usage is zero, unless an env fault or `env_fault_overruled` is already set.
 
@@ -552,23 +556,35 @@ Optional capabilities (each has a default):
 
 [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) is the shipped
 non-tmux adapter. It drives [OpenCode](https://opencode.ai) over `opencode serve`'s HTTP API
-and SSE stream (`injection = "http"`, `observation = "sse"`, `state = "remote"`). Its module
-docstring records the API contract it relies on. Patterns worth reusing:
+and SSE stream (`injection = "http"`, `observation = "sse"`, `state = "remote"`). Patterns
+worth reusing:
 
+- **Split the wire codec from the transport.** OpenCode 1.x and 2.x serve different HTTP
+  APIs from the same binary name. The transport (server process, port, password, teardown,
+  the stall/budget/timeout loop) is shared; each major's routes, frame envelope, turn-end
+  events, usage read and transcript renderer live in a protocol class in
+  [`adapters/opencode_protocol.py`](../src/bmad_loop/adapters/opencode_protocol.py), whose
+  module docstring records each API contract as pinned live. The adapter picks one from
+  `opencode --version` before spawning, refuses a major it has no codec for, and
+  cross-checks the choice at health time: each major answers the other's routes with the
+  web UI's HTML.
 - **One server per session.** Each session gets its own `opencode serve`, spawned with
   `cwd = spec.cwd` and `spec.env`, so the engine's `BMAD_LOOP_*` contract reaches tool
   subprocesses. The argv is
   `[binary, *launch_args, "serve", "--port", <free port>, "--hostname", "127.0.0.1", "--print-logs", *extra_args]`.
   Permissions, the model and a hermetic skills path go in `OPENCODE_CONFIG_CONTENT`, with a
-  per-server `OPENCODE_SERVER_PASSWORD`. Reasoning effort rides each `prompt_async` body as
-  `variant`.
-- **Map the transport onto hook-signal semantics.** SSE `session.idle` ≙ the Stop hook;
-  server-process death ≙ window death (`crashed`); on SSE loss, a poll of
-  `GET /session/status` plus proof of a completed assistant message takes over. An idle
+  per-server `OPENCODE_SERVER_PASSWORD`. Reasoning effort is the model `variant`: in each
+  1.x `prompt_async` body, and on the 2.x session's model ref at create.
+- **Map the transport onto hook-signal semantics.** The SSE turn end (1.x `session.idle`,
+  2.x `session.execution.*`) ≙ the Stop hook; server-process death ≙ window death
+  (`crashed`); on SSE loss, a poll of the busy map (1.x `GET /session/status`, 2.x
+  `GET /api/session/active`) plus proof of a completed assistant message takes over. An idle
   event without proof of new work never completes a session.
-- **Three log sinks, one per audience.** `<task-id>.log` is a readable transcript curated
-  off the SSE stream; `<task-id>.server.out` takes the server's own stdout and is what
-  env-fault classification scans; `<task-id>.sse.jsonl` keeps raw frames behind the
+- **Log sinks, one per audience.** `<task-id>.log` is a readable transcript curated off
+  the SSE stream; `<task-id>.server.out` takes the server's own stdout;
+  `<task-id>.provider-errors.log` gets one adapter-written line per provider-error event
+  (2.x logs no per-retry error to stdout). Env-fault classification scans those last two,
+  never the model-written transcript. `<task-id>.sse.jsonl` keeps raw frames behind the
   `sse_trace` knob.
 - **Hookless profile.** `[hooks] dialect = "none"`: no hook registration and no hook-config
   merge into worktrees. Skills still install; opencode discovers `.claude/skills/<name>/SKILL.md`.
@@ -584,9 +600,12 @@ docstring records the API contract it relies on. Patterns worth reusing:
   tree is force-killed first.
 
 [`tests/test_opencode_http.py`](../tests/test_opencode_http.py) runs the adapter against a
-scripted stdlib fake server; [`tests/test_opencode_live.py`](../tests/test_opencode_live.py)
-smoke-checks the HTTP contract against a real local binary, skipped when absent, zero
-tokens spent.
+scripted stdlib fake server with a mode per major;
+[`tests/test_opencode_live.py`](../tests/test_opencode_live.py) smoke-checks the detected
+major's HTTP contract against a real local binary without ever prompting, and
+[`tests/test_opencode_live_turn.py`](../tests/test_opencode_live_turn.py) runs one full 2.x
+turn whose every LLM request goes to an in-process fake provider. Both skip when no binary
+is on PATH and spend zero tokens.
 
 ### Shipping a new adapter class out-of-tree
 

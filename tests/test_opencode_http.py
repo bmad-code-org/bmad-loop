@@ -3106,7 +3106,7 @@ def test_unsupported_major_is_refused_with_clear_message(tmp_path, fake_opencode
     message = str(excinfo.value)
     assert "opencode 3.1.0" in message
     assert "1.x (>= 1.18.0)" in message and "2.x (>= 2.0.21)" in message
-    assert "docs/setup-guide.md (OpenCode section)" in message
+    assert "docs/setup-guide.md#opencode-versions" in message
     assert not (rec / "pid").exists()  # nothing was spawned
     assert adapter._sessions == {}
 
@@ -3123,7 +3123,7 @@ def test_unparseable_version_is_refused(tmp_path, fake_opencode, monkeypatch):
     message = str(excinfo.value)
     assert "could not read an OpenCode version" in message
     assert "'garbage build'" in message
-    assert "docs/setup-guide.md (OpenCode section)" in message
+    assert "docs/setup-guide.md#opencode-versions" in message
     assert not (rec / "pid").exists()
 
 
