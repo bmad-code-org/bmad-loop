@@ -195,7 +195,7 @@ class EnvFaultMixin:
         evidence = self._env_fault_evidence(handle.task_id)
         if evidence is None:
             return result
-        tokens = self._overruling_usage_total(result)
+        tokens = self._overruling_usage_total(handle.task_id, result)
         if tokens is not None:
             self._note_lifecycle(
                 handle.task_id,
@@ -210,18 +210,25 @@ class EnvFaultMixin:
         )
         return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
 
-    def _overruling_usage_total(self, result: SessionResult) -> int | None:
+    def _overruling_usage_total(self, task_id: str, result: SessionResult) -> int | None:
         """The session's tracked token total when it is nonzero, else None (#764).
 
         None covers untracked usage, a tracked zero and a ``read_usage`` fault,
-        all of which keep the env-fault verdict. A fault is swallowed exactly as
-        ``_classify_zero_token_timeout`` swallows it — usage is metadata, never a
-        gate, and an escape would unwind ``run()`` before the engine records the
-        session; the engine's own ``read_usage`` right after ``run()`` re-raises
-        it on its journaled path."""
+        all of which keep the env-fault verdict. A fault cannot escape — usage is
+        metadata, never a gate, and an escape would unwind ``run()`` before the
+        engine records the session — but the fault None is a fold, not an
+        answer: the veto never looked. The engine's own ``read_usage`` right
+        after ``run()`` re-raises only a fault that persists; a transient one
+        (a file lock, a torn read) is gone by then, so ``session-end`` can carry
+        real tokens beside a verdict this read could not overrule. An
+        ``env-fault-usage-read-failed`` crumb (``error``) records the fold so the
+        post-mortem can tell "no work measured" from "never measured"."""
         try:
             usage = self.read_usage(result)
-        except Exception:  # usage is metadata, never a gate; the engine re-raises it
+        except Exception as exc:  # usage is metadata, never a gate; journal the fold
+            self._note_lifecycle(
+                task_id, "env-fault-usage-read-failed", error=f"{type(exc).__name__}: {exc}"
+            )
             return None
         if usage is None or usage.total <= 0:
             return None

@@ -4926,8 +4926,11 @@ def test_classify_env_fault_kept_on_untracked_usage(tmp_path):
 
 @pytest.mark.parametrize("exc", [OSError("transcript gone"), ValueError("bad jsonl")])
 def test_classify_env_fault_kept_when_usage_read_raises(tmp_path, exc):
-    """A usage-read fault is swallowed (usage is metadata, never a gate; the
-    engine's own read re-raises it) and keeps the verdict — it never escapes."""
+    """A usage-read fault never escapes and keeps the verdict, but it is not
+    silent: an `env-fault-usage-read-failed` crumb ahead of the classified one
+    tells the post-mortem the veto never measured (a transient fault the
+    engine's own read no longer sees would otherwise leave no trace).
+    ABLATION: drop the crumb and the event list loses its first entry."""
     adapter = make_adapter(tmp_path)
 
     def raising(_result):
@@ -4938,6 +4941,12 @@ def test_classify_env_fault_kept_when_usage_read_raises(tmp_path, exc):
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.env_fault_overruled is None
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == [
+        "env-fault-usage-read-failed",
+        "env-fault-classified",
+    ]
+    assert events[0]["error"] == f"{type(exc).__name__}: {exc}"
 
 
 def test_classify_env_fault_no_usage_read_without_pattern_hit(tmp_path):
