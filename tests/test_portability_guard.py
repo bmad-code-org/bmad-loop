@@ -4695,10 +4695,11 @@ def test_task_cycle_artifacts_named_only_through_the_constant():
 
 
 def test_task_cycle_artifact_docs_track_the_canonical_tuple():
-    """The run inventory and extension boundary keep pace with the shared list."""
+    """The run-state reference inventory and extension boundary keep pace with the
+    shared list."""
     project_root = Path(__file__).resolve().parents[1]
-    features = (project_root / "docs/FEATURES.md").read_text(encoding="utf-8")
-    inventory = features.split("- All run state in", 1)[1].split("\n- ", 1)[0]
+    run_state = (project_root / "docs/reference/run-state.md").read_text(encoding="utf-8")
+    inventory = run_state.split("- All run state in", 1)[1].split("\n- ", 1)[0]
     guide = (project_root / "docs/adapter-authoring-guide.md").read_text(encoding="utf-8")
     start_session_contract = guide.split("- `start_session", 1)[1].split(
         "- `wait_for_completion", 1

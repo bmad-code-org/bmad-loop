@@ -13,6 +13,8 @@ guides below go deeper, roughly in the order you'll need them.
 ## Reference
 
 - **[Configuration](reference/configuration.md)** — `.bmad-loop/policy.toml` location and precedence, the `BMAD_LOOP_*` environment variables, and every policy setting with its type, default and allowed values (generated from the settings schema).
+- **[CLI](reference/cli.md)** — every `bmad-loop` subcommand and its options, the `--json` document shapes, exit codes, and the `validate` check ids.
+- **[Run state](reference/run-state.md)** — where run state lives, the run and task directory layout, session naming and teardown, stopping a run, and what `cleanup`, `clean`, `delete` and `archive` remove.
 
 ## Extending bmad-loop
 
