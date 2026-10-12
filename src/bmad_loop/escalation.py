@@ -256,7 +256,7 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
 
 def session_failure_reason(role: str, result: SessionResult) -> str:
     """The reason text for a non-completed session: ``<role> session <status>``,
-    plus the lost-session diagnosis (#489).
+    plus the lost-session diagnosis (#489) and the overruled-env-fault note (#764).
 
     Without the suffix a session destroyed under the run reads exactly like a CLI
     that ran and produced nothing, and the operator debugs the agent instead of
@@ -271,13 +271,20 @@ def session_failure_reason(role: str, result: SessionResult) -> str:
     negative ``TerminalMultiplexer.has_session`` confirmed by a listing that
     proves it gone (DW-459) — not what removed it. That is enough to stop an
     operator reading window death as a CLI exit, and not enough to assert the
-    session was destroyed."""
+    session was destroyed.
+
+    When the adapter overruled a log-tail env-fault pattern match because the
+    session's tracked usage was nonzero (``env_fault_overruled``, #764), a fixed
+    note is appended after either form, so the operator sees why a provider
+    error in the log did not pause the run. Absent otherwise."""
     reason = f"{role} session {result.status}"
     if result.session_vanished:
-        return (
+        reason = (
             f"{reason}: the multiplexer no longer reports the session, so the window's "
             "disappearance is not evidence the CLI exited"
         )
+    if result.env_fault_overruled:
+        reason += "; a provider error in its log tail was overruled: the session consumed tokens"
     return reason
 
 
@@ -300,7 +307,9 @@ def decide_dev(
             # A transport/API failure (the CLI never reached the API, #194): the
             # attempt did no real work, so pause for a human instead of charging
             # it — re-arm resets the budget, exactly like a verify env-fault (rc
-            # 126/127). The crits check above already ran (env-fault results carry
+            # 126/127). The classifier withholds env_fault from a session with
+            # measured token use (#764), so this arm means "no measured work".
+            # The crits check above already ran (env-fault results carry
             # result_json=None, so it found nothing).
             return Decision(
                 Action.PAUSE,

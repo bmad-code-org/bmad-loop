@@ -8012,6 +8012,11 @@ class Engine:
             extras["env_fault"] = True
             if result.env_fault_evidence:
                 extras["env_fault_evidence"] = result.env_fault_evidence
+        # overruled transport-failure match (#764): same present-only convention,
+        # so a grep finds exactly the sessions whose log-tail provider error was
+        # outweighed by measured token use and charged instead of paused.
+        if result.env_fault_overruled:
+            extras["env_fault_overruled"] = result.env_fault_overruled
         # lost-session diagnosis (#489): rides the same chokepoint so EVERY
         # role — dev, review, fix, migration, triage, injected workflows —
         # leaves the greppable record, not only the dev decision. The boolean

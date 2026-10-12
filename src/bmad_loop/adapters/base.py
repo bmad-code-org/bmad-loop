@@ -317,6 +317,14 @@ class SessionResult:
     # APPENDED.
     resultless_verdict: str | None = None
     resultless_detail: str | None = None
+    # The evidence line an `env_fault_patterns` match found in the log tail but a
+    # tracked nonzero `read_usage` overruled (#764): measured token use disproves
+    # "the CLI never reached the API", so `env_fault` stays False and the session
+    # is charged like any timeout/stall/crash. Set only on a non-completed result,
+    # by `EnvFaultMixin._classify_env_fault`; journaled on `session-end` and named
+    # in `session_failure_reason`. Diagnostic only: never read by routing.
+    # APPENDED.
+    env_fault_overruled: str | None = None
 
 
 class CodingCLIAdapter(ABC):
@@ -439,6 +447,8 @@ class CodingCLIAdapter(ABC):
         Runs LAST in ``run()``, after ``_classify_env_fault``, so a
         pattern-matched evidence line wins (and ``read_usage`` is not even
         consulted) and a reconcile upgrade to ``completed`` is never touched.
+        A pattern match that tracked nonzero usage overruled (``env_fault_overruled``,
+        #764) is skipped too: usage was already read and was nonzero.
         Only ``status == "timeout"`` with ``result_json is None`` is inspected —
         ``stalled`` / ``crashed`` / ``over_budget`` are never classified here.
 
@@ -456,7 +466,12 @@ class CodingCLIAdapter(ABC):
         engine does. ``read_usage`` is idempotent (DW-117), so the engine's
         later read is unaffected; on an untracked timeout the generic adapter's
         ``usage_grace_s`` poll (copilot: 8s) runs here too."""
-        if result.env_fault or result.status != "timeout" or result.result_json is not None:
+        if (
+            result.env_fault
+            or result.env_fault_overruled is not None
+            or result.status != "timeout"
+            or result.result_json is not None
+        ):
             return result
         try:
             usage = self.read_usage(result)

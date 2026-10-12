@@ -33,6 +33,16 @@ The opencode server log tolerates the anchor-plus-cause form only because the
 model cannot write to it. Seed either from a captured line, never a plausible
 one; the profiles' own comments carry the provenance and
 tests/test_env_fault_patterns.py pins both halves.
+
+A pattern match is a claim that the CLI never reached the API, and measured
+usage disproves it (#764): a late transient 5xx in the tail of a session that
+billed tokens for its whole clock is a real timeout, not an outage. So after a
+match the classifier reads the session's usage, and a tracked nonzero total
+overrules the verdict — ``env_fault`` stays False, ``env_fault_overruled`` keeps
+the evidence, and the session is charged like any other failure. It is the
+rationale that already excludes ``over_budget``. Untracked usage (``None``), a
+tracked zero, or a fault reading usage keep today's verdict: only a measurement
+can overrule.
 """
 
 from __future__ import annotations
@@ -47,6 +57,9 @@ import regex
 
 from .base import SessionHandle, SessionResult, SessionSpec
 from .profile import CLIProfile
+
+if TYPE_CHECKING:
+    from ..model import TokenUsage
 
 # Post-mortem transport-failure classification (#194): how much of the tee'd
 # session log's tail to scan, how long an evidence excerpt to keep, and which
@@ -131,6 +144,9 @@ class EnvFaultMixin:
         # so depending on _ResultFileMixin here would be a cycle.
         def _note_lifecycle(self, task_id: str, event: str, **fields: object) -> None: ...
 
+        # Supplied by CodingCLIAdapter, the base of every host of this mixin.
+        def read_usage(self, result: SessionResult) -> TokenUsage | None: ...
+
     @cached_property
     def _env_fault_patterns(self) -> tuple[regex.Pattern[str], ...]:
         """Compiled once per adapter, on first classification. The profile
@@ -163,7 +179,13 @@ class EnvFaultMixin:
         without patterns stay inert. On a matching log-tail line, stamp
         ``env_fault`` / ``env_fault_evidence`` and drop an ``env-fault-classified``
         lifecycle breadcrumb. No match, no patterns, or an unreadable log leaves
-        the verdict untouched — best-effort, like ``_write_heartbeat``."""
+        the verdict untouched — best-effort, like ``_write_heartbeat``.
+
+        A match is overruled when the session's tracked usage is nonzero (#764):
+        ``env_fault`` stays False, ``env_fault_overruled`` carries the evidence,
+        and an ``env-fault-overruled`` breadcrumb (with ``tokens``) replaces the
+        classified one. Usage is read only after a match, so a healthy log costs
+        no extra read."""
         if (
             not self._env_fault_patterns
             or result.status not in ENV_FAULT_STATUSES
@@ -173,10 +195,37 @@ class EnvFaultMixin:
         evidence = self._env_fault_evidence(handle.task_id)
         if evidence is None:
             return result
+        tokens = self._overruling_usage_total(result)
+        if tokens is not None:
+            self._note_lifecycle(
+                handle.task_id,
+                "env-fault-overruled",
+                status=result.status,
+                evidence=evidence,
+                tokens=tokens,
+            )
+            return dataclasses.replace(result, env_fault_overruled=evidence)
         self._note_lifecycle(
             handle.task_id, "env-fault-classified", status=result.status, evidence=evidence
         )
         return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
+
+    def _overruling_usage_total(self, result: SessionResult) -> int | None:
+        """The session's tracked token total when it is nonzero, else None (#764).
+
+        None covers untracked usage, a tracked zero and a ``read_usage`` fault,
+        all of which keep the env-fault verdict. A fault is swallowed exactly as
+        ``_classify_zero_token_timeout`` swallows it — usage is metadata, never a
+        gate, and an escape would unwind ``run()`` before the engine records the
+        session; the engine's own ``read_usage`` right after ``run()`` re-raises
+        it on its journaled path."""
+        try:
+            usage = self.read_usage(result)
+        except Exception:  # usage is metadata, never a gate; the engine re-raises it
+            return None
+        if usage is None or usage.total <= 0:
+            return None
+        return usage.total
 
     def _env_fault_evidence(self, task_id: str) -> str | None:
         """Scan the tail of the tee'd session log for a transport-failure pattern.

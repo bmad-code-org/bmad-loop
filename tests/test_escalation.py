@@ -20,6 +20,7 @@ from bmad_loop.escalation import (
     display_pause_reason,
     preference_escalations,
     review_retry_or_exhaust,
+    session_failure_reason,
 )
 from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
@@ -370,6 +371,46 @@ def test_vanished_session_says_so_without_changing_the_routing():
     # and the review side reads the same signal
     review = decide_review_session(task, vanished, POLICY)
     assert "multiplexer no longer reports the session" in review.reason
+
+
+_OVERRULED_SUFFIX = "; a provider error in its log tail was overruled: the session consumed tokens"
+
+
+def test_session_failure_reason_names_an_overruled_env_fault():
+    """#764: a log-tail provider error that measured usage overruled is named in
+    the reason, so the operator sees why it did not pause. The bare reason stays
+    byte-identical when the field is unset."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    assert session_failure_reason("dev", overruled) == f"dev session timeout{_OVERRULED_SUFFIX}"
+    assert session_failure_reason("dev", SessionResult(status="timeout")) == "dev session timeout"
+
+
+def test_session_failure_reason_overruled_composes_after_lost_session():
+    """The #764 note follows the #489 lost-session text rather than replacing it."""
+    both = SessionResult(status="crashed", session_vanished=True, env_fault_overruled="x")
+    reason = session_failure_reason("dev", both)
+    assert reason.startswith("dev session crashed: the multiplexer no longer reports")
+    assert reason.endswith(_OVERRULED_SUFFIX)
+
+
+def test_dev_overruled_timeout_retries_with_budget_left():
+    """An overruled session is a plain timeout to routing (#764): it is charged
+    and retried while budget lasts, and the reason names the overrule."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    decision = decide_dev(_task(attempt=1), overruled, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert decision.reason.endswith(_OVERRULED_SUFFIX)
+    assert "environment fault" not in decision.reason
+
+
+def test_dev_overruled_timeout_takes_the_exhausted_action_when_spent():
+    """No pause special case on exhaustion (#764): a spent budget DEFERs, the
+    same as a plain timeout."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    decision = decide_dev(_task(attempt=2), overruled, None, POLICY)
+    plain = decide_dev(_task(attempt=2), SessionResult(status="timeout"), None, POLICY)
+    assert decision.action == plain.action == Action.DEFER
+    assert decision.budget_exhausted is True
 
 
 def test_env_fault_and_lost_session_compose_instead_of_cancelling():

@@ -15120,6 +15120,39 @@ def test_lost_session_is_journaled_structurally_on_dev_decision(project):
     assert "session_vanished" not in plain_end
 
 
+def test_overruled_env_fault_is_journaled_and_retried(project):
+    """#764: a session whose log-tail provider error the adapter overruled on
+    measured usage is a plain timeout to the engine — charged and retried — and
+    the overruled line rides `session-end` (present-only) and the reason."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # Any scripted line serves: the mock adapter never scans it. Kept clear of
+    # the shipped patterns, which test_pane_capture_patterns_do_not_match_this_repo
+    # forbids in tracked files outside its corpus.
+    evidence = "provider 529 (overloaded)"
+    engine, adapter = make_engine(
+        project,
+        [
+            SessionResult(status="timeout", env_fault_overruled=evidence),
+            SessionResult(status="timeout", env_fault_overruled=evidence),
+        ],
+    )
+    engine.run()
+
+    assert len(adapter.sessions) == 2  # the retry actually ran
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    assert "overruled: the session consumed tokens" in decisions[0]["reason"]
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all(e["env_fault_overruled"] == evidence for e in ends)
+    assert not any(e.get("env_fault") for e in ends)
+    # guard pin: a plain timeout's session-end omits the key. The journal is
+    # per-project, so only the second run's own last entry may be inspected.
+    engine2, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "env_fault_overruled" not in plain_end
+
+
 def test_session_env_fault_pauses_dev_without_burning_budget(project):
     """A dev session classified an environment fault (#194) pauses the run at the
     first story rather than charging the attempt; the decision + session-end carry

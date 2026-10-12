@@ -40,6 +40,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Charge and retry a session whose log tail shows a provider error but whose tracked
+  usage is nonzero, instead of pausing the run as an environment fault (#764).
 - Count Claude Code session usage once per API response and include subagent
   transcripts (`<session>/subagents/**/*.jsonl`). Per-session and per-story totals
   were over-counted ~2× without subagents and under-counted with them, so budgets
