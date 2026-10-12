@@ -4,8 +4,16 @@ One parser per CLI family, selected by the profile's `usage_parser` key. All
 parsers are tolerant — unknown lines and shapes are skipped, never fatal; a
 transcript that yields nothing reads as None (untracked), not zero.
 
-- claude-jsonl:  ~/.claude/projects/<munged-cwd>/<session-id>.jsonl;
-                 assistant entries carry an API `usage` block, summed.
+- claude-jsonl:  ~/.claude/projects/<munged-cwd>/<session-id>.jsonl plus
+                 its <session-id>/subagents/**/*.jsonl tree (read
+                 recursively: workflow agents nest under workflows/wf_*/);
+                 assistant entries carry an API `usage` block. Claude Code
+                 writes one entry per content block, each repeating the
+                 response's usage, so blocks are deduped by message.id with a
+                 per-field max (output_tokens grows while the response
+                 streams; max is order-independent across files). The dedupe
+                 is global because fork subagents copy their parent's message
+                 ids. Entries without an id each count.
 - codex-rollout: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl; `token_count`
                  event payloads carry CUMULATIVE totals, so the last one is
                  the session usage (sessions here are fresh per task).
@@ -89,29 +97,60 @@ _CLAUDE_USAGE_KEYS = (
 
 
 def tally(transcript_path: Path) -> TokenUsage | None:
-    """Sum every assistant `usage` block, or None when the transcript holds none.
+    """Sum the session's assistant `usage` blocks, or None when it holds none.
 
-    None (a missing file, or no usage-bearing line) is "no usage signal" and must
-    never read as free (DW-364): a zeroed TokenUsage is reserved for a transcript
-    that did report usage — an all-zero block still counts as seen — so a caller
-    can tell tracked zero spend from untracked."""
-    total = TokenUsage()
+    Reads the transcript plus every `*.jsonl` under the sibling
+    `<session-id>/subagents/` tree, recursively (workflow agents live in
+    `subagents/workflows/wf_<id>/`). Claude Code writes one entry per content
+    block and each repeats the response's usage, so a block whose
+    `message.id` is a string merges into one global per-id record by per-field
+    max (#836): only output_tokens differs between duplicates, growing as the
+    response streams, and max — unlike last-wins — does not depend on file
+    order. The record is global, not per-file, because a fork subagent copies
+    its parent's history, message ids included. Blocks without an id (or the
+    top-level `usage` shape) each count, as before.
+
+    None (a missing file, or no usage-bearing line in any file) is "no usage
+    signal" and must never read as free (DW-364): a zeroed TokenUsage is
+    reserved for a session that did report usage — an all-zero block still
+    counts as seen — so a caller can tell tracked zero spend from untracked.
+    OSError/ValueError propagate to the caller."""
+    paths = [transcript_path]
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    if subagents_dir.is_dir():
+        paths.extend(sorted(subagents_dir.rglob("*.jsonl")))
+    by_id: dict[str, dict[str, int]] = {}
+    anon: list[dict[str, int]] = []
     seen = False
-    for entry in _jsonl_entries(transcript_path):
-        usage = _usage_block(entry)
-        # Absent, empty `{}`, or no recognized token key: no usage signal here.
-        if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
-            continue
-        seen = True
+    for path in paths:
+        for entry in _jsonl_entries(path):
+            usage = _usage_block(entry)
+            # Absent, empty `{}`, or no recognized token key: no usage signal here.
+            if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
+                continue
+            seen = True
+            counts = {key: _int(usage.get(key)) for key in _CLAUDE_USAGE_KEYS}
+            message = entry.get("message")
+            message_id = message.get("id") if isinstance(message, dict) else None
+            if not isinstance(message_id, str):
+                anon.append(counts)
+                continue
+            merged = by_id.setdefault(message_id, dict.fromkeys(_CLAUDE_USAGE_KEYS, 0))
+            for key, value in counts.items():
+                merged[key] = max(merged[key], value)
+    if not seen:
+        return None
+    total = TokenUsage()
+    for counts in [*by_id.values(), *anon]:
         total.add(
             TokenUsage(
-                input_tokens=_int(usage.get("input_tokens")),
-                output_tokens=_int(usage.get("output_tokens")),
-                cache_read_tokens=_int(usage.get("cache_read_input_tokens")),
-                cache_creation_tokens=_int(usage.get("cache_creation_input_tokens")),
+                input_tokens=counts["input_tokens"],
+                output_tokens=counts["output_tokens"],
+                cache_read_tokens=counts["cache_read_input_tokens"],
+                cache_creation_tokens=counts["cache_creation_input_tokens"],
             )
         )
-    return total if seen else None
+    return total
 
 
 # ----------------------------------------------------------- codex-rollout

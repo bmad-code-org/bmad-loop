@@ -40,6 +40,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Count Claude Code session usage once per API response and include subagent
+  transcripts (`<session>/subagents/**/*.jsonl`). Per-session and per-story totals
+  were over-counted ~2× without subagents and under-counted with them, so budgets
+  tuned on old figures may trip differently (#836).
 - Bind the re-drive's own spec on a fixable repair when a resolved re-drive
   began with no spec, instead of crashing the engine with "attempt-owned spec
   became unreadable" (#860).
