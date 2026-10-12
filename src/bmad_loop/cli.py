@@ -588,6 +588,50 @@ def _validate_environment_probes(
         report.fail("environment.probe", message, detail)
 
 
+def _check_opencode_version(report: ValidationReport, profile_name: str, resolved: str) -> None:
+    """``adapter.opencode-version``: which OpenCode server API ``resolved`` would
+    run, judged by the same :func:`opencode_protocol.support_verdict` the adapter
+    refuses unsupported majors with. OK or a warning, never a problem; skipped
+    when ``--version`` itself fails (``adapter.binary-unrunnable`` covers it)."""
+    from . import probe as probe_mod
+    from .adapters.opencode_protocol import (
+        parse_opencode_version,
+        support_verdict,
+        supported_ranges,
+    )
+
+    first_line = probe_mod.binary_version_text(resolved)
+    if first_line is None:
+        return
+    detail: dict[str, object] = {"profile": profile_name, "path": resolved, "output": first_line}
+    version = parse_opencode_version(first_line)
+    if version is None:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: `--version` printed {first_line[:200]!r}, which names no "
+            f"OpenCode version — runs will refuse to start (supported: {supported_ranges()})",
+            detail,
+        )
+        return
+    verdict, message = support_verdict(version)
+    detail["version"] = ".".join(str(part) for part in version)
+    detail["verdict"] = verdict
+    if verdict == "ok":
+        report.ok("adapter.opencode-version", f"{profile_name}: {message}", detail)
+    elif verdict == "unsupported-major":
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: {message} — runs will refuse to start",
+            detail,
+        )
+    else:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: {message} — it may work; upgrade if sessions misbehave",
+            detail,
+        )
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from .install import relay_registered
 
@@ -822,6 +866,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     from . import probe as probe_mod
 
     packaged_binaries = {p.binary for p in profiles if p.packaged}
+    # tool -> the path `which` returned, for packaged binaries whose `--version`
+    # exited 0 — the only ones a later check may execute again (see below).
+    runnable: dict[str, str] = {}
     for tool in dict.fromkeys(p.binary for p in profiles):
         resolved = shutil.which(tool)
         if resolved:
@@ -868,6 +915,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             continue
         rc = probe_mod.binary_runs(resolved)
         if rc == 0:
+            runnable[tool] = resolved
             continue
         # Any nonzero code, never an allowlist: #294's own transcript reports rc 2
         # and a reproduction of the same shim exits 127, the code being a property
@@ -937,6 +985,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                         "launch_args": list(profile.launch_args),
                     },
                 )
+            # The server API major the run would detect from `--version` (#847):
+            # 2.x replaced 1.x under the same binary name. Read only for a binary
+            # already proven runnable above — that is the packaged-provenance gate
+            # (#294), and a failed `--version` is `adapter.binary-unrunnable`'s
+            # finding, not this one's. Never a problem: the run itself refuses an
+            # unsupported major with a clear error, and validate's rc is a
+            # compatibility contract.
+            resolved_binary = runnable.get(profile.binary)
+            if resolved_binary is not None:
+                _check_opencode_version(report, profile.name, resolved_binary)
         if profile.hookless:
             report.ok(
                 "adapter.hookless",

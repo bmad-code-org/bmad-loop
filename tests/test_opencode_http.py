@@ -63,6 +63,7 @@ from bmad_loop.adapters.opencode_http import (
     _sum_args,
     _sum_usage,
 )
+from bmad_loop.adapters.opencode_protocol import V1Protocol
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
@@ -96,11 +97,16 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   sse-black-hole     the SSE stream closes right after connecting (every
 #                      reconnect); the turn completes result+messages only —
 #                      completion is reachable only via the HTTP poll fallback
+#   html-health        /global/health answers 200 text/html (the web-UI shell
+#                      a server of another major serves for V1 routes)
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
 # turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
 # post-mortem reads (NOT <task_id>.log, the curated conversation transcript).
 # Unset = silent, so every other scenario is unaffected.
+# FAKE_OPENCODE_VERSION: what `--version` prints (default "1.18.2"); read from
+# the TEST process env, since the adapter probes `--version` before it builds the
+# session env — set it with monkeypatch.setenv.
 # FAKE_OPENCODE_SPEC_PATH/_SPEC_TEXT: a bmad-dev-auto-style terminal spec the
 # turn writes wherever a scenario writes its result (and at the start of
 # busy-forever, for the post-kill rescue). Unset = no-op, like RESULT_PATH.
@@ -111,6 +117,13 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 FAKE_OPENCODE = r"""
 import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+if sys.argv[1:] == ["--version"]:
+    # The adapter's pre-spawn protocol detection: answered from the caller's own
+    # env (the probe runs before any session env exists), so it is checked
+    # before anything below reads FAKE_OPENCODE_DIR.
+    print(os.environ.get("FAKE_OPENCODE_VERSION", "1.18.2"), flush=True)
+    sys.exit(0)
 
 SCENARIO = os.environ.get("FAKE_OPENCODE_SCENARIO", "completed")
 REC_DIR = os.environ["FAKE_OPENCODE_DIR"]
@@ -229,7 +242,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/global/health":
+        if self.path == "/global/health" and SCENARIO == "html-health":
+            body = b"<!doctype html><html><body>opencode</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/global/health":
             self._json(200, {"healthy": True, "version": "1.18.2"})
         elif self.path == "/session/status":
             with LOCK:
@@ -563,6 +583,7 @@ def test_spawn_hands_popen_the_wrapper_argv(tmp_path, monkeypatch):
 
     monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
     monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V1Protocol(), (1, 18, 2)))
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     with pytest.raises(_Stop):
         adapter._spawn_server(spec)
@@ -594,6 +615,7 @@ def test_spawn_give_up_error_names_the_wrapper_launch(tmp_path, monkeypatch):
 
     monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
     monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V1Protocol(), (1, 18, 2)))
     monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     with pytest.raises(opencode_http.OpencodeServerError) as excinfo:
@@ -2721,6 +2743,160 @@ def test_usage_sample_fault_streak_is_crumbed_at_transitions(tmp_path, monkeypat
     # the heartbeat precedes each tick's sample, so it lags the streak by one
     assert [b["usage_sample_failures"] for b in beats[:5]] == [0, 1, 2, 3, 0]
     assert all(b["sse_frames_dropped"] == 0 for b in beats)
+
+
+# ----------------------------------------------- protocol detection (#847)
+#
+# OpenCode 2.x replaces the 1.x binary under the same name and answers every V1
+# route with its web-UI shell, so the adapter reads the major from `--version`
+# before spawning. These drive the real detection path: the fake launcher
+# answers `--version` from FAKE_OPENCODE_VERSION.
+
+
+def _lifecycle(tmp_path: Path, task_id: str = "t-1") -> list[dict]:
+    return read_jsonl(tmp_path / "run" / "tasks" / task_id / "session-lifecycle.jsonl")
+
+
+def _count_version_probes(monkeypatch) -> list[list[str]]:
+    """Record every `--version` argv the adapter hands childrun, calling through."""
+    calls: list[list[str]] = []
+    real = opencode_http.childrun.run_argv
+
+    def counting(argv, **kwargs):
+        calls.append(list(argv))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(opencode_http.childrun, "run_argv", counting)
+    return calls
+
+
+def test_detects_protocol_from_version_output(tmp_path, fake_opencode, monkeypatch):
+    """The fake's `--version` answer picks the V1 codec, the session runs to
+    completion over it, and the detected version is crumbed once."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.19.0")
+    calls = _count_version_probes(monkeypatch)
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    seen: list[tuple[type, str]] = []
+    real_await = adapter._await_healthy
+
+    def spy(sess):
+        seen.append((type(sess.protocol), sess.server_version))
+        return real_await(sess)
+
+    monkeypatch.setattr(adapter, "_await_healthy", spy)
+
+    result = adapter.run(make_spec(tmp_path, rec, "completed"))
+
+    assert result.status == "completed"
+    assert seen == [(V1Protocol, "1.19.0")]
+    assert calls == [[str(launcher), "--version"]]
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "opencode-server-version"]
+    assert len(crumbs) == 1
+    assert {k: crumbs[0][k] for k in ("version", "major", "verdict")} == {
+        "version": "1.19.0",
+        "major": 1,
+        "verdict": "ok",
+    }
+    assert_server_gone(rec)
+
+
+def test_version_detection_is_cached_per_binary_identity(tmp_path, fake_opencode, monkeypatch):
+    """One `--version` per binary identity: a second session on the same file
+    reuses the answer, and a binary changed in place (an upgrade mid-run) is
+    asked again."""
+    launcher, rec = fake_opencode
+    calls = _count_version_probes(monkeypatch)
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    resolved = opencode_http.shutil.which(str(launcher))
+    assert resolved is not None
+
+    assert adapter._protocol_for(resolved)[1] == (1, 18, 2)
+    assert adapter._protocol_for(resolved)[1] == (1, 18, 2)
+    assert len(calls) == 1
+
+    # An in-place upgrade: same path, new content (size) and mtime.
+    stat = os.stat(resolved)
+    with open(resolved, "a", encoding="utf-8") as fh:
+        fh.write("\n" if sys.platform == "win32" else "\n# upgraded\n")
+    os.utime(resolved, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.19.0")
+    assert adapter._protocol_for(resolved)[1] == (1, 19, 0)
+    assert len(calls) == 2
+
+
+def test_unsupported_major_is_refused_with_clear_message(tmp_path, fake_opencode, monkeypatch):
+    """A major the adapter does not speak is refused before any server is
+    spawned, with an error naming what was found, what is supported and where to
+    read more — never the opaque "not healthy in time" of #847.
+
+    ABLATION: drop the `unsupported-major` guard in `_protocol_for` and the
+    session spawns against an unknown API — this reddens."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "opencode v3.1.0")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "completed"))
+
+    message = str(excinfo.value)
+    assert "opencode 3.1.0" in message
+    assert "1.x (>= 1.18.0)" in message and "2.x (>= 2.0.21)" in message
+    assert "docs/setup-guide.md (OpenCode section)" in message
+    assert not (rec / "pid").exists()  # nothing was spawned
+    assert adapter._sessions == {}
+
+
+def test_unparseable_version_is_refused(tmp_path, fake_opencode, monkeypatch):
+    """Output with no X.Y.Z is refused, quoting the first line it got."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "garbage build")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "completed"))
+
+    message = str(excinfo.value)
+    assert "could not read an OpenCode version" in message
+    assert "'garbage build'" in message
+    assert "docs/setup-guide.md (OpenCode section)" in message
+    assert not (rec / "pid").exists()
+
+
+def test_v2_detected_raises_not_yet_supported(tmp_path, fake_opencode, monkeypatch):
+    """2.x is a supported major by policy, but its server API is not driven yet:
+    refuse it by name instead of talking V1 routes at its web-UI shell."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "opencode v2.0.27")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "completed"))
+
+    message = str(excinfo.value)
+    assert "OpenCode 2.x detected (2.0.27)" in message
+    assert "V2 server API support is not implemented yet" in message
+    assert not (rec / "pid").exists()
+
+
+def test_html_health_reports_protocol_mismatch(tmp_path, fake_opencode):
+    """A server whose health route answers the web-UI HTML shell speaks another
+    API than `--version` said; the give-up error says that instead of #847's bare
+    "did not become healthy in time".
+
+    ABLATION: drop the `if html:` fault in `_await_healthy` and this reddens."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.health_timeout_s = 0.5
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "html-health"))
+
+    message = str(excinfo.value)
+    assert "answered HTML on the 1.x health endpoint" in message
+    assert "different OpenCode API than `--version` reported (1.18.2)" in message
+    assert "did not become healthy in time" not in message
+    assert_server_gone(rec)
 
 
 # ------------------------------------------------------------------- E2E tests

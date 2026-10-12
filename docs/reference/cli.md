@@ -596,6 +596,7 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `adapter.binary-unrunnable`            | warning                | a packaged profile's binary is on `PATH` but `--version` fails                                                                    |
 | `adapter.httpx`                        | ok / problem           | `httpx` is importable for an opencode-http profile                                                                                |
 | `adapter.launch-args-unservable`       | warning                | an opencode-http profile's `launch_args` cannot form a valid serve command                                                        |
+| `adapter.opencode-version`             | ok / warning           | the OpenCode server API an opencode-http binary's `--version` reports is supported                                                |
 | `adapter.hookless`                     | ok                     | the profile is hookless, so hook checks are skipped                                                                               |
 | `adapter.kind`                         | ok / problem           | the profile's `adapter` kind is registered                                                                                        |
 | `adapter.external`                     | warning                | a third-party adapter entry point failed to load                                                                                  |

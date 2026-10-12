@@ -67,6 +67,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "adapter.hookless",
         "adapter.httpx",
         "adapter.launch-args-unservable",
+        # opencode-http: the server API major `--version` reports (#847)
+        "adapter.opencode-version",
         "adapter.kind",
         "adapter.external",
         "adapter.external-profile",

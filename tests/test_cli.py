@@ -9703,6 +9703,59 @@ def test_validate_hookless_profile_flags_missing_httpx(project, capsys, monkeypa
     assert "bmad-loop[opencode]" in text
 
 
+def _opencode_version_findings(project, capsys, monkeypatch, version_line: str | None):
+    """`adapter.opencode-version` findings for an opencode project whose binary
+    resolves, runs, and prints ``version_line`` for `--version`. The rc is not
+    asserted: other gates (upstream skills, mux) legitimately vary by machine."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "opencode"\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    probed: list[str] = []
+
+    def fake_version_text(binary, *_a, **_kw):
+        probed.append(binary)
+        return version_line
+
+    monkeypatch.setattr(probe_mod, "binary_version_text", fake_version_text)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    captured = capsys.readouterr()
+    assert captured.out, captured.err
+    doc = json.loads(captured.out)
+    assert probed == ["/usr/bin/opencode"]
+    return [f for f in doc["findings"] if f["check"] == "adapter.opencode-version"]
+
+
+def test_validate_reports_opencode_version_ok(project, capsys, monkeypatch):
+    """#847: validate names the OpenCode server API the run would detect."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "1.19.0")
+    assert [f["severity"] for f in findings] == ["ok"]
+    assert "opencode 1.19.0 → v1 server api" in findings[0]["message"].lower()
+    assert findings[0]["detail"]["verdict"] == "ok"
+
+
+def test_validate_reports_opencode_version_warns_below_floor(project, capsys, monkeypatch):
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "1.17.0")
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["verdict"] == "below-floor"
+    assert "1.18.0" in findings[0]["message"]
+
+
+def test_validate_reports_opencode_version_warns_unsupported_major(project, capsys, monkeypatch):
+    """A major the adapter refuses is a warning, never a problem — validate's rc
+    is a compatibility contract; the run itself refuses with a clear error."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "opencode v3.1.0")
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["verdict"] == "unsupported-major"
+    assert "runs will refuse to start" in findings[0]["message"]
+
+
+def test_validate_opencode_version_skipped_when_version_fails(project, capsys, monkeypatch):
+    """A failing `--version` is `adapter.binary-unrunnable`'s finding; this check
+    adds nothing on top of it."""
+    assert _opencode_version_findings(project, capsys, monkeypatch, None) == []
+
+
 def test_validate_warns_when_no_desktop_notifier(project, monkeypatch, capsys):
     """#231: notify.desktop defaults on, but when this platform resolves no
     notifier the setting is silently inert — validate must surface it as a
