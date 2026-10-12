@@ -134,6 +134,11 @@ identical on every route below), zero tokens against a local mock provider
   /api/skill`` is NOT filtered by the rules** — it lists every discovered skill
   either way (it loads lazily per ``location``: the first call can be ``[]``),
   so hermeticity is checked on what the model is offered, never on that route.
+  An id allowed by name resolves to the PROJECT copy: the registry keeps one
+  skill per id, and the configured ``skills`` paths are applied after the
+  ``~/.claude`` / ``~/.agents`` / ``~/.config/opencode`` roots (each scanned
+  sequentially, sorted). A same-id personal copy in all three roots lost in
+  every start, with either side's scan slowed by 2000 extra skills.
 - A ``question`` deny removes the ``question`` tool from what the model is
   offered, so an unattended session cannot park on a form. Reads are not
   gated: under the allow-all config a ``read`` of a path outside the project
