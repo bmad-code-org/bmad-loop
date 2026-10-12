@@ -4266,6 +4266,28 @@ def test_opencode_classifies_provider_quota_as_env_fault(tmp_path, line):
     assert "AI_APICallError" in result.env_fault_evidence
 
 
+def test_opencode_env_fault_overruled_by_nonzero_usage(tmp_path):
+    """#764 on the HTTP transport: a provider refusal in the server log of a
+    session whose tracked usage is nonzero is overruled — the session did real
+    work, so it is charged and retried rather than paused."""
+    adapter = make_adapter(tmp_path)
+    adapter.read_usage = lambda r: TokenUsage(output_tokens=12)
+    _write_ef_log(adapter, _QUOTA_LINE + "\n")
+    result = _ef_classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+    assert result.env_fault_overruled is not None
+    assert "Usage limit reached" in result.env_fault_overruled
+    events = [
+        json.loads(line)
+        for line in (adapter.tasks_dir / _EF_TASK / "session-lifecycle.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [e["event"] for e in events] == ["env-fault-overruled"]
+    assert events[0]["tokens"] == 12
+
+
 def test_opencode_env_fault_writes_lifecycle_breadcrumb(tmp_path):
     adapter = make_adapter(tmp_path)
     _write_ef_log(adapter, _QUOTA_LINE + "\n")

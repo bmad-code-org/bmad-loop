@@ -4873,6 +4873,121 @@ def test_run_classifies_env_fault_after_reconcile(tmp_path):
     assert "ECONNREFUSED" in result.env_fault_evidence
 
 
+# A pattern match is overruled by a tracked nonzero usage read (#764): a late
+# transient provider 5xx in the tail of a session that billed tokens is a real
+# timeout, so it is charged and retried instead of pausing the run. Untracked,
+# zero, or a usage-read fault keeps the #194 verdict.
+
+_OVERLOADED = b"API Error: 529 Overloaded\n"
+
+
+def test_classify_env_fault_overruled_by_tracked_nonzero_usage(tmp_path):
+    """The #764 headline: the claude 529 line plus measured usage leaves env_fault
+    False, keeps the matched line on env_fault_overruled, and swaps the
+    classified breadcrumb for an `env-fault-overruled` one carrying the tokens.
+    ABLATION: drop the veto branch and env_fault comes back True."""
+    adapter = make_adapter(tmp_path)
+    adapter.read_usage = lambda r: TokenUsage(input_tokens=5)
+    _write_task_log(adapter, b"implementing...\n" + _OVERLOADED)
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+    assert result.env_fault_overruled == "API Error: 529 Overloaded"
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-overruled"]
+    assert events[0]["tokens"] == 5
+    assert events[0]["status"] == "timeout"
+    assert events[0]["evidence"] == "API Error: 529 Overloaded"
+
+
+def _assert_env_fault_kept(adapter, usage) -> None:
+    adapter.read_usage = lambda r: usage
+    _write_task_log(adapter, _OVERLOADED)
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.env_fault_evidence == "API Error: 529 Overloaded"
+    assert result.env_fault_overruled is None
+    assert [e["event"] for e in _lifecycle_lines(adapter, _ENV_FAULT_TASK)] == [
+        "env-fault-classified"
+    ]
+
+
+def test_classify_env_fault_kept_on_tracked_zero_usage(tmp_path):
+    """Tracked zero usage is no work measured: the #194 verdict stands, so a
+    persistent outage still pauses."""
+    _assert_env_fault_kept(make_adapter(tmp_path), TokenUsage())
+
+
+def test_classify_env_fault_kept_on_untracked_usage(tmp_path):
+    """Untracked usage (None) is no measurement at all: only a measurement
+    overrules, so the #194 verdict stands."""
+    _assert_env_fault_kept(make_adapter(tmp_path), None)
+
+
+@pytest.mark.parametrize(
+    "exc", [OSError("transcript gone"), ValueError("bad jsonl: SECRET-PROMPT-TEXT")]
+)
+def test_classify_env_fault_kept_when_usage_read_raises(tmp_path, exc):
+    """A usage-read fault never escapes and keeps the verdict, but it is not
+    silent: an `env-fault-usage-read-failed` crumb ahead of the classified one
+    tells the post-mortem the veto never measured (a transient fault the
+    engine's own read no longer sees would otherwise leave no trace). The crumb
+    names the exception class only — a parser's message can quote transcript
+    content, which must not reach the journal.
+    ABLATION: drop the crumb and the event list loses its first entry; journal
+    the message and the `error` equality fails."""
+    adapter = make_adapter(tmp_path)
+
+    def raising(_result):
+        raise exc
+
+    adapter.read_usage = raising
+    _write_task_log(adapter, _OVERLOADED)
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.env_fault_overruled is None
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == [
+        "env-fault-usage-read-failed",
+        "env-fault-classified",
+    ]
+    assert events[0]["error"] == type(exc).__name__
+
+
+def test_classify_env_fault_no_usage_read_without_pattern_hit(tmp_path):
+    """Usage is read only after a pattern hit: a healthy log costs no read, so
+    the no-overrule path stays byte-identical."""
+    adapter = make_adapter(tmp_path)
+    reads: list[SessionResult] = []
+    adapter.read_usage = lambda r: (reads.append(r), TokenUsage(input_tokens=5))[1]
+    _write_task_log(adapter, b"all tests pass\n")
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_overruled is None
+    assert reads == []
+    assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+def test_run_overruled_timeout_is_plain_timeout(tmp_path):
+    """Through run(): an overruled timeout stays a plain timeout, and the
+    zero-token classifier does not read usage a second time.
+    ABLATION: drop the veto branch and env_fault comes back True."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    _write_task_log(adapter, b"implementing...\n" + _OVERLOADED, task_id="3-1-dev-1")
+    reads: list[SessionResult] = []
+    adapter.read_usage = lambda r: (reads.append(r), TokenUsage(output_tokens=7))[1]
+    adapter.start_session = lambda spec: _dev_handle()
+    adapter.wait_for_completion = lambda handle, spec: _unvouched("timeout")
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: True  # alive → reconcile keeps the timeout
+    result = adapter.run(_dev_spec(tmp_path))
+    assert result.status == "timeout"
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+    assert result.env_fault_overruled == "API Error: 529 Overloaded"
+    assert len(reads) == 1  # the classifier's read only
+
+
 def _run_timeout_over_transcript(tmp_path, entries) -> SessionResult:
     """Drive the production dev adapter's run() to a non-rescued timeout whose
     transcript is a real claude-jsonl file holding `entries` (no task log, so

@@ -74,6 +74,19 @@ def test_pattern_matched_env_fault_wins_and_skips_usage_read(tmp_path):
     assert adapter.usage_reads == 0
 
 
+def test_overruled_timeout_skips_zero_token_read(tmp_path):
+    """#764: a pattern match the adapter already overruled on tracked nonzero
+    usage is not re-read here — the read happened and was nonzero, so even a
+    zero-reading second pass must not flip it back to an env fault.
+    ABLATION: drop the `env_fault_overruled` guard and env_fault reads True."""
+    scripted = SessionResult(status="timeout", env_fault_overruled="x")
+    adapter = _CountingAdapter([scripted], usage_per_session=TokenUsage())
+    result = adapter.run(_spec(tmp_path))
+    assert result.env_fault is False
+    assert result.env_fault_overruled == "x"
+    assert adapter.usage_reads == 0
+
+
 @pytest.mark.parametrize("status", ["stalled", "crashed", "over_budget"])
 def test_non_timeout_zero_spend_is_unchanged(tmp_path, status):
     scripted = SessionResult(status=status)
