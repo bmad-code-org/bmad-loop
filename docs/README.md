@@ -10,6 +10,10 @@ guides below go deeper, roughly in the order you'll need them.
 - **[Features & functionality](FEATURES.md)** — the full capability matrix and policy reference.
 - **[Terminal multiplexer backends](multiplexer-backends.md)** — which backend drives your agent sessions (tmux bundled; externals like the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr) install as packages), how selection works, and how external backends arrive.
 
+## Reference
+
+- **[Configuration](reference/configuration.md)** — `.bmad-loop/policy.toml` location and precedence, the `BMAD_LOOP_*` environment variables, and every policy setting with its type, default and allowed values (generated from the settings schema).
+
 ## Extending bmad-loop
 
 - **[Authoring CLI adapters & profiles](adapter-authoring-guide.md)** — using `bmad-loop probe-adapter` to collect + sanitize the hook payload shape, transcript location, and token schema a new CLI profile needs, plus the `CodingCLIAdapter` ABC and how an adapter class (and the profile selecting it) ships out-of-tree.
