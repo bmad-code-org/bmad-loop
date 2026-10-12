@@ -3155,11 +3155,14 @@ class Engine:
         unbound, so recovery can never restore bytes that belong to a stale path.
         Called once before DEV_RUNNING becomes durable. Later orchestrator and
         hook mutations refresh only this established path through
-        ``_refresh_dispatched_spec_snapshot``.
+        ``_refresh_dispatched_spec_snapshot``. A bind that finds no recorded spec
+        at all latches ``dispatched_spec_absent``; a degraded bind of a recorded
+        spec does not, so its repairs still fail closed.
         """
         task.dispatched_spec_snapshot = None
         task.dispatched_spec_file = self._dispatched_spec_for_attempt(task)
         self._refresh_dispatched_spec_snapshot(task)
+        task.dispatched_spec_absent = task.dispatched_spec_file is None and not task.spec_file
 
     @staticmethod
     def _prompt_names_recorded_spec(task: StoryTask, prompt: str) -> bool:
@@ -3186,9 +3189,15 @@ class Engine:
         return True
 
     def _preserves_dispatched_spec_snapshot_for_repair(self, task: StoryTask) -> bool:
-        """Whether this repair must retain (or fail closed on) chain authority."""
+        """Whether this repair must retain (or fail closed on) chain authority.
+
+        A resolved re-drive fails closed even when unbound: its operator-corrected
+        spec may have existed and failed to bind. A re-drive whose chain began
+        with no recorded spec (``dispatched_spec_absent``) has no operator bytes
+        to retain, so its repair binds the spec the chain created (#860).
+        """
         return self._retains_dispatched_spec_snapshot_on_repair() and (
-            task.resolved_redrive
+            (task.resolved_redrive and not task.dispatched_spec_absent)
             or task.dispatched_spec_file is not None
             or task.dispatched_spec_snapshot is not None
         )
@@ -4629,6 +4638,7 @@ class Engine:
             task.reverify_replayed = ""
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
+            task.dispatched_spec_absent = False
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
@@ -5440,6 +5450,7 @@ class Engine:
         if (task.dispatched_spec_file is None) != (task.dispatched_spec_snapshot is None):
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
+            task.dispatched_spec_absent = False
         # The attempt is accepted; no later path may restore the pre-harvest
         # ledger snapshot. Attempt-owned spec authority intentionally survives
         # through review repair/rollback and is retired only after commit.

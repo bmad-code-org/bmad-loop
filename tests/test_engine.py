@@ -11570,6 +11570,155 @@ def test_resolved_redrive_fixable_retry_never_rebinds_missing_chain_snapshot(pro
     assert task.dispatched_spec_snapshot is None
 
 
+def test_resolved_redrive_without_spec_fixable_repair_binds_created_spec(project):
+    """A re-drive that began with no spec has no operator bytes to retain (#860).
+
+    Child A creates the spec and fails verify fixably. The repair binds the spec
+    A created, as a plain chain does, instead of failing closed on a snapshot
+    that never existed. Ablation: drop ``not task.dispatched_spec_absent`` from
+    `_preserves_dispatched_spec_snapshot_for_repair` and the repair raises
+    "pre-launch snapshot" before child B launches.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(project, "1-1-a")
+    marker = project.project / "verify-fixed.marker"
+    successful_effect = dev_effect(project, "1-1-a", followup_review=False)
+    absent_at_first: list[bool] = []
+    repair_bindings: list[tuple[str | None, bytes | None]] = []
+
+    def child_a(session):
+        absent_at_first.append(load_state(engine.run_dir).tasks["1-1-a"].dispatched_spec_absent)
+        return successful_effect(session)
+
+    def child_b(session):
+        persisted = load_state(engine.run_dir).tasks["1-1-a"]
+        repair_bindings.append((persisted.dispatched_spec_file, persisted.dispatched_spec_snapshot))
+        marker.write_text("fixed\n")
+        return successful_effect(session)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-fixed.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(project, [child_a, child_b], policy=policy)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=None, resolved_redrive=True)
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert len(adapter.sessions) == 2
+    assert absent_at_first == [True]
+    [(bound_file, bound_snapshot)] = repair_bindings
+    assert bound_file == str(sp.resolve())
+    assert bound_snapshot is not None
+    assert task.dispatched_spec_absent is False
+
+
+def test_resolved_redrive_without_spec_review_fix_binds_created_spec(project):
+    """The review-fix entry point binds a spec-less re-drive's own spec (#860).
+
+    A clean review leaves verify failing fixably, so `_fix_phase` repairs. The
+    chain began with no recorded spec, so the repair binds the spec the re-drive
+    created through `_run_session`'s hook-route arm. Ablation: drop
+    ``not task.dispatched_spec_absent`` from
+    `_preserves_dispatched_spec_snapshot_for_repair` and the repair raises
+    "before repair prompt construction".
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(project, "1-1-a")
+    marker = project.project / "verify-fixed.marker"
+    absent_at_review: list[bool] = []
+    repair_bindings: list[tuple[str | None, bytes | None]] = []
+    clean_review = review_effect(project, "1-1-a", clean=True)
+
+    def child_a(session):
+        marker.write_text("fixed\n")
+        return dev_effect(project, "1-1-a")(session)
+
+    def review_breaks_verify(session):
+        absent_at_review.append(load_state(engine.run_dir).tasks["1-1-a"].dispatched_spec_absent)
+        marker.unlink()
+        return clean_review(session)
+
+    def repair(session):
+        persisted = load_state(engine.run_dir).tasks["1-1-a"]
+        repair_bindings.append((persisted.dispatched_spec_file, persisted.dispatched_spec_snapshot))
+        marker.write_text("fixed\n")
+        return dev_effect(project, "1-1-a", followup_review=False)(session)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-fixed.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_engine(
+        project, [child_a, review_breaks_verify, repair, clean_review], policy=policy
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=None, resolved_redrive=True)
+    engine.state.tasks[task.story_key] = task
+
+    engine._drive_story(task)
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+    assert absent_at_review == [True]
+    [(bound_file, bound_snapshot)] = repair_bindings
+    assert bound_file == str(sp.resolve())
+    assert bound_snapshot is not None
+    assert task.phase == Phase.DONE
+    assert "fix-decision" in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_resolved_redrive_degraded_bind_still_fails_closed_on_repair(project, monkeypatch):
+    """A recorded spec that failed to bind is not a spec-less chain (#860).
+
+    The operator-corrected spec exists, but attempt 1's bind degraded, so the
+    absence marker stays False and the fixable repair still fails closed before
+    its prompt can reopen the spec. Ablation: latch ``dispatched_spec_absent``
+    True in `_bind_dispatched_spec_for_attempt` and the repair prompt rewrites
+    the child's spec before the later prompt-route guard raises.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(project.project))
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("never-created.marker"),)),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    successful_effect = dev_effect(project, "1-1-a", followup_review=False)
+    child_bytes: list[bytes] = []
+
+    def child_a(session):
+        result = successful_effect(session)
+        child_bytes.append(sp.read_bytes())
+        return result
+
+    engine, adapter = make_engine(project, [child_a, successful_effect], policy=policy)
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", lambda _task: None)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp), resolved_redrive=True)
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert len(adapter.sessions) == 1
+    # Failed before the repair prompt could reopen the child's spec.
+    assert child_bytes == [sp.read_bytes()]
+    assert task.dispatched_spec_absent is False
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="file symlink creation may need elevation")
 def test_dev_repair_validates_retained_binding_before_prompt_mutation(project, monkeypatch):
     """A child-retargeted spec cannot be rewritten while building a repair prompt."""
