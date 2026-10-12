@@ -1,487 +1,351 @@
 # Porting bmad-loop to a new OS
 
-bmad-loop runs on Linux and macOS today, and on Windows **via WSL** (which _is_
-Linux — every fast path works unchanged). A **native** Windows host, or any other
-OS, is not yet shipped. This guide is the map for adding one.
+bmad-loop runs on Linux, macOS, WSL (which _is_ Linux), and native Windows through the
+bundled, experimental psmux backend. This guide maps the seams a new OS or transport plugs
+into. Operators choosing or running a backend read
+[Terminal multiplexer backends](multiplexer-backends.md); the orthogonal **CLI axis**
+(teaching bmad-loop a new coding CLI) is in the
+[adapter authoring guide](adapter-authoring-guide.md).
 
-## The promise
+## The seams
 
-The OS-specific work is quarantined behind four seams. Porting to a new OS is
-**new files plus one registration line per seam** — no edits to the bodies of the
-core `.py` modules or their call sites. Each seam selects its implementation by
-platform from a registry, with an env-var override for tests.
+The OS-specific work sits behind four seams. Each selects its implementation by platform
+from a registry, with an env-var override for tests.
 
-| #   | Seam                 | Contract / registry                                            | Override env var                                        |
-| --- | -------------------- | -------------------------------------------------------------- | ------------------------------------------------------- |
-| 1   | Terminal multiplexer | `TerminalMultiplexer` / `register_multiplexer`                 | `BMAD_LOOP_MUX_BACKEND` (or `bmad-loop mux set <name>`) |
-| 2   | Process lifecycle    | `ProcessHost` / `register_process_host`                        | `BMAD_LOOP_PROCESS_HOST`                                |
-| 3   | Hook interpreter     | `ProcessHost.hook_interpreter()`                               | (rides on seam 2)                                       |
-| 4   | Validate preflight   | `_platform_preflight(project)` (no new code — reads seams 1–2) | —                                                       |
+| #   | Seam                 | Contract / registry                                      | Override env var                                        |
+| --- | -------------------- | -------------------------------------------------------- | ------------------------------------------------------- |
+| 1   | Terminal multiplexer | `TerminalMultiplexer` / `register_multiplexer`           | `BMAD_LOOP_MUX_BACKEND` (or `bmad-loop mux set <name>`) |
+| 2   | Process lifecycle    | `ProcessHost` / `register_process_host`                  | `BMAD_LOOP_PROCESS_HOST`                                |
+| 3   | Hook interpreter     | `ProcessHost.hook_interpreter()`                         | (rides on seam 2)                                       |
+| 4   | Validate preflight   | `runsetup.platform_preflight(project)` (reads seams 1–2) | —                                                       |
 
-The **one** bundled caveat: a backend you ship _in this repo_ needs its import
-added to the relevant `_load_builtin_*` loader so it self-registers (one line). An
-out-of-tree backend skips even that — it registers at its own import time.
-
-This guide covers porting **the OS axis** (transport + process lifecycle). The
-orthogonal **CLI axis** — teaching bmad-loop a new coding CLI — lives in the
-[adapter authoring guide](adapter-authoring-guide.md). The deep transport contract
-(every method a multiplexer must implement) also lives there; this guide links to
-it rather than duplicating it.
+A new backend or host is new files plus a registration. A bundled one adds its import and
+its `register_*` call to the matching `_load_builtin_*` loader; an out-of-tree one calls
+`register_*` at import time. Transport features beyond the seam contract, such as a
+[registry namespace](#registry-namespaces-only-if-your-transport-has-one), also need core
+support in `runs` and `cli`.
 
 ---
 
 ## Seam 1 — terminal multiplexer (transport)
 
-**Contract:** `TerminalMultiplexer` (`src/bmad_loop/adapters/multiplexer.py`) — how
-sessions, windows, and panes are created, observed, and torn down. Everything that
-touches a session goes through `get_multiplexer()`; nothing else shells out to a
-multiplexer directly.
+**Contract:** `TerminalMultiplexer` (`src/bmad_loop/adapters/multiplexer.py`) creates,
+observes and tears down sessions, windows and panes. Everything that touches a session goes
+through `get_multiplexer()`. The per-method obligations are in
+[the transport contract](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
 
-**Register** at import time:
+**Register:**
 
 ```python
 from bmad_loop.adapters.multiplexer import register_multiplexer
 
-register_multiplexer("psmux", lambda platform: platform == "win32", PsmuxMultiplexer)
+register_multiplexer("mymux", lambda platform: platform == "win32", MyMultiplexer)
 ```
 
 `register_multiplexer(name, matches, factory)`:
 
-- `name` — the key the `BMAD_LOOP_MUX_BACKEND` override selects by.
-- `matches(sys.platform) -> bool` — decides automatic selection.
-- `factory() -> TerminalMultiplexer` — builds the backend.
+- `name`: the key `BMAD_LOOP_MUX_BACKEND` and `[mux] backend` select by. The first
+  registration under a name wins, and the builtins register first.
+- `matches(sys.platform) -> bool`: decides automatic selection.
+- `factory() -> TerminalMultiplexer`: builds the backend. Keep it a plain constructor;
+  `bmad-loop mux` instantiates every registered backend to list it.
 
-`get_multiplexer()` resolves by precedence:
-
-1. `BMAD_LOOP_MUX_BACKEND` — forces a backend by name (per-invocation).
-2. `[mux] backend` in `.bmad-loop/policy.toml` — the persisted, machine-scoped
-   choice (`bmad-loop init` gitignores policy.toml, so it never reaches
-   teammates). Set it with `bmad-loop mux set <name>`.
-3. The **platform default** — win32: `psmux`, everywhere else: `tmux` — when
-   that backend is registered _and_ `available()`.
-4. The first registered backend whose `matches(sys.platform)` is true _and_
-   whose `available()` reports usable (registration order breaks ties).
-5. The historical fallback: first platform match regardless of availability,
-   bottoming out at tmux — so a POSIX host without tmux still selects
-   `TmuxMultiplexer` and `validate` reports it unavailable.
-
-A forced name (1–2) bypasses both the platform predicate and `available()` — an
-explicit choice is trusted — and fails loudly when it matches no registered
-backend. Launch preflights and TUI observers share one forced-aware gate
-(`mux_usable()`), which warns once on stderr when a forced backend probes
-unavailable instead of silently proceeding or refusing. `bmad-loop mux` lists every registered backend with its availability,
-version, and the current selection. (The result is cached — see
-[Testing a port](#testing-a-port).)
+Selection precedence is in
+[Which backend is running](multiplexer-backends.md#which-backend-is-running-and-how-to-switch).
+A forced name bypasses both `matches` and `available()`, and fails loudly when it matches
+no registered backend. Launch preflights and TUI observers share one forced-aware gate,
+`mux_usable()`, which warns once on stderr when a forced backend probes unavailable.
 
 ### Shipping out-of-tree: the `bmad_loop.mux_backends` entry point
 
-How does the registration snippet above ever _run_ when the backend lives in its
-own package? Advertise the module in the package's `pyproject.toml`:
+Advertise the module that calls `register_multiplexer(...)` in the package's
+`pyproject.toml`:
 
 ```toml
 [project.entry-points."bmad_loop.mux_backends"]
-psmux = "my_package.backend"
+mymux = "my_package.backend"
 ```
 
-Before every selection, core scans that entry-point group and imports each
-advertised module (builtins first, so tmux keeps first registration and the
-precedence above is unchanged); the module's top-level `register_multiplexer(...)`
-call does the rest. Installing the package into bmad-loop's environment — e.g.
-`uv tool install bmad-loop --with <your-adapter>` — is the entire setup; no core
-edit, no config step. The entry-point _value_ is a bare module path (core only
-imports it; the name is just a diagnostic label).
-
-A package that fails to import can never break selection: the failure is
-recorded and reported by `bmad-loop mux` (a `warning:` line under the table) and
-the `validate` preflight, and selection proceeds without it. The reference
-out-of-tree adapter is
+On first selection or detection, core imports each advertised module once per process,
+after the builtins. Installing the package into bmad-loop's environment (for example
+`uv tool install bmad-loop --with <your-adapter>`) is the whole setup. The entry-point
+value is a bare module path; the name is a diagnostic label. A package that fails to import
+never breaks selection: the failure is recorded and
+[reported](multiplexer-backends.md#external-backends). The reference out-of-tree backend is
 [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr).
 
 ### Two build paths
 
-- **Extend `BaseTmuxBackend`** (`adapters/tmux_base.py`) for a **tmux-family**
-  backend. `BaseTmuxBackend` holds every argv construction and routes every spawn
-  through one primitive, `_run(argv, *, check=..., env=...)`. A native-Windows
-  "psmux" that speaks a tmux-like CLI sets the `_BINARY` class attribute to the
-  binary it drives (every spawn, PATH probe, and in-source client verb follows
-  it) and the `_ENCODING` class attribute for output decoding (e.g. `"utf-8"`),
-  and passes a per-call `env=` where needed — overriding `_run()` itself only
-  to tweak the timeout — plus the
-  shell-dialect hooks that `new_window` / `new_parked_window` compose from
-  (`_shell_wrap`, `_join_argv`, `_parked_trailer`, `_source_prefix`,
-  `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK` fragments) —
-  **without editing** `tmux_base.py` or its POSIX leaf `tmux_backend.py`
-  (`TmuxMultiplexer`). The one method-body override left is `pipe_pane`, whose
-  POSIX `cat >>` redirection is not behind a hook. The base `_window_launch` is
-  dialect-neutral (`-e` flags plus the raw command); the POSIX `TmuxMultiplexer`
-  leaf adds a literal `/bin/sh -c` prelude that records the launched pid for the
-  relays' hook lineage (DW-507) and then execs `$SHELL -c <command>`. A leaf on
-  the base that does not record `BMAD_LOOP_LAUNCH_PID` gets `unknown` lineage,
-  which attribution ignores (psmux; with no `/proc` there, its lineage reads
-  `unknown` anyway).
-- **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI
-  at all (e.g. a ConPTY-based window manager). You implement the full contract
-  directly; `tmux_backend.py` is the reference for what each method must produce.
-  The reference worked example is the external **herdr adapter**
+- **Extend `BaseTmuxBackend`** (`adapters/tmux_base.py`) for a **tmux-family** backend.
+  The base holds every argv construction and routes every spawn through `_run(argv, *,
+check=..., env=...)`. A leaf sets class attributes rather than overriding methods:
+  `_BINARY` (the binary every spawn, `PATH` probe and client verb uses), `_CLIENT_FLAGS`,
+  `_ENCODING`, `_ERRORS`, and the session/window-gone stderr markers. It overrides `_run`
+  only to wrap the spawn (psmux binds its registry root there). A non-POSIX leaf also
+  overrides the shell-dialect hooks that `new_window` and `new_parked_window` compose from
+  (`_shell_wrap`, `_join_argv`, `_parked_trailer`, `_source_prefix`, `_window_launch`, and
+  the `_EXIT_CAPTURE` / `_ECHO` / `_PARK` fragments), plus `pipe_pane`, whose POSIX
+  `cat >>` sink has no hook. Never edit `tmux_base.py` or its POSIX leaf `tmux_backend.py`
+  for a new leaf.
+
+  The base `_window_launch` is dialect-neutral (`-e` flags plus the raw command). The POSIX
+  `TmuxMultiplexer` leaf adds a `/bin/sh -c` prelude that exports its pid as
+  `BMAD_LOOP_LAUNCH_PID` for the relays' hook lineage, then execs `$SHELL -c <command>`. A
+  leaf that does not set `BMAD_LOOP_LAUNCH_PID` (psmux does not) gets `unknown` lineage,
+  which attribution ignores.
+
+- **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI. You
+  implement the full contract; `tmux_base.py` shows what each method must produce. The
+  worked example is the herdr adapter
   ([pbean/bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr),
-  `src/bmad_loop_adapter_herdr/backend.py`) — a cross-platform, agent-aware
-  workspace manager whose object model (workspace/tab/pane) and CLI are a
-  different binary family entirely, so it subclasses nothing and maps the whole
-  contract onto herdr verbs: a bmad-loop session is a herdr **workspace** (label
-  == session name), a window is a **tab** (its `root_pane.pane_id` is the native
-  window id), and the launched command runs via a typed `exec <argv>` so
-  process-exit stays tmux-identical window death. Where herdr has no analogue
-  for a contract method — options, `pipe_pane`, the parked-window return hop,
-  detach — it emulates or degrades honestly (a JSON sidecar for options, a
-  polling tee for `pipe_pane`, a per-window return file for the parked trailer,
-  a no-op detach); that **degradation ledger** is the module docstring, and it
-  is the template for what "implement fresh" costs in practice. (The
-  operator-facing view of those degradations — what a herdr _user_ notices and
-  does — is
-  [the adapter's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).)
+  `src/bmad_loop_adapter_herdr/backend.py`): a bmad-loop session is a herdr **workspace**,
+  a window is a **tab** (its root pane id is the native window id), and the command runs via
+  `exec <argv>` so process exit closes the tab. Where herdr has no analogue (options,
+  `pipe_pane`, the parked-window return hop, detach) it emulates or degrades, and its
+  module docstring lists each case.
 
-`available()` gates whether the backend is usable on the current host (e.g. its
-binary is on PATH); the optional `version()` feeds `bmad-loop mux`, the diagnostic
-dump, and the validate preflight (seam 4).
+`available()` gates whether the backend is usable on this host; `version()` feeds
+`bmad-loop mux`, the diagnostic dump and the validate preflight.
 
-**`version()` returns one bounded line.** Every one of those consumers renders it
-inline — a table row whose width sets every other row's, a finding message, a
-scalar `--json` field — so a binary whose `--version` prints several lines (psmux
-prints a `tmux X.Y.Z` compatibility line plus its own) folds them in the backend,
-and a very long single line breaks the same surfaces a newline does. Use
-`fold_version()` from `adapters/multiplexer.py`: it joins the non-blank lines with
-`"; "` **in order**, caps the result at `VERSION_MAX_CHARS`, and returns `None` —
-the "no version" sentinel, never `""` — for an all-blank probe. Order is
-load-bearing wherever something parses the string: psmux's version gate anchors at
-the first segment, and the cap only ever cuts the tail. Core applies the same fold
-defensively at each consumer, so breaking the promise cannot split a `mux` row —
-but fold at the source, since only the backend knows which line identifies it.
+**`version()` returns one bounded line.** Each consumer renders it inline (a table row, a
+finding message, a scalar `--json` field). Fold multi-line output with `fold_version()` from
+`adapters/multiplexer.py`: it joins non-blank lines with `"; "` in order, caps the result at
+`VERSION_MAX_CHARS`, and returns `None` (never `""`) for a blank probe. Put the identifying
+version in the first segment; a version gate parses from the front, and the cap cuts the
+tail.
 
 ### Availability discriminators (same-platform backends)
 
-Selection consults `available()`, so it must be a **cheap, side-effect-free
-probe** — PATH lookups, plus at most one bounded version query when usability
-genuinely depends on the installed version — and `factory()` must be a plain
-constructor: `detect_multiplexers()` instantiates every registered backend just
-to list it. When two backends claim the same platform, their `available()`
-probes should be **pairwise discriminating** — otherwise both report usable and
-only the platform default / registration order separates them in listings and
-selection. The bundled psmux backend discriminates by construction: it drives
-psmux's distinctly-named binary (`_BINARY = "psmux"`), so it never claims some
-other tmux-family install that owns the `tmux` name. Its probe also
-version-gates — psmux 3.3.8 or newer is required
-([why](multiplexer-backends.md#psmux-native-windows-experimental)), so an old or unidentifiable
-version reads as unavailable (`psmux -V` keeps the `tmux X.Y.Z` output format
-deliberately):
+Selection calls `available()`, so it must be a **cheap, side-effect-free probe**: `PATH`
+lookups plus at most one bounded version query when usability depends on the installed
+version. psmux is the example: it requires `psmux` and `pwsh` on `PATH` and a minimum psmux
+version ([requirements](multiplexer-backends.md#psmux-native-windows-experimental)), and
+caches the verdict per instance.
+
+When two backends claim the same platform, their `available()` probes should be **pairwise
+discriminating**; otherwise both report usable and only the platform default or
+registration order separates them. psmux discriminates by construction: it drives its own
+`psmux` binary, so it never claims another install that owns the `tmux` name. A
+hypothetical sibling that owns `tmux` on Windows would discriminate explicitly:
 
 ```python
-class PsmuxMultiplexer(BaseTmuxBackend):
-    _BINARY = "psmux"
-
-    def available(self) -> bool:
-        if not all(shutil.which(exe) for exe in ("psmux", "pwsh")):
-            return False
-        reported = re.match(r"tmux (\d+)\.(\d+)(?:\.(\d+))?", self.version() or "")
-        return bool(reported) and tuple(int(part or 0) for part in reported.groups()) > (3, 3, 7)
-
-# a sibling that owns the `tmux` name (e.g. a tmux-windows port) discriminates
-# against psmux explicitly:
 class WindowsTmuxMultiplexer(BaseTmuxBackend):
     def available(self) -> bool:
         return shutil.which("tmux") is not None and shutil.which("psmux") is None
 ```
 
-Do **not** inherit `BaseTmuxBackend.available()` (a bare `which` on `_BINARY`)
-for a same-platform sibling that shares a binary name: selection would still
-break the tie via the platform default, but `bmad-loop mux` and the validate
-preflight would list both as available when only one actually drives the
-installed binary. A host with an ambiguous install resolves it explicitly:
+Do not inherit `BaseTmuxBackend.available()` (a bare `which` on `_BINARY`) for a
+same-platform sibling that shares a binary name: `bmad-loop mux` and the preflight would
+list both as available. An operator with an ambiguous install resolves it with
 `bmad-loop mux set <name>`.
 
-A backend from a **different binary family** sidesteps this problem entirely.
-The external herdr adapter probes `shutil.which("herdr")` — a distinct binary
-that no tmux-family backend claims — so it is **pairwise-discriminating by
-construction**: it can never report available on a host where only tmux is
-installed, and vice versa, without any explicit tie-break. That `available()`
-must stay a pure PATH lookup (it is called by `detect_multiplexers()` on every
-listing) — the herdr adapter in particular **never** probes or starts its
-background server from `available()`, `version()`, or the constructor; server
-autostart is lazy, confined to the mutating operations that actually need it.
+A backend from a different binary family, such as herdr, discriminates by construction. Its
+`available()` must stay a pure `PATH` lookup; never start a server from `available()`,
+`version()` or the constructor.
 
 ### Registry namespaces (only if your transport has one)
 
-Some multiplexers address sessions through a **registry**: a directory of
-per-session addressing files that every verb resolves a target through. psmux is
-one — `PSMUX_DATA_DIR`, a `.port`/`.key` set per session. tmux is not: a server
-is a socket, and there is no root a caller could be pointed at.
+Some multiplexers address sessions through a **registry**: a directory of per-session
+addressing files every verb resolves a target through. psmux is one (`PSMUX_DATA_DIR`, one
+`.port`/`.key`/`.sid`/`.pid` set per session). tmux is not: a server is a socket.
 
-The distinction matters because a registry is a **namespace, not a filter**. A
-session in registry A is not merely hidden from a verb aimed at registry B; it is
-unaddressable from it, and the transport usually reports that as an ordinary "no
-such session" rather than an error. Two processes that disagree about the root
-therefore disagree about which sessions exist — and the verbs that carry that
-disagreement (`has_session`, `list_window_ids`) are exactly the ones whose seam
-contract says to degrade quietly.
+A registry is a **namespace, not a filter**. A session in registry A is unaddressable from
+registry B, and the transport usually reports that as an ordinary "no such session". Two
+processes that disagree about the root disagree about which sessions exist. If your
+transport namespaces, four rules:
 
-If your transport namespaces, four rules:
+- **Derive the root from the project**, never from the run, the launching shell, or anything
+  a driven session can write (`policy.toml` and the project tree are both session-writable).
+  bmad-loop's derivation is `runs.mux_registry_root`, keyed on `runs.project_tag`; it belongs
+  in `runs`, beside the state root, not in the backend.
+- **Bind it once, ahead of every spawn.** `cli._configure_mux` exports it before dispatch.
+  Derive by default and override an ambient value, reporting that you did; honouring an
+  ambient value is an explicit operator opt-in
+  ([`honor_ambient_psmux_data_dir`](multiplexer-backends.md#using-your-own-psmux_data_dir)).
+- **Carry `new_window`'s env inside the command you launch**, not in the environment the
+  pane inherits. A multiplexer may clear a pane's inherited environment (psmux's
+  `PSMUX_BARE_ENV`). `_window_launch` is the dialect hook that owns this.
+- **Answer `has_registry_namespace()`, `registry_root()` and `legacy_registries()`.** The
+  first tells cleanup the transport namespaces at all, so a registry with no root in force
+  reads as the shared default rather than as proof of ownership. The second lets
+  `bmad-loop mux` disclose the root. The third hands cleanup instances bound to older roots;
+  each must be an independent instance, never a global environment swap, because the sweep
+  runs on a TUI worker thread beside other verbs.
 
-- **Derive the root from the project**, never from the run, never from the
-  launching shell, and never from anything a driven session can write
-  (`policy.toml` and the project tree are both session-writable). bmad-loop's is
-  `runs.mux_registry_root` — `<state root>/<project key>/_mux`, reusing
-  `runs.project_tag` so two spellings of one project cannot key two registries.
-  The derivation belongs in `runs`, beside the state root, not in the backend.
-- **Bind it once, ahead of every spawn.** `cli._configure_mux` exports it before
-  dispatch — the last point that still knows the project and the first that
-  precedes every verb. A create-call-only injection is worse than doing nothing.
-  An ambient value needs a real question answered, not a flag. A multiplexer
-  hands every pane child the server's environment, so an ambient value there was
-  inherited rather than typed — and a process cannot tell an inherited one from a
-  typed one, nor a value typed in one shell from one a profile exports into every
-  shell. Those want opposite answers, so do not try to decide between them: derive
-  unconditionally, override what you find, and report that you did. A derived root
-  is a pure function of (project, state root), so every process agrees without
-  anything having to travel between them, which is the property worth protecting.
-- **Carry `new_window`'s env inside the command you launch**, not in the
-  environment you hope the pane inherits. A multiplexer is free not to hand a
-  pane child the server's environment (psmux's `PSMUX_BARE_ENV=1` mode clears
-  it to a 14-name allowlist — a mode bmad-loop declares unsupported and warns
-  about, precisely because the _other_ windows ride inheritance); an env dict a
-  caller passed explicitly must survive regardless, and an in-command transport
-  is the one that does. `_window_launch` is the dialect hook that owns each
-  family dialect's answer; the base one passes bare `-e` flags, and a leaf
-  whose shell wraps the command (psmux) overrides it alongside `_shell_wrap`.
-- **Answer `has_registry_namespace()`, `registry_root()` and
-  `legacy_registries()`.** The first tells cleanup your transport namespaces
-  sessions at all, so a registry with no root in force reads as the shared
-  default it is rather than as proof of ownership. The second lets
-  `bmad-loop mux` disclose the root, so an operator's own client is not silently
-  looking at an empty registry. The third hands cleanup instances bound to roots
-  your sessions may predate; each must be an independent instance, never a global
-  environment swap, because the sweep runs on a TUI worker thread beside other
-  threads issuing ordinary verbs.
-
-All three default to "no namespace" on `TerminalMultiplexer`, so a transport
-without one inherits the right answers and writes no code.
-
-**Deep contract →** [adapter authoring guide: the transport contract for a backend
-author](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
+All three default to "no namespace", so a transport without one writes no code.
 
 ---
 
 ## Seam 2 — process lifecycle (`ProcessHost`)
 
-**Contract:** `ProcessHost` (`src/bmad_loop/process_host.py`) — the four pid
-operations the orchestrator needs (`runs.stop_run`, the TUI liveness column), plus
-the hook interpreter (seam 3). On POSIX these are `os.kill` calls; on Windows
-`taskkill` / psutil. `WindowsProcessHost` already ships (unexercised until a
-Windows backend lands).
+**Contract:** `ProcessHost` (`src/bmad_loop/process_host.py`): the pid operations behind
+`runs.stop_run` and the TUI liveness column, plus the hook interpreter (seam 3).
+`PosixProcessHost` uses `os.kill`; `WindowsProcessHost` uses `taskkill` and psutil. Both are
+registered in `_load_builtin_hosts`.
 
 **Register** like the multiplexer:
 
 ```python
 from bmad_loop.process_host import register_process_host
 
-register_process_host("windows", lambda platform: platform == "win32", WindowsProcessHost)
+register_process_host("myhost", lambda platform: platform == "myos", MyProcessHost)
 ```
 
-`get_process_host()` selects by the same rule as `get_multiplexer()`;
-`BMAD_LOOP_PROCESS_HOST` forces one by name; POSIX is the default fallback.
+`get_process_host()` picks the host named by `BMAD_LOOP_PROCESS_HOST`, otherwise the first
+registered host whose `matches(sys.platform)` is true, otherwise POSIX. A forced name that
+matches nothing raises.
 
 **Implement:**
 
-- `terminate(pid)` — politely stop it (POSIX `SIGTERM` / Windows `taskkill`). Raise
-  the `OSError` family (`ProcessLookupError` / `PermissionError`) so callers keep
-  their "already gone / not ours" handling. This is the polite fast path, not the
-  stop guarantee: `bmad-loop stop` also lodges a hard `stop-request.json` the engine
-  reads itself, so a port whose `terminate` cannot actually be delivered still stops
-  runs (#319).
-- `force_kill(pid)` — escalation when `terminate` is ignored (POSIX `SIGKILL` /
-  Windows `taskkill /F /T`). Only ever called once identity is confirmed.
-- `is_alive(pid)` — read-only liveness probe, no signal sent.
-- `identity(pid) -> float | None` — the **PID-reuse guard**: a value that stays
-  constant for the life of `pid` but changes if the pid is reused (Linux reads
-  `/proc/<pid>/stat` start-time; elsewhere psutil's `create_time()`). Return
-  `None` where the platform can't provide one — callers then **refuse to
-  force-kill** rather than risk an unrelated process that inherited the pid.
-- `hook_interpreter()` — seam 3, below.
-- `unsafe_shell_chars(path)` — the shell metacharacters `shell_quote()` leaves
-  exposed in `path`; `init` and `validate` warn on them (DW-346). The default
-  `()` suits hosts that always quote; override it alongside `shell_quote()`
-  when the host's quoting is conditional (Windows' list2cmdline quotes only on
-  whitespace).
+- `terminate(pid)`: polite stop (POSIX `SIGTERM`, Windows `taskkill`). The contract raises
+  the `OSError` family (`ProcessLookupError` / `PermissionError`) so callers keep their
+  "already gone / not ours" handling. `bmad-loop stop` also writes a `stop-request.json` the
+  engine reads, so an undeliverable `terminate` still stops runs.
+- `force_kill(pid)`: escalation when `terminate` is ignored (POSIX `SIGKILL`, Windows
+  `taskkill /F /T`). Called only once identity is confirmed.
+- `is_alive(pid)`: read-only liveness probe, no signal sent.
+- `identity(pid) -> float | None`: the **PID-reuse guard**, a value constant for the life of
+  `pid` that changes if the pid is reused (Linux reads `/proc/<pid>/stat` start time;
+  elsewhere psutil's `create_time()`). Return `None` where the platform cannot provide one;
+  callers then refuse to force-kill.
+- `hook_interpreter()`: seam 3, below.
+
+Defaults you may override: `descendants(pid)` (pid → identity snapshot of the process tree,
+never raises; psutil by default), `shell_quote(arg)` (default `shlex.quote`), and
+`unsafe_shell_chars(path)` (the shell metacharacters `shell_quote()` leaves exposed;
+`init` and `validate` warn on them). Override `unsafe_shell_chars` alongside `shell_quote`
+when quoting is conditional (Windows' `list2cmdline` quotes only on whitespace).
 
 ---
 
 ## Seam 3 — hook interpreter
 
-`ProcessHost.hook_interpreter()` supplies an absolute, host-quoted
-`sys.executable` path for temporary Python hook scripts, such as the live probe
-capture hook. Both POSIX and Windows use that interpreter directly. `init` and
-worktree provisioning register the installed `bmad-loop relay <Event>` console
-script by absolute path instead of invoking a Python script in the workspace.
-A new OS overrides the quoting behavior on its `ProcessHost` as needed.
+`ProcessHost.hook_interpreter()` supplies an absolute, host-quoted `sys.executable` path for
+temporary Python hook scripts, such as the live probe's capture hook. `init` and worktree
+provisioning register the installed `bmad-loop relay <Event>` console script by absolute
+path instead of invoking a Python script in the workspace. A new OS overrides the quoting
+on its `ProcessHost` as needed.
 
 ---
 
 ## Seam 4 — validate preflight
 
-`platform_preflight(project)` (`src/bmad_loop/runsetup.py`, imported into `cli.py` as
-`_platform_preflight` and called from `cmd_validate`)
-asks the selected multiplexer for its `available()` / `version()` and names the
-selected process host. A new OS therefore surfaces its readiness in `bmad-loop
-validate` **by registering** (seams 1–2) — not by adding a `win32` block to
-`validate`. The process host is named in the output so a misselection (e.g. the
-Windows host picked on Linux) is visible at a glance.
+`runsetup.platform_preflight(project)`, called from `cmd_validate`, asks the selected
+multiplexer for `available()` / `version()`, reports the selection reason and any external
+load or probe faults, and names the selected process host. A new OS surfaces its readiness
+in `bmad-loop validate` **by registering** (seams 1–2), not by adding a platform block to
+`validate`. There is no new code to write for this seam.
 
-There is no new code to write for this seam — it reads seams 1 and 2.
-
-The one `sys.platform` branch that does live here is not a port seam and is not a
-precedent for one: the `host.win32-on-wsl-path` check (#332) reports that the _interpreter
-itself_ is the wrong build for the shell that launched it — a native-Windows
-`bmad-loop` reached from a WSL prompt. No registration can express that, because
-every seam is correctly selected for the interpreter that is running; what is wrong
-is which interpreter the operator got. Readiness questions still register.
+The one `sys.platform` branch here, `host.win32-on-wsl-path`, is not a port seam: it warns
+when a native-Windows interpreter is working on a WSL distro path, which no registration
+can express.
 
 ---
 
 ## Helper scripts (plugins)
 
-Plugin **helper scripts** (e.g. the bundled Unity plugin's `unity_setup.py` /
-`unity_teardown.py`) are spawned under the orchestrator's own interpreter via
-`sys.executable`, **not** a PATH-resolved `python3`. The practical consequence: a
-bundled helper script may `import bmad_loop` — so for pid lifecycle it should
-**use the seam** rather than re-implement kill/liveness behind its own
-`sys.platform` guards:
+Plugin helper scripts (for example the bundled Unity plugin's `unity_setup.py` /
+`unity_teardown.py`) run under the orchestrator's own interpreter via `sys.executable`, not a
+`PATH`-resolved `python3`. A bundled helper may therefore `import bmad_loop`, and for pid
+lifecycle it should use the seam rather than its own `sys.platform` guards:
 
 ```python
 from bmad_loop.process_host import get_process_host
 
 host = get_process_host()
+ident = host.identity(pid)
 host.terminate(pid)
-if host.is_alive(pid):
+if host.is_alive(pid) and ident is not None and host.identity(pid) == ident:
     host.force_kill(pid)
 ```
 
-**Worked example:** `data/plugins/unity/unity_teardown.py` now _delegates_ its
-SIGTERM→SIGKILL sweep of leaked Editor / MCP-server processes to
-`get_process_host()` instead of calling `os.kill` / `signal.SIGKILL` itself — so it
-gains Windows behavior for free when a Windows host registers. (It still does its
-own worktree-bound process _discovery_ via `/proc` with a psutil fallback, because
-discovery has no seam — see the next section.)
+`data/plugins/unity/unity_teardown.py` routes its terminate/force-kill sweep through
+`get_process_host()`. Process discovery has no seam, so it scans `/proc` on Linux and falls
+back to psutil elsewhere.
 
-> Out-of-tree plugin scripts distributed outside this repo can't assume `bmad_loop`
-> is importable in every install; the import path is reliable for **bundled**
-> scripts spawned under `sys.executable`.
+> Out-of-tree plugin scripts can't assume `bmad_loop` is importable in every install; the
+> import is reliable only for bundled scripts spawned under `sys.executable`.
 
 ---
 
 ## The portability guard
 
-`tests/test_portability_guard.py` AST-scans `src/bmad_loop` and fails CI if a new
-hard POSIX dependency creeps in outside an allowlist — a `["tmux", …]` argv outside
-the tmux backend, a bare `os.kill(pid, 0)` outside the liveness helpers, an
-unguarded `signal.SIGKILL`, a hardcoded `/tmp` / `/proc` / `/dev/null`,
-`start_new_session=True`, or `shell=True`. When you add a seam, route the OS call
-**through** it rather than widening an allowlist; the few sanctioned exceptions
-(the quarantine files, the platform-guarded discovery helpers) carry a
-`# portability:` ack on the line.
+`tests/test_portability_guard.py` AST-scans `src/bmad_loop` and fails CI when a hard POSIX
+dependency appears outside an allowlist: a `["tmux", …]` argv outside the tmux backend, a
+bare `os.kill(pid, 0)` outside the liveness helpers, any `os.kill(` outside
+`process_host.py`, an unguarded `signal.SIGKILL`, a hardcoded `/tmp` / `/proc` /
+`/dev/null`, `start_new_session=True`, or `shell=True`. When you add a seam, route the OS
+call through it rather than widening an allowlist. Allowlisted lines carry a
+`# portability:` ack; the tmux quarantine files (`tmux_base.py`, `tmux_backend.py`) are
+exempt from the tmux-argv rule only; every other rule still applies to them.
 
-Things **without** a seam still need a hand-guarded fallback behind a
-`sys.platform` branch with that ack: `cp --reflink` / CoW copies, symlinks,
-`/proc` scanning, `/tmp`, and `start_new_session`. Keep the Linux fast path
-byte-identical; the new-OS branch can be best-effort until exercised.
-Hook-event lineage (DW-507) is one such `/proc` reader with no seam: both relays
-walk the parent chain through Linux `/proc` only, so on any other OS every event
-is tagged `unknown` and attribution keeps only the #767 rules.
+Things **without** a seam need a hand-guarded fallback behind a `sys.platform` branch with
+that ack: `cp --reflink` / CoW copies, symlinks, `/proc` scanning, `/tmp`, and
+`start_new_session`. Keep the Linux fast path byte-identical; the new-OS branch may be
+best-effort. Hook-event lineage is one such `/proc` reader: both relays (`events.py`,
+`data/bmad_loop_hook.py`) walk the parent chain through `/proc`, so on an OS without it
+every event is tagged `unknown` and attribution ignores lineage.
 
 ---
 
 ## Path predicates — the guard family a port must not relax
 
-`src/bmad_loop/platform_util.py` carries four predicates that every "this config
-value must be a path inside the project" guard is built from. They are
-**platform-independent by construction**: each answers the same way on every host,
-because a config file must not mean different things depending on where the run
+`src/bmad_loop/platform_util.py` carries four predicates that every "this config value must
+be a path inside the project" guard is built from. They are **platform-independent by
+construction**: a config file must not mean different things depending on where the run
 happens.
 
-- `is_absolute_path(value)` — rooted or drive-qualified in _either_ flavour:
-  `/etc/passwd`, `C:\x`, `\\server\share`, and the drive-_relative_ `C:foo`.
-- `has_parent_ref(value)` — a `..` segment in either flavour.
-- `names_tree_root(value)` — names the tree itself rather than anything inside it:
-  `""`, `"."`, and the all-periods-and-spaces spellings Win32 trims to nothing
-  (`". "`, `"..."`, `"   "`).
-- `names_win32_alias(value)` — the determinism member. The other three refuse a value
-  that _escapes_ the tree; this one refuses a value that stays inside it and still
-  names a **different** path on Windows: a reserved device basename (`NUL`,
-  `aux.json`, `CON .txt`), a component whose trailing periods and spaces Win32
-  strips (`.claude/skills.`), or a component of _nothing but_ periods and spaces
-  sitting beside a real one (`sub/...` — Win32 empties it and the value addresses
-  `sub`).
+- `is_absolute_path(value)`: rooted or drive-qualified in _either_ flavour: `/etc/passwd`,
+  `C:\x`, `\\server\share`, and the drive-relative `C:foo`.
+- `has_parent_ref(value)`: a `..` segment in either flavour.
+- `names_tree_root(value)`: names the tree itself: `""`, `"."`, and the
+  all-periods-and-spaces spellings Win32 trims to nothing (`". "`, `"..."`, `"   "`).
+- `names_win32_alias(value)`: a value that stays inside the tree but names a **different**
+  path on Windows: a reserved device basename (`NUL`, `aux.json`, `CON .txt`), a component
+  whose trailing periods and spaces Win32 strips (`.claude/skills.`), or a
+  periods-and-spaces component beside a real one (`sub/...`).
 
-What a porter needs to know:
+Rules for a porter:
 
 - **Do not make any of them consult `sys.platform`.** A value refused here is refused
-  everywhere, deliberately — `skill_tree = "NUL"` is rejected on Linux for the same
-  reason `C:\secrets` is. The alternative turns a `seed_files` entry into a
-  build-number question, since Windows 11 narrowed the device rule and Windows 10 did
-  not.
-- **They refuse disjoint spelling classes, and that is load-bearing.**
-  `names_tree_root` carves out `..` for `has_parent_ref`; `names_win32_alias` carves
-  out a _value_ made entirely of period/space components for `names_tree_root` (a
-  single such component beside a real one stays its own — it aliases its parent, not
-  the root) and the `.`/`..` components for their owners. Those carve-outs are what
-  let each predicate be ablated on its own — a "simplification" that merges them
-  costs the suite its ability to say which rule fired.
-- **`_is_reserved_basename` is a _segment_ predicate**, blind to `sub/NUL`: it splits
-  on the first dot of the whole string. Apply it per component, after splitting on
-  both separators, or it silently answers False.
-- **`safe_segment` is not one of them.** It maps `/` to `_`, so it sanitizes a single
-  name (a run id, a sweep bundle name) and must never be applied to a multi-segment
-  config path.
-- **Their Win32 half is cited, not measured** — CI's legs are Linux and nothing here
-  calls a Win32 API. A native-Windows port is the first chance to measure it; the
-  docstrings carry their sources (Microsoft, Wine's ntdll path conformance tests,
-  Project Zero) so a disagreement can be settled rather than argued.
-- `src/bmad_loop/data/plugins/unity/unity_seed_assets.py` re-implements all four by
-  hand: it is deployed into a consumer project, is stdlib-only, and is excluded from
-  pyright. Its only drift guard is the parity suite in
-  `tests/test_unity_scene_guard.py`. Mirror any change there too.
+  everywhere: `skill_tree = "NUL"` is rejected on Linux for the same reason `C:\secrets` is.
+- **They refuse disjoint spelling classes.** Each predicate carves out the others' cases, so
+  each can be ablated on its own. Do not merge them.
+- **`_is_reserved_basename` is a _segment_ predicate**, blind to `sub/NUL`. Apply it per
+  component, after splitting on both separators.
+- **`safe_segment` is not one of them.** It maps `/` to `_` to sanitize a single name (a run
+  id, a sweep bundle name); never apply it to a multi-segment config path.
+- **Their Win32 half is cited, not measured.** The docstrings carry their sources so a
+  disagreement measured on a real Windows host can be settled.
+- `src/bmad_loop/data/plugins/unity/unity_seed_assets.py` re-implements all four by hand
+  (it is deployed into a consumer project, stdlib-only, and excluded from pyright). Its only
+  drift guard is the parity suite in `tests/test_unity_scene_guard.py`; mirror any change
+  there.
 
 ---
 
 ## Testing a port
 
-Both `get_multiplexer()` and `get_process_host()` are `lru_cache`d, and selection
-keys off `sys.platform`. To exercise a not-yet-default backend on your dev box:
+`get_multiplexer()` and `get_process_host()` are `lru_cache`d, and selection keys off
+`sys.platform`. To force a registered backend or host on a dev box:
 
-| To force…      | Set                              | Then clear the cache             |
-| -------------- | -------------------------------- | -------------------------------- |
-| a multiplexer  | `BMAD_LOOP_MUX_BACKEND=psmux`    | `get_multiplexer.cache_clear()`  |
-| a process host | `BMAD_LOOP_PROCESS_HOST=windows` | `get_process_host.cache_clear()` |
+| To force…      | Set                             | Then clear the cache             |
+| -------------- | ------------------------------- | -------------------------------- |
+| a multiplexer  | `BMAD_LOOP_MUX_BACKEND=<name>`  | `get_multiplexer.cache_clear()`  |
+| a process host | `BMAD_LOOP_PROCESS_HOST=<name>` | `get_process_host.cache_clear()` |
 
-The env var picks the registered backend by `name`; `cache_clear()` is required
-because the first call memoizes the selection for the process. To make a
-multiplexer choice stick across invocations instead, persist it with
-`bmad-loop mux set <name>` (writes `[mux] backend` into the machine-local
-policy.toml; the env var still outranks it, and `configure_multiplexer` /
-`register_multiplexer` clear the cache themselves).
+`cache_clear()` is required because the first call memoizes the selection for the process.
+`register_multiplexer`, `register_process_host` and `configure_multiplexer` clear the cache
+themselves. To make a multiplexer choice persist, use
+[`bmad-loop mux set <name>`](multiplexer-backends.md#which-backend-is-running-and-how-to-switch).
 
 ---
 
-## What a native-Windows port costs, end to end
+## Reference port: native Windows
 
-Concretely, a native-Windows port is:
-
-1. `PsmuxMultiplexer(BaseTmuxBackend)` (or a fresh `TerminalMultiplexer`) +
-   its `register_multiplexer("psmux", …)`.
-2. `WindowsProcessHost` — **already shipped** — needs only its registration, which
-   is **already present** in `_load_builtin_hosts`. Its `hook_interpreter()`
-   (an absolute, host-quoted interpreter path) is in place too.
-3. A CI runner on Windows to exercise the above.
-
-No edits to the adapters, `runs.py`, `tui/launch.py`, `probe.py`, `tui/data.py`,
-`cli.py`'s `validate`, or the POSIX seam bodies. The remaining design questions
-(what hosts the windows, how attach/detach and the parked exit-status window map
-without a POSIX shell, the Windows-Unity cache-path follow-up) are tracked in
+The native-Windows port is `PsmuxMultiplexer` (`adapters/psmux_backend.py`) on
+`BaseTmuxBackend`, plus `WindowsProcessHost` (`process_host.py`), both registered in their
+`_load_builtin_*` loaders. Its registry namespace adds `runs`/`cli` support for the
+per-project registry root. The Windows CI legs and the psmux live gate
+(`tests/test_psmux_live.py`) exercise it. Remaining work is on
 [the roadmap](ROADMAP.md#native-windows-multiplexer-backend).

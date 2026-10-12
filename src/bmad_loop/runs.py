@@ -3140,11 +3140,12 @@ def live_session_may_be_ours(
     so it reads as untagged and the refusal stands — by then the listing has
     already established that a session is live.
 
-    Both reads are caught explicitly because the seam permits a raise: only
-    `pipe_pane` and `kill_session` are contractually best-effort, so an
-    out-of-tree backend raises :class:`MultiplexerError` here where the bundled
-    one returns empty (docs/adapter-authoring-guide.md). The listing is checked
-    first, so the tag query only runs on a name collision.
+    Both reads are caught explicitly because the seam permits a raise: neither
+    `list_sessions` nor `session_options` is contractually best-effort, so an
+    out-of-tree backend may raise :class:`MultiplexerError` here where the bundled
+    one returns empty (docs/adapter-authoring-guide.md, "The transport contract
+    for a backend author"). The listing is checked first, so the tag query only
+    runs on a name collision.
 
     A stronger shape was built and withdrawn: a proof discipline (block unless
     the transport *proves* the session absent) fell to four consecutive reviews,

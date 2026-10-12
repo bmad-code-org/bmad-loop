@@ -1,362 +1,242 @@
 # Terminal multiplexer backends
 
-The orchestrator drives every agent session — and the TUI's launch/attach keys — through
-a terminal multiplexer behind a pluggable seam (`TerminalMultiplexer`). Two backends ship
-in the box: **tmux** (the POSIX default) and the experimental **psmux** (the native-Windows
-default). Additional backends install as separate packages and register themselves
-automatically. This page is for operators: which backend is running, how to switch, and how
-external backends arrive.
-Contributors porting a new backend should start with
-[Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+The orchestrator drives every agent session, and the TUI's launch and attach keys, through
+a terminal multiplexer behind a pluggable seam (`TerminalMultiplexer`). Two backends ship:
+**tmux** (the POSIX default) and the experimental **psmux** (the native-Windows default).
+Other backends install as separate packages and register themselves. This page is for
+operators: which backend is running, how to switch, and what each one needs. Authors of a
+new backend start with [Porting bmad-loop to a new OS](porting-to-a-new-os.md) and
+[the transport contract](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
 
 ## Which backend is running, and how to switch
 
 `bmad-loop mux` lists the registered backends (platform · availability · version) and
 shows which one is selected and why. Selection precedence, highest first:
 
-1. `BMAD_LOOP_MUX_BACKEND=<name>` — forces a backend for one invocation.
-2. `bmad-loop mux set <name>` — persists the choice into the gitignored, machine-scoped
-   `[mux] backend` key in `.bmad-loop/policy.toml` (`mux set --clear` reverts to auto).
-3. The platform default — tmux on POSIX, psmux on native Windows — when registered
-   and available (psmux's availability rules are below).
+1. `BMAD_LOOP_MUX_BACKEND=<name>` forces a backend for one invocation.
+2. `bmad-loop mux set <name>` persists the choice in the `[mux] backend` key of the
+   gitignored, machine-scoped `.bmad-loop/policy.toml`. `mux set --clear` reverts to auto.
+3. The platform default (tmux on POSIX, psmux on native Windows), when registered and
+   available.
 4. The first registered backend that matches the platform and is available.
-5. If none of the above is available, a historical fallback keeps older setups working:
-   the first backend matching the platform regardless of availability, else tmux. The
-   selected backend then probes unavailable, and `bmad-loop validate` reports it as such.
+5. Fallback: the first backend matching the platform regardless of availability, else
+   tmux. The selected backend then probes unavailable, and `bmad-loop validate` reports it.
 
-The choice applies to the next invocation — switch between runs, not while one is live:
-`attach`, `cleanup`, and the TUI all look for sessions in the currently selected backend.
-After switching, `bmad-loop validate` reports the selected backend's availability and
-version as part of the preflight.
+A forced name (1 or 2) skips the platform and availability checks; a forced backend that
+probes unavailable is still used, with a one-time warning. A name that matches no
+registered backend fails.
 
-The `AVAILABLE` column answers "does this backend's binary answer on this host", not
-"can it be selected here". The two diverge when a foreign-platform binary shares a name
-with a local one — on Windows, `tmux` is psmux's compatibility shim, so the tmux row
-reads as a real tmux install. Only steps 3–5 above consult the platform, so `bmad-loop
-mux` prints a `note:` naming exactly the rows that are **available, foreign to this
-platform, and not the selected one** — the combination that looks like a contradiction.
-A forced choice (step 1 or 2) reaches those backends anyway, which is why the column is
-not gated instead; and a backend forced _into_ selection is left out of the note, since
-calling it unselectable would contradict its own `*` marker.
+Switch between runs, not while one is live: `attach`, `cleanup` and the TUI look for
+sessions in the currently selected backend. `bmad-loop validate` reports the selected
+backend's availability and version.
+
+The `AVAILABLE` column answers "does this backend's binary answer on this host", not "can it
+be selected here". On Windows, `tmux` can be psmux's compatibility shim, so the tmux row
+reads as available. `bmad-loop mux` prints a `note:` naming each row that is available,
+foreign to this platform, and not selected; such a backend is reachable only by forcing it.
 
 ## tmux (the default)
 
-tmux is the reference backend: everything else in these docs — the `bmad-loop-<run-id>`
-and `bmad-loop-ctl` session names, the `ctrl-b d` detach chord — describes tmux behavior.
-While tmux is the selected backend it is required for launching, attaching, and driving
-runs (an external backend brings its own session mechanism instead); pure TUI observation
+tmux is the reference backend: the `bmad-loop-<run-id>` and `bmad-loop-ctl` session names
+and the `ctrl-b d` detach chord elsewhere in these docs describe tmux. While tmux is
+selected it is required for launching, attaching and driving runs; pure TUI observation
 works without any backend.
 
-**The supported floor is tmux 3.2.** No version gate enforces it — tmux is selected on the
-presence of the binary alone — so an older tmux is not refused up front. It does not follow
-that an older tmux merely runs untested, because these adapters do not all speak the same
-vintage: environment injection goes out as `new-window -e KEY=VALUE`, which tmux gained in
-3.0, so anything older fails loudly at window creation, while other forms — the `=`
-exact-match target prefix among them — are considerably older and parse fine. Do not take the
-oldest form the argv happens to accept as the floor either. Between whatever an old tmux still
-parses and 3.2 lies a range that may run without complaint, and that nobody tests.
-psmux carries a separate version requirement of its own, for unrelated reasons — see below.
-The two floors are independent and neither implies the other.
+The supported floor is **tmux 3.2**. Nothing enforces it: tmux counts as available when the
+binary is on `PATH`. Environment injection uses `new-window -e KEY=VALUE`, which a much
+older tmux rejects at window creation.
 
 ### A server started under another state root
 
 A tmux server is long-lived, and its panes inherit the environment the _server_ started
-with, not the environment of the client asking for the pane. A server started while
-`BMAD_LOOP_STATE_DIR` (or `XDG_STATE_HOME`, or `HOME`) named one state root, and reused
-later by a bmad-loop under another, hands every new shell there the first root. The engine
-windows the TUI parks are not exposed: the TUI hands each one its own state root on the
-command line (a hidden `--state-root` option ahead of the subcommand, #731), so the run lands
-where the TUI watches whatever the server holds, and two projects under different state roots
-can share one server. A TUI that cannot derive a state root of its own refuses the launch
-rather than let the engine inherit one it could not watch.
+with. A server started under one state root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME` or
+`HOME`) and reused by a bmad-loop under another hands every new shell the first root.
 
-What stays exposed is a shell: window 0 of the control session, or any shell opened there, still
-inherits the server's root, so a `bmad-loop` command typed into one would use it. When the TUI
-launches into its control session it asks tmux (`show-environment`) what a new window there
-would inherit, resolves the state root from that, and notes once — naming both roots — when it
-differs from its own. It offers no remedy: on tmux `bmad-loop-ctl` is one session shared by every
-bmad-loop project on the server, so no value set there is right for all of them, and nothing
-bmad-loop launches needs one. A shell that must agree can `export BMAD_LOOP_STATE_DIR=<root>`.
+- Engine windows the TUI parks are not affected: the TUI passes each one its state root on
+  the command line. A TUI that cannot derive a state root refuses the launch.
+- A shell is affected: window 0 of the control session, or any shell opened there, inherits
+  the server's root, so a `bmad-loop` command typed there uses it. When the TUI launches into
+  its control session it compares the root a new window would inherit with its own and
+  notes once, naming both, when they differ. A shell that must agree can
+  `export BMAD_LOOP_STATE_DIR=<root>`.
 
-psmux cannot answer the question — its `show-environment` does not report inherited values
-— so there is no such note on psmux. Its per-project registry is keyed on the state root,
-so a psmux launcher under one root never reaches a server started under another through
-the ordinary path.
+psmux cannot report inherited values, so there is no such note on psmux. Its registry is
+keyed on the state root, so a launcher under one root never reaches a server started under
+another.
 
 ## psmux (native Windows, experimental)
 
 On a native-Windows host the bundled **psmux** backend is the platform default. psmux is a
-ConPTY tmux re-implementation that speaks the tmux CLI through its own `psmux` binary, so it
-reuses tmux's session/window model — the `bmad-loop-<run-id>` session names carry over, and
-the control session's does with a per-registry suffix
-([below](#where-psmux-sessions-live-the-per-project-registry)). It is selected automatically
-when available; `available()` requires the
-`psmux` and `pwsh` (PowerShell) binaries on `PATH` and a psmux **3.3.8 or newer** (older
-releases report unavailable and selection falls through: 3.3.6 and below can force-kill a
-recycled PID during teardown, and the backend's verbs are written against fixes that landed
-in 3.3.8 rather than routing around the defects they close). Every psmux window launch also
-needs **PowerShell 7.3 or newer** as `pwsh`: older versions corrupt the arguments of the
-command a window runs (a path with a space and a trailing backslash swallows the next
-argument; an empty or quoted argument is mangled), so the backend reads the `pwsh` version
-once per process and refuses to open a window or create a session under an older one (or
-one whose version it cannot read), naming what it found and asking you to upgrade pwsh. A
-forced backend (`BMAD_LOOP_MUX_BACKEND=psmux` or `[mux] backend`) is refused the same way
-(#861). The backend resolves `pwsh` to one absolute path on its own `PATH`, reads that
-executable's version, and launches every window and the pipe-pane log sink with that same
-path, so the psmux server's `PATH` never picks a different one; a `pwsh` that does not
-resolve is refused. A new session's initial window still runs psmux's own default shell
-(#863). Window commands run with PowerShell's Standard argument passing, so a `.cmd` or
-`.bat` launcher (an npm-installed CLI's shim) receives an empty or quoted argument intact;
-batch launchers have remaining argument limits, tracked separately. Native Windows is still
-experimental — see the
-[roadmap](ROADMAP.md#native-windows-multiplexer-backend) for the remaining work. WSL is
-unaffected: it _is_ Linux and uses tmux — provided bmad-loop was installed with the
-distro's own Python. WSL appends the Windows `PATH` to its own, so a Windows-installed
-bmad-loop is reachable from the bash prompt; that process reports `win32` and takes the
-psmux default no matter how Linux the shell looks. `bmad-loop validate` names the
-selection reason on every host, and warns (`host.win32-on-wsl-path`) when a `win32` interpreter
-is working on a `\\wsl.localhost\...` project (#332).
+ConPTY tmux re-implementation driven through its own `psmux` binary, so it reuses tmux's
+session and window model and the `bmad-loop-<run-id>` session names.
 
-Two model differences matter if you port a backend or read psmux argv. psmux runs one server
-per session, so window ids are minted per server and the backend session-qualifies every id it
-hands out (`session:@N`). And psmux has no per-window user options — one scope exists per
-server — so the window-option verbs and the `@`-prefixed columns of `list_windows` are served
-by a session-scoped option whose key carries a seam-owned marker plus the window id
-(`@bmad_project__blw@3` for window `@3`; no real-world naming convention collides with the
-marker, so the channel's cleanup sweeps stay off hand-written user options unless one
-deliberately imitates the seam). Both are properties of psmux's model, not gaps awaiting an
-upstream release. Practical consequence: such a value is **not** readable via
-`psmux show-options -w` by hand — read it with
-`psmux show-options -qv -t <session> "@bmad_project__blw@N"` instead. Session-scoped options need
-no such substitute — one server per session means that server's single map _is_ the session's —
-but the value has to read back verbatim either way, so session-scoped `@` options are gated the
-same way. One visible limit: a value that cannot make that round trip is refused with a stderr
-warning and the option reads as unset. Ordinary Windows paths pass — spaced, UNC, apostrophed,
-trailing-separator alike. What is refused is what the backend's own listing parse cannot carry
-back: a value containing a double quote or a line break, or one with leading/trailing
-whitespace (both reads strip it). A `-`-leading value is refused too, because psmux still
-treats it as a flag. The project ownership tag no
-longer meets this gate: it is stored as a hex digest of the project path, transportable by
-construction ([#419](https://github.com/bmad-code-org/bmad-loop/issues/419)), so sessions stay
-tagged whatever the path and the run-dir fallback remains only for genuinely untagged state.
+Requirements:
+
+- **psmux 3.3.8 or newer** and **`pwsh`** on `PATH`. `available()` requires both binaries
+  and reads psmux's reported version; an older or unreadable version reports unavailable
+  and selection falls through.
+- **PowerShell 7.3 or newer** as `pwsh`. The backend resolves `pwsh` to one absolute path,
+  reads its version once per process, and refuses to create a session or open a window
+  under an older, unreadable or unresolvable one, naming what it found. A forced psmux is
+  refused the same way. Every window and the pipe-pane log sink run with that same `pwsh`.
+- A new session's initial window runs psmux's own default shell. Window commands use
+  PowerShell's Standard argument passing, so a `.cmd` or `.bat` launcher (an npm CLI shim)
+  receives empty or quoted arguments intact.
+
+Native Windows is experimental; the remaining work is on the
+[roadmap](ROADMAP.md#native-windows-multiplexer-backend).
+
+**WSL** is Linux and uses tmux, provided bmad-loop was installed with the distro's Python.
+WSL appends the Windows `PATH`, so a Windows-installed bmad-loop is reachable from the bash
+prompt; that process reports `win32` and selects psmux. `bmad-loop validate` names the
+selection reason and warns (`host.win32-on-wsl-path`) when a `win32` interpreter works on a
+`\\wsl.localhost\...` project.
+
+**Window options.** psmux has one option scope per server, so bmad-loop stores a window
+option as a session option whose key carries the window id: `@bmad_project__blw@3` for
+window `@3`. `psmux show-options -w` does not show these values; read one with
+`psmux show-options -qv -t <session> "@bmad_project__blw@N"`. Window ids are
+session-qualified (`session:@N`).
+
+**Refused option values.** An `@` option value must read back verbatim. A value that is
+empty, starts with `-`, contains a double quote or a line break, or has leading or trailing
+whitespace is refused with a stderr warning, and the option reads as unset. Ordinary
+Windows paths (spaced, UNC, apostrophed, trailing separator) pass. The project ownership
+tag is a hex digest of the project path, so it always passes.
 
 ### Where psmux sessions live: the per-project registry
 
-psmux resolves every target through a **registry** — the directory named by `PSMUX_DATA_DIR`,
-holding one `.port`/`.key`/`.sid`/`.pid` set per session — and defaults it to
-`%USERPROFILE%\.psmux`. bmad-loop points it at a per-project root instead:
-`<state root>/<project key>/_mux`, where `<state root>` is the location
-[`BMAD_LOOP_STATE_DIR`](reference/configuration.md#environment-variables) resolves to and `<project key>` is
-the same digest of the project's resolved path that tags session ownership. The export happens
-once per bmad-loop process, before anything spawns psmux, so `run`, `cleanup`, `stop`, `attach`
-and the TUI all agree on one registry without any of them persisting it.
+psmux resolves every target through a **registry**: the directory named by
+`PSMUX_DATA_DIR`, holding one `.port`/`.key`/`.sid`/`.pid` set per session. psmux defaults it
+to `%USERPROFILE%\.psmux`. bmad-loop uses a per-project root instead:
+`<state root>/<project key>/_mux`, where `<state root>` is what
+[`BMAD_LOOP_STATE_DIR`](reference/configuration.md#environment-variables) resolves to and
+`<project key>` is the 16-hex digest of the project path that also tags session ownership.
+Every bmad-loop process exports this root before it spawns psmux, so `run`, `cleanup`,
+`stop`, `attach` and the TUI agree on one registry.
 
-**The consequence to know: a bare `psmux ls` does not show these sessions.** It reads psmux's
-default registry, finds nothing there, and answers "no sessions" — not an error. The same goes
-for `psmux attach -t bmad-loop-<run-id>` typed by hand. To reach them, export the same root
-first:
-
-```powershell
-$env:PSMUX_DATA_DIR = 'C:\Users\you\AppData\Local\bmad-loop\state\<project key>\_mux'
-psmux ls
-```
-
-`bmad-loop mux` prints that root and a paste-ready export line for the current project, which is
-the reliable way to get it — do not compose the path by hand. `bmad-loop attach` needs none of
-this: it runs the client itself, under the root it just exported.
-
-Two further consequences:
-
-- **The control session is now per project, and its name says so.** `bmad-loop-ctl` was one
-  session shared by every project on the machine; separate registries mean one per project — and
-  the name must change with the scope, because psmux's duplicate-server guard is a mutex keyed on
-  the session name alone, across every registry in your login session (`Local\psmux-session-<name>`
-  — a per-login-session object namespace, not a machine-global one), so a fixed name would let only
-  one registry there hold a control session and every other project's launch would fail as a
-  duplicate. On psmux the session is therefore `bmad-loop-ctl-<16-hex registry digest>`; the
-  TUI's toasts name the exact session. On tmux (no registries) the shared `bmad-loop-ctl` is
-  unchanged.
-- **Sessions created before this change are in whichever registry the old build inherited**,
-  and `bmad-loop cleanup` sweeps those too — but only for sessions that carry this project's
-  ownership tag and are not still running. There are two such registries, because the old build
-  simply used whatever `PSMUX_DATA_DIR` it found: psmux's **default** registry on a machine that
-  never set the variable, and **your own exported root** on one that did — the same root
-  bmad-loop now overrides (it remembers what it displaced, for exactly this sweep). The leftovers
-  line names the registry each session is in, so the one to open is the one it names.
-
-  Whatever the sweep leaves standing is **named on stderr** (and in `cleanup --json`, at
-  `sessions.legacy_leftovers`) so a removal count never quietly stands for a partial migration.
-  A legacy registry that could not be asked at all — its listing failed, or no backend could be
-  selected to name one — is named the same way (`sessions.legacy_unverified` in `--json`, a toast
-  in the TUI), since "not looked at" is not "nothing left".
-  Three kinds stay behind by design:
-
-  - An **untagged** `bmad-loop-<run-id>` session. In a shared registry a matching run directory
-    here is not proof of ownership — run ids are only unique within one project, and `--run-id`
-    is caller-supplied — so claiming one could kill a live session belonging to another project.
-  - **A live session of your own.** Cleanup never kills a run whose engine is still going,
-    wherever it lives.
-  - The pre-upgrade **`bmad-loop-ctl` control session**. The ctl-window sweep runs against the
-    current registry only.
-
-  The list is taken by _presence_ — what the registry still holds once the sweep has run — so it
-  covers a kill that silently did not land as well as one that was never attempted. (`cleanup`'s
-  own `removed` count is still the pre-kill plan, the ceiling `cleanup --json`'s
-  `sessions.removed` has always documented; the leftovers line is what catches the difference.)
-
-  These are one-time artifacts of the upgrade. To see them, put the shell on the registry the
-  leftovers line named. For psmux's default registry that means a shell with **no**
-  `PSMUX_DATA_DIR` set; for a root of your own, export that root:
-
-  ```powershell
-  Remove-Item Env:PSMUX_DATA_DIR      # psmux's default registry
-  # ...or, for the root bmad-loop displaced, the one the message named:
-  $env:PSMUX_DATA_DIR = 'D:\your-own-registry'
-
-  psmux ls
-  psmux list-windows -t bmad-loop-ctl -F '#{window_index}: #{window_name}'
-  ```
-
-  > **Do not reach for `psmux kill-session -t bmad-loop-ctl`.** That session is machine-wide, and
-  > `kill-session` kills every child process in every one of its windows — across every project
-  > that used it. bmad-loop's own windows run the engine first and park only once it exits, so a
-  > window there is a **live run** until it isn't. If `bmad-loop cleanup` reported a leftover
-  > control session while any pre-upgrade run was still going, that run is what you would be
-  > killing.
-
-  **`list-windows` cannot tell you which is which.** A live window and a parked one render
-  identically — `1: run-… (1 panes) [120x30]` — and so do `#{pane_pid}` and `#{pane_dead}`: the
-  parked window's shell is still alive, holding the prompt. The `[bmad-loop exited …]` banner is
-  pane _text_, so the one command that answers it is `capture-pane`:
-
-  ```powershell
-  psmux capture-pane -p -t bmad-loop-ctl:1     # per window index from the listing above
-  ```
-
-  A window whose last line reads `[bmad-loop exited <code> — press enter]` has finished. One that
-  does not is still running — take its `run-<run-id>` / `sweep-<run-id>` name to
-  `bmad-loop list --project <that project>` and stop it through bmad-loop
-  (`bmad-loop stop --project <that project> <run-id>`, or run it from that project)
-  rather than through psmux.
-
-  **`stop` works there, but it does not sweep the old registry.** The stop reaches the engine
-  _process_, not a session: it lodges a request in the run directory and signals the recorded pid,
-  and a run directory belongs to a project and a run id, not to a registry. So a pre-upgrade run
-  stops, and a still-live engine tears its own window down under the registry it was launched with.
-  What `stop` does not reach is its own backstop kill — that one addresses the registry bmad-loop
-  exported for this project, so an agent session an already-dead engine left behind in an older
-  registry stays standing and the run is still marked stopped. It is `bmad-loop cleanup` that
-  reaches those, through the legacy pass described above: a session carrying this project's tag is
-  killed there, and anything the tag rule declines is named on the leftovers line with the registry
-  it is in. `stop` is deliberately not widened to match — a by-name kill in a registry shared with
-  other projects, without that tag proof, could take a neighbour's same-named session, since run
-  ids are unique only within one project.
-
-  Finished windows can simply be left parked — a parked window costs one idle shell. To close one,
-  `psmux kill-window -t bmad-loop-ctl:<index>` kills only that window's own children, so it is
-  safe once `capture-pane` has shown you the banner. Closing the last window ends the session too,
-  but only while psmux's `exit-empty` is on; it is on by default, and `psmux show-options -g
-exit-empty` says which you have. With it off, an empty session stays.
-
-By default, setting `PSMUX_DATA_DIR` yourself does **not** move bmad-loop's registry. bmad-loop
-derives the root from the project and the state root and exports it over whatever it finds, saying
-so once on stderr when it replaced something. Your value is left alone for your own psmux sessions — it is
-psmux's variable, not bmad-loop's, so bmad-loop overrides it rather than refusing to run.
-
-That is deliberate, and the reason is worth having: an honoured export would make the registry a
-function of the shell a command happened to start in. A TUI launched from the Start menu carries no
-profile environment and would derive; a run started from a dev shell whose profile exports a root
-would honour it — two registries on one machine, and a live session reading as gone in one of them.
-Nor can bmad-loop tell the two apart: a value typed once in one shell and a value a profile exports
-into every shell arrive identically, and they want opposite answers.
-
-To reach these sessions from a bare psmux, point your shell at bmad-loop's root rather than the
-other way round. `bmad-loop mux` prints it ready to paste:
+**A bare `psmux ls` does not show these sessions.** It reads psmux's default registry and
+answers "no sessions". The same goes for a hand-typed `psmux attach -t bmad-loop-<run-id>`.
+`bmad-loop mux` prints the root and a paste-ready export line; use it rather than composing
+the path:
 
 ```powershell
 $env:PSMUX_DATA_DIR = '<root from bmad-loop mux>'
 psmux ls
 ```
 
-One registry serving both bmad-loop and your own psmux is a preference you state rather than one
-bmad-loop guesses at ([#729](https://github.com/bmad-code-org/bmad-loop/issues/729)). If your
-profile exports `PSMUX_DATA_DIR` into **every** shell, turn on the switch in the project's
-`policy.toml`:
+`bmad-loop attach` needs none of this; it runs the client under the root it exported.
+
+**The control session is per project on psmux:** `bmad-loop-ctl-<16-hex registry digest>`.
+The TUI's toasts name the exact session. When no state root can be derived it is plain
+`bmad-loop-ctl`, as on tmux.
+
+**If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
+path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then
+claims only sessions carrying this project's ownership tag.
+
+### Using your own `PSMUX_DATA_DIR`
+
+By default an ambient `PSMUX_DATA_DIR` does **not** move bmad-loop's registry: bmad-loop
+exports its derived root over it and notes once on stderr that it replaced a value. Your
+value still applies to your own psmux sessions.
+
+If your profile exports `PSMUX_DATA_DIR` into **every** shell and you want one registry for
+both, turn on the switch in the project's `policy.toml`:
 
 ```toml
 [mux]
 honor_ambient_psmux_data_dir = true
 ```
 
-bmad-loop then uses your value as the registry, a pane child inherits and honours it, and a clean
-process carrying your profile honours it too, so every process agrees. An engine window the TUI
-parks is handed the registry in force on its command line (a hidden `--registry-root`, beside
-`--state-root`), so it agrees even under `PSMUX_BARE_ENV`, where a pane inherits no
-`PSMUX_DATA_DIR`; a run typed into a bare window-0 shell derives the registry instead. The handed
-value is judged by the same rules as an inherited one. `bmad-loop mux` says
-`your own $PSMUX_DATA_DIR, honoured` and prints the derived root it would otherwise use. Leave the
-switch off for a value you typed into one shell: a process started without it would derive, and the
-session would read as gone there. Rules, all fixed:
+bmad-loop then uses your value as the registry, and `bmad-loop mux` reports it as your own
+`$PSMUX_DATA_DIR`, honoured, alongside the derived root it would otherwise use. Engine
+windows the TUI parks are handed the registry on their command line. Leave the switch off
+for a value typed into one shell: a process started without it would use the derived root,
+and the session would read as gone there.
 
-- It is a yes/no switch, never a path. `policy.toml` is writable by the sessions bmad-loop drives,
-  so a policy-supplied root would let one aim cleanup's kills at a registry of its choosing.
-- With no `PSMUX_DATA_DIR` set, or a relative or empty one, the switch changes nothing: the derived
-  root is used.
-- A value shaped like a bmad-loop-derived root (`<16-hex project key>\_mux`) is never treated as
-  your pin. That is what a pane child inherits when the outer process derived, and it re-derives
-  like a clean process does.
-- The TUI's control session gets its own name in your registry, so turning the switch on while an
-  old control session still runs in the derived root does not collide with it.
-- A running TUI keeps watching the registry it started with. After you flip the switch either way,
-  it refuses to launch a run until you restart it (`bmad-loop tui`). A run started then would land
-  in a registry the TUI no longer watches.
-- Sessions started in the derived root before you turned the switch on are still reached by
-  `bmad-loop cleanup`'s tag-scoped sweep. Your registry is shared with your own sessions, so cleanup
-  claims a session there only by its ownership tag.
+- It is a yes/no switch; policy can never set a path.
+- An empty or relative `PSMUX_DATA_DIR`, or none, changes nothing: the derived root is used.
+- A value shaped like a derived root (`<16-hex project key>\_mux`) is never treated as
+  yours; a pane child re-derives.
+- The control session gets its own name in your registry.
+- A running TUI keeps the registry it started with and refuses to launch runs after the
+  switch flips, until you restart it (`bmad-loop tui`).
+- Sessions left in the derived root are still reached by `bmad-loop cleanup`, which claims a
+  session in your registry only by its ownership tag.
 
-Two consequences of deriving, both benign:
+The registry follows `BMAD_LOOP_STATE_DIR`, so a process under a different state root uses a
+different registry. Coding-CLI windows receive the state root in their env dict, which
+travels inside the command the window runs; a `BMAD_LOOP_STATE_DIR` in a profile's `[env]`
+table is overwritten with the resolved root.
 
-- A pane child agrees with a clean process by construction — `bmad-loop --project <other>` run from
-  a pane of this project's session gets the other project's root, not this one's.
-- The registry follows `BMAD_LOOP_STATE_DIR`, so a process under a different state root uses a
-  different registry. It moves with the out-of-tree state the state root already holds — each run's
-  control-plane directory and its hook-event channel. The run _directory_ is not among them: that
-  stays in-tree at `<project>/.bmad-loop/runs` and moves with the project.
+### `PSMUX_BARE_ENV` is not supported
 
-How the state root reaches the windows bmad-loop opens: coding-CLI windows (the engine's sessions
-and the probe launcher's window) are **told** it through their env dict, which travels inside the
-command the window runs; the engine windows the TUI parks are handed it on their command line
-(`--state-root`, #731); a session's initial shell window inherits it from the multiplexer server,
-as it always has. The told entry is
-always this process's own answer: a `BMAD_LOOP_STATE_DIR` declared in a profile's `[env]` table is
-overwritten with the resolved root, and when no root can be derived the entry is removed rather
-than forwarded — the window then inherits and fails exactly as its parent does, instead of being
-aimed at a state root (and so a registry) its own orchestrator cannot see.
+`PSMUX_BARE_ENV=1` makes psmux rebuild a pane child's environment from a short allowlist
+that drops `BMAD_LOOP_STATE_DIR` and `LOCALAPPDATA`. The windows bmad-loop launches keep
+their roots (parked engine windows get them on the command line; coding-CLI windows carry
+their env inside the command). What breaks:
 
-One psmux mode breaks that inheritance and is **not supported**: `PSMUX_BARE_ENV=1` (psmux's
-escape hatch for a Windows environment block near the 32 KB `CreateProcessW` limit) empties a pane
-child's environment and rebuilds it from a 14-name allowlist that drops both
-`BMAD_LOOP_STATE_DIR` and the `LOCALAPPDATA` its default falls back to — so an inherited value is
-no value at all. (`TMUX` is still set in the pane, but by psmux afterwards, not by the allowlist,
-which does not contain it.) The windows bmad-loop launches keep their roots: a parked engine window
-is handed its state root and registry root on its command line, and a coding-CLI window's env
-rides the in-command transport, which psmux applies after the bare-env clear (source-read at
-v3.3.8). A `bmad-loop` command typed into a window-0 shell under that switch re-derives the state
-root from what survived, and lands somewhere else — reading a live session as gone — whenever
-`BMAD_LOOP_STATE_DIR` was in force or `LOCALAPPDATA` points outside `%USERPROFILE%\AppData\Local`;
-`USERPROFILE` survives the clear, so a default profile re-derives the same root. The clear also
-drops every variable a window's env dict does not name, silently: a coding CLI can miss
-credentials or configuration, and without `APPDATA` git stops reading your global excludes in
-`%APPDATA%\Git\ignore`. bmad-loop warns once per process when the switch is on in its environment
-(the server, not this process, is what reads the switch at pane spawn, so a server already running
-with it on under a clean client is not detected), and the TUI shows the warning again once its
-screen is up; the remedy is to unset `PSMUX_BARE_ENV` for bmad-loop's sessions.
+- A `bmad-loop` command typed into a window-0 shell re-derives the state root from what
+  survived and can read a live session as gone, whenever `BMAD_LOOP_STATE_DIR` was set or
+  `LOCALAPPDATA` points outside `%USERPROFILE%\AppData\Local`.
+- Every variable a window's env dict does not name is dropped. A coding CLI can miss
+  credentials or configuration, and without `APPDATA` git stops reading global excludes in
+  `%APPDATA%\Git\ignore`.
 
-If the state root cannot be derived at all — `BMAD_LOOP_STATE_DIR` set to a relative path, say —
-bmad-loop has no registry of its own to point at, says so, and leaves whatever `PSMUX_DATA_DIR` you
-had in force. `cleanup` then refuses to claim an untagged session on run-directory evidence, because
-that evidence only holds in a registry bmad-loop derived: a run id is unique within a project, not
-across the registry you are sharing with it.
+bmad-loop warns once per process when the switch is set in its environment, and the TUI
+repeats the warning. A server already running with it on is not detected. Unset
+`PSMUX_BARE_ENV` for bmad-loop's sessions.
+
+### Sessions in another registry
+
+`bmad-loop cleanup` also sweeps the registries this project's sessions may sit in from
+before the per-project root: psmux's default registry, and any `PSMUX_DATA_DIR` root
+bmad-loop displaced. It kills only sessions that carry this project's ownership tag and
+whose run is not still going. Whatever it leaves is named on stderr as
+`left in <registry> (not migrated): …` and in `cleanup --json` at
+`sessions.legacy_leftovers`; a registry that could not be asked at all is named as
+`legacy registry not checked …` (`sessions.legacy_unverified`, a toast in the TUI).
+
+Three kinds stay behind by design:
+
+- An **untagged** `bmad-loop-<run-id>` session. Run ids are unique only within a project, so
+  a matching run directory is not proof of ownership in a shared registry.
+- **A live session of your own.** Cleanup never kills a run whose engine is still going.
+- The shared **`bmad-loop-ctl` control session** in that registry.
+
+To inspect one, put the shell on the registry the message named:
+
+```powershell
+Remove-Item Env:PSMUX_DATA_DIR      # psmux's default registry
+# ...or the root the message named:
+$env:PSMUX_DATA_DIR = 'D:\your-own-registry'
+
+psmux ls
+psmux list-windows -t bmad-loop-ctl -F '#{window_index}: #{window_name}'
+```
+
+> **Do not run `psmux kill-session -t bmad-loop-ctl`.** That session can be shared by every
+> project that used the registry, and `kill-session` kills every child process in every
+> window. A window there runs its engine first and parks only once the engine exits, so it
+> is a **live run** until it shows the exit banner.
+
+`list-windows` cannot tell a live window from a parked one. Read the pane text:
+
+```powershell
+psmux capture-pane -p -t bmad-loop-ctl:1     # per window index from the listing above
+```
+
+A window whose last line reads `[bmad-loop exited <code> — press enter]` has finished. One
+that does not is still running: find its `run-<run-id>` / `sweep-<run-id>` name with
+`bmad-loop list --project <that project>` and stop it with
+`bmad-loop stop --project <that project> <run-id>`, not through psmux. `stop` reaches the
+engine process wherever its session lives, but an agent session a dead engine left in an
+older registry is reached only by `bmad-loop cleanup`.
+
+A finished window can stay parked; it costs one idle shell. To close one,
+`psmux kill-window -t bmad-loop-ctl:<index>` kills only that window's children, so it is
+safe once `capture-pane` has shown the banner.
 
 ## Recovering a stranded session
 
@@ -377,9 +257,9 @@ Never kill a `bmad-loop-ctl…` control session this way: its windows can be liv
 
 ## External backends
 
-Every backend beyond the two bundled ones is a separate package that you co-install with bmad-loop; it
-registers itself through the `bmad_loop.mux_backends` entry-point group, so installation
-is the entire setup — the new backend simply appears in `bmad-loop mux`, selectable and
+Every backend beyond the two bundled ones is a separate package co-installed with
+bmad-loop. It registers through the `bmad_loop.mux_backends` entry-point group, so
+installing it is the whole setup: the backend appears in `bmad-loop mux`, selectable and
 persistable like a bundled one. With bmad-loop installed as a `uv` tool:
 
 ```bash
@@ -390,30 +270,20 @@ bmad-loop mux set <name> # persist for this machine
 ```
 
 The reference external backend is
-**[bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr)** —
-[herdr](https://herdr.dev) is a cross-platform, agent-aware terminal workspace manager
-whose agent-status sidebar is a natural fit for watching runs. What changes from your
-seat on herdr (one manual detach chord, `ctrl+b q`; polled logs; a JSON state sidecar) is
-documented in
-[that repo's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).
+**[bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr)**.
+[herdr](https://herdr.dev) is a cross-platform, agent-aware terminal workspace manager. What
+changes on herdr (one manual detach chord, `ctrl+b q`; polled logs; a JSON state sidecar) is
+in [that repo's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).
 
-Two operational notes that apply to any external backend:
+Operational notes for any external backend:
 
-- **A broken adapter package never breaks bmad-loop.** If an installed backend fails to
-  import, selection proceeds without it; `bmad-loop mux` prints a
-  `warning: external backend '<name>' failed to load: <reason>` line and `validate` notes
-  the same. The fix is usually reinstalling or upgrading the adapter.
-- **A raising probe reads as unavailable, but says so.** When a backend's platform
-  predicate, factory or `available()` raises, selection skips it with a one-time
-  `warning:` on stderr, `bmad-loop mux` prints `warning: <name> backend probe failed:
-<error>`, and `validate` adds a `mux.backend-probe` warning. A `version()` that raises
-  is reported as a failed version probe. None of these reads the same as an
-  ordinary unavailable row (DW-464).
-- **`mux set --force` covers late registrations.** A backend that only registers on some
-  other machine (where the package IS installed) can still be persisted in a shared
-  workflow with `bmad-loop mux set <name> --force`.
-- **`capture_pane` is optional.** `TerminalMultiplexer.capture_pane(window_id)` (the
-  window's visible screen as text) is non-abstract: its default raises
-  `MultiplexerError`, which the generic adapter reads as "no match" at a stall-grace
-  expiry, so an existing backend keeps working unchanged. Override it to enable the
-  profile's `parked_prompt_patterns` (DW-350) on your transport.
+- **A broken package never breaks bmad-loop.** If a backend fails to import, selection
+  proceeds without it; `bmad-loop mux` prints
+  `warning: external backend '<name>' failed to load: <reason>` and `validate` reports a
+  `mux.external-backend` warning. Reinstalling or upgrading the package usually fixes it.
+- **A raising probe reads as unavailable, and says so.** A raising `available()` is skipped
+  by selection with a one-time stderr warning. `bmad-loop mux` prints
+  `warning: <name> backend probe failed: <error>` (or `version probe failed` for a raising
+  `version()`), and `validate` adds a `mux.backend-probe` warning.
+- **`mux set --force` persists a backend that is not registered here**, for a shared
+  workflow where the package is installed on other machines.
