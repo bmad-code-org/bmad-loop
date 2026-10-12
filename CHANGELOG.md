@@ -37,6 +37,10 @@ breaking changes may land in a minor release.
   with `PYTHONDONTWRITEBYTECODE=1` (#496, #497).
 - Show a project plugin's grant status in the TUI settings screen; toggling it on
   records its grant after a successful save, toggling it off revokes it (#496, #497).
+- Restructure the docs: FEATURES.md is a feature catalog; configuration, CLI and
+  run-state reference pages live in docs/reference/ (the settings tables generated from
+  the schema); sweep and escalation recovery have their own guides; a docs hygiene test
+  guards links, anchors, tracker refs, block length and the catalog shape.
 
 ### Fixed
 

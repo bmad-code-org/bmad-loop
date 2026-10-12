@@ -56,7 +56,8 @@ ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 # The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/) that
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
 # `bmad-dev-auto`) is upstream (not bundled here): the orchestrator drives it as an
-# already-installed skill.
+# already-installed skill. These dirs are the only skills init writes: the
+# BMAD-installed skills and `_bmad/` are read, never modified.
 MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
@@ -3404,7 +3405,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             #
             # The rollback exists because the enable one line above is a PERMANENT
             # repo-format change, and the guarantee this code owes (docstring,
-            # CHANGELOG, docs/FEATURES.md) is that the flag outlives a failed shield
+            # CHANGELOG) is that the flag outlives a failed shield
             # only where a rollback was DECLINED or could not be made, and the reason
             # says which. `needs_enable` gates it — a safety property, not a
             # micro-optimization, and see `_shield_undo_extension` for the second gate

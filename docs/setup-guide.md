@@ -10,12 +10,11 @@ their artifacts. Installing the tool is part of setup, not
 an optional extra.
 
 There are two ways the skills land in a project. The orchestrator's wheel **bundles**
-the three skills, so the simplest path is **pip + `bmad-loop init`**, which installs them
+the three skills, so the simplest path is **`uv tool install` + `bmad-loop init`**, which installs them
 itself. Alternatively the **BMAD-method installer** copies them. Either way the
 `/bmad-loop-setup` skill installs the orchestrator tool, picks which coding CLIs to
 drive, and bootstraps the project. For the one-page summary,
-see the [Installing the skill module](../README.md#installing-the-skill-module) section
-of the README.
+see [Installing and upgrading](../README.md#installing-and-upgrading) in the README.
 
 ## Platform prerequisites
 
@@ -41,26 +40,24 @@ of the README.
   or the `[mux] backend` policy key, or the `BMAD_LOOP_MUX_BACKEND` env var — forces the
   choice per machine.
 - **OS** — Linux or macOS. **Windows is supported via WSL**, which _is_ Linux: tmux and
-  every POSIX path work unchanged there, so no special setup is needed. **Native Windows is
-  experimental** — the bundled `psmux` backend (a ConPTY tmux re-implementation) drives runs
-  there and is selected automatically as the win32 default when its prerequisites are present:
-  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` 3.3.8 or newer (older
-  releases read as unavailable — see
-  [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why). It is
-  not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
-  hosting, attach/detach, Unity cache paths) is tracked in
-  [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Stopping a run is not part of
-  that gap: `bmad-loop stop` lodges its request in a control file the engine reads itself,
-  at item boundaries and mid-session, so it no longer depends on Windows signal delivery
-  (#319). Inside WSL, install with the
-  **Linux** interpreter — a Windows-installed bmad-loop is reachable from the bash prompt
-  and silently behaves as Windows
-  ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:
-  `bmad-loop mux` should read `platform default for linux`; if it names `win32` you are
-  running the Windows build, and `bmad-loop validate` says so too. (A forced choice —
-  `BMAD_LOOP_MUX_BACKEND` or `[mux] backend` — is reported as the reason _instead_ of the
-  platform, so clear it before reading that line as a platform check.)
+  every POSIX path work unchanged there, so no special setup is needed.
+  - **Native Windows is experimental.** The bundled `psmux` backend (a ConPTY tmux
+    re-implementation) drives runs there and is selected automatically as the win32 default
+    when its prerequisites are present: the `psmux` and `pwsh` (PowerShell) binaries on
+    `PATH`, with `psmux` 3.3.8 or newer (older releases read as unavailable — see
+    [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why).
+  - It is below the Linux/macOS/WSL support tier; open native-Windows work is in
+    [the roadmap](ROADMAP.md#native-windows-multiplexer-backend), and the port path is in
+    [Porting bmad-loop to a new OS](porting-to-a-new-os.md). `bmad-loop stop` works there too:
+    it lodges its request in a control file the engine reads at item boundaries and
+    mid-session, with no signal delivery involved.
+  - **Inside WSL, install with the Linux interpreter.** A Windows-installed bmad-loop is
+    reachable from the bash prompt and silently behaves as Windows
+    ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:
+    `bmad-loop mux` should read `platform default for linux`; if it names `win32` you are
+    running the Windows build, and `bmad-loop validate` says so too. (A forced choice —
+    `BMAD_LOOP_MUX_BACKEND` or `[mux] backend` — is reported as the reason _instead_ of the
+    platform, so clear it before reading that line as a platform check.)
 
 ## Installed via the BMAD-method installer? (recommended)
 
@@ -85,7 +82,7 @@ claude "/bmad-loop-setup accept all defaults"
    `uv tool upgrade bmad-loop --reinstall`.
 2. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
    to install the `bmad-loop-*` skills + register hooks + write the `.bmad-loop/policy.toml`
-   template + add gitignore entries (including policy.toml itself — policy is per-machine; repos initialized before this run `git rm --cached .bmad-loop/policy.toml` once if theirs is already committed) (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
+   template + add gitignore entries, including policy.toml itself, which is per-machine (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
    and [Initializing CLIs other than claude](#initializing-clis-other-than-claude)). On an
    upgrade it passes `--force-skills` so the per-project skill copies are refreshed.
 3. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
@@ -110,8 +107,10 @@ claude "/bmad-loop-setup accept all defaults"                   # install the to
 ```
 
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
-installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`,
-`bmad-loop-setup`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
+installs all the bundled skills together: `bmad-loop-resolve` (the interactive
+`/bmad-loop-resolve <story>` escalation workflow), `bmad-loop-sweep` (automation-only
+ledger triage) and `bmad-loop-setup` (installs the tool, then runs `init` and
+`validate`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-build-auto`
 (spelled `bmad-dev-auto` before the 6.10.1 rename — the orchestrator resolves
 whichever name is on disk and invokes that one) is
@@ -144,9 +143,9 @@ A layer disabled with an empty `instruction`, or replaced in
 nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
 v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
 
-`bmad-review-verification-gap` is no longer required unconditionally (#260): no tagged
-release ships it as a standalone skill, and on current sources it is only a thin
-forwarder to `bmad-review`. It is required exactly when your installed layers name it.
+`bmad-review-verification-gap` is required only when your installed layers name it: no
+tagged release ships it as a standalone skill, and on current sources it is a thin
+forwarder to `bmad-review`.
 
 ### Customizing the review layers
 
@@ -168,7 +167,7 @@ without running the review:
   convention is ``Invoke the `skill-name` skill``).
 
 Both come back as `skills.review-layer-unresolved` warnings, so a customized layer can
-never block a run the way the old fixed catalog did. What _is_ a problem: every layer
+never block a run. What _is_ a problem: every layer
 disabled at once (`skills.review-layers-empty`), which makes the primitive HALT
 blocked with `no active review layers`.
 
@@ -182,14 +181,17 @@ would not carry.
 `bmad-retrospective` reads session logs as evidence for its process lessons: why a
 session stalled, what it tried and dropped. It doesn't know where bmad-loop keeps them,
 so on an epic bmad-loop drove it finds none and skips that analysis. bmad-loop ships no
-override for this (DW-387). To point the skill at the run records, create
+override for this. To point the skill at the run records, create
 `_bmad/custom/bmad-retrospective.toml` yourself, or `bmad-retrospective.user.toml` for a
 personal copy:
 
 ```toml
 [workflow]
 persistent_facts = [
-  "Session logs for bmad-loop-driven stories are the bmad-loop run directories, .bmad-loop/runs/<run-id>/ under {project-root}. journal.jsonl is one JSON event per line: a session-start (task_id, role, story_key, adapter, model) and a session-end (task_id, tokens, and a status of completed, stalled, timeout, crashed, over_budget or aborted) per coding-CLI session, joined on task_id since session-end carries no story_key, plus review results and retries, rollbacks, pauses and escalations. logs/<task-id>.log is that session's raw terminal capture (tmux pane output including escape sequences and repaints; for the hookless opencode profile, a readable transcript), and the journal's log_task / log_pos fields give the log file and byte offset each event lines up with. state.json records the run's stories and their outcome. Find the runs for this epic by grepping journal.jsonl files for its story keys. Runs archived by bmad-loop archive or bmad-loop clean are .bmad-loop/archive/<run-id>.tar.gz and still hold journal.jsonl, state.json and logs/: search inside them as well. Record a session-log gap only for runs that were deleted.",
+  "Session logs for bmad-loop-driven stories are the run directories .bmad-loop/runs/<run-id>/ under {project-root}. Find this epic's runs by grepping their journal.jsonl files for its story keys.",
+  "journal.jsonl holds one JSON event per line: a session-start (task_id, role, story_key, adapter, model) and a session-end (task_id, tokens, and a status of completed, stalled, timeout, crashed, over_budget or aborted) per coding-CLI session, joined on task_id since session-end carries no story_key, plus review results, retries, rollbacks, pauses and escalations.",
+  "logs/<task-id>.log is that session's raw terminal capture (escape sequences and repaints included; a readable transcript for the hookless opencode profile). The journal's log_task / log_pos fields name the log file and byte offset each event lines up with. state.json records the run's stories and their outcome.",
+  "Runs archived by bmad-loop archive or bmad-loop clean are .bmad-loop/archive/<run-id>.tar.gz and still hold journal.jsonl, state.json and logs/: search inside them too. Record a session-log gap only for runs that were deleted.",
 ]
 ```
 
@@ -208,7 +210,7 @@ time or retro the epic before its runs are deleted.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
-`antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
+`antigravity` (Google's `agy`, experimental — worktree isolation needs the project root trusted; see [First-run notes](#first-run-notes)), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
@@ -238,13 +240,17 @@ untouched — the default is correct.
 ## Installing the tool and TUI
 
 The `[tui]` extra pulls in the Textual dashboard (`textual` + `tomlkit` + `pyte`) so
-`bmad-loop tui` works. The core tool needs only `pyyaml`.
+`bmad-loop tui` works. The core tool needs only `pyyaml` and `regex` (plus `psutil` on Windows).
 
 **Together (recommended):**
 
 ```bash
 uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
 ```
+
+**A pinned release tag** (reproducible; recommended for day-to-day use): append the tag to the URL,
+as in `...bmad-loop.git@v<version>` (see the [releases](https://github.com/bmad-code-org/bmad-loop/releases) for tags).
+Without a tag the install tracks `main`.
 
 **Tool first, TUI later (separately):** install the core without the extra, then add the
 dashboard whenever you want it by re-running the same command **with** `[tui]`:
@@ -264,14 +270,37 @@ failing obscurely.
 `uv tool install` drops `bmad-loop` into uv's own managed tool environment, so there's no
 PEP 668 externally-managed conflict and no need for a virtualenv, `--user`, or `--break-system-packages`.
 
-To upgrade later, the simplest path is to re-run `/bmad-loop-setup` (or `/bmad-loop-setup
-upgrade`) — it detects the existing install, upgrades the tool with `uv tool upgrade
-bmad-loop --reinstall` (the `--reinstall` is **required** for a git source — a plain
-`uv tool upgrade` reuses the cached commit and won't pull new code), and re-lays the
-per-project skills with `bmad-loop init --force-skills`. To do it by hand, run those two
-commands yourself (see the [Upgrading](../README.md#upgrading) section of the README).
-
 Confirm with `bmad-loop --version`.
+
+### Upgrading
+
+Upgrading is two steps: the tool, and the per-project skill copies that `init` laid down
+(a tool upgrade does not touch them). The simplest path is to re-run the setup skill, which
+detects the existing install and runs both steps:
+
+```bash
+claude "/bmad-loop-setup upgrade"
+```
+
+By hand (non-Claude CLIs, CI, scripts):
+
+```bash
+# 1. upgrade the tool; --reinstall is required for a git source, or uv reuses the cached commit
+uv tool upgrade bmad-loop --reinstall
+#    to move to a newer tag instead, re-install with the new ref:
+#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<version>"
+
+# 2. re-lay the refreshed skills into each project that uses bmad-loop; without --cli this
+#    refreshes only the CLIs the policy selects (claude by default), so name every CLI
+#    you initialized the project for, e.g.:
+bmad-loop init --project /path/to/project --force-skills --cli claude --cli codex
+```
+
+`.bmad-loop/policy.toml` is left untouched: new keys are optional and take their defaults.
+`init` gitignores policy.toml because it is per-machine; if yours is already committed, run
+`git rm --cached .bmad-loop/policy.toml` once to stop sharing it (your local copy is kept).
+Read the [CHANGELOG](../CHANGELOG.md) or the
+[releases](https://github.com/bmad-code-org/bmad-loop/releases) for what changed between tags.
 
 ## Initializing CLIs other than claude
 
@@ -327,12 +356,11 @@ them to whoever owns the machine:
     with `bmad-loop probe-adapter antigravity --workspace <path>` (exit `0` = trusted).
     **Known limitation:** entries are never removed when a worktree is torn down, so
     `trustedWorkspaces` accumulates one entry per unit — prune stale
-    `.bmad-loop/runs/` paths by hand if the list grows. See
-    [#169](https://github.com/bmad-code-org/bmad-loop/issues/169) / DW-390.
+    `.bmad-loop/runs/` paths by hand if the list grows.
   - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
     not a gap: agy's transcript carries no usage data at all (it counts tokens only in
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.
-- **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
+- **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
   `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). A reasoning
@@ -343,6 +371,25 @@ them to whoever owns the machine:
   transcript of the agent's prose, tool calls, file edits and permission decisions — or the
   TUI Log tab. The server's own stdout lands beside it in `<task-id>.server.out`, and a
   structured trace of the raw SSE frames in `<task-id>.sse.jsonl`.
+
+#### Codex hook trust under worktrees
+
+Codex trusts hooks per directory, and an untrusted hook never fires, so a session would never report back. Check trust before the first run:
+
+1. In the project root, run `codex` and accept both prompts (workspace trust, then "Hooks need review → Trust all and continue").
+2. `bmad-loop validate`: the `hooks.trust` check must be ok. `bmad-loop probe-adapter codex` reports Codex's verdict for the project checkout as `hook_trust` and exits 1 unless it is `trusted`. It does not account for stage `extra_args` or worktree isolation, so always re-check with `validate`.
+3. If the verdict is not `trusted`:
+   - `untrusted`, trust is stale: open Codex in that checkout and accept the hook prompt again.
+   - `untrusted`, the relay is not usable or Codex omitted it: re-register it with `bmad-loop init --cli codex`.
+   - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox`, profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
+
+Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` under worktree isolation; that failure is expected, and `probe-adapter codex` still reports the project checkout. The run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
+
+1. Read the escalation. It names the role, the worktree path, the status and the reason. For `unverifiable`, fix the cause first.
+2. `cd` into the named worktree (it stays mounted under `.bmad-loop/runs/<run-id>/worktrees/`), run `codex`, and accept the hook trust prompt.
+3. `bmad-loop resolve <run-id> --no-interactive` and answer yes: it re-arms the story and resumes the run. (With `--no-resume`, run `bmad-loop resume <run-id>` afterwards.)
+
+Expect one pause per unit: each worktree path needs its own grant. The re-armed story restarts from its baseline. bmad-loop never writes Codex's trust state itself.
 
 ### Skill location
 
@@ -365,7 +412,7 @@ yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expecte
 output as a readiness checklist, not an install failure.
 
 For the dashboard itself, see [docs/tui-guide.md](tui-guide.md). For the full policy
-reference, see the [Policy section](../README.md#policy-bmad-looppolicytoml) of the README.
+reference, see the [configuration reference](reference/configuration.md).
 
 ## Uninstalling
 
@@ -384,16 +431,22 @@ Tear down any leftover worktrees, tmux sessions, and archived runs while the too
 installed — once `.bmad-loop/` is gone these are unreachable:
 
 ```bash
-bmad-loop clean --hard --project <project-root>   # delete every concluded run + its worktrees
+bmad-loop clean --hard --retain 0 --project <project-root>   # delete every concluded run + its worktrees
 bmad-loop cleanup --project <project-root>         # kill leftover tmux sessions/windows
 ```
 
 `clean --hard` permanently deletes runs instead of archiving them (we're removing the tool, so
-there's nothing to keep). Running it **first** also matters for the out-of-tree half: each run's
+there's nothing to keep), and `--retain 0` puts every concluded run past the retention window
+(a `[cleanup] retention_days` you set still keeps newer runs; unset it first). Running it **first** also matters for the out-of-tree half: each run's
 control-plane directory lives under the user-scoped state root, and `clean` is what collects it
-(step 2 covers what is left over). See the disk-reclamation coverage in
-[docs/FEATURES.md](FEATURES.md) and the [command reference](../README.md#command-reference) for
-what each command touches. Make sure no run is still live (Editor open, session attached) first.
+(step 2 covers what is left over). See
+[Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk) and the
+[CLI reference](reference/cli.md#subcommands) for what each command touches. Make sure no run is still live (Editor open, session attached) first.
+
+`clean` never collects paused, crashed or interrupted runs. Run `bmad-loop list --project <project-root>`
+afterwards; for each run still listed, save any work you want from its worktree under
+`.bmad-loop/runs/<run-id>/worktrees/`, then `bmad-loop delete <run-id> --project <project-root>`
+(or `archive` to keep a tarball). Deleting `.bmad-loop/` by hand instead skips their worktree teardown.
 
 ### 2. Remove the orchestrator state
 
@@ -406,7 +459,7 @@ rm -rf .bmad-loop/
 ```
 
 One piece is **not** under `.bmad-loop/`: each run's hook-event channel lives in a user-scoped
-state root outside the project (#494) — `$XDG_STATE_HOME/bmad-loop`, else
+state root outside the project — `$XDG_STATE_HOME/bmad-loop`, else
 `~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows; or whatever
 `BMAD_LOOP_STATE_DIR` names. Step 1 collected this project's runs from it, leaving an empty
 per-project directory whose name is a digest of the project path — not something to pick out by
@@ -454,8 +507,8 @@ so remove it only when uninstalling the package itself.
 
 ### 5. Drop the gitignore lines
 
-`init` appended `.bmad-loop/runs/`, `.bmad-loop/cache/`, and `.bmad-loop/policy.toml` to
-`.gitignore`. Remove those three lines (skip any your project relies on for other reasons). If
+`init` appended `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and `_bmad/render/` to
+`.gitignore`. Remove those four lines (skip any your project relies on for other reasons). If
 you had run `git rm --cached .bmad-loop/policy.toml` to stop sharing the per-machine policy, the
 file is untracked — re-add it (`git add .bmad-loop/policy.toml`) only if you want it back in version control.
 

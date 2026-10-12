@@ -77,7 +77,9 @@ def test_tolerates_garbage_stdin(tmp_path):
 
 
 def test_installed_copy_matches_source(tmp_path):
-    # packaged alongside the real relay; importlib.resources resolves it
+    """The packaged resource matches the source relay. This only bites in a
+    wheel-installed run: under an editable install both sides resolve to the same
+    file."""
     from importlib import resources
 
     packaged = resources.files("bmad_loop.data").joinpath("bmad_loop_probe_hook.py")

@@ -8534,7 +8534,7 @@ class Engine:
         """Warn once when a story's cost-weighted spend crosses
         ``limits.max_tokens_per_story``, at the session boundary that crossed it.
 
-        The cap is advisory by contract (docs/FEATURES.md) — this warns, it never
+        The cap is advisory by contract (docs/reference/configuration.md) — this warns, it never
         terminates. Enforcement is the separate mid-session guard (#158,
         ``max_tokens_per_session``), a different cap with its own latch, untouched
         here.
@@ -10352,6 +10352,9 @@ class Engine:
         at teardown. Uncarried, the main board keeps the story at
         ``ready-for-dev`` — inside ``ACTIONABLE_STATUSES`` — and ``_pick_next``,
         which reads the MAIN board, re-picks finished work on the next run.
+
+        Only this story's own advance is carried. Any other row a session edits in
+        a gitignored worktree board is lost with the worktree at teardown.
 
         Through ``sprintstatus.advance``, the orchestrator's sole write path to this
         file, never a copy of the worktree's: that keeps the never-regress rule and

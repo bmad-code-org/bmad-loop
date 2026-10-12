@@ -15868,9 +15868,8 @@ def test_auto_sweep_records_a_child_stopped_by_a_ledger_fault_as_finished(projec
 
     That is the truthful record, which is why the row asserts it rather than trying
     to restore the old one: the child finalized its run dir and reported its own stop, with its own
-    repair notice naming the ledger. Repair is followed by a fresh sweep. The cost, named in
-    `docs/FEATURES.md` beside the other auto-sweep residuals, is that the PARENT's
-    journal no longer says anything about the ledger — the stop token lives in the
+    repair notice naming the ledger. Repair is followed by a fresh sweep. The cost is
+    that the PARENT's journal no longer says anything about the ledger — the stop token lives in the
     child's run dir. This row is where that trade is written down.
 
     The child is driven through the real `sweep_factory` seam with a real

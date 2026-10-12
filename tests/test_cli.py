@@ -8552,8 +8552,8 @@ def test_resume_warns_when_the_trusted_baseline_is_unreadable(project, monkeypat
 def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
     """The out-of-tree baseline is keyed by the project's RESOLVED PATH
     (`runs.project_tag`), so moving or renaming the project keys the run somewhere
-    new and orphans the subtree holding its `config-digest` — FEATURES.md documents
-    the GC half of the same fact. state.json travels with the run dir instead.
+    new and orphans the subtree holding its `config-digest` —
+    docs/reference/run-state.md documents the GC half of the same fact. state.json travels with the run dir instead.
 
     Stamping ONLY out of tree therefore made a rename silently retire the pin: the
     reader answers `None`, the in-tree copy was never written under that code, and
@@ -12204,9 +12204,9 @@ def test_validate_json_mode_and_spec_folder_reflect_the_flag(project, capsys, sp
 
 
 def test_validate_json_every_emitted_check_is_registered(project, capsys, monkeypatch):
-    """The `add` assert enforces this per call site; this proves it end-to-end over a
-    real run, so an id that only ever appears on an unexercised path still has to be
-    in the registry."""
+    """The `add` assert enforces registration per executed call site; this unions the
+    ids a real passing and failing run emit and asserts them registered. Exercised
+    paths only: an id on a branch neither run reaches is not seen."""
     from bmad_loop.checks import VALIDATE_CHECKS
 
     _make_validate_pass(project, monkeypatch, capsys)
@@ -16483,8 +16483,8 @@ def test_validate_isolation_gate_needs_both_halves(
     project, monkeypatch, capsys, override, policy_text
 ):
     """Either half alone is a configuration this release supports and documents: a
-    `repo_root` override under `isolation = "none"` is the monorepo knob README's
-    "Worktree isolation" section documents, and
+    `repo_root` override under `isolation = "none"` is the monorepo knob the
+    FEATURES "Trust-nothing verification" entry documents, and
     worktree isolation without an override is the ordinary isolated setup. The
     gate stays silent on both, and validate still passes — the green rc is the second
     witness, since a gate that fired would take the whole verdict with it."""

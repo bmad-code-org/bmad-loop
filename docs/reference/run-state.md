@@ -1,0 +1,165 @@
+# Run state reference
+
+Where bmad-loop keeps the state of runs and sweeps, what each file holds, how multiplexer sessions are named and torn down, and what `stop`, `cleanup`, `clean`, `delete` and `archive` remove. Command options are in the [CLI reference](cli.md).
+
+## Run inventory
+
+- All run state in `.bmad-loop/runs/<run-id>/` (gitignored by `init`): `state.json`, `journal.jsonl`, `engine.pid`, `logs/<task_id>.log`, and `tasks/<task_id>/` per agent session, which holds the session prompt, the heartbeat, adapter-private records, and the shared artifacts: [`result.json`, `escalation.json`]. The hook-event channel and the config digest live outside the tree, under the [state root](#state-root).
+
+A directory under `.bmad-loop/runs/` counts as a run only if it contains a `state.json` file.
+
+## State root
+
+Out-of-tree state is user-scoped. The first rule that applies sets the root:
+
+| Platform | Root                                                                                                                                                       |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| any      | `$BMAD_LOOP_STATE_DIR`, used as-is (see [environment variables](configuration.md#environment-variables)). Must be absolute; an empty value reads as unset. |
+| POSIX    | `$XDG_STATE_HOME/bmad-loop` when that variable is absolute, else `~/.local/state/bmad-loop`                                                                |
+| Windows  | `%LOCALAPPDATA%\bmad-loop\state`, else `%USERPROFILE%\AppData\Local\bmad-loop\state`                                                                       |
+
+Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 of its resolved path (`runs.project_tag`). Moving or renaming a project changes its key; the old subtree is left behind and `clean` does not reach it.
+
+```text
+<state root>/
+├── locks/                      advisory-lock files, shared across this user's projects
+└── <project key>/
+    ├── <run-id>/               the run's control plane
+    │   ├── events/             hook-event files written by `bmad-loop relay` (BMAD_LOOP_EVENTS_DIR)
+    │   └── config-digest       baseline digest of the host-exec config, checked on resume
+    ├── _mux/                   per-project multiplexer registry (psmux)
+    ├── _plugin-snapshots/      verified copies of granted project plugins
+    └── plugin-grants.json      project-plugin trust grants (`bmad-loop plugins`)
+```
+
+## Project `.bmad-loop/` directory
+
+| Path                                 | Contents                                               | Gitignored by `init` |
+| ------------------------------------ | ------------------------------------------------------ | -------------------- |
+| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                 | yes                  |
+| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                | yes                  |
+| `.bmad-loop/cache/`                  | plugin caches                                          | yes                  |
+| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                | no                   |
+| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep            | no                   |
+| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed) | no                   |
+| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                       | no                   |
+| `.bmad-loop/plugins/`                | project-local plugins                                  | no                   |
+
+## Run directory
+
+```text
+.bmad-loop/runs/<run-id>/
+├── state.json                  resumable run state
+├── journal.jsonl               append-only engine decision log
+├── engine.pid                  engine pid and process identity; rewritten on resume
+├── sweep.json                  sweep runs: the launch options
+├── tasks/<task_id>/            one per agent session (see Task directory)
+├── logs/<task_id>.log          session log (pane capture; opencode: the server transcript)
+├── verify/                     verifier stdout/stderr streams the journal points at
+├── worktrees/                  per-story git worktrees ([scm] isolation = "worktree")
+├── stop-request.json           pending stop request (see Stopping a run)
+├── ATTENTION                   human-readable alerts appended by gates
+├── crash.txt                   traceback of an unexpected engine exception
+├── feedback/<story>-<n>.md     verification-failure feedback handed to the next session
+├── deferred/<story>/           stashed spec of a deferred story
+├── failed/<unit>/changes.patch diff of a dropped unit
+├── resolve/<story>/            escalation context.json and the resolve agent's resolution.json
+├── ctl-window                  TUI: the control window last opened for this run
+├── decisions.json              sweep runs: run-scoped triage decisions
+└── bundles/<name>/intent.md    sweep runs: per-bundle intent
+```
+
+Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `logs/` appear only when the run reaches the step that writes them. Plugins may add their own files.
+
+- **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock; `bmad-loop status` reads it.
+- **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start`. Written by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
+- **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts.
+
+## Task directory
+
+`tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.
+
+| File                      | Written by        | Contents                                                                              |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------- |
+| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                             |
+| `result.json`             | session           | the session's result contract (verdict, escalations)                                  |
+| `escalation.json`         | sweep session     | escalations raised during triage                                                      |
+| `heartbeat.json`          | adapter           | proof of life (above)                                                                 |
+| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                |
+| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification) |
+| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript                                           |
+
+`result.json` and `escalation.json` are the shared cycle artifacts (`journal.TASK_CYCLE_ARTIFACTS`). Both built-in adapters delete them before launching a session, so a reused task id never inherits a previous session's result. Adapters refuse a task directory that is a symlink or junction, and an adapter-written file (heartbeat, breadcrumb logs, `messages.json`, session logs) that is a link or special file.
+
+## Run ids
+
+A run id is `YYYYMMDD-HHMMSS-<4 hex>` in local time, for example `20261012-011529-6a63`. The segment after the last `-` is the short ref used by [run references](cli.md#run-references). Retention reads the run's age from the timestamp prefix.
+
+## Multiplexer sessions
+
+| Object          | Name                                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| agent session   | `bmad-loop-<run-id>`, one per run, tagged with the project key (`@bmad_project`); multiplexer-driven adapters only (opencode runs none) |
+| agent window    | one per agent session, named after the task id (last 40 characters); its pane is piped to `logs/<task_id>.log`                          |
+| control session | `bmad-loop-ctl` on tmux; `bmad-loop-ctl-<16 hex>` on psmux (derived from the per-project registry)                                      |
+| control window  | `<kind>-<run-id>`, where `kind` is `run`, `sweep`, `resume` or `resolve`; opened by the TUI, parks after the command exits              |
+
+Teardown:
+
+| Event                                    | Agent session `bmad-loop-<run-id>`                                  |
+| ---------------------------------------- | ------------------------------------------------------------------- |
+| an agent session ends                    | its window is killed; the session is kept                           |
+| run finishes, or a graceful stop ends it | killed when `[adapter] cleanup_session_on_finish` is true (default) |
+| hard stop, SIGTERM or SIGINT             | killed                                                              |
+| engine crash                             | killed; `crash.txt` written; run marked `crashed`                   |
+| run pauses                               | kept                                                                |
+| engine process dies                      | left behind (the run reads as `interrupted`)                        |
+| `resume`                                 | a leftover session is killed before the relaunch                    |
+| `bmad-loop cleanup` / TUI `c`            | killed for this project's runs whose engine is not provably alive   |
+
+## Derived run status
+
+`list` and the TUI show the first status that applies:
+
+1. `finished` — `state.json` has `finished`
+2. `paused` — `state.json` has a non-null `paused_reason`
+3. `stopped` — `state.json` has `stopped`
+4. `crashed` — `state.json` has `crashed`
+5. `running` — the engine process is alive
+6. `interrupted` — the engine process is dead
+7. `unknown` — engine liveness cannot be determined, or `state.json` cannot be read
+
+## Stopping a run
+
+Both stop modes write `stop-request.json` (`{"requested_at": …, "mode": "hard" | "graceful"}`) into the run directory; the engine consumes it.
+
+|                  | Hard: `bmad-loop stop` (TUI `x`)                                                        | Graceful: `bmad-loop stop --graceful` (TUI `S`)                                   |
+| ---------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Request          | replaces any pending request                                                            | lodged only if no request is pending                                              |
+| Signal           | SIGTERM to the engine; force-kill after 10 s only if the process identity still matches | none                                                                              |
+| Engine honors it | at the next item boundary, and mid-session (the session is aborted)                     | at the next item boundary; the in-flight story or bundle completes through commit |
+| Agent session    | always killed                                                                           | killed under `[adapter] cleanup_session_on_finish`                                |
+| Auto-sweeps      | —                                                                                       | suppressed                                                                        |
+| End state        | `stopped`, resumable                                                                    | `stopped`, resumable from the next item                                           |
+
+- `stop --cancel-graceful` removes a pending request of either mode.
+- `resume` discards any pending request before restarting the engine.
+- The engine treats SIGTERM and SIGINT (Ctrl+C in its terminal) as a hard stop. On native Windows it ignores console Ctrl+C / Ctrl+Break; use `bmad-loop stop`.
+- A request still pending when the engine exits is deleted and journaled as `stop-request-discarded`.
+
+## Reclaiming sessions and disk
+
+|               | `cleanup`                                                                                                    | `clean`                                                                                                                                                                                                                | `delete <run>`                                                                                                                     | `archive <run>`                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Reclaims      | multiplexer sessions and windows                                                                             | disk, per `[cleanup]`                                                                                                                                                                                                  | one run                                                                                                                            | one run                                                              |
+| Removes       | `bmad-loop-<run-id>` sessions of this project's runs, and parked control windows whose run is no longer live | leaked worktrees; runs past retention are trimmed then archived (or deleted with `--hard` / `archive_old = false`); runs inside retention are trimmed when `trim_artifacts` is set; orphaned control-plane directories | the run directory, its git worktree entries, its control-plane directory                                                           | same as `delete`, after writing `.bmad-loop/archive/<run-id>.tar.gz` |
+| Eligible runs | engine not provably alive (any status, including paused, and runs whose directory is gone)                   | `finished` or `stopped`, engine not provably alive                                                                                                                                                                     | any                                                                                                                                | any                                                                  |
+| Never touches | live runs, other projects' sessions and windows, the window you run it from                                  | `--keep` runs, paused / crashed / interrupted / running runs, runs whose agent session may be live                                                                                                                     | a live engine or agent session; `--force` hard-stops a live engine first and skips the session guard (the session is left running) | same as `delete`                                                     |
+| TUI           | `c`                                                                                                          | —                                                                                                                                                                                                                      | `D`                                                                                                                                | `A`                                                                  |
+
+- "Trimmed" means the heavy `worktrees/` and `verify/` entries are removed; a trimmed run stays resumable.
+- Retention: concluded runs are counted oldest first; all but the newest `[cleanup] run_retention` (or `clean --retain N`) are past retention. When `retention_days` is above 0, a run must also be older than that many days.
+- Unverifiable engine liveness produces a warning; it does not block.
+- `[cleanup] auto_clean_on_finish` makes each `run` and `sweep` start by tearing down worktrees left under finished runs.
+
+See the [`[cleanup]` settings](configuration.md#cleanup).

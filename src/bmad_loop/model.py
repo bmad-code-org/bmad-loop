@@ -1191,7 +1191,7 @@ class RunState:
     # only surviving pin:
     #   * the state root is keyed by the project's RESOLVED PATH (`runs.project_tag`),
     #     so moving or renaming the project keys the run somewhere new and orphans
-    #     its state subtree (FEATURES.md documents the GC half of this). state.json
+    #     its state subtree (docs/reference/run-state.md documents the GC half of this). state.json
     #     lives in the run dir and travels with it. Same for a BMAD_LOOP_STATE_DIR
     #     that changes between launch and resume.
     #   * a run PAUSED before #498 has its baseline here and nowhere else; the first

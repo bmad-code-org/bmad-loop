@@ -126,9 +126,11 @@ def test_extra_less_install_core_works_and_tui_hints(tmp_path):
     """The core CLI surface works with the ``[tui]`` extra absent (#650).
 
     A core-only ``uv tool install bmad-loop`` has no pyte/rich/textual/tomlkit, but
-    every test job installs ``--all-extras`` and the packaging job's isolated wheel
-    run only calls ``--version`` — which argparse answers before any subcommand code
-    imports. That blind spot let ``ls`` crash on a missing ``pyte`` for 23 releases.
+    every test job installs ``--all-extras``, and a wheel run of only ``--version``
+    is answered by argparse before any subcommand code imports. That blind spot let
+    ``ls`` crash on a missing ``pyte`` for 23 releases. The packaging job now also
+    runs ``bmad-loop list`` from the isolated wheel, the same floor at install level;
+    this test is the in-suite half that every ``--all-extras`` job would otherwise miss.
     So: a fresh interpreter (the subprocess *is* the test, per this module's header)
     installs an import-system blocker for those four packages, proves the blocker
     bites, then runs the paths a core-only install actually takes.

@@ -3,8 +3,8 @@
 These operator/test override knobs used to be read inline at scattered call
 sites (`engine`, `adapters.multiplexer`, `cli`, `process_host`), which left them
 undiscoverable and undocumented. This module is the one place each is named,
-typed, and given a reader; the operator-facing table lives in the README under
-"Environment variables".
+typed, and given a reader; the operator-facing table lives in
+`docs/reference/configuration.md` under "Environment variables".
 
 Each reader preserves its call site's exact semantics — same parse, same
 fallback — so routing a site through here changes nothing observable. Only the

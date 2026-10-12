@@ -5685,7 +5685,7 @@ def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
     # Only a negative lookup is confirmed (DW-459); a live or unaskable session
     # never reaches the listing.
     assert adapter.mux.listed == ([adapter.session_name] if has_session is False else [])
-    # The durable half of the diagnosis: CHANGELOG and FEATURES both promise this
+    # The durable half of the diagnosis: the CHANGELOG promises this
     # crumb, and without an assertion deleting the write keeps the suite green.
     crumbs = _lifecycle_events(adapter, "session-vanished")
     assert len(crumbs) == (1 if expect_vanished else 0)

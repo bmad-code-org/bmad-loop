@@ -8495,8 +8495,8 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
     used to `return` inside the `except` and drop the whole family — including
     `stale-restore-commits`, which `cli._echo_rearm_events`' own docstring calls the one
     record a human must act on. The two surfaces had been unified on ROUTING while
-    still drifting on the abort path, and `docs/FEATURES.md` claimed they could not
-    drift at all.
+    still drifting on the abort path, while the docs claimed they could not drift
+    at all.
 
     Ablation: move the `self._echo_rearm_events(...)` call out of the `finally` and back
     below the `try`, and this reddens — the commits warning never fires — while

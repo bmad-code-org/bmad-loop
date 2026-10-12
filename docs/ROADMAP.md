@@ -9,79 +9,27 @@ Status legend: **planned** (agreed, not started) · **in progress** (started; so
 
 ## Native Windows multiplexer backend
 
-**Status:** in progress — the platform seams and a native-Windows backend (`psmux`, held by a real-Windows live gate) have **shipped in-tree**; still open are the second tmux-family backend `tmux-windows` (#85), herdr's win32 launch path, and the open questions at the end of this section · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; availability-aware backend selection + `bmad-loop mux`, #87; out-of-tree backend discovery via `bmad_loop.mux_backends` entry points; original seam v0.7.0) · a first non-tmux-family, native-Windows-capable backend — **herdr** — ships end-to-end on POSIX as the external [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) (the win32 `agent.start` launch path is tracked there)
+**Status:** in progress — the platform seams and the experimental `psmux` backend ship in-tree; a second tmux-family backend and herdr's win32 launch path are still open.
 
-The orchestrator no longer fuses tmux into the engine. All session/window/pane operations
-go through a single `TerminalMultiplexer` ABC (`src/bmad_loop/adapters/multiplexer.py`),
-obtained from `get_multiplexer()`; the tmux backend — argv + spawn primitive in
-`BaseTmuxBackend` (`adapters/tmux_base.py`), POSIX leaf `TmuxMultiplexer`
-(`adapters/tmux_backend.py`) — is the **only** place allowed to shell out to `tmux`, and it
-quarantines the POSIX `sh -c` parked-window trailer. Backends now self-**register**
-(`register_multiplexer`) rather than being hardcoded into `get_multiplexer()`, and selection
-(#87) is availability-aware with a dev-choosable persisted pick: `BMAD_LOOP_MUX_BACKEND` env
-var → the machine-scoped `[mux] backend` policy key (`bmad-loop mux set <name>`; policy.toml
-is gitignored) → the platform default (win32: `psmux`, elsewhere: `tmux`) when installed →
-the first registered platform match that is `available()`. The process-lifecycle POSIX-isms moved behind a
-matching seam, `ProcessHost` (`src/bmad_loop/process_host.py`): `terminate` / `force_kill` /
-`is_alive` / `identity` (a PID-reuse guard) plus `hook_interpreter()` (so hook registration
-never branches on platform), registered the same way (`register_process_host`,
-`BMAD_LOOP_PROCESS_HOST`); `WindowsProcessHost` already ships. `bmad-loop validate` runs a
-`platform_preflight(project)` (`runsetup.py`) that reports the selected backend's readiness and names the process
-host — so a new OS surfaces in preflight by registering, not by a `validate` edit. The Unity
-plugin's `/proc`/`/tmp`/`cp -a`/symlink primitives degrade off Linux (with `psutil` from the
-optional `non-linux` extra) and its pid lifecycle now delegates to `ProcessHost`; everything is
-held by a CI portability guard (`tests/test_portability_guard.py`). **WSL already works today**
-— it _is_ Linux, so it takes every fast path unchanged; this is purely about a future _native_
-Windows host.
-
-Three native-Windows candidates now exist, and they are **not stages of one plan**.
-Two are **sibling tmux-family backends**: `psmux` has **shipped in-tree** (drives
-psmux's tmux-compatible CLI through its own `psmux` binary, via pwsh) while
-`tmux-windows` (#85; drives the tmux-windows port) is still in flight — both subclass
-`BaseTmuxBackend` and both register for `win32`, which is why selection is
-availability-aware with discriminating `available()` probes (psmux →
-`which("psmux") and which("pwsh")` plus a version gate requiring psmux 3.3.8 or newer
-([why](multiplexer-backends.md#psmux-native-windows-experimental)); tmux-windows →
-`which("tmux") and not which("psmux")`) and an explicit `bmad-loop mux set <name>` tie-break.
-
-The third — **herdr** — has **shipped** end-to-end on POSIX (engine run path +
-TUI-launch surface), and now lives **out-of-tree** as the reference external adapter,
-[pbean/bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr)
-(developed in-tree in #136/#137, extracted pre-release per core-team direction; it
-co-installs with bmad-loop and self-registers via the `bmad_loop.mux_backends`
-entry-point group). It is a different-binary-family backend: it implements
-`TerminalMultiplexer` fresh over herdr's workspace/tab/pane model rather than
-subclassing `BaseTmuxBackend`, and probes `which("herdr")`, so it is
-pairwise-discriminating against the tmux family by construction (no `mux set`
-tie-break needed to tell them apart). It registers with `matches = True` (all
-platforms), which keeps the door open for native Windows without disturbing POSIX. On
-POSIX, tmux stays the platform default, so herdr activates only on an explicit
-`BMAD_LOOP_MUX_BACKEND=herdr` / `bmad-loop mux set herdr`. On **win32**,
-`_PLATFORM_DEFAULTS` is **untouched** — psmux remains the declared win32 default — so
-herdr is picked only by **first-match** (the fourth precedence step) when installed and
-`available()` and no higher-priority backend is: once psmux (or tmux-windows) ships and
-registers for win32, the win32 default reasserts and outranks herdr's first-match
-automatically, no code change. herdr's `exec` launch is POSIX-only for now; the Windows
-launch path (herdr's `agent.start`) is tracked in
-[the adapter repo's issues](https://github.com/pbean/bmad-loop-adapter-herdr/issues),
-and the Phase-0 characterization must be re-run on a real Windows host before #92 is claimed.
-
-The seams are designed so each backend slots in as **new files plus one registration line,
-with no change to the adapters, `runs.py`, `tui/launch.py`, `probe.py`, `tui/data.py`, or
-`cli.py`'s `validate`** (`WindowsProcessHost` and its hook interpreter are already in place
-and registered; herdr proved this end to end — one registration line and one sanctioned
-`probe.py` gate fix, zero portability-guard allowlist changes; the extraction then proved
-the **fully external** path — the same registration arriving via entry-point discovery,
-zero core files). The end-to-end port path —
-both build options, the test-override env vars, and exactly what a native-Windows port costs —
-is documented in [Porting bmad-loop to a new OS](porting-to-a-new-os.md); the deep transport
-contract is in the
+What ships today is documented elsewhere: backend selection and psmux operation in
+[multiplexer backends](multiplexer-backends.md), the seams and the reference native-Windows port
+in [Porting bmad-loop to a new OS](porting-to-a-new-os.md), and the per-method obligations in the
 [adapter authoring guide](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
+WSL is Linux and needs none of this.
 
-**Open questions:** what hosts the windows on native Windows (Windows Terminal panes, a
-ConPTY-based manager, a headless process supervisor?); how attach/detach and the parked
-exit-status window map without a POSIX shell; and the Windows-Unity cache-path correctness
-left as a documented follow-up in Phase 4.
+Open work:
+
+- **`tmux-windows` backend** — a sibling of psmux that drives the tmux-windows port. It would
+  subclass `BaseTmuxBackend` and register for `win32`; its `available()` probe must stay
+  discriminating against psmux (`tmux` present, `psmux` absent), with `bmad-loop mux set <name>`
+  as the tie-break.
+- **herdr on native Windows** — the external
+  [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) backend runs on
+  POSIX only; its win32 launch path is tracked in that repo. psmux stays the declared win32
+  default, so herdr is picked there only by first available match.
+
+**Open questions:** how attach/detach and the parked exit-status window map without a POSIX shell
+on hosts other than psmux, and the Unity plugin's cache-path correctness on native Windows.
 
 ---
 
@@ -109,9 +57,12 @@ multiple in-flight units per run.
 
 **Status:** planned · **Blocked-by:** retro-item detail isn't standardized yet
 
-The parser now recognizes `epic-{N}-retro-item-{M}-{slug}` keys in `sprint-status.yaml`
+The parser recognizes `epic-{N}-retro-item-{M}-{slug}` keys in `sprint-status.yaml`
 (`src/bmad_loop/sprintstatus.py` → `RetroItem` / `SprintStatus.retro_items`), so the
-`sprint-status-unknown-keys` warning no longer fires. They are tracked but **not driven** as work.
+`sprint-status-unknown-keys` warning does not fire. They are tracked but **not driven** as work.
+Separately, a fresh sweep already files a retrospective's `action_items:` list into the
+deferred-work ledger ([Retro action items](FEATURES.md#retro-action-items)); this entry is about
+driving the `epic-N-retro-item-*` board keys themselves.
 
 The goal is to run actionable (`backlog`) retro items through the dev → review → commit pipeline,
 the same way deferred-work sweeps already run.
@@ -122,7 +73,7 @@ branch, a retro-item intent fed to the `bmad-build-auto` primitive, and `verify`
 the bundle verifiers. Story runs stay untouched.
 
 **Why blocked:** retro-item _detail_ is scattered — some lives in the epic retro-doc Action-Items
-table (`epic-N-retro-YYYY-MM-DD.md`), some in `deferred-work.md` (DW-N) entries, some in ad-hoc
+table (`epic-N-retro-YYYY-MM-DD.md`), some in `deferred-work.md` entries, some in ad-hoc
 `spec-*.md` files; only one epic has an `epic-N-action-items.md`. A deterministic key→file map isn't
 viable, so automation needs an LLM triage step (like sweep's) to locate/extract each item's intent
 **and** classify out the non-code items (research, docs). **Prerequisite:** standardize where
@@ -136,7 +87,7 @@ reliable enough to trust unattended.
 **Status:** exploring · **Foundation:** experimental opt-in `tea` plugin landed (v0.5.1)
 
 The bundled, **experimental** `tea` plugin (`[plugins] enabled = ["tea"]`, see the
-[TEA plugin guide](tea-plugin-guide.md)) now wires the BMAD Test Architect (TEA) suite —
+[TEA plugin guide](tea-plugin-guide.md)) wires the BMAD Test Architect (TEA) suite —
 `bmad-testarch-test-design`, `-automate`, `-atdd`, `-nfr`, `-trace`, `-test-review`, and the
 `bmad-tea` agent — into every run and sweep as **advisory-by-default** quality steps (the three
 gate steps can be flipped to blocking). It's experimental: the workflows ride the generic
@@ -155,14 +106,14 @@ Which testarch skills become orchestrated vs. stay interactive?
 
 ## Integrate BMAD GDS game-test items
 
-**Status:** exploring · **Foundation:** opt-in game-engine layer landed (Unity, shared + per_worktree), now riding the general plugin system
+**Status:** exploring · **Foundation:** opt-in game-engine layer landed (Unity, shared + per_worktree) on the general plugin system
 
-The opt-in Unity plugin (`docs/FEATURES.md` → "Game-engine projects"), enabled with
+The opt-in [Unity plugin](FEATURES.md#unity-plugin), enabled with
 `[plugins] enabled = ["unity"]`, already lets a Unity project run its dev/sweep cycle against a
 live Editor MCP in **shared** mode (agent works in place on the operator's open Editor; a readiness
 gate blocks until the Editor + MCP are up) and in **per_worktree** mode (one managed Editor per
 worktree, with reflink/CoW `Library` priming, setup/teardown hooks, and MCP-skill seeding via
-`seed_globs`). The game-engine layer is no longer bespoke core code — it's a plugin built on the
+`seed_globs`). The game-engine layer is a plugin built on the
 general [plugin system](plugin-authoring-guide.md) (the legacy `[engine]` block is a deprecated
 compatibility shim, folded onto `[plugins.unity]` at load time). Next steps: batchmode `verify_cmd`
 and Godot/Unreal plugins on the same `plugin.toml`+scripts shape — the authoring path is documented
@@ -180,3 +131,14 @@ implement → test → review loop.
 **Open questions:** how do GDS workflow artifacts map onto the orchestrator's sprint-status/work-item
 model? Does GDS need its own run type, or can the test-design/automation integration above generalize
 to cover it? Depends on the testarch integration landing first.
+
+---
+
+## Cursor CLI profile
+
+**Status:** blocked · **Blocked-by:** Cursor CLI exposes no token usage
+
+Cursor CLI's `sessionStart`/`stop` hooks fire, so a profile using the window-death fallback and
+`usage_parser = "none"` is feasible. Two gaps remain: token usage is not exposed anywhere (hooks,
+JSON output or on-disk chats), so budgets cannot count it, and slash-command expansion of the
+initial prompt argument is unverified.
