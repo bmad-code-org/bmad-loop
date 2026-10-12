@@ -164,7 +164,9 @@ class GitNotARepositoryError(GitError):
 
 # Git's repository-discovery failure (`setup.c`), stable under `_run_git`'s
 # `LC_ALL=C`, matched at the START of a stderr line. The trailing "(or any " is
-# what excludes the gitfile form (`not a git repository: <path>`).
+# what excludes a broken gitfile's pre-2.56 form (`not a git repository: <path>`);
+# git 2.56+ words it `gitfile does not point to a valid repository: <path>`, which
+# the prefix misses outright.
 _NOT_A_REPOSITORY_PREFIX = "fatal: not a git repository (or any "
 
 
@@ -2081,6 +2083,24 @@ def _run_git(
         raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
     except OSError as exc:
         raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
+
+
+def _snapshot_ident_env() -> dict[str, str]:
+    """``os.environ`` with the synthetic ``bmad-loop`` identity a preservation commit
+    is made under, so it succeeds with no git user configured, and WITHOUT an
+    inherited ``GIT_AUTHOR_DATE``/``GIT_COMMITTER_DATE``: preserve-ref retention ranks
+    refs by ``committerdate``, so a snapshot back-dated by the launching shell would
+    be the first one pruned however recently it was taken."""
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")
+    }
+    env.update(
+        GIT_AUTHOR_NAME="bmad-loop",
+        GIT_AUTHOR_EMAIL="bmad-loop@localhost",
+        GIT_COMMITTER_NAME="bmad-loop",
+        GIT_COMMITTER_EMAIL="bmad-loop@localhost",
+    )
+    return env
 
 
 def _git(repo: Path, *args: str) -> tuple[int, str]:
@@ -4819,7 +4839,8 @@ def path_clean(repo: Path, rel: str, *, env: dict[str, str] | None = None) -> bo
     `LC_ALL=C`, and it is matched at the start of a stderr line alone, so neither a
     porcelain record nor operator path text quoted mid-line (`cannot change to
     '<repo>'`) can forge it. The match is deliberately that narrow: a broken gitfile
-    (`not a git repository: <path>`) or a `safe.directory` refusal is a real
+    (`not a git repository: <path>`, or from git 2.56 `gitfile does not point to a
+    valid repository: <path>`) or a `safe.directory` refusal is a real
     repository's fault, which a caller that degrades on an absent repository must
     still see.
 
@@ -6370,13 +6391,7 @@ def snapshot_worktree(
     # A synthetic identity (merged over os.environ) so the snapshot commit succeeds
     # with no git user.name/user.email configured — else the best-effort caller would
     # catch the GitError and reset past the very work this ref exists to preserve.
-    ident = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "bmad-loop",
-        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
-        "GIT_COMMITTER_NAME": "bmad-loop",
-        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
-    }
+    ident = _snapshot_ident_env()
     rc, snap, detail = _git_out(
         repo, "commit-tree", tree, "-p", head, "-m", "attempt worktree snapshot", env=ident
     )
@@ -6386,6 +6401,27 @@ def snapshot_worktree(
     if rc != 0:
         raise GitError(f"git update-ref {ref_name} {snap[:12]} failed in {repo}: {out}")
     return ref_name
+
+
+def snapshot_commit(repo: Path, ref_name: str, head: str, message: str) -> str:
+    """Create the FULL ref ``ref_name`` at a fresh commit of ``head``'s tree parented
+    on ``head``, and return the new commit's sha. Same content and ancestry as
+    pointing the ref at ``head`` itself, but stamped with the current committer
+    date: preserve-ref retention ranks refs by ``committerdate``, so a ref at an
+    old commit would be pruned first however recently it was created. Synthetic
+    ``bmad-loop`` identity as in :func:`snapshot_worktree`; the empty old-value
+    refuses an existing ``ref_name`` rather than overwrite it. Raises
+    :class:`GitError`."""
+    ident = _snapshot_ident_env()
+    rc, snap, detail = _git_out(
+        repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", message, env=ident
+    )
+    if rc != 0:
+        raise GitError(f"git commit-tree (snapshot of {head[:12]}) failed in {repo}: {detail}")
+    rc, out = _git(repo, "update-ref", ref_name, snap, "")
+    if rc != 0:
+        raise GitError(f"git update-ref {ref_name} {snap[:12]} failed in {repo}: {out}")
+    return snap
 
 
 class PreserveRefExhaustedError(GitError):
@@ -6415,6 +6451,21 @@ def ref_exists(repo: Path, refname: str) -> bool:
     run" for "the name is free"."""
     rc, _ = _git(repo, "show-ref", "--verify", "--quiet", refname)
     return rc == 0
+
+
+def list_refs(repo: Path, prefix: str) -> list[str]:
+    """The FULL refnames under the ref hierarchy ``prefix`` (e.g.
+    ``refs/attempt-preserve-dirty/``), newest committer date first. ``prefix`` must
+    end at a ``/``: for-each-ref matches a plain pattern only up to a slash, so a
+    partial last component lists nothing. Reads stdout alone, as :func:`_prune_refs` does
+    (#442). Raises :class:`GitError` when the listing fails — an empty list is
+    always a real "none"."""
+    rc, out, detail = _git_out(
+        repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname)", prefix
+    )
+    if rc != 0:
+        raise GitError(f"git for-each-ref {prefix} failed in {repo}: {detail}")
+    return [line for line in out.splitlines() if line]
 
 
 @dataclass(frozen=True)
@@ -6738,6 +6789,34 @@ def current_branch(repo: Path) -> str:
 def branch_exists(repo: Path, name: str) -> bool:
     rc, _ = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{name}")
     return rc == 0
+
+
+def branch_exists_checked(repo: Path, name: str) -> bool:
+    """:func:`branch_exists` for a caller that records the answer: a listing that
+    fails raises :class:`GitError` instead of reading as "gone". `show-ref --verify`
+    exits non-zero for a missing ref and for a repository it cannot read alike, so
+    this lists with `for-each-ref` (rc 0 with no line is a real "absent") and matches
+    the exact refname, since the pattern also matches refs nested beneath it."""
+    return ref_exists_checked(repo, f"refs/heads/{name}")
+
+
+def ref_exists_checked(repo: Path, refname: str) -> bool:
+    """:func:`ref_exists` for a caller that records the answer, for any FULL
+    ``refname``: as :func:`branch_exists_checked`, a listing that fails raises
+    :class:`GitError` rather than reading as "absent"."""
+    rc, out, detail = _git_out(repo, "for-each-ref", "--format=%(refname)", refname)
+    if rc != 0:
+        raise GitError(f"git for-each-ref {refname} failed in {repo}: {detail}")
+    return refname in out.splitlines()
+
+
+def create_ref(repo: Path, refname: str, revision: str) -> None:
+    """Create the FULL ref ``refname`` at ``revision``. The empty old-value makes
+    `update-ref` refuse a ref that already exists rather than overwrite it. Raises
+    :class:`GitError`."""
+    rc, out = _git(repo, "update-ref", refname, revision, "")
+    if rc != 0:
+        raise GitError(f"git update-ref {refname} {revision[:12]} failed in {repo}: {out}")
 
 
 def branch_checkout_path(repo: Path, branch: str) -> Path | None:
@@ -7247,13 +7326,7 @@ def _preserve_collision_paths(repo: Path, paths: list[str]) -> str | None:
         raise GitError(f"git rev-parse {head}^{{tree}} failed in {repo}: {detail}")
     if tree == head_tree:
         return None  # the working tree already matches HEAD at every path — no bytes to park
-    ident = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "bmad-loop",
-        "GIT_AUTHOR_EMAIL": "bmad-loop@localhost",
-        "GIT_COMMITTER_NAME": "bmad-loop",
-        "GIT_COMMITTER_EMAIL": "bmad-loop@localhost",
-    }
+    ident = _snapshot_ident_env()
     rc, snap, detail = _git_out(
         repo,
         "commit-tree",

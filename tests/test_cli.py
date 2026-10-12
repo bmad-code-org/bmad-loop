@@ -95,6 +95,16 @@ def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     (bmad_loop_dir / "policy.toml").write_text(text)
 
 
+def _python_verify_policy(code: str) -> str:
+    """A `[verify]` policy running `code` under the test interpreter, never a bare
+    `python`: a stock Ubuntu (WSL2 included) ships only `python3`, where the bare
+    name exits 127 and a "this command fails" row would pass for the wrong reason."""
+    command = f'"{sys.executable}" -c "{code}"'
+    # ensure_ascii=False: a non-BMP path char would otherwise become a JSON surrogate
+    # pair escape, which TOML rejects.
+    return f"[verify]\ncommands = [{json.dumps(command, ensure_ascii=False)}]\n"
+
+
 def _config_pin(project) -> str:
     """The host-exec config digest for a sandbox project as it stands — the launch
     baseline `cmd_run` / `_resume_paused_run` pin (#461 point 4)."""
@@ -4885,6 +4895,25 @@ def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
 
     assert f"`bmad-loop plugins enable {TRUST_PLUGIN}`" in capsys.readouterr().err
     assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_resolve_abandon_is_not_judged_by_plugin_trust(project, monkeypatch, capsys):
+    """DW-535: `--abandon` closes the run and launches nothing — no engine, session
+    or plugin — so an ungranted enabled plugin must not strand a superseded replay.
+
+    `_resolve_abandon` is stubbed to 0, so the rc can only come from reaching it.
+    Ablation: drop the `abandon` exemption from the trust preflight in
+    `cmd_resolve` and the rc is 1 with the plugin-enable steer."""
+    install_bmad_config(project)
+    _escalated_run(project.project, "r1")
+    _write_trust_plugin(project)
+    _write_policy(project.project, f'[plugins]\nenabled = ["{TRUST_PLUGIN}"]\n')
+    monkeypatch.setattr(cli, "_resolve_abandon", lambda *a, **k: 0)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--abandon"]
+    assert cli.main(argv) == 0
+
+    assert "plugins enable" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("shape", ["inside", "sibling"])
@@ -13981,12 +14010,13 @@ def test_confirm_reverify_failure_blocks_the_flip(project, capsys, monkeypatch):
     install_bmad_config(project)
     sp = _park_story(project)
     before = sp.read_text()
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"raise SystemExit(3)\\""]\n')
+    _write_policy(project.project, _python_verify_policy("raise SystemExit(3)"))
     monkeypatch.setattr(cli, "_confirm", lambda _q: True)
 
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
     captured = capsys.readouterr()
     assert "--reverify failed" in captured.err and "NOT confirmed" in captured.err
+    assert "failed (rc 3)" in captured.err  # the command ran; not a can't-spawn rc
     assert sp.read_text() == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
@@ -13997,7 +14027,7 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
 
     install_bmad_config(project)
     _park_story(project)
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    _write_policy(project.project, _python_verify_policy("pass"))
     monkeypatch.setattr(cli, "_confirm", lambda _q: True)
 
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 0
@@ -14078,7 +14108,7 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     write_repo_root_override(project, missing)
     sp = _park_story(project)
     before = sp.read_text()
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    _write_policy(project.project, _python_verify_policy("pass"))
     monkeypatch.setattr(cli, "_confirm", lambda _q: True)
 
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
@@ -14123,7 +14153,7 @@ def test_reverify_does_not_stutter_the_could_not_run_prefix(project, tmp_path):
     cwd-only interpolation, or trim `spawn_error` to drop its `: {exc}` half, and
     the diagnosis assertions redden instead.
     """
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    _write_policy(project.project, _python_verify_policy("pass"))
     missing = tmp_path / "no-such-cwd"
 
     reason = cli._reverify(project.project, missing)
@@ -14967,12 +14997,13 @@ def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, caps
 
     install_bmad_config(project)
     _interrupted_story(project)
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"raise SystemExit(3)\\""]\n')
+    _write_policy(project.project, _python_verify_policy("raise SystemExit(3)"))
     monkeypatch.setattr(cli, "_confirm", lambda _q: True)
 
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
     err = capsys.readouterr().err
     assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert "failed (rc 3)" in err  # the command ran; not a can't-spawn rc
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
 
@@ -14989,7 +15020,7 @@ def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
     write_repo_root_override(project, missing)
     spec = _interrupted_story(project)
     before = spec.read_text(encoding="utf-8")
-    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    _write_policy(project.project, _python_verify_policy("pass"))
     monkeypatch.setattr(cli, "_confirm", lambda _q: True)
 
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1

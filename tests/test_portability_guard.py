@@ -268,12 +268,15 @@ SAVE_STATE_CALLERS = {
     ("runsetup.py", "compose_sweep"),
     # DW-525: the replay run's first publication, outside the finished run's lock
     ("unitreplay.py", "_publish_replay_run"),
+    # DW-535: the abandoned replay run's `finished` publication, under its own lock
+    ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
+    ("cli.py", "_resolve_abandon"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
@@ -287,6 +290,8 @@ RUN_STATE_TRANSACTIONS = {
     ("tui/app.py", "_do_rearm"),
     # DW-525: the locked re-check + worktree move under the FINISHED run's lock
     ("unitreplay.py", "mint_replay_run"),
+    # DW-535: the re-check, snapshot, teardown and `finished` write of an abandon
+    ("unitreplay.py", "abandon_replay_run"),
 }
 
 # The two refusal surfaces review iteration 6 kept re-finding by hand, enumerated so
@@ -318,6 +323,8 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
     ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
+    # DW-535: abandon over a kept unit moved under the run dir; test_engine_worktree.py
+    ("unitreplay.py", "_refuse_worktrees_left_under_run"),
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
     ("workspace.py", "_refuse_foreign_checkout"),
     ("worktree_flow.py", "_refuse_integrated_artifacts"),
@@ -515,6 +522,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "attempt",
         "blocked",
         "blocking",
+        # DW-535: whether `replay-abandoned`'s unit branch still existed after the
+        # teardown (a bare boolean; the branch name itself aliases as `branch`).
+        "branch_kept",
         "budget",
         "budget_mode",
         "budget_weighted",
@@ -774,6 +784,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "record",
         "redrive",
         "ref",
+        # DW-535: `replay-abandoned`'s flag that a retry's recovered `-abandon` ref
+        # was pruned since the earlier attempt parked it (a bare boolean).
+        "ref_pruned",
         "refiled",
         "refs",
         # `sweep-ledger-commit-refused` (DW-199/203/205): WHY `_commit_ledger`
@@ -1269,6 +1282,15 @@ JOURNAL_KINDS = frozenset(
         # `replay_of` is benign, and `path` (the board) and `error` are presence-only
         # in `diagnostics._JOURNAL_DROP_FIELDS`.
         "replay-merge-refused",
+        # DW-535. An escalated replay run closed by `resolve <replay-run> --abandon`,
+        # from `unitreplay.abandon_replay_run`. `story_key` and `branch` alias by name;
+        # `replay_of`, `worktree`, `ref` (the `-abandon` snapshot, or null),
+        # `ref_pruned` and `branch_kept` are benign.
+        "replay-abandoned",
+        # DW-535. The snapshot ref `unitreplay.abandon_replay_run` parked, journaled
+        # BEFORE the teardown so a retry after a post-teardown fault recovers it.
+        # `story_key` aliases by name; `worktree` and `ref` are benign.
+        "replay-abandon-snapshot",
         # A worktree unit's merge paused because the main checkout is not on the
         # run's pinned target (`WorktreeFlow.require_target_checked_out`). `story_key`,
         # `branch`, `target_branch` and `checked_out_branch` alias by name.
