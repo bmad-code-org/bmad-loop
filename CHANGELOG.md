@@ -59,6 +59,8 @@ breaking changes may land in a minor release.
   first.
 - Fix `bmad-loop delete` leaving a paused run's kept worktree registered with git
   (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
+- Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
+  has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883).
 
 ### Security
 
