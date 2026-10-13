@@ -43,7 +43,21 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Run the live psmux gate
+        # The blocking gate's runner and timeout reserve, so the metrics below
+        # exist even when the gate is stopped at the job's deadline.
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q tests/test_psmux_live.py --durations=15
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/live"
+          --timeout 1500
+          -- -q tests/test_psmux_live.py --durations=15
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/live/junit.xml"
+
+      - name: Verify the live gate ran every test
+        # As in ci.yml's aggregator: pytest exits 0 when a live row skips, but a
+        # skip in the live gate means that behaviour was never exercised, so a
+        # green canary would vouch for a release it did not test.
+        if: always()
+        run: uv run python tests/perf_report.py verify-executed "$env:RUNNER_TEMP/test-metrics/live"
