@@ -2520,6 +2520,108 @@ def test_codex_stall_reprobe_death_resolves_at_exit(tmp_path, monkeypatch):
     assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
 
 
+@pytest.mark.parametrize("exit_kind", ["timeout", "abort-top", "abort-after-wait"])
+def test_codex_non_hook_exits_resolve(tmp_path, monkeypatch, exit_kind):
+    """SessionStart came before its rollout existed, and the session then ends
+    on an exit no hook event precedes (timeout, or a hard stop at either poll)
+    before the next heartbeat: the exit itself resolves, so the result carries
+    the rollout.
+
+    Ablation: remove the `try_resolve()` call ahead of that exit's return and
+    the matching case fails."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    home = _codex_home(tmp_path, monkeypatch)
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex")
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    # heartbeat-free after the first tick: its own resolve must not find it
+    monkeypatch.setattr(generic, "HEARTBEAT_INTERVAL_S", 1e9)
+    created: list[Path] = []
+
+    def alive(handle):
+        # past the post-wait poll, so the top-of-loop poll is the one to fire
+        if exit_kind == "abort-top" and created:
+            _lodge_stop_request(adapter, "hard")
+        return True
+
+    adapter._window_alive = alive
+
+    def create_then_exit(call_n):
+        if call_n != 2:
+            return
+        created.append(_write_codex_rollout(home))
+        if exit_kind == "timeout":
+            clock["t"] += 1000.0
+        elif exit_kind == "abort-after-wait":
+            _lodge_stop_request(adapter, "hard")
+
+    adapter.watcher = _ScriptedWatcher(
+        [_hook_event("SessionStart", session_id=CODEX_SESSION)], on_call=create_then_exit
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == ("timeout" if exit_kind == "timeout" else "aborted")
+    assert adapter.watcher.calls == 2
+    assert created
+    assert Path(result.transcript_path) == created[0]
+    assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
+
+
+def test_codex_live_stall_resolves_at_exit(tmp_path, monkeypatch):
+    """The stall exit under a live window: a rollout that appeared after
+    SessionStart, with no hook event since, still rides the stalled result.
+
+    Ablation: move the stall exit's `try_resolve()` back inside the dead-window
+    branch and this fails."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    home = _codex_home(tmp_path, monkeypatch)
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex")
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    monkeypatch.setattr(generic, "HEARTBEAT_INTERVAL_S", 1e9)
+    created: list[Path] = []
+
+    def expire_after_rollout(call_n):
+        if call_n == 3:
+            created.append(_write_codex_rollout(home))
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=CODEX_SESSION),
+            _stop_event("3-1-dev-1", CODEX_SESSION, None),
+        ],
+        on_call=expire_after_rollout,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "stalled"
+    assert created
+    assert Path(result.transcript_path) == created[0]
+    assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
+
+
 def test_non_codex_stop_without_transcript_never_resolves(tmp_path, monkeypatch):
     """Scope pin: only codex-rollout transcripts are resolvable by id. A claude
     Stop with no path stays untracked and crumbs nothing new, even with a codex

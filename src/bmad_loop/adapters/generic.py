@@ -1179,8 +1179,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
         def try_resolve() -> None:
             """Resolve the transcript by session id when no readable one is known.
-            One lookup per call — each hook event, each heartbeat, each
-            window-death exit; a hit becomes the loop's transcript (so every
+            One lookup per call — each hook event, each heartbeat, and before
+            each exit that no hook event just preceded; a hit becomes the loop's transcript (so every
             SessionResult and the budget guard see it) and is crumbed once — the
             ``resolved is None`` gate makes the hit itself one-shot."""
             nonlocal transcript_path, resolved
@@ -1253,6 +1253,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # own Stop may have been read as foreign)
                     foreign_hook_events=foreign_hook_events,
                 )
+                # Every exit resolves first (a SessionStart that came before its
+                # rollout existed, then no further hook event): the exit's
+                # `transcript_path` argument is read before `produced_work()`.
+                try_resolve()
                 return SessionResult(
                     status="timeout",
                     session_id=session_id,
@@ -1277,6 +1281,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # left on disk for the engine to consume and attribute the stop.
             if self._hard_stop_requested():
                 self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                try_resolve()
                 return SessionResult(
                     status="aborted",
                     session_id=session_id,
@@ -1489,6 +1494,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # the pre-#319 outcome, never a worse one.
             if self._hard_stop_requested():
                 self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                try_resolve()
                 return SessionResult(
                     status="aborted",
                     session_id=session_id,
@@ -1613,9 +1619,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
+                    # Both exits below (crashed or stalled) carry the rollout.
+                    try_resolve()
                     if self._probe_liveness(handle, "stall") is False:
-                        # A window-death exit like the top-of-tick one above.
-                        try_resolve()
                         return self._final(
                             handle,
                             spec,
