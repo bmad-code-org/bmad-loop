@@ -46,6 +46,10 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Start bmad-loop's psmux servers with `PSMUX_NO_WARM=1`: their warm pool and hidden
+  `__warm__` standby were never used, and dropping them cuts an idle project from 16 psmux
+  processes and about 935 MiB of summed working sets to 4 and about 175 MiB. The operator's
+  own psmux keeps its pool (#903).
 - Make an un-enabled builtin `[python]` plugin wholly inert: its hooks, workflows and
   seeds no longer run without its module (#496, #497).
 - Run granted project plugins from a verified out-of-tree snapshot: `{scripts}` points

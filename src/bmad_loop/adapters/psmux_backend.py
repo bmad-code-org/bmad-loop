@@ -644,6 +644,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         }
         env["PSMUX_ALLOW_NESTING"] = "1"
+        # psmux's warm pool (spare shells per server) and its hidden `__warm__`
+        # standby server serve only default-shell creates: every window this
+        # backend opens carries a command and every session passes `-c`, so
+        # neither is ever claimed, yet together they cost about 0.75 GiB of
+        # summed working sets per idle project (#903). The server reads this at
+        # boot, and this call is the one that boots it; scoped to the spawn, so
+        # the operator's own psmux keeps its pool. Ceilings: the server's panes
+        # inherit it, so a psmux session started from inside one starts cold;
+        # and a psmux config that says `set -g warm on` re-enables the pool at
+        # load, which stays the operator's call (forcing `warm off` at runtime
+        # would also kill the registry's shared standby).
+        env["PSMUX_NO_WARM"] = "1"
         # The initial window is a window launch too: the same PowerShell floor
         # as `_shell_wrap`, checked before psmux creates anything.
         self._require_pwsh_floor()

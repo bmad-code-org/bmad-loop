@@ -361,6 +361,9 @@ def test_new_session_bypasses_nesting_guard(rec, monkeypatch, tmp_path):
     # the no-op belt: create is verified by a has-session probe afterwards
     assert rec.argv == ["psmux", "has-session", "-t", "=s"]
     assert create_kwargs["env"]["PSMUX_ALLOW_NESTING"] == "1"
+    # the server this call boots keeps no warm pool and spawns no `__warm__`
+    # standby: neither serves a `-c` session or a command-bearing window (#903)
+    assert create_kwargs["env"]["PSMUX_NO_WARM"] == "1"
     # the claude session vars are scrubbed from the create env (the psmux server
     # this call may cold-start would otherwise hand them to every window)
     assert "CLAUDE_CODE_SSE_PORT" not in create_kwargs["env"]
