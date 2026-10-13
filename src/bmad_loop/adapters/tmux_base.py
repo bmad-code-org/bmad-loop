@@ -37,7 +37,14 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .multiplexer import PARKED_BANNER, MultiplexerError, TerminalMultiplexer, fold_version
+from .multiplexer import (
+    PARKED_BANNER,
+    UNSET,
+    MultiplexerError,
+    TerminalMultiplexer,
+    Unset,
+    fold_version,
+)
 
 TMUX_TIMEOUT_S = 30
 # Per-window option value (vs a pane target) telling the parked trailer to detach
@@ -150,6 +157,60 @@ class BaseTmuxBackend(TerminalMultiplexer):
         if check and proc.returncode != 0:
             raise TmuxError(f"{self._BINARY} {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
         return proc
+
+    def _show_environment(
+        self,
+        scopes: list[list[str]],
+        name: str,
+        on_fault: Callable[[str], None] | None,
+        *,
+        fold_case: bool = False,
+    ) -> str | Unset | None:
+        """The ``inherited_env`` parse (#731), shared by the leaves that answer
+        it: ``show-environment <scope> NAME`` is asked of each scope in order,
+        and the first answer wins. Private, so a tmux-family leaf keeps the
+        seam's Unknown default until it names the scopes its binary answers.
+
+        Replies, measured on tmux 3.4 and psmux 3.4.0: ``NAME=value`` is the
+        value (``NAME=`` is a set-empty ``""``), ``-NAME`` is the removal marker
+        (known-unset), and rc 1 with exactly ``unknown variable: NAME`` is a miss
+        in that scope, so the next one is asked; a miss in every scope is
+        known-unset. Anything else — another error such as ``no such session``,
+        a timeout, a missing binary, an unparseable reply — is a fault:
+        ``None``, reported once through ``on_fault``. ``fold_case`` matches the
+        echoed name case-insensitively, for a binary that answers with the
+        spelling it stores (psmux on Windows: ``PATH`` comes back ``Path=``)."""
+
+        def same(echoed: str) -> bool:
+            return echoed.casefold() == name.casefold() if fold_case else echoed == name
+
+        for scope in scopes:
+            argv = ["show-environment", *scope, name]
+            try:
+                proc = self._run(argv, check=False)
+            except (subprocess.SubprocessError, OSError, UnicodeError, TmuxError) as exc:
+                return self._env_fault(argv, str(exc), on_fault)
+            reply = proc.stdout.removesuffix("\n")
+            if proc.returncode == 0:
+                if "\n" not in reply:
+                    if reply.startswith("-") and same(reply[1:]):
+                        return UNSET
+                    echoed, eq, value = reply.partition("=")
+                    if eq and same(echoed):
+                        return value
+                return self._env_fault(argv, f"unexpected reply {reply!r}", on_fault)
+            # A miss is exactly the binary's own line for exactly this name;
+            # anything merely containing the words (a socket path, say) is a fault.
+            if proc.returncode != 1 or proc.stderr.strip() != f"unknown variable: {name}":
+                detail = proc.stderr.strip() or f"exit {proc.returncode}"
+                return self._env_fault(argv, detail, on_fault)
+        return UNSET
+
+    def _env_fault(
+        self, argv: list[str], detail: str, on_fault: Callable[[str], None] | None
+    ) -> None:
+        if on_fault is not None:
+            on_fault(f"{self._BINARY} {' '.join(argv)} failed: {detail}")
 
     def _session_proved_gone(self, proc: subprocess.CompletedProcess[str]) -> bool:
         """Whether a non-zero listing exit PROVES the session no longer exists.

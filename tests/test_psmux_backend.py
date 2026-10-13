@@ -665,19 +665,15 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
         "which",
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8")
-    assert PsmuxMultiplexer().available() is True
-
-    # 3.3.7 and older are refused: 3.3.6 force-kills recycled PIDs on teardown,
-    # and 3.3.7 lacks the fixes this backend's verbs now assume.
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
-    assert PsmuxMultiplexer().available() is False
-
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.6")
-    assert PsmuxMultiplexer().available() is False
-
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.4.0")
     assert PsmuxMultiplexer().available() is True
+
+    # 3.3.8 and older are refused: 3.3.6 force-kills recycled PIDs on teardown,
+    # 3.3.7 lacks the fixes this backend's verbs assume, and 3.3.8 unsets a key
+    # on a `-`-leading value (psmux/psmux#583).
+    for refused in ("3.3.8", "3.3.7", "3.3.6"):
+        monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self, v=refused: f"tmux {v}")
+        assert PsmuxMultiplexer().available() is False
 
     # multi-digit segments compare numerically, not lexicographically
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.10.0")
@@ -687,10 +683,10 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
 
     # a suffixed newer release still clears the strictly-greater gate; a
     # suffixed refused one still fails it (the suffix is not read at all)
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8-rc0")
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.9-rc0")
     assert PsmuxMultiplexer().available() is True
 
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8-rc0")
     assert PsmuxMultiplexer().available() is False
 
     # a two-part compat version (tmux's own format) reads as patch 0
@@ -715,7 +711,7 @@ def test_available_composes_real_version_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"C:\\bin\\{name}.exe")
-    rec = _RecordRun(stdout="tmux 3.3.8\n")
+    rec = _RecordRun(stdout="tmux 3.4.0\n")
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().available() is True
     assert rec.argv == ["psmux", "-V"]
@@ -736,7 +732,7 @@ def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
     )
 
-    for release, expected in (("3.3.8", True), ("3.3.7", False)):
+    for release, expected in (("3.4.0", True), ("3.3.8", False)):
         rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (66cf613 2026-08-18)\n")
         monkeypatch.setattr(tmux_base.subprocess, "run", rec)
         mux = PsmuxMultiplexer()
@@ -756,7 +752,7 @@ def test_available_caches_version_gate_per_instance(monkeypatch):
     def probe(self):
         nonlocal calls
         calls += 1
-        return "tmux 3.3.8"
+        return "tmux 3.4.0"
 
     monkeypatch.setattr(PsmuxMultiplexer, "version", probe)
     mux = PsmuxMultiplexer()
@@ -803,7 +799,7 @@ def _pwsh_floor_fake(monkeypatch, reported: str) -> list[list[str]]:
         if argv[0] == PINNED_PWSH:
             out = reported + "\n"
         else:
-            out = "tmux 3.3.8\npsmux 3.3.8\n" if argv[1:] == ["-V"] else "@2\n"
+            out = "tmux 3.4.0\npsmux 3.4.0\n" if argv[1:] == ["-V"] else "@2\n"
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1693,7 +1689,6 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
         "bad\nline",  # the listing is parsed line-by-line — a break splits the value
         "bad\rline",  # splitlines() cuts on `\r` too, not just `\n`
         "",  # empty write is a silent server-side no-op; unset exists for this
-        "-flag",  # dropped as a flag server-side, or flips to unset (psmux/psmux#583)
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
     ],
@@ -1724,6 +1719,8 @@ def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, v
         "\\\\srv\\share My Proj",  # spaced UNC — `\\` no longer collapses (#547)
         "C:\\dir with space\\",  # trailing `\` no longer eats the closing quote
         "x\u00a0y",  # non-ASCII whitespace no longer splits server-side (#536)
+        "-u",  # a `-`-leading value is stored, not read as a flag (psmux/psmux#583)
+        "-flag",
     ],
 )
 def test_set_window_option_accepts_wire_safe_values(monkeypatch, value):
@@ -1750,7 +1747,6 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
         'C:\\a"b\\proj',  # `"` cannot survive the listing's one-quote-pair strip
         "bad\nline",  # the listing is parsed line-by-line
         "",  # an empty write is a silent server-side no-op
-        "-flag",  # dropped as a flag server-side (psmux/psmux#583)
     ],
 )
 def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
@@ -1778,11 +1774,12 @@ def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, 
         "C:\\projects\\my proj\\",  # trailing `\` no longer eats the closing quote
         "\\\\srv\\share name\\proj",  # spaced UNC — `\\` no longer collapses (#547)
         "C:\\Users\\O'Brien\\proj",  # unspaced `'` no longer opens a quote
+        "-u",  # a `-`-leading value is stored, not read as a flag (psmux/psmux#583)
     ],
 )
 def test_set_session_option_accepts_transportable_values(monkeypatch, value):
-    # All eight round-trip unchanged on psmux 3.3.8; a gate that refused them
-    # would untag ordinary Windows project paths.
+    # All round-trip unchanged on the supported psmux; a gate that refused
+    # them would untag ordinary Windows project paths.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
     assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
@@ -2012,6 +2009,7 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
         "C:\\dir with space\\",
         "\\\\srv\\share My Proj",
         "x\u00a0y",
+        "-u",
     ],
 )
 def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value):
@@ -2062,10 +2060,8 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
     monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
 
     candidates, undetermined = launch._ctl_window_candidates(tmp_path)
-    # The scan resolves the per-registry ctl name (runs.ctl_session_for) on a
-    # namespacing backend, and the qualified candidate ids carry it.
+    # The qualified candidate ids carry the control session's name.
     ctl = runs.ctl_session_for(tmp_path, mux)
-    assert ctl.startswith("bmad-loop-ctl-")
     assert candidates == [(f"{ctl}:@2", "run-20260726-1")]
     assert captured == [f"{ctl}:@2"]
     assert undetermined == []

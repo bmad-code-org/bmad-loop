@@ -60,9 +60,10 @@ with. A server started under one state root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_H
   notes once, naming both, when they differ. A shell that must agree can
   `export BMAD_LOOP_STATE_DIR=<root>`.
 
-psmux cannot report inherited values, so there is no such note on psmux. Its registry is
-keyed on the state root, so a launcher under one root never reaches a server started under
-another.
+psmux (3.4.0 or newer) answers the same query, so the note fires on psmux too. psmux runs one
+server per session, so the inherited environment is that session's own server's. Its
+registry is keyed on the state root, so a launcher normally reaches only servers started
+under its own root; the note covers the cases where it does not.
 
 ## psmux (native Windows, experimental)
 
@@ -72,7 +73,7 @@ session and window model and the `bmad-loop-<run-id>` session names.
 
 Requirements:
 
-- **psmux 3.3.8 or newer** and **`pwsh`** on `PATH`. `available()` requires both binaries
+- **psmux 3.4.0 or newer** and **`pwsh`** on `PATH`. `available()` requires both binaries
   and reads psmux's reported version; an older or unreadable version reports unavailable
   and selection falls through.
 - **PowerShell 7.3 or newer** as `pwsh`. The backend resolves `pwsh` to one absolute path,
@@ -99,8 +100,8 @@ window `@3`. `psmux show-options -w` does not show these values; read one with
 session-qualified (`session:@N`).
 
 **Refused option values.** An `@` option value must read back verbatim. A value that is
-empty, starts with `-`, contains a double quote or a line break, or has leading or trailing
-whitespace is refused with a stderr warning, and the option reads as unset. Ordinary
+empty, contains a double quote or a line break, or has leading or trailing whitespace is
+refused with a stderr warning, and the option reads as unset. Ordinary
 Windows paths (spaced, UNC, apostrophed, trailing separator) pass. The project ownership
 tag is a hex digest of the project path, so it always passes.
 
@@ -127,9 +128,13 @@ psmux ls
 
 `bmad-loop attach` needs none of this; it runs the client under the root it exported.
 
-**The control session is per project on psmux:** `bmad-loop-ctl-<16-hex registry digest>`.
-The TUI's toasts name the exact session. When no state root can be derived it is plain
-`bmad-loop-ctl`, as on tmux.
+**The control session is `bmad-loop-ctl`**, one per project registry on psmux. A session
+named `bmad-loop-ctl-<16 hex>` is also a control session to bmad-loop, so `cleanup` never
+prunes it. Nothing launches into it, though, so the TUI's attach and stop keys and the
+parked-window sweep do not reach its windows. To end one, let its runs finish
+(`bmad-loop stop` reaches a live engine wherever it runs) and check that every window shows
+the exit banner (see `capture-pane` below). Then run
+`psmux kill-session -t bmad-loop-ctl-<16 hex>`.
 
 **If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
 path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then
@@ -246,9 +251,9 @@ safe once `capture-pane` has shown the banner.
 2. `bmad-loop cleanup`, then run `delete` or `archive` again.
 3. Or pass `--force`. It stops a live engine first, then removes the run without checking for a session, and leaves any orphaned session running.
 
-A removal can still strand a session when the session listing misses it: the multiplexer binary is not on `PATH`, or on psmux a registry entry was briefly reaped. To clear a stranded session:
+A removal can still strand a session when the session listing misses it, because the multiplexer binary is not on the removing process's `PATH`. To clear a stranded session:
 
-1. Put the multiplexer back on `PATH`. On psmux after a reap, wait a few seconds for the server to republish the entry.
+1. Put the multiplexer back on `PATH`.
 2. Run `bmad-loop cleanup`. It prunes a session tagged to this project even when its run directory is gone.
 3. For an untagged session, inspect it by hand. `bmad-loop attach` cannot reach it, because it needs the run directory. On psmux, paste the `$env:PSMUX_DATA_DIR = …` line `bmad-loop mux` prints first ([why](#where-psmux-sessions-live-the-per-project-registry)). Then attach with `psmux attach -t bmad-loop-<run-id>` (`tmux attach -t …` on tmux).
 4. Once you have confirmed from its contents that it is yours (the name does not carry the project), kill it: `psmux kill-session -t bmad-loop-<run-id>` (or `tmux kill-session -t …`).

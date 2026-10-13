@@ -2,10 +2,9 @@
 
 Observer/launcher only: the TUI never runs engines in-process. Run control
 (r/s/e) launches detached bmad-loop processes in the control session via
-tui.launch (bmad-loop-ctl on tmux; a per-registry name on psmux, which the
-launch toasts print). Dry runs are captured into a text modal; validate
-renders its `--json` document into a findings modal (falling back to the text
-one), so the verdict is the document's `ok` rather than an exit code.
+tui.launch (bmad-loop-ctl, which the launch toasts print). Dry runs are
+captured into a text modal; validate renders its `--json` document into a
+findings modal (falling back to the text one), so the verdict is the document's `ok` rather than an exit code.
 The g binding opens the policy.toml settings editor. The ctrl+p command palette
 lists every key-bound command live on the current screen or modal (tui.commands).
 """

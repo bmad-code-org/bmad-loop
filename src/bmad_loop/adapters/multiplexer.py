@@ -631,9 +631,8 @@ class TerminalMultiplexer(ABC):
         backend says nothing.
 
         Non-abstract, defaulting to ``None`` with nothing reported, so released
-        out-of-tree backends keep working unchanged. psmux keeps this default:
-        its ``show-environment`` reports only values set through psmux itself,
-        never inherited ones."""
+        out-of-tree backends keep working unchanged. tmux and psmux answer it
+        through ``show-environment``."""
         return None
 
     def window_pane_pids(self, target: str) -> list[int]:

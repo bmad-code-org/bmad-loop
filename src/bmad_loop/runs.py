@@ -253,8 +253,9 @@ def is_reserved_run_id(value: str) -> bool:
 
 def run_id_aliases_control_session(value: str) -> bool:
     """True when ``session_name(value)`` names a session that can BE a live
-    control session: the fixed name (id ``ctl``) or a per-registry digest name
-    (id ``ctl-<16 hex>`` — the only suffix :func:`ctl_session_for` can mint).
+    control session: the fixed name (id ``ctl``) or the per-registry digest
+    name earlier releases minted on psmux (id ``ctl-<16 hex>``; see
+    :func:`is_ctl_session_name`).
     The adapter's ensure-session would *adopt* that live session as the run's
     own, and the run's teardown would kill the whole control session, every
     parked window of every run in it — so the project-free READ paths key on
@@ -264,7 +265,7 @@ def run_id_aliases_control_session(value: str) -> bool:
     this name be a control session's on some registry" — and it must stay
     out of any site asking the *instance* question ("is it the control
     session this process addresses"): :func:`live_session_may_be_ours`
-    compares against the actual names (the fixed one plus this project's
+    compares against the actual name (this project's
     :func:`ctl_session_for`), because discounting the whole shape there
     destroyed run dirs under live `ctl-<other digest>` agents on tmux.
 
@@ -1802,93 +1803,39 @@ _SESSION_PREFIX = "bmad-loop-"
 
 
 def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> str:
-    """The control-session name this project's launches and lookups share.
+    """The control-session name this project's launches and lookups share: the
+    fixed :data:`CTL_SESSION`, on every bundled transport.
 
-    On a transport with no registry namespace (tmux) it is the fixed
-    :data:`CTL_SESSION`, machine-shared as it has always been. On a namespacing
-    transport (psmux) the name carries the registry's identity — a 16-hex
-    digest of the derived registry root — because the two scopes genuinely
-    differ: the session lives *per registry*, but psmux's duplicate-server
-    guard is a mutex keyed on the session name alone, across every registry
-    in the **login session** (``Local\\psmux-session-{name}`` over
-    ``port_file_base()`` — the ``Local\\`` kernel-object namespace is
-    per-login-session, not machine-global; ``server/mod.rs:853`` /
-    ``platform.rs:346`` / ``types.rs:1345``, source-read at v3.3.8 —
-    ``PSMUX_DATA_DIR`` never enters it). A fixed name therefore admits ONE
-    control session across every registry a desktop session can reach,
-    and the second project's create is rejected as a duplicate server — its
-    TUI launch fails instead of minting its own session (measured: a second
-    registry answers ``new-session`` rc 1 for the fixed name while the first
-    registry's server lives, and rc 0 for a per-registry name).
+    On tmux one server serves the machine and the session really is
+    machine-wide, scoped by the per-window project tag. On psmux it lives in
+    the project's own registry, so each project holds its own session under the
+    one fixed name: psmux keys its one-server-per-name guard on the data root
+    as well as the name (psmux/psmux#599, ``session_mutex_name`` over
+    ``data_root_tag()``, source-read at v3.4.0), so two registries can each hold
+    a ``bmad-loop-ctl``. Earlier releases minted ``bmad-loop-ctl-<16 hex>`` on
+    psmux to dodge a guard keyed on the name alone; see
+    :func:`is_ctl_session_name` for what still recognises that shape.
 
-    The digest is over ``mux_registry_root(project)`` **resolved**: the name
-    must be unique per *physical* registry, and the resolved path is that
-    registry's identity — (project, state root), both axes; ``project_tag``
-    alone would recreate the collision for one project under two state roots.
-    Resolved rather than as spelled because two spellings of one state root
-    (``C:\\work\\state`` vs ``C:\\work\\alias\\..\\state``) reach **one**
-    registry — Windows resolves both to the same files, and psmux keeps the
-    spelling only while constructing those paths (``src/paths.rs:79``,
-    source-read at v3.3.8; convergence measured) — so an as-spelled digest
-    minted two control sessions inside one registry, each blind to the other's
-    parked windows: the split-control-plane failure again, one level up. Same
-    rule ``project_tag`` already states: resolve *before* digesting.
-
-    …and then ``os.path.normcase``, because ``resolve()`` can only return the
-    filesystem's stored case for a path that **exists**, and the registry
-    root usually does not yet exist at the moment the name is needed (psmux
-    ``create_dir_all``\\s it at first spawn). Two case spellings of a
-    not-yet-created state root resolve to two strings, digest to two names —
-    and then land in ONE physical registry, because NTFS folds case when
-    psmux opens the ``.port`` files (measured). ``normcase`` folds exactly
-    where the filesystem does: it lowercases on Windows and is the identity
-    on POSIX, where case is significant and two case spellings ARE two
-    registries — folding there would merge genuinely distinct roots.
-    Ceiling, named: ``normcase`` lowercases with ``str.lower``, which can
-    disagree with NTFS's own fold table for a few non-ASCII case pairs; a
-    state root spelled in two such casings of the same non-ASCII name stays
-    split, as it is for every other digest of an operator-supplied path.
-
-    When the operator's own root is honoured (``[mux]
-    honor_ambient_psmux_data_dir``), that settled root is digested alongside
-    the derived one: the name stays per project, and changes with the
-    registry it lives in.
-
-    The degrade arm (namespaced transport, underivable state root) answers
-    the fixed name: that arm runs on the transport's shared default registry,
-    where a shared session scoped by per-window project tags is the correct,
-    tmux-shaped semantic — and where a pre-#537 legacy ctl session under the
-    fixed name may exist to be reused rather than collided with.
-    """
-    mux = mux or get_multiplexer()
-    if not mux.has_registry_namespace():
-        return CTL_SESSION
-    try:
-        derived = mux_registry_root(project)
-        scope = os.path.normcase(str(derived.resolve()))
-        # An honoured operator root (#729) is a different physical registry, so
-        # it gets a different name — or turning the opt-in on would mint the
-        # same name in the new registry while the old one's control session
-        # still holds psmux's mutex. Not honoured, the export settled the
-        # derived root and the name is byte-identical to before. Compared as
-        # identities, resolved and case-folded like `scope`, so another spelling
-        # of the derived registry is still that registry. The root is the
-        # backend's, not the environment's, so a bound instance answers for its
-        # own registry.
-        settled = mux.registry_root()
-        if settled and Path(settled).is_absolute():
-            pinned = os.path.normcase(str(Path(settled).resolve()))
-            if pinned != scope:
-                scope += "\0" + pinned
-    except (StateRootError, OSError, RuntimeError):
-        return CTL_SESSION
-    return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
+    The mint and instance side of the control-session question, kept apart
+    from the shape side (:func:`is_ctl_session_name`) on purpose: every site
+    that *addresses* this project's control session resolves the name here, and
+    every reader that asks whether some name *is a* control session asks the
+    shape predicate, which answers for names this release never mints."""
+    return CTL_SESSION
 
 
 def is_ctl_session_name(name: str) -> bool:
     """Whether ``name`` is a control session's name — the fixed
-    :data:`CTL_SESSION`, or ``bmad-loop-ctl-<16 hex>``, the ONE suffix shape
-    :func:`ctl_session_for` can mint.
+    :data:`CTL_SESSION`, or ``bmad-loop-ctl-<16 hex>``, the per-registry shape
+    earlier releases minted on psmux.
+
+    The digest shape is still recognised, though :func:`ctl_session_for` no
+    longer mints it, because a control session started before an upgrade keeps
+    running under it with live runs in its windows. Recognised, it stays out
+    of the prune and of every kill path, and ``in_ctl_session`` still answers
+    True inside it; it is not adopted — launches, attach, stop and the
+    parked-window sweep address :func:`ctl_session_for` only — so it ends when
+    the operator ends it.
 
     The shape predicate exists because several readers ask "is this A control
     session" without a project in hand: the agent-session parser must exclude
@@ -1898,7 +1845,7 @@ def is_ctl_session_name(name: str) -> bool:
     and ``in_ctl_session`` classifies whatever session this process woke up
     inside.
 
-    Exactly the mintable shapes, no wider: an arbitrary suffix
+    Exactly the shapes a release has minted, no wider: an arbitrary suffix
     (``bmad-loop-ctl-foo``) is NOT a control session — it is the agent
     session of a run an older release accepted as ``--run-id ctl-foo``, and
     reading it as a control session made it unreachable by ``stop`` and the
@@ -3150,85 +3097,53 @@ def live_session_may_be_ours(
     A stronger shape was built and withdrawn: a proof discipline (block unless
     the transport *proves* the session absent) fell to four consecutive reviews,
     each refuting its newest proof source — the transports genuinely offer none.
-    psmux's registry is advisory and self-healing (its server re-creates a
-    reaped port file on a 5 s tick, source-read at v3.3.8), a binary's PATH
-    presence is per-process while the server is not, and the listing is
-    load-sensitive; so a "proof of absence" either wedges every removal behind
-    `--force` or quietly accepts a refutable proof.
+    psmux's registry is advisory and self-healing (its server re-writes its own
+    entry on a 5 s tick), a binary's PATH presence is per-process while the
+    server is not, and the listing is load-sensitive; so a "proof of absence"
+    either wedges every removal behind `--force` or quietly accepts a refutable
+    proof.
 
     Revisited with the cost measured (#732), and the degrade is KEPT — not for
-    want of a stronger read, but because the more dangerous of the two costs
-    reaches this function as an ordinary answer. On psmux 3.3.8 a live session's
-    registry entry is reaped by any `has-session` whose 500 ms connect does not
-    land, and until the server's registry maintenance re-writes it the listing
-    does not name that session while reporting no fault at all: exit **0**, no
-    stderr (measured; the listing empty in that run because the session was the
-    only one, the server pid alive throughout, the entry back 1.7 s later).
-    That maintenance runs when the server's own loop notices 5 s have elapsed —
-    a nominal interval, not a scheduling guarantee, so 1.7 s is a sample and 5 s
-    is not a bound. The listing therefore does not fail, it answers wrongly —
-    and the read this guard makes is the one with no discrimination in it at
-    all. ``mux_sessions()`` lands on ``BaseTmuxBackend.list_sessions``, which
-    returns ``[]`` under the three conditions its own comment names — the binary
-    is missing, no server is running, or the query itself fails — and returns
-    nothing to say which. None of the three raises: the bundled backend folds
-    ``SubprocessError`` and ``OSError`` into that same sentinel, and only an
-    out-of-tree backend raises ``MultiplexerError`` here. A failed query does
-    now say so (DW-458, ``_warn_unproven_listing`` — on stderr, or through
-    ``warn`` below), but a report is not a signal this function conditions on
-    — and the reap reaches none of
-    those branches anyway, because its exit is 0. So it leaves neither a
-    signal nor a word on stderr.
+    want of a stronger read, but because the cost reaches this function as an
+    ordinary answer. ``mux_sessions()`` lands on
+    ``BaseTmuxBackend.list_sessions``, which returns ``[]`` under the three
+    conditions its own comment names — the binary is missing, no server is
+    running, or the query itself fails — and returns nothing to say which. None
+    of the three raises: the bundled backend folds ``SubprocessError`` and
+    ``OSError`` into that same sentinel, and only an out-of-tree backend raises
+    ``MultiplexerError`` here. A failed query does now say so (DW-458,
+    ``_warn_unproven_listing`` — on stderr, or through ``warn`` below), but a
+    report is not a signal this function conditions on.
 
-    The second cost lasts as long as its cause: a process whose PATH lacks the
-    binary reads every session as absent for as long as that PATH does (measured
-    through the seam — the sessions reappear when PATH is restored), because the
-    binary is per-process while the server is not. That one is no mystery to the
-    transport: ``list_sessions`` decides it from ``shutil.which`` on purpose,
-    being one of the two methods that report what exists, and folds it into the
-    same ``[]`` deliberately (its own comment: the absence of sessions and the
-    absence of the multiplexer are indistinguishable here). The fold is the
-    seam's decision; what reaches this function is its result.
+    The ceiling is the PATH case, and it lasts as long as its cause: a process
+    whose PATH lacks the binary reads every session as absent for as long as
+    that PATH does (measured through the seam — the sessions reappear when PATH
+    is restored), because the binary is per-process while the server is not.
+    That one is no mystery to the transport: ``list_sessions`` decides it from
+    ``shutil.which`` on purpose, being one of the two methods that report what
+    exists, and folds it into the same ``[]`` deliberately (its own comment:
+    the absence of sessions and the absence of the multiplexer are
+    indistinguishable here). The fold is the seam's decision; what reaches this
+    function is its result — a *negative membership*, this run's name not in
+    the listing, which is exactly what a genuinely dead session produces.
 
-    What the two costs share is not a shape but a verdict. A reap takes one
-    session's entry, so its listing may still name every other session on the
-    box; a missing binary yields nothing at all. Both arrive as the same
-    *negative membership* — this run's name is not in the listing — which is
-    exactly what a genuinely dead session produces, and there is no fourth
-    answer to distinguish them by.
-
-    The named alternatives were weighed and refused. Retry-with-delay, in the
-    shape this guard could hold, pays a delay on every removal that finds no
-    session — the common case — once per run inside `clean`; a retry hoisted to
-    command scope would pay it once, but neither can bound a window whose close
-    is a nominal tick rather than a deadline. A tag-first read draws on the same
-    listing and is blind in exactly the same window. Warning whenever the
-    multiplexer is unusable fires on every box that simply has no multiplexer,
-    which is the noise ``BaseTmuxBackend._warn_unproven_listing`` already stays
-    silent about. What is left is the accepted ceiling, written down here and in
-    docs/multiplexer-backends.md so an operator meets it as a documented limit rather than a
-    surprise.
-
-    The psmux half is a *defect*, not a design: four sibling reap sites in that
-    binary gate on `ConnectionRefused` precisely because "a timeout means
-    busy-but-alive and must not be deleted" (its own comment), the `has-session`
-    site does not, and tmux 3.4 blocks rather than reaps under the same
-    treatment (measured). Reported as psmux/psmux#622, which is the thing to
-    watch. Retiring it takes two parties, though, and an upstream fix alone is
-    not enough: the reap window closes for this project once a psmux release
-    repairs that site AND the supported floor is raised to that release or
-    later, since an installed 3.3.8 keeps reaping whatever master does. And it
-    retires only itself — the PATH case is ours, and so are the two arms above
-    it, a backend that cannot be selected and a listing that raises. What that
-    fix removes is one measured case, not the ceiling.
+    The named alternatives were weighed and refused. A retry cannot help: the
+    PATH is this process's own and does not change between tries. A tag-first
+    read draws on the same listing and is blind in exactly the same way.
+    Warning whenever the multiplexer is unusable fires on every box that simply
+    has no multiplexer, which is the noise
+    ``BaseTmuxBackend._warn_unproven_listing`` already stays silent about. What
+    is left is the accepted ceiling, written down here and in
+    docs/multiplexer-backends.md so an operator meets it as a documented limit
+    rather than a surprise. A backend that cannot be selected and a listing
+    that raises meet it too, through the two signalled arms below.
 
     Two registry-root-era additions on that unchanged contract:
 
-    **The control-alias discount.** An id whose session name is one of THE
-    control session's own names — the fixed :data:`CTL_SESSION`, or this
-    project's :func:`ctl_session_for` — answers False before any transport
-    read: that session is the control plane's, never claimed through a run
-    dir, so its liveness is not evidence about the run, and blocking removal
+    **The control-alias discount.** An id whose session name is THE control
+    session's own name — this project's :func:`ctl_session_for` — answers
+    False before any transport read: that session is the control plane's,
+    never claimed through a run dir, so its liveness is not evidence about the run, and blocking removal
     on it wedged exactly the recovery (`bmad-loop delete ctl`) the resume
     refusal points an operator at, for as long as the machine had a control
     session at all. This is the *instance* question, deliberately not
@@ -3236,9 +3151,7 @@ def live_session_may_be_ours(
     `main`-created run `ctl-<16 hex>` owns a genuine agent session distinct
     from the fixed name (measured: killing it exactly leaves `bmad-loop-ctl`
     alive), and the shape discount destroyed its run dir without ever querying
-    the mux. A namespace probe that cannot answer degrades to the fixed name
-    alone — the *smaller* discount, which blocks more, the safe direction. A
-    discount, not a proof source: it removes non-evidence, and never clears a
+    the mux. A discount, not a proof source: it removes non-evidence, and never clears a
     removal on transport testimony.
 
     **Transport-owned name comparison.** Every comparison goes through
@@ -3276,8 +3189,8 @@ def live_session_may_be_ours(
     instead of printing it, and the fault is reported here in the same words
     as the raise. Left ``None``, the listing keeps its own stderr warning and
     this function adds nothing: still exactly one line per fault on each route.
-    The ``ctl_session_for`` and tag-read arms stay silent on
-    purpose: both degrade toward refusal, the safe direction."""
+    The tag-read arm stays silent on purpose: it degrades toward refusal,
+    the safe direction."""
     try:
         mux = get_multiplexer()
     except MultiplexerError as exc:
@@ -3287,12 +3200,7 @@ def live_session_may_be_ours(
         return False
     key = mux.session_name_key
     name = session_name(run_id)
-    control = {CTL_SESSION}
-    try:
-        control.add(ctl_session_for(project, mux))
-    except MultiplexerError:
-        pass  # namespace unanswerable: only the fixed name is knowable
-    if key(name) in {key(c) for c in control}:
+    if key(name) == key(ctl_session_for(project, mux)):
         return False
 
     def folded(fault: str) -> None:

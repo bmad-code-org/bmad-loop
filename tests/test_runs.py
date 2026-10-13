@@ -2014,6 +2014,9 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
         "bmad-loop-untag-fin",  # pre-upgrade session, no tag
         "bmad-loop-untag-orphan",  # pre-upgrade, no tag, no run dir here
         "bmad-loop-ctl",  # control session: never a candidate
+        # a control session an earlier release minted per registry, still
+        # running after the upgrade: tagged ours, and still never a candidate
+        "bmad-loop-ctl-0123456789abcdef",
         "unrelated",  # not ours
     ]
     monkeypatch.setattr(runs, "mux_sessions", lambda: sessions)
@@ -2025,6 +2028,7 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
             "bmad-loop-fin-1": mine,
             "bmad-loop-orphan-1": mine,
             "bmad-loop-other-1": "/some/other/project",
+            "bmad-loop-ctl-0123456789abcdef": mine,
             # untag-* and unrelated intentionally absent (no tag)
         },
     )
@@ -7740,50 +7744,6 @@ def test_honouring_still_overrides_a_value_psmux_would_panic_on(tmp_path, monkey
     assert os.environ[runs.PSMUX_DATA_DIR] == derived
 
 
-def test_ctl_session_for_follows_an_honoured_registry(tmp_path, monkeypatch):
-    """psmux's duplicate-server mutex is keyed on the session name alone, so the
-    control session in an honoured registry must not reuse the name the derived
-    registry's one holds: turning the opt-in on while the old control session
-    lives would otherwise make every TUI launch fail. With the derived root
-    settled, the name is unchanged.
-
-    Ablate the honoured-root arm in `ctl_session_for` and the first assert
-    fails."""
-    derived = str(runs.mux_registry_root(tmp_path))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
-    as_derived = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "pinned"))
-    as_honoured = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, os.path.join(derived, "..", runs.MUX_REGISTRY_DIR))
-    respelled = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-    monkeypatch.delenv(runs.PSMUX_DATA_DIR)
-    unset = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-
-    assert as_honoured != as_derived
-    assert as_derived == unset == respelled
-    assert runs.is_ctl_session_name(as_honoured)
-
-
-def test_ctl_session_for_reads_the_backends_root(tmp_path, monkeypatch):
-    """The honoured root is the one the backend's verbs resolve through, not
-    whatever the environment says: a bound instance answers for its own
-    registry, so its control session is named for that registry.
-
-    Ablate (read `PSMUX_DATA_DIR` from the environment again) and the bound
-    instance is named for the derived registry instead."""
-    derived = str(runs.mux_registry_root(tmp_path))
-    pinned = str(tmp_path / "pinned")
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
-    as_honoured = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
-    as_derived = runs.ctl_session_for(tmp_path, _NamespaceStub(True))
-
-    bound = runs.ctl_session_for(tmp_path, _NamespaceStub(True, root=pinned))
-
-    assert as_honoured != as_derived  # the premise: the two roots name differently
-    assert bound == as_honoured
-
-
 def test_honouring_hands_the_derived_root_to_the_sweep(tmp_path, monkeypatch):
     """Turning the flag on moves the registry from the derived root to the pin,
     and sessions started before the switch are still in the derived one. It is
@@ -7833,95 +7793,46 @@ def test_pinned_state_env_degrades_on_an_underivable_state_root(monkeypatch):
 
 
 class _NamespaceStub:
-    """Duck-typed mux answering only what ctl_session_for consults: the
-    namespace question, and the registry root — the environment's, as the
-    primary psmux instance answers, unless bound to its own."""
+    """Duck-typed mux answering only the namespace question, so an ablation
+    that restores a per-registry name has a namespacing transport to act on."""
 
-    def __init__(self, namespaced, root=None):
+    def __init__(self, namespaced):
         self._namespaced = namespaced
-        self._root = root
 
     def has_registry_namespace(self):
         return self._namespaced
 
     def registry_root(self):
-        return self._root or os.environ.get(runs.PSMUX_DATA_DIR)
+        return os.environ.get(runs.PSMUX_DATA_DIR)
 
 
-def test_ctl_session_for_is_fixed_without_a_registry_namespace(tmp_path):
-    """tmux keeps the machine-shared `bmad-loop-ctl` byte-identically — the
-    shared session is correct there and every pinned tmux argv depends on it.
+@pytest.mark.parametrize("namespaced", [False, True])
+def test_ctl_session_for_is_the_fixed_name_on_every_transport(tmp_path, monkeypatch, namespaced):
+    """psmux keys its one-server-per-name guard on the data root as well as the
+    name (psmux/psmux#599, fixed in 3.4.0), so each project's registry holds a
+    `bmad-loop-ctl` of its own and the per-registry digest earlier releases
+    minted is retired (#733): the name moves with neither the project, the
+    state root nor an honoured registry root. tmux keeps the machine-shared
+    name it always had.
 
-    Ablate the `has_registry_namespace()` arm (suffix always) and this fails."""
-    assert runs.ctl_session_for(tmp_path, _NamespaceStub(False)) == runs.CTL_SESSION
-
-
-def test_ctl_session_for_carries_the_registry_identity(tmp_path, monkeypatch):
-    """On a namespacing transport the name is per REGISTRY, because psmux's
-    duplicate-server mutex is keyed on the session name alone, machine-wide
-    (`Local\\psmux-session-{name}`, source-read at v3.3.8): a fixed name lets
-    only one registry on the machine hold a control session, and the second
-    project's create is rejected as a duplicate server (measured: rc 1). Both
-    axes of the registry key must move the name — a project-only tag would
-    recreate the collision for one project under two state roots.
-
-    Ablate the suffix (return the fixed name always) and every assertion but
-    the stability one fails; key the suffix on `project_tag` alone and the
-    state-root case fails."""
-    mux = _NamespaceStub(True)
+    Ablate (restore the digest arm for a namespacing transport) and the
+    namespaced case fails."""
+    mux = _NamespaceStub(namespaced)
     a, b = tmp_path / "proj-a", tmp_path / "proj-b"
     a.mkdir()
     b.mkdir()
-
-    name_a = runs.ctl_session_for(a, mux)
-    name_b = runs.ctl_session_for(b, mux)
-    assert name_a.startswith(runs.CTL_SESSION + "-") and name_b.startswith(runs.CTL_SESSION + "-")
-    assert name_a != name_b  # two projects, two registries, two names
-    assert runs.ctl_session_for(a, mux) == name_a  # stable per registry
-
-    # ...and the OTHER axis of the registry key: same project, moved state root
+    names = {runs.ctl_session_for(a, mux), runs.ctl_session_for(b, mux)}
     monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
-    assert runs.ctl_session_for(a, mux) != name_a
-
-
-def test_ctl_session_for_converges_across_spellings_of_one_root(tmp_path, monkeypatch):
-    """Two spellings of one state root reach ONE physical registry (the OS
-    resolves both to the same files; psmux keeps the spelling only while
-    constructing those paths — src/paths.rs:79, source-read at v3.3.8), so
-    they must mint ONE control-session name: an as-spelled digest gave the
-    same registry two ctl sessions, each blind to the other's parked windows.
-
-    Ablate the `.resolve()` in ctl_session_for and this fails."""
-    mux = _NamespaceStub(True)
-    project = tmp_path / "proj"
-    project.mkdir()
-    (tmp_path / "state").mkdir()
-    (tmp_path / "alias").mkdir()
-    plain = str(tmp_path / "state")
-    detour = str(tmp_path / "alias" / ".." / "state")
-    assert plain != detour  # the premise: two spellings, not one
-
-    monkeypatch.setenv(envvars.STATE_DIR, plain)
-    name_plain = runs.ctl_session_for(project, mux)
-    monkeypatch.setenv(envvars.STATE_DIR, detour)
-    name_detour = runs.ctl_session_for(project, mux)
-
-    assert name_plain.startswith(runs.CTL_SESSION + "-")
-    assert name_plain == name_detour
-
-
-def test_ctl_session_for_degrades_to_the_fixed_name(tmp_path, monkeypatch):
-    """The underivable arm runs on the transport's shared default registry —
-    the one place psmux is in the tmux-shaped world where a shared session
-    scoped by window tags is correct, and where a pre-#537 legacy ctl session
-    under the fixed name may exist to be reused rather than collided with."""
-    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
-    assert runs.ctl_session_for(tmp_path, _NamespaceStub(True)) == runs.CTL_SESSION
+    names.add(runs.ctl_session_for(a, mux))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "pinned"))
+    names.add(runs.ctl_session_for(a, mux))
+    assert names == {runs.CTL_SESSION}
 
 
 def test_is_ctl_session_name_shapes():
-    """Exactly the shapes ctl_session_for can mint — the fixed name and a
-    16-hex suffix. An arbitrary suffix is NOT a control session: it is the
+    """Exactly the shapes a release has minted — the fixed name, and the 16-hex
+    suffix earlier releases minted on psmux, which a control session started
+    before the upgrade still carries (#733). An arbitrary suffix is NOT a control session: it is the
     agent session of a run an older release accepted (`--run-id ctl-foo`),
     and reading it as a control session made it unreachable by stop and the
     prune both. Ablate the 16-hex narrowing (back to any `-` suffix) and the
@@ -8001,30 +7912,6 @@ def test_run_id_reservation_stops_at_the_ctl_shape(near_miss):
     reservation is the predicate's own boundary (`ctl`, `ctl-…`), not a
     prefix ban, and the case fold widens no further than the shape."""
     assert runs.is_valid_run_id(near_miss)
-
-
-def test_ctl_session_for_folds_case_only_where_the_filesystem_does(tmp_path, monkeypatch):
-    """Two case spellings of a NOT-YET-created state root: `resolve()` can
-    return stored case only for a path that exists, and the registry root
-    usually does not exist at name time — so the digest folds case itself,
-    via `os.path.normcase`. On Windows both spellings land in ONE physical
-    registry (the `.port` files open case-insensitively), so they must mint
-    one name; on POSIX case is significant — two case spellings ARE two
-    registries and must keep two names.
-
-    Ablate the normcase and the win32 arm fails; replace it with an
-    unconditional `str.lower` and the POSIX arm fails."""
-    mux = _NamespaceStub(True)
-    project = tmp_path / "proj"
-    project.mkdir()
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "MiXeD-State"))  # never created
-    name_mixed = runs.ctl_session_for(project, mux)
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "mixed-state"))  # never created
-    name_lower = runs.ctl_session_for(project, mux)
-    if sys.platform == "win32":
-        assert name_mixed == name_lower
-    else:
-        assert name_mixed != name_lower
 
 
 def test_kill_session_never_addresses_a_control_session_alias():
@@ -8127,12 +8014,8 @@ def test_live_session_may_be_ours_compares_names_the_transports_way(tmp_path, mo
     # psmux shape: the transport folds, so the case-variant IS the control session
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(sessions, fold=True))
     assert not runs.live_session_may_be_ours(tmp_path, "CTL")
-    # this project's derived name is also the control session's
-    monkeypatch.setattr(
-        runs, "ctl_session_for", lambda project, mux=None: "bmad-loop-ctl-aaaabbbbccccdddd"
-    )
-    assert not runs.live_session_may_be_ours(tmp_path, "ctl-aaaabbbbccccdddd")
-    # ...while an OTHER digest in this registry is still not the control session
+    # ...while a digest-shaped name is not THE control session this process
+    # addresses, even where an earlier release's control session holds it
     assert runs.live_session_may_be_ours(tmp_path, "ctl-0123456789abcdef")
 
 
@@ -8203,13 +8086,10 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
     """The accepted ceiling of #732, pinned so it cannot be closed by accident.
 
     The two tests above cover a listing that *fails*. This one covers the
-    listing that succeeds and is wrong: psmux reaps a live session's registry
-    entry on any `has-session` whose 500 ms connect does not land, and until the
-    server's registry maintenance re-writes it `ls` exits 0 with that session
-    simply missing — no error, no stderr. (That maintenance runs on a nominal
-    5 s check in the server's own loop, so the window has no hard bound; 1.7 s
-    was one measured sample.) The guard therefore cannot tell "absent" from
-    "omitted", and removal proceeds. That is the documented trade, not an
+    listing that answers and is wrong: a process whose PATH lacks the
+    multiplexer binary reads every session as absent, with no error and no
+    stderr. The guard therefore cannot tell "absent" from "omitted", and
+    removal proceeds. That is the documented trade, not an
     oversight; a change that makes an empty or short listing block instead has
     to delete this test and read why.
 
@@ -8223,8 +8103,8 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 
-    # Non-empty and still omitting it: a reap takes one session's entry, not the
-    # registry, so "the listing came back with rows in it" is no reassurance either.
+    # Non-empty and still omitting it: "the listing came back with rows in it" is
+    # no proof that it names every live session either.
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([runs.session_name("other")]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 
@@ -8251,15 +8131,14 @@ def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monke
     assert runs.prune_sessions(tmp_path, dry_run=True) == (["ctl-foo"], [], set())
 
 
-def test_no_valid_run_id_can_mint_the_control_session_name(tmp_path):
-    """The reviewer's reproduction, pinned end to end: read the live per-registry
-    control-session name, replay its suffix as a --run-id, and the id is
-    refused before `session_name` can alias the two session types. Covers the
-    fixed name too — `--run-id ctl` minted `bmad-loop-ctl` itself, on every
-    transport."""
-    project = tmp_path / "proj"
-    project.mkdir()
-    ctl = runs.ctl_session_for(project, _NamespaceStub(True))
+def test_no_valid_run_id_can_mint_the_control_session_name():
+    """The reviewer's reproduction, pinned end to end: take a per-registry
+    control-session name an earlier release minted, replay its suffix as a
+    --run-id, and the id is refused before `session_name` can alias the two
+    session types. Covers the fixed name too — `--run-id ctl` minted
+    `bmad-loop-ctl` itself, on every transport; the reservation does not
+    depend on the digest that #733 retired."""
+    ctl = runs.CTL_SESSION + "-0123456789abcdef"
     colliding_id = ctl[len("bmad-loop-") :]
     assert runs.session_name(colliding_id) == ctl  # the alias, were the id valid
     assert not runs.is_valid_run_id(colliding_id)

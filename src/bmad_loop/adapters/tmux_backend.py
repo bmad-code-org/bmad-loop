@@ -7,7 +7,7 @@ native-Windows "psmux") can replace them wholesale. All argv construction and
 the single spawn primitive live in :class:`~.tmux_base.BaseTmuxBackend`; this
 leaf is the POSIX implementation and inherits the full contract, adding only
 the POSIX launch-pid prelude to each coding-CLI window (DW-507) and the
-``inherited_env`` query psmux must not inherit (#731). See
+scopes of its ``inherited_env`` query (#731). See
 :mod:`.multiplexer` for the contract.
 
 ``subprocess`` and ``shutil`` are imported (and re-exported) here so existing
@@ -18,10 +18,10 @@ callers and tests can still reach the spawn seam via ``tmux_backend.subprocess``
 from __future__ import annotations
 
 import shutil  # noqa: F401 — re-exported for callers/tests reaching the spawn seam
-import subprocess
+import subprocess  # noqa: F401 — re-exported for callers/tests reaching the spawn seam
 from collections.abc import Callable
 
-from .multiplexer import UNSET, Unset
+from .multiplexer import Unset
 from .tmux_base import PARKED_RETURN_DETACH  # noqa: F401 — re-exported for back-compat
 from .tmux_base import TMUX_TIMEOUT_S  # noqa: F401 — re-exported for back-compat
 from .tmux_base import TmuxError  # noqa: F401 — re-exported for back-compat
@@ -84,41 +84,7 @@ class TmuxMultiplexer(BaseTmuxBackend):
     ) -> str | Unset | None:
         """The seam query (#731), answered by ``show-environment``: a new pane's
         env is the global env overlaid with the session env, so the session
-        scope is asked first and the global scope only on a session miss.
-
-        Replies, measured on tmux 3.4: ``NAME=value`` is the value (``NAME=``
-        is a set-empty ``""``), ``-NAME`` is tmux's removal marker (known-unset),
-        and rc 1 with exactly ``unknown variable: NAME`` is a miss in that scope. Anything
-        else — another error such as ``no such session``, a timeout, a missing
-        binary, an unparseable reply — is a fault: ``None``, reported once
-        through ``on_fault``.
-
-        Here and not on :class:`~.tmux_base.BaseTmuxBackend`, which would hand
-        it to psmux: psmux's ``show-environment`` ignores the variable name and
-        hides inherited values, so its replies do not mean what this parse
-        reads them as."""
-        for scope in (["-t", f"={session}"], ["-g"]):
-            argv = ["show-environment", *scope, name]
-            try:
-                proc = self._run(argv, check=False)
-            except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
-                return self._env_fault(argv, str(exc), on_fault)
-            reply = proc.stdout.removesuffix("\n")
-            if proc.returncode == 0:
-                if reply == f"-{name}":
-                    return UNSET
-                if reply.startswith(f"{name}=") and "\n" not in reply:
-                    return reply[len(name) + 1 :]
-                return self._env_fault(argv, f"unexpected reply {reply!r}", on_fault)
-            # A miss is exactly tmux's own line for exactly this name; anything
-            # merely containing the words (a socket path, say) is a fault.
-            if proc.returncode != 1 or proc.stderr.strip() != f"unknown variable: {name}":
-                detail = proc.stderr.strip() or f"exit {proc.returncode}"
-                return self._env_fault(argv, detail, on_fault)
-        return UNSET
-
-    def _env_fault(
-        self, argv: list[str], detail: str, on_fault: Callable[[str], None] | None
-    ) -> None:
-        if on_fault is not None:
-            on_fault(f"{self._BINARY} {' '.join(argv)} failed: {detail}")
+        scope is asked first and the global scope only on a session miss. The
+        parse is the base's ``_show_environment``; the scopes are this leaf's,
+        since tmux's ``-g`` is server-wide and psmux's is not."""
+        return self._show_environment([["-t", f"={session}"], ["-g"]], name, on_fault)

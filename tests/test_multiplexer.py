@@ -16,7 +16,6 @@ import sys
 import pytest
 from conftest import needs_strict_codec
 
-from bmad_loop import envvars
 from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.generic import GenericAdapter
@@ -1766,8 +1765,8 @@ class _EnvReplies:
 
     def __call__(self, argv, **_k):
         self.calls.append(list(argv))
-        assert argv[2] == "show-environment"
-        rc, out, err = self.by_scope[argv[3].lstrip("-")]
+        verb = argv.index("show-environment")
+        rc, out, err = self.by_scope[argv[verb + 1].lstrip("-")]
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr=err)
 
 
@@ -1856,23 +1855,105 @@ def test_tmux_inherited_env_reports_a_failed_query_as_unknown(monkeypatch, failu
     assert mux.inherited_env("ctl", "HOME") is None
 
 
-def test_psmux_inherited_env_is_unknown_and_asks_nothing(monkeypatch):
-    """psmux keeps the seam default: its `show-environment` ignores the name and
-    hides inherited values, so parsing it as tmux's would read every inherited
-    variable as unset. Unknown, no spawn, nothing reported.
+@pytest.mark.parametrize(
+    ("replies", "expected", "asked"),
+    [
+        pytest.param({"t": (0, "BMAD_LOOP_STATE_DIR=/s1\n", "")}, "/s1", ["t"], id="session-set"),
+        pytest.param({"t": (0, "Bmad_Loop_State_Dir=/s1\n", "")}, "/s1", ["t"], id="stored-case"),
+        pytest.param({"t": (0, "BMAD_LOOP_STATE_DIR=\n", "")}, "", ["t"], id="set-empty"),
+        pytest.param({"t": (0, "-bmad_loop_state_dir\n", "")}, UNSET, ["t"], id="removed"),
+        pytest.param(
+            {"t": _MISS, "g": (0, "Bmad_Loop_State_Dir=/g\n", "")},
+            "/g",
+            ["t", "g"],
+            id="global-hit",
+        ),
+        pytest.param({"t": _MISS, "g": _MISS}, UNSET, ["t", "g"], id="global-miss"),
+        pytest.param(
+            {"t": _MISS, "g": (0, "-BMAD_LOOP_STATE_DIR\n", "")},
+            UNSET,
+            ["t", "g"],
+            id="global-removed",
+        ),
+    ],
+)
+def test_psmux_inherited_env_parses_show_environment(monkeypatch, replies, expected, asked):
+    """psmux answers tmux's replies since psmux/psmux#775, with two differences
+    measured on 3.4.0: the global scope is targeted at the session (one server
+    per session, so an untargeted `-g` answers from whichever server it lands
+    on), and the echoed name is the stored spelling, so it is matched
+    case-insensitively. Nothing reaches `on_fault`.
 
-    Ablation: move `inherited_env` from `TmuxMultiplexer` to `BaseTmuxBackend`
-    and this fails on the spawn."""
+    Ablation: drop `fold_case=True` and the stored-case, removed and global-hit
+    rows fail; drop the `-g` target and the argv assertion fails."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    fake = _EnvReplies(**replies)
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    faults: list[str] = []
+
+    got = PsmuxMultiplexer().inherited_env("ctl", "BMAD_LOOP_STATE_DIR", on_fault=faults.append)
+
+    assert got == expected and type(got) is type(expected)
+    assert faults == []
+    scopes = {"t": ["-t", "=ctl"], "g": ["-g", "-t", "=ctl"]}
+    assert fake.calls == [
+        ["psmux", "show-environment", *scopes[s], "BMAD_LOOP_STATE_DIR"] for s in asked
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param((1, "", "psmux: no server running on session 'ctl'\n"), id="no-server"),
+        pytest.param((1, "", "unknown variable: OTHER\n"), id="miss-for-another-name"),
+        pytest.param((0, "PATH=C:/x\n", ""), id="another-name"),
+        pytest.param((0, "", ""), id="empty-reply"),
+        pytest.param(subprocess.TimeoutExpired(["psmux"], 5), id="timeout"),
+        pytest.param(FileNotFoundError("psmux"), id="missing-binary"),
+    ],
+)
+def test_psmux_inherited_env_reports_a_failed_query_as_unknown(monkeypatch, failure):
+    """A query psmux could not answer is Unknown (`None`) AND one `on_fault`
+    call, never a silent Unknown and never raised. The case fold widens the
+    name match only: a reply for another name is still a fault.
+
+    Ablation: drop the `on_fault` call from `_env_fault` and every row fails on
+    the fault count."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    def run(argv, **_k):
+        if isinstance(failure, BaseException):
+            raise failure
+        rc, out, err = failure
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr=err)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    faults: list[str] = []
+    mux = PsmuxMultiplexer()
+
+    assert mux.inherited_env("ctl", "HOME", on_fault=faults.append) is None
+    assert len(faults) == 1 and "show-environment" in faults[0]
+    assert mux.inherited_env("ctl", "HOME") is None
+
+
+def test_psmux_inherited_env_reports_a_refused_registry_root(monkeypatch):
+    """The backend's own refusal to spawn under a relative `PSMUX_DATA_DIR`
+    raises `TmuxError` from `_run`; the query reports it rather than raising.
+
+    Ablation: drop `TmuxError` from `_show_environment`'s except and this
+    raises."""
     from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 
     def no_spawn(argv, **_k):
-        raise AssertionError(f"psmux inherited_env spawned {argv}")
+        raise AssertionError(f"spawned {argv} under a refused registry root")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", no_spawn)
+    monkeypatch.setenv("PSMUX_DATA_DIR", "relative")
     faults: list[str] = []
-    got = PsmuxMultiplexer().inherited_env("ctl", envvars.STATE_DIR, on_fault=faults.append)
-    assert got is None
-    assert faults == []
+
+    assert PsmuxMultiplexer().inherited_env("ctl", "HOME", on_fault=faults.append) is None
+    assert len(faults) == 1 and "PSMUX_DATA_DIR" in faults[0]
 
 
 def test_inherited_env_seam_default_is_unknown_for_an_out_of_tree_backend():

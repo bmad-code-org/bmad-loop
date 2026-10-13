@@ -44,7 +44,7 @@ see [Installing and upgrading](../README.md#installing-and-upgrading) in the REA
   - **Native Windows is experimental.** The bundled `psmux` backend (a ConPTY tmux
     re-implementation) drives runs there and is selected automatically as the win32 default
     when its prerequisites are present: the `psmux` and `pwsh` (PowerShell) binaries on
-    `PATH`, with `psmux` 3.3.8 or newer (older releases read as unavailable — see
+    `PATH`, with `psmux` 3.4.0 or newer (older releases read as unavailable — see
     [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why).
   - It is below the Linux/macOS/WSL support tier; open native-Windows work is in
     [the roadmap](ROADMAP.md#native-windows-multiplexer-backend), and the port path is in
