@@ -61,6 +61,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
+  gap's HTTP probe completed the session before the reader reconnected. The fake now
+  holds the turn busy until the reconnect is up.
 - Resolve a codex session's rollout by session id when the hook's transcript path is
   missing or unreadable, so its usage is captured and the token budget guard arms
   (#775).
