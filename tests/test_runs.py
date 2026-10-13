@@ -8086,13 +8086,10 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
     """The accepted ceiling of #732, pinned so it cannot be closed by accident.
 
     The two tests above cover a listing that *fails*. This one covers the
-    listing that succeeds and is wrong: psmux reaps a live session's registry
-    entry on any `has-session` whose 500 ms connect does not land, and until the
-    server's registry maintenance re-writes it `ls` exits 0 with that session
-    simply missing — no error, no stderr. (That maintenance runs on a nominal
-    5 s check in the server's own loop, so the window has no hard bound; 1.7 s
-    was one measured sample.) The guard therefore cannot tell "absent" from
-    "omitted", and removal proceeds. That is the documented trade, not an
+    listing that answers and is wrong: a process whose PATH lacks the
+    multiplexer binary reads every session as absent, with no error and no
+    stderr. The guard therefore cannot tell "absent" from "omitted", and
+    removal proceeds. That is the documented trade, not an
     oversight; a change that makes an empty or short listing block instead has
     to delete this test and read why.
 
@@ -8106,8 +8103,8 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 
-    # Non-empty and still omitting it: a reap takes one session's entry, not the
-    # registry, so "the listing came back with rows in it" is no reassurance either.
+    # Non-empty and still omitting it: "the listing came back with rows in it" is
+    # no proof that it names every live session either.
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([runs.session_name("other")]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 

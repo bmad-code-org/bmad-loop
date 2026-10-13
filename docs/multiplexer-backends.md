@@ -251,9 +251,9 @@ safe once `capture-pane` has shown the banner.
 2. `bmad-loop cleanup`, then run `delete` or `archive` again.
 3. Or pass `--force`. It stops a live engine first, then removes the run without checking for a session, and leaves any orphaned session running.
 
-A removal can still strand a session when the session listing misses it: the multiplexer binary is not on `PATH`, or on psmux a registry entry was briefly reaped. To clear a stranded session:
+A removal can still strand a session when the session listing misses it, because the multiplexer binary is not on the removing process's `PATH`. To clear a stranded session:
 
-1. Put the multiplexer back on `PATH`. On psmux after a reap, wait a few seconds for the server to republish the entry.
+1. Put the multiplexer back on `PATH`.
 2. Run `bmad-loop cleanup`. It prunes a session tagged to this project even when its run directory is gone.
 3. For an untagged session, inspect it by hand. `bmad-loop attach` cannot reach it, because it needs the run directory. On psmux, paste the `$env:PSMUX_DATA_DIR = …` line `bmad-loop mux` prints first ([why](#where-psmux-sessions-live-the-per-project-registry)). Then attach with `psmux attach -t bmad-loop-<run-id>` (`tmux attach -t …` on tmux).
 4. Once you have confirmed from its contents that it is yours (the name does not carry the project), kill it: `psmux kill-session -t bmad-loop-<run-id>` (or `tmux kill-session -t …`).

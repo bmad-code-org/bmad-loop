@@ -687,16 +687,15 @@ def test_adopted_two_registries_each_hold_a_session_of_one_name(tmp_path):
     assert a_kept, "root B's create took root A's session down"
 
 
-def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(
-    probe, psmux_data_root
-):
-    """A `has-session` whose 500 ms connect times out deletes the session's
-    `.port` even though its server is alive — the reap window the accepted
-    ceiling in `runs.live_session_may_be_ours` documents (psmux/psmux#622).
+def test_adopted_a_live_registry_entry_survives_a_slow_connect(probe, psmux_data_root):
+    """A `has-session` whose 500 ms connect times out leaves a live server's
+    `.port` in place: it reaps only on a refusal or a dead pid anchor
+    (psmux/psmux#622). That is why the ceiling in
+    `runs.live_session_may_be_ours` is the PATH case alone (#754).
 
-    Red means a timeout no longer reaps, and that ceiling's psmux half retires —
-    only behind the `_LAST_UNSUPPORTED` gate, set to the last release WITHOUT
-    the fix (the gate is exclusive), since an older admitted build still reaps.
+    Red means a slow connect reaps a live entry again, and a successful listing
+    can omit a live session with no fault reported: the removal guard's
+    ceiling grows that case back.
 
     Determinism: the forged port is one this process has bound but never
     listens on, which on Windows times out rather than refuses (checked first:
@@ -754,11 +753,10 @@ def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(
         assert (
             asked.returncode != 0
         ), "probe setup: has-session answered through a port nothing listens on"
-        assert reaped, (
-            "psmux has-session no longer reaps a live session's .port on a connect "
-            f"timeout (psmux/psmux#622, .port kept as {left!r}) — the reap-window ceiling "
-            "prose in runs.live_session_may_be_ours (#754) narrows once _LAST_UNSUPPORTED "
-            "is the last release without the fix"
+        assert not reaped, (
+            "psmux has-session reaped a live session's .port on a connect timeout "
+            "(psmux/psmux#622) — runs.live_session_may_be_ours can read a live session "
+            "as absent again, beyond the PATH case its ceiling names (#754)"
         )
     finally:
         dead.close()
