@@ -10601,6 +10601,481 @@ def test_idle_journal_retries_transient_event_failures(tmp_path, monkeypatch):
     assert [entry["kind"] for entry in journal.entries] == ["session-idle", "session-active"]
 
 
+# ------------------------------------------------- idle notice: subagent tree
+# A parent blocked on a foreground subagent writes nothing to its own
+# transcript; the profile's subagent tree (claude: `<stem>/subagents`, walked
+# recursively and stat-only) keeps the idle clock moving. Its key is separate
+# from `idle.last_key`, which stays the parent's #727 scan offset.
+
+
+def _subagent_file(transcript: Path, rel: str, payload: bytes = b'{"type":"user"}\n') -> Path:
+    """A subagent transcript at `<transcript stem>/subagents/<rel>` — the tree
+    claude's derived `subagent_transcript_dir` names."""
+    path = transcript.parent / transcript.stem / "subagents" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["agent-a.jsonl", "workflows/wf_x/agent-b.jsonl"],
+    ids=["direct", "workflow"],
+)
+def test_subagent_writes_keep_a_static_parent_active(tmp_path, monkeypatch, rel):
+    """The parent transcript never moves while a subagent's transcript grows on
+    every heartbeat — directly under `subagents/` or nested in a workflow dir:
+    the session is active throughout, so no `session-idle` and every age after
+    the naming heartbeat is 0.
+
+    ABLATION: drop `or sub_moved` and both rows open a stretch; stop descending
+    into subdirectories and the workflow row does."""
+    adapter, mux, log, transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch)
+    agent = _subagent_file(transcript, rel)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            _grow(agent, b'{"type":"assistant"}\n')
+        if call_n == 8:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "timeout"
+    assert mux.sent == []
+    assert adapter.journal.entries == []
+    assert heartbeats[0]["transcript_idle_s"] is None  # predates the naming
+    ages = [hb["transcript_idle_s"] for hb in heartbeats[1:]]
+    assert len(ages) >= 5 and all(age == 0.0 for age in ages), ages
+
+
+def test_subagent_tree_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatch):
+    """No tree when the parent goes quiet, so the stretch opens at the grace
+    crossing; the first subagent then creates the tree, which reads as movement
+    from an absent tree's (0, 0, 0): one `session-active` carrying the
+    stretch's full length.
+
+    ABLATION: drop `or sub_moved` and the `session-active` is missing."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    agent = None
+
+    def script(call_n):
+        nonlocal agent
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+            _grow(log, "\r⠋".encode())
+        if call_n == 5:
+            agent = _subagent_file(transcript, "agent-a.jsonl")  # heartbeat 5: 120 s
+        if call_n > 5:
+            _grow(agent, b'{"type":"assistant"}\n')  # keeps working to the end
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active"]
+    assert entries[0]["since_ts"] == 5000.0
+    assert entries[1]["idle_s"] == 120.0  # the stretch: naming (mono 1000) to mono 1120
+
+
+def test_silent_subagent_tree_still_opens_one_idle_stretch(tmp_path, monkeypatch):
+    """A subagent tree that exists but sits as still as the parent is no
+    activity: its first walk is a baseline, not a change, so exactly one
+    `session-idle` opens at the grace crossing.
+
+    ABLATION: count every walk as movement (`sub_moved = sub is not None`) and
+    no stretch ever opens."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _subagent_file(transcript, "agent-a.jsonl")
+    _subagent_file(transcript, "workflows/wf_x/agent-b.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+
+
+def _faulting_tree_key(monkeypatch, fail_roots: dict[Path, int]):
+    """Patch the module-level `_subagent_tree_key` (never `generic.os`, the global
+    module) to raise PermissionError for the next N walks of each named root."""
+    real = generic._subagent_tree_key
+    calls: list[Path] = []
+
+    def key(root):
+        calls.append(root)
+        if fail_roots.get(root, 0) > 0:
+            fail_roots[root] -= 1
+            raise PermissionError(13, "Permission denied")
+        return real(root)
+
+    monkeypatch.setattr(generic, "_subagent_tree_key", key)
+    return calls
+
+
+def test_repointed_transcript_rebaselines_the_subagent_tree(tmp_path, monkeypatch):
+    """A hook event re-points the transcript to one with its own, different,
+    static tree, and the walks of that tree fault on the re-pointing tick. The
+    first clean walk must be the new tree's baseline — never compared with the
+    OLD tree's key — so the static session reads idle from the re-pointing.
+
+    ABLATION: drop `idle.sub_key = None` from the rebaseline and the recovered
+    walk differs from the old tree's key, resetting the age to 0."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    _subagent_file(transcript, "agent-a.jsonl")
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')
+    _subagent_file(other, "agent-x.jsonl", b'{"type":"user","a":"longer payload"}\n')
+    # both walks of the re-pointing tick fault: its hook-event sample and its
+    # heartbeat sample
+    calls = _faulting_tree_key(monkeypatch, {tmp_path / "other" / "subagents": 2})
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        _session_start("3-1-dev-1", str(other)),  # re-pointed on tick 3
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert tmp_path / "other" / "subagents" in calls
+    # the re-pointed file's own clock: 0 at the heartbeat that first sampled it
+    # (its tree walk faulted), then climbing through the recovered walk
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 30.0, 0.0, 30.0, 60.0]
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_subagent_growth_is_not_transcript_work(tmp_path, monkeypatch):
+    """A growing subagent tree under a static pane and a static parent keeps the
+    idle clock moving but is not #727 work: the parent's `last_key` never moved,
+    so the assistant-activity scan never runs and `produced_work` stays False.
+
+    ABLATION: fold the subagent change into `idle.last_key` and the scan runs on
+    credited bytes."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    agent = _subagent_file(transcript, "agent-a.jsonl")
+    scans: list[tuple[str, int]] = []
+
+    def scan(path, since_size):
+        scans.append((path, since_size))
+        return True
+
+    adapter._transcript_has_assistant_activity = scan
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(agent, b'{"type":"assistant"}\n')
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert all(hb["transcript_idle_s"] == 0.0 for hb in heartbeats[1:])  # active
+    assert scans == []
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_subagent_scan_failure_is_crumbed_once_and_degrades_to_the_parent(tmp_path, monkeypatch):
+    """A tree walk that raises degrades the tick to the parent alone — the
+    pre-subagent behaviour — so a silent parent still opens its stretch on time.
+    The streak is crumbed at its transitions only: one `subagent-scan-failed`
+    (`path`, `error`) at failure 1 and one `subagent-scan-recovered`
+    (`failures`) at the first clean walk, which is a baseline (the faulted
+    baseline walk left no key to compare against), not movement.
+
+    ABLATION: swallow the fault into (0, 0, 0) and neither crumb is written;
+    drop the `idle.sub_key is not None` guard and the recovered walk reads as
+    movement, moving `since_ts`."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _subagent_file(transcript, "agent-a.jsonl")
+    root = tmp_path / "transcript" / "subagents"
+    calls = _faulting_tree_key(monkeypatch, {root: 2})
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert len(calls) > 3  # the streak closed before the session ended
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    (failed,) = _lifecycle_events(adapter, "subagent-scan-failed")
+    assert failed["path"] == str(root)
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+    (recovered,) = _lifecycle_events(adapter, "subagent-scan-recovered")
+    assert recovered["failures"] == 2
+
+
+def test_subagent_failure_streak_survives_a_repoint(tmp_path, monkeypatch):
+    """A streak open when a hook event re-points the transcript still gets its
+    recovery crumb from the new tree's first clean walk: the rebaseline resets
+    the key, never the streak.
+
+    ABLATION: reset `sub_scan_failures` in the rebaseline and the recovery crumb
+    is lost."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    _subagent_file(transcript, "agent-a.jsonl")
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user"}\n')
+    _faulting_tree_key(monkeypatch, {tmp_path / "transcript" / "subagents": 99})
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        _session_start("3-1-dev-1", str(other)),  # re-pointed on tick 3
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    (failed,) = _lifecycle_events(adapter, "subagent-scan-failed")
+    assert failed["path"] == str(tmp_path / "transcript" / "subagents")
+    (recovered,) = _lifecycle_events(adapter, "subagent-scan-recovered")
+    assert recovered["failures"] == 2  # ticks 1 and 2 on the first tree
+
+
+@pytest.mark.parametrize("profile_name", ["gemini", "codex", "copilot"])
+def test_subagent_fold_is_off_without_a_declared_layout(tmp_path, monkeypatch, profile_name):
+    """Profiles whose usage parser derives no tree, and that declare none, keep
+    the parent-only idle clock: a growing `<stem>/subagents/` file beside their
+    transcript is not watched, so the silent parent opens its stretch, and no
+    walk ever runs (no `subagent-scan-*` crumb).
+
+    ABLATION: hard-code claude's `{stem}/subagents` root and no stretch opens."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, profile_name=profile_name
+    )
+    assert adapter.profile.subagent_transcript_root == ""
+    agent = _subagent_file(transcript, "agent.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            _grow(agent, b'{"type":"assistant"}\n')
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle"]
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def test_declared_subagent_dir_folds_under_usage_parser_none(tmp_path, monkeypatch):
+    """The field, not the usage parser, gates the fold: a profile that reads no
+    usage but declares a tree has its writes counted.
+
+    ABLATION: resolve the root from usage_parser alone and the stretch opens."""
+    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch)
+    adapter.profile = dataclasses.replace(
+        adapter.profile, usage_parser="none", subagent_transcript_dir="{stem}/subagents"
+    )
+    agent = _subagent_file(transcript, "agent-a.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            _grow(agent, b'{"type":"assistant"}\n')
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert adapter.journal.entries == []
+    assert all(hb["transcript_idle_s"] == 0.0 for hb in heartbeats[1:])
+
+
+def test_subagent_activity_in_the_final_interval_closes_the_stretch(tmp_path, monkeypatch):
+    """An open stretch whose subagent tree moves after the last heartbeat, with
+    the deadline elapsing before another: the exit-time sample walks the tree
+    too, so the journal reads `session-idle` then `session-active`.
+
+    ABLATION: drop `or sub_moved` and the `session-active` is missing."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    agent = _subagent_file(transcript, "agent-a.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(log, "\r⠋".encode())
+        if 2 <= call_n <= 4:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+        if call_n == 5:
+            clock["t"] += 10.0  # inside the final interval: no heartbeat fires
+            _grow(agent, b'{"type":"assistant"}\n')
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
+
+
+# `_subagent_tree_key` directly: the stat-only walk's skip/raise rules.
+
+
+def test_subagent_tree_key_of_a_missing_or_file_root_is_empty(tmp_path):
+    assert generic._subagent_tree_key(tmp_path / "absent" / "subagents") == (0, 0, 0)
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_bytes(b"x")
+    assert generic._subagent_tree_key(not_a_dir) == (0, 0, 0)
+
+
+def test_subagent_tree_key_counts_only_jsonl_transcripts(tmp_path):
+    """Recursive, and `*.meta.json` siblings (and any non-jsonl) are not
+    transcripts."""
+    root = tmp_path / "subagents"
+    (root / "workflows" / "wf_1").mkdir(parents=True)
+    (root / "agent-a.jsonl").write_bytes(b"12345")
+    (root / "agent-a.meta.json").write_bytes(b'{"agentType":"x"}')
+    (root / "workflows" / "wf_1" / "agent-b.jsonl").write_bytes(b"123")
+    (root / "workflows" / "wf_1" / "notes.txt").write_bytes(b"ignored")
+    count, total, newest = generic._subagent_tree_key(root)
+    assert (count, total) == (2, 8)
+    assert newest == max(
+        (root / "agent-a.jsonl").stat().st_mtime_ns,
+        (root / "workflows" / "wf_1" / "agent-b.jsonl").stat().st_mtime_ns,
+    )
+
+
+def test_subagent_tree_key_skips_a_file_that_vanishes_mid_walk(tmp_path, monkeypatch):
+    """A file listed by the walk but gone by its stat (a subagent's transcript
+    rotated away) is skipped, not raised.
+
+    ABLATION: let FileNotFoundError propagate and this raises."""
+    root = tmp_path / "subagents"
+    root.mkdir()
+    (root / "a.jsonl").write_bytes(b"12345")
+    gone = root / "b.jsonl"
+    gone.write_bytes(b"123")
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):  # delegates for every other path
+        if os.fspath(path) == str(gone):
+            raise FileNotFoundError(2, "No such file or directory", str(gone))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", stat)
+    count, total, _ = generic._subagent_tree_key(root)
+    assert (count, total) == (1, 5)
+
+
+def test_subagent_tree_key_raises_a_non_enoent_fault(tmp_path, monkeypatch):
+    """Any other OSError is a real fault for the caller to crumb, never folded
+    into an empty-looking tree."""
+    root = tmp_path / "subagents"
+    root.mkdir()
+    denied = root / "a.jsonl"
+    denied.write_bytes(b"12345")
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path) == str(denied):
+            raise PermissionError(13, "Permission denied", str(denied))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", stat)
+    with pytest.raises(PermissionError):
+        generic._subagent_tree_key(root)
+
+
+def test_subagent_tree_key_moves_on_an_append_inside_one_mtime_tick(tmp_path):
+    """An append to a NON-newest file whose mtime does not advance (a coarse
+    clock tick) still moves the key: it is an aggregate, not the newest file's
+    (mtime, size)."""
+    root = tmp_path / "subagents"
+    root.mkdir()
+    older, newer = root / "a.jsonl", root / "b.jsonl"
+    older.write_bytes(b"1")
+    newer.write_bytes(b"2")
+    base_ns = 1_700_000_000_000_000_000
+    os.utime(older, ns=(base_ns, base_ns))
+    os.utime(newer, ns=(base_ns + 1_000, base_ns + 1_000))
+    before = generic._subagent_tree_key(root)
+    _grow(older, b"more")
+    os.utime(older, ns=(base_ns, base_ns))
+    after = generic._subagent_tree_key(root)
+    assert before[2] == after[2] == base_ns + 1_000
+    assert after != before
+
+
+def test_subagent_tree_key_does_not_follow_a_symlinked_dir(tmp_path):
+    """A symlink is neither descended nor counted: the tree is the CLI's own
+    files, never a link out of it."""
+    root = tmp_path / "subagents"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.jsonl").write_bytes(b"12345")
+    try:
+        os.symlink(outside, root / "link", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    assert generic._subagent_tree_key(root) == (0, 0, 0)
+
+
 # ------------------------------------ parked-session signals (DW-348/DW-350)
 #
 # A CLI parked on a permission / idle / quota prompt looks exactly like a stalled

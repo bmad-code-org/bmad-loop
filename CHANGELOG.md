@@ -36,6 +36,8 @@ breaking changes may land in a minor release.
   start whose effort is not one of the model's variants (#847).
 - Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`
   and classify rate-limit, quota and transport outages there as environment faults (#847).
+- Add the `subagent_transcript_dir` CLI profile field: a subagent transcript tree whose
+  writes count as session activity for the idle notice (#858).
 
 ### Changed
 
@@ -102,6 +104,8 @@ breaking changes may land in a minor release.
   (DW-538): the stale admin entry is now pruned; a prune that fails is reported.
 - Make the test suite pass on WSL2: skip the pidfd reap tests when the Python build
   has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883).
+- Count Claude subagent and workflow-agent transcript writes as session activity, so a
+  session waiting on a foreground subagent no longer journals `session-idle` (#858).
 
 ### Security
 
