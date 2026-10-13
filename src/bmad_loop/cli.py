@@ -591,8 +591,12 @@ def _validate_environment_probes(
 def _check_opencode_version(report: ValidationReport, profile_name: str, resolved: str) -> None:
     """``adapter.opencode-version``: which OpenCode server API ``resolved`` would
     run, judged by the same :func:`opencode_protocol.support_verdict` the adapter
-    refuses unsupported majors with. OK or a warning, never a problem; skipped
-    when ``--version`` itself fails (``adapter.binary-unrunnable`` covers it)."""
+    refuses unsupported majors with. OK or a warning, never a problem.
+
+    Called only once ``binary_runs`` saw ``--version`` exit 0, so a read that
+    now fails, times out, or prints nothing is not ``adapter.binary-unrunnable``'s
+    finding: it is a warning here, because the run reads the same output and
+    refuses to start on it."""
     from . import probe as probe_mod
     from .adapters.opencode_protocol import (
         parse_opencode_version,
@@ -602,6 +606,13 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
 
     first_line = probe_mod.binary_version_text(resolved)
     if first_line is None:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: `--version` exited 0 once, but a second read failed, "
+            f"timed out, or printed nothing — runs read it to pick the server API "
+            f"and refuse to start without one (supported: {supported_ranges()})",
+            {"profile": profile_name, "path": resolved, "output": None},
+        )
         return
     detail: dict[str, object] = {"profile": profile_name, "path": resolved, "output": first_line}
     version = parse_opencode_version(first_line)
@@ -988,7 +999,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # The server API major the run would detect from `--version` (#847):
             # 2.x replaced 1.x under the same binary name. Read only for a binary
             # already proven runnable above — that is the packaged-provenance gate
-            # (#294), and a failed `--version` is `adapter.binary-unrunnable`'s
+            # (#294), and a failed first `--version` is `adapter.binary-unrunnable`'s
             # finding, not this one's. Never a problem: the run itself refuses an
             # unsupported major with a clear error, and validate's rc is a
             # compatibility contract.

@@ -250,9 +250,7 @@ def binary_version_text(binary: str, timeout_s: float = 10) -> str | None:
 
     Never raises, for :func:`binary_runs`'s reason (cmd_validate has no error
     path of its own), and bounded by the same :func:`childrun.run_argv`. A
-    failed run is None rather than a reason: ``adapter.binary-unrunnable``
-    already reports it, so the caller skips the version check instead of
-    reporting the same fault twice."""
+    failed run is None rather than a reason; the caller reports it."""
     try:
         run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
     except (OSError, subprocess.SubprocessError, ProcessHostError):

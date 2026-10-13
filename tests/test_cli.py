@@ -9750,10 +9750,16 @@ def test_validate_reports_opencode_version_warns_unsupported_major(project, caps
     assert "runs will refuse to start" in findings[0]["message"]
 
 
-def test_validate_opencode_version_skipped_when_version_fails(project, capsys, monkeypatch):
-    """A failing `--version` is `adapter.binary-unrunnable`'s finding; this check
-    adds nothing on top of it."""
-    assert _opencode_version_findings(project, capsys, monkeypatch, None) == []
+def test_validate_opencode_version_warns_when_second_read_fails(project, capsys, monkeypatch):
+    """The check runs only after `binary_runs` saw `--version` exit 0, so a read
+    that now fails or prints nothing is reported by no other finding. The run
+    refuses to start on it, so validate warns rather than staying silent.
+
+    Ablation target: return early on a None read and this sees no finding."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, None)
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["output"] is None
+    assert "refuse to start" in findings[0]["message"]
 
 
 def test_validate_warns_when_no_desktop_notifier(project, monkeypatch, capsys):
