@@ -21,7 +21,14 @@ transcript that yields nothing reads as None (untracked), not zero.
                  missing or unusable the rollout is resolved by id
                  (`resolve_transcript`). `token_count` event payloads carry
                  CUMULATIVE totals, so the last one is the session usage
-                 (sessions here are fresh per task).
+                 (sessions here are fresh per task). Each subagent writes its
+                 own rollout, and its usage is NOT part of the parent's
+                 totals: a sibling whose first-line session_meta names the
+                 parent as its `session_id` (the root thread, at any depth),
+                 or whose `parent_thread_id` chains into the parent's tree,
+                 adds its own last cumulative totals. Siblings are sought in
+                 the parent's day dir and later ones (a session can cross
+                 midnight), from the parent's filename timestamp on.
 - gemini-chat:   ~/.gemini/tmp/<project>/chats/session-*.jsonl — a JSONL
                  patch stream: bare message entries (and messages inside
                  "$set" patches) carry a per-API-call `tokens` block
@@ -39,7 +46,10 @@ transcript that yields nothing reads as None (untracked), not zero.
 
 from __future__ import annotations
 
+import datetime
 import json
+import re
+import threading
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -210,7 +220,10 @@ def tally(transcript_path: Path) -> TokenUsage | None:
 # ----------------------------------------------------------- codex-rollout
 
 
-def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
+def _codex_rollout_total(transcript_path: Path) -> dict[str, Any] | None:
+    """The rollout's last cumulative `token_count` totals, or None when it has
+    none. A subagent's rollout holds only its own turns, so this rule holds
+    for children as well as for the parent. OSError/ValueError propagate."""
     last: dict[str, Any] | None = None
     for entry in _jsonl_entries(transcript_path):
         payload = entry.get("payload")
@@ -221,15 +234,190 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
             continue
         totals = info.get("total_token_usage")
         last = totals if isinstance(totals, dict) else info
-    if last is None:
-        return None
-    cached = _int(last.get("cached_input_tokens"))
+    return last
+
+
+def _codex_usage(totals: dict[str, Any]) -> TokenUsage:
+    cached = _int(totals.get("cached_input_tokens"))
     return TokenUsage(
         # Codex's input_tokens includes the cached portion; split it out.
-        input_tokens=max(0, _int(last.get("input_tokens")) - cached),
-        output_tokens=_int(last.get("output_tokens")),
+        input_tokens=max(0, _int(totals.get("input_tokens")) - cached),
+        output_tokens=_int(totals.get("output_tokens")),
         cache_read_tokens=cached,
     )
+
+
+# A session_meta line is ~18-23 KB (it embeds base_instructions). A membership
+# test reads at most this much of a sibling, never its body.
+_CODEX_META_READ_CAP = 1 << 20
+
+# (id, session_id, parent_thread_id) from a rollout's first-line session_meta,
+# or None when the file does not open with one. session_meta is written once and
+# never changes, so every answer, negative included, is cached by path for
+# good; only a first line still being written (no newline yet) is re-read.
+# Bounded oldest-first like opencode_http's USAGE_STASH_CAP. A day dir holds a
+# few hundred rollouts and a tally lists the parent's day plus the next, so the
+# cap sits far above one tally's candidate set: the budget guard's per-heartbeat
+# tally never evicts its own siblings, and re-reads only the files' bodies.
+CODEX_META_CACHE_CAP = 4096
+_CodexMeta = tuple[str, str | None, str | None]
+_codex_meta_cache: dict[str, _CodexMeta | None] = {}
+_codex_meta_lock = threading.Lock()
+
+_ROLLOUT_TS = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})")
+
+
+def _read_codex_first_line(path: Path) -> bytes:
+    with path.open("rb") as f:
+        return f.readline(_CODEX_META_READ_CAP)
+
+
+def _parse_codex_meta(line: bytes) -> _CodexMeta | None:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+        return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    def text(value: Any) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    thread_id = text(payload.get("id"))
+    if thread_id is None:
+        return None
+    parent = text(payload.get("parent_thread_id"))
+    if parent is None:
+        # Older rollouts name the parent only in the spawn source.
+        source = payload.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        parent = text(spawn.get("parent_thread_id")) if isinstance(spawn, dict) else None
+    return thread_id, text(payload.get("session_id")), parent
+
+
+def _codex_meta(path: Path) -> _CodexMeta | None:
+    """The rollout's session_meta facts, cached (see CODEX_META_CACHE_CAP).
+    OSError propagates."""
+    key = str(path)
+    with _codex_meta_lock:
+        if key in _codex_meta_cache:
+            return _codex_meta_cache[key]
+    line = _read_codex_first_line(path)
+    meta = _parse_codex_meta(line)
+    if line.endswith(b"\n") or len(line) >= _CODEX_META_READ_CAP:
+        with _codex_meta_lock:
+            if key not in _codex_meta_cache:
+                while len(_codex_meta_cache) >= CODEX_META_CACHE_CAP:
+                    del _codex_meta_cache[next(iter(_codex_meta_cache))]
+            _codex_meta_cache[key] = meta
+    return meta
+
+
+def _codex_day(folder: Path) -> datetime.date | None:
+    try:
+        return datetime.date(
+            int(folder.parent.parent.name), int(folder.parent.name), int(folder.name)
+        )
+    except ValueError:
+        return None
+
+
+def _codex_sibling_candidates(transcript_path: Path) -> list[Path]:
+    """Rollouts that may be the parent's subagents: `rollout-*.jsonl` in the
+    parent's day dir and each later day dir through the day after the parent's
+    last write (capped at local today + 1; dirs are local dates and a child
+    can start after midnight), whose filename timestamp is not earlier than
+    the parent's. A parent outside a YYYY/MM/DD tree searches its own dir."""
+    folder = transcript_path.parent
+    first = _codex_day(folder)
+    folders = [folder]
+    if first is not None:
+        today = datetime.date.today()
+        try:
+            written = datetime.date.fromtimestamp(transcript_path.stat().st_mtime)
+        except (OSError, ValueError, OverflowError):
+            written = today
+        last = max(first, min(written, today)) + datetime.timedelta(days=1)
+        sessions = folder.parent.parent.parent
+        folders = []
+        day = first
+        while day <= last:
+            folders.append(sessions / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}")
+            day += datetime.timedelta(days=1)
+    stamp = _ROLLOUT_TS.match(transcript_path.name)
+    floor = stamp.group(1) if stamp else ""
+    candidates: list[Path] = []
+    for each in folders:
+        for path in sorted(each.glob("rollout-*.jsonl")):
+            match = _ROLLOUT_TS.match(path.name)
+            if path != transcript_path and (match.group(1) if match else "") >= floor:
+                candidates.append(path)
+    return candidates
+
+
+def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
+    """The session's usage: the parent rollout's last cumulative totals plus
+    each subagent rollout's own (Codex keeps a child's usage out of the
+    parent's totals).
+
+    A parent whose first line is not a session_meta tallies alone. A child is
+    a sibling (see `_codex_sibling_candidates`) whose session_meta names the
+    parent as its `session_id` (the root thread, at any depth), or whose
+    `parent_thread_id` chains into the parent's tree (children that predate
+    `session_id`), iterated to a fixpoint. One thread written to two files
+    counts once, from the later file. A child's usage makes the session
+    tracked even when the parent reports none. An unreadable sibling
+    (OSError/ValueError) is skipped; parent errors propagate as before, and
+    None still means no usage signal anywhere."""
+    parent_totals = _codex_rollout_total(transcript_path)
+    try:
+        parent_meta = _codex_meta(transcript_path)
+    except OSError:
+        parent_meta = None
+    totals: list[dict[str, Any]] = [] if parent_totals is None else [parent_totals]
+    if parent_meta is not None:
+        root = parent_meta[0]
+        metas: dict[str, _CodexMeta] = {}
+        try:
+            candidates = _codex_sibling_candidates(transcript_path)
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                meta = _codex_meta(path)
+            except OSError:
+                continue
+            if meta is not None and meta[0] != root:
+                metas[str(path)] = meta
+        tree = {root}
+        members = {path for path, meta in metas.items() if meta[1] == root}
+        tree.update(metas[path][0] for path in members)
+        grew = True
+        while grew:
+            grew = False
+            for path, (thread_id, _, parent) in metas.items():
+                if path not in members and parent in tree:
+                    members.add(path)
+                    tree.add(thread_id)
+                    grew = True
+        by_thread = {metas[path][0]: Path(path) for path in sorted(members)}
+        for child in by_thread.values():
+            try:
+                child_totals = _codex_rollout_total(child)
+            except (OSError, ValueError):
+                continue
+            if child_totals is not None:
+                totals.append(child_totals)
+    if not totals:
+        return None
+    usage = TokenUsage()
+    for each in totals:
+        usage.add(_codex_usage(each))
+    return usage
 
 
 # ------------------------------------------------------------- gemini-chat

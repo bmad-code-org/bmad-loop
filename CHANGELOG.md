@@ -58,6 +58,11 @@ breaking changes may land in a minor release.
   (#775).
 - Decode hook stdin as UTF-8 bytes instead of the locale code page, and record an
   unreadable hook payload in `session-lifecycle.jsonl` (#775).
+- Count codex subagent rollouts in session usage. Codex writes each subagent to its
+  own rollout and leaves its usage out of the parent's totals, so subagent-heavy
+  sessions were under-counted by half or more. Codex totals and budgets can roughly
+  double for those sessions, so budgets tuned on old figures may trip differently
+  (#775).
 - Stop failing every opencode-http session start against OpenCode 2.x with a health
   timeout (#847).
 - Keep probing an opencode-http session over HTTP after an event-stream reconnect
