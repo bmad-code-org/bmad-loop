@@ -8,14 +8,17 @@ instead of charging a dev attempt, and re-arming resets the budget.
 
 This lives in its own module rather than on one adapter because the signal is
 **transport-agnostic**: every adapter that writes a per-task diagnostic log can
-be classified from it, whatever produced the bytes. Which file that is per
-adapter is named by ``ENV_FAULT_LOG_SUFFIX``: the tmux adapters tee a pane
-capture to ``logs/<task_id>.log`` (``mux.pipe_pane``); the opencode HTTP adapter
-redirects the ``opencode serve`` process's own stdout/stderr to
-``logs/<task_id>.server.out`` — NOT its ``.log``, which is a model-written
-conversation transcript. Keeping the classifier attached to a single adapter is
-what let #194 ship covering only half the adapters, so the next sibling adapter
-inherits this instead of re-omitting it.
+be classified from it, whatever produced the bytes. Which files those are per
+adapter is named by ``ENV_FAULT_LOG_SUFFIX`` (one file) or
+``ENV_FAULT_LOG_SUFFIXES`` (several): the tmux adapters tee a pane capture to
+``logs/<task_id>.log`` (``mux.pipe_pane``); the opencode HTTP adapter scans the
+``opencode serve`` process's own stdout/stderr, ``logs/<task_id>.server.out``,
+plus ``logs/<task_id>.provider-errors.log``, the one line per provider-error
+event it writes itself from structured fields (OpenCode 2.x logs no provider
+retry to stdout) — NOT its ``.log``, which is a model-written conversation
+transcript. Keeping the classifier attached to a single adapter is what let
+#194 ship covering only half the adapters, so the next sibling adapter inherits
+this instead of re-omitting it.
 
 Host-class contract: ``self.profile`` (a ``CLIProfile``), ``self.logs_dir``, and
 ``_note_lifecycle`` (from ``_ResultFileMixin``). Mix in alongside that mixin.
@@ -24,7 +27,8 @@ Note the two log flavors differ in how *dirty* they are, which is why the
 shipped patterns are anchored the way they are. A tmux pane capture contains the
 model's own output — a story that implements rate limiting will print "429" and
 "quota" in ordinary healthy work — whereas the opencode server log carries only
-server and provider lines. That difference sets the bar per profile, and the two
+server and provider lines, and its provider-errors log only adapter-authored
+structured fields. That difference sets the bar per profile, and the two
 bars are NOT the same. On a pane capture a pattern must reproduce a COMPLETE
 captured CLI error sentence: an error-shaped token plus a cause on the same line
 is precisely the shape a story writing ABOUT the error emits, so that weaker rule
@@ -103,11 +107,16 @@ _ANSI_RE = re.compile(
 
 
 class EnvFaultMixin:
-    """Classify a dead session as an environment fault from its log tail (#194).
+    """Classify a dead session as an environment fault from its log tails (#194).
 
-    Mixed into every adapter that writes a per-task diagnostic log; which file
-    is scanned is named by ``ENV_FAULT_LOG_SUFFIX``. Inert for a profile with no
-    ``env_fault_patterns``, so mixing it in is always safe."""
+    Mixed into every adapter that writes a per-task diagnostic log; which files
+    are scanned is named by ``ENV_FAULT_LOG_SUFFIXES`` (or, when that is unset,
+    the single ``ENV_FAULT_LOG_SUFFIX``). Inert for a profile with no
+    ``env_fault_patterns``, so mixing it in is always safe.
+
+    Several files are scanned independently — each its own tail, straddle and
+    match-timeout handling, each read fault its own crumb — and the last match
+    across them wins, files taken in suffix order."""
 
     # Set by the concrete adapter's __init__; bare annotations (no runtime effect)
     # tell the type checker which host attributes this mixin reads.
@@ -134,9 +143,23 @@ class EnvFaultMixin:
     # opencode's are anchored on the assumption of a model-free log, so pointing
     # this at a transcript would make them unsound.
     ENV_FAULT_LOG_SUFFIX = ".log"
+    # Every per-task file the scan reads, in order — for an adapter whose
+    # diagnostics land in more than one file (opencode-http: the server's own
+    # stdout plus the provider-error lines it writes from SSE events). Empty =
+    # just ENV_FAULT_LOG_SUFFIX, so an adapter class that only ever set the
+    # single suffix keeps scanning exactly that file. Every file named here is
+    # held to the same model-free bar as above, and each must exist by the time
+    # the session ends: a missing one is a read fault, never a clean answer.
+    ENV_FAULT_LOG_SUFFIXES: tuple[str, ...] = ()
 
     def _env_fault_log_path(self, task_id: str) -> Path:
+        """The primary scanned file (``ENV_FAULT_LOG_SUFFIX``)."""
         return self.logs_dir / f"{task_id}{self.ENV_FAULT_LOG_SUFFIX}"
+
+    def _env_fault_log_paths(self, task_id: str) -> tuple[Path, ...]:
+        """Every scanned file, in scan order."""
+        suffixes = self.ENV_FAULT_LOG_SUFFIXES or (self.ENV_FAULT_LOG_SUFFIX,)
+        return tuple(self.logs_dir / f"{task_id}{suffix}" for suffix in suffixes)
 
     if TYPE_CHECKING:
         # Supplied by _ResultFileMixin, which every host of this mixin already
@@ -235,25 +258,53 @@ class EnvFaultMixin:
         return usage.total
 
     def _env_fault_evidence(self, task_id: str) -> str | None:
-        """Scan the tail of the tee'd session log for a transport-failure pattern.
+        """Scan the tail of each diagnostic log for a transport-failure pattern.
 
-        Reads the last ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with
-        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each line
-        against the precompiled patterns under a per-match ``ENV_FAULT_MATCH_TIMEOUT_S``
-        bound. Returns the ANSI-stripped matching line (last match winning, windowed
-        to ``ENV_FAULT_EVIDENCE_MAX`` around the match), or None when nothing matches,
-        the log can't be read (any ``OSError``), or a pattern exceeds the match timeout
-        (``TimeoutError``) — no classification, the best-effort doctrine.
+        For each file of :meth:`_env_fault_log_paths`: reads the last
+        ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with ``errors="replace"``,
+        ``\\r``→``\\n``), strips ANSI, and matches each line against the
+        precompiled patterns under a per-match ``ENV_FAULT_MATCH_TIMEOUT_S``
+        bound. Returns the ANSI-stripped matching line (last match winning,
+        across files in suffix order, windowed to ``ENV_FAULT_EVIDENCE_MAX``
+        around the match), or None when nothing matches or a pattern exceeds the
+        match timeout (``TimeoutError``) — no classification, the best-effort
+        doctrine. A file that can't be read (any ``OSError``) is skipped; the
+        others are still scanned.
 
-        The last two Nones are folds, not answers: the scan never looked, so an
-        outage in that log reads as an ordinary failure and spends a dev attempt.
-        Each drops an ``env-fault-scan-failed`` lifecycle crumb (``stage`` =
-        ``read`` or ``match``, ``log``, ``error``; ``match`` adds ``pattern``) so
-        the post-mortem can tell "no provider error" from "never checked" (DW-460).
-        A MISSING log is a read fault too, not an answer: both hosts create it
-        before the session starts (the pane tee pre-touched, ``.server.out`` at
-        spawn), so its absence here means it went away."""
-        log_path = self._env_fault_log_path(task_id)
+        Those folds are not answers: the scan never looked (at that file, or at
+        all), so an outage in it reads as an ordinary failure and spends a dev
+        attempt. Each drops an ``env-fault-scan-failed`` lifecycle crumb
+        (``stage`` = ``read`` or ``match``, ``log``, ``error``; ``match`` adds
+        ``pattern``) so the post-mortem can tell "no provider error" from "never
+        checked" (DW-460) — one per unreadable file. A MISSING log is a read
+        fault too, not an answer: every host creates each scanned file before
+        the session starts (the pane tee pre-touched, ``.server.out`` and
+        ``.provider-errors.log`` at spawn), so its absence here means it went
+        away."""
+        found: tuple[str, int] | None = None
+        for log_path in self._env_fault_log_paths(task_id):
+            lines = self._env_fault_tail_lines(task_id, log_path)
+            if lines is None:
+                continue  # read fault, crumbed: the other files still count
+            for line in lines:
+                for pat in self._env_fault_patterns:
+                    try:
+                        hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
+                    except TimeoutError as exc:
+                        # runaway pattern → decline to classify (best-effort, like OSError)
+                        self._note_scan_failed(task_id, "match", log_path, exc, pattern=pat.pattern)
+                        return None
+                    if hit is not None:
+                        found = (line, hit.start())  # last match wins
+                        break
+        if found is None:
+            return None
+        return _excerpt(*found)
+
+    def _env_fault_tail_lines(self, task_id: str, log_path: Path) -> list[str] | None:
+        """The ANSI-stripped lines of ``log_path``'s last ``ENV_FAULT_TAIL_BYTES``,
+        a straddling first fragment dropped — or None, crumbed, when the file
+        cannot be read."""
         try:
             with log_path.open("rb") as fh:
                 fh.seek(0, 2)  # SEEK_END
@@ -299,22 +350,7 @@ class EnvFaultMixin:
             #   but silently classifying nothing is exactly the failure this
             #   classifier exists to prevent.
             lines = lines[1:]
-        match_line: str | None = None
-        match_pos = 0
-        for line in lines:
-            for pat in self._env_fault_patterns:
-                try:
-                    hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
-                except TimeoutError as exc:
-                    # runaway pattern → decline to classify (best-effort, like OSError)
-                    self._note_scan_failed(task_id, "match", log_path, exc, pattern=pat.pattern)
-                    return None
-                if hit is not None:
-                    match_line, match_pos = line, hit.start()  # last match wins
-                    break
-        if match_line is None:
-            return None
-        return _excerpt(match_line, match_pos)
+        return lines
 
     def _note_scan_failed(
         self, task_id: str, stage: str, log_path: Path, exc: BaseException, **fields: object

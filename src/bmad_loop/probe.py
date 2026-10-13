@@ -244,6 +244,23 @@ def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
     return run.returncode
 
 
+def binary_version_text(binary: str, timeout_s: float = 10) -> str | None:
+    """The first line of ``binary --version`` output (stdout, then stderr), or
+    None when it could not run, timed out, exited nonzero, or printed nothing.
+
+    Never raises, for :func:`binary_runs`'s reason (cmd_validate has no error
+    path of its own), and bounded by the same :func:`childrun.run_argv`. A
+    failed run is None rather than a reason; the caller reports it."""
+    try:
+        run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
+        return None
+    if run.timed_out or run.interrupted or run.returncode != 0:
+        return None
+    output = ((run.stdout or "") + (run.stderr or "")).strip()
+    return output.splitlines()[0] if output else None
+
+
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
     """Scrubbed ``--version``/``--help`` for a binary. Never raises."""
     if not shutil.which(binary):

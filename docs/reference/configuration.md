@@ -130,7 +130,7 @@ CLI client, model & bypass flags (base for all stages).
 | --- | --- | --- | --- | --- |
 | `name` | string | unset — CLI profile — default: claude |  |  |
 | `model` | string | unset — CLI default model |  |  |
-| `effort` | string | unset — provider default |  | reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the per-prompt variant, ignored by the tmux CLIs |
+| `effort` | string | unset — provider default |  | reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the model variant (on 2.x it must be one of the model's variants), ignored by the tmux CLIs |
 | `extra_args` | array of strings | unset |  | when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts |
 | `cleanup_session_on_finish` | boolean | `true` |  |  |
 | `usage_grace_s` | float | unset — inherit from CLI profile (copilot ships 8s) | ≥ 0 | seconds to poll the transcript for token usage after a session ends; CLIs that flush totals on shutdown (copilot) need a grace |

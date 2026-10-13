@@ -55,6 +55,9 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ├── sweep.json                  sweep runs: the launch options
 ├── tasks/<task_id>/            one per agent session (see Task directory)
 ├── logs/<task_id>.log          session log (pane capture; opencode: the server transcript)
+├── logs/<task_id>.server.out   opencode: the server's own stdout/stderr
+├── logs/<task_id>.provider-errors.log  opencode: one line per provider-error event
+├── logs/<task_id>.sse.jsonl    opencode: structured trace of the raw SSE frames
 ├── verify/                     verifier stdout/stderr streams the journal points at
 ├── worktrees/                  per-story git worktrees ([scm] isolation = "worktree")
 ├── stop-request.json           pending stop request (see Stopping a run)
@@ -71,6 +74,8 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 
 Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `logs/` appear only when the run reaches the step that writes them. Plugins may add their own files.
 
+The opencode adapter's environment-fault classifier scans `<task_id>.server.out` and `<task_id>.provider-errors.log`, never the model-written `<task_id>.log`. On OpenCode 2.x provider failures appear only as session events, so the adapter writes each `session.retry.scheduled` / `session.step.failed` / `session.execution.failed` frame as one `provider-error event=… type=… status=… attempt=… message="…"` line built from the event's structured fields (the provider's response body is never copied). The file is created at spawn on both majors and is empty on a healthy session.
+
 - **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock; `bmad-loop status` reads it.
 - **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start`. Written by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
 - **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts.
@@ -79,15 +84,15 @@ Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `lo
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.
 
-| File                      | Written by        | Contents                                                                              |
-| ------------------------- | ----------------- | ------------------------------------------------------------------------------------- |
-| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                             |
-| `result.json`             | session           | the session's result contract (verdict, escalations)                                  |
-| `escalation.json`         | sweep session     | escalations raised during triage                                                      |
-| `heartbeat.json`          | adapter           | proof of life (above)                                                                 |
-| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                |
-| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification) |
-| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript                                           |
+| File                      | Written by        | Contents                                                                                                                                                         |
+| ------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                                                                                                        |
+| `result.json`             | session           | the session's result contract (verdict, escalations)                                                                                                             |
+| `escalation.json`         | sweep session     | escalations raised during triage                                                                                                                                 |
+| `heartbeat.json`          | adapter           | proof of life (above)                                                                                                                                            |
+| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                                                                                           |
+| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification)                                                                            |
+| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript; the shape is the server's own (1.x: each message's info and parts; 2.x: user/assistant/idle messages, oldest first) |
 
 `result.json` and `escalation.json` are the shared cycle artifacts (`journal.TASK_CYCLE_ARTIFACTS`). Both built-in adapters delete them before launching a session, so a reused task id never inherits a previous session's result. Adapters refuse a task directory that is a symlink or junction, and an adapter-written file (heartbeat, breadcrumb logs, `messages.json`, session logs) that is a link or special file.
 

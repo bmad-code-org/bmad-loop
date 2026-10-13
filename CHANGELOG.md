@@ -27,6 +27,15 @@ breaking changes may land in a minor release.
   detached HEAD the branch lacks, are parked on a `refs/attempt-preserve-dirty/*-abandon`
   ref; other git-ignored files are removed with the worktree. The branch is kept and the run is recorded finished.
   A tree at the recorded path that is not the run's own unit worktree is refused, not removed.
+- Support OpenCode 2.x (`@opencode/cli`) in the opencode-http adapter: sessions, the
+  poll fallback, usage and the token budget, the `[bmad]` transcript and SSE trace over
+  the 2.x `/api/*` server API. The server API major is detected from
+  `opencode --version`; an unsupported or unparseable version fails the session start
+  with a clear error, and `validate` reports it as `adapter.opencode-version` (#847).
+- On OpenCode 2.x, send `effort` as the session model's variant, and refuse a session
+  start whose effort is not one of the model's variants (#847).
+- Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`
+  and classify rate-limit, quota and transport outages there as environment faults (#847).
 
 ### Changed
 
@@ -44,6 +53,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop failing every opencode-http session start against OpenCode 2.x with a health
+  timeout (#847).
+- Keep probing an opencode-http session over HTTP after an event-stream reconnect
+  until its turn end is seen, so a turn end lost in the gap no longer runs to the
+  session timeout (#847).
 - Charge and retry a session whose log tail shows a provider error but whose tracked
   usage is nonzero, instead of pausing the run as an environment fault (#764).
 - Count Claude Code session usage once per API response and include subagent

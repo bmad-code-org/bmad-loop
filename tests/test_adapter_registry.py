@@ -1208,7 +1208,7 @@ def test_dry_run_previews_the_http_sequence_for_an_opencode_kind_with_a_hook_dia
     """`_render_invocation` follows the adapter KIND, as `make_adapters` does. An
     `opencode-http` profile carrying a hook dialect is a legal profile that still
     launches the HTTP adapter — and sends `effort` as `variant` — so its preview
-    is the server/prompt_async line with the effort, not a tmux argv.
+    is the server/session/prompt line with the effort, not a tmux argv.
 
     ABLATION: key the branch on `profile.hookless` and this reddens (argv render,
     no effort)."""
@@ -1232,7 +1232,7 @@ def test_dry_run_previews_argv_for_a_hookless_profile_of_another_kind(
     _write_profile(project.project, "hermes", adapter="hermes")  # hookless=True
     _write_policy(project.project, '[adapter]\nname = "hermes"\nmodel = "m1"\n')
     line = _dry_run_dev_line(project, capsys)
-    assert "serve --hostname" not in line and "prompt_async" not in line
+    assert "serve --hostname" not in line and "create session" not in line
     assert "hermes" in line and "--model m1" in line
 
 

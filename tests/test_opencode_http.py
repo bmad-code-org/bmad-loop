@@ -63,6 +63,7 @@ from bmad_loop.adapters.opencode_http import (
     _sum_args,
     _sum_usage,
 )
+from bmad_loop.adapters.opencode_protocol import SUPPORTED, V1Protocol, V2Protocol
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
@@ -96,21 +97,67 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   sse-black-hole     the SSE stream closes right after connecting (every
 #                      reconnect); the turn completes result+messages only —
 #                      completion is reachable only via the HTTP poll fallback
+#   html-health        the health route answers 200 text/html (the web-UI
+#                      shell a server of another major serves for its routes)
+#   sse-drop-once      completed, but the FIRST event stream closes right after
+#                      server.connected — the turn end arrives on the reconnect
+#   provider-outage    (V2) the turn never finishes: the provider is down, so the
+#                      stream carries `session.retry.scheduled` frames (the shape
+#                      captured live from 2.0.27 on a closed port) and nothing else
+#   provider-outage-after-work  the same, but Session.Info reports the tokens of
+#                      work already done (the #764 veto's measurement)
+#   provider-quota     (V2) the provider refuses on quota: no retry, the turn
+#                      fails at once (`session.step.failed` + `session.execution.failed`,
+#                      `provider.quota` status 402 — the shapes captured from 2.0.27)
+#   provider-quota-settling  provider-quota in 2.0.27's real order: the session
+#                      stays on `/api/session/active` ~0.5s AFTER its
+#                      `session.execution.failed` is published
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
 # turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
 # post-mortem reads (NOT <task_id>.log, the curated conversation transcript).
 # Unset = silent, so every other scenario is unaffected.
+# FAKE_OPENCODE_VERSION: what `--version` prints (default "1.18.2"); read from
+# the TEST process env, since the adapter probes `--version` before it builds the
+# session env — set it with monkeypatch.setenv. A 2.x value also switches the
+# server to its V2 mode: the `/api/*` surface pinned in the `opencode_protocol`
+# module docstring (`data`-envelope frames, a `: heartbeat` SSE comment, the
+# turn end as `session.execution.succeeded`, a child session's turn end first
+# to prove the filter). Each mode answers the OTHER mode's GET routes with the
+# web-UI HTML shell, so a cross-protocol call fails loudly. The V2 message route
+# pages and orders as pinned (`limit`/`order`/`cursor`; every read is recorded in
+# message_reads.jsonl); the busy-zero-* scenarios report a completed zero-token
+# step V2-shaped (a provider error / an interrupt's `aborted`, no tokens).
+# FAKE_OPENCODE_HISTORY=N (V2): N older user messages ahead of this run's, so a
+# transcript spans several pages. FAKE_OPENCODE_DEFAULT_MODEL (V2): the
+# `provider/model` `/api/model/default` answers ("" = none — `data: null`);
+# `/api/model` lists mock/mock-1 (variants low|medium|high) and mock/mock-2
+# (turbo).
 # FAKE_OPENCODE_SPEC_PATH/_SPEC_TEXT: a bmad-dev-auto-style terminal spec the
 # turn writes wherever a scenario writes its result (and at the start of
 # busy-forever, for the post-kill rescue). Unset = no-op, like RESULT_PATH.
 #
 # Recordings under FAKE_OPENCODE_DIR: sessions.jsonl (incl. the Authorization
-# header), prompts.jsonl, aborts.jsonl, pid (the server's own pid).
+# header), prompts.jsonl, aborts.jsonl, streams.jsonl (one line per event-stream
+# connect), pid (the server's own pid).
 
 FAKE_OPENCODE = r"""
-import json, os, sys, threading, time
+import itertools, json, os, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+VERSION = os.environ.get("FAKE_OPENCODE_VERSION", "1.18.2")
+
+if sys.argv[1:] == ["--version"]:
+    # The adapter's pre-spawn protocol detection: answered from the caller's own
+    # env (the probe runs before any session env exists), so it is checked
+    # before anything below reads FAKE_OPENCODE_DIR.
+    print(VERSION, flush=True)
+    sys.exit(0)
+
+_VERSION_MATCH = re.search(r"(\d+)\.(\d+)\.(\d+)", VERSION)
+V2 = bool(_VERSION_MATCH) and _VERSION_MATCH.group(1) == "2"
+VERSION_NUM = _VERSION_MATCH.group(0) if _VERSION_MATCH else VERSION
 
 SCENARIO = os.environ.get("FAKE_OPENCODE_SCENARIO", "completed")
 REC_DIR = os.environ["FAKE_OPENCODE_DIR"]
@@ -119,6 +166,8 @@ LOG_LINE = os.environ.get("FAKE_OPENCODE_LOG_LINE", "")
 SPEC_PATH = os.environ.get("FAKE_OPENCODE_SPEC_PATH", "")
 SPEC_TEXT = os.environ.get("FAKE_OPENCODE_SPEC_TEXT", "")
 START_FAILURES = int(os.environ.get("FAKE_OPENCODE_START_FAILURES", "0"))
+HISTORY = int(os.environ.get("FAKE_OPENCODE_HISTORY", "0"))
+DEFAULT_MODEL = os.environ.get("FAKE_OPENCODE_DEFAULT_MODEL", "mock/mock-1")
 
 argv = sys.argv[1:]
 assert argv and argv[0] == "serve", argv
@@ -138,9 +187,12 @@ if START_FAILURES:
         sys.exit(1)
 
 SESSION_ID = "ses_fake0000000000000000000001"
+CHILD_SESSION_ID = "ses_fakechild00000000000000001"
 LOCK = threading.Lock()
-STATE = {"busy": False, "completed_ms": 0, "prompts": 0}
+STATE = {"busy": False, "completed_ms": 0, "prompts": 0, "streams": 0}
 EVENTS = []
+EVENT_IDS = itertools.count(1)
+USER_MSGS = []  # V2 inbox items, oldest first
 
 
 def now_ms():
@@ -166,6 +218,44 @@ def pop_events():
 
 def idle_event():
     return {"type": "session.idle", "properties": {"sessionID": SESSION_ID}}
+
+
+def v2_frame(etype, **data):
+    # One V2 `/api/event` frame: the session id rides under `data`.
+    return {"id": f"evt_fake{next(EVENT_IDS):08d}", "created": now_ms(), "type": etype,
+            "data": data}
+
+
+def turn_tokens():
+    # The usage a finished turn reports (one assistant message's worth).
+    if SCENARIO in ("busy-big-usage", "big-usage-then-complete"):
+        return {"input": 4000000, "output": 1000000, "reasoning": 0,
+                "cache": {"read": 0, "write": 0}}
+    with LOCK:
+        done = STATE["completed_ms"]
+    if done or SCENARIO == "provider-outage-after-work":
+        return {"input": 100, "output": 50, "reasoning": 5, "cache": {"read": 7, "write": 3}}
+    return {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+
+
+def push_turn_start():
+    if V2:
+        push(v2_frame("session.execution.started", sessionID=SESSION_ID))
+        push(v2_frame("session.step.started", sessionID=SESSION_ID))
+        # A child (subagent) session's turn end shares the stream: it must not
+        # read as this session's.
+        push(v2_frame("session.execution.succeeded", sessionID=CHILD_SESSION_ID))
+
+
+def push_idle():
+    if not V2:
+        push(idle_event())
+        return
+    push(v2_frame("session.text.ended", sessionID=SESSION_ID, text="Done."))
+    push(v2_frame("session.step.ended", sessionID=SESSION_ID, finish="stop",
+                  tokens=turn_tokens(), cost=0.01))
+    push(v2_frame("session.usage.updated", sessionID=SESSION_ID, tokens=turn_tokens()))
+    push(v2_frame("session.execution.succeeded", sessionID=SESSION_ID))
 
 
 def write_result():
@@ -195,19 +285,42 @@ def run_turn():
         print(LOG_LINE, flush=True)  # stdout is the adapter's tee'd session log
     # let the 204 flush before any scripted death tears the connection down
     time.sleep(0.15)
-    if SCENARIO == "completed":
-        write_result(); write_spec(); finish_turn(); push(idle_event())
+    push_turn_start()
+    if SCENARIO in ("completed", "sse-drop-once"):
+        write_result(); write_spec(); finish_turn(); push_idle()
     elif SCENARIO == "nudge-then-complete":
         if n >= 2:
             write_result()
-        finish_turn(); push(idle_event())
+        finish_turn(); push_idle()
     elif SCENARIO == "stall":
-        finish_turn(); push(idle_event())
+        finish_turn(); push_idle()
     elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
+    elif SCENARIO in ("provider-quota", "provider-quota-settling"):
+        error = {"type": "provider.quota", "status": 402,
+                 "message": "You exceeded your current quota, please check your plan "
+                            "and billing details.",
+                 "response": {"body": '{"error": {"type": "insufficient_quota"}}'}}
+        push(v2_frame("session.step.failed", sessionID=SESSION_ID,
+                      assistantMessageID="msg_fakeasst1", error=error, files=[]))
+        if SCENARIO == "provider-quota-settling":
+            push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
+            time.sleep(0.5)
+        with LOCK:
+            STATE["busy"] = False  # the turn is over; nothing was spent
+        if SCENARIO == "provider-quota":
+            push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
+    elif SCENARIO in ("provider-outage", "provider-outage-after-work"):
+        for attempt in (2, 3, 4):  # live, the first retry is attempt 2
+            push(v2_frame("session.retry.scheduled", sessionID=SESSION_ID,
+                          assistantMessageID="msg_fakeasst1", attempt=attempt,
+                          at=now_ms() + 1000 * attempt,
+                          error={"type": "provider.transport",
+                                 "message": "ConnectionRefused: Unable to connect. "
+                                            "Is the computer able to access the url?"}))
     elif SCENARIO == "big-usage-then-complete":
         time.sleep(0.35)  # stay busy through several fast heartbeat samples
-        write_result(); finish_turn(); push(idle_event())
+        write_result(); finish_turn(); push_idle()
     elif SCENARIO == "die-after-result":
         write_result(); os._exit(0)
     elif SCENARIO == "die-no-result":
@@ -228,8 +341,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _html(self):
+        # The web-UI SPA shell a server answers for routes it does not own.
+        body = b"<!doctype html><html><body>opencode</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == "/global/health":
+        if V2:
+            self._get_v2()
+        elif self.path.startswith("/api/") or (
+            self.path == "/global/health" and SCENARIO == "html-health"
+        ):
+            self._html()
+        elif self.path == "/global/health":
             self._json(200, {"healthy": True, "version": "1.18.2"})
         elif self.path == "/session/status":
             with LOCK:
@@ -282,25 +410,103 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"name": "NotFoundError"})
 
+    def _get_v2(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/api/info":
+            if SCENARIO == "html-health":
+                self._html()
+            else:
+                self._json(200, {"version": VERSION_NUM, "pid": os.getpid(),
+                                 "urls": [f"http://{HOST}:{PORT}"],
+                                 "paths": {"tmp": REC_DIR}, "capabilities": {}})
+        elif path == "/api/event":
+            self._sse()
+        elif path == "/api/session/active":
+            with LOCK:
+                busy = STATE["busy"]
+            self._json(200, {"data": {SESSION_ID: {"type": "running"}} if busy else {}})
+        elif path == f"/api/session/{SESSION_ID}/message":
+            self._message_page(parse_qs(urlsplit(self.path).query))
+        elif path == f"/api/session/{SESSION_ID}":
+            self._json(200, {"data": session_info()})
+        elif path in ("/api/model", "/api/model/default"):
+            query = parse_qs(urlsplit(self.path).query)
+            directory = (query.get("location[directory]") or [""])[0]
+            if not os.path.isabs(directory):
+                # the deepObject param is how V2 reads a location; a bare
+                # `directory=` is ignored and falls back to the server's cwd
+                self._json(404, {"_tag": "LocationNotFoundError"})
+            elif path == "/api/model":
+                self._json(200, {"location": {"directory": directory}, "data": MODELS})
+            else:
+                default = next((m for m in MODELS
+                                if f"{m['providerID']}/{m['id']}" == DEFAULT_MODEL), None)
+                self._json(200, {"location": {"directory": directory}, "data": default})
+        elif path.startswith("/api/"):
+            self._json(404, {"_tag": "NotFoundError"})
+        else:
+            self._html()  # every V1 route included: the web-UI shell
+
+    def _message_page(self, query):
+        # The pinned pagination: newest-first, `limit` 1..200 (a 400 outside it,
+        # never clamped), `order` asc|desc, `cursor` walks on and may not be
+        # combined with `order`; a full last page still carries a `next`, and
+        # the walk ends on an empty page whose cursors are both null.
+        record("message_reads.jsonl", {k: v[0] for k, v in query.items()})
+        limit = int((query.get("limit") or ["50"])[0])
+        if not 1 <= limit <= 200:
+            self._json(400, {"_tag": "InvalidRequestError"})
+            return
+        if "cursor" in query and "order" in query:
+            self._json(400, {"_tag": "InvalidCursorError"})
+            return
+        if "cursor" in query:
+            order, offset = query["cursor"][0].split(":")
+            offset = int(offset)
+        else:
+            order, offset = (query.get("order") or ["desc"])[0], 0
+        msgs = v2_messages()  # oldest first
+        if order == "desc":
+            msgs.reverse()
+        page = msgs[offset:offset + limit]
+        nxt = f"{order}:{offset + limit}" if page else None
+        prev = f"{order}:{max(offset - limit, 0)}" if page and offset else None
+        self._json(200, {"data": page, "cursor": {"previous": prev, "next": nxt}})
+
     def _sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
+        with LOCK:
+            STATE["streams"] += 1
+            stream_no = STATE["streams"]
+        record("streams.jsonl", {"n": stream_no, "path": self.path})
 
         def emit(evt):
             self.wfile.write(b"data: " + json.dumps(evt).encode("utf-8") + b"\n\n")
             self.wfile.flush()
 
+        def beat():
+            if V2:
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+            else:
+                emit({"type": "server.heartbeat", "properties": {}})
+
         try:
-            emit({"type": "server.connected", "properties": {}})
+            emit(v2_frame("server.connected") if V2
+                 else {"type": "server.connected", "properties": {}})
             if SCENARIO == "sse-black-hole":
                 return  # close the stream: events are never deliverable
+            if SCENARIO == "sse-drop-once" and stream_no == 1:
+                beat()
+                return  # the first stream breaks; queued events wait for the reconnect
             last_beat = time.time()
             while True:
                 for evt in pop_events():
                     emit(evt)
                 if time.time() - last_beat > 0.2:
-                    emit({"type": "server.heartbeat", "properties": {}})
+                    beat()
                     last_beat = time.time()
                 time.sleep(0.02)
         except OSError:
@@ -309,7 +515,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
-        if self.path == "/session":
+        if V2:
+            self._post_v2(body)
+        elif self.path == "/session":
             record("sessions.jsonl",
                    {"body": body, "auth": self.headers.get("Authorization", "")})
             self._json(200, {"id": SESSION_ID, "title": body.get("title", ""),
@@ -329,6 +537,83 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, True)
         else:
             self._json(404, {"name": "NotFoundError"})
+
+    def _post_v2(self, body):
+        if self.path == "/api/session":
+            record("sessions.jsonl",
+                   {"body": body, "auth": self.headers.get("Authorization", "")})
+            self._json(200, {"data": session_info(title=body.get("title", ""))})
+        elif self.path == f"/api/session/{SESSION_ID}/prompt":
+            record("prompts.jsonl", body)
+            with LOCK:
+                STATE["prompts"] += 1
+                item = {"id": f"msg_fakeuser{STATE['prompts']:04d}",
+                        "time": {"created": now_ms()}, "type": "user",
+                        "payload": {"text": body.get("text", "")}, "delivery": "steer"}
+                USER_MSGS.append(item)
+            push(v2_frame("session.inbox.enqueued", sessionID=SESSION_ID, item=item))
+            threading.Thread(target=run_turn, daemon=True).start()
+            self._json(200, {"data": item})
+        elif self.path == f"/api/session/{SESSION_ID}/interrupt":
+            record("aborts.jsonl", {"path": self.path})
+            with LOCK:
+                busy = STATE["busy"]
+            self._json(200, {"interrupted": busy})
+        else:
+            self._json(404, {"_tag": "NotFoundError"})
+
+
+MODELS = [
+    {"id": "mock-1", "modelID": "mock-1", "providerID": "mock", "name": "Mock 1",
+     "variants": [{"id": "low", "settings": {"reasoningEffort": "low"}},
+                  {"id": "medium", "settings": {"reasoningEffort": "medium"}},
+                  {"id": "high", "settings": {"reasoningEffort": "high"}}]},
+    {"id": "mock-2", "modelID": "mock-2", "providerID": "mock", "name": "Mock 2",
+     "variants": [{"id": "turbo", "body": {"foo": "bar"}}]},
+]
+
+
+def session_info(title=""):
+    # V2 `Session.Info`: `tokens` is the cumulative session aggregate.
+    with LOCK:
+        done = STATE["completed_ms"]
+    return {"id": SESSION_ID, "title": title, "cost": 0.01 if done else 0,
+            "tokens": turn_tokens(), "outcome": "succeeded" if done else None,
+            "time": {"created": now_ms(), "updated": now_ms(), "idle": done or None}}
+
+
+def v2_messages():
+    # The whole V2 history, OLDEST first (the route pages and orders it): any
+    # FAKE_OPENCODE_HISTORY filler, then this run's user messages, then the
+    # turn's assistant message and its idle marker.
+    with LOCK:
+        done = STATE["completed_ms"]
+        users = list(USER_MSGS)
+    msgs = [{"id": f"msg_fakehist{i:05d}", "time": {"created": 1000 + i}, "type": "user",
+             "text": f"old {i}"} for i in range(HISTORY)]
+    msgs += [{"id": u["id"], "time": u["time"], "type": "user", "text": u["payload"]["text"]}
+             for u in users]
+    if SCENARIO in ("busy-zero-errored", "busy-zero-aborted"):
+        # A finished zero-token step: a provider failure that exhausted its
+        # retries, or the step an interrupt cancelled — both stamped completed,
+        # neither carrying tokens.
+        error = ({"type": "provider.transport", "message": "fake"}
+                 if SCENARIO == "busy-zero-errored"
+                 else {"type": "aborted", "message": "Step interrupted"})
+        msgs.append({"id": "msg_fakezero1", "type": "assistant", "agent": "build",
+                     "time": {"created": now_ms() - 10, "completed": now_ms()},
+                     "model": {"id": "mock-1", "providerID": "mock"}, "content": [],
+                     "finish": "error", "error": error, "cost": 0})
+    elif done or SCENARIO in ("busy-big-usage", "big-usage-then-complete"):
+        msgs.append({"id": "msg_fakeasst1", "type": "assistant", "agent": "build",
+                     "time": {"created": (done or now_ms()) - 10, "streamed": done or None,
+                              "completed": done or None},
+                     "model": {"id": "mock-1", "providerID": "mock"}, "content": [],
+                     "finish": "stop" if done else None, "tokens": turn_tokens(), "cost": 0.01})
+    if done:
+        msgs.append({"id": "msg_fakeidle1", "time": {"created": done}, "type": "idle",
+                     "outcome": "succeeded"})
+    return msgs
 
 
 if sys.platform == "win32":
@@ -436,7 +721,11 @@ def assert_server_gone(rec: Path) -> None:
 
 
 def prompt_texts(rec: Path) -> list[str]:
-    return [p["parts"][0]["text"] for p in read_jsonl(rec / "prompts.jsonl")]
+    # V1 prompt_async bodies carry `parts`; a V2 prompt body is `{"text": ...}`.
+    return [
+        p["parts"][0]["text"] if "parts" in p else p["text"]
+        for p in read_jsonl(rec / "prompts.jsonl")
+    ]
 
 
 # ------------------------------------------------------------------ unit tests
@@ -563,6 +852,7 @@ def test_spawn_hands_popen_the_wrapper_argv(tmp_path, monkeypatch):
 
     monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
     monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V1Protocol(), (1, 18, 2)))
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     with pytest.raises(_Stop):
         adapter._spawn_server(spec)
@@ -594,6 +884,7 @@ def test_spawn_give_up_error_names_the_wrapper_launch(tmp_path, monkeypatch):
 
     monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
     monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V1Protocol(), (1, 18, 2)))
     monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
     spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
     with pytest.raises(opencode_http.OpencodeServerError) as excinfo:
@@ -772,6 +1063,7 @@ class _FakeSseHttpx:
     def __init__(self, sess, attempts):
         self.sess = sess
         self.attempts = list(attempts)
+        self.paths: list[str] = []
 
     def Timeout(self, *_a, **_kw):  # noqa: N802 - mirrors httpx.Timeout
         return None
@@ -787,7 +1079,8 @@ class _FakeSseHttpx:
                 return False
 
             @contextlib.contextmanager
-            def stream(self, _method, _path):
+            def stream(self, _method, path):
+                fake.paths.append(path)
                 kind, *rest = fake.attempts.pop(0)
                 if kind == "stop":
                     fake.sess.sse_stop.set()
@@ -2723,6 +3016,150 @@ def test_usage_sample_fault_streak_is_crumbed_at_transitions(tmp_path, monkeypat
     assert all(b["sse_frames_dropped"] == 0 for b in beats)
 
 
+# ----------------------------------------------- protocol detection (#847)
+#
+# OpenCode 2.x replaces the 1.x binary under the same name and answers every V1
+# route with its web-UI shell, so the adapter reads the major from `--version`
+# before spawning. These drive the real detection path: the fake launcher
+# answers `--version` from FAKE_OPENCODE_VERSION.
+
+
+def _lifecycle(tmp_path: Path, task_id: str = "t-1") -> list[dict]:
+    return read_jsonl(tmp_path / "run" / "tasks" / task_id / "session-lifecycle.jsonl")
+
+
+def _count_version_probes(monkeypatch) -> list[list[str]]:
+    """Record every `--version` argv the adapter hands childrun, calling through."""
+    calls: list[list[str]] = []
+    real = opencode_http.childrun.run_argv
+
+    def counting(argv, **kwargs):
+        calls.append(list(argv))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(opencode_http.childrun, "run_argv", counting)
+    return calls
+
+
+def test_detects_protocol_from_version_output(tmp_path, fake_opencode, monkeypatch):
+    """The fake's `--version` answer picks the V1 codec, the session runs to
+    completion over it, and the detected version is crumbed once."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.19.0")
+    calls = _count_version_probes(monkeypatch)
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    seen: list[tuple[type, str]] = []
+    real_await = adapter._await_healthy
+
+    def spy(sess):
+        seen.append((type(sess.protocol), sess.server_version))
+        return real_await(sess)
+
+    monkeypatch.setattr(adapter, "_await_healthy", spy)
+
+    result = adapter.run(make_spec(tmp_path, rec, "completed"))
+
+    assert result.status == "completed"
+    assert seen == [(V1Protocol, "1.19.0")]
+    assert calls == [[str(launcher), "--version"]]
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "opencode-server-version"]
+    assert len(crumbs) == 1
+    assert {k: crumbs[0][k] for k in ("version", "major", "verdict")} == {
+        "version": "1.19.0",
+        "major": 1,
+        "verdict": "ok",
+    }
+    assert_server_gone(rec)
+
+
+def test_version_detection_is_cached_per_binary_identity(tmp_path, fake_opencode, monkeypatch):
+    """One `--version` per binary identity: a second session on the same file
+    reuses the answer, and a binary changed in place (an upgrade mid-run) is
+    asked again."""
+    launcher, rec = fake_opencode
+    calls = _count_version_probes(monkeypatch)
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    resolved = opencode_http.shutil.which(str(launcher))
+    assert resolved is not None
+
+    assert adapter._protocol_for(resolved)[1] == (1, 18, 2)
+    assert adapter._protocol_for(resolved)[1] == (1, 18, 2)
+    assert len(calls) == 1
+
+    # An in-place upgrade: same path, new content (size) and mtime.
+    stat = os.stat(resolved)
+    with open(resolved, "a", encoding="utf-8") as fh:
+        fh.write("\n" if sys.platform == "win32" else "\n# upgraded\n")
+    os.utime(resolved, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.19.0")
+    assert adapter._protocol_for(resolved)[1] == (1, 19, 0)
+    assert len(calls) == 2
+
+
+def test_unsupported_major_is_refused_with_clear_message(tmp_path, fake_opencode, monkeypatch):
+    """A major the adapter does not speak is refused before any server is
+    spawned, with an error naming what was found, what is supported and where to
+    read more — never the opaque "not healthy in time" of #847.
+
+    ABLATION: drop the `unsupported-major` guard in `_protocol_for` and the
+    session spawns against an unknown API — this reddens."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "opencode v3.1.0")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "completed"))
+
+    message = str(excinfo.value)
+    assert "opencode 3.1.0" in message
+    assert "1.x (>= 1.18.0)" in message and "2.x (>= 2.0.21)" in message
+    assert "docs/setup-guide.md#opencode-versions" in message
+    assert not (rec / "pid").exists()  # nothing was spawned
+    assert adapter._sessions == {}
+
+
+def test_unparseable_version_is_refused(tmp_path, fake_opencode, monkeypatch):
+    """Output with no X.Y.Z is refused, quoting the first line it got."""
+    launcher, rec = fake_opencode
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "garbage build")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "completed"))
+
+    message = str(excinfo.value)
+    assert "could not read an OpenCode version" in message
+    assert "'garbage build'" in message
+    assert "docs/setup-guide.md#opencode-versions" in message
+    assert not (rec / "pid").exists()
+
+
+def test_every_supported_major_has_a_codec():
+    """`_protocol_for` picks the codec by major; a major `SUPPORTED` admits with
+    no codec would pass the verdict and then KeyError at spawn."""
+    assert set(opencode_http._PROTOCOLS) == set(SUPPORTED)
+
+
+def test_html_health_reports_protocol_mismatch(tmp_path, fake_opencode):
+    """A server whose health route answers the web-UI HTML shell speaks another
+    API than `--version` said; the give-up error says that instead of #847's bare
+    "did not become healthy in time".
+
+    ABLATION: drop the `if html:` fault in `_await_healthy` and this reddens."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.health_timeout_s = 0.5
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "html-health"))
+
+    message = str(excinfo.value)
+    assert "answered HTML on the 1.x health endpoint" in message
+    assert "different OpenCode API than `--version` reported (1.18.2)" in message
+    assert "did not become healthy in time" not in message
+    assert_server_gone(rec)
+
+
 # ------------------------------------------------------------------- E2E tests
 
 
@@ -3500,6 +3937,106 @@ def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, mo
     assert probes == []  # never entered the dispatch leg below the wait
 
 
+def test_gap_keeps_probing_through_heartbeats_until_completion(tmp_path, monkeypatch):
+    """A gap's lone probe can read busy before the turn settles, and the
+    reconnected stream never replays a turn end it missed; heartbeats then keep
+    the silence fallback disarmed for good. So the gap re-probes every tick
+    until a substantive frame arrives and probes once after it. That frame may
+    be child or session-less traffic and that probe may read busy, so the gap
+    then re-probes every `silence_threshold_s` until completion.
+
+    Ablation: drop `gap_activity` from the probe condition -> the fast ticks
+    2-4 vanish; drop `gap_due` -> the slow re-probes (10, 16) vanish and the
+    finished turn waits out its timeout.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 30.0  # heartbeats below keep the stream fresh
+
+    ticks: list[int] = []
+    probes: list[int] = []
+    monkeypatch.setattr(
+        type(adapter), "_probe_completion", lambda self, sess: (probes.append(len(ticks)), False)[1]
+    )
+
+    def advance():
+        clock["mono"] += 5.0
+        sess.last_frame_monotonic = clock["mono"]  # a `: heartbeat` every tick
+        if len(ticks) == 4:
+            sess.activity += 1  # the reconnected stream carries a real frame
+
+    sess = _timeout_driven_session(adapter, advance)
+    get_empty = sess.events.get
+
+    def get(timeout=None):
+        ticks.append(1)
+        if len(ticks) == 1:
+            advance()
+            return "gap"
+        return get_empty(timeout)
+
+    sess.events.get = get
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=90.0),
+    )
+
+    assert result.status == "timeout"
+    # gap tick, two heartbeat-only ticks, the tick that saw the frame, then one
+    # re-probe per silence_threshold_s (30 s = 6 ticks)
+    assert probes == [1, 2, 3, 4, 10, 16]
+
+
+def test_gap_slow_reprobe_finds_the_missed_turn_end(tmp_path, monkeypatch):
+    """The slow re-probe after a gap is what ends the turn: the probe that
+    follows the post-gap frame reads busy, a later one reads settled, and the
+    session completes instead of timing out."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 30.0
+
+    ticks: list[int] = []
+    probes: list[int] = []
+
+    def probe(self, sess):
+        probes.append(len(ticks))
+        return len(ticks) >= 8  # settled only by the first slow re-probe
+
+    monkeypatch.setattr(type(adapter), "_probe_completion", probe)
+    monkeypatch.setattr(
+        type(adapter), "_result_json", lambda self, handle, spec, wait=False: {"status": "done"}
+    )
+
+    def advance():
+        clock["mono"] += 5.0
+        sess.last_frame_monotonic = clock["mono"]
+        if len(ticks) == 2:
+            sess.activity += 1  # e.g. a child session's frame after reconnect
+
+    sess = _timeout_driven_session(adapter, advance)
+    get_empty = sess.events.get
+
+    def get(timeout=None):
+        ticks.append(1)
+        if len(ticks) == 1:
+            advance()
+            return "gap"
+        return get_empty(timeout)
+
+    sess.events.get = get
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=90.0),
+    )
+
+    assert result.status == "completed"
+    assert probes == [1, 2, 8]
+
+
 def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
     """Graceful means *finish the in-flight item*, so a graceful request pending
     on the same channel must not touch a running session — only `hard` aborts.
@@ -3747,6 +4284,985 @@ def test_e2e_sse_loss_degrades_to_poll_fallback(tmp_path, fake_opencode):
     assert result.status == "completed"
     assert result.result_json == {"ok": True, "workflow": "fake-triage"}
     assert_server_gone(rec)
+
+
+# ----------------------------------------------- OpenCode 2.x (V2) lifecycle
+
+
+@pytest.fixture
+def v2_fake(fake_opencode, monkeypatch):
+    """The fake in its V2 mode: `--version` and the server read the same env."""
+    monkeypatch.setenv("FAKE_OPENCODE_VERSION", "opencode v2.0.27")
+    return fake_opencode
+
+
+def _v2_sess(session_id: str = "ses_parent") -> _ServerSession:
+    sess = _ServerSession(
+        process=None, port=0, base_url="", password="", log_fh=None, protocol=V2Protocol()
+    )
+    sess.session_id = session_id
+    return sess
+
+
+def _v2_frame(etype: str, **data) -> dict:
+    return {"id": "evt_1", "created": PINNED_EPOCH_MS, "type": etype, "data": data}
+
+
+def _sse_data(frame: dict) -> str:
+    return "data: " + json.dumps(frame)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` is not legal in a Windows name")
+def test_v2_spawn_crumbs_refused_wildcard_skill_ids(tmp_path, v2_fake):
+    """A project skill the V2 rules cannot re-allow (its id is a wildcard) is
+    left denied, and the spawn says so — a skill that silently fails to load
+    would read as a model mistake."""
+    launcher, rec = v2_fake
+    skill = tmp_path / ".claude" / "skills" / "*"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: star\n---\n", encoding="utf-8")
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "completed"))
+
+    assert result.status == "completed"
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "skill-ids-refused"]
+    assert [c["ids"] for c in crumbs] == [["*"]]
+
+
+def test_v2_completed_scenario_end_to_end(tmp_path, v2_fake, monkeypatch):
+    """A 2.x `--version` picks the V2 codec and one session runs to completion
+    over `/api/*`: create with the task title and the project as its location,
+    one `{"text"}` prompt, the turn end as `session.execution.succeeded` — and a
+    child session's turn end on the same stream (the fake pushes one first) is
+    not read as ours, or the result-less Stop would have nudged. Teardown
+    interrupts through `/interrupt`."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    seen: list[tuple[type, str]] = []
+    real_await = adapter._await_healthy
+
+    def spy(sess):
+        seen.append((type(sess.protocol), sess.server_version))
+        return real_await(sess)
+
+    monkeypatch.setattr(adapter, "_await_healthy", spy)
+
+    result = adapter.run(make_spec(tmp_path, rec, "completed"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert result.session_id == "ses_fake0000000000000000000001"
+    assert seen == [(V2Protocol, "2.0.27")]
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "opencode-server-version"]
+    assert [(c["version"], c["major"], c["verdict"]) for c in crumbs] == [("2.0.27", 2, "ok")]
+    sessions = read_jsonl(rec / "sessions.jsonl")
+    assert [s["body"] for s in sessions] == [
+        {"title": "t-1", "location": {"directory": str(tmp_path)}}
+    ]
+    assert sessions[0]["auth"].startswith("Basic ")
+    assert read_jsonl(rec / "prompts.jsonl") == [
+        {"text": "Use the bmad-loop-sweep skill now: run it"}
+    ]
+    assert [a["path"] for a in read_jsonl(rec / "aborts.jsonl")] == [
+        "/api/session/ses_fake0000000000000000000001/interrupt"
+    ]
+    assert {s["path"] for s in read_jsonl(rec / "streams.jsonl")} == {"/api/event"}
+    # Usage is the Session.Info aggregate (reasoning folded into output); the
+    # transcript is every message, oldest first, read in one asc page.
+    assert adapter.read_usage(result) == TokenUsage(
+        input_tokens=100, output_tokens=55, cache_read_tokens=7, cache_creation_tokens=3
+    )
+    assert result.transcript_path
+    messages = json.loads(Path(result.transcript_path).read_text(encoding="utf-8"))
+    assert [m["type"] for m in messages] == ["user", "assistant", "idle"]
+    assert messages[0]["text"] == "Use the bmad-loop-sweep skill now: run it"
+    assert {"order": "asc", "limit": "200"} in read_jsonl(rec / "message_reads.jsonl")
+    assert not [c for c in _lifecycle(tmp_path) if c["event"] == "usage-capture-failed"]
+    # The trace records this session's frames in the `data` envelope.
+    trace = read_jsonl(tmp_path / "run" / "logs" / "t-1.sse.jsonl")
+    assert trace[-1]["type"] == "session.execution.succeeded"
+    assert {r["properties"]["sessionID"] for r in trace} == {"ses_fake0000000000000000000001"}
+    assert adapter._sessions == {}
+    assert_server_gone(rec)
+
+
+def test_v2_nudge_then_complete(tmp_path, v2_fake):
+    """A result-less V2 turn end is a Stop: the adapter nudges over the V2
+    prompt route and the second turn completes."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "nudge-then-complete"))
+
+    assert result.status == "completed"
+    texts = prompt_texts(rec)
+    assert len(texts) == 2
+    assert texts[1] == NUDGE_TEXT
+    assert_server_gone(rec)
+
+
+@pytest.mark.parametrize(
+    "scenario, status, result_json",
+    [
+        ("die-no-result", "crashed", None),
+        ("die-after-result", "completed", {"ok": True, "workflow": "fake-triage"}),
+    ],
+)
+def test_v2_server_death_is_crashed(tmp_path, v2_fake, scenario, status, result_json):
+    """Server death ≙ window death on V2 too: crashed, a landed result honored."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, scenario))
+
+    assert result.status == status
+    assert result.result_json == result_json
+    assert_server_gone(rec)
+
+
+def test_v2_sse_reconnect(tmp_path):
+    """The V2 reader reads `/api/event`, crumbs a break once, and the turn end
+    delivered on the reconnect still queues `idle` — the reconnect is the same
+    loop for both majors, only the path and the frame envelope differ."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _v2_sess()
+    fake = _FakeSseHttpx(
+        sess,
+        [
+            (
+                "stream",
+                200,
+                [_sse_data(_v2_frame("server.connected")), "", ": heartbeat", ""],
+                RuntimeError("reset"),
+            ),
+            (
+                "stream",
+                200,
+                [
+                    _sse_data(_v2_frame("server.connected")),
+                    "",
+                    _sse_data(_v2_frame("session.execution.succeeded", sessionID="ses_parent")),
+                    "",
+                ],
+                None,
+            ),
+            ("stop", RuntimeError("closed by teardown")),
+        ],
+    )
+    adapter._httpx = fake
+
+    adapter._sse_loop(sess, "t-sse")
+
+    assert fake.paths == ["/api/event"] * 3
+    events = []
+    while not sess.events.empty():
+        events.append(sess.events.get_nowait())
+    assert events == ["gap", "idle", "gap"]
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "t-sse")]
+    assert crumbs == ["sse-stream-failed", "sse-stream-recovered"]
+
+
+def test_v2_e2e_sse_reconnect_delivers_the_turn_end(tmp_path, v2_fake):
+    """End to end: the first event stream breaks right after connecting; the
+    turn end queued meanwhile arrives on the reconnect and completes the
+    session."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "sse-drop-once"))
+
+    assert result.status == "completed"
+    assert len(read_jsonl(rec / "streams.jsonl")) >= 2
+    assert len(prompt_texts(rec)) == 1
+    assert_server_gone(rec)
+
+
+def test_v2_heartbeat_comment_keeps_stream_fresh(tmp_path):
+    """V2's heartbeat is an SSE comment, not a frame: it must keep the stream
+    fresh for the wait loop's silence check (`last_frame_monotonic`) without
+    counting as agent activity — a heartbeat re-arming the stall grace would
+    hide a stalled session behind a healthy stream.
+
+    ABLATION: make `_note_sse_comment` a no-op and `last_frame_monotonic` stays
+    0.0 — this reddens."""
+    adapter = make_adapter(tmp_path)
+    adapter.reconnect_sleep_s = 0.0
+    sess = _v2_sess()
+    adapter._httpx = _FakeSseHttpx(
+        sess,
+        [
+            ("stream", 200, [": heartbeat", "", ": heartbeat", ""], None),
+            ("stop", RuntimeError("closed")),
+        ],
+    )
+    before = time.monotonic()
+
+    adapter._sse_loop(sess, "t-sse")
+
+    assert sess.last_frame_monotonic >= before
+    assert sess.activity == 0
+    assert sess.events.get_nowait() == "gap"  # only the stream end
+    assert sess.events.empty()
+
+
+def test_sse_parser_reports_comments_and_yields_nothing_for_them():
+    comments: list[None] = []
+    lines = [": heartbeat", "", "data: " + json.dumps({"type": "x"}), "", ": hb"]
+    events = list(_parse_sse_lines(lines, on_comment=lambda: comments.append(None)))
+    assert [e["type"] for e in events] == ["x"]
+    assert len(comments) == 2
+
+
+def test_v2_dispatch_filters_child_sessions_and_maps_execution_events(tmp_path):
+    """`server.connected` is liveness only; a child session's turn end counts
+    as activity but is not ours; V1's `session.idle` (deprecated, never emitted
+    on V2) queues nothing; every `session.execution.*` turn end queues
+    `idle` — a failed execution included, since it never precedes a retry."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    adapter._dispatch_sse(sess, _v2_frame("server.connected"))
+    assert sess.activity == 0 and sess.last_frame_monotonic > 0
+    adapter._dispatch_sse(sess, _v2_frame("session.execution.succeeded", sessionID="ses_child"))
+    assert sess.activity == 1 and sess.events.empty()
+    for stale in ("session.idle", "session.status", "session.error"):
+        adapter._dispatch_sse(sess, _v2_frame(stale, sessionID="ses_parent"))
+    assert sess.events.empty()
+    # A V1-shaped frame names no session in the V2 envelope: filtered.
+    adapter._dispatch_sse(
+        sess, {"type": "session.execution.succeeded", "properties": {"sessionID": "ses_parent"}}
+    )
+    assert sess.events.empty()
+    for etype, queued in [
+        ("session.execution.succeeded", "idle"),
+        ("session.execution.interrupted", "idle"),
+        ("session.execution.failed", "idle"),
+    ]:
+        adapter._dispatch_sse(sess, _v2_frame(etype, sessionID="ses_parent"))
+        assert sess.events.get_nowait() == queued, etype
+
+
+def test_v2_html_health_reports_protocol_mismatch(tmp_path, v2_fake):
+    """`--version` said 2.x but `/api/info` answers the web-UI HTML shell: the
+    give-up error names the mismatch on the 2.x health endpoint."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.health_timeout_s = 0.5
+
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter.start_session(make_spec(tmp_path, rec, "html-health"))
+
+    message = str(excinfo.value)
+    assert "answered HTML on the 2.x health endpoint" in message
+    assert "(2.0.27)" in message
+    assert_server_gone(rec)
+
+
+def test_v2_session_env_and_config_are_the_v2_dialect(tmp_path, monkeypatch):
+    """The V2 session env drops V1's OPENCODE_DISABLE_EXTERNAL_SKILLS (absent
+    from the V2 core — the permission rules hide external skills instead) and
+    carries the V2-keyed config."""
+    monkeypatch.delenv("OPENCODE_DISABLE_EXTERNAL_SKILLS", raising=False)
+    adapter = make_adapter(tmp_path)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    env = adapter._session_env(spec, "sekrit", V2Protocol())
+    assert "OPENCODE_DISABLE_EXTERNAL_SKILLS" not in env
+    assert env["OPENCODE_SERVER_PASSWORD"] == "sekrit"
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert "permission" not in config
+    assert config["skills"] == [str(tmp_path / ".claude" / "skills")]
+    assert config["permissions"][0] == {"action": "*", "resource": "*", "effect": "allow"}
+
+
+# ------------------------------- OpenCode 2.x (V2) poll fallback, usage, effort
+
+
+class _V2RouteClient:
+    """A V2 control client answering GETs off a per-route script (the path
+    before any query): an int is a bare status code, an Exception is raised,
+    anything else is a 200 whose JSON body is that value. A route's last entry
+    repeats; an unscripted route is a 404. Every GET is recorded with its
+    params."""
+
+    def __init__(self, **routes):
+        self.routes = {path: list(answers) for path, answers in routes.items()}
+        self.gets: list[tuple[str, dict | None]] = []
+        self.posts: list[str] = []
+
+    def get(self, path, params=None):
+        self.gets.append((path, params))
+        answers = self.routes.get(path) or [404]
+        answer = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+
+        class _Resp:
+            status_code = answer if isinstance(answer, int) else 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return answer
+
+        return _Resp()
+
+    def post(self, path, **_kw):
+        self.posts.append(path)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    def close(self):
+        pass
+
+
+_V2_SID = "ses_1"
+_V2_ACTIVE = "/api/session/active"
+_V2_MESSAGES = f"/api/session/{_V2_SID}/message"
+_V2_INFO = f"/api/session/{_V2_SID}"
+
+
+def _v2_info(**tokens) -> dict:
+    full = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+    full.update(tokens)
+    return {"data": {"id": _V2_SID, "tokens": full}}
+
+
+def _v2_assistant(completed: int | None, **extra) -> dict:
+    return {
+        "id": "msg_a",
+        "type": "assistant",
+        "time": {"created": 1, "completed": completed},
+        **extra,
+    }
+
+
+def _v2_page(*messages, next_cursor=None) -> dict:
+    return {"data": list(messages), "cursor": {"previous": None, "next": next_cursor}}
+
+
+def test_v2_completion_floor_ignores_stale_assistant_message(tmp_path):
+    """The V2 poll fallback reads proof-of-work like V1: a session listed in
+    `/api/session/active` is busy and never probed further; once absent, only an
+    assistant message completed strictly after the floor is a completion, and
+    consuming it advances the floor so it can never be consumed twice."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess(_V2_SID)
+    sess.floor_ms = 5_000
+    stale = _v2_page(_v2_assistant(4_999), {"id": "msg_u", "type": "user", "time": {"created": 1}})
+    sess.client = _V2RouteClient(**{_V2_ACTIVE: [{"data": {}}], _V2_MESSAGES: [stale]})
+    assert adapter._probe_completion(sess) is False
+    assert sess.floor_ms == 5_000
+
+    fresh = _v2_page(
+        {"id": "msg_i", "type": "idle", "time": {"created": 6_001}, "outcome": "succeeded"},
+        _v2_assistant(6_000),
+        _v2_assistant(4_999),
+    )
+    sess.client = _V2RouteClient(**{_V2_ACTIVE: [{"data": {}}], _V2_MESSAGES: [fresh]})
+    assert adapter._probe_completion(sess) is True
+    assert sess.floor_ms == 6_000
+    assert adapter._probe_completion(sess) is False  # consumed once
+
+    # listed (a retry backoff included — the only type is `running`): busy,
+    # the messages are never read
+    sess.floor_ms = 0
+    sess.client = _V2RouteClient(
+        **{_V2_ACTIVE: [{"data": {_V2_SID: {"type": "running"}}}], _V2_MESSAGES: [fresh]}
+    )
+    assert adapter._probe_completion(sess) is False
+    assert [path for path, _ in sess.client.gets] == [_V2_ACTIVE]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [500, RuntimeError("refused"), {"data": None}, ["not", "a", "map"]],
+    ids=["non-200", "transport", "no-map", "wrong-body"],
+)
+def test_v2_session_busy_unknown_is_never_settled(tmp_path, answer):
+    """An unreadable `/api/session/active` is None (unknown), never False: the
+    poll fallback must not read a failed probe as a settled session."""
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_ACTIVE: [answer]})
+    assert make_adapter(tmp_path)._session_status(sess) is None
+
+
+def test_v2_session_busy_absent_is_settled_and_listed_is_busy(tmp_path):
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_ACTIVE: [{"data": {"ses_other": {"type": "running"}}}]})
+    assert adapter._session_status(sess) is False
+    sess.client = _V2RouteClient(**{_V2_ACTIVE: [{"data": {_V2_SID: {"type": "running"}}}]})
+    assert adapter._session_status(sess) is True
+
+
+def test_v2_poll_fallback_after_sse_black_hole(tmp_path, v2_fake):
+    """The V2 stream closes after every connect, so the turn end is never
+    deliverable: completion arrives through `/api/session/active` + the
+    assistant message's `time.completed` (epoch ms) on the newest-first page."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "sse-black-hole"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert len(prompt_texts(rec)) == 1
+    # the proof-of-work read is the default (newest-first) first page
+    assert {} in read_jsonl(rec / "message_reads.jsonl")
+    assert_server_gone(rec)
+
+
+def test_v2_busy_forever_times_out(tmp_path, v2_fake):
+    """A turn that never ends times out and is interrupted over `/interrupt`.
+    Nothing was spent and no step completed, so usage is untracked — None
+    with no fault crumb, never a measured zero."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.result_json is None
+    aborts = read_jsonl(rec / "aborts.jsonl")
+    assert aborts and aborts[0]["path"].endswith("/interrupt")
+    assert adapter.read_usage(result) is None
+    assert result.env_fault is False
+    assert not [c for c in _lifecycle(tmp_path) if c["event"] == "usage-capture-failed"]
+    assert_server_gone(rec)
+
+
+def test_v2_stall_scenario(tmp_path, v2_fake):
+    """Every V2 turn ends result-less: one Stop nudge, then a stall."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "stall"))
+
+    assert result.status == "stalled"
+    assert result.result_json is None
+    texts = prompt_texts(rec)
+    assert len(texts) == 2 and texts[1] == NUDGE_TEXT
+    assert_server_gone(rec)
+
+
+def test_v2_busy_big_usage_trips_budget(tmp_path, v2_fake):
+    """The budget guard samples the V2 Session.Info aggregate mid-turn: 4M in +
+    1M out trips a 1M enforce cap, nudges, then interrupts over_budget."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher), policy=_budget_policy())
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "busy-big-usage",
+        token_budget=1_000_000,
+        token_budget_mode="enforce",
+        token_budget_grace_s=0.3,
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "over_budget"
+    assert result.budget_weighted == 5_000_000
+    texts = prompt_texts(rec)
+    assert len(texts) == 2 and texts[1] == BUDGET_NUDGE_TEXT
+    aborts = read_jsonl(rec / "aborts.jsonl")
+    assert aborts and aborts[0]["path"].endswith("/interrupt")
+    assert adapter.read_usage(result) == TokenUsage(input_tokens=4_000_000, output_tokens=1_000_000)
+    assert_server_gone(rec)
+
+
+def test_v2_capture_usage_reads_session_tokens(tmp_path):
+    """V2 usage is `GET /api/session/{id}` → `data.tokens`, the cumulative
+    aggregate: reasoning folds into output, cache read/write map onto the
+    cache fields, and the per-message tokens are NOT summed on top."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9, tokens={"input": 999, "output": 999}))],
+            _V2_INFO: [_v2_info(input=96, output=40, reasoning=8, cache={"read": 5, "write": 2})],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    transcript = adapter._capture_usage(handle, sess)
+
+    assert transcript is not None
+    assert adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID)) == (
+        TokenUsage(input_tokens=96, output_tokens=48, cache_read_tokens=5, cache_creation_tokens=2)
+    )
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+@pytest.mark.parametrize(
+    "messages, expected",
+    [
+        pytest.param([], None, id="nothing-ran"),
+        pytest.param([_v2_assistant(None)], None, id="in-flight-step"),
+        pytest.param(
+            [_v2_assistant(7, finish="error", error={"type": "aborted", "message": "x"})],
+            None,
+            id="interrupted-step",
+        ),
+        pytest.param(
+            [_v2_assistant(7, finish="error", error={"type": "provider.transport"})],
+            TokenUsage(),
+            id="provider-failure-is-a-measured-zero",
+        ),
+    ],
+)
+def test_v2_zero_usage_is_untracked_unless_a_step_completed(messages, expected):
+    """V1's untracked rule on V2: a zero aggregate is a TRACKED zero only when
+    an assistant step finished on its own (a provider failure counts — the
+    env-fault classifier's signal); an in-flight or interrupted step is None."""
+    client = _V2RouteClient(**{_V2_INFO: [_v2_info()]})
+    assert V2Protocol().usage(client, _V2_SID, messages) == (expected, None)
+
+
+@pytest.mark.parametrize(
+    "answer, stage, error",
+    [
+        (502, "fetch", "HTTP 502"),
+        (RuntimeError("connection refused"), "fetch", "RuntimeError: connection refused"),
+        ({"data": {"tokens": "n/a"}}, "payload", "malformed session: TypeError"),
+        ({"data": {"tokens": {"input": "many"}}}, "payload", "malformed session: ValueError"),
+        ({"error": "no data"}, "payload", "malformed session: KeyError"),
+    ],
+    ids=["non-200", "transport", "tokens-not-object", "count-not-int", "no-data"],
+)
+def test_v2_usage_fetch_fault_is_crumbed_not_zero(tmp_path, answer, stage, error):
+    """DW-461 on V2: a failed or malformed Session.Info read stashes nothing
+    (read_usage None — unknown, never a zero) and is crumbed with its stage;
+    the transcript, read fine, is still dumped.
+
+    ABLATION: make `V2Protocol.usage` answer `TokenUsage()` on a non-200 and
+    the non-200 case reddens."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_MESSAGES: [_v2_page(_v2_assistant(9))], _V2_INFO: [answer]})
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    transcript = adapter._capture_usage(handle, sess)
+
+    assert transcript is not None and Path(transcript).is_file()
+    assert adapter.read_usage(SessionResult(status="timeout", session_id=_V2_SID)) is None
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == stage and crumb["error"].startswith(error)
+
+
+def test_v2_sample_usage_separates_faults_from_inert(tmp_path):
+    """The budget sample is one Session.Info GET a tick: a zero aggregate is
+    inert, a failed or malformed read is a fault, a spend is a sample."""
+    adapter = make_adapter(tmp_path)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_INFO: [_v2_info()]})
+    assert adapter._sample_weighted_usage(sess, spec) == (None, None)
+    sess.client = _V2RouteClient(**{_V2_INFO: [500]})
+    assert adapter._sample_weighted_usage(sess, spec) == (None, "HTTP 500")
+    sess.client = _V2RouteClient(**{_V2_INFO: [{"data": {}}]})
+    weighted, fault = adapter._sample_weighted_usage(sess, spec)
+    assert weighted is None and fault and fault.startswith("KeyError")
+    sess.client = _V2RouteClient(**{_V2_INFO: [_v2_info(input=3, output=1)]})
+    assert adapter._sample_weighted_usage(sess, spec) == (4, None)
+    assert [path for path, _ in sess.client.gets] == [_V2_INFO]  # never the walk
+
+
+def test_v2_transcript_walks_all_pages(tmp_path, v2_fake, monkeypatch):
+    """End to end: a history longer than the 200-message page cap is walked
+    oldest-first via `cursor.next` until the empty last page, and dumped whole
+    as messages.json."""
+    monkeypatch.setenv("FAKE_OPENCODE_HISTORY", "450")
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(
+        make_spec(tmp_path, rec, "completed", extra_env={"FAKE_OPENCODE_HISTORY": "450"})
+    )
+
+    assert result.status == "completed"
+    assert result.transcript_path
+    messages = json.loads(Path(result.transcript_path).read_text(encoding="utf-8"))
+    assert len(messages) == 450 + 3
+    assert [m["id"] for m in messages[:2]] == ["msg_fakehist00000", "msg_fakehist00001"]
+    assert [m["type"] for m in messages[-3:]] == ["user", "assistant", "idle"]
+    assert len({m["id"] for m in messages}) == len(messages)
+    walk = [r for r in read_jsonl(rec / "message_reads.jsonl") if r.get("limit") == "200"]
+    assert walk[-4:] == [
+        {"order": "asc", "limit": "200"},
+        {"cursor": "asc:200", "limit": "200"},
+        {"cursor": "asc:400", "limit": "200"},
+        {"cursor": "asc:600", "limit": "200"},
+    ]
+    assert_server_gone(rec)
+
+
+@pytest.mark.parametrize(
+    "pages, fault",
+    [
+        pytest.param([_v2_page(_v2_assistant(1), next_cursor="c1"), 503], "HTTP 503", id="page-2"),
+        pytest.param([{"data": "x"}], "message page is str, not a list", id="malformed"),
+        pytest.param([RuntimeError("boom")], "RuntimeError: boom", id="transport"),
+        pytest.param(
+            [_v2_page(_v2_assistant(1), next_cursor="again")],
+            "message history did not end within 1000 pages",
+            id="runaway-cursor",
+        ),
+    ],
+)
+def test_v2_transcript_fault_is_never_a_partial_history(pages, fault):
+    """A page failing mid-walk, a malformed page, or a cursor that never runs
+    dry is a fault with no transcript — never the pages read so far."""
+    client = _V2RouteClient(**{_V2_MESSAGES: pages})
+    assert V2Protocol().transcript(client, _V2_SID) == (None, fault)
+
+
+def test_v2_effort_sets_model_variant_at_create(tmp_path, v2_fake):
+    """V2's prompt has no variant: the effort rides the session's model ref at
+    create — checked against the model's variants on `/api/model` — and every
+    prompt (the nudge included) inherits it, so no prompt body carries one."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "nudge-then-complete", model="mock/mock-1", effort="high")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    (session,) = read_jsonl(rec / "sessions.jsonl")
+    assert session["body"]["model"] == {"id": "mock-1", "providerID": "mock", "variant": "high"}
+    bodies = read_jsonl(rec / "prompts.jsonl")
+    assert len(bodies) == 2 and all(set(body) == {"text"} for body in bodies)
+    assert_server_gone(rec)
+
+
+def test_v2_effort_without_model_uses_the_default_model(tmp_path, v2_fake, monkeypatch):
+    monkeypatch.setenv("FAKE_OPENCODE_DEFAULT_MODEL", "mock/mock-2")
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "completed",
+        effort="turbo",
+        extra_env={"FAKE_OPENCODE_DEFAULT_MODEL": "mock/mock-2"},
+    )
+
+    assert adapter.run(spec).status == "completed"
+    (session,) = read_jsonl(rec / "sessions.jsonl")
+    assert session["body"]["model"] == {"id": "mock-2", "providerID": "mock", "variant": "turbo"}
+    assert_server_gone(rec)
+
+
+def test_v2_no_effort_sends_no_model_ref(tmp_path, v2_fake):
+    """Without an effort the create body is unchanged: the policy model rides
+    the config, and no model lookup is made."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    assert adapter.run(make_spec(tmp_path, rec, "completed", model="mock/mock-1")).status == (
+        "completed"
+    )
+    (session,) = read_jsonl(rec / "sessions.jsonl")
+    assert set(session["body"]) == {"title", "location"}
+    assert_server_gone(rec)
+
+
+@pytest.mark.parametrize(
+    "model, effort, default, match",
+    [
+        pytest.param(
+            "mock/mock-1",
+            "nonsense",
+            "mock/mock-1",
+            r"effort 'nonsense' is not a variant of mock/mock-1 \(available: low, medium, high\)",
+            id="unknown-variant",
+        ),
+        pytest.param(
+            "mock/nope",
+            "high",
+            "mock/mock-1",
+            r"effort 'high' needs the model's variants, but 'mock/nope' is not among",
+            id="unknown-model",
+        ),
+        pytest.param(
+            "",
+            "high",
+            "",
+            r"effort 'high' is set but the opencode server has no default model",
+            id="no-default-model",
+        ),
+    ],
+)
+def test_v2_unusable_effort_fails_the_session_start(
+    tmp_path, v2_fake, monkeypatch, model, effort, default, match
+):
+    """V2 accepts ANY variant at create and only fails the turn at prompt time
+    (pinned: `provider.no-route` "Variant unavailable"), so the adapter checks
+    the effort against the model's variants first and refuses to start —
+    loudly, naming the effort — rather than drop it or burn a result-less turn.
+
+    ABLATION: drop the `spec.effort not in variants` raise and the
+    unknown-variant case reddens (the session would start and complete)."""
+    monkeypatch.setattr(V2Protocol, "model_settle_s", 0.3)
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "completed",
+        model=model,
+        effort=effort,
+        extra_env={"FAKE_OPENCODE_DEFAULT_MODEL": default},
+    )
+    monkeypatch.setenv("FAKE_OPENCODE_DEFAULT_MODEL", default)
+
+    with pytest.raises(OpencodeServerError, match=match):
+        adapter.run(spec)
+
+    assert read_jsonl(rec / "sessions.jsonl") == []  # no session was created
+    assert adapter._sessions == {}
+    assert_server_gone(rec)
+
+
+def test_v2_zero_token_timeouts_classify_like_v1(tmp_path, v2_fake):
+    """DW-364 on V2 end to end: a provider failure that exhausted its retries
+    (a completed, token-less step) is a tracked zero → env fault; the step the
+    timeout's own interrupt cancelled (`aborted`) is not a measured zero."""
+    launcher, rec = v2_fake
+    errored = make_adapter(tmp_path / "e", binary=str(launcher))
+    result = errored.run(make_spec(tmp_path / "e", rec, "busy-zero-errored", timeout_s=1.5))
+    assert result.status == "timeout"
+    assert errored.read_usage(result) == TokenUsage()
+    assert result.env_fault is True
+    assert_server_gone(rec)
+
+    aborted = make_adapter(tmp_path / "a", binary=str(launcher))
+    result = aborted.run(make_spec(tmp_path / "a", rec, "busy-zero-aborted", timeout_s=1.5))
+    assert result.status == "timeout"
+    assert aborted.read_usage(result) is None
+    assert result.env_fault is False
+    assert_server_gone(rec)
+
+
+# ------------------------------- OpenCode 2.x (V2) provider faults (env fault)
+
+
+def test_v2_provider_error_log_classifies_transport_outage(tmp_path, v2_fake):
+    """The V2 env-fault path end to end: 2.x logs no provider error to its own
+    stdout, so the evidence is the adapter-authored `provider-errors.log` line
+    the reader writes for each `session.retry.scheduled`. A turn that only ever
+    retries a dead provider times out untracked (no tokens, no completed step —
+    the zero-token rule cannot see it) and must still classify, off that file.
+
+    ABLATION: drop `.provider-errors.log` from ENV_FAULT_LOG_SUFFIXES (or stop
+    `_note_provider_error` writing) and env_fault reads False."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-outage", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.result_json is None
+    assert adapter.read_usage(result) is None  # untracked: the pattern did this
+    assert result.env_fault is True
+    assert result.env_fault_evidence.startswith(
+        "provider-error event=session.retry.scheduled type=provider.transport"
+    )
+    logs = tmp_path / "run" / "logs"
+    lines = (logs / "t-1.provider-errors.log").read_text(encoding="utf-8").splitlines()
+    assert lines == [
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        f'attempt={n} message="ConnectionRefused: Unable to connect. Is the computer '
+        'able to access the url?"'
+        for n in (2, 3, 4)
+    ]
+    # The server log carries nothing (as on the real 2.x); the transcript is
+    # never the source.
+    assert "provider.transport" not in (logs / "t-1.server.out").read_text(encoding="utf-8")
+    events = _lifecycle(tmp_path)
+    assert [e["event"] for e in events][-1:] == ["env-fault-classified"]
+    assert not [e for e in events if e["event"] == "env-fault-scan-failed"]
+    assert_server_gone(rec)
+
+
+def test_v2_provider_quota_failure_classifies_and_renders(tmp_path, v2_fake):
+    """A quota refusal is not retried: the turn fails at once on
+    `session.execution.failed`. The provider-errors log carries both frames'
+    lines (never the response body), the failure is an environment fault, and
+    the transcript shows the prompt and the error as `[bmad]` lines."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota", timeout_s=5.0))
+
+    assert result.status in ("timeout", "stalled", "crashed"), result.status
+    assert result.result_json is None
+    assert result.env_fault is True
+    assert "type=provider.quota status=402" in result.env_fault_evidence
+    logs = tmp_path / "run" / "logs"
+    lines = (logs / "t-1.provider-errors.log").read_text(encoding="utf-8").splitlines()
+    # One pair per failed turn (the result-less turn end is nudged, and the
+    # nudged turn fails the same way).
+    events = [line.split(" type=")[0] for line in lines]
+    assert events and len(events) % 2 == 0
+    assert events == [
+        "provider-error event=session.step.failed",
+        "provider-error event=session.execution.failed",
+    ] * (len(events) // 2)
+    assert not any("insufficient_quota" in line for line in lines)
+    transcript = (logs / "t-1.log").read_text(encoding="utf-8")
+    assert "[bmad] user:" in transcript
+    assert "Use the bmad-loop-sweep skill now: run it" in transcript
+    assert "[bmad] error: provider.quota 402: You exceeded your current quota" in transcript
+    assert_server_gone(rec)
+
+
+def test_v2_failed_execution_ends_the_turn_while_still_listed_active(tmp_path, v2_fake):
+    """2.0.27 publishes `session.execution.failed` BEFORE it drops the session
+    from `/api/session/active`. The failure is still the turn end — nudged like
+    any result-less Stop — never discarded because the busy probe read it
+    listed; the heartbeat comments keep the stream fresh, so nothing else
+    would recover it before the timeout.
+
+    ABLATION: map `session.execution.failed` back to `error_types` and the run
+    sends no nudge and times out."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota-settling", timeout_s=5.0))
+
+    assert result.status != "timeout", result.status
+    assert len(prompt_texts(rec)) >= 2  # the failed turn end was nudged
+    assert result.env_fault is True
+    assert_server_gone(rec)
+
+
+def test_v2_capture_usage_survives_a_failed_transcript_walk(tmp_path):
+    """V2 usage is the `Session.Info` aggregate, a read apart from the
+    transcript: a walk that fails on page 2 is crumbed (`stage=fetch`) and no
+    transcript is dumped, but the measured usage is still stashed.
+
+    ABLATION: return on the transcript fault unconditionally and nothing is
+    stashed."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(1), next_cursor="c1"), 503],
+            _V2_INFO: [_v2_info(input=7, output=3)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is None
+
+    assert adapter._usage[_V2_SID].total == 10
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "fetch" and crumb["error"] == "HTTP 503"
+    assert not (adapter.tasks_dir / "t-cap" / "messages.json").exists()
+
+
+def test_v2_capture_usage_zero_without_transcript_stays_untracked(tmp_path):
+    """Without the transcript a zero aggregate cannot be told from an in-flight
+    first step, so it stays untracked (None) — never a measured zero."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(**{_V2_MESSAGES: [RuntimeError("boom")], _V2_INFO: [_v2_info()]})
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is None
+
+    assert adapter._usage == {}
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["error"] == "RuntimeError: boom"
+
+
+def test_v2_provider_outage_after_work_is_overruled(tmp_path, v2_fake):
+    """#764 on V2: the same outage lines in a session whose Session.Info reports
+    tokens already spent are overruled — the session did real work, so it is
+    charged like any other failure rather than paused."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-outage-after-work", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert adapter.read_usage(result).total > 0
+    assert result.env_fault is False
+    assert result.env_fault_overruled is not None
+    assert "type=provider.transport" in result.env_fault_overruled
+    events = _lifecycle(tmp_path)
+    assert [e["event"] for e in events][-1:] == ["env-fault-overruled"]
+    assert_server_gone(rec)
+
+
+def test_provider_errors_log_is_created_at_spawn_on_v1(tmp_path, fake_opencode):
+    """Every protocol creates the provider-errors log at spawn — V1 never writes
+    a line to it — so a healthy V1 session's scan reads an empty file (a clean
+    answer), never a missing one (a read-fault crumb)."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.env_fault is False
+    assert (tmp_path / "run" / "logs" / "t-1.provider-errors.log").read_bytes() == b""
+    assert not [e for e in _lifecycle(tmp_path) if e["event"] == "env-fault-scan-failed"]
+    assert_server_gone(rec)
+
+
+def test_stale_provider_errors_log_is_dropped_at_session_start(tmp_path, v2_fake):
+    """The pause loop `test_env_fault_log_is_dropped_at_session_start` guards
+    against, for the second scanned file: a re-armed run reusing a task id must
+    not classify off the PREVIOUS cycle's provider-error line."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    stale = tmp_path / "run" / "logs" / "t-1.provider-errors.log"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=1 message="stale"\n',
+        encoding="utf-8",
+    )
+
+    result = adapter.run(make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5))
+
+    assert result.status == "timeout"
+    assert result.env_fault is False, f"classified off a stale log: {result.env_fault_evidence}"
+    assert stale.read_bytes() == b""
+
+
+def test_provider_error_write_failure_is_crumbed_once(tmp_path):
+    """A lost provider-error line is a lost classification, so the reader's
+    append failing is visible — one `provider-errors-write-failed` crumb per
+    session — and never kills the reader or the queue put behind it."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.lifecycle_task = "t-1"
+    sess.provider_errors_path = tmp_path / "missing-dir" / "t-1.provider-errors.log"
+    failed = _v2_frame(
+        "session.execution.failed",
+        sessionID="ses_parent",
+        error={"type": "provider.transport", "message": "down"},
+    )
+
+    adapter._dispatch_sse(sess, failed)
+    adapter._dispatch_sse(sess, failed)
+
+    assert [sess.events.get_nowait(), sess.events.get_nowait()] == ["idle", "idle"]
+    crumbs = [e for e in _lifecycle(tmp_path) if e["event"] == "provider-errors-write-failed"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["frame"] == "session.execution.failed"
+    assert crumbs[0]["error"].startswith("FileNotFoundError: ")
 
 
 def test_e2e_spawn_retry_survives_one_early_death(tmp_path, fake_opencode):
@@ -4250,7 +5766,13 @@ def _write_ef_log(adapter, text: str, task_id: str = _EF_TASK) -> None:
     suffix here would just restate the implementation. Pinning the wiring is
     test_e2e_env_fault_classified_through_run's job, and it is the only thing that
     caught the scan pointing at the wrong file after <task_id>.log became the
-    conversation transcript."""
+    conversation transcript.
+
+    The other scanned files are created empty, as the spawn creates them: a
+    missing one is a read fault (crumbed), not the clean answer these tests
+    are about."""
+    for scanned in adapter._env_fault_log_paths(task_id):
+        scanned.touch()
     adapter._env_fault_log_path(task_id).write_text(text, encoding="utf-8")
 
 
@@ -4331,16 +5853,20 @@ def test_opencode_env_fault_skips_completed_and_result_bearing(tmp_path):
 def test_opencode_env_fault_missing_log_declines_with_a_crumb(tmp_path):
     """Best-effort doctrine: an unreadable log leaves the verdict untouched — and
     says so (DW-460). This host reaches the crumb through the same
-    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names the file it
-    actually scans (`.server.out`), not the transcript."""
+    `_note_lifecycle` it inherits from `_ResultFileMixin`, and names each file it
+    actually scans (`.server.out`, then `.provider-errors.log`), not the
+    transcript — one crumb per unreadable file."""
     adapter = make_adapter(tmp_path)
     result = _ef_classify(adapter, "timeout", task_id="never-ran")
     assert result.env_fault is False
     events = _lifecycle_lines(adapter, "never-ran")
-    assert [e["event"] for e in events] == ["env-fault-scan-failed"]
-    assert events[0]["stage"] == "read"
-    assert events[0]["log"] == str(adapter.logs_dir / "never-ran.server.out")
-    assert events[0]["error"].startswith("FileNotFoundError: ")
+    assert [e["event"] for e in events] == ["env-fault-scan-failed"] * 2
+    assert [e["stage"] for e in events] == ["read", "read"]
+    assert [e["log"] for e in events] == [
+        str(adapter.logs_dir / "never-ran.server.out"),
+        str(adapter.logs_dir / "never-ran.provider-errors.log"),
+    ]
+    assert all(e["error"].startswith("FileNotFoundError: ") for e in events)
 
 
 def test_opencode_env_fault_clean_scan_leaves_no_crumb(tmp_path):

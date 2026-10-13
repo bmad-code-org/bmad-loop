@@ -42,6 +42,7 @@ from pathlib import Path
 import pytest
 import regex
 
+from bmad_loop.adapters.opencode_protocol import format_provider_error
 from bmad_loop.adapters.profile import get_profile
 
 # The profiles whose patterns are backed by captured output from a real outage.
@@ -83,7 +84,115 @@ OPENCODE_REAL = [
     "providerID=zai-coding-plan modelID=glm-5.2 session.id=ses_fake0000000000000000000002 "
     'small=false agent=build mode=primary error.error="AI_APICallError: Cannot connect to '
     'API: The socket connection was closed unexpectedly."',
+    *(
+        # OpenCode 2.x: the `provider-errors.log` lines the adapter writes
+        # (`format_provider_error`) for frames captured live from 2.0.27
+        # (2026-10-12, zero tokens, a local mock provider answering a 429 rate
+        # limit, a 429 and a 402 `insufficient_quota`, and a closed port). Every
+        # byte is reproduced — test_v2_corpus_lines_are_what_the_adapter_writes
+        # rebuilds them from those frames' payloads.
+        "provider-error event=session.retry.scheduled type=provider.rate-limit status=429 "
+        'attempt=2 message="Rate limit reached for requests"',
+        "provider-error event=session.step.failed type=provider.rate-limit status=429 "
+        'attempt=- message="Rate limit reached for requests"',
+        "provider-error event=session.execution.failed type=provider.quota status=429 "
+        'attempt=- message="You exceeded your current quota, please check your plan and '
+        'billing details."',
+        "provider-error event=session.step.failed type=provider.quota status=402 "
+        'attempt=- message="You exceeded your current quota, please check your plan and '
+        'billing details."',
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=2 message="ConnectionRefused: Unable to connect. Is the computer able to '
+        'access the url?"',
+        "provider-error event=session.execution.failed type=provider.transport status=- "
+        'attempt=- message="ConnectionRefused: Unable to connect. Is the computer able to '
+        'access the url?"',
+    ),
 ]
+
+# The captured 2.x frames behind the provider-errors lines above: `(event,
+# data)` with the `data` payload as the server sent it (ids shortened; they carry
+# no test signal), `response.body` included — the adapter must drop it.
+_RATE_LIMIT_ERROR = {
+    "type": "provider.rate-limit",
+    "message": "Rate limit reached for requests",
+    "status": 429,
+    "response": {
+        "body": '{"error": {"message": "Rate limit reached for requests", "type": "requests", '
+        '"param": null, "code": "rate_limit_exceeded"}}'
+    },
+}
+_QUOTA_MESSAGE = "You exceeded your current quota, please check your plan and billing details."
+_QUOTA_BODY = (
+    '{"error": {"message": "You exceeded your current quota, please check your plan and '
+    'billing details.", "type": "insufficient_quota", "param": null, '
+    '"code": "insufficient_quota"}}'
+)
+_TRANSPORT_ERROR = {
+    "type": "provider.transport",
+    "message": "ConnectionRefused: Unable to connect. Is the computer able to access the url?",
+}
+OPENCODE_V2_CAPTURED_FRAMES = [
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_1",
+            "assistantMessageID": "msg_1",
+            "attempt": 2,
+            "at": 1791830376429,
+            "error": _RATE_LIMIT_ERROR,
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_1",
+            "assistantMessageID": "msg_1",
+            "error": _RATE_LIMIT_ERROR,
+            "snapshot": "34371aaf",
+            "files": [],
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_2",
+            "error": {
+                "type": "provider.quota",
+                "message": _QUOTA_MESSAGE,
+                "status": 429,
+                "response": {"body": _QUOTA_BODY},
+            },
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_3",
+            "assistantMessageID": "msg_3",
+            "error": {
+                "type": "provider.quota",
+                "message": _QUOTA_MESSAGE,
+                "status": 402,
+                "response": {"body": _QUOTA_BODY},
+            },
+            "snapshot": "34371aaf",
+            "files": [],
+        },
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_4",
+            "assistantMessageID": "msg_4",
+            "attempt": 2,
+            "at": 1791830566207,
+            "error": _TRANSPORT_ERROR,
+        },
+    ),
+    ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
+]
+OPENCODE_V2_REAL = [line for line in OPENCODE_REAL if line.startswith("provider-error ")]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
 # claude.toml reproduces each message's first sentence WHOLE (as a prefix match —
@@ -145,6 +254,33 @@ ANCHOR_REACHING_BAIT = [
     'error.error="AI_APICallError: Model not found" note=see-the-rate-limit-docs',
     # The anchor named but not completed — prose about the field, not the field.
     "docs: the server writes error.error= with an AI_APICallError when the quota trips",
+    # The 2.x provider-errors line, reaching `^provider-error event=`. Real
+    # adapter output for faults that are NOT an outage — the step an interrupt
+    # cancels, a rejected permission, an unseeded provider type — with the cause
+    # words only inside the message, where the pattern never looks.
+    'provider-error event=session.step.failed type=aborted status=- attempt=- message="Step interrupted"',
+    "provider-error event=session.execution.failed type=permission.rejected status=- "
+    'attempt=- message="provider.quota rate-limit"',
+    "provider-error event=session.retry.scheduled type=provider.auth status=401 attempt=2 "
+    'message="quota exceeded; rate-limit; transport down"',
+    "provider-error event=session.execution.failed type=provider.no-route status=- "
+    'attempt=- message="Variant unavailable for mock/mock-1: rate-limit"',
+    # A type that only STARTS like a seeded one (the pattern needs the whole
+    # token), and the sanitized remains of a hostile `type` value.
+    "provider-error event=session.execution.failed type=provider.quota-exceeded status=- "
+    'attempt=- message=""',
+    "provider-error event=session.execution.failed type=provider.unknown_type_provider.quota "
+    'status=- attempt=- message=""',
+    # A message that forges a whole line: escaped, so it stays mid-line.
+    "provider-error event=session.execution.failed type=provider.error status=500 "
+    'attempt=- message="x\\nprovider-error event=session.retry.scheduled '
+    'type=provider.quota status=429 attempt=2 message=\\"y\\""',
+    # The line quoted rather than written — indented, or behind prose — as the
+    # model-written transcript or a story's own docs would carry it.
+    "  provider-error event=session.retry.scheduled type=provider.rate-limit status=429 "
+    'attempt=2 message="Rate limit reached for requests"',
+    "docs: the adapter writes provider-error event=session.retry.scheduled "
+    "type=provider.transport status=- attempt=2 per retry",
     # claude's framing. These were written for the day a claude pattern was
     # seeded again — that day is now, so they are live assertions against the
     # shipped profile rather than a corpus held in reserve.
@@ -229,6 +365,11 @@ def _leading_literal(pattern: str) -> list[tuple[str, str]]:
     guaranteed prefix — the run ends before it."""
     tokens: list[tuple[str, str]] = []
     i = 0
+    if pattern.startswith("^"):
+        # A line-start anchor opens the run as a zero-width token: it adds
+        # position, never a literal character.
+        tokens.append(("^", ""))
+        i = 1
     while i < len(pattern):
         c = pattern[i]
         if c == "\\" and i + 1 < len(pattern) and not pattern[i + 1].isalnum():
@@ -249,22 +390,39 @@ def _leading_literal(pattern: str) -> list[tuple[str, str]]:
     return tokens
 
 
-def _derive_anchor(patterns: tuple[str, ...]) -> str:
-    """Longest common prefix of the patterns' leading literal runs."""
-    literals = ["".join(lit for _, lit in _leading_literal(p)) for p in patterns]
-    if not literals:
-        return ""
-    anchor = literals[0]
-    for lit in literals[1:]:
-        n = 0
-        while n < min(len(anchor), len(lit)) and anchor[n] == lit[n]:
-            n += 1
-        anchor = anchor[:n]
-    return anchor
+def _derive_anchors(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """Each anchor family's literal: the patterns' leading literal runs, grouped
+    by a shared prefix of at least MIN_ANCHOR_LEN characters, each group reduced
+    to its longest common prefix. One profile can key on more than one framing
+    (opencode: the 1.x server log's `error.error=` field and the 2.x
+    provider-errors line), and every family has to be reached by the corpus."""
+    anchors: list[str] = []
+    for literal in ("".join(lit for _, lit in _leading_literal(p)) for p in patterns):
+        for i, anchor in enumerate(anchors):
+            n = 0
+            while n < min(len(anchor), len(literal)) and anchor[n] == literal[n]:
+                n += 1
+            if n >= MIN_ANCHOR_LEN:
+                anchors[i] = anchor[:n]
+                break
+        else:
+            anchors.append(literal)
+    return tuple(anchors)
 
 
-PROFILE_ANCHOR_LITERAL = {
-    name: _derive_anchor(get_profile(name).env_fault_patterns) for name in SEEDED_PROFILES
+def _leading_spelling(pattern: str, anchor: str) -> str | None:
+    """The raw regex spelling of ``pattern``'s leading tokens whose literal
+    characters spell ``anchor``, or None when its leading literal does not."""
+    spelling, literal = "", ""
+    for raw, lit in _leading_literal(pattern):
+        if len(literal) >= len(anchor):
+            break
+        spelling, literal = spelling + raw, literal + lit
+    return spelling if literal == anchor else None
+
+
+PROFILE_ANCHOR_LITERALS = {
+    name: _derive_anchors(get_profile(name).env_fault_patterns) for name in SEEDED_PROFILES
 }
 
 # Ordinary output from a healthy session working on a story that involves rate
@@ -488,38 +646,45 @@ def test_anchor_reaching_bait_is_not_vacuous(name: str) -> None:
     """Guards the guard. The test above is worthless unless its corpus actually
     contains the anchor under test — and it silently stopped doing so once, when
     the profile the corpus had been written for was withdrawn. Assert reachability
-    mechanically instead of trusting it."""
-    anchor = PROFILE_ANCHOR_LITERAL[name]
-    reaching = [line for line in ANCHOR_REACHING_BAIT if anchor in line]
-    assert reaching, f"no ANCHOR_REACHING_BAIT line contains {name}'s anchor {anchor!r}"
+    mechanically instead of trusting it, for every anchor family the profile
+    keys on."""
+    for anchor in PROFILE_ANCHOR_LITERALS[name]:
+        reaching = [line for line in ANCHOR_REACHING_BAIT if anchor in line]
+        assert reaching, f"no ANCHOR_REACHING_BAIT line contains {name}'s anchor {anchor!r}"
 
 
 @pytest.mark.parametrize("name", SEEDED_PROFILES)
 def test_anchor_literal_is_the_live_patterns_anchor(name: str) -> None:
-    """DW-373: guards the derivation of `PROFILE_ANCHOR_LITERAL`. The vacuity guard
+    """DW-373: guards the derivation of `PROFILE_ANCHOR_LITERALS`. The vacuity guard
     above is only as good as its input — an empty or trivially short anchor is
     `in` every bait line, so a derivation that silently went vacuous would pass it
-    for every reason. Assert the derived anchor is meaningful, and that every live
-    pattern opens with a regex spelling of it: the pattern's own leading tokens,
-    run through the regex engine, must match the anchor exactly — so a decoding
-    slip in `_leading_literal` cannot fake the prefix.
+    for every reason. Assert each derived anchor is meaningful, and that every live
+    pattern opens with a regex spelling of one of them: the pattern's own leading
+    tokens, run through the regex engine, must match the anchor exactly — so a
+    decoding slip in `_leading_literal` cannot fake the prefix.
 
-    ABLATION: make `_derive_anchor` return "" (or stop decoding `[.]`) and this
+    ABLATION: make `_derive_anchors` return ("",) (or stop decoding `[.]`) and this
     reddens; move a live pattern's anchor off the corpus and the guard above does."""
     patterns = get_profile(name).env_fault_patterns
     assert patterns, f"{name} ships no env_fault_patterns"
-    anchor = PROFILE_ANCHOR_LITERAL[name]
-    assert (
-        len(anchor) >= MIN_ANCHOR_LEN
-    ), f"{name}: derived anchor {anchor!r} is shorter than {MIN_ANCHOR_LEN} chars"
+    anchors = PROFILE_ANCHOR_LITERALS[name]
+    for anchor in anchors:
+        assert (
+            len(anchor) >= MIN_ANCHOR_LEN
+        ), f"{name}: derived anchor {anchor!r} is shorter than {MIN_ANCHOR_LEN} chars"
     for pattern in patterns:
-        tokens = _leading_literal(pattern)[: len(anchor)]
-        spelling = "".join(raw for raw, _ in tokens)
-        assert pattern.startswith(spelling), (name, pattern)
-        assert regex.fullmatch(spelling, anchor), (
-            f"{name}: live pattern {pattern!r} does not open with anchor {anchor!r} "
-            f"(its leading spelling {spelling!r})"
-        )
+        spellings = [
+            (anchor, spelling)
+            for anchor in anchors
+            if (spelling := _leading_spelling(pattern, anchor)) is not None
+        ]
+        assert spellings, f"{name}: live pattern {pattern!r} opens with none of {anchors!r}"
+        for anchor, spelling in spellings:
+            assert pattern.startswith(spelling), (name, pattern)
+            assert regex.fullmatch(spelling, anchor), (
+                f"{name}: live pattern {pattern!r} does not open with anchor {anchor!r} "
+                f"(its leading spelling {spelling!r})"
+            )
 
 
 @pytest.mark.parametrize(("name", "line"), REAL_BY_PROFILE)
@@ -534,7 +699,16 @@ def test_each_seeded_profile_catches_its_own_cli_error_lines(name: str, line: st
 def test_patterns_require_an_anchor_not_a_bare_cause(name: str) -> None:
     """The doctrine itself: a cause word alone must never be sufficient. Guards
     against a future edit that drops an anchor for 'better coverage'."""
-    for bare in ("quota", "rate limit", "429", "usage limit reached", "too many requests"):
+    for bare in (
+        "quota",
+        "rate limit",
+        "429",
+        "usage limit reached",
+        "too many requests",
+        "type=provider.quota ",
+        "provider.rate-limit",
+        "type=provider.transport status=- attempt=2",
+    ):
         assert not _matches(name, bare), f"{name}.toml classifies the bare cause {bare!r}"
 
 
@@ -663,3 +837,28 @@ def test_unseeded_profiles_stay_inert(name: str) -> None:
     log line, with the run it came from cited, and add it to REAL_BY_PROFILE and
     this module's BAIT in the same change."""
     assert get_profile(name).env_fault_patterns == ()
+
+
+def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
+    """Provenance for the 2.x half of OPENCODE_REAL: each line is exactly what
+    the adapter writes (`format_provider_error`) for a frame captured live —
+    so the corpus is the real thing, not a plausible-looking string."""
+    written = [format_provider_error(event, data) for event, data in OPENCODE_V2_CAPTURED_FRAMES]
+    assert written == OPENCODE_V2_REAL
+    for line in written:
+        assert "response" not in line and "insufficient_quota" not in line  # body dropped
+
+
+@pytest.mark.parametrize("line", OPENCODE_V2_REAL)
+def test_v2_provider_error_line_is_model_free_shape(line: str) -> None:
+    """The 2.x pattern matches only the structured head of an adapter-written
+    line: cut the line at `message=` and it still classifies, so nothing
+    provider- or model-sourced is what made it match; and the same line behind
+    any leading text — quoted in the transcript, a doc, a fixture — does not."""
+    head = line.split(' message="', 1)[0] + " "
+    v2 = [p for p in _patterns("opencode") if p.pattern.startswith("^provider-error")]
+    assert len(v2) == 1, "the opencode profile should ship one 2.x provider-error pattern"
+    assert v2[0].search(head)
+    assert v2[0].search(line)
+    assert not v2[0].search("  " + line)
+    assert not v2[0].search("log: " + line)

@@ -9703,6 +9703,65 @@ def test_validate_hookless_profile_flags_missing_httpx(project, capsys, monkeypa
     assert "bmad-loop[opencode]" in text
 
 
+def _opencode_version_findings(project, capsys, monkeypatch, version_line: str | None):
+    """`adapter.opencode-version` findings for an opencode project whose binary
+    resolves, runs, and prints ``version_line`` for `--version`. The rc is not
+    asserted: other gates (upstream skills, mux) legitimately vary by machine."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "opencode"\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    probed: list[str] = []
+
+    def fake_version_text(binary, *_a, **_kw):
+        probed.append(binary)
+        return version_line
+
+    monkeypatch.setattr(probe_mod, "binary_version_text", fake_version_text)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    captured = capsys.readouterr()
+    assert captured.out, captured.err
+    doc = json.loads(captured.out)
+    assert probed == ["/usr/bin/opencode"]
+    return [f for f in doc["findings"] if f["check"] == "adapter.opencode-version"]
+
+
+def test_validate_reports_opencode_version_ok(project, capsys, monkeypatch):
+    """#847: validate names the OpenCode server API the run would detect."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "1.19.0")
+    assert [f["severity"] for f in findings] == ["ok"]
+    assert "opencode 1.19.0 → v1 server api" in findings[0]["message"].lower()
+    assert findings[0]["detail"]["verdict"] == "ok"
+
+
+def test_validate_reports_opencode_version_warns_below_floor(project, capsys, monkeypatch):
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "1.17.0")
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["verdict"] == "below-floor"
+    assert "1.18.0" in findings[0]["message"]
+
+
+def test_validate_reports_opencode_version_warns_unsupported_major(project, capsys, monkeypatch):
+    """A major the adapter refuses is a warning, never a problem — validate's rc
+    is a compatibility contract; the run itself refuses with a clear error."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, "opencode v3.1.0")
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["verdict"] == "unsupported-major"
+    assert "runs will refuse to start" in findings[0]["message"]
+
+
+def test_validate_opencode_version_warns_when_second_read_fails(project, capsys, monkeypatch):
+    """The check runs only after `binary_runs` saw `--version` exit 0, so a read
+    that now fails or prints nothing is reported by no other finding. The run
+    refuses to start on it, so validate warns rather than staying silent.
+
+    Ablation target: return early on a None read and this sees no finding."""
+    findings = _opencode_version_findings(project, capsys, monkeypatch, None)
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["output"] is None
+    assert "refuse to start" in findings[0]["message"]
+
+
 def test_validate_warns_when_no_desktop_notifier(project, monkeypatch, capsys):
     """#231: notify.desktop defaults on, but when this platform resolves no
     notifier the setting is silently inert — validate must surface it as a
@@ -10515,7 +10574,7 @@ OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/cl
 
 def test_dry_run_renders_hookless_http_line(project, capsys):
     """A hookless adapter has no shell invocation — dry-run renders the honest
-    HTTP sequence (server spawn → session → prompt_async) instead of a fake
+    HTTP sequence (server spawn → session → prompt) instead of a fake
     argv that run would never execute."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     _write_policy(project.project, OPENCODE_QUALIFIED_POLICY)
@@ -10526,8 +10585,10 @@ def test_dry_run_renders_hookless_http_line(project, capsys):
     out = capsys.readouterr().out
     dev_line = next(line for line in out.splitlines() if "dev:" in line)
     assert "opencode serve --hostname 127.0.0.1 --port <auto>" in dev_line
-    assert "POST /session" in dev_line and "prompt_async" in dev_line
-    # the profile's codex-style template is rendered into the prompt_async body
+    # protocol-neutral: the server API major is only detected at spawn
+    assert "→ create session → prompt " in dev_line
+    assert "POST /session" not in dev_line and "prompt_async" not in dev_line
+    # the profile's codex-style template is rendered into the prompt body
     assert "Use the bmad-dev-auto skill now:" in dev_line
     assert "model=anthropic/claude-haiku-4-5" in dev_line
     assert "effort=" not in dev_line  # unset → absent, like model
