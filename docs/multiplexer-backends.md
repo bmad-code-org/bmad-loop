@@ -127,9 +127,14 @@ psmux ls
 
 `bmad-loop attach` needs none of this; it runs the client under the root it exported.
 
-**The control session is per project on psmux:** `bmad-loop-ctl-<16-hex registry digest>`.
-The TUI's toasts name the exact session. When no state root can be derived it is plain
-`bmad-loop-ctl`, as on tmux.
+**The control session is `bmad-loop-ctl`**, one per project registry on psmux. Earlier
+releases named it `bmad-loop-ctl-<16-hex registry digest>` on psmux. A control session
+started under that name before an upgrade keeps running, and bmad-loop still treats it as a
+control session: `cleanup` never prunes it. New launches go to `bmad-loop-ctl` instead, so
+the TUI's attach and stop keys and the parked-window sweep no longer reach the old session's
+windows. Let its runs finish (`bmad-loop stop` reaches a live engine wherever it runs), check
+that every window shows the exit banner (see `capture-pane` below), then end it with
+`psmux kill-session -t bmad-loop-ctl-<digest>`.
 
 **If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
 path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then

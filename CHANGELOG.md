@@ -62,6 +62,11 @@ breaking changes may land in a minor release.
 - **Require psmux 3.4.0 or newer (#879).** `available()` refuses 3.3.8 and below, so **on
   such a host the psmux backend reports unavailable and selection falls through: upgrade
   psmux**. 3.3.8 silently unsets an option given a `-`-leading value (psmux/psmux#583).
+- Name the psmux control session `bmad-loop-ctl` again, one per project registry, now that
+  psmux 3.4.0 keys its duplicate-server guard on the registry (psmux#599). A pre-upgrade
+  `bmad-loop-ctl-<digest>` session is still treated as a control session and never pruned,
+  but new launches, the TUI's attach and stop keys and the parked-window sweep use
+  `bmad-loop-ctl`; end the old session once its windows have parked (#733).
 
 ### Removed
 

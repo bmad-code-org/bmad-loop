@@ -106,7 +106,7 @@ A run id is `YYYYMMDD-HHMMSS-<4 hex>` in local time, for example `20261012-01152
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | agent session   | `bmad-loop-<run-id>`, one per run, tagged with the project key (`@bmad_project`); multiplexer-driven adapters only (opencode runs none) |
 | agent window    | one per agent session, named after the task id (last 40 characters); its pane is piped to `logs/<task_id>.log`                          |
-| control session | `bmad-loop-ctl` on tmux; `bmad-loop-ctl-<16 hex>` on psmux (derived from the per-project registry)                                      |
+| control session | `bmad-loop-ctl`; on psmux one per project registry (earlier releases named it `bmad-loop-ctl-<16 hex>` there)                           |
 | control window  | `<kind>-<run-id>`, where `kind` is `run`, `sweep`, `resume` or `resolve`; opened by the TUI, parks after the command exits              |
 
 Teardown:

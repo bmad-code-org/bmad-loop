@@ -112,9 +112,8 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         proc = mux._run(["set-option", "-t", session, foreign, "user"], check=False)
         assert proc.returncode == 0, proc.stderr
 
-        # The ctl-session NAME is resolved per (project, transport) since the
-        # per-registry rename (runs.ctl_session_for); pin the resolver to this
-        # test's own session so the prune sweeps the windows minted above.
+        # Pin the ctl-session resolver (runs.ctl_session_for) to this test's own
+        # session so the prune sweeps the windows minted above.
         monkeypatch.setattr(runs, "ctl_session_for", lambda _p, _m=None: session)
         monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
         # Pin "outside any pane": when pytest itself runs inside psmux the
@@ -633,22 +632,15 @@ def test_premise_target_less_display_message_ignores_tmux_pane(probe):
     )
 
 
-def test_premise_one_session_name_is_held_across_registries(tmp_path):
-    """psmux's one-server-per-name guard is keyed on the session name alone, not
-    the registry root, so while root A holds a session a second root cannot
-    create one of the same name. That collision is why `runs.ctl_session_for`
-    suffixes the control-session name per registry (psmux/psmux#599).
+def test_adopted_two_registries_each_hold_a_session_of_one_name(tmp_path):
+    """psmux's one-server-per-name guard follows `PSMUX_DATA_DIR`
+    (psmux/psmux#599), so while root A holds a session, root B creates its own
+    of the same name and both answer in their own registry. That is what lets
+    every project's registry hold the fixed `bmad-loop-ctl`
+    (`runs.ctl_session_for`, #733).
 
-    Red means the guard follows `PSMUX_DATA_DIR` and the per-registry suffix is
-    no longer forced by psmux — droppable only behind the `_LAST_UNSUPPORTED`
-    gate, set to the last release WITHOUT the fix (the gate is exclusive).
-
-    Only a refusal with nothing registered in B counts as the collision. A
-    failed create whose server registers anyway is the client's readiness
-    deadline under load, not the guard, and a fixed build can produce it too.
-    Ceiling: B is read once, so a server registering after that read passes
-    as the collision. That errs green, never red: on a fixed release it delays
-    the flip to the next unloaded run instead of inventing one.
+    Red means the guard is keyed on the name alone again: every project's TUI
+    launch but the first fails as a duplicate cold-spawn.
 
     Root A is torn down before root B, and that order is load-bearing: B's
     never-seen teardown ends in a process-table kill by session token, which
@@ -681,25 +673,18 @@ def test_premise_one_session_name_is_held_across_registries(tmp_path):
                 ["new-session", "-d", "-s", session, "-c", str(tmp_path)], check=False, env=env_b
             )
             b_seen = _plain_has_session(mux, session, env=env_b)
-            # A dead A would let B's create succeed on any build: not a flip.
-            assert _plain_has_session(
-                mux, session, env=env_a
-            ), "probe setup: root A's session died while root B created its own"
+            a_kept = _plain_has_session(mux, session, env=env_a)
         finally:
             _teardown_probe_session(mux, session, env_a, known_created=a_seen)
     finally:
         _teardown_probe_session(mux, session, env_b, known_created=b_seen)
-    assert created_b.returncode == 0 or not b_seen, (
-        "probe setup: root B's create reported failure but its session registered "
-        f"anyway — a readiness timeout, not the name guard: {created_b.stderr.strip()!r}"
+    assert created_b.returncode == 0 and b_seen, (
+        "psmux refused a second registry a session name another registry's live "
+        f"server owns (psmux/psmux#599, rc {created_b.returncode}: "
+        f"{created_b.stderr.strip()!r}) — the fixed control-session name in "
+        "runs.ctl_session_for (#733) admits one project per login session again"
     )
-    assert created_b.returncode != 0, (
-        "psmux now lets a second registry hold a session name another registry's live "
-        "server owns (psmux/psmux#599) — the per-registry control-session suffix in "
-        "runs.ctl_session_for (#733) retires, but only through a _LAST_UNSUPPORTED bump "
-        "to the last release without the fix, never a deletion: an older admitted build "
-        "still collides"
-    )
+    assert a_kept, "root B's create took root A's session down"
 
 
 def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(

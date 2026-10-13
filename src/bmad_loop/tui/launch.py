@@ -1,11 +1,11 @@
 """Detached launching of bmad-loop commands for the TUI.
 
 The TUI never runs engines in-process: run/sweep/resume are launched in new
-windows of a dedicated control session (bmad-loop-ctl on tmux, a per-registry
-name on psmux — see the CTL_SESSION comment below) so they survive TUI exit,
-and the dashboard observes them through run-dir artifacts exactly like runs
-started from a plain shell. Fast read-only commands (validate,
---dry-run) are captured instead, for display in a modal.
+windows of a dedicated control session (bmad-loop-ctl — see the CTL_SESSION
+comment below) so they survive TUI exit, and the dashboard observes them
+through run-dir artifacts exactly like runs started from a plain shell. Fast
+read-only commands (validate, --dry-run) are captured instead, for display in
+a modal.
 
 No textual imports here — everything drives the multiplexer seam (or a plain
 subprocess for the captured read-only commands) and is unit-testable.
@@ -41,16 +41,11 @@ from ..platform_util import (
 )
 
 CTL_SESSION = runs.CTL_SESSION
-# The control-session NAME is the transport's business, resolved per call
-# through `runs.ctl_session_for(project)`: the fixed name on tmux, where one
-# server serves the machine and the session really is machine-wide (scoped by
-# the per-window PROJECT_OPTION tag below), and a per-registry name on psmux,
-# whose duplicate-server mutex is keyed on the session name alone, across
-# every registry in the login session (`Local\` is a per-login-session object
-# namespace) — so a fixed name would let only ONE registry there hold a control
-# session and every other project's launch would fail as a duplicate.
-# The constant survives as the fixed base name (display fallbacks, tmux argv
-# pins); anything that addresses a live session resolves the name instead.
+# Anything that addresses a live control session resolves its name through
+# `runs.ctl_session_for(project)` rather than this constant: on tmux the one
+# session is machine-wide (scoped by the per-window PROJECT_OPTION tag below),
+# on psmux each project's registry holds its own session of this name. The
+# constant serves display fallbacks and tmux argv pins.
 
 # control-session windows are named <kind>-<run_id> (see start_detached)
 _CTL_WINDOW_RE = re.compile(r"^(?:run|sweep|resume|resolve)-(.+)$")
@@ -78,8 +73,7 @@ def agent_session_exists(session: str) -> bool:
     concerned. Saying why is the difference between that and "no session".
 
     Kept off :func:`session_exists` itself, which also answers for the control
-    session — a per-project name already (`runs.ctl_session_for`), whose
-    session carries no project tag at all."""
+    session, which carries no project tag at all (its windows do)."""
     if not session_exists(session):
         return False
     refusal = runs.foreign_session_refusal(session, get_multiplexer())
@@ -669,8 +663,9 @@ def in_ctl_session() -> bool:
     current_session() is None whenever this process is not inside the selected
     multiplexer, so no direct TMUX/HERDR_* env sniffing happens here. The
     shape predicate rather than one project's resolved name: the question its
-    callers ask is "am I in A control session", and on a namespacing transport
-    the name carries a registry suffix (runs.ctl_session_for)."""
+    callers ask is "am I in A control session", and a control session started
+    by an earlier release on psmux carries a registry suffix
+    (runs.is_ctl_session_name)."""
     session = current_session()
     return session is not None and runs.is_ctl_session_name(session)
 

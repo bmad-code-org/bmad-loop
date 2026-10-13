@@ -967,16 +967,18 @@ def test_current_return_target_none_on_empty_pane(monkeypatch):
     assert launch.current_return_target() is None
 
 
-def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypatch):
-    """On a namespacing transport the launcher creates and parks into the
-    per-registry control session (runs.ctl_session_for), never the fixed name:
-    psmux's duplicate-server mutex is keyed on the session name machine-wide,
-    so a second project minting the fixed `bmad-loop-ctl` is rejected as a
-    duplicate and its launch fails. The tmux half — the fixed name,
-    byte-identical argv — is pinned by test_start_run_detached_argv.
+def test_start_detached_uses_the_fixed_ctl_name_on_a_namespacing_transport(
+    tmp_path: Path, monkeypatch
+):
+    """On a namespacing transport the launcher creates and parks into the fixed
+    `bmad-loop-ctl`, in the project's own registry: psmux keys its
+    one-server-per-name guard on the data root too (psmux/psmux#599), so every
+    project's registry can hold one, and the per-registry digest earlier
+    releases minted is retired (#733). The tmux half — byte-identical argv —
+    is pinned by test_start_run_detached_argv.
 
-    Ablate `runs.ctl_session_for` at `_ensure_ctl_session` / the parked-window
-    call (hardcode CTL_SESSION) and this fails."""
+    Ablate (restore a per-registry name in `runs.ctl_session_for`) and this
+    fails."""
 
     class _NamespacedStub:
         def __init__(self):
@@ -1007,10 +1009,8 @@ def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypat
     monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
 
     assert launch.start_detached(tmp_path, ["run"], "RID", "run") == "@7"
-    expected = runs.ctl_session_for(tmp_path, stub)
-    assert expected.startswith(runs.CTL_SESSION + "-")
-    assert stub.created == [expected]
-    assert stub.parked == [(expected, "run-RID")]
+    assert stub.created == [runs.CTL_SESSION]
+    assert stub.parked == [(runs.CTL_SESSION, "run-RID")]
 
 
 @pytest.mark.parametrize(
@@ -2207,16 +2207,17 @@ class _NamespacedMux:
         return _PARKED_SCREEN
 
 
-def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path: Path):
+def test_launch_addresses_the_resolved_control_session(monkeypatch, tmp_path: Path):
     """Every launch-layer read of the control session resolves its name through
     `runs.ctl_session_for`, never the `CTL_SESSION` constant.
 
-    On a namespacing transport the name carries the registry digest, so a site
-    still spelling the constant addresses a session that does not exist there:
-    `list_windows` answers empty and attach reports "nothing to attach", while
-    the post-kill listing reads every candidate as removed — cleanup claims
-    windows it never closed. All three fail silently, which is why the constant
-    survived at these sites at all.
+    The two agree today on every bundled transport, so the resolver is pinned
+    to a distinct name here: a site spelling the constant would address a
+    session that does not exist wherever they part — `list_windows` answers
+    empty and attach reports "nothing to attach", while the post-kill listing
+    reads every candidate as removed, so cleanup claims windows it never
+    closed. All three fail silently, which is why the constant survived at
+    these sites once already.
 
     Ablate any one of `ctl_window_id`'s listing, `ctl_target`'s token, or
     `prune_ctl_windows`' post-kill listing back to `runs.CTL_SESSION` and the
@@ -2226,11 +2227,8 @@ def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path
     mine = runs.project_tag(tmp_path)
     mux = _NamespacedMux([("@2", "run-20260101-000000-dead", mine)])
     monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
-
-    expected = runs.ctl_session_for(tmp_path, mux)
-    # premise: the digest name is what this project's control session is called,
-    # and it is NOT the constant — without this the assertion below is vacuous
-    assert expected.startswith(runs.CTL_SESSION + "-") and expected != runs.CTL_SESSION
+    expected = "bmad-loop-ctl-resolved"
+    monkeypatch.setattr(runs, "ctl_session_for", lambda _p, _m=None: expected)
 
     assert launch.ctl_window_id(tmp_path, "20260101-000000-dead") == "@2"
     assert launch.ctl_target(tmp_path) == f"={expected}"

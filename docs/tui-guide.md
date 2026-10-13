@@ -53,8 +53,7 @@ validate viewers) are the tightest thing the TUI draws:
 The TUI never runs an engine in-process.
 
 - **Launcher.** `r`, `s`, `e`, `R` and `V` spawn detached `bmad-loop` processes
-  as windows of a dedicated control session, `bmad-loop-ctl` (on psmux the name
-  carries a per-project suffix; the launch toast names the exact session).
+  as windows of a dedicated control session, `bmad-loop-ctl`.
   Windows are named `run-<run-id>`, `sweep-<run-id>`, `resume-<run-id>` and so
   on, and run the same Python interpreter as the TUI. A window stays open after
   its command exits, showing `[bmad-loop exited <code> — press enter]`, so you

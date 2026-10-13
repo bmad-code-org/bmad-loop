@@ -2060,10 +2060,8 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
     monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
 
     candidates, undetermined = launch._ctl_window_candidates(tmp_path)
-    # The scan resolves the per-registry ctl name (runs.ctl_session_for) on a
-    # namespacing backend, and the qualified candidate ids carry it.
+    # The qualified candidate ids carry the control session's name.
     ctl = runs.ctl_session_for(tmp_path, mux)
-    assert ctl.startswith("bmad-loop-ctl-")
     assert candidates == [(f"{ctl}:@2", "run-20260726-1")]
     assert captured == [f"{ctl}:@2"]
     assert undetermined == []
