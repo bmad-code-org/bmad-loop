@@ -1,0 +1,63 @@
+name: psmux canary
+
+# The live psmux gate against the LATEST psmux release, outside the required
+# checks. ci.yml pins the gate to one psmux release so an upstream release can
+# never turn a PR red. This job is how that release still gets noticed: a red
+# `test_premise_*` row here means psmux fixed a defect bmad-loop works around,
+# and the next pin bump can retire it (its message names the workaround). Any
+# other red row is a psmux regression to report upstream before moving the pin.
+on:
+  schedule:
+    - cron: 17 6 * * 1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: psmux canary (windows, latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: false
+          python-version: '3.14'
+
+      - name: Install the project
+        run: uv sync --locked --all-extras
+
+      - name: Ensure psmux (latest release)
+        timeout-minutes: 6
+        uses: ./.github/actions/ensure-psmux
+        with:
+          version: latest
+          github-token: ${{ github.token }}
+
+      - name: Run the live psmux gate
+        # The blocking gate's runner and timeout reserve, so the metrics below
+        # exist even when the gate is stopped at the job's deadline.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/live"
+          --timeout 1500
+          -- -q tests/test_psmux_live.py --durations=15
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/live/junit.xml"
+
+      - name: Verify the live gate ran every test
+        # As in ci.yml's aggregator: pytest exits 0 when a live row skips, but a
+        # skip in the live gate means that behaviour was never exercised, so a
+        # green canary would vouch for a release it did not test.
+        if: always()
+        run: uv run python tests/perf_report.py verify-executed "$env:RUNNER_TEMP/test-metrics/live"

@@ -14481,6 +14481,30 @@ def test_reverify_answers_with_the_first_ordinary_failure_not_a_later_one(tmp_pa
     assert "verify commands passed" not in capsys.readouterr().out
 
 
+def test_reverify_timeout_names_the_limit_and_the_key(tmp_path, monkeypatch):
+    """A `--reverify` command killed at its time limit is reported to the
+    OPERATOR with the limit and the key that sets it — unlike the engine's
+    neutral reason, which reaches an agent. The configured minutes reach the
+    runner as seconds. Faked runner; nothing sleeps toward a deadline.
+    Ablation: revert the timeout arm in `_reverify` and the message falls back to
+    `failed (rc -1)` with neither the limit nor the key."""
+    timeouts: list[float] = []
+
+    def timed_out(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, -1, "timed out")
+
+    monkeypatch.setattr(verify, "_run_shell_command", timed_out)
+    _write_policy(tmp_path, '[verify]\ncommands = ["slow-gate"]\ncommand_timeout_min = 7\n')
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert timeouts == [420]
+    assert reason is not None
+    assert repr("slow-gate") in reason
+    assert "7 min" in reason and "[verify] command_timeout_min" in reason
+
+
 def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
     """The control for the two rows above: with nothing to return on, the walk
     reaches the end and reports the pass.

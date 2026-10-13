@@ -5744,6 +5744,14 @@ def _reverify(project: Path, cwd: Path) -> str | None:
                     f"(rc={result.returncode}, [verify] env_fault_rc)"
                 )
             return f"{result.command!r} could not run: {fault}"
+        if verify._timed_out_leg(result):
+            # Operator-facing, unlike the engine's neutral reason: naming the key
+            # here is the point — only the operator decides the gate is slow.
+            return (
+                f"{result.command!r} timed out after {pol.verify.command_timeout_min} min — "
+                "raise [verify] command_timeout_min in policy.toml if this gate is "
+                "legitimately this slow"
+            )
         if result.returncode != 0:
             return f"{result.command!r} failed (rc {result.returncode}):\n{result.output_tail}"
     print("  verify commands passed")

@@ -1385,6 +1385,36 @@ def test_environment_probe_timeout_must_be_positive(bad):
         policy.loads(f"[environment]\nprobe_timeout_s = {bad}\n")
 
 
+def test_verify_command_timeout_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").verify.command_timeout_min == 30
+    assert policy.loads("[verify]\ncommand_timeout_min = 60\n").verify.command_timeout_min == 60
+    # a partial table keeps the default
+    assert policy.loads('[verify]\ncommands = ["pytest -q"]\n').verify.command_timeout_min == 30
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["verify"]["command_timeout_min"] == policy.VerifyPolicy.command_timeout_min
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_verify_command_timeout_must_be_positive(bad):
+    """A 0-minute bound would kill every verify command before it could answer,
+    and core.toml's `minimum = 1` is not enforced at load. Ablation: drop the
+    `command_timeout_min < 1` check and both rows parse."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.command_timeout_min must be >= 1"):
+        policy.loads(f"[verify]\ncommand_timeout_min = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", "2.5", '"60"'])
+def test_verify_command_timeout_rejects_non_integers(bad):
+    """`true` would read as a 1-minute bound and a string as a type error mid-run.
+    Ablation: read the value with `.get` instead of `_typed_int` and every row
+    loads or fails with something other than a PolicyError naming the key."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.command_timeout_min"):
+        policy.loads(f"[verify]\ncommand_timeout_min = {bad}\n")
+
+
 @pytest.mark.parametrize("bad", ['[""]', '["   "]', '["pg_isready", "\\t"]'])
 def test_environment_probes_reject_blank_entries(bad):
     """A blank probe is `sh -c ""`, which exits 0 — a check of nothing that reads

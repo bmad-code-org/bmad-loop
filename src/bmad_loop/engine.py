@@ -6411,7 +6411,10 @@ class Engine:
         sequence = self._journal_verify_command_results(task, verification_stage, results)
         self._stop_if_verify_interrupted(results)
         outcome = verify.verify_command_results_outcome(
-            list(results), self.workspace.root, env_fault_rc=self.policy.verify.env_fault_rc
+            list(results),
+            self.workspace.root,
+            env_fault_rc=self.policy.verify.env_fault_rc,
+            command_timeout_min=self.policy.verify.command_timeout_min,
         )
         return outcome, VerifyCommandRecords(
             results=results, stage=verification_stage, sequence=sequence

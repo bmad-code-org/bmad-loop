@@ -69,7 +69,6 @@ from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
 GIT_TIMEOUT_S = 120
-COMMAND_TIMEOUT_S = 30 * 60
 
 # The oldest git bmad-loop SUPPORTS — the version this project tests against, writes
 # code against, and will help you with. INCLUSIVE: 2.34 itself clears it. (The
@@ -9566,16 +9565,21 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     Every child runs through :func:`childrun.run_child`, which kills the whole
     process tree on a timeout or a hard stop (DW-353). A hard stop is read off
     the ambient probe the outermost ``Engine.run()`` installs; outside an engine
-    run (``cli._reverify``) none is installed and no command is ever interrupted."""
+    run (``cli._reverify``) none is installed and no command is ever interrupted.
+
+    Each command is bounded by ``[verify] command_timeout_min`` on its own, not
+    the pass as a whole: a command running past it is killed and lands on the
+    timeout leg, and the next command still gets its full bound."""
     results = []
     interrupted = False
+    # One per-command bound for the whole pass, passed positionally: test fakes
+    # of _run_shell_command take (command, cwd, timeout).
+    timeout_s = policy.verify.command_timeout_min * 60
     for command in policy.verify.commands:
         if interrupted:
             results.append(_interrupted_result(command, "", "", tail=_NOT_STARTED_TAIL))
             continue
-        # COMMAND_TIMEOUT_S is read here, at call time, so a patched module
-        # value reaches the child.
-        result = _run_shell_command(command, cwd, COMMAND_TIMEOUT_S)
+        result = _run_shell_command(command, cwd, timeout_s)
         interrupted = result.interrupted
         results.append(result)
     return results
@@ -9715,7 +9719,11 @@ def _env_fault_outcome(result: CommandResult, reason: str, cause: str) -> Verify
 
 
 def verify_command_results_outcome(
-    results: list[CommandResult], cwd: Path, *, env_fault_rc: int = 0
+    results: list[CommandResult],
+    cwd: Path,
+    *,
+    env_fault_rc: int = 0,
+    command_timeout_min: int | None = None,
 ) -> VerifyOutcome:
     """Classify already-observed verifier results without discarding them.
 
@@ -9729,6 +9737,15 @@ def verify_command_results_outcome(
     session dispatched for the ordinary failure would still run in the
     broken environment. Note the first loop inspects rc=0 results too — on
     Windows an unrunnable command is a silent pass, not a failure (#302).
+
+    A command killed at its time limit (:func:`_timed_out_leg`) is an ordinary
+    fixable failure like any other nonzero exit. When ``command_timeout_min`` is
+    given, the reason's second line names that limit instead of the bare
+    ``"timed out"`` tail, so a reader learns a time limit was hit and which. The
+    wording stays neutral on purpose: this reason is written verbatim into the
+    repair session's feedback, and it must not invite the agent to raise the
+    limit in policy.toml — that is the operator's call (``--reverify`` names the
+    key). The first line is unchanged on every leg.
 
     An interrupted result (DW-353) is not classifiable at all and raises
     :class:`VerifyInterrupted` before anything else is read: the engine raises
@@ -9745,9 +9762,13 @@ def verify_command_results_outcome(
             return _env_fault_outcome(result, reason, cause)
     for result in results:
         if result.returncode != 0:
+            detail = result.output_tail
+            if command_timeout_min is not None and _timed_out_leg(result):
+                detail = (
+                    f"timed out after {command_timeout_min} min (the per-command verify time limit)"
+                )
             return VerifyOutcome.retry(
-                f"verify command failed (rc={result.returncode}): {result.command}\n"
-                f"{result.output_tail}",
+                f"verify command failed (rc={result.returncode}): {result.command}\n{detail}",
                 fixable=True,
             )
     return VerifyOutcome.passed()
@@ -9789,9 +9810,10 @@ def preflight_required(policy: Policy) -> bool:
     return bool(policy.verify.commands) and bool(policy.environment.probes)
 
 
-def _probe_timed_out(result: CommandResult) -> bool:
-    # `_run_shell_command`'s timeout leg: rc -1 with the literal tail. A
-    # signal-killed child (rc -1 is SIGHUP) carries its own output instead.
+def _timed_out_leg(result: CommandResult) -> bool:
+    # `_run_shell_command`'s timeout leg — for a probe and a [verify] command
+    # alike: rc -1 with the literal tail. A signal-killed child (rc -1 is
+    # SIGHUP) carries its own output instead.
     return result.returncode == -1 and result.output_tail == "timed out" and not result.spawn_error
 
 
@@ -9802,7 +9824,7 @@ def probe_failure_reason(result: CommandResult, timeout_s: int, *, cwd: Path | N
     #302) name why; without it that leg reads ``"rc=0"``."""
     if result.spawn_error is not None:
         return f"could not be started: {result.spawn_error}"
-    if _probe_timed_out(result):
+    if _timed_out_leg(result):
         return f"timed out after {timeout_s}s"
     if result.returncode == 0 and cwd is not None:
         unrunnable = env_fault_reason(result, cwd)
@@ -9815,7 +9837,7 @@ def _probe_failed(result: CommandResult, cwd: Path) -> bool:
     return (
         result.spawn_error is not None
         or result.returncode != 0
-        or _probe_timed_out(result)
+        or _timed_out_leg(result)
         # rc 0 is not proof on win32: cmd exits 0 for a file it cannot execute
         or env_fault_reason(result, cwd) is not None
     )
@@ -9876,7 +9898,7 @@ def check_environment_probes(policy: Policy, cwd: Path) -> tuple[ProbeCheck, ...
     nothing, and is not one of the compositions tests/test_portability_guard.py
     pins to the preflight runners. What it shares with the run is the verdict —
     the same :func:`_run_shell_command` runner, ``probe_timeout_s`` bound,
-    :func:`_probe_timed_out`/:func:`_probe_failed` predicates and
+    :func:`_timed_out_leg`/:func:`_probe_failed` predicates and
     :func:`probe_failure_reason` phrasing — so validate and the run cannot
     disagree on a given probe RESULT. They can still see different environments:
     validate probes the run's code root (``repo_root``), which is where the run
@@ -9891,7 +9913,7 @@ def check_environment_probes(policy: Policy, cwd: Path) -> tuple[ProbeCheck, ...
         if result.interrupted:
             checks.append(ProbeCheck(result, "interrupted", "interrupted by a hard stop request"))
             break
-        if _probe_timed_out(result):
+        if _timed_out_leg(result):
             checks.append(
                 ProbeCheck(result, "timeout", probe_failure_reason(result, timeout_s, cwd=cwd))
             )
@@ -9965,7 +9987,12 @@ def verify_commands_outcome(
     results = run_verify_commands(policy, cwd)
     if on_results is not None:
         on_results(tuple(results))
-    return verify_command_results_outcome(results, cwd, env_fault_rc=policy.verify.env_fault_rc)
+    return verify_command_results_outcome(
+        results,
+        cwd,
+        env_fault_rc=policy.verify.env_fault_rc,
+        command_timeout_min=policy.verify.command_timeout_min,
+    )
 
 
 def _verify_review_commands(
