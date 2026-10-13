@@ -40,6 +40,8 @@ breaking changes may land in a minor release.
   writes count as session activity for the idle notice (#858).
 - Name the tool call an idle Claude session is waiting on: `session-idle` carries
   `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
+- Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
+  previously fixed at 30 minutes (#857).
 
 ### Changed
 
@@ -54,6 +56,8 @@ breaking changes may land in a minor release.
   run-state reference pages live in docs/reference/ (the settings tables generated from
   the schema); sweep and escalation recovery have their own guides; a docs hygiene test
   guards links, anchors, tracker refs, block length and the catalog shape.
+- Name the per-command time limit in a timed-out verify command's failure reason;
+  `--reverify` also names the key to raise.
 
 ### Fixed
 

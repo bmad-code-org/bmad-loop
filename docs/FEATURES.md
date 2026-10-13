@@ -53,7 +53,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - With probes configured, a failing, timed-out or unstartable probe stops verification before any `[verify]` command runs.
   - `bmad-loop validate --probes` runs every probe, not stopping at the first failure, and fails validate if any probe fails.
   - A `repo_root` key in `_bmad/bmm/config.yaml` moves verify commands and git checks to a monorepo's code root.
-- **Config:** `[verify] commands`, `[verify] env_fault_rc`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
+- **Config:** `[verify] commands`, `[verify] command_timeout_min`, `[verify] env_fault_rc`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
 - **Tested by:** `tests/test_verify.py`, `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_bmadconfig.py`
 - **Docs:** [Configuration: [verify]](reference/configuration.md#verify), [Configuration: [environment]](reference/configuration.md#environment), [Environment faults](escalations-guide.md#environment-faults), [Re-verify kept work](escalations-guide.md#resolve-reverify)
 

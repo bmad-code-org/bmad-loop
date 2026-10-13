@@ -457,8 +457,8 @@ def _sole_verify_record(engine):
 def test_verify_stream_capture_retains_a_bounded_tail(project):
     """A chatty command is cut to `verify.stream_capture_kb`, and the record says so.
 
-    COMMAND_TIMEOUT_S is 30 minutes, so an uncapped retain is hundreds of MB per
-    attempt with no GC behind it. The cut keeps the TAIL — the direction every
+    `[verify] command_timeout_min` defaults to 30 minutes, so an uncapped retain
+    is hundreds of MB per attempt with no GC behind it. The cut keeps the TAIL — the direction every
     other bound on this output takes, and where a failing suite puts its failure.
 
     Ablation: have `_bounded_stream_tail` return `(text, full, full)`
@@ -3101,6 +3101,50 @@ def test_dev_retry_notice_folds_a_multiline_reason(project, monkeypatch):
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
     assert "FAILED tests/test_b.py::test_two" in decision["reason"]
+
+
+def test_dev_retry_feedback_names_the_verify_time_limit(project, monkeypatch):
+    """A dev-pass verify command killed at its time limit reaches the repair
+    session's feedback naming that limit — and only neutrally: the feedback must
+    never point the agent at policy.toml, since a limit it raised there would
+    survive the attempt unaccounted. Ablation: drop the `command_timeout_min`
+    keyword from the engine's classifier call and the feedback reverts to the
+    bare `timed out` tail."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+            verify=VerifyPolicy(commands=["pytest -q"], command_timeout_min=45),
+        ),
+    )
+    # time out exactly the first invocation, pass every later one (see the
+    # multiline-reason row above for why the script must not run dry)
+    failing = iter([[verify.CommandResult("pytest -q", -1, "timed out")]])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(
+            project.repo_root,
+            lambda: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+        ),
+    )
+
+    assert engine.run().done == 1
+
+    feedback = sorted((engine.run_dir / "feedback").glob("*.md"))
+    assert feedback  # else the content checks below are vacuous
+    text = "".join(path.read_text(encoding="utf-8") for path in feedback)
+    assert "verify command failed (rc=-1): pytest -q" in text
+    assert "timed out after 45 min" in text
+    assert "policy.toml" not in text
 
 
 def test_exhaustion_defer_folds_a_multiline_verify_reason_into_one_attention_line(
