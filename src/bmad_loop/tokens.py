@@ -14,9 +14,14 @@ transcript that yields nothing reads as None (untracked), not zero.
                  streams; max is order-independent across files). The dedupe
                  is global because fork subagents copy their parent's message
                  ids. Entries without an id each count.
-- codex-rollout: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl; `token_count`
-                 event payloads carry CUMULATIVE totals, so the last one is
-                 the session usage (sessions here are fresh per task).
+- codex-rollout: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+                 (CODEX_HOME defaults to ~/.codex; day dirs are LOCAL dates
+                 while session_meta timestamps are UTC). The filename UUID is
+                 the hook `session_id`, so when the hook's transcript_path is
+                 missing or unusable the rollout is resolved by id
+                 (`resolve_transcript`). `token_count` event payloads carry
+                 CUMULATIVE totals, so the last one is the session usage
+                 (sessions here are fresh per task).
 - gemini-chat:   ~/.gemini/tmp/<project>/chats/session-*.jsonl — a JSONL
                  patch stream: bare message entries (and messages inside
                  "$set" patches) carry a per-API-call `tokens` block
@@ -35,6 +40,8 @@ transcript that yields nothing reads as None (untracked), not zero.
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +58,47 @@ def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
     if parser == "copilot-events":
         return tally_copilot_events(transcript_path)
     return None
+
+
+def codex_home(env: Mapping[str, str]) -> Path | None:
+    """Codex's state root: ``CODEX_HOME`` when set and non-empty, else
+    ``~/.codex``; None when no home directory can be determined."""
+    configured = env.get("CODEX_HOME")
+    if configured:
+        return Path(configured)
+    try:
+        return Path.home() / ".codex"
+    except RuntimeError:
+        return None
+
+
+def find_codex_rollout(session_id: str | None, home: Path | None) -> Path | None:
+    """The rollout file Codex wrote for ``session_id`` under ``home``, or None.
+
+    The id is canonicalised as a UUID before it reaches the glob, so a hostile
+    or garbled id (``*``, ``../x``) matches nothing. Day directories are local
+    dates, so every one is searched; on several matches the newest wins."""
+    if home is None or session_id is None:
+        return None
+    try:
+        canonical = str(uuid.UUID(session_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    try:
+        matches = list((home / "sessions").glob(f"*/*/*/rollout-*-{canonical}.jsonl"))
+        if not matches:
+            return None
+        return max(matches, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def resolve_transcript(parser: str, session_id: str | None, env: Mapping[str, str]) -> Path | None:
+    """The transcript ``parser`` reads for ``session_id``, found without the
+    hook's transcript_path. Only codex-rollout files are resolvable by id."""
+    if parser != "codex-rollout":
+        return None
+    return find_codex_rollout(session_id, codex_home(env))
 
 
 def _jsonl_entries(transcript_path: Path):

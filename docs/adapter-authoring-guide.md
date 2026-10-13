@@ -255,6 +255,9 @@ Turn the report's `token_field_candidates` into a parser in
 `read_usage`. Decide **per-call vs cumulative** yourself: a `token_count`-style event that
 carries running totals (codex) is read differently from per-message blocks that are summed
 (claude, gemini). Re-run the scan; the **parsed counts** self-check should now appear.
+At run time the parser reads the file named by the hook payload's `transcript_path`. For
+`codex-rollout`, a missing or unusable hook path is resolved from the session id under
+`$CODEX_HOME/sessions`.
 
 **`none` is a legitimate final answer.** If the report has no `token_field_candidates`, the
 CLI may not expose usage anywhere a parser can reach. `antigravity` is the example: it

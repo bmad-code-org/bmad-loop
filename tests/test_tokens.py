@@ -1,5 +1,9 @@
 import json
+import os
 
+import pytest
+
+from bmad_loop import tokens
 from bmad_loop.model import TokenUsage
 from bmad_loop.tokens import (
     read_usage,
@@ -309,6 +313,106 @@ def test_codex_rollout_without_token_counts_is_none(tmp_path):
     path.write_text(json.dumps({"type": "event_msg", "payload": {"type": "agent_message"}}) + "\n")
     assert tally_codex_rollout(path) is None
     assert tally_codex_rollout(tmp_path / "nope.jsonl") is None
+
+
+SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
+
+
+def _codex_rollout(home, day, session_id, *, utc="2026-10-11T23:30:00.000Z", output=7):
+    """A minimal rollout at ``home/sessions/<day>/rollout-<ts>-<id>.jsonl``.
+    ``day`` is the LOCAL date dir, independent of the UTC session_meta stamp."""
+    folder = home / "sessions" / day
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"rollout-{day.replace('/', '-')}T00-30-00-{session_id}.jsonl"
+    lines = [
+        {"timestamp": utc, "type": "session_meta", "payload": {"id": session_id}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 50, "output_tokens": output}},
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def test_resolve_codex_rollout_by_session_id(tmp_path):
+    """The rollout sits in the LOCAL-date dir (10/12) while its session_meta is
+    stamped the previous UTC day: the lookup globs every day dir rather than
+    deriving one from a timestamp, and the resolved file tallies.
+
+    Ablation: make `find_codex_rollout` return None and this fails."""
+    path = _codex_rollout(tmp_path, "2026/10/12", SESSION, utc="2026-10-11T23:30:00.000Z")
+    env = {"CODEX_HOME": str(tmp_path)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+    # Any UUID spelling canonicalises to the filename's.
+    assert tokens.resolve_transcript("codex-rollout", SESSION.upper(), env) == path
+    assert read_usage("codex-rollout", path) == TokenUsage(input_tokens=50, output_tokens=7)
+
+
+@pytest.mark.parametrize("session_id", ["*", "../x", "", None, "abc"])
+def test_resolve_rejects_non_uuid_ids(tmp_path, session_id):
+    """A hook payload is unvalidated, so an id that is not a UUID never reaches
+    the glob — "*" would otherwise match the sentinel rollout below.
+
+    Ablation: drop the `uuid.UUID` canonicalisation (glob the raw id) and the
+    "*" row fails."""
+    _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    env = {"CODEX_HOME": str(tmp_path)}
+    assert tokens.resolve_transcript("codex-rollout", session_id, env) is None
+
+
+def test_resolve_ignores_other_uuids_and_parsers(tmp_path):
+    """Only the session's own rollout resolves, and only for codex-rollout: a
+    claude or gemini transcript is never looked up by id.
+
+    Ablation: drop the parser check in `resolve_transcript` and the
+    claude-jsonl row resolves the codex file."""
+    other = "019a2b3c-0000-7000-8000-000000000000"
+    _codex_rollout(tmp_path, "2026/10/12", other)
+    path = _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    env = {"CODEX_HOME": str(tmp_path)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+    missing = "019a2b3c-ffff-7fff-8fff-ffffffffffff"
+    assert tokens.resolve_transcript("codex-rollout", missing, env) is None
+    for parser in ("claude-jsonl", "gemini-chat", "copilot-events", ""):
+        assert tokens.resolve_transcript(parser, SESSION, env) is None
+
+
+def test_resolve_defaults_to_home_dot_codex(tmp_path, monkeypatch):
+    """Without CODEX_HOME (or with it empty) the lookup roots at ~/.codex, read
+    at call time. HOME and USERPROFILE are both patched: Windows' Path.home()
+    reads USERPROFILE, never HOME.
+
+    Ablation: drop the `Path.home() / ".codex"` default (return None) and this
+    fails."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    path = _codex_rollout(tmp_path / ".codex", "2026/10/12", SESSION)
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, {}) == path
+    assert tokens.resolve_transcript("codex-rollout", SESSION, {"CODEX_HOME": ""}) == path
+
+
+def test_resolve_newest_mtime_wins(tmp_path):
+    """Two rollouts with one id (a resumed session written into a later day dir)
+    resolve to the newer by mtime, whatever order the glob returns them in.
+
+    Ablation: take the first glob match instead of the max mtime and one of the
+    two assertions fails, whichever order the glob yields."""
+    older = _codex_rollout(tmp_path, "2026/10/11", SESSION)
+    newer = _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    os.utime(older, (2_000_000_000, 2_000_000_000))
+    os.utime(newer, (1_000_000_000, 1_000_000_000))
+    env = {"CODEX_HOME": str(tmp_path)}
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == older
+    os.utime(newer, (3_000_000_000, 3_000_000_000))
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == newer
 
 
 def test_gemini_chat_dedupes_reemitted_messages(tmp_path):

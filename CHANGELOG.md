@@ -53,6 +53,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Resolve a codex session's rollout by session id when the hook's transcript path is
+  missing or unreadable, so its usage is captured and the token budget guard arms
+  (#775).
+- Decode hook stdin as UTF-8 bytes instead of the locale code page, and record an
+  unreadable hook payload in `session-lifecycle.jsonl` (#775).
 - Stop failing every opencode-http session start against OpenCode 2.x with a health
   timeout (#847).
 - Keep probing an opencode-http session over HTTP after an event-stream reconnect

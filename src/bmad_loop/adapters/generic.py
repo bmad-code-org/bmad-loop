@@ -29,6 +29,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import os
 import shlex
 import stat
 import time
@@ -41,7 +42,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import regex
 
-from .. import devcontract, gates, runs
+from .. import devcontract, gates, runs, tokens
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
@@ -295,6 +296,18 @@ def load_result_document(tasks_dir: Path, task_id: str) -> dict | None:
     # imposing stricter numeric semantics on completed session results.
     json.dumps(data, ensure_ascii=False).encode("utf-8")
     return data
+
+
+def _is_regular_file(path: str | None) -> bool:
+    """Whether a hook-reported transcript path names a regular file. Any fault
+    reads as False: the caller's answer to False is a by-id lookup whose miss is
+    crumbed, so a metadata fault cannot hide."""
+    if not path:
+        return False
+    try:
+        return stat.S_ISREG(Path(path).stat().st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 class _ResultFileMixin:
@@ -990,6 +1003,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # (its Stop is dropped), so it is crumbed once instead of staying silent.
         pin_checked = handle.pinned_session_id is None
         transcript_path: str | None = None
+        # A codex-rollout transcript can be found by session id when the hook's
+        # path is missing or names no file (a Windows relay decoding stdin with
+        # the locale code page garbles it). `resolved` is that path once found:
+        # it sticks against a later unusable hook path. `hook_transcript_path` is
+        # the last raw value a hook sent, for the crumbs.
+        resolvable = self.profile.usage_parser == "codex-rollout"
+        resolved: str | None = None
+        hook_transcript_path: str | None = None
+        unresolved_crumbed = False
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
         # goes silent before its first Stop cannot burn the full wall timeout. A
@@ -1154,6 +1176,37 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         handle.task_id, "transcript-scan-recovered", failures=scan_failures
                     )
                 scan_failures = 0
+
+        def try_resolve() -> None:
+            """Resolve the transcript by session id when no readable one is known.
+            One lookup per call; a hit becomes the loop's transcript (so every
+            SessionResult and the budget guard see it) and is crumbed once — the
+            ``resolved is None`` gate makes the hit itself one-shot."""
+            nonlocal transcript_path, resolved
+            if not resolvable or not session_id or resolved is not None:
+                return
+            if _is_regular_file(transcript_path):
+                return
+            # The pane's env as launch() builds it, over this process's own: the
+            # CLI reads CODEX_HOME from there. Known limit: a tmux pane inherits
+            # the tmux SERVER's env, so a server started under another CODEX_HOME
+            # is missed — and the miss is crumbed at Stop.
+            hit = tokens.resolve_transcript(
+                self.profile.usage_parser,
+                session_id,
+                {**os.environ, **self.profile.env, **spec.env},
+            )
+            if hit is None:
+                return
+            sample_transcript(str(hit), time.monotonic())
+            transcript_path = resolved = str(hit)
+            self._note_lifecycle(
+                handle.task_id,
+                "transcript-resolved",
+                session_id=session_id,
+                hook_transcript_path=hook_transcript_path,
+                path=resolved,
+            )
 
         def produced_work() -> bool:
             # Read at call time, after a final frame sample, so every exit below
@@ -1463,7 +1516,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                 probe_failures = 0
                 if not alive:
-                    # died without a SessionEnd hook (killed, crashed hard)
+                    # died without a SessionEnd hook (killed, crashed hard). A
+                    # SessionStart that came before its rollout existed, then no
+                    # Stop: resolve once more so the crash still carries the
+                    # transcript. Before the return, not inside `produced_work()`:
+                    # the exit's `transcript_path` argument is read first.
+                    try_resolve()
                     return self._final(
                         handle,
                         spec,
@@ -1638,6 +1696,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         dropped_so_far=foreign_hook_events,
                     )
                 continue
+            if event.payload_error:
+                # The relay could not read this hook's payload (events._read_payload),
+                # so the event carries nulls. Completion handling is unchanged;
+                # the crumb keeps the degrade visible.
+                self._note_lifecycle(
+                    handle.task_id,
+                    "hook-payload-unreadable",
+                    hook_event=event.event,
+                    payload_error=event.payload_error,
+                )
             if (
                 event.event == "Stop"
                 and self.profile.subagent_stop_without_transcript
@@ -1651,13 +1719,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             session_id = event.session_id or session_id
-            if event.transcript_path and event.transcript_path != transcript_path:
+            hook_transcript_path = event.transcript_path or hook_transcript_path
+            hook_path = event.transcript_path
+            if resolved and hook_path and not _is_regular_file(hook_path):
+                # A rollout resolved by id sticks: an unusable hook path on a
+                # later event (the same garbled path a Stop repeats) must not
+                # overwrite it.
+                hook_path = None
+            if hook_path and hook_path != transcript_path:
                 # Take the idle baseline as soon as a hook names a new transcript,
                 # including a later re-point (#680). A write before the next
                 # heartbeat is then a change for the #727 work check rather than
                 # being absorbed into the baseline at exit.
-                sample_transcript(event.transcript_path, time.monotonic())
-            transcript_path = event.transcript_path or transcript_path
+                sample_transcript(hook_path, time.monotonic())
+            transcript_path = hook_path or transcript_path
+            try_resolve()
 
             if event.event == "SessionStart":
                 continue
@@ -1686,6 +1762,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Latched after the subagent filter above, which rejects a stop that
                 # is not the main session's turn-end. Never cleared.
                 stop_seen = True
+                if resolvable and not unresolved_crumbed and not _is_regular_file(transcript_path):
+                    # Not gated on session_id: a Stop whose payloads all came
+                    # through as `{}` has none, and that miss must show too.
+                    unresolved_crumbed = True
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "transcript-unresolved",
+                        session_id=session_id,
+                        hook_transcript_path=hook_transcript_path,
+                    )
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
                     if transcript_path:

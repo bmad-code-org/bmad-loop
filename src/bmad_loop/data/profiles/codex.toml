@@ -2,8 +2,9 @@
 # the initial prompt argument; the $skill-name mention syntax attaches the
 # skill instead (skills live in .agents/skills/) — live-verified 2026-06-11.
 # "use subagents as needed" is required or Codex runs the skill's parallel
-# phases (e.g. review layers) without spawning subagents. Codex has no
-# SessionEnd hook event — the adapter's window-death fallback covers crashes.
+# phases (e.g. review layers) without spawning subagents. Codex defines
+# SessionEnd and SubagentStop hook events, but bmad-loop maps only SessionStart
+# and Stop; the adapter's window-death fallback covers crashes.
 name = "codex"
 binary = "codex"
 prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"

@@ -2287,6 +2287,227 @@ def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_pat
     assert _lifecycle_lines(adapter) == []
 
 
+CODEX_SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
+
+
+def _codex_home(tmp_path, monkeypatch):
+    """A CODEX_HOME under tmp_path (HOME/USERPROFILE too, so a resolver that
+    ignored CODEX_HOME cannot find the operator's real ~/.codex)."""
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    return home
+
+
+def _write_codex_rollout(home, session_id=CODEX_SESSION, input_tokens=500, output_tokens=60):
+    folder = home / "sessions" / "2026" / "10" / "12"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"rollout-2026-10-12T00-30-00-{session_id}.jsonl"
+    lines = [
+        {"type": "session_meta", "payload": {"id": session_id}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens,
+                    }
+                },
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def _codex_dev_adapter(tmp_path, profile_name="codex"):
+    adapter, impl = make_dev_adapter(tmp_path, profile_name=profile_name)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n", encoding="utf-8"
+    )
+    return adapter
+
+
+def test_codex_stop_without_transcript_resolves_rollout(tmp_path, monkeypatch):
+    """#775's symptom: codex hooks that arrive with no transcript_path (a Windows
+    relay decoding stdin with cp1252) left the session untracked. The rollout is
+    found by session id instead, rides the SessionResult, and tallies.
+
+    Ablation: delete the intake `try_resolve()` call and this fails — the result
+    carries no transcript, and read_usage is None."""
+    rollout = _write_codex_rollout(_codex_home(tmp_path, monkeypatch))
+    adapter = _codex_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=CODEX_SESSION),
+            _stop_event("3-1-dev-1", CODEX_SESSION, None),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert Path(result.transcript_path) == rollout
+    assert adapter.read_usage(result) == TokenUsage(input_tokens=500, output_tokens=60)
+    (resolved,) = _lifecycle_events(adapter, "transcript-resolved")
+    assert resolved["session_id"] == CODEX_SESSION
+    assert resolved["hook_transcript_path"] is None
+    assert Path(resolved["path"]) == rollout
+    assert _lifecycle_events(adapter, "transcript-unresolved") == []
+
+
+def test_codex_garbled_hook_path_is_replaced_and_sticks(tmp_path, monkeypatch):
+    """A garbled (code-page-mangled) hook path names no file. It is replaced by
+    the rollout resolved at SessionStart, and the Stop that repeats the SAME
+    garbled path must not overwrite the resolution.
+
+    Ablation: delete the stickiness guard (`hook_path = None` for an unusable
+    path once resolved) and this fails — the result carries the garbled path."""
+    rollout = _write_codex_rollout(_codex_home(tmp_path, monkeypatch))
+    garbled = str(tmp_path / "Ã\x81nna" / "rollout.jsonl")
+    adapter = _codex_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=CODEX_SESSION, transcript_path=garbled),
+            _stop_event("3-1-dev-1", CODEX_SESSION, garbled),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert Path(result.transcript_path) == rollout
+    (resolved,) = _lifecycle_events(adapter, "transcript-resolved")
+    assert resolved["hook_transcript_path"] == garbled
+
+
+def test_codex_existing_hook_path_wins(tmp_path, monkeypatch):
+    """A hook path that names a real file is used as-is: the by-id lookup never
+    runs, so the healthy path (every Linux codex session) costs no glob."""
+    rollout = _write_codex_rollout(_codex_home(tmp_path, monkeypatch))
+
+    def boom(*_a, **_k):
+        raise AssertionError("resolve_transcript must not run for a readable hook path")
+
+    monkeypatch.setattr(generic.tokens, "resolve_transcript", boom)
+    adapter = _codex_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=CODEX_SESSION, transcript_path=str(rollout)),
+            _stop_event("3-1-dev-1", CODEX_SESSION, str(rollout)),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.transcript_path == str(rollout)
+    assert _lifecycle_events(adapter, "transcript-resolved") == []
+    assert _lifecycle_events(adapter, "transcript-unresolved") == []
+
+
+def test_codex_unresolved_stop_is_crumbed_without_session_id(tmp_path, monkeypatch):
+    """Both payloads collapsed to `{}`: no session id, no path. Nothing can be
+    resolved, and that must be visible rather than an untracked session with no
+    record of why.
+
+    Ablation: gate the `transcript-unresolved` crumb on `session_id` and this
+    fails."""
+    _write_codex_rollout(_codex_home(tmp_path, monkeypatch))
+    adapter = _codex_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=None),
+            _stop_event("3-1-dev-1", None, None),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.transcript_path is None
+    (unresolved,) = _lifecycle_events(adapter, "transcript-unresolved")
+    assert unresolved["session_id"] is None
+    assert unresolved["hook_transcript_path"] is None
+
+
+def test_codex_window_death_resolves_at_exit(tmp_path, monkeypatch):
+    """SessionStart fired before the rollout existed and the window died before
+    any Stop: the window-death exit still resolves, so the crashed result
+    carries the rollout for usage and salvage.
+
+    Ablation: remove the `try_resolve()` call in the dead-window branch and this
+    fails."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    home = _codex_home(tmp_path, monkeypatch)
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex")
+    adapter._window_alive = lambda handle: False
+    created: list[Path] = []
+
+    def create_rollout(call_n):
+        if call_n == 2:
+            created.append(_write_codex_rollout(home))
+
+    adapter.watcher = _ScriptedWatcher(
+        [_hook_event("SessionStart", session_id=CODEX_SESSION)], on_call=create_rollout
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert created
+    assert Path(result.transcript_path) == created[0]
+    assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
+
+
+def test_non_codex_stop_without_transcript_never_resolves(tmp_path, monkeypatch):
+    """Scope pin: only codex-rollout transcripts are resolvable by id. A claude
+    Stop with no path stays untracked and crumbs nothing new, even with a codex
+    rollout of the same id on disk."""
+    _write_codex_rollout(_codex_home(tmp_path, monkeypatch))
+
+    def boom(*_a, **_k):
+        raise AssertionError("resolve_transcript must not run for a non-codex profile")
+
+    monkeypatch.setattr(generic.tokens, "resolve_transcript", boom)
+    adapter = _codex_dev_adapter(tmp_path, profile_name="claude")
+    adapter.watcher = _ScriptedWatcher([_stop_event("3-1-dev-1", CODEX_SESSION, None)])
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.transcript_path is None
+    assert adapter.read_usage(result) is None
+    events = {entry["event"] for entry in _lifecycle_lines(adapter)}
+    assert not events & {"transcript-resolved", "transcript-unresolved"}
+
+
+def test_payload_error_is_crumbed_and_stop_still_completes(tmp_path):
+    """A Stop whose payload the relay could not read still completes exactly as
+    before — completion rides on the event, not the payload — and the degrade is
+    crumbed with the relay's tag.
+
+    Ablation: remove the `hook-payload-unreadable` crumb and this fails."""
+    adapter = _codex_dev_adapter(tmp_path, profile_name="claude")
+    stop = dataclasses.replace(
+        _stop_event("3-1-dev-1", None, None), payload_error="JSONDecodeError"
+    )
+    adapter.watcher = _ScriptedWatcher([stop])
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.stop_seen is True
+    (crumb,) = _lifecycle_events(adapter, "hook-payload-unreadable")
+    assert crumb["hook_event"] == "Stop"
+    assert crumb["payload_error"] == "JSONDecodeError"
+
+
 def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
     """The launched session's own SessionEnd (same id as its bound start) is
     admitted and still crashes the session."""
@@ -3902,6 +4123,38 @@ def test_budget_warn_trips_once_and_session_completes(tmp_path, monkeypatch):
     assert tripped[0]["weighted"] == 5000
     assert tripped[0]["budget"] == 1000
     assert tripped[0]["mode"] == "warn"
+
+
+def test_budget_guard_arms_after_codex_resolution(tmp_path, monkeypatch):
+    """A codex session whose hooks carry no transcript path used to leave the
+    mid-session budget guard blind (it samples the loop's transcript). Resolved
+    by id at SessionStart, the guard samples the rollout and trips.
+
+    Ablation: delete the intake `try_resolve()` call and this fails — nothing
+    is sampled, so no trip and budget_weighted is None."""
+    home = _codex_home(tmp_path, monkeypatch)
+    _write_codex_rollout(home, input_tokens=5000, output_tokens=0)
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch, usage_parser="codex-rollout")
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}', encoding="utf-8")
+    start = HookEvent(
+        ts=1,
+        event="SessionStart",
+        task_id="b-1",
+        session_id=CODEX_SESSION,
+        transcript_path=None,
+        path=Path("x"),
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [start, None, None, _stop_event("b-1", CODEX_SESSION, None)],
+        on_call=_advance_31(clock),
+    )
+
+    result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="warn"))
+
+    assert result.status == "completed"
+    assert result.budget_weighted == 5000
+    tripped = [ln for ln in _lifecycle_lines(adapter, "b-1") if ln["event"] == "budget-tripped"]
+    assert len(tripped) == 1
 
 
 def test_budget_enforce_nudges_then_terminates_over_budget(tmp_path, monkeypatch):
