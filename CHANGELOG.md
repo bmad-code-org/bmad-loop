@@ -18,9 +18,10 @@ breaking changes may land in a minor release.
 - Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
   stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
   (#496, #497).
-- Add psmux live-gate tripwires for psmux#773 (pane `PATH` rebuilt from the registry),
-  psmux#775 (`show-environment NAME` ignores the name) and psmux#774 (a case-only
-  duplicate session is refused) (#879).
+- Add psmux live-gate probes: a tripwire for psmux#775 (`show-environment NAME` ignores
+  the name), and ordinary-direction rows for psmux#774 (a case-only duplicate session is
+  refused), psmux#773 (a pane inherits the server's start `PATH`) and psmux#583 (a
+  `-`-leading option value is stored) (#879).
 - Add `bmad-loop resolve <replay-run> --abandon` (DW-535): close a replay run that
   escalated because its story was finished meanwhile. Uncommitted tracked and
   untracked changes (plus the run's own spec/board/ledger copies), or commits on a
@@ -58,6 +59,14 @@ breaking changes may land in a minor release.
   guards links, anchors, tracker refs, block length and the catalog shape.
 - Name the per-command time limit in a timed-out verify command's failure reason;
   `--reverify` also names the key to raise.
+- **Require psmux 3.4.0 or newer (#879).** `available()` refuses 3.3.8 and below, so **on
+  such a host the psmux backend reports unavailable and selection falls through: upgrade
+  psmux**. 3.3.8 silently unsets an option given a `-`-leading value (psmux/psmux#583).
+
+### Removed
+
+- psmux: stop refusing an `@` option value that starts with `-`; psmux 3.4.0 stores it
+  verbatim (#879).
 
 ### Fixed
 

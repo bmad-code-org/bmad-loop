@@ -64,9 +64,10 @@ session``. For the lost-session probe
 rather than inventing one — and the collision it needs is an independently
 created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
 another run's on a colliding id (see #531). The psmux
-behaviors cited in this module were read from the psmux source at tag
-``v3.3.8`` — the oldest build ``available()`` admits — and the safe
-observable subset is probed in ``tests/test_psmux_live.py``.
+behaviors cited in this module were read from the psmux source at the tag
+each citation names, most at ``v3.3.8``; ``available()`` admits 3.4.0 and
+later, and the safe observable subset is probed live on the installed build in
+``tests/test_psmux_live.py``.
 See :mod:`.multiplexer` for the contract.
 """
 
@@ -562,10 +563,15 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         #
         # Every psmux call is a call-operator line on the absolute path the
         # backend resolves (`_psmux_path`), because a bare name resolves on the
-        # pane's PATH, which psmux builds from the registry rather than from the
-        # server's environment (psmux/psmux#773): another build, or none at all,
-        # with every error going to $null (#877). The path is baked in when the
-        # window is minted, so a window parked before an upgrade keeps its own.
+        # pane's PATH: another build, or none at all, with every error going to
+        # $null (#877). The admitted builds give a pane the PATH of the process
+        # that started its server (psmux/psmux#773), but that need not be this
+        # launcher's: a long-lived control session can be served by a server
+        # started earlier, from another PATH or by a pre-floor psmux still
+        # running after an upgrade (which rebuilds PATH from the registry), and
+        # a relative PATH entry stops resolving once the pane's working
+        # directory differs. The path is baked in when the window is minted, so
+        # a window parked before an upgrade keeps its own.
         mux = "& " + _pwsh_quote(self._psmux_path())
         probe = (
             '"$(' + mux + " display-message -p -t $env:TMUX_PANE '#{window_id}' 2>$null)\".Trim()"
@@ -939,10 +945,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # break, and leading/trailing whitespace stay refused however cleanly
         # the wire now carries them — a value that reads back different is the
         # same silently-unprunable window whichever hop mangled it. An empty
-        # value is a silent server-side no-op (`-u` is the verb for that), and a
-        # `-`-leading one is still dropped as a flag server-side, or flips the
-        # key to unset at rc 0 (psmux/psmux#583, open upstream).
-        if not value or value.startswith("-"):
+        # value is a silent server-side no-op (`-u` is the verb for that).
+        if not value:
             return False
         if '"' in value or value != value.strip():
             return False
@@ -1576,13 +1580,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # Releases up to this version are refused. 3.3.6 and older force-kill a
     # recycled PID during pane teardown and let orphaned servers accumulate —
-    # engine-fatal on its own. 3.3.7 is excluded for a second reason: 3.3.8 is
-    # the build this backend is written against, and several verbs here now
-    # assume its fixes rather than routing around the defects (a direct
-    # `pipe-pane -o` flag transport, a `select-window` id target, the `=name`
-    # kill-session form, and the control-line shapes `_transportable` admits).
-    # On 3.3.7 those would fail silently, so the floor forbids it outright.
-    _LAST_UNSUPPORTED = (3, 3, 7)
+    # engine-fatal on its own. 3.3.7 lacks the fixes several verbs here assume
+    # rather than route around (a direct `pipe-pane -o` flag transport, a
+    # `select-window` id target, the `=name` kill-session form, and the
+    # control-line shapes `_transportable` admits). 3.3.8 stores a `-`-leading
+    # option value as the unset flag at rc 0 (psmux/psmux#583), a value
+    # `_transportable` no longer refuses. On those builds the failures are
+    # silent, so the floor forbids them outright.
+    _LAST_UNSUPPORTED = (3, 3, 8)
     # Class-level default; instances shadow it on first probe. Never assign on
     # the class outside tests — that would poison every future instance.
     _version_ok: bool | None = None

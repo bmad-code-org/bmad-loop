@@ -327,7 +327,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** On native Windows, the bundled psmux backend (a ConPTY tmux re-implementation driven through PowerShell) runs sessions without WSL. It is experimental.
 - **Properties:**
   - On a win32 host, psmux is the default backend whenever it reports itself available.
-  - psmux counts as available only when `psmux` and `pwsh` are both on PATH and psmux is 3.3.8 or newer. Otherwise selection moves on to the next backend.
+  - psmux counts as available only when `psmux` and `pwsh` are both on PATH and psmux is 3.4.0 or newer. Otherwise selection moves on to the next backend.
   - psmux refuses to open a window under PowerShell older than 7.3, or when the version cannot be read. This applies even when psmux is forced.
   - psmux sessions are registered in a per-project registry under the state root. To use an ambient `PSMUX_DATA_DIR` instead, set `[mux] honor_ambient_psmux_data_dir`.
 - **Config:** `[mux] backend`; `[mux] honor_ambient_psmux_data_dir`; `BMAD_LOOP_MUX_BACKEND=psmux`

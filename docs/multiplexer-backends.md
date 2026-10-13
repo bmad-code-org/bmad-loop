@@ -72,7 +72,7 @@ session and window model and the `bmad-loop-<run-id>` session names.
 
 Requirements:
 
-- **psmux 3.3.8 or newer** and **`pwsh`** on `PATH`. `available()` requires both binaries
+- **psmux 3.4.0 or newer** and **`pwsh`** on `PATH`. `available()` requires both binaries
   and reads psmux's reported version; an older or unreadable version reports unavailable
   and selection falls through.
 - **PowerShell 7.3 or newer** as `pwsh`. The backend resolves `pwsh` to one absolute path,
@@ -99,8 +99,8 @@ window `@3`. `psmux show-options -w` does not show these values; read one with
 session-qualified (`session:@N`).
 
 **Refused option values.** An `@` option value must read back verbatim. A value that is
-empty, starts with `-`, contains a double quote or a line break, or has leading or trailing
-whitespace is refused with a stderr warning, and the option reads as unset. Ordinary
+empty, contains a double quote or a line break, or has leading or trailing whitespace is
+refused with a stderr warning, and the option reads as unset. Ordinary
 Windows paths (spaced, UNC, apostrophed, trailing separator) pass. The project ownership
 tag is a hex digest of the project path, so it always passes.
 

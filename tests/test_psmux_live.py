@@ -18,7 +18,7 @@ premise — carry a ``probe setup: `` prefix instead, so an instrument failure i
 never read as a premise flip.
 
 The `test_adopted_*` probes are the ordinary-direction complement: each
-exercises a behavior the 3.3.8 floor let the backend assume (several through
+exercises a behavior a version floor let the backend assume (several through
 the backend verb itself, deliberately), so a red probe there means psmux
 regressed, not that a workaround became droppable.
 
@@ -633,35 +633,6 @@ def test_premise_target_less_display_message_ignores_tmux_pane(probe):
     )
 
 
-def test_premise_a_dash_leading_option_value_unsets_the_key(probe):
-    """`set-option -t S @k -u` reads the value as the unset flag: rc 0, and the
-    key is gone. That silent data loss is why `_transportable` refuses every
-    `-`-leading value (psmux/psmux#583).
-
-    Red means the installed psmux stores the value verbatim, and that refusal is
-    droppable — but only behind the `_LAST_UNSUPPORTED` gate, set to the last
-    release WITHOUT the fix (the gate is exclusive: ``available()`` admits only
-    versions above it), since an older admitted build still unsets.
-    """
-    mux, session, _ = probe
-    seeded = mux._run(["set-option", "-t", session, "@k", "v"], check=False)
-    assert seeded.returncode == 0, f"probe setup: seeding @k failed: {seeded.stderr.strip()!r}"
-    seen = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
-    assert seen.stdout.strip() == "v", f"probe setup: @k did not read back: {seen.stdout!r}"
-    written = mux._run(["set-option", "-t", session, "@k", "-u"], check=False)
-    assert written.returncode == 0, (
-        "psmux now refuses a `-`-leading option value outright instead of silently "
-        f"unsetting the key (psmux/psmux#583): {written.stderr.strip()!r}"
-    )
-    got = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
-    assert got.returncode == 0, f"probe setup: reading @k back failed: {got.stderr.strip()!r}"
-    assert got.stdout.strip() == "", (
-        "psmux now stores a `-`-leading option value verbatim (psmux/psmux#583, read "
-        f"back {got.stdout.strip()!r}) — the `-` refusal in psmux_backend._transportable "
-        "is droppable once _LAST_UNSUPPORTED is the last release without the fix"
-    )
-
-
 def test_premise_one_session_name_is_held_across_registries(tmp_path):
     """psmux's one-server-per-name guard is keyed on the session name alone, not
     the registry root, so while root A holds a session a second root cannot
@@ -811,92 +782,6 @@ def test_premise_has_session_reaps_a_live_registry_entry_on_a_connect_timeout(
         port_file.write_text(real, encoding="utf-8")
 
 
-def test_premise_pane_path_is_rebuilt_from_the_registry(tmp_path):
-    """A pane does not inherit the PATH of the process that started its server:
-    psmux rebuilds it from the registry (psmux/psmux#773). That is why the
-    parked-window trailer pins the absolute psmux path instead of trusting a
-    bare `psmux` inside the pane (#877).
-
-    Red means the pane kept the launcher's PATH entry, and the pin can retire,
-    but only behind the `_LAST_UNSUPPORTED` gate, set to the last release
-    WITHOUT the fix (the gate is exclusive), since an older admitted build
-    still rebuilds PATH.
-
-    Its own fresh registry root, so the session is a cold start from this
-    test's environment and never a claimed warm server whose first pane was
-    spawned before the claim. A launcher-only variable rides along as the
-    control: a pane missing THAT never saw this environment at all.
-    """
-    mux = PsmuxMultiplexer()
-    if not mux.available():
-        pytest.skip("psmux present but not an admitted version")
-    root = tmp_path / "registry"
-    root.mkdir()  # pre-created: see psmux_data_root for the measured cost
-    marker = tmp_path / "path-marker"
-    marker.mkdir()
-    report = tmp_path / "pane-env.txt"
-    staging = tmp_path / "pane-env.tmp"
-    mark = uuid.uuid4().hex
-    env = _new_session_env()
-    env["PSMUX_DATA_DIR"] = str(root)
-    env["PATH"] = f"{marker};{env.get('PATH', '')}"
-    env["BMAD_LOOP_PROBE_MARK"] = mark
-    # Staged then moved, so a poll never reads a half-written report. The
-    # source travels as -EncodedCommand: psmux re-parses a command line, and
-    # base64 is the one shape that survives it whatever the paths hold.
-    source = (
-        f"Set-Content -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
-        '-Value ("$env:BMAD_LOOP_PROBE_MARK|" + $env:PATH); '
-        f"Move-Item -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
-        f"-Destination {psmux_backend._pwsh_quote(str(report))}; Start-Sleep 60"
-    )
-    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-    session = f"bmad-loop-path-probe-{uuid.uuid4().hex[:8]}"
-    seen = False
-    text = ""
-    try:
-        created = mux._run(
-            [
-                "new-session",
-                "-d",
-                "-s",
-                session,
-                "-c",
-                str(tmp_path),
-                "pwsh",
-                "-NoProfile",
-                "-EncodedCommand",
-                encoded,
-            ],
-            check=False,
-            env=env,
-        )
-        assert (
-            created.returncode == 0
-        ), f"probe setup: probe session creation failed: {created.stderr.strip()!r}"
-        seen = _plain_has_session(mux, session, env=env)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not report.exists():
-            time.sleep(0.25)
-        assert report.exists(), "probe setup: the probe pane never reported its environment"
-        text = report.read_text(encoding="utf-8-sig").strip()
-    finally:
-        _teardown_probe_session(mux, session, env, known_created=seen)
-    got_mark, _, pane_path = text.partition("|")
-    assert got_mark == mark, (
-        "probe setup: the pane did not inherit the launcher's environment at all "
-        f"(control variable read {got_mark!r}) — it says nothing about PATH"
-    )
-    entries = [entry.rstrip("\\").lower() for entry in pane_path.split(";")]
-    assert str(marker).lower() not in entries, (
-        "psmux now gives a pane the launcher's PATH instead of rebuilding it from the "
-        "registry (psmux/psmux#773) — the pinned psmux path in the parked-window "
-        "trailer (#877, item 1 of #879) retires, but only through a _LAST_UNSUPPORTED "
-        "bump to the last release without the fix, never a deletion: an older admitted "
-        "build still rebuilds PATH"
-    )
-
-
 def test_premise_show_environment_ignores_the_name(probe):
     """`show-environment -t <session> NAME` answers with the session server's
     whole listing at rc 0, whatever NAME is (psmux/psmux#775). A tmux-style
@@ -936,11 +821,11 @@ def test_premise_show_environment_ignores_the_name(probe):
 # ------------------------------------------------- adopted-behavior probes
 #
 # The mirror image of the premise probes above. Those guarded workarounds and
-# went red when upstream made one droppable; these guard the four behaviors the
-# 3.3.8 floor let this backend START assuming, and go red if a later psmux takes
-# one back. Without them the seam's only evidence for those four is a mocked
-# argv shape, which cannot notice a regression in the binary at all. Ordinary
-# semantics: red means broken.
+# went red when upstream made one droppable; these guard the behaviors a version
+# floor let this backend START assuming, and go red if a later psmux takes one
+# back. Without them the seam's only evidence for those is a mocked argv shape,
+# which cannot notice a regression in the binary at all. Ordinary semantics: red
+# means broken.
 
 
 def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe, tmp_path):
@@ -1048,12 +933,158 @@ def test_a_pinned_pwsh_path_with_shell_syntax_launches_and_pipes(probe, tmp_path
         os.rmdir(link)  # the junction only, never the install it points at
 
 
+def test_adopted_a_dash_leading_option_value_is_stored(probe):
+    """A `-`-leading option value is stored verbatim, not read as the unset
+    flag (psmux/psmux#583), on both option channels and through the backend
+    verbs themselves, since `_transportable` no longer refuses one. Red means
+    psmux drops or unsets such a value again, and the refusal is needed back.
+
+    Each key is seeded first, so an unset (the 3.3.8 behavior: rc 0 and the
+    key gone) reads as a lost value, never as a write that did not happen.
+    """
+    mux, session, windows = probe
+    for value in ("-u", "-flag"):
+        seeded = mux._run(["set-option", "-t", session, "@k", "seed"], check=False)
+        assert seeded.returncode == 0, f"probe setup: seeding @k failed: {seeded.stderr.strip()!r}"
+        mux.set_session_option(session, "@k", value)
+        got = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
+        assert got.returncode == 0, f"probe setup: reading @k back failed: {got.stderr.strip()!r}"
+        assert got.stdout.strip() == value, (
+            f"psmux no longer stores the `-`-leading option value {value!r} (psmux/psmux#583, "
+            f"read back {got.stdout.strip()!r}) — psmux_backend._transportable must refuse "
+            "`-`-leading values again"
+        )
+    window = windows[0]
+    key = mux._scoped_option_key("@r", window.rsplit("@", 1)[1])
+    mux.set_window_option(window, "@r", "-u")
+    options = mux._scoped_options(session)
+    assert options is not None, "probe setup: the scoped option listing failed"
+    assert options.get(key) == "-u", (
+        "psmux no longer stores a `-`-leading per-window option value (psmux/psmux#583, "
+        f"read back {options.get(key)!r}) — psmux_backend._transportable must refuse "
+        "`-`-leading values again"
+    )
+
+
+def test_adopted_a_pane_inherits_the_servers_start_path(tmp_path):
+    """A pane inherits the PATH of the process that started its server, and a
+    bare `psmux` in the pane resolves through it (psmux/psmux#773); 3.3.8
+    rebuilt the pane's PATH from the registry instead. The parked-window
+    trailer keeps pinning psmux's absolute path (#877), because a pane's PATH
+    is the server starter's, not this launcher's; this row records the
+    inheritance that pin's retirement would rest on, and that #879 measured.
+
+    The launcher's PATH reaches psmux only through a junction onto the
+    directory `psmux` resolves from, with that directory itself removed, so
+    the pane can find psmux through the launcher's entry alone. The pane runs
+    the installed pwsh by absolute path for the same reason. Red means psmux
+    rebuilds a pane's PATH again.
+
+    Its own fresh registry root, so the session is a cold start from this
+    test's environment and never a claimed warm server whose first pane was
+    spawned before the claim. A launcher-only variable rides along as the
+    control: a pane missing THAT never saw this environment at all.
+    """
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    found = shutil.which("psmux")
+    assert found is not None, "probe setup: psmux does not resolve"
+    install_dir = os.path.dirname(os.path.abspath(found))
+    root = tmp_path / "registry"
+    root.mkdir()  # pre-created: see psmux_data_root for the measured cost
+    link = tmp_path / "launcher-only psmux"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), install_dir],
+        capture_output=True,
+        text=True,
+        timeout=tmux_base.TMUX_TIMEOUT_S,
+    )
+    assert made.returncode == 0, f"probe setup: junction failed: {made.stderr.strip()!r}"
+    report = tmp_path / "pane-env.txt"
+    staging = tmp_path / "pane-env.tmp"
+    mark = uuid.uuid4().hex
+    env = _new_session_env()
+    env["PSMUX_DATA_DIR"] = str(root)
+    kept = [
+        entry
+        for entry in env.get("PATH", "").split(";")
+        if entry and os.path.normcase(entry.rstrip("\\")) != os.path.normcase(install_dir)
+    ]
+    env["PATH"] = ";".join([str(link), *kept])
+    env["BMAD_LOOP_PROBE_MARK"] = mark
+    # Staged then moved, so a poll never reads a half-written report. The
+    # source travels as -EncodedCommand: psmux re-parses a command line, and
+    # base64 is the one shape that survives it whatever the paths hold.
+    source = (
+        f"Set-Content -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
+        '-Value ("$env:BMAD_LOOP_PROBE_MARK|" + '
+        "(Get-Command psmux -CommandType Application -ErrorAction SilentlyContinue "
+        '| Select-Object -First 1).Source + "|" + $env:PATH); '
+        f"Move-Item -LiteralPath {psmux_backend._pwsh_quote(str(staging))} "
+        f"-Destination {psmux_backend._pwsh_quote(str(report))}; Start-Sleep 60"
+    )
+    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
+    session = f"bmad-loop-path-probe-{uuid.uuid4().hex[:8]}"
+    seen = False
+    text = ""
+    try:
+        try:
+            created = mux._run(
+                [
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session,
+                    "-c",
+                    str(tmp_path),
+                    _REAL_PWSH_PATH(mux),
+                    "-NoProfile",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                check=False,
+                env=env,
+            )
+            assert (
+                created.returncode == 0
+            ), f"probe setup: probe session creation failed: {created.stderr.strip()!r}"
+            seen = _plain_has_session(mux, session, env=env)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not report.exists():
+                time.sleep(0.25)
+            assert report.exists(), "probe setup: the probe pane never reported its environment"
+            text = report.read_text(encoding="utf-8-sig").strip()
+        finally:
+            _teardown_probe_session(mux, session, env, known_created=seen)
+    finally:
+        os.rmdir(link)  # the junction only, never the install it points at
+    got_mark, _, rest = text.partition("|")
+    resolved, _, pane_path = rest.partition("|")
+    assert got_mark == mark, (
+        "probe setup: the pane did not inherit the launcher's environment at all "
+        f"(control variable read {got_mark!r}) — it says nothing about PATH"
+    )
+    entries = [os.path.normcase(entry.rstrip("\\")) for entry in pane_path.split(";")]
+    assert os.path.normcase(str(link)) in entries, (
+        "psmux no longer gives a pane the PATH of the process that started its server "
+        "(psmux/psmux#773) — a bare `psmux` in a pane can find another build or none, "
+        "so the trailer's pinned psmux path (#877) cannot retire"
+    )
+    assert resolved and os.path.normcase(os.path.dirname(resolved)) == os.path.normcase(
+        str(link)
+    ), (
+        f"a bare `psmux` in the pane resolved {resolved!r}, not the build the launcher's "
+        "PATH holds — the trailer's pinned psmux path (#877) cannot retire"
+    )
+
+
 def test_a_parked_trailer_runs_the_pinned_psmux_off_the_pane_path(probe, tmp_path, monkeypatch):
     """The parked-window trailer calls the absolute psmux the backend resolved,
-    not whatever the pane's PATH finds (#877): psmux builds a pane's PATH from
-    the registry (psmux/psmux#773), so a psmux reachable only through the
-    launching shell's PATH is missing in the pane. Here the pane's PATH is cut
-    to System32, and the pinned path is a junction holding a space, an
+    not whatever the pane's PATH finds (#877): a pane's PATH is that of the
+    process that started its server, or on a pre-floor psmux one rebuilt from
+    the registry, so a psmux reachable only through this launcher's PATH can be
+    missing in the pane. Here the pane's PATH is cut to System32, and the pinned path is a junction holding a space, an
     apostrophe and a doubled space onto the directory of the running server's
     own image. The trailer's last verb frees the return-target key, and every
     trailer error goes to $null, so the key going away is the proof that the
