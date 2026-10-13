@@ -263,7 +263,7 @@ jobs:
           # Moving this pin is a deliberate PR that also moves the floor and
           # retires the workarounds; psmux-canary.yml runs the same gate against
           # `latest` to say when that PR is due.
-          version: v3.3.8
+          version: v3.4.0
           github-token: ${{ github.token }}
 
       - name: Run the live psmux gate
