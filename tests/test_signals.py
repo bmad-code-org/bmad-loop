@@ -78,6 +78,28 @@ def test_parse_event_keeps_only_a_known_lineage_tag(tmp_path, extra, expected):
     assert event.lineage == expected
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"payload_error": "JSONDecodeError"}, "JSONDecodeError"),
+        ({"payload_error": "not-an-object"}, "not-an-object"),
+        ({"payload_error": 1}, None),  # a non-string is dropped, not coerced
+        ({"payload_error": ["JSONDecodeError"]}, None),
+        ({}, None),  # a readable payload (or an older relay) carries no tag
+    ],
+)
+def test_parse_event_keeps_string_payload_error_only(tmp_path, extra, expected):
+    """The relay's unreadable-payload tag lands on the HookEvent (str only), so
+    the wait loop's crumb never journals a value the relay did not write.
+
+    Ablation: drop the `isinstance(payload_error, str)` check and the non-string
+    rows fail."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "Stop", **extra)
+    (event,) = watcher.poll()
+    assert event.payload_error == expected
+
+
 @pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])
 def test_parse_event_drops_a_non_string_session_id(tmp_path, value):
     """#767: a non-string id reads as absent, so attribution never hashes it —

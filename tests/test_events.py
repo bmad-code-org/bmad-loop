@@ -50,6 +50,7 @@ TWINNED = (
     "_is_link_like",
     "_write_all",
     "_write_event",
+    "_read_payload",
 )
 
 
@@ -991,6 +992,85 @@ def test_relay_tolerates_garbage_on_stdin(tmp_path, monkeypatch, capsys, garbage
     files = list((tmp_path / "events").glob("*.json"))
     assert len(files) == 1
     assert json.loads(files[0].read_text())["session_id"] is None
+
+
+def _run_twin(twin: str, event: str, stdin: bytes, run_dir: Path, **env: str):
+    """Run one relay twin as a real subprocess, feeding ``stdin`` as raw bytes.
+    ``twin`` is "hook" (the copied script) or "relay" (``bmad-loop relay``)."""
+    argv = (
+        [sys.executable, str(HOOK), event]
+        if twin == "hook"
+        else [sys.executable, "-m", "bmad_loop", "relay", event]
+    )
+    return subprocess.run(
+        argv,
+        input=stdin,
+        # As in test_relay_and_the_hook_shape_the_same_event: `env=` replaces the
+        # environment, and a Windows child needs SYSTEMROOT to start at all.
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(run_dir),
+            "BMAD_LOOP_TASK_ID": "t1",
+            **env,
+        },
+        capture_output=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("twin", ["hook", "relay"])
+def test_utf8_payload_survives_cp1252_stdin(tmp_path, twin):
+    """A Windows host runs the relay without UTF-8 mode, so a text stdin decodes
+    with the locale code page (cp1252). The CLIs write UTF-8, so a non-ASCII
+    transcript path either fails to decode (0x81 is undefined in cp1252, so the
+    whole payload became `{}`) or comes out garbled and names a file that does
+    not exist. Both twins must read the bytes and recover the exact path.
+
+    Ablation: revert `_read_payload` to `json.load(stdin)` (on either twin) and
+    that twin's row fails — the event carries a null path."""
+    path = str(tmp_path / "Ánna" / "rollout.jsonl")
+    payload = {"session_id": "s1", "transcript_path": path}
+    stdin = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    assert b"\xc3\x81" in stdin
+
+    proc = _run_twin(twin, "Stop", stdin, tmp_path, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+
+    assert proc.returncode == 0, proc.stderr
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text(encoding="utf-8"))
+    assert event["transcript_path"] == path
+    assert event["session_id"] == "s1"
+    assert "payload_error" not in event
+
+
+@pytest.mark.parametrize("twin", ["hook", "relay"])
+@pytest.mark.parametrize(
+    ("stdin", "expected"),
+    [
+        (b'{"session_id": "s1", "transcript_pa', "JSONDecodeError"),
+        (b'["s1"]', "not-an-object"),
+        (b'{"session_id": "s1"}', None),
+    ],
+    ids=["truncated", "list", "valid"],
+)
+def test_unreadable_payload_is_tagged(tmp_path, twin, stdin, expected):
+    """An unreadable payload still writes the event (the completion signal rides
+    on it), but the event says WHY it carries nulls, so the orchestrator can crumb
+    the degrade instead of folding it into an ordinary missing transcript. A
+    readable payload's event has no `payload_error` key at all.
+
+    Ablation: drop the tag (return `{}, None` from `_read_payload`'s failure
+    arms) and the truncated/list rows fail on either twin."""
+    proc = _run_twin(twin, "Stop", stdin, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text(encoding="utf-8"))
+    assert event.get("payload_error") == expected
+    if expected is None:
+        assert "payload_error" not in event
+        assert event["session_id"] == "s1"
+    else:
+        assert event["session_id"] is None
 
 
 class _UnreadableStream:

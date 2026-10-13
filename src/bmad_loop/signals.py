@@ -48,6 +48,11 @@ class HookEvent:
     # that predates the field and for any value outside LINEAGE_TAGS. APPENDED
     # with a default, like the two fields above.
     lineage: str | None = None
+    # Why the relay could not read the hook payload (events._read_payload): the
+    # exception class name or "not-an-object". None on a readable payload, on an
+    # older vendored relay that predates the field, and for a non-string value.
+    # APPENDED with a default, like the fields above.
+    payload_error: str | None = None
 
 
 # The relays' lineage tags (DW-507, events._lineage). Anything else parses as None.
@@ -78,6 +83,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
     notification_type = data.get("notification_type")
     source = data.get("source")
     lineage = data.get("lineage")
+    payload_error = data.get("payload_error")
     # Payload values are forwarded from the CLI unvalidated, so a non-string one
     # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
@@ -90,6 +96,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         notification_type=notification_type if isinstance(notification_type, str) else None,
         source=source if isinstance(source, str) else None,
         lineage=lineage if isinstance(lineage, str) and lineage in LINEAGE_TAGS else None,
+        payload_error=payload_error if isinstance(payload_error, str) else None,
     )
 
 
