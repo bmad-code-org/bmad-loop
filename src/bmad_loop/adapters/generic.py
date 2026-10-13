@@ -1179,7 +1179,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
         def try_resolve() -> None:
             """Resolve the transcript by session id when no readable one is known.
-            One lookup per call; a hit becomes the loop's transcript (so every
+            One lookup per call — each hook event, each heartbeat, each
+            window-death exit; a hit becomes the loop's transcript (so every
             SessionResult and the budget guard see it) and is crumbed once — the
             ``resolved is None`` gate makes the hit itself one-shot."""
             nonlocal transcript_path, resolved
@@ -1287,6 +1288,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
+                # A rollout created after SessionStart, in a turn with no further
+                # hook event, is found here rather than at Stop — so the budget
+                # guard below is not blind for the whole turn. Bounded by the
+                # heartbeat cadence; a no-op once a readable transcript is known.
+                try_resolve()
                 # Transcript idle sample (#680), ahead of the heartbeat write so
                 # the payload carries this tick's age. Inert until a hook event
                 # has named the transcript.
@@ -1608,6 +1614,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
                     if self._probe_liveness(handle, "stall") is False:
+                        # A window-death exit like the top-of-tick one above.
+                        try_resolve()
                         return self._final(
                             handle,
                             spec,

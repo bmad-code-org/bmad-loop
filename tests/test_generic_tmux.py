@@ -2465,6 +2465,61 @@ def test_codex_window_death_resolves_at_exit(tmp_path, monkeypatch):
     assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
 
 
+def test_codex_stall_reprobe_death_resolves_at_exit(tmp_path, monkeypatch):
+    """The other window-death exit: alive at the top-of-tick probe, dead at
+    the stall-expiry re-probe. A rollout that appeared after SessionStart
+    still rides the crashed result.
+
+    Ablation: remove the `try_resolve()` call before the stall re-probe's
+    crash return and this fails."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    home = _codex_home(tmp_path, monkeypatch)
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex")
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    alive_calls = {"n": 0}
+
+    def flaky_alive(handle):
+        alive_calls["n"] += 1
+        return alive_calls["n"] == 1
+
+    adapter._window_alive = flaky_alive
+    # heartbeat-free clock: the heartbeat's own resolve must not be what finds it
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    monkeypatch.setattr(generic, "HEARTBEAT_INTERVAL_S", 1e9)
+    created: list[Path] = []
+
+    def expire_after_rollout(call_n):
+        if call_n == 3:
+            created.append(_write_codex_rollout(home))
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=CODEX_SESSION),
+            _stop_event("3-1-dev-1", CODEX_SESSION, None),
+        ],
+        on_call=expire_after_rollout,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert alive_calls["n"] == 2
+    assert created
+    assert Path(result.transcript_path) == created[0]
+    assert len(_lifecycle_events(adapter, "transcript-resolved")) == 1
+
+
 def test_non_codex_stop_without_transcript_never_resolves(tmp_path, monkeypatch):
     """Scope pin: only codex-rollout transcripts are resolvable by id. A claude
     Stop with no path stays untracked and crumbs nothing new, even with a codex
@@ -4147,6 +4202,44 @@ def test_budget_guard_arms_after_codex_resolution(tmp_path, monkeypatch):
     adapter.watcher = _ScriptedWatcher(
         [start, None, None, _stop_event("b-1", CODEX_SESSION, None)],
         on_call=_advance_31(clock),
+    )
+
+    result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="warn"))
+
+    assert result.status == "completed"
+    assert result.budget_weighted == 5000
+    tripped = [ln for ln in _lifecycle_lines(adapter, "b-1") if ln["event"] == "budget-tripped"]
+    assert len(tripped) == 1
+
+
+def test_budget_guard_arms_when_rollout_appears_mid_turn(tmp_path, monkeypatch):
+    """SessionStart came before its rollout existed, and the turn sends no
+    further hook event: the heartbeat retries the by-id lookup, so the guard
+    samples the rollout and trips before Stop.
+
+    Ablation: delete the heartbeat's `try_resolve()` call and this fails —
+    the rollout is found only at Stop, after the last sample."""
+    home = _codex_home(tmp_path, monkeypatch)
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch, usage_parser="codex-rollout")
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}', encoding="utf-8")
+    start = HookEvent(
+        ts=1,
+        event="SessionStart",
+        task_id="b-1",
+        session_id=CODEX_SESSION,
+        transcript_path=None,
+        path=Path("x"),
+    )
+    advance = _advance_31(clock)
+
+    def advance_and_create(call_n):
+        advance(call_n)
+        if call_n == 2:
+            _write_codex_rollout(home, input_tokens=5000, output_tokens=0)
+
+    adapter.watcher = _ScriptedWatcher(
+        [start, None, None, _stop_event("b-1", CODEX_SESSION, None)],
+        on_call=advance_and_create,
     )
 
     result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="warn"))

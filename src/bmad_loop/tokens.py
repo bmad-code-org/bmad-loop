@@ -47,7 +47,9 @@ transcript that yields nothing reads as None (untracked), not zero.
 from __future__ import annotations
 
 import datetime
+import fnmatch
 import json
+import os
 import re
 import threading
 import uuid
@@ -72,10 +74,15 @@ def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
 
 def codex_home(env: Mapping[str, str]) -> Path | None:
     """Codex's state root: ``CODEX_HOME`` when set and non-empty, else
-    ``~/.codex``; None when no home directory can be determined."""
+    ``.codex`` under the home ``env`` names (``USERPROFILE`` on Windows,
+    ``HOME`` elsewhere, as ``Path.home()`` reads them), else under this
+    process's home; None when no home directory can be determined."""
     configured = env.get("CODEX_HOME")
     if configured:
         return Path(configured)
+    home = env.get("USERPROFILE" if os.name == "nt" else "HOME")
+    if home:
+        return Path(home) / ".codex"
     try:
         return Path.home() / ".codex"
     except RuntimeError:
@@ -254,7 +261,8 @@ _CODEX_META_READ_CAP = 1 << 20
 # (id, session_id, parent_thread_id) from a rollout's first-line session_meta,
 # or None when the file does not open with one. session_meta is written once and
 # never changes, so every answer, negative included, is cached by path for
-# good; only a first line still being written (no newline yet) is re-read.
+# good; only a first line still being written (no newline yet) is re-read, and
+# a complete first line that is not JSON raises, uncached, every time.
 # Bounded oldest-first like opencode_http's USAGE_STASH_CAP. A day dir holds a
 # few hundred rollouts and a tally lists the parent's day plus the next, so the
 # cap sits far above one tally's candidate set: the budget guard's per-heartbeat
@@ -273,10 +281,9 @@ def _read_codex_first_line(path: Path) -> bytes:
 
 
 def _parse_codex_meta(line: bytes) -> _CodexMeta | None:
-    try:
-        entry = json.loads(line)
-    except ValueError:
-        return None
+    """None for a JSON line that is not a usable session_meta; ValueError
+    (JSONDecodeError, UnicodeDecodeError) for one that is not JSON at all."""
+    entry = json.loads(line)
     if not isinstance(entry, dict) or entry.get("type") != "session_meta":
         return None
     payload = entry.get("payload")
@@ -301,14 +308,21 @@ def _parse_codex_meta(line: bytes) -> _CodexMeta | None:
 
 def _codex_meta(path: Path) -> _CodexMeta | None:
     """The rollout's session_meta facts, cached (see CODEX_META_CACHE_CAP).
-    OSError propagates."""
+    OSError propagates, and so does ValueError for a complete first line that
+    does not parse; a first line still being written reads as None."""
     key = str(path)
     with _codex_meta_lock:
         if key in _codex_meta_cache:
             return _codex_meta_cache[key]
     line = _read_codex_first_line(path)
-    meta = _parse_codex_meta(line)
-    if line.endswith(b"\n") or len(line) >= _CODEX_META_READ_CAP:
+    complete = line.endswith(b"\n") or len(line) >= _CODEX_META_READ_CAP
+    try:
+        meta = _parse_codex_meta(line)
+    except ValueError:
+        if complete:
+            raise
+        meta = None
+    if complete:
         with _codex_meta_lock:
             if key not in _codex_meta_cache:
                 while len(_codex_meta_cache) >= CODEX_META_CACHE_CAP:
@@ -326,12 +340,15 @@ def _codex_day(folder: Path) -> datetime.date | None:
         return None
 
 
-def _codex_sibling_candidates(transcript_path: Path) -> list[Path]:
+def _codex_sibling_candidates(transcript_path: Path, unread: list[str]) -> list[Path]:
     """Rollouts that may be the parent's subagents: `rollout-*.jsonl` in the
     parent's day dir and each later day dir through the day after the parent's
     last write (capped at local today + 1; dirs are local dates and a child
     can start after midnight), whose filename timestamp is not earlier than
-    the parent's. A parent outside a YYYY/MM/DD tree searches its own dir."""
+    the parent's. A parent outside a YYYY/MM/DD tree searches its own dir.
+    A missing day dir holds no rollouts; one that cannot be listed is named
+    in ``unread`` (by its date path) and the other dirs are still searched —
+    listed directly, since ``Path.glob`` swallows a scan's OSError."""
     folder = transcript_path.parent
     first = _codex_day(folder)
     folders = [folder]
@@ -352,7 +369,16 @@ def _codex_sibling_candidates(transcript_path: Path) -> list[Path]:
     floor = stamp.group(1) if stamp else ""
     candidates: list[Path] = []
     for each in folders:
-        for path in sorted(each.glob("rollout-*.jsonl")):
+        try:
+            paths = sorted(each.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            unread.append(f"{'/'.join(each.parts[-3:])}/: {type(e).__name__}")
+            continue
+        for path in paths:
+            if not fnmatch.fnmatchcase(path.name, "rollout-*.jsonl"):
+                continue
             match = _ROLLOUT_TS.match(path.name)
             if path != transcript_path and (match.group(1) if match else "") >= floor:
                 candidates.append(path)
@@ -372,8 +398,8 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
     counts once, from the later file. A child's usage makes the session
     tracked even when the parent reports none. An unreadable sibling
     (OSError/ValueError) is skipped and named in `TokenUsage.unread`, as are
-    a failed sibling scan and an unreadable parent first line (both leave the
-    children uncounted). Parent body errors propagate as before, and None
+    an unlistable day dir and an unreadable or unparseable parent first line
+    (which leaves the children uncounted). Parent body errors propagate as before, and None
     still means no usage signal anywhere: a skip can only qualify a figure
     that exists. The budget guard's live samples ignore `unread`, since a
     child mid-write can tear a UTF-8 read; the engine's post-session read
@@ -382,22 +408,17 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
     unread: list[str] = []
     try:
         parent_meta = _codex_meta(transcript_path)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         parent_meta = None
         unread.append(f"{transcript_path.name}: {type(e).__name__}")
     totals: list[dict[str, Any]] = [] if parent_totals is None else [parent_totals]
     if parent_meta is not None:
         root = parent_meta[0]
         metas: dict[str, _CodexMeta] = {}
-        try:
-            candidates = _codex_sibling_candidates(transcript_path)
-        except OSError as e:
-            candidates = []
-            unread.append(f"{transcript_path.parent.name}/: {type(e).__name__}")
-        for path in candidates:
+        for path in _codex_sibling_candidates(transcript_path, unread):
             try:
                 meta = _codex_meta(path)
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 unread.append(f"{path.name}: {type(e).__name__}")
                 continue
             if meta is not None and meta[0] != root:

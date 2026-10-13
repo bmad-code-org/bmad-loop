@@ -400,6 +400,20 @@ def test_resolve_defaults_to_home_dot_codex(tmp_path, monkeypatch):
     assert tokens.resolve_transcript("codex-rollout", SESSION, {"CODEX_HOME": ""}) == path
 
 
+def test_resolve_default_home_comes_from_the_passed_env(tmp_path, monkeypatch):
+    """The pane's env decides where Codex writes: a HOME/USERPROFILE override
+    there must root the fallback, not this process's own home.
+
+    Ablation: read `Path.home()` unconditionally and this fails."""
+    monkeypatch.setenv("HOME", str(tmp_path / "controller"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "controller"))
+    pane_home = tmp_path / "pane"
+    path = _codex_rollout(pane_home / ".codex", "2026/10/12", SESSION)
+    env = {"HOME": str(pane_home), "USERPROFILE": str(pane_home)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+
+
 def test_resolve_newest_mtime_wins(tmp_path):
     """Two rollouts with one id (a resumed session written into a later day dir)
     resolve to the newer by mtime, whatever order the glob returns them in.
@@ -642,6 +656,112 @@ def test_codex_tally_names_sibling_whose_first_line_fails(tmp_path, monkeypatch)
     usage = tally_codex_rollout(parent)
     assert usage == TokenUsage(input_tokens=10, output_tokens=1)
     assert usage is not None and usage.unread == (f"{locked.name}: PermissionError",)
+
+
+def test_codex_tally_names_sibling_whose_first_line_does_not_parse(tmp_path, monkeypatch):
+    """A complete first line that is not JSON (invalid UTF-8 here) may hide a
+    child, so it is named in `unread` rather than read as "not a subagent".
+
+    Ablation: let `_codex_meta` return None on a parse failure and the
+    assertion fails."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    garbled = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-05-00-{CHILD}.jsonl"
+    garbled.write_bytes(b'{"type": "session_meta", "payload": "\xff"}\n')
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == (f"{garbled.name}: UnicodeDecodeError",)
+    # failures are not cached: the next tally names it again
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == (f"{garbled.name}: UnicodeDecodeError",)
+
+
+def test_codex_tally_names_parent_whose_first_line_does_not_parse(tmp_path, monkeypatch):
+    """An unparseable parent first line leaves its children uncounted, so the
+    parent's own total is a lower bound and says so.
+
+    Ablation: catch only OSError around the parent's `_codex_meta` and the
+    tally raises."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-00-00-{ROOT}.jsonl"
+    _write_jsonl(
+        parent,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 30, "output_tokens": 3}},
+                },
+            }
+        ],
+    )
+    body = parent.read_bytes()
+    parent.write_bytes(b"{not json\n" + body)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=30, output_tokens=3)
+    assert usage is not None and usage.unread == (f"{parent.name}: JSONDecodeError",)
+
+
+def test_codex_tally_skips_sibling_first_line_still_being_written(tmp_path, monkeypatch):
+    """A first line with no newline yet is a rollout mid-creation, not a
+    fault: it reads as not-a-child for now, uncached, and names nothing.
+
+    Ablation: raise for an incomplete line too and `unread` is non-empty."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    torn = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-05-00-{CHILD}.jsonl"
+    torn.write_bytes(b'{"type": "session_meta", "payl')
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == ()
+    assert str(torn) not in tokens._codex_meta_cache
+
+
+def test_codex_tally_names_unlistable_day_dir(tmp_path, monkeypatch):
+    """`Path.glob` swallows a scan's OSError, so the dirs are listed directly:
+    an unlistable day dir is named in `unread` by its date path, and the
+    other days are still searched.
+
+    Ablation: list the dirs with `glob("rollout-*.jsonl")` again and the
+    `unread` assertion fails."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "23-50-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    after_midnight = _local_ts("2026/10/02", hour=0, minute=20)
+    os.utime(parent, (after_midnight, after_midnight))
+    _codex_thread(
+        tmp_path, "2026/10/01", "23-55-00", CHILD, session_id=ROOT, parent=ROOT, usage=(7, 0, 3)
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/02",
+        "00-10-00",
+        GRANDCHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(500, 0, 50),
+    )
+    locked = tmp_path / "sessions/2026/10/02"
+    real_iterdir = type(locked).iterdir
+
+    def iterdir(self):
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(type(locked), "iterdir", iterdir)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=17, output_tokens=4)
+    assert usage is not None and usage.unread == ("2026/10/02/: PermissionError",)
 
 
 def test_codex_clean_tally_has_no_unread(tmp_path):
