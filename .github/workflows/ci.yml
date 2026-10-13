@@ -250,48 +250,21 @@ jobs:
         # Bounded, for the reason the Linux `Ensure tmux` step above documents at
         # length: an unbounded fetch wedged that job for 14 minutes with no exit
         # status for `|| true` to discard. Here the retries are bounded by
-        # Invoke-WebRequest and everything else by the step timeout.
+        # Invoke-WebRequest and everything else by the step timeout. After
+        # `Install the project`, because the action's floor assertion runs
+        # `uv run`; the aggregator's `verify-executed` then refuses any skip
+        # inside the gate itself.
         timeout-minutes: 6
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # After `Install the project`, because the assertion below runs `uv run`.
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # The release archive, not `choco install`. Chocolatey's community feed
-          # answered the V2 package lookup with 503 on BOTH matrix legs of this
-          # job's first run, while the package itself sat published and healthy.
-          # Chocolatey document that feed as neither supported nor guaranteed and
-          # rate-limited per IP behind Cloudflare, and hosted runners share egress
-          # addresses — other projects track the same feed-503 flake. This is one
-          # GET against the host the job already depends on.
-          #
-          # `releases/latest`, not a pinned tag: the floor assertion below stays
-          # the only version gate, so a psmux release needs no edit here.
-          $url = gh api repos/psmux/psmux/releases/latest --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
-          if (-not $url) { throw 'no windows-x64 asset on the latest psmux release' }
-          $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
-          $dir = Join-Path $env:RUNNER_TEMP 'psmux'
-          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
-          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
-          $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
-          if (-not $exe) { throw "no psmux.exe in $url" }
-          # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
-          # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
-          # `sys.platform != "win32"` before it ever looks for the binary.
-          # PATH for this step, GITHUB_PATH for the gate step.
-          $env:PATH = "$($exe.Directory.FullName);$env:PATH"
-          Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
-          psmux -V
-          # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
-          # PsmuxMultiplexer.available(), so an install at or below the version
-          # floor would leave this job green with the entire live gate never run
-          # — the one failure a "did it install?" check cannot see. Calling
-          # available() also keeps the floor in a single place (it reads
-          # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
-          # `pwsh`, which every parked window needs. The aggregator's
-          # `verify-executed` then refuses any skip inside the gate itself.
-          uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"
+        uses: ./.github/actions/ensure-psmux
+        with:
+          # A pinned release, not `releases/latest`: the gate's `test_premise_*`
+          # rows turn red by design when a psmux release fixes what they pin, so
+          # an unpinned install turned every PR red the day psmux 3.4.0 shipped.
+          # Moving this pin is a deliberate PR that also moves the floor and
+          # retires the workarounds; psmux-canary.yml runs the same gate against
+          # `latest` to say when that PR is due.
+          version: v3.3.8
+          github-token: ${{ github.token }}
 
       - name: Run the live psmux gate
         # Serial, and out of the parallel shards: these 15 tests drive real psmux
