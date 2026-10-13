@@ -80,9 +80,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from .multiplexer import Unset
 from .tmux_base import PARKED_RETURN_DETACH, TMUX_TIMEOUT_S, BaseTmuxBackend, TmuxError
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1577,6 +1578,29 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"warning: pipe-pane log capture failed for {window_id}: {exc}",
                 file=sys.stderr,
             )
+
+    def inherited_env(
+        self,
+        session: str,
+        name: str,
+        *,
+        on_fault: Callable[[str], None] | None = None,
+    ) -> str | Unset | None:
+        """The seam query (#731), with tmux's replies since psmux/psmux#775
+        (``src/environ.rs``, source-read at v3.4.0): the session scope first,
+        then the global one, through the base's ``_show_environment``. Two
+        psmux specifics, both measured on 3.4.0. ``-g`` is session-targeted:
+        one server per session makes "global" that session's server start
+        environment, and an untargeted ``-g`` answers from whichever server it
+        lands on. The echoed name is matched case-insensitively: the reply
+        spells the name as the environment block stores it (``PATH`` can come
+        back ``Path=``).
+
+        Ceiling: under ``PSMUX_BARE_ENV`` a pane gets an allowlist, not what
+        this answers (see ``_warn_if_bare_env``); bmad-loop does not support
+        that mode and already warns about it."""
+        target = ["-t", f"={session}"]
+        return self._show_environment([target, ["-g", *target]], name, on_fault, fold_case=True)
 
     # Releases up to this version are refused. 3.3.6 and older force-kill a
     # recycled PID during pane teardown and let orphaned servers accumulate —

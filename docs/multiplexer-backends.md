@@ -60,9 +60,10 @@ with. A server started under one state root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_H
   notes once, naming both, when they differ. A shell that must agree can
   `export BMAD_LOOP_STATE_DIR=<root>`.
 
-psmux cannot report inherited values, so there is no such note on psmux. Its registry is
-keyed on the state root, so a launcher under one root never reaches a server started under
-another.
+psmux (3.4.0 or newer) answers the same query, so the note fires on psmux too. psmux runs one
+server per session, so the inherited environment is that session's own server's. Its
+registry is keyed on the state root, so a launcher normally reaches only servers started
+under its own root; the note covers the cases where it does not.
 
 ## psmux (native Windows, experimental)
 

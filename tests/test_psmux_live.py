@@ -45,7 +45,7 @@ import pytest
 
 from bmad_loop import runs
 from bmad_loop.adapters import psmux_backend, tmux_base
-from bmad_loop.adapters.multiplexer import parked_screen
+from bmad_loop.adapters.multiplexer import UNSET, parked_screen
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.tui import launch
 
@@ -765,40 +765,59 @@ def test_adopted_a_live_registry_entry_survives_a_slow_connect(probe, psmux_data
         port_file.write_text(real, encoding="utf-8")
 
 
-def test_premise_show_environment_ignores_the_name(probe):
-    """`show-environment -t <session> NAME` answers with the session server's
-    whole listing at rc 0, whatever NAME is (psmux/psmux#775). A tmux-style
-    named query cannot be asked, which is why the psmux backend keeps the
-    seam's `inherited_env -> None` default (#660).
+def test_adopted_show_environment_answers_one_name_per_session_scope(probe):
+    """`show-environment` answers for the one NAME asked (psmux/psmux#775,
+    fixed in 3.4.0), which is what `PsmuxMultiplexer.inherited_env` parses:
+    `NAME=value` from the session scope, `-NAME` for a removal, `unknown
+    variable: NAME` at rc 1 for a miss, and a `-g -t =<session>` global scope
+    that is that session's server start environment. The reply echoes the name
+    as stored, so a differently-cased query must still match it.
 
-    Red means psmux answers for that one name, and a psmux `inherited_env`
-    can be adopted behind a `_LAST_UNSUPPORTED` bump to the last release
-    without the fix. Two adoption notes measured on the fixed build: an
-    untargeted `-g` answers from whichever session's server it lands on (one
-    server per session), and `-g PATH` answers `Path=...`, the spelling the
-    environment block stores.
+    Raw argv for the reply shape, then the backend verb itself. Red means
+    psmux went back to answering with a listing, and the backend's query
+    turns every answer into a fault (or a wrong value): the stale state-root
+    note goes silent on Windows.
     """
     mux, session, _ = probe
     name = "BMAD_LOOP_PROBE_SES"
-    stored = mux._run(["set-environment", "-t", session, name, "session-val"], check=False)
-    assert stored.returncode == 0, f"probe setup: set-environment failed: {stored.stderr.strip()!r}"
-    asked = mux._run(["show-environment", "-t", session, name], check=False)
-    assert (
-        asked.returncode == 0
-    ), f"probe setup: the named show-environment failed: {asked.stderr.strip()!r}"
-    lines = [line.strip() for line in asked.stdout.splitlines() if line.strip()]
-    # Either shape carries the line; its absence means the write never landed
-    # or the reply came from another server, and neither is the premise.
-    assert (
-        f"{name}=session-val" in lines
-    ), f"probe setup: the reply does not carry the stored variable: {lines!r}"
-    assert lines != [f"{name}=session-val"], (
-        "psmux now answers show-environment NAME for that one name (psmux/psmux#775) — "
-        "a psmux inherited_env can be adopted (#660) behind a _LAST_UNSUPPORTED bump to "
-        "the last release without the fix: send `show-environment -g -t =<session> NAME` "
-        "(an untargeted -g answers from whichever session's server it lands on) and match "
-        "the returned name case-insensitively (`-g PATH` answers `Path=...`)"
+    gone = "BMAD_LOOP_PROBE_RM"
+    for argv in (
+        ["set-environment", "-t", session, name, "session-val"],
+        ["set-environment", "-t", session, "-r", gone],
+    ):
+        stored = mux._run(argv, check=False)
+        assert stored.returncode == 0, f"probe setup: {argv!r} failed: {stored.stderr.strip()!r}"
+    inherited = os.environ.get("LOCALAPPDATA")
+    assert inherited, "probe setup: this process has no LOCALAPPDATA for the server to inherit"
+
+    asked = mux._run(["show-environment", "-t", f"={session}", name.lower()], check=False)
+    assert (asked.returncode, asked.stdout.splitlines()) == (0, [f"{name}=session-val"]), (
+        "psmux no longer answers a named session-scope show-environment for that one "
+        f"name (psmux/psmux#775): rc {asked.returncode}, {asked.stdout[:200]!r}"
     )
+    glob = mux._run(["show-environment", "-g", "-t", f"={session}", "localappdata"], check=False)
+    lines = glob.stdout.splitlines()
+    assert (
+        glob.returncode == 0
+        and len(lines) == 1
+        and lines[0].lower() == f"localappdata={inherited}".lower()
+    ), (
+        "psmux no longer answers a named, session-targeted `-g` query from that "
+        f"session's server start environment: rc {glob.returncode}, {glob.stdout[:200]!r}"
+    )
+
+    faults: list[str] = []
+    answers = {
+        query: mux.inherited_env(session, query, on_fault=faults.append)
+        for query in (name.lower(), gone, "BMAD_LOOP_PROBE_NOPE", "localappdata")
+    }
+    assert answers == {
+        name.lower(): "session-val",
+        gone: UNSET,
+        "BMAD_LOOP_PROBE_NOPE": UNSET,
+        "localappdata": inherited,
+    }, f"inherited_env misread psmux's show-environment replies: {answers!r}"
+    assert faults == [], f"inherited_env reported faults on a healthy session: {faults!r}"
 
 
 # ------------------------------------------------- adopted-behavior probes

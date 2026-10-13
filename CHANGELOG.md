@@ -18,10 +18,10 @@ breaking changes may land in a minor release.
 - Add the `plugins.trust` validate check: an ungranted, changed, enabled-but-ungranted,
   stale, missing or unreadable project plugin, or an unreadable grant store, is a problem
   (#496, #497).
-- Add psmux live-gate probes: a tripwire for psmux#775 (`show-environment NAME` ignores
-  the name), and ordinary-direction rows for psmux#774 (a case-only duplicate session is
-  refused), psmux#773 (a pane inherits the server's start `PATH`) and psmux#583 (a
-  `-`-leading option value is stored) (#879).
+- Add psmux live-gate rows for psmux#774 (a case-only duplicate session is refused),
+  psmux#773 (a pane inherits the server's start `PATH`), psmux#583 (a `-`-leading option
+  value is stored) and psmux#775 (`show-environment NAME` answers for that one name)
+  (#879).
 - Add `bmad-loop resolve <replay-run> --abandon` (DW-535): close a replay run that
   escalated because its story was finished meanwhile. Uncommitted tracked and
   untracked changes (plus the run's own spec/board/ledger copies), or commits on a
@@ -75,6 +75,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
+  value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
   gap's HTTP probe completed the session before the reader reconnected. The fake now
   holds the turn busy until the reconnect is up.
