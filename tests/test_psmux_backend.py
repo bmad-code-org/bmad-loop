@@ -1681,6 +1681,15 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
     assert [c[0][1] for c in rec_.calls] == ["kill-window"]
 
 
+# Shapes psmux's client argv normalizers rewrite or refuse before `set-option`
+# parses its value (psmux/psmux#795): `-X=value` reads back as `-X value` with
+# rc 0, and `-t…`/`--` fail rc 1, leaving a prior value in place.
+_PSMUX_ARGV_SHAPES = ["-x=foo", "-a=b c", "-Z=1", "-t", "-tx", "-t=foo", "-target", "--"]
+# Their measured neighbours, which psmux 3.4.0 stores verbatim: the refusal must
+# not widen to them.
+_DASH_SAFE_CONTROLS = ["-1=x", "--x=y", "-x=", "-a="]
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -1691,6 +1700,7 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
         "",  # empty write is a silent server-side no-op; unset exists for this
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
+        *_PSMUX_ARGV_SHAPES,
     ],
 )
 def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, value):
@@ -1721,6 +1731,7 @@ def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, v
         "x\u00a0y",  # non-ASCII whitespace no longer splits server-side (#536)
         "-u",  # a `-`-leading value is stored, not read as a flag (psmux/psmux#583)
         "-flag",
+        *_DASH_SAFE_CONTROLS,
     ],
 )
 def test_set_window_option_accepts_wire_safe_values(monkeypatch, value):
@@ -1747,6 +1758,7 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
         'C:\\a"b\\proj',  # `"` cannot survive the listing's one-quote-pair strip
         "bad\nline",  # the listing is parsed line-by-line
         "",  # an empty write is a silent server-side no-op
+        *_PSMUX_ARGV_SHAPES,
     ],
 )
 def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
@@ -1775,6 +1787,7 @@ def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, 
         "\\\\srv\\share name\\proj",  # spaced UNC — `\\` no longer collapses (#547)
         "C:\\Users\\O'Brien\\proj",  # unspaced `'` no longer opens a quote
         "-u",  # a `-`-leading value is stored, not read as a flag (psmux/psmux#583)
+        *_DASH_SAFE_CONTROLS,
     ],
 )
 def test_set_session_option_accepts_transportable_values(monkeypatch, value):

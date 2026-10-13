@@ -968,6 +968,37 @@ def test_adopted_a_dash_leading_option_value_is_stored(probe):
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "outcome"),
+    [
+        ("-x=foo", (0, "-x foo")),  # rewritten, and the write reports success
+        ("-tx", (1, "seed")),  # read as a target flag: refused, the seed stays
+        ("--", (1, "seed")),  # read as the end of options: same
+    ],
+)
+def test_premise_an_argv_flag_shaped_option_value_is_not_stored(probe, value, outcome):
+    # psmux's client argv normalizers rewrite `-X=value` to `-X value` and read
+    # `-t…`/`--` as flags before `set-option` sees its value (psmux/psmux#795).
+    # One row per family, so each retires on its own: red means psmux handles
+    # that shape differently now, and if it reads back verbatim,
+    # _transportable's matching refusal is droppable behind a floor bump. The
+    # write's rc is part of the premise, so a probe whose write never ran
+    # cannot pass on the seed alone.
+    mux, session, _ = probe
+    seeded = mux._run(["set-option", "-t", session, "@k", "seed"], check=False)
+    assert seeded.returncode == 0, f"probe setup: seeding @k failed: {seeded.stderr.strip()!r}"
+    written = mux._run(["set-option", "-t", session, "@k", value], check=False)
+    got = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
+    assert got.returncode == 0, f"probe setup: reading @k back failed: {got.stderr.strip()!r}"
+    observed = (written.returncode, got.stdout.strip())
+    assert observed == outcome, (
+        f"psmux now answers the option value {value!r} with (rc, read back) {observed!r}, "
+        f"not {outcome!r} (psmux/psmux#795) — if it reads back verbatim, "
+        "psmux_backend._transportable's refusal of that shape is droppable behind a "
+        "floor bump"
+    )
+
+
 def test_adopted_a_pane_inherits_the_servers_start_path(tmp_path):
     """A pane inherits the PATH of the process that started its server, and a
     bare `psmux` in the pane resolves through it (psmux/psmux#773); 3.3.8
