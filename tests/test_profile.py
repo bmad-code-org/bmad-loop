@@ -1,4 +1,5 @@
 import dataclasses
+import re
 from importlib import resources
 from pathlib import Path
 
@@ -498,6 +499,83 @@ def test_hookless_profile_cannot_set_a_session_id_flag(tmp_path):
     )
     with pytest.raises(ProfileError, match="must not set session_id_flag"):
         load_profiles(tmp_path)
+
+
+def test_subagent_transcript_dir_defaults_from_usage_parser(tmp_path):
+    """Unset derives from usage_parser: claude-jsonl's tree, nothing for the rest."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["claude"].subagent_transcript_dir is None
+    assert profiles["claude"].subagent_transcript_root == "{stem}/subagents"
+    assert profiles["mycli"].subagent_transcript_dir is None
+    assert profiles["mycli"].subagent_transcript_root == ""
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", 'subagent_transcript_dir = "{stem}/agents"\n[hooks]')
+    )
+    assert load_profiles(tmp_path)["mycli"].subagent_transcript_root == "{stem}/agents"
+
+
+def test_explicit_empty_subagent_transcript_dir_disables_the_default(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'usage_parser = "claude-jsonl"\nsubagent_transcript_dir = ""\n[hooks]'
+        )
+    )
+    mycli = load_profiles(tmp_path)["mycli"]
+    assert mycli.subagent_transcript_dir == ""
+    assert mycli.subagent_transcript_root == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_transcript_dir must be a string"),
+        ('["x"]', "subagent_transcript_dir must be a string"),
+        # value: relative, under the transcript's directory
+        ('"/abs/{stem}"', "relative path"),
+        ('"../{stem}"', "relative path"),
+        # value: exactly the {stem} placeholder, so sibling sessions never share it
+        ('"subagents"', "{stem}"),
+        ('"{sid}/x"', "{stem}"),
+        ('"{stem"', "not a valid template"),
+        ('"{stem!r}/x"', "{stem}"),
+        # value: a NUL would crash the tree walk with ValueError, not OSError
+        ('"{stem}\\u0000/x"', "NUL"),
+    ],
+)
+def test_malformed_subagent_transcript_dir_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_transcript_dir = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_transcript_dir(tmp_path):
+    """The tree extends the transcript idle notice, and a hookless profile has no
+    transcript path."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_transcript_dir = "{stem}/x"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_transcript_dir"):
+        load_profiles(tmp_path)
+
+
+def test_claude_subagent_root_matches_the_tally_anchor(tmp_path):
+    """The idle notice watches the same tree tokens.tally sums for claude."""
+    transcript = tmp_path / "x.jsonl"
+    template = get_profile("claude").subagent_transcript_root
+    rendered = transcript.parent / template.format(stem=transcript.stem)
+    assert rendered == transcript.parent / transcript.stem / "subagents"
 
 
 def test_render_prompt_passthrough_and_template():

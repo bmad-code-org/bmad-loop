@@ -116,7 +116,8 @@ class LimitsPolicy:
     # Stop/idle evidence, so productive work keeps extending it. Bounded by
     # session_timeout_min. Also the transcript-idle notice threshold (#680): the
     # journal's session-idle/session-active pair and the TUI's idle age fire when
-    # the live transcript sits still this long. 0 disables the launch timer (and
+    # the live transcript (and its profile's subagent transcript tree) sits still
+    # this long. 0 disables the launch timer (and
     # the idle notice) while retaining fail-fast handling when a turn ends without
     # a terminal spec/result.
     dev_stall_grace_s: int = 600

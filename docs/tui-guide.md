@@ -176,8 +176,10 @@ The **agent line** names who is driving. While a session is open it reads
 `agent <name> · <model> · <role>` (`model` omitted when the CLI profile's
 default is used; `role` is the session's stage, such as `dev`, `review`,
 `triage` or `retro`), with a yellow
-`· idle <age>` once the session's transcript has been quiet past
-`limits.dev_stall_grace_s`. Between sessions it shows the run's configured
+`· idle <age>` once the session's transcript (and any subagent transcripts its
+profile declares) has been quiet past
+`limits.dev_stall_grace_s`, followed by `· in <tool>` when the session is
+waiting on a tool call (`unknown` if the transcript could not be read). Between sessions it shows the run's configured
 adapters from its policy snapshot. A run with no snapshot shows no agent line;
 an unreadable session identity shows `agent unreadable — <fault>`.
 

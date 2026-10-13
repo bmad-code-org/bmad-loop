@@ -33,6 +33,7 @@ profile state a TOML author would have been refused.
 from __future__ import annotations
 
 import importlib.metadata
+import string
 import tomllib
 from dataclasses import dataclass, field, replace
 from importlib import resources
@@ -51,6 +52,11 @@ from ..policy import PROFILE_ALIASES
 from .entrypoints import record_load_error
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
+# The subagent transcript tree a usage parser's CLI writes beside its session
+# transcript, for profiles that leave `subagent_transcript_dir` unset. Mirrors
+# the subagent anchor tokens.tally already sums (`<stem>/subagents`, walked
+# recursively); "{stem}" is the transcript's filename stem.
+SUBAGENT_TRANSCRIPT_DIR_DEFAULTS = {"claude-jsonl": "{stem}/subagents"}
 HOOK_DIALECTS = {
     "claude-settings-json",
     "codex-hooks-json",
@@ -252,6 +258,13 @@ class CLIProfile:
     # An argv flag, so it is part of runsetup.config_digest's launch surface.
     # APPENDED after workspace_trust for the same positional-compatibility reason.
     session_id_flag: str = ""
+    # Template, relative to the transcript's directory, of the subagent transcript
+    # tree the CLI writes beside the session transcript ("{stem}" = the
+    # transcript's filename stem). The idle notice stat-walks it recursively and
+    # counts its writes as session activity — never read, never usage. None =
+    # derive from usage_parser (SUBAGENT_TRANSCRIPT_DIR_DEFAULTS); "" = off.
+    # APPENDED after session_id_flag for the same positional-compatibility reason.
+    subagent_transcript_dir: str | None = None
 
     @property
     def hookless(self) -> bool:
@@ -259,6 +272,14 @@ class CLIProfile:
         instead of via hook scripts — no hook config exists to register, merge,
         validate, or git-exclude."""
         return self.hooks.dialect == "none"
+
+    @property
+    def subagent_transcript_root(self) -> str:
+        """The effective subagent-tree template: the declared
+        `subagent_transcript_dir`, else the usage parser's default, else "" (off)."""
+        if self.subagent_transcript_dir is not None:
+            return self.subagent_transcript_dir
+        return SUBAGENT_TRANSCRIPT_DIR_DEFAULTS.get(self.usage_parser, "")
 
     def render_prompt(self, prompt: str) -> str:
         """Render the engine's canonical "/skill args" prompt for this CLI.
@@ -449,6 +470,39 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 "it pins hook-event attribution, and a hookless profile has no hook events"
             )
 
+    # Only an explicit non-empty template is checked: None derives from a known
+    # usage_parser, "" is off. "{stem}" is required — a tree shared by sibling
+    # sessions would let another session's writes mask this one's idleness — and
+    # the rendered path must stay under the transcript's directory.
+    subdir = profile.subagent_transcript_dir
+    if subdir:
+        # TOML accepts a "\u0000" escape; the rendered path would make the
+        # tree walk raise ValueError, not the OSError it degrades.
+        if "\0" in subdir:
+            raise fail(f"subagent_transcript_dir must not contain a NUL character: got {subdir!r}")
+        try:
+            parts = list(string.Formatter().parse(subdir))
+        except ValueError as e:
+            raise fail(f"subagent_transcript_dir is not a valid template: {e}: got {subdir!r}")
+        fields = [(name, spec, conv) for _, name, spec, conv in parts if name is not None]
+        if not fields or any(name != "stem" or spec or conv for name, spec, conv in fields):
+            raise fail(
+                'subagent_transcript_dir must use exactly the placeholder "{stem}" (the '
+                "transcript's filename stem), with no other field, format spec or "
+                f"conversion: got {subdir!r}"
+            )
+        if is_absolute_path(subdir) or has_parent_ref(subdir):
+            raise fail(
+                "subagent_transcript_dir must be a relative path under the transcript's "
+                f"directory, with no '..': got {subdir!r}"
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set subagent_transcript_dir: '
+                "it extends the transcript idle notice, and a hookless profile has no "
+                "transcript path"
+            )
+
     if profile.usage_parser not in USAGE_PARSERS:
         raise fail(
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
@@ -621,6 +675,14 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not isinstance(raw_session_id_flag, str):
         raise fail(f"session_id_flag must be a string: got {type(raw_session_id_flag).__name__}")
 
+    # None (absent) is meaningful — it derives the default from usage_parser — so
+    # it is kept, and anything present must already be a string.
+    raw_subagent_dir = doc.get("subagent_transcript_dir")
+    if raw_subagent_dir is not None and not isinstance(raw_subagent_dir, str):
+        raise fail(
+            f"subagent_transcript_dir must be a string: got {type(raw_subagent_dir).__name__}"
+        )
+
     profile = CLIProfile(
         name=str(doc.get("name", "")).strip(),
         binary=str(doc.get("binary", "")).strip(),
@@ -652,6 +714,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         env_fault_patterns=str_list("env_fault_patterns"),
         parked_prompt_patterns=str_list("parked_prompt_patterns"),
         workspace_trust=workspace_trust,
+        subagent_transcript_dir=raw_subagent_dir,
     )
     _validate_profile(profile, source)
     return profile

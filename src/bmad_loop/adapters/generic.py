@@ -8,7 +8,8 @@ drive the wait loop (only tee'd for human debugging), though its *growth*
 (mtime/size, never the bytes — see ``_log_activity_key``) is read as a liveness
 signal to re-arm the dev-stall grace window and, on a separate timeline, as the
 #727 no-work verdict (``SessionResult.produced_work`` — see ``_work_verdict``);
-the live transcript's growth is likewise stat'ed, never parsed, for the #680
+the live transcript's growth — and its profile's subagent transcript tree's
+(``subagent_transcript_dir``) — is likewise stat'ed, never parsed, for the #680
 idle notice (``_sample_transcript_idle``). The one exception is post-mortem:
 after the verdict and reconcile have settled, a single tail read of the log
 classifies a transport-failure environment fault (#194, see
@@ -150,7 +151,17 @@ class _IdleTracker:
     `heartbeat.json` reports), None until the first sample. `open_since` is the
     wall time the currently open idle stretch began — the `since_ts` its
     `session-idle` carried — or None between stretches: the latch that makes the
-    pair one-per-stretch."""
+    pair one-per-stretch.
+
+    `last_key` stays the PARENT transcript's key alone even when the profile
+    declares a subagent tree: the wait loop's `sample_transcript` reads
+    `last_key[1]` as the parent's byte size — the #727 growth test and the scan
+    offset for `_transcript_has_assistant_activity` — so a folded key would credit
+    subagent bytes as parent growth and scan from a wrong offset. The tree gets
+    its own `sub_key`, OR-ed only into the idle clock's change test.
+
+    `tool_scan_failures` is the streak of `session-idle` `in_tool` reads that
+    raised; it never moves the clock, only the `tool-scan-*` crumbs."""
 
     # The transcript path the samples below belong to. A later hook event that
     # names a DIFFERENT path rebaselines the tracker (`_sample_transcript_idle`):
@@ -168,6 +179,19 @@ class _IdleTracker:
     # created). The next successful sample is a change from absence, not a
     # pre-existing file's baseline.
     seen_absent: bool = False
+    # The subagent tree's (count, total_bytes, newest_mtime_ns) at the last clean
+    # walk; None = not walked on this path yet, or the profile declares no tree.
+    # Reset on a re-point; kept through a failed walk, so writes made during a
+    # fault count as movement once the walk recovers.
+    sub_key: tuple[int, int, int] | None = None
+    # The running streak of subagent-tree walks that raised: crumbed at its
+    # transitions (`subagent-scan-failed` / `subagent-scan-recovered`). NOT reset
+    # on a re-point, so a streak open across one still gets its recovery crumb.
+    sub_scan_failures: int = 0
+    # The running streak of `in_tool` reads that raised (`_idle_tool_label`):
+    # crumbed at its transitions (`tool-scan-failed` / `tool-scan-recovered`).
+    # NOT reset on a re-point, for the same reason as `sub_scan_failures`.
+    tool_scan_failures: int = 0
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -308,6 +332,95 @@ def _is_regular_file(path: str | None) -> bool:
         return stat.S_ISREG(Path(path).stat().st_mode)
     except (OSError, ValueError):
         return False
+
+
+def _subagent_tree_files(root: Path) -> list[tuple[Path, os.stat_result]]:
+    """Every subagent transcript (``*.jsonl``) under ``root``, recursively, with
+    its stat — the stat-only walk behind the idle notice's subagent fold.
+
+    Recursive because workflow agents nest under ``workflows/wf_<id>/`` (the
+    reason ``tokens.tally`` rglobs the same anchor). Symlinks are neither
+    descended nor counted; each file is ``os.stat``'ed by path (a cached
+    ``DirEntry.stat()`` can be stale on Windows) and never opened, so a FIFO
+    cannot block the wait loop. ``FileNotFoundError``/``NotADirectoryError`` —
+    a root or entry that is not there, or not a directory — are skipped, so a
+    missing tree is empty; every other ``OSError`` propagates for the caller to
+    crumb. Uncapped: a cap would silently truncate the signal."""
+    files: list[tuple[Path, os.stat_result]] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(Path(entry.path))
+            elif entry.name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
+                try:
+                    st = os.stat(entry.path)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                files.append((Path(entry.path), st))
+    return files
+
+
+def _subagent_tree_key(root: Path) -> tuple[int, int, int]:
+    """Activity signature of a subagent transcript tree: (count, total_bytes,
+    newest_mtime_ns) over `_subagent_tree_files`; (0, 0, 0) when it is absent. An
+    aggregate rather than the newest file's key, so an append to a non-newest
+    file inside the same mtime tick still moves `total_bytes`."""
+    files = _subagent_tree_files(root)
+    return (
+        len(files),
+        sum(st.st_size for _, st in files),
+        max((st.st_mtime_ns for _, st in files), default=0),
+    )
+
+
+# The tool names `session-idle`'s `in_tool` may carry verbatim: Claude Code's
+# built-ins. A closed slug chosen by code, so the journal never carries
+# transcript text or MCP server names — `_idle_tool_slug` maps every other name
+# to "mcp" or "other".
+_IDLE_TOOL_SLUGS = frozenset(
+    {
+        "Bash",
+        "PowerShell",
+        "Agent",
+        "Task",
+        "Workflow",
+        "SendMessage",
+        "TaskOutput",
+        "TaskStop",
+        "Monitor",
+        "AskUserQuestion",
+        "ExitPlanMode",
+        "EnterPlanMode",
+        "WebFetch",
+        "WebSearch",
+        "Read",
+        "Write",
+        "Edit",
+        "NotebookEdit",
+        "Grep",
+        "Glob",
+        "Skill",
+        "ToolSearch",
+    }
+)
+
+
+def _idle_tool_slug(name: str) -> str:
+    """The closed `in_tool` slug for a transcript's tool name: a built-in in
+    `_IDLE_TOOL_SLUGS` passes through, an `mcp__<server>__<tool>` name is "mcp"
+    (the server name stays out of the journal), anything else is "other"."""
+    if name in _IDLE_TOOL_SLUGS:
+        return name
+    if name.startswith("mcp__"):
+        return "mcp"
+    return "other"
 
 
 class _ResultFileMixin:
@@ -535,6 +648,70 @@ class _ResultFileMixin:
                             ):
                                 return True
         return False
+
+    @staticmethod
+    def _open_tool_call(paths: list[Path]) -> str | None:
+        """The raw name of the newest unanswered Claude tool call across
+        `paths`, or None when every call has its result.
+
+        A `tool_use` content item opens a call under its `id`; a `tool_result`
+        whose `tool_use_id` names it closes it in EVERY file, whatever the read
+        order: a forked subagent's transcript copies the parent's still-open
+        `Agent` call under the same id, and the parent's later result must close
+        that copy too. Of the calls still open, the one
+        whose entry carries the newest `timestamp` wins, across ALL files
+        (ISO-8601 strings compare chronologically; a missing one sorts oldest), so
+        a parent's open `Agent` loses to its subagent's later open `Bash`: the
+        innermost wait. Content-reading by design, unlike the stat-only idle
+        clock — only `_idle_tool_label` calls it, once per opened stretch.
+        Tolerant like the usage parsers: a torn, undecodable or non-dict line is
+        skipped. A path that is not a regular file is skipped (a FIFO would
+        block the wait loop): `is_file` filters it before the open, and the
+        non-blocking open is re-checked with `fstat`, so one swapped in between
+        is skipped too. An ``OSError`` propagates for the caller to crumb."""
+        calls: dict[str, tuple[str, str]] = {}
+        closed: set[str] = set()
+        for path in paths:
+            if not path.is_file():
+                continue
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    continue
+                while line := stream.readline():
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    message = entry.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if not isinstance(content, list):
+                        continue
+                    timestamp = entry.get("timestamp")
+                    if not isinstance(timestamp, str):
+                        timestamp = ""
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "tool_use":
+                            call_id = item.get("id")
+                            name = item.get("name")
+                            if isinstance(call_id, str):
+                                calls[call_id] = (
+                                    name if isinstance(name, str) else "",
+                                    timestamp,
+                                )
+                        elif item.get("type") == "tool_result":
+                            call_id = item.get("tool_use_id")
+                            if isinstance(call_id, str):
+                                closed.add(call_id)
+        open_calls = {call_id: call for call_id, call in calls.items() if call_id not in closed}
+        if not open_calls:
+            return None
+        name, _ = max(open_calls.values(), key=lambda call: call[1])
+        return name
 
     def _session_vanished(self, task_id: str) -> bool:
         """Whether the whole multiplexer session is gone, asked only once a
@@ -1124,9 +1301,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     activity_seen = True
                 frame_key = tick_key
 
-        # Idle detection (#680): the live transcript's (mtime_ns, size), sampled on
-        # the heartbeat cadence from the first tick that knows `transcript_path`
-        # — see `_sample_transcript_idle`. Observes only: nothing here nudges,
+        # Idle detection (#680): the live transcript's (mtime_ns, size) — plus the
+        # profile's subagent transcript tree, whose writes also count as activity
+        # — sampled on the heartbeat cadence from the first tick that knows
+        # `transcript_path`; see `_sample_transcript_idle`. Observes only: nothing here nudges,
         # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
         # neither consulted nor touched.
         idle = _IdleTracker()
@@ -1312,8 +1490,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "stall_nudges_sent": stall_nudges_sent,
                         # stall nudges whose send raised (DW-449)
                         "stall_nudges_failed": stall_nudges_failed,
-                        # seconds since the live transcript last changed (#680);
-                        # null until a hook event has named the transcript.
+                        # seconds since the live transcript (or its profile's
+                        # subagent tree) last changed (#680); null until a hook
+                        # event has named the transcript.
                         "transcript_idle_s": idle.idle_s,
                         # the running liveness-probe failure streak (DW-447)
                         "probe_failures": probe_failures,
@@ -1901,12 +2080,90 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         log also grows for a spinner repaint. Deliberately never parsed:
         `_sample_weighted_usage` yields no sample for `usage_parser = "none"`, and idle
         detection has to work for that profile too. None is "no sample", never
-        "idle" — the caller skips the tick."""
+        "idle" — the caller skips the tick. Parent-only by design: the subagent
+        tree is keyed separately (`_sample_subagent_tree`), because the wait
+        loop reads this key's size as the #727 scan offset."""
         try:
             st = Path(transcript_path).stat()
         except OSError:
             return None
         return (st.st_mtime_ns, st.st_size)
+
+    def _subagent_root(self, transcript_path: str) -> Path | None:
+        """The subagent transcript tree the profile declares beside
+        `transcript_path` (`CLIProfile.subagent_transcript_root`, "{stem}" = the
+        transcript's filename stem), or None when the profile declares none or the
+        transcript is not a regular file — a FIFO or directory has no tree."""
+        template = self.profile.subagent_transcript_root
+        if not template or not _is_regular_file(transcript_path):
+            return None
+        path = Path(transcript_path)
+        return path.parent / template.format(stem=path.stem)
+
+    def _sample_subagent_tree(
+        self, task_id: str, transcript_path: str, idle: _IdleTracker
+    ) -> tuple[int, int, int] | None:
+        """The subagent tree's `_subagent_tree_key` this tick, or None when there
+        is no tree to watch or the walk raised. A raising walk degrades the tick
+        to parent-only (the pre-subagent behaviour) and is crumbed at the streak's
+        transitions, as the wait loop's transcript scan is:
+        `subagent-scan-failed` (`path`, `error`) at failure 1,
+        `subagent-scan-recovered` (`failures`) at the next clean walk."""
+        root = self._subagent_root(transcript_path)
+        if root is None:
+            return None
+        try:
+            key = _subagent_tree_key(root)
+        except OSError as e:
+            idle.sub_scan_failures += 1
+            if idle.sub_scan_failures == 1:
+                self._note_lifecycle(
+                    task_id,
+                    "subagent-scan-failed",
+                    path=str(root),
+                    error=f"{type(e).__name__}: {e}",
+                )
+            return None
+        if idle.sub_scan_failures:
+            self._note_lifecycle(
+                task_id, "subagent-scan-recovered", failures=idle.sub_scan_failures
+            )
+            idle.sub_scan_failures = 0
+        return key
+
+    def _idle_tool_label(
+        self, task_id: str, transcript_path: str, idle: _IdleTracker
+    ) -> str | None:
+        """The `in_tool` slug a `session-idle` about to open carries: what the
+        silence is waiting on, read once per stretch. A silent transcript holds
+        still, so the state read here holds for the whole stretch — a
+        `tool_result` landing moves the file and closes it.
+
+        None (the field is omitted) unless the profile parses `claude-jsonl`:
+        the tool_use/tool_result shape is Claude's, so an absent field means
+        "this CLI cannot tell". Otherwise `_idle_tool_slug` of the newest open
+        call across the parent and its subagent tree (`_open_tool_call`), or
+        "none" when nothing is open. A read or tree-walk fault is "unknown" —
+        never folded into "none" — crumbed at the streak's transitions:
+        `tool-scan-failed` (`error`) at failure 1, `tool-scan-recovered`
+        (`failures`) at the next clean read."""
+        if self.profile.usage_parser != "claude-jsonl":
+            return None
+        try:
+            paths = [Path(transcript_path)]
+            root = self._subagent_root(transcript_path)
+            if root is not None:
+                paths.extend(path for path, _ in _subagent_tree_files(root))
+            name = self._open_tool_call(paths)
+        except OSError as e:
+            idle.tool_scan_failures += 1
+            if idle.tool_scan_failures == 1:
+                self._note_lifecycle(task_id, "tool-scan-failed", error=f"{type(e).__name__}: {e}")
+            return "unknown"
+        if idle.tool_scan_failures:
+            self._note_lifecycle(task_id, "tool-scan-recovered", failures=idle.tool_scan_failures)
+            idle.tool_scan_failures = 0
+        return "none" if name is None else _idle_tool_slug(name)
 
     def _sample_transcript_idle(
         self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
@@ -1929,7 +2186,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         attached (`resolve.run_session`, `probe`, fixtures) means no events; the
         age is still measured for `heartbeat.json`. Every write is best-effort —
         an unwritable journal must not end a session that is, by this very
-        evidence, alive."""
+        evidence, alive.
+
+        The profile's subagent transcript tree (`_sample_subagent_tree`) counts
+        too: a parent blocked on a foreground subagent writes nothing to its own
+        transcript, so a tree that moved since the last clean walk is a change
+        like a parent key that moved. Its first walk on a path is a baseline. A
+        walk that raises degrades the tick to parent-only, crumbed as
+        `subagent-scan-failed` / `subagent-scan-recovered`; `idle.last_key` stays
+        the parent's key either way.
+
+        On a `claude-jsonl` profile, `session-idle` also carries `in_tool`
+        (`_idle_tool_label`), read once as the stretch opens: the closed slug of
+        the unanswered tool call the silence is waiting on — a Claude built-in
+        name, "mcp", "other", "none" (nothing open) or "unknown" (the read
+        raised, crumbed as `tool-scan-failed` / `tool-scan-recovered`). It
+        labels, never suppresses: a running tool and a hung one leave identical
+        transcripts. Other parsers omit the field."""
 
         def flush_active() -> None:
             if idle.pending_active_s is None or self.journal is None:
@@ -1954,13 +2227,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             idle.idle_s = None
             idle.open_since = None
             idle.seen_absent = False
+            idle.sub_key = None
         key = self._transcript_activity_key(transcript_path)
         flush_active()
         if key is None:
             if idle.last_key is None:
                 idle.seen_absent = True
             return
-        if key != idle.last_key:
+        sub = self._sample_subagent_tree(task_id, transcript_path, idle)
+        sub_moved = sub is not None and idle.sub_key is not None and sub != idle.sub_key
+        if sub is not None:
+            idle.sub_key = sub
+        if key != idle.last_key or sub_moved:
             if idle.open_since is not None:
                 idle.pending_active_s = round(now - idle.last_change_mono, 3)
                 flush_active()
@@ -1976,6 +2254,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             and self._idle_threshold_s > 0
             and idle.idle_s >= self._idle_threshold_s
         ):
+            label = self._idle_tool_label(task_id, transcript_path, idle)
+            extra = {} if label is None else {"in_tool": label}
             try:
                 self.journal.append(
                     "session-idle",
@@ -1983,6 +2263,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     idle_s=idle.idle_s,
                     since_ts=idle.last_change_wall,
                     threshold_s=self._idle_threshold_s,
+                    **extra,
                 )
             except OSError:
                 pass

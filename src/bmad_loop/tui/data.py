@@ -724,6 +724,26 @@ def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str)
     return since
 
 
+def _idle_tool(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> str | None:
+    """The tool call the open session's current idle stretch is waiting on, or
+    None: the string `in_tool` of the last `session-idle` for `task_id` after
+    index `start` — a closed slug the adapter chose — unless a later
+    `session-active` for the same task closed the stretch. None too when that
+    `session-idle` carries no `in_tool` (a CLI that cannot tell) or a non-string
+    one. `_idle_since`'s walk; never raises on a malformed entry."""
+    tool: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "session-idle":
+            raw = entry.get("in_tool")
+            tool = raw if isinstance(raw, str) else None
+        elif kind == "session-active":
+            tool = None
+    return tool
+
+
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
     """Task whose agent session is currently open: the last session-start
     without a later session-end. Falls back to the newest file in logs/ —
@@ -775,6 +795,12 @@ class ActiveAgent:
     # while the transcript is moving. The header renders `· idle <age>` from it
     # only when set. APPENDED, so every positional construction stays valid.
     idle_since: float | None = None
+    # The tool call that open idle stretch is waiting on — its `session-idle`'s
+    # `in_tool` slug (a Claude built-in name, `mcp`, `other`, `none`, `unknown`)
+    # — or None when no stretch is open or the CLI cannot tell. The header
+    # appends `· in <tool>` from it unless it is `none`. APPENDED, like
+    # `idle_since`.
+    idle_tool: str | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -837,6 +863,7 @@ def active_agent(
             name=name,
             model=model,
             idle_since=_idle_since(journal_entries, start_index, task_id),
+            idle_tool=_idle_tool(journal_entries, start_index, task_id),
         )
     except _MALFORMED_AGENT_FAULTS as e:
         return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")
