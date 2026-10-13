@@ -544,6 +544,8 @@ def test_explicit_empty_subagent_transcript_dir_disables_the_default(tmp_path):
         ('"{sid}/x"', "{stem}"),
         ('"{stem"', "not a valid template"),
         ('"{stem!r}/x"', "{stem}"),
+        # value: a NUL would crash the tree walk with ValueError, not OSError
+        ('"{stem}\\u0000/x"', "NUL"),
     ],
 )
 def test_malformed_subagent_transcript_dir_is_a_profile_error(tmp_path, value, match):

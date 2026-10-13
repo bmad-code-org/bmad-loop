@@ -11352,15 +11352,50 @@ def test_open_tool_call_skips_a_fifo(tmp_path, monkeypatch):
     os.mkfifo(fifo)
     regular = tmp_path / "transcript.jsonl"
     regular.write_bytes(_tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
-    original_open = Path.open
+    original_open = os.open
 
     def guarded_open(path, *args, **kwargs):
         if path == fifo:
             raise AssertionError("FIFO would block on open")
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(os, "open", guarded_open)
     assert generic.GenericAdapter._open_tool_call([regular, fifo]) == "Bash"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes unavailable")
+def test_open_tool_call_skips_a_fifo_swapped_in_after_the_check(tmp_path, monkeypatch):
+    """A FIFO that replaces a transcript between the `is_file` check and the
+    open neither blocks the open nor gets read: the open is non-blocking and
+    the opened descriptor is re-checked with `fstat`.
+
+    ABLATION: drop O_NONBLOCK and the open-flags assertion fails; drop the
+    `fstat` check and the FIFO's buffered "Write" call wins."""
+    fifo = tmp_path / "agent.jsonl"
+    os.mkfifo(fifo)
+    regular = tmp_path / "transcript.jsonl"
+    regular.write_bytes(_tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    original_is_file = Path.is_file
+    original_open = os.open
+
+    def raced_is_file(path):
+        return True if path == fifo else original_is_file(path)
+
+    def nonblocking_open(path, flags, *args, **kwargs):
+        if path == fifo:
+            assert flags & os.O_NONBLOCK, "FIFO would block on open"
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", raced_is_file)
+    monkeypatch.setattr(os, "open", nonblocking_open)
+    reader = original_open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    writer = original_open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(writer, _tool_use("t2", "Write", "2026-01-01T00:00:02Z"))
+        assert generic.GenericAdapter._open_tool_call([regular, fifo]) == "Bash"
+    finally:
+        os.close(writer)
+        os.close(reader)
 
 
 def test_open_tool_call_propagates_a_read_fault(tmp_path, monkeypatch):
@@ -11370,14 +11405,14 @@ def test_open_tool_call_propagates_a_read_fault(tmp_path, monkeypatch):
     ABLATION: catch OSError in the reader and this returns None."""
     path = tmp_path / "t.jsonl"
     path.write_bytes(_tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
-    original_open = Path.open
+    original_open = os.open
 
     def failing_open(p, *args, **kwargs):
         if p == path:
             raise PermissionError(13, "Permission denied")
         return original_open(p, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "open", failing_open)
     with pytest.raises(PermissionError):
         generic.GenericAdapter._open_tool_call([path])
 

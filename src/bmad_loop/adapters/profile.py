@@ -476,6 +476,10 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     # the rendered path must stay under the transcript's directory.
     subdir = profile.subagent_transcript_dir
     if subdir:
+        # TOML accepts a "\u0000" escape; the rendered path would make the
+        # tree walk raise ValueError, not the OSError it degrades.
+        if "\0" in subdir:
+            raise fail(f"subagent_transcript_dir must not contain a NUL character: got {subdir!r}")
         try:
             parts = list(string.Formatter().parse(subdir))
         except ValueError as e:

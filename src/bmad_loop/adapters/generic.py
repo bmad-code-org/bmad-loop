@@ -665,15 +665,19 @@ class _ResultFileMixin:
         innermost wait. Content-reading by design, unlike the stat-only idle
         clock — only `_idle_tool_label` calls it, once per opened stretch.
         Tolerant like the usage parsers: a torn, undecodable or non-dict line is
-        skipped. A path that is not a regular file is skipped unopened (a FIFO
-        would block the wait loop). An ``OSError`` propagates for the caller to
-        crumb."""
+        skipped. A path that is not a regular file is skipped (a FIFO would
+        block the wait loop): `is_file` filters it before the open, and the
+        non-blocking open is re-checked with `fstat`, so one swapped in between
+        is skipped too. An ``OSError`` propagates for the caller to crumb."""
         calls: dict[str, tuple[str, str]] = {}
         closed: set[str] = set()
         for path in paths:
             if not path.is_file():
                 continue
-            with path.open("rb") as stream:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    continue
                 while line := stream.readline():
                     try:
                         entry = json.loads(line)
