@@ -72,6 +72,7 @@ from .model import (
     RunState,
     SessionRecord,
     StoryTask,
+    TokenUsage,
     VerifyOutcome,
     env_fault_site_reverifiable,
     result_mapping,
@@ -7988,7 +7989,7 @@ class Engine:
 
     # ------------------------------------------------------------- helpers
 
-    def _session_end_extras(self, result: SessionResult) -> dict:
+    def _session_end_extras(self, result: SessionResult, usage: TokenUsage | None = None) -> dict:
         """Timeout forensics for the session-end entry (#157). ``teardown_s``
         is the timeout-fire → journal gap — the window the incident showed
         could silently stretch for hours. A tripped session-budget guard
@@ -8044,6 +8045,10 @@ class Engine:
             extras["resultless_verdict"] = result.resultless_verdict
         if result.resultless_detail:
             extras["resultless_detail"] = result.resultless_detail
+        # skipped usage sources: same present-only convention, so a grep finds
+        # exactly the sessions whose `tokens` is a lower bound.
+        if usage is not None and usage.unread:
+            extras["usage_unread"] = list(usage.unread)
         return extras
 
     @staticmethod
@@ -8438,7 +8443,7 @@ class Engine:
                 tokens_weighted=(
                     usage.weighted_total(self.state.cache_read_weight()) if usage else None
                 ),
-                **self._session_end_extras(result),
+                **self._session_end_extras(result, usage),
             )
             ended = True
         finally:

@@ -371,25 +371,34 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
     `session_id`), iterated to a fixpoint. One thread written to two files
     counts once, from the later file. A child's usage makes the session
     tracked even when the parent reports none. An unreadable sibling
-    (OSError/ValueError) is skipped; parent errors propagate as before, and
-    None still means no usage signal anywhere."""
+    (OSError/ValueError) is skipped and named in `TokenUsage.unread`, as are
+    a failed sibling scan and an unreadable parent first line (both leave the
+    children uncounted). Parent body errors propagate as before, and None
+    still means no usage signal anywhere: a skip can only qualify a figure
+    that exists. The budget guard's live samples ignore `unread`, since a
+    child mid-write can tear a UTF-8 read; the engine's post-session read
+    journals it."""
     parent_totals = _codex_rollout_total(transcript_path)
+    unread: list[str] = []
     try:
         parent_meta = _codex_meta(transcript_path)
-    except OSError:
+    except OSError as e:
         parent_meta = None
+        unread.append(f"{transcript_path.name}: {type(e).__name__}")
     totals: list[dict[str, Any]] = [] if parent_totals is None else [parent_totals]
     if parent_meta is not None:
         root = parent_meta[0]
         metas: dict[str, _CodexMeta] = {}
         try:
             candidates = _codex_sibling_candidates(transcript_path)
-        except OSError:
+        except OSError as e:
             candidates = []
+            unread.append(f"{transcript_path.parent.name}/: {type(e).__name__}")
         for path in candidates:
             try:
                 meta = _codex_meta(path)
-            except OSError:
+            except OSError as e:
+                unread.append(f"{path.name}: {type(e).__name__}")
                 continue
             if meta is not None and meta[0] != root:
                 metas[str(path)] = meta
@@ -408,13 +417,14 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
         for child in by_thread.values():
             try:
                 child_totals = _codex_rollout_total(child)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
+                unread.append(f"{child.name}: {type(e).__name__}")
                 continue
             if child_totals is not None:
                 totals.append(child_totals)
     if not totals:
         return None
-    usage = TokenUsage()
+    usage = TokenUsage(unread=tuple(unread))
     for each in totals:
         usage.add(_codex_usage(each))
     return usage

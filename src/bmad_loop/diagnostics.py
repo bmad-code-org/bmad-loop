@@ -372,6 +372,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # free-text rule above (it is a `GitError` string quoting git's own stderr),
         # not this identifier-shape argument — same set, different rationale.
         "repo",
+        # The usage sources a parser skipped as unreadable (`session-end`), as
+        # "<file name>: <ExcType>". A codex rollout's file name embeds the session
+        # id, so the list reduces to a presence flag here; the operator reads the
+        # names from the raw journal.
+        "usage_unread",
         # An absolute host path naming the folder a sentinel's upstream correction has
         # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
         # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and

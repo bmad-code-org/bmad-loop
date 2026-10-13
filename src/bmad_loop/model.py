@@ -120,6 +120,12 @@ class TokenUsage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Sources the parser skipped as unreadable, so the totals above are a lower
+    # bound. Each entry is "<file name>: <ExcType>": no directory and no message,
+    # because a home path or quoted transcript text must not reach the journal.
+    # Diagnostic only, and left out of equality, `add` and `to_dict`. The engine
+    # journals it on `session-end` as `usage_unread`. APPENDED.
+    unread: tuple[str, ...] = field(default=(), compare=False)
 
     def add(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens

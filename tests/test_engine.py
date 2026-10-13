@@ -15365,6 +15365,33 @@ def test_session_end_extras_omits_resultless_when_unset(project):
     assert all("resultless_verdict" not in e and "resultless_detail" not in e for e in ends)
 
 
+def test_session_end_carries_usage_unread(project):
+    """A usage parser that skipped unreadable sources leaves them on
+    `session-end`, so a lower-bound `tokens` is visible as one.
+
+    ABLATION: delete the `usage_unread` block in `_session_end_extras` and the
+    assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    unread = ("rollout-2026-10-01T10-06-00-x.jsonl: UnicodeDecodeError",)
+    adapter.usage_per_session = TokenUsage(input_tokens=10, output_tokens=5, unread=unread)
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2
+    assert all(e["usage_unread"] == list(unread) for e in ends)
+    assert all(e["tokens"] == 15 for e in ends)
+
+
+def test_session_end_omits_usage_unread_when_clean(project):
+    """Present-only, the `parked` convention."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="timeout")])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("usage_unread" not in e for e in ends)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same

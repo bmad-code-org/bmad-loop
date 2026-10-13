@@ -590,10 +590,11 @@ def test_codex_tally_parent_thread_chain_without_session_id(tmp_path):
 
 
 def test_codex_tally_skips_unreadable_sibling(tmp_path):
-    """A child whose body cannot be decoded is skipped; the readable child and
-    the parent still count.
+    """A child whose body cannot be decoded is skipped and named in `unread`;
+    the readable child and the parent still count.
 
-    Ablation: let the child's read error propagate and the tally raises."""
+    Ablation: let the child's read error propagate and the tally raises; drop
+    the child's `unread` append and the `unread` assertion fails."""
     parent = _codex_thread(
         tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
     )
@@ -612,7 +613,45 @@ def test_codex_tally_skips_unreadable_sibling(tmp_path):
     with broken.open("ab") as f:
         f.write(b'{"type": "event_msg", "payload": "\xff\xfe"}\n')
 
-    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=15, output_tokens=6)
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=15, output_tokens=6)
+    assert usage is not None and usage.unread == (f"{broken.name}: UnicodeDecodeError",)
+
+
+def test_codex_tally_names_sibling_whose_first_line_fails(tmp_path, monkeypatch):
+    """A sibling whose session_meta cannot be read may be a child, so it is
+    named in `unread` too, by file name only: no directory reaches the journal.
+
+    Ablation: drop the candidate's `unread` append and the assertion fails."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    locked = _codex_thread(
+        tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, usage=(5, 0, 5)
+    )
+    real_read = tokens._read_codex_first_line
+
+    def read(path):
+        if path == locked:
+            raise PermissionError(13, "denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(tokens, "_read_codex_first_line", read)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == (f"{locked.name}: PermissionError",)
+
+
+def test_codex_clean_tally_has_no_unread(tmp_path):
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    _codex_thread(tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, usage=(5, 0, 5))
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == ()
 
 
 def test_codex_membership_cache_hit(tmp_path, monkeypatch):
