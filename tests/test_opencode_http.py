@@ -100,7 +100,9 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   html-health        the health route answers 200 text/html (the web-UI
 #                      shell a server of another major serves for its routes)
 #   sse-drop-once      completed, but the FIRST event stream closes right after
-#                      server.connected — the turn end arrives on the reconnect
+#                      server.connected, and the turn ends only once the reconnect
+#                      is up (until then an HTTP probe reads busy) — the turn end
+#                      arrives on the reconnect however slowly the client reconnects
 #   provider-outage    (V2) the turn never finishes: the provider is down, so the
 #                      stream carries `session.retry.scheduled` frames (the shape
 #                      captured live from 2.0.27 on a closed port) and nothing else
@@ -286,6 +288,13 @@ def run_turn():
     # let the 204 flush before any scripted death tears the connection down
     time.sleep(0.15)
     push_turn_start()
+    if SCENARIO == "sse-drop-once":
+        deadline = time.time() + 10  # a reader that never reconnects fails the test
+        while time.time() < deadline:
+            with LOCK:
+                if STATE["streams"] >= 2:
+                    break
+            time.sleep(0.02)
     if SCENARIO in ("completed", "sse-drop-once"):
         write_result(); write_spec(); finish_turn(); push_idle()
     elif SCENARIO == "nudge-then-complete":
@@ -4466,10 +4475,15 @@ def test_v2_sse_reconnect(tmp_path):
 
 def test_v2_e2e_sse_reconnect_delivers_the_turn_end(tmp_path, v2_fake):
     """End to end: the first event stream breaks right after connecting; the
-    turn end queued meanwhile arrives on the reconnect and completes the
-    session."""
+    turn end arrives on the reconnect and completes the session.
+
+    The reconnect is slowed past the gap's per-tick probe cadence, the timing a
+    slow runner hits anyway: the fake holds the turn busy until the reconnect,
+    so the probe cannot complete the session over HTTP first.
+    Ablation: drop the fake's wait for the second stream -> one stream."""
     launcher, rec = v2_fake
     adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter.reconnect_sleep_s = 0.5
 
     result = adapter.run(make_spec(tmp_path, rec, "sse-drop-once"))
 
