@@ -158,7 +158,10 @@ class _IdleTracker:
     `last_key[1]` as the parent's byte size — the #727 growth test and the scan
     offset for `_transcript_has_assistant_activity` — so a folded key would credit
     subagent bytes as parent growth and scan from a wrong offset. The tree gets
-    its own `sub_key`, OR-ed only into the idle clock's change test."""
+    its own `sub_key`, OR-ed only into the idle clock's change test.
+
+    `tool_scan_failures` is the streak of `session-idle` `in_tool` reads that
+    raised; it never moves the clock, only the `tool-scan-*` crumbs."""
 
     # The transcript path the samples below belong to. A later hook event that
     # names a DIFFERENT path rebaselines the tracker (`_sample_transcript_idle`):
@@ -185,6 +188,10 @@ class _IdleTracker:
     # transitions (`subagent-scan-failed` / `subagent-scan-recovered`). NOT reset
     # on a re-point, so a streak open across one still gets its recovery crumb.
     sub_scan_failures: int = 0
+    # The running streak of `in_tool` reads that raised (`_idle_tool_label`):
+    # crumbed at its transitions (`tool-scan-failed` / `tool-scan-recovered`).
+    # NOT reset on a re-point, for the same reason as `sub_scan_failures`.
+    tool_scan_failures: int = 0
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -371,6 +378,49 @@ def _subagent_tree_key(root: Path) -> tuple[int, int, int]:
         sum(st.st_size for _, st in files),
         max((st.st_mtime_ns for _, st in files), default=0),
     )
+
+
+# The tool names `session-idle`'s `in_tool` may carry verbatim: Claude Code's
+# built-ins. A closed slug chosen by code, so the journal never carries
+# transcript text or MCP server names — `_idle_tool_slug` maps every other name
+# to "mcp" or "other".
+_IDLE_TOOL_SLUGS = frozenset(
+    {
+        "Bash",
+        "PowerShell",
+        "Agent",
+        "Task",
+        "Workflow",
+        "SendMessage",
+        "TaskOutput",
+        "TaskStop",
+        "Monitor",
+        "AskUserQuestion",
+        "ExitPlanMode",
+        "EnterPlanMode",
+        "WebFetch",
+        "WebSearch",
+        "Read",
+        "Write",
+        "Edit",
+        "NotebookEdit",
+        "Grep",
+        "Glob",
+        "Skill",
+        "ToolSearch",
+    }
+)
+
+
+def _idle_tool_slug(name: str) -> str:
+    """The closed `in_tool` slug for a transcript's tool name: a built-in in
+    `_IDLE_TOOL_SLUGS` passes through, an `mcp__<server>__<tool>` name is "mcp"
+    (the server name stays out of the journal), anything else is "other"."""
+    if name in _IDLE_TOOL_SLUGS:
+        return name
+    if name.startswith("mcp__"):
+        return "mcp"
+    return "other"
 
 
 class _ResultFileMixin:
@@ -598,6 +648,61 @@ class _ResultFileMixin:
                             ):
                                 return True
         return False
+
+    @staticmethod
+    def _open_tool_call(paths: list[Path]) -> str | None:
+        """The raw name of the newest unanswered Claude tool call across
+        `paths`, or None when every call has its result.
+
+        A `tool_use` content item opens a call under its `id`; a `tool_result`
+        whose `tool_use_id` names it closes it. Of the calls still open, the one
+        whose entry carries the newest `timestamp` wins, across ALL files
+        (ISO-8601 strings compare chronologically; a missing one sorts oldest), so
+        a parent's open `Agent` loses to its subagent's later open `Bash`: the
+        innermost wait. Content-reading by design, unlike the stat-only idle
+        clock — only `_idle_tool_label` calls it, once per opened stretch.
+        Tolerant like the usage parsers: a torn, undecodable or non-dict line is
+        skipped. A path that is not a regular file is skipped unopened (a FIFO
+        would block the wait loop). An ``OSError`` propagates for the caller to
+        crumb."""
+        open_calls: dict[str, tuple[str, str]] = {}
+        for path in paths:
+            if not path.is_file():
+                continue
+            with path.open("rb") as stream:
+                while line := stream.readline():
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    message = entry.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if not isinstance(content, list):
+                        continue
+                    timestamp = entry.get("timestamp")
+                    if not isinstance(timestamp, str):
+                        timestamp = ""
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "tool_use":
+                            call_id = item.get("id")
+                            name = item.get("name")
+                            if isinstance(call_id, str):
+                                open_calls[call_id] = (
+                                    name if isinstance(name, str) else "",
+                                    timestamp,
+                                )
+                        elif item.get("type") == "tool_result":
+                            call_id = item.get("tool_use_id")
+                            if isinstance(call_id, str):
+                                open_calls.pop(call_id, None)
+        if not open_calls:
+            return None
+        name, _ = max(open_calls.values(), key=lambda call: call[1])
+        return name
 
     def _session_vanished(self, task_id: str) -> bool:
         """Whether the whole multiplexer session is gone, asked only once a
@@ -2017,6 +2122,40 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             idle.sub_scan_failures = 0
         return key
 
+    def _idle_tool_label(
+        self, task_id: str, transcript_path: str, idle: _IdleTracker
+    ) -> str | None:
+        """The `in_tool` slug a `session-idle` about to open carries: what the
+        silence is waiting on, read once per stretch. A silent transcript holds
+        still, so the state read here holds for the whole stretch — a
+        `tool_result` landing moves the file and closes it.
+
+        None (the field is omitted) unless the profile parses `claude-jsonl`:
+        the tool_use/tool_result shape is Claude's, so an absent field means
+        "this CLI cannot tell". Otherwise `_idle_tool_slug` of the newest open
+        call across the parent and its subagent tree (`_open_tool_call`), or
+        "none" when nothing is open. A read or tree-walk fault is "unknown" —
+        never folded into "none" — crumbed at the streak's transitions:
+        `tool-scan-failed` (`error`) at failure 1, `tool-scan-recovered`
+        (`failures`) at the next clean read."""
+        if self.profile.usage_parser != "claude-jsonl":
+            return None
+        try:
+            paths = [Path(transcript_path)]
+            root = self._subagent_root(transcript_path)
+            if root is not None:
+                paths.extend(path for path, _ in _subagent_tree_files(root))
+            name = self._open_tool_call(paths)
+        except OSError as e:
+            idle.tool_scan_failures += 1
+            if idle.tool_scan_failures == 1:
+                self._note_lifecycle(task_id, "tool-scan-failed", error=f"{type(e).__name__}: {e}")
+            return "unknown"
+        if idle.tool_scan_failures:
+            self._note_lifecycle(task_id, "tool-scan-recovered", failures=idle.tool_scan_failures)
+            idle.tool_scan_failures = 0
+        return "none" if name is None else _idle_tool_slug(name)
+
     def _sample_transcript_idle(
         self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
     ) -> None:
@@ -2046,7 +2185,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         like a parent key that moved. Its first walk on a path is a baseline. A
         walk that raises degrades the tick to parent-only, crumbed as
         `subagent-scan-failed` / `subagent-scan-recovered`; `idle.last_key` stays
-        the parent's key either way."""
+        the parent's key either way.
+
+        On a `claude-jsonl` profile, `session-idle` also carries `in_tool`
+        (`_idle_tool_label`), read once as the stretch opens: the closed slug of
+        the unanswered tool call the silence is waiting on — a Claude built-in
+        name, "mcp", "other", "none" (nothing open) or "unknown" (the read
+        raised, crumbed as `tool-scan-failed` / `tool-scan-recovered`). It
+        labels, never suppresses: a running tool and a hung one leave identical
+        transcripts. Other parsers omit the field."""
 
         def flush_active() -> None:
             if idle.pending_active_s is None or self.journal is None:
@@ -2098,6 +2245,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             and self._idle_threshold_s > 0
             and idle.idle_s >= self._idle_threshold_s
         ):
+            label = self._idle_tool_label(task_id, transcript_path, idle)
+            extra = {} if label is None else {"in_tool": label}
             try:
                 self.journal.append(
                     "session-idle",
@@ -2105,6 +2254,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     idle_s=idle.idle_s,
                     since_ts=idle.last_change_wall,
                     threshold_s=self._idle_threshold_s,
+                    **extra,
                 )
             except OSError:
                 pass

@@ -231,10 +231,15 @@ class RunHeader(Static):
                 # pane may still be repainting a spinner, so this is the one
                 # surface that separates a session working from one parked in a
                 # tool call. Yellow, not red — it is a notice, not a verdict, and
-                # nothing bounds the stretch.
+                # nothing bounds the stretch. `· in <tool>` names the unanswered
+                # tool call the silence is waiting on (a running tool and a hung
+                # one look alike, so it says which to suspect); `none` — the turn
+                # is over — adds nothing, and `unknown` means the read failed.
                 text.append(
                     f" · idle {_format_age(time.time() - agent.idle_since)}", style="yellow"
                 )
+                if agent.idle_tool and agent.idle_tool != "none":
+                    text.append(f" · in {agent.idle_tool}", style="yellow")
         else:
             # No session open: show the configured adapters from the run's policy
             # snapshot. Skip the line entirely when the snapshot can't be rebuilt

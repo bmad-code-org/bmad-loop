@@ -649,6 +649,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-idle` / `session-active` (#680): seconds the live transcript has
         # sat still — a float the adapter measured from two stats, no identifier.
         "idle_s",
+        # `session-idle`'s waited-on tool (#858): a closed slug the adapter chose
+        # from a code-side set (`generic._IDLE_TOOL_SLUGS` — a Claude built-in
+        # name — or `mcp` | `other` | `none` | `unknown`), never transcript text.
+        # An MCP tool's name would carry the operator's configured server name, so
+        # it collapses to `mcp`; any name outside the set ships as `other`.
+        "in_tool",
         # `sweep-retro-ingest-unavailable`'s discriminator (DW-388): WHICH input the
         # retro action-item ingest could not use, as a closed three-value enum
         # (`sprint-status-unreadable` | `action-items-malformed` |
@@ -1199,7 +1205,8 @@ JOURNAL_KINDS = frozenset(
         # stretches, one `session-idle` at the crossing of `dev_stall_grace_s` and
         # one `session-active` when the transcript moves again. Both carry only
         # `task_id` (routed) and measured floats (`idle_s`, `since_ts`,
-        # `threshold_s`, declared benign).
+        # `threshold_s`, declared benign); a `claude-jsonl` `session-idle` adds
+        # `in_tool`, a closed slug the adapter chose (declared benign).
         "session-active",
         "session-idle",
         # cli.py

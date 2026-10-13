@@ -7047,6 +7047,52 @@ async def test_header_agent_line_shows_open_idle_stretch(project_tree, monkeypat
         assert "idle" not in str(header.content)
 
 
+async def test_header_agent_line_names_the_waited_tool(project_tree, monkeypatch):
+    """An open stretch's `in_tool` slug follows the age as `· in <tool>`; "none"
+    (the turn is over) and an unlabelled stretch render the age alone, and the
+    label never appears without an open stretch.
+
+    ABLATION: drop the `!= "none"` test in `show_run` and the "none" row renders
+    `· in none`; drop the `idle_tool` branch and the first assertion reddens."""
+    monkeypatch.setattr(widgets.time, "time", lambda: 10_000.0)
+    state = RunState(
+        run_id="r1",
+        project=str(project_tree.project),
+        started_at="now",
+        tasks={"1-1-alpha": StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)},
+    )
+    idle = data.ActiveAgent(
+        task_id="1-1-alpha-dev-1",
+        story_key="1-1-alpha",
+        role="dev",
+        name="claude",
+        model="opus",
+        idle_since=10_000.0 - 71 * 60,
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run(
+            "r1", data.RUNNING, state, agent=dataclasses.replace(idle, idle_tool="Bash")
+        )
+        assert "· idle 1h11m · in Bash" in str(header.content)
+
+        header.show_run(
+            "r1", data.RUNNING, state, agent=dataclasses.replace(idle, idle_tool="unknown")
+        )
+        assert "· idle 1h11m · in unknown" in str(header.content)
+
+        header.show_run(
+            "r1", data.RUNNING, state, agent=dataclasses.replace(idle, idle_tool="none")
+        )
+        assert "· idle 1h11m" in str(header.content)
+        assert "· in" not in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=idle)  # unlabelled CLI
+        assert "· idle 1h11m" in str(header.content)
+        assert "· in" not in str(header.content)
+
+
 async def test_header_marks_stale_state_unreadable_agent_and_read_faults(project_tree):
     """DW-472/474/475 at the header: a stale last-good state gets its own warning
     line, a state never parsed names why, an unreadable agent says so instead of

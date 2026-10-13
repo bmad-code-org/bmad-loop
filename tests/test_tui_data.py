@@ -1074,6 +1074,58 @@ def test_active_agent_idle_since_never_raises_on_malformed_entry():
     assert agent is not None and agent.idle_since == 5030.0
 
 
+def test_active_agent_idle_tool_from_open_idle_stretch():
+    """The open stretch's `session-idle` `in_tool` slug sets `idle_tool`; a
+    `session-idle` without one (a CLI that cannot tell) and no stretch at all
+    both leave it None, the default.
+
+    ABLATION: drop the `_idle_tool` derivation and the first assertion reddens."""
+    idle = {
+        "kind": "session-idle",
+        "task_id": "1-1-alpha-dev-3",
+        "since_ts": 5030.0,
+        "in_tool": "Bash",
+    }
+    agent = data.active_agent([_stamped_start(), idle], None)
+    assert agent is not None and agent.idle_tool == "Bash"
+    unlabelled = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0}
+    agent = data.active_agent([_stamped_start(), unlabelled], None)
+    assert agent is not None and agent.idle_tool is None
+    assert data.active_agent([_stamped_start()], None).idle_tool is None
+
+
+def test_active_agent_idle_tool_cleared_by_session_active():
+    """A `session-active` closes the stretch and its label; a later stretch
+    carries its own, and a later UNLABELLED one never inherits the old slug.
+
+    ABLATION: drop the `session-active` arm of `_idle_tool` and the first
+    assertion reddens."""
+    idle = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": "Bash"}
+    active = {"kind": "session-active", "task_id": "1-1-alpha-dev-3", "idle_s": 120.0}
+    agent = data.active_agent([_stamped_start(), idle, active], None)
+    assert agent is not None and agent.idle_tool is None
+    later = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": "mcp"}
+    agent = data.active_agent([_stamped_start(), idle, active, later], None)
+    assert agent is not None and agent.idle_tool == "mcp"
+    bare = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5150.0}
+    agent = data.active_agent([_stamped_start(), idle, active, bare], None)
+    assert agent is not None and agent.idle_tool is None
+    other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "in_tool": "Bash"}
+    agent = data.active_agent([_stamped_start(), other], None)
+    assert agent is not None and agent.idle_tool is None
+
+
+def test_active_agent_idle_tool_never_raises_on_malformed_entry():
+    """A non-string `in_tool` reads as None — never rendered, never raised —
+    and the agent itself is still derived.
+
+    ABLATION: pass the raw value through and the non-string rows leak it."""
+    for raw in (None, 7, True, ["Bash"], {"name": "Bash"}):
+        bad = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": raw}
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.idle_tool is None
+
+
 def test_active_agent_none_without_resolvable_snapshot():
     # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
     # would mislabel a run that predates stamping, so the agent is unknown.

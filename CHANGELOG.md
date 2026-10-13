@@ -38,6 +38,8 @@ breaking changes may land in a minor release.
   and classify rate-limit, quota and transport outages there as environment faults (#847).
 - Add the `subagent_transcript_dir` CLI profile field: a subagent transcript tree whose
   writes count as session activity for the idle notice (#858).
+- Name the tool call an idle Claude session is waiting on: `session-idle` carries
+  `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
 
 ### Changed
 

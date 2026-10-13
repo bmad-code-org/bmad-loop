@@ -10285,6 +10285,7 @@ def test_idle_stretch_journals_one_pair_and_stamps_heartbeat(tmp_path, monkeypat
         "idle_s": 60.0,
         "since_ts": 5000.0,  # wall time the transcript was first named (mono 1000)
         "threshold_s": 60.0,
+        "in_tool": "none",  # claude-jsonl: the transcript holds no open tool call
     }
     assert active == {"kind": "session-active", "task_id": "3-1-dev-1", "idle_s": 150.0}
     assert second["since_ts"] == 5150.0  # the move at mono 1150 started the new stretch
@@ -11074,6 +11075,296 @@ def test_subagent_tree_key_does_not_follow_a_symlinked_dir(tmp_path):
     except OSError:
         pytest.skip("symlinks unavailable")
     assert generic._subagent_tree_key(root) == (0, 0, 0)
+
+
+# `session-idle`'s `in_tool` label: the unanswered tool call a claude-jsonl
+# stretch is waiting on, read once as the stretch opens.
+
+
+def _tool_use(call_id: str, name: str, ts: str) -> bytes:
+    """A claude assistant line opening tool call `call_id`."""
+    entry = {
+        "type": "assistant",
+        "timestamp": ts,
+        "message": {"content": [{"type": "tool_use", "id": call_id, "name": name}]},
+    }
+    return json.dumps(entry).encode() + b"\n"
+
+
+def _tool_result(call_id: str) -> bytes:
+    """A claude user line answering tool call `call_id`."""
+    entry = {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": call_id}]},
+    }
+    return json.dumps(entry).encode() + b"\n"
+
+
+def _run_silent_stretch(tmp_path, adapter, log, transcript, clock, *, end_call=7):
+    """Drive one silent stretch: the pane keeps repainting, the transcript (and any
+    tree) holds still past the 60 s grace, then the deadline ends the loop."""
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == end_call:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    return adapter.wait_for_completion(_dev_handle(), spec)
+
+
+def test_idle_notice_names_the_open_tool_call(tmp_path, monkeypatch):
+    """A parent whose last line opens a `Bash` call and then goes silent: the
+    stretch's `session-idle` names it.
+
+    ABLATION: drop the `in_tool` kwarg from the append and the key is missing."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["kind"] == "session-idle"
+    assert idle["in_tool"] == "Bash"
+
+
+def test_idle_notice_reports_none_when_no_tool_is_open(tmp_path, monkeypatch):
+    """Every call answered — the turn is over — reads "none", explicitly, not
+    an absent field (absent means a CLI that cannot tell).
+
+    ABLATION: return None for an empty open set and the field disappears."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z") + _tool_result("t1"))
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["in_tool"] == "none"
+
+
+def test_idle_notice_names_the_innermost_wait(tmp_path, monkeypatch):
+    """The parent waits on an `Agent` call (older), whose subagent waits on a
+    `Bash` call (newer); both sit silent. The label names the innermost wait —
+    the newest open call across the parent AND its subagent tree.
+
+    ABLATION: read the parent only and the label is `Agent`."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("p1", "Agent", "2026-01-01T00:00:01Z"))
+    _subagent_file(
+        transcript,
+        "workflows/wf_x/agent-a.jsonl",
+        _tool_use("s1", "Read", "2026-01-01T00:00:02Z")
+        + _tool_result("s1")
+        + _tool_use("s2", "Bash", "2026-01-01T00:00:03Z"),
+    )
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["in_tool"] == "Bash"
+
+
+@pytest.mark.parametrize(
+    ("name", "slug"),
+    [("mcp__srv__x", "mcp"), ("WeirdTool", "other"), ("Bash", "Bash"), ("", "other")],
+)
+def test_idle_tool_slugs_are_closed(name, slug):
+    """Only a Claude built-in passes through: an MCP tool collapses to "mcp"
+    (its server name is operator config, never journaled) and any other name to
+    "other"."""
+    assert generic._idle_tool_slug(name) == slug
+
+
+def test_idle_notice_maps_an_mcp_call_to_its_slug(tmp_path, monkeypatch):
+    """End to end, an open MCP call journals "mcp" — the server name never
+    reaches the journal."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("t1", "mcp__secret-server__query", "2026-01-01T00:00:01Z"))
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["in_tool"] == "mcp"
+    assert "secret-server" not in json.dumps(idle)
+
+
+@pytest.mark.parametrize("profile_name", ["gemini", "codex", "copilot"])
+def test_idle_notice_omits_in_tool_for_other_parsers(tmp_path, monkeypatch, profile_name):
+    """Only a `claude-jsonl` profile is labelled: the tool_use/tool_result shape is
+    claude's, so every other parser omits `in_tool` — even over a transcript that
+    happens to hold a claude-shaped open call.
+
+    ABLATION: drop the `usage_parser` gate and the field appears ("Bash")."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, profile_name=profile_name
+    )
+    assert adapter.profile.usage_parser != "claude-jsonl"
+    _grow(transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["kind"] == "session-idle"
+    assert "in_tool" not in idle
+
+
+def test_tool_scan_fault_reports_unknown_and_crumbs_once(tmp_path, monkeypatch):
+    """A raising read labels its stretch "unknown" — never "none", never an
+    absent field — and the streak is crumbed at its transitions only: one
+    `tool-scan-failed` (`error`) across two faulted stretches, then one
+    `tool-scan-recovered` (`failures`) and a real slug on the third.
+
+    ABLATION: fold the fault into "none" and the first two labels read "none"."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    real = generic.GenericAdapter._open_tool_call
+    faults = {"left": 2}
+
+    def open_tool_call(paths):
+        if faults["left"]:
+            faults["left"] -= 1
+            raise PermissionError(13, "Permission denied")
+        return real(paths)
+
+    # the staticmethod, never `generic.os` (the global module)
+    monkeypatch.setattr(generic.GenericAdapter, "_open_tool_call", staticmethod(open_tool_call))
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # stretch crossings at 3, 7, 11
+            _grow(log, "\r⠋".encode())
+        if call_n == 5:
+            _grow(transcript, b'{"type":"assistant"}\n')  # closes stretch 1
+        if call_n == 9:
+            _grow(transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))  # closes 2
+        if call_n == 12:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+
+    idles = [e for e in adapter.journal.entries if e["kind"] == "session-idle"]
+    assert [e["in_tool"] for e in idles] == ["unknown", "unknown", "Bash"]
+    (failed,) = _lifecycle_events(adapter, "tool-scan-failed")
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+    (recovered,) = _lifecycle_events(adapter, "tool-scan-recovered")
+    assert recovered["failures"] == 2
+
+
+def test_tool_scan_counts_a_subagent_walk_fault(tmp_path, monkeypatch):
+    """A fault listing the subagent tree is a scan fault too: "unknown", crumbed —
+    never a parent-only label that could name the wrong (outer) wait.
+
+    ABLATION: catch the walk's fault inside the path listing and the label reads
+    the parent's "Agent"."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("p1", "Agent", "2026-01-01T00:00:01Z"))
+
+    def tree_files(root):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_subagent_tree_files", tree_files)
+    _run_silent_stretch(tmp_path, adapter, log, transcript, clock)
+    (idle,) = adapter.journal.entries
+    assert idle["in_tool"] == "unknown"
+    (failed,) = _lifecycle_events(adapter, "tool-scan-failed")
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+
+
+def test_session_active_is_unchanged_by_the_label(tmp_path, monkeypatch):
+    """The label rides `session-idle` alone: the `session-active` closing a
+    labelled stretch carries exactly the fields it always did."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    _grow(transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 5:
+            _grow(transcript, _tool_result("t1"))  # the call returns: stretch closes
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    # the deadline's jump lets the exit-time sample open a later stretch; the
+    # labelled stretch and its close come first
+    idle, active = adapter.journal.entries[:2]
+    assert idle["in_tool"] == "Bash"
+    assert active == {"kind": "session-active", "task_id": "3-1-dev-1", "idle_s": 120.0}
+
+
+# `_open_tool_call` directly: the tolerant reader's skip rules.
+
+
+def test_open_tool_call_tolerates_torn_and_garbage_lines(tmp_path):
+    """Undecodable bytes, non-JSON, non-dict JSON, odd `message`/`content`
+    shapes and a torn final line are skipped; the well-formed lines still
+    decide. A missing timestamp sorts oldest.
+
+    ABLATION: let a decode error propagate and this raises."""
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(
+        b"\xff\xfe not utf-8\n"
+        b"not json\n"
+        b"[1, 2]\n"
+        b'{"message": "str"}\n'
+        b'{"message": {"content": "str"}}\n'
+        b'{"message": {"content": [7, {"type": "tool_use", "name": "Edit"}]}}\n'
+        + _tool_use("t1", "Bash", "2026-01-01T00:00:02Z")
+        + b'{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t0","name":"Grep"}]}}\n'
+        + _tool_use("t2", "Read", "2026-01-01T00:00:01Z")
+        + b'{"type":"user","message":{"content":[{"type":"tool_res'
+    )
+    assert generic.GenericAdapter._open_tool_call([path]) == "Bash"
+    _grow(path, b"\n" + _tool_result("t1"))
+    assert generic.GenericAdapter._open_tool_call([path]) == "Read"
+    _grow(path, _tool_result("t2"))
+    assert generic.GenericAdapter._open_tool_call([path]) == "Grep"  # no timestamp: oldest
+    _grow(path, _tool_result("t0"))
+    assert generic.GenericAdapter._open_tool_call([path]) is None
+    assert generic.GenericAdapter._open_tool_call([tmp_path / "absent.jsonl"]) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes unavailable")
+def test_open_tool_call_skips_a_fifo(tmp_path, monkeypatch):
+    """A FIFO among the paths is never opened — the open would block the wait
+    loop — while the regular files still decide.
+
+    ABLATION: remove the regular-file guard and the stubbed open fails."""
+    fifo = tmp_path / "agent.jsonl"
+    os.mkfifo(fifo)
+    regular = tmp_path / "transcript.jsonl"
+    regular.write_bytes(_tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == fifo:
+            raise AssertionError("FIFO would block on open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    assert generic.GenericAdapter._open_tool_call([regular, fifo]) == "Bash"
+
+
+def test_open_tool_call_propagates_a_read_fault(tmp_path, monkeypatch):
+    """A read fault is the caller's to crumb as "unknown": it propagates, never
+    folds into None ("nothing open").
+
+    ABLATION: catch OSError in the reader and this returns None."""
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(_tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    original_open = Path.open
+
+    def failing_open(p, *args, **kwargs):
+        if p == path:
+            raise PermissionError(13, "Permission denied")
+        return original_open(p, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(PermissionError):
+        generic.GenericAdapter._open_tool_call([path])
 
 
 # ------------------------------------ parked-session signals (DW-348/DW-350)
