@@ -93,6 +93,10 @@ breaking changes may land in a minor release.
   rename): name it as such and say its control session and untagged sessions most likely
   belong to that project, while a session tagged as this project's is yours; the stderr
   note names it too (#906).
+- Report a pre-upgrade `bmad-loop-ctl-<16 hex>` control session left in the project's own
+  psmux registry: `cleanup` names it on stderr and in `sessions.legacy_leftovers` with the
+  command that ends it (`sessions.legacy_kill_commands`), and `attach` names it when it finds
+  nothing to attach (#733).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the

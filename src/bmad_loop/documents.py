@@ -397,6 +397,7 @@ def cleanup_document(
     windows_undetermined: list[str] | None = None,
     legacy_leftovers: list[str] | None = None,
     legacy_unverified: list[str] | None = None,
+    legacy_kill_commands: dict[str, str] | None = None,
     sessions_scan_error: str | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
@@ -458,6 +459,12 @@ def cleanup_document(
     `legacy_unverified` means "not looked at", not "nothing left". Additive, no
     schema bump; the text mode prints each line on stderr.
 
+    `sessions.legacy_kill_commands` maps each pre-upgrade control session in
+    this project's own registry (#733) — also named in `legacy_leftovers` — to
+    the paste-ready command that ends it. No bmad-loop command addresses such a
+    session, so this is the only way out; run it once every window in it has
+    parked. Additive, no schema bump; the text mode prints each on stderr.
+
     `sessions.scan_error` is present only when the session listing could not
     see this project's sessions (#864): the backend is unavailable while a run
     of this project is or may be alive (`runs.session_scan_error`). `removed` and
@@ -478,6 +485,7 @@ def cleanup_document(
         "unverifiable_pid": sorted(unknown),
         "legacy_leftovers": list(legacy_leftovers or []),
         "legacy_unverified": list(legacy_unverified or []),
+        "legacy_kill_commands": dict(legacy_kill_commands or {}),
     }
     if sessions_scan_error is not None:
         sessions["scan_error"] = sessions_scan_error

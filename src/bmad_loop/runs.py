@@ -2525,7 +2525,78 @@ def legacy_registry_leftovers(
             # rows are merged rather than overwritten.
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
+    # The project's own registry is no legacy one, but a control session an
+    # earlier release named there survives the rename too (#733).
+    primary = get_multiplexer()
+    label = primary.registry_root() or DEFAULT_REGISTRY_LABEL
+    try:
+        stale = superseded_ctl_sessions(
+            project, primary, on_fault=lambda msg: faults.append(f"{label}: {msg}")
+        )
+    except MultiplexerError as exc:
+        faults.append(f"{label}: could not be listed: {exc}")
+        stale = []
+    if stale:
+        grouped[label] = sorted(set(grouped.get(label, []) + stale))
     return grouped, faults
+
+
+def superseded_ctl_name(project: Path) -> str:
+    """The control-session name an earlier release minted for ``project`` in its
+    own derived registry (#733): ``bmad-loop-ctl-`` plus the first 16 hex of the
+    SHA-256 of that root, resolved and case-folded where the filesystem folds.
+
+    The formula that release used, kept verbatim for this one reader. Its
+    honoured-operator-root arm salted the digest with that root too, but
+    :func:`superseded_ctl_sessions` only reads the derived registry, where the
+    salt was never added.
+
+    Raises :class:`StateRootError` or ``OSError`` when the root cannot be
+    derived."""
+    scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+    return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
+
+
+def superseded_ctl_sessions(
+    project: Path,
+    mux: TerminalMultiplexer | None = None,
+    *,
+    on_fault: Callable[[str], None] | None = None,
+) -> list[str]:
+    """The control session standing in this process's own registry under the
+    name an earlier release minted for this project on psmux,
+    :func:`superseded_ctl_name` (#733), as each spelling is listed.
+
+    That exact name, not every ``bmad-loop-ctl-<16 hex>`` shape: a run's own
+    agent session for run id ``ctl-<16 hex>`` is spelled the same way, and
+    naming it here would publish a kill command for a live run.
+
+    Nothing addresses them: launches, attach, stop and the parked-window sweep
+    use :func:`ctl_session_for` only, and the prune spares every ctl-shaped
+    name (:func:`is_ctl_session_name`). A run window parked in one is reached by
+    no command, so this is what the cleanup and attach frontends name.
+
+    Only when the registry in force is this project's derived one
+    (:func:`mux_registry_root`): a control session in it is this project's.
+    psmux's shared default registry, an operator's own root, and a
+    machine-wide server (tmux, which never minted the digest shape) prove
+    nothing about whose a session spelled that way is.
+
+    A listing that could not be taken goes to ``on_fault`` and answers ``[]``
+    (:meth:`~.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
+    mux = mux or get_multiplexer()
+    root = mux.registry_root()
+    try:
+        if root is None or Path(root) != mux_registry_root(project):
+            return []
+        old = mux.session_name_key(superseded_ctl_name(project))
+    except (StateRootError, OSError, RuntimeError):
+        return []
+    return sorted(
+        name
+        for name in mux.list_sessions_reporting(on_fault=on_fault)
+        if mux.session_name_key(name) == old
+    )
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:
