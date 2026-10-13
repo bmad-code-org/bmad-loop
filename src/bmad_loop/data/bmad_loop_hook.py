@@ -358,18 +358,41 @@ def _write_event(events_dir, name, event):
     os.replace(tmp_path, os.path.join(events_dir, name))
 
 
+def _read_payload(stdin):
+    """The hook payload and why it is unusable: ``(payload, None)`` on success,
+    else ``({}, tag)``.
+
+    A hook that fires with nothing on stdin, half a JSON document, undecodable
+    bytes, or a bare list is not an error the operator can act on — the event still
+    has to be written, because the run's completion signal rides on it. Every
+    non-dict outcome collapses to ``{}`` and the shaped event carries nulls plus a
+    ``payload_error`` tag (the exception's class name, or ``not-an-object``) the
+    orchestrator crumbs, so the degrade stays visible.
+
+    The bytes are read when the stream has a buffer: ``json.loads`` detects
+    UTF-8/16/32 itself, where a text stdin would decode with the locale code page
+    (cp1252 on Windows) and garble or reject a non-ASCII transcript path. A
+    text-only stream (no ``buffer``) is read as text. ``UnicodeDecodeError`` and
+    ``json.JSONDecodeError`` are both ``ValueError`` subclasses and ride the same
+    arm; ``OSError`` covers a closed or unreadable descriptor.
+    """
+    buffer = getattr(stdin, "buffer", None)
+    try:
+        payload = json.loads(buffer.read()) if buffer is not None else json.load(stdin)
+    except (ValueError, OSError) as e:
+        return {}, type(e).__name__
+    if not isinstance(payload, dict):
+        return {}, "not-an-object"
+    return payload, None
+
+
 def main() -> int:
     run_dir = os.environ.get("BMAD_LOOP_RUN_DIR")
     task_id = os.environ.get("BMAD_LOOP_TASK_ID")
     if not run_dir or not task_id:
         return 0
     event_name = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+    payload, payload_error = _read_payload(sys.stdin)
 
     ts = time.time_ns()
     event = {
@@ -400,6 +423,9 @@ def main() -> int:
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": _lineage(event_name, ("bmad_loop_hook.py",)),
     }
+    # Only when set, so a readable payload's event is unchanged.
+    if payload_error:
+        event["payload_error"] = payload_error
     # The orchestrator's own events dir when it named one, else the legacy
     # in-tree location this file's older selves are still installed at (see the
     # module docstring). `or`, not a presence test: an exported-but-empty value

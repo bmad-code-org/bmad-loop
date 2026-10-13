@@ -337,6 +337,19 @@ def test_attach_session_usage_does_not_double_count_existing_usage():
     assert task.tokens.total == 15
 
 
+def test_token_usage_unread_is_diagnostic_only():
+    """`unread` qualifies a figure without changing it: equality, `add` and the
+    persisted dict ignore it, so a skip never alters stored totals or `--json`.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, unread=("rollout-x.jsonl: OSError",))
+    assert usage == TokenUsage(input_tokens=10)
+    assert "unread" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.unread == ()
+
+
 def test_session_record_result_json_round_trips():
     record = SessionRecord(
         task_id="1-1-a-dev-1",

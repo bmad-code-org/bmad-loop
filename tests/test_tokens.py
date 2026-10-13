@@ -1,5 +1,10 @@
+import datetime
 import json
+import os
 
+import pytest
+
+from bmad_loop import tokens
 from bmad_loop.model import TokenUsage
 from bmad_loop.tokens import (
     read_usage,
@@ -309,6 +314,535 @@ def test_codex_rollout_without_token_counts_is_none(tmp_path):
     path.write_text(json.dumps({"type": "event_msg", "payload": {"type": "agent_message"}}) + "\n")
     assert tally_codex_rollout(path) is None
     assert tally_codex_rollout(tmp_path / "nope.jsonl") is None
+
+
+SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
+
+
+def _codex_rollout(home, day, session_id, *, utc="2026-10-11T23:30:00.000Z", output=7):
+    """A minimal rollout at ``home/sessions/<day>/rollout-<ts>-<id>.jsonl``.
+    ``day`` is the LOCAL date dir, independent of the UTC session_meta stamp."""
+    folder = home / "sessions" / day
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"rollout-{day.replace('/', '-')}T00-30-00-{session_id}.jsonl"
+    lines = [
+        {"timestamp": utc, "type": "session_meta", "payload": {"id": session_id}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 50, "output_tokens": output}},
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def test_resolve_codex_rollout_by_session_id(tmp_path):
+    """The rollout sits in the LOCAL-date dir (10/12) while its session_meta is
+    stamped the previous UTC day: the lookup globs every day dir rather than
+    deriving one from a timestamp, and the resolved file tallies.
+
+    Ablation: make `find_codex_rollout` return None and this fails."""
+    path = _codex_rollout(tmp_path, "2026/10/12", SESSION, utc="2026-10-11T23:30:00.000Z")
+    env = {"CODEX_HOME": str(tmp_path)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+    # Any UUID spelling canonicalises to the filename's.
+    assert tokens.resolve_transcript("codex-rollout", SESSION.upper(), env) == path
+    assert read_usage("codex-rollout", path) == TokenUsage(input_tokens=50, output_tokens=7)
+
+
+@pytest.mark.parametrize("session_id", ["*", "../x", "", None, "abc"])
+def test_resolve_rejects_non_uuid_ids(tmp_path, session_id):
+    """A hook payload is unvalidated, so an id that is not a UUID never reaches
+    the glob — "*" would otherwise match the sentinel rollout below.
+
+    Ablation: drop the `uuid.UUID` canonicalisation (glob the raw id) and the
+    "*" row fails."""
+    _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    env = {"CODEX_HOME": str(tmp_path)}
+    assert tokens.resolve_transcript("codex-rollout", session_id, env) is None
+
+
+def test_resolve_ignores_other_uuids_and_parsers(tmp_path):
+    """Only the session's own rollout resolves, and only for codex-rollout: a
+    claude or gemini transcript is never looked up by id.
+
+    Ablation: drop the parser check in `resolve_transcript` and the
+    claude-jsonl row resolves the codex file."""
+    other = "019a2b3c-0000-7000-8000-000000000000"
+    _codex_rollout(tmp_path, "2026/10/12", other)
+    path = _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    env = {"CODEX_HOME": str(tmp_path)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+    missing = "019a2b3c-ffff-7fff-8fff-ffffffffffff"
+    assert tokens.resolve_transcript("codex-rollout", missing, env) is None
+    for parser in ("claude-jsonl", "gemini-chat", "copilot-events", ""):
+        assert tokens.resolve_transcript(parser, SESSION, env) is None
+
+
+def test_resolve_defaults_to_home_dot_codex(tmp_path, monkeypatch):
+    """Without CODEX_HOME (or with it empty) the lookup roots at ~/.codex, read
+    at call time. HOME and USERPROFILE are both patched: Windows' Path.home()
+    reads USERPROFILE, never HOME.
+
+    Ablation: drop the `Path.home() / ".codex"` default (return None) and this
+    fails."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    path = _codex_rollout(tmp_path / ".codex", "2026/10/12", SESSION)
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, {}) == path
+    assert tokens.resolve_transcript("codex-rollout", SESSION, {"CODEX_HOME": ""}) == path
+
+
+def test_resolve_default_home_comes_from_the_passed_env(tmp_path, monkeypatch):
+    """The pane's env decides where Codex writes: a HOME/USERPROFILE override
+    there must root the fallback, not this process's own home.
+
+    Ablation: read `Path.home()` unconditionally and this fails."""
+    monkeypatch.setenv("HOME", str(tmp_path / "controller"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "controller"))
+    pane_home = tmp_path / "pane"
+    path = _codex_rollout(pane_home / ".codex", "2026/10/12", SESSION)
+    env = {"HOME": str(pane_home), "USERPROFILE": str(pane_home)}
+
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == path
+
+
+def test_resolve_newest_mtime_wins(tmp_path):
+    """Two rollouts with one id (a resumed session written into a later day dir)
+    resolve to the newer by mtime, whatever order the glob returns them in.
+
+    Ablation: take the first glob match instead of the max mtime and one of the
+    two assertions fails, whichever order the glob yields."""
+    older = _codex_rollout(tmp_path, "2026/10/11", SESSION)
+    newer = _codex_rollout(tmp_path, "2026/10/12", SESSION)
+    os.utime(older, (2_000_000_000, 2_000_000_000))
+    os.utime(newer, (1_000_000_000, 1_000_000_000))
+    env = {"CODEX_HOME": str(tmp_path)}
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == older
+    os.utime(newer, (3_000_000_000, 3_000_000_000))
+    assert tokens.resolve_transcript("codex-rollout", SESSION, env) == newer
+
+
+ROOT = "019a0000-0000-7000-8000-000000000001"
+CHILD = "019a0000-0000-7000-8000-000000000002"
+GRANDCHILD = "019a0000-0000-7000-8000-000000000003"
+OTHER = "019a0000-0000-7000-8000-000000000004"
+
+
+def _local_ts(day, hour=12, minute=0):
+    year, month, dom = (int(part) for part in day.split("/"))
+    return datetime.datetime(year, month, dom, hour, minute).timestamp()
+
+
+def _codex_thread(home, day, clock, thread_id, *, session_id=None, parent=None, usage=None):
+    """A rollout at ``home/sessions/<day>/rollout-<day>T<clock>-<id>.jsonl``
+    whose session_meta carries the given tree fields, plus one cumulative
+    token_count when ``usage`` = (input, cached, output). Its mtime is pinned
+    to noon of its LOCAL ``day``, which bounds the sibling search window."""
+    payload = {"id": thread_id}
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if parent is not None:
+        payload["parent_thread_id"] = parent
+    lines = [{"type": "session_meta", "payload": payload}]
+    if usage is not None:
+        input_tokens, cached, output = usage
+        totals = {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached,
+            "output_tokens": output,
+        }
+        lines.append(
+            {
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": totals}},
+            }
+        )
+    path = home / "sessions" / day / f"rollout-{day.replace('/', '-')}T{clock}-{thread_id}.jsonl"
+    _write_jsonl(path, lines)
+    stamp = _local_ts(day)
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_codex_tally_sums_subagent_rollouts(tmp_path):
+    """Codex keeps each subagent's usage in its own rollout, out of the
+    parent's totals: a depth-1 and a depth-2 child (both naming the root as
+    session_id) add their own last cumulative totals; an unrelated rollout
+    from the same day does not.
+
+    Ablation: drop the `session_id == root` filter (every sibling a member)
+    and the unrelated rollout is counted."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(100, 40, 10)
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-05-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(50, 10, 5),
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-06-00",
+        GRANDCHILD,
+        session_id=ROOT,
+        parent=CHILD,
+        usage=(20, 0, 2),
+    )
+    _codex_thread(
+        tmp_path, "2026/10/01", "10-07-00", OTHER, session_id=OTHER, usage=(1000, 0, 1000)
+    )
+
+    assert tally_codex_rollout(parent) == TokenUsage(
+        input_tokens=60 + 40 + 20, output_tokens=17, cache_read_tokens=50
+    )
+
+
+def test_codex_tally_child_across_midnight(tmp_path):
+    """Day dirs are local dates, so a child spawned after midnight lands in
+    the next day's dir; the parent's last write (00:20) puts it in the window.
+
+    Ablation: search only the parent's own day dir and this fails."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "23-50-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    after_midnight = _local_ts("2026/10/02", hour=0, minute=20)
+    os.utime(parent, (after_midnight, after_midnight))
+    _codex_thread(
+        tmp_path,
+        "2026/10/02",
+        "00-10-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(7, 0, 3),
+    )
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=17, output_tokens=4)
+
+
+def test_codex_tally_parent_without_session_meta_is_parent_only(tmp_path):
+    """A parent that does not open with a session_meta has no thread id to
+    match children against, so it tallies alone — even beside a sibling whose
+    session_meta carries no tree fields at all.
+
+    Ablation: search siblings with a None root instead of returning the
+    parent's own total and the bare sibling (session_id None == root) is
+    counted."""
+    parent = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-00-00-{ROOT}.jsonl"
+    _write_jsonl(
+        parent,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 30, "output_tokens": 3}},
+                },
+            }
+        ],
+    )
+    stamp = _local_ts("2026/10/01")
+    os.utime(parent, (stamp, stamp))
+    _codex_thread(tmp_path, "2026/10/01", "10-05-00", CHILD, usage=(500, 0, 50))
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=30, output_tokens=3)
+
+
+def test_codex_tally_tracked_when_only_a_child_has_usage(tmp_path):
+    """A parent that reported no token_count yet still reads as tracked when
+    a child did: None stays reserved for no usage signal anywhere.
+
+    Ablation: return None whenever the parent has no totals and this fails."""
+    parent = _codex_thread(tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT)
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-05-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(9, 0, 1),
+    )
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=9, output_tokens=1)
+
+
+def test_codex_tally_parent_thread_chain_without_session_id(tmp_path):
+    """Older rollouts carry no session_id; membership then follows the
+    parent_thread_id chain into the parent's tree, to a fixpoint — the
+    grandchild's file sorts before its parent's, so one pass would miss it.
+    A rollout chained to an unknown thread stays out.
+
+    Ablation: run the chain loop a single pass and the grandchild is
+    missed."""
+    parent = _codex_thread(tmp_path, "2026/10/01", "10-00-00", ROOT, usage=(10, 0, 1))
+    _codex_thread(tmp_path, "2026/10/01", "10-30-00", CHILD, parent=ROOT, usage=(20, 0, 2))
+    _codex_thread(tmp_path, "2026/10/01", "10-20-00", GRANDCHILD, parent=CHILD, usage=(30, 0, 3))
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-40-00",
+        OTHER,
+        parent="019a0000-0000-7000-8000-0000000000ff",
+        usage=(900, 0, 9),
+    )
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=60, output_tokens=6)
+
+
+def test_codex_tally_skips_unreadable_sibling(tmp_path):
+    """A child whose body cannot be decoded is skipped and named in `unread`;
+    the readable child and the parent still count.
+
+    Ablation: let the child's read error propagate and the tally raises; drop
+    the child's `unread` append and the `unread` assertion fails."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-05-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(5, 0, 5),
+    )
+    broken = _codex_thread(
+        tmp_path, "2026/10/01", "10-06-00", GRANDCHILD, session_id=ROOT, parent=ROOT
+    )
+    with broken.open("ab") as f:
+        f.write(b'{"type": "event_msg", "payload": "\xff\xfe"}\n')
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=15, output_tokens=6)
+    assert usage is not None and usage.unread == (f"{broken.name}: UnicodeDecodeError",)
+
+
+def test_codex_tally_names_sibling_whose_first_line_fails(tmp_path, monkeypatch):
+    """A sibling whose session_meta cannot be read may be a child, so it is
+    named in `unread` too, by file name only: no directory reaches the journal.
+
+    Ablation: drop the candidate's `unread` append and the assertion fails."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    locked = _codex_thread(
+        tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, usage=(5, 0, 5)
+    )
+    real_read = tokens._read_codex_first_line
+
+    def read(path):
+        if path == locked:
+            raise PermissionError(13, "denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(tokens, "_read_codex_first_line", read)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == (f"{locked.name}: PermissionError",)
+
+
+def test_codex_tally_names_sibling_whose_first_line_does_not_parse(tmp_path, monkeypatch):
+    """A complete first line that is not JSON (invalid UTF-8 here) may hide a
+    child, so it is named in `unread` rather than read as "not a subagent".
+
+    Ablation: let `_codex_meta` return None on a parse failure and the
+    assertion fails."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    garbled = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-05-00-{CHILD}.jsonl"
+    garbled.write_bytes(b'{"type": "session_meta", "payload": "\xff"}\n')
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == (f"{garbled.name}: UnicodeDecodeError",)
+    # failures are not cached: the next tally names it again
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == (f"{garbled.name}: UnicodeDecodeError",)
+
+
+def test_codex_tally_names_parent_whose_first_line_does_not_parse(tmp_path, monkeypatch):
+    """An unparseable parent first line leaves its children uncounted, so the
+    parent's own total is a lower bound and says so.
+
+    Ablation: catch only OSError around the parent's `_codex_meta` and the
+    tally raises."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-00-00-{ROOT}.jsonl"
+    _write_jsonl(
+        parent,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 30, "output_tokens": 3}},
+                },
+            }
+        ],
+    )
+    body = parent.read_bytes()
+    parent.write_bytes(b"{not json\n" + body)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=30, output_tokens=3)
+    assert usage is not None and usage.unread == (f"{parent.name}: JSONDecodeError",)
+
+
+def test_codex_tally_skips_sibling_first_line_still_being_written(tmp_path, monkeypatch):
+    """A first line with no newline yet is a rollout mid-creation, not a
+    fault: it reads as not-a-child for now, uncached, and names nothing.
+
+    Ablation: raise for an incomplete line too and `unread` is non-empty."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    torn = tmp_path / "sessions/2026/10/01" / f"rollout-2026-10-01T10-05-00-{CHILD}.jsonl"
+    torn.write_bytes(b'{"type": "session_meta", "payl')
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=10, output_tokens=1)
+    assert usage is not None and usage.unread == ()
+    assert str(torn) not in tokens._codex_meta_cache
+
+
+def test_codex_tally_names_unlistable_day_dir(tmp_path, monkeypatch):
+    """`Path.glob` swallows a scan's OSError, so the dirs are listed directly:
+    an unlistable day dir is named in `unread` by its date path, and the
+    other days are still searched.
+
+    Ablation: list the dirs with `glob("rollout-*.jsonl")` again and the
+    `unread` assertion fails."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "23-50-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    after_midnight = _local_ts("2026/10/02", hour=0, minute=20)
+    os.utime(parent, (after_midnight, after_midnight))
+    _codex_thread(
+        tmp_path, "2026/10/01", "23-55-00", CHILD, session_id=ROOT, parent=ROOT, usage=(7, 0, 3)
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/02",
+        "00-10-00",
+        GRANDCHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(500, 0, 50),
+    )
+    locked = tmp_path / "sessions/2026/10/02"
+    real_iterdir = type(locked).iterdir
+
+    def iterdir(self):
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(type(locked), "iterdir", iterdir)
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=17, output_tokens=4)
+    assert usage is not None and usage.unread == ("2026/10/02/: PermissionError",)
+
+
+def test_codex_clean_tally_has_no_unread(tmp_path):
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    _codex_thread(tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, usage=(5, 0, 5))
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == ()
+
+
+def test_codex_membership_cache_hit(tmp_path, monkeypatch):
+    """The budget guard tallies every heartbeat: after the first pass each
+    sibling's first line is cached (negatives too), so a repeat tally reads
+    none, and a new sibling costs exactly one first-line read.
+
+    Ablation: skip the cache store and the second tally re-reads every first
+    line."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    reads = []
+    real_read = tokens._read_codex_first_line
+
+    def counting_read(path):
+        reads.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(tokens, "_read_codex_first_line", counting_read)
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-05-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(5, 0, 1),
+    )
+    _codex_thread(tmp_path, "2026/10/01", "10-06-00", OTHER, session_id=OTHER, usage=(9, 0, 9))
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=15, output_tokens=2)
+    assert len(reads) == 3
+    reads.clear()
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=15, output_tokens=2)
+    assert reads == []
+    late = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-09-00",
+        GRANDCHILD,
+        session_id=ROOT,
+        parent=CHILD,
+        usage=(1, 0, 1),
+    )
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=16, output_tokens=3)
+    assert reads == [late.name]
+
+
+def test_codex_membership_cache_is_bounded(tmp_path, monkeypatch):
+    """The cache evicts oldest-first at its cap, so a long-lived engine never
+    grows it without bound.
+
+    Ablation: drop the eviction loop and the cache outgrows the cap."""
+    monkeypatch.setattr(tokens, "_codex_meta_cache", {})
+    monkeypatch.setattr(tokens, "CODEX_META_CACHE_CAP", 2)
+    parent = _codex_thread(tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT)
+    for index, thread in enumerate((CHILD, GRANDCHILD, OTHER)):
+        _codex_thread(
+            tmp_path,
+            "2026/10/01",
+            f"10-0{index + 1}-00",
+            thread,
+            session_id=ROOT,
+            parent=ROOT,
+            usage=(1, 0, 1),
+        )
+
+    assert tally_codex_rollout(parent) == TokenUsage(input_tokens=3, output_tokens=3)
+    assert len(tokens._codex_meta_cache) == 2
 
 
 def test_gemini_chat_dedupes_reemitted_messages(tmp_path):

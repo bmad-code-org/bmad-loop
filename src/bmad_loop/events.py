@@ -368,13 +368,16 @@ def shape_event(
     task_id: str,
     payload: dict[str, Any],
     lineage: str | None = None,
+    payload_error: str | None = None,
 ) -> dict[str, Any]:
     """The event record the orchestrator consumes, built from one hook payload.
 
     ``lineage`` is the relay-side process-lineage tag (DW-507, see
     :func:`_lineage`); :func:`relay` computes it, since it reads this process's
-    own parent chain rather than anything in the payload."""
-    return {
+    own parent chain rather than anything in the payload. ``payload_error`` is
+    :func:`_read_payload`'s tag, written only when set so a readable payload's
+    event is unchanged."""
+    event = {
         "ts": ts,
         "event": event_name,
         "task_id": task_id,
@@ -402,24 +405,37 @@ def shape_event(
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": lineage,
     }
+    if payload_error:
+        event["payload_error"] = payload_error
+    return event
 
 
-def _read_payload(stdin: IO[str]) -> dict[str, Any]:
-    """The hook payload, or an empty dict for anything unreadable.
+def _read_payload(stdin):
+    """The hook payload and why it is unusable: ``(payload, None)`` on success,
+    else ``({}, tag)``.
 
     A hook that fires with nothing on stdin, half a JSON document, undecodable
     bytes, or a bare list is not an error the operator can act on — the event still
     has to be written, because the run's completion signal rides on it. Every
-    non-dict outcome collapses to ``{}`` and the shaped event simply carries nulls.
-    ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are both ``ValueError``
-    subclasses and ride the same arm; ``OSError`` covers a closed or unreadable
-    descriptor.
+    non-dict outcome collapses to ``{}`` and the shaped event carries nulls plus a
+    ``payload_error`` tag (the exception's class name, or ``not-an-object``) the
+    orchestrator crumbs, so the degrade stays visible.
+
+    The bytes are read when the stream has a buffer: ``json.loads`` detects
+    UTF-8/16/32 itself, where a text stdin would decode with the locale code page
+    (cp1252 on Windows) and garble or reject a non-ASCII transcript path. A
+    text-only stream (no ``buffer``) is read as text. ``UnicodeDecodeError`` and
+    ``json.JSONDecodeError`` are both ``ValueError`` subclasses and ride the same
+    arm; ``OSError`` covers a closed or unreadable descriptor.
     """
+    buffer = getattr(stdin, "buffer", None)
     try:
-        payload = json.load(stdin)
-    except (ValueError, OSError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        payload = json.loads(buffer.read()) if buffer is not None else json.load(stdin)
+    except (ValueError, OSError) as e:
+        return {}, type(e).__name__
+    if not isinstance(payload, dict):
+        return {}, "not-an-object"
+    return payload, None
 
 
 def relay(event_name: str, stdin: IO[str]) -> int:
@@ -443,8 +459,14 @@ def relay(event_name: str, stdin: IO[str]) -> int:
     if not run_dir or not task_id:
         return 0
     ts = time.time_ns()
+    payload, payload_error = _read_payload(stdin)
     event = shape_event(
-        ts, event_name, task_id, _read_payload(stdin), _lineage(event_name, ("bmad-loop", "relay"))
+        ts,
+        event_name,
+        task_id,
+        payload,
+        _lineage(event_name, ("bmad-loop", "relay")),
+        payload_error,
     )
     # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
     # channel out of the project tree), else the legacy in-tree location — the
