@@ -1,0 +1,52 @@
+name: Ensure psmux
+description: >-
+  Download one psmux release's windows-x64 archive, put psmux.exe on PATH, and
+  assert that bmad-loop admits it. Needs `uv sync` to have run first.
+inputs:
+  version:
+    description: A psmux release tag (for example `v3.3.8`), or `latest`.
+    required: true
+  github-token:
+    description: Token for the release lookup.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install psmux
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PSMUX_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # The release archive, not `choco install`. Chocolatey's community feed
+        # answered the V2 package lookup with 503 on BOTH matrix legs of the gate's
+        # first run, while the package itself sat published and healthy.
+        # Chocolatey document that feed as neither supported nor guaranteed and
+        # rate-limited per IP behind Cloudflare, and hosted runners share egress
+        # addresses — other projects track the same feed-503 flake. This is one
+        # GET against the host the job already depends on.
+        $release = if ($env:PSMUX_VERSION -eq 'latest') { 'releases/latest' } else { "releases/tags/$env:PSMUX_VERSION" }
+        $url = gh api "repos/psmux/psmux/$release" --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
+        if (-not $url) { throw "no windows-x64 asset on psmux $env:PSMUX_VERSION" }
+        $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
+        $dir = Join-Path $env:RUNNER_TEMP 'psmux'
+        Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+        Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+        $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
+        if (-not $exe) { throw "no psmux.exe in $url" }
+        # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
+        # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
+        # `sys.platform != "win32"` before it ever looks for the binary.
+        # PATH for this step, GITHUB_PATH for the steps after it.
+        $env:PATH = "$($exe.Directory.FullName);$env:PATH"
+        Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
+        psmux -V
+        # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
+        # PsmuxMultiplexer.available(), so an install at or below the version
+        # floor would leave the job green with the entire live gate never run
+        # — the one failure a "did it install?" check cannot see. Calling
+        # available() also keeps the floor in a single place (it reads
+        # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
+        # `pwsh`, which every parked window needs.
+        uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"

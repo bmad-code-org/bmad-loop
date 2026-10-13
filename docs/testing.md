@@ -296,8 +296,12 @@ The Windows jobs split one leg across machines without dropping a test:
   never split. Units are assigned by a SHA-256 digest of the unit's nodeid, never Python's
   randomized `hash()` or a file list, so a new test is assigned automatically and existing
   tests do not move. The digest balances test counts, not seconds.
-- **test-windows-live** installs psmux and runs the L5 gate once per leg, serially, on a
-  machine of its own.
+- **test-windows-live** installs one pinned psmux release and runs the L5 gate once per leg,
+  serially, on a machine of its own. The pin, not `latest`: the gate's `test_premise_*` rows
+  turn red by design when a psmux release fixes what they pin, so an upstream release must
+  never reach a PR's checks. Moving the pin is its own PR, which also moves the version floor
+  and retires the workarounds. The non-required **psmux canary** workflow (weekly, or on
+  demand) runs the same gate against the latest release and goes red when that PR is due.
 - **test-windows** keeps the check name `test (windows, py3.x)` and is the leg's verdict.
   `perf_report.py verify-shards --count 2` requires both shards present and green, their
   selections disjoint, and their union equal to the collected set, with no function family
