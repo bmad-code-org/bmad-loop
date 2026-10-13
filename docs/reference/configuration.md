@@ -101,6 +101,7 @@ Post-implementation verification commands.
 | Key | Type | Default | Allowed | Description |
 | --- | --- | --- | --- | --- |
 | `commands` | array of strings | `[]` |  |  |
+| `command_timeout_min` | integer | `30` | ≥ 1 | per-command wall-clock bound; a command running past it is killed and counts as an ordinary (fixable) verify failure · a graceful stop waits for the running command |
 | `stream_capture_kb` | integer | `256` | ≥ 0 | per-stream cap on the verifier stdout/stderr retained under the run's verify/ directory (the tail is kept; the journal records the full size and a truncation flag) · 0 = capture nothing |
 | `env_fault_rc` | integer | `0` | 0–255 | exit status a verify command uses to declare an environment fault (pause, attempt not charged) instead of a code failure · 0 = disabled; 75 (EX_TEMPFAIL) is a good choice |
 

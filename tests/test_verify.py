@@ -2547,6 +2547,84 @@ def test_probe_timeout_is_a_failure(tmp_path, monkeypatch):
     assert probe.reason == "timed out after 1s"
 
 
+def test_verify_command_timeout_reaches_the_runner(tmp_path, monkeypatch):
+    """`[verify] command_timeout_min` reaches the runner in seconds, once per
+    command — the bound is per command, not per pass. Faked runner; no test sleeps
+    toward a deadline. Ablation: hard-code 1800 in `run_verify_commands`, or drop
+    the `* 60`, and a row goes red."""
+    timeouts: list[float] = []
+
+    def records(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, 0, "")
+
+    monkeypatch.setattr(verify, "_run_shell_command", records)
+
+    verify.run_verify_commands(
+        Policy(verify=VerifyPolicy(commands=("a", "b"), command_timeout_min=45)), tmp_path
+    )
+    assert timeouts == [2700, 2700]
+
+    timeouts.clear()
+    verify.run_verify_commands(Policy(verify=VerifyPolicy(commands=("a",))), tmp_path)
+    assert timeouts == [1800]  # the default 30 minutes
+
+
+def test_verify_timeout_reason_names_the_limit_neutrally(tmp_path):
+    """A timed-out command's reason names the per-command limit it hit, in words
+    that never point the repair agent at policy.toml — this text is written
+    verbatim into its feedback, and raising the limit is the operator's call.
+    The first line stays byte-identical and the failure stays an ordinary fixable
+    retry.
+
+    Ablation: key the note on `rc == -1` alone and the Hangup and spawn-error rows
+    gain it; delete the note branch and the positive row loses it."""
+    out = verify.verify_command_results_outcome(
+        [verify.CommandResult("slow", -1, "timed out")], tmp_path, command_timeout_min=45
+    )
+    assert out.reason.startswith("verify command failed (rc=-1): slow\n")
+    assert "timed out after 45 min (the per-command verify time limit)" in out.reason
+    assert "policy.toml" not in out.reason
+    assert "command_timeout_min" not in out.reason
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
+
+    # rc -1 from a signal (SIGHUP) is not the timeout leg: its own output stays
+    hangup = verify.verify_command_results_outcome(
+        [verify.CommandResult("x", -1, "Hangup")], tmp_path, command_timeout_min=45
+    )
+    assert hangup.reason == "verify command failed (rc=-1): x\nHangup"
+
+    # a timed-out-shaped result that never spawned is not the timeout leg either
+    shaped = verify.CommandResult("x", -1, "timed out", spawn_error="child not started")
+    assert not verify._timed_out_leg(shaped)
+    noted = verify.verify_command_results_outcome([shaped], tmp_path, command_timeout_min=45)
+    assert "min (the per-command verify time limit)" not in noted.reason
+
+    # without the keyword, today's exact text
+    bare = verify.verify_command_results_outcome(
+        [verify.CommandResult("slow", -1, "timed out")], tmp_path
+    )
+    assert bare.reason == "verify command failed (rc=-1): slow\ntimed out"
+
+
+def test_review_composition_passes_the_configured_limit_to_the_reason(tmp_path, monkeypatch):
+    """`verify_commands_outcome` — the review gates' composition — hands the
+    configured limit to the classifier. Ablation: drop the `command_timeout_min`
+    keyword there and the reason reverts to the bare tail."""
+    monkeypatch.setattr(
+        verify,
+        "_run_shell_command",
+        lambda command, cwd, timeout: verify.CommandResult(command, -1, "timed out"),
+    )
+
+    out = verify.verify_commands_outcome(
+        Policy(verify=VerifyPolicy(commands=("slow",), command_timeout_min=45)), tmp_path
+    )
+
+    assert not out.ok and out.fixable
+    assert "timed out after 45 min" in out.reason
+
+
 def test_probe_spawn_fault_is_a_failure(tmp_path):
     """A probe that cannot even be started (unusable cwd) fails the pass."""
     policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
@@ -2793,7 +2871,10 @@ def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, m
     Ablation: set `SPAWN_FAULT_RC = -1` and the sentinel assertion below stops
     discriminating; set `spawn_error` on the timeout leg and the classification
     flips to `env_fault`."""
-    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    real = verify._run_shell_command
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: real(command, cwd, 0.5)
+    )
     sleeper = tmp_path / "sleeper.py"
     sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{sleeper}"',)))
@@ -2829,7 +2910,10 @@ def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path
     exception escapes before the fifth command runs; set `SPAWN_FAULT_RC = -1` and
     the two no-exit-status legs stop being distinguishable by rc.
     """
-    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    real = verify._run_shell_command
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: real(command, cwd, 0.5)
+    )
     sleeper = tmp_path / "sleeper.py"
     sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     hangs = f'"{sys.executable}" "{sleeper}"'
@@ -3080,7 +3164,8 @@ def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
         "from pathlib import Path\n"
         "from bmad_loop import verify\n"
         "from bmad_loop.policy import Policy, VerifyPolicy\n"
-        "verify.COMMAND_TIMEOUT_S = 1.0\n"
+        "_real = verify._run_shell_command\n"
+        "verify._run_shell_command = lambda command, cwd, timeout: _real(command, cwd, 1.0)\n"
         "def run(mode):\n"
         '    cmd = \'"%s" "%s" %s\' % (sys.executable, sys.argv[1], mode)\n'
         "    (r,) = verify.run_verify_commands(\n"

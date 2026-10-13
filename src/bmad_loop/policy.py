@@ -180,6 +180,12 @@ class LimitsPolicy:
 @dataclass(frozen=True)
 class VerifyPolicy:
     commands: tuple[str, ...] = ()
+    # command_timeout_min is the wall-clock bound on EACH [verify] command, in
+    # minutes, across the dev, review and --reverify passes. A command running
+    # past it is killed and fails as an ordinary, fixable verify failure — the
+    # same leg as a nonzero exit — so a slow-but-healthy gate (a mutation suite)
+    # needs a bigger bound, not a different failure class.
+    command_timeout_min: int = 30
     # stream_capture_kb bounds, per stream, the verifier stdout/stderr retained
     # under the run's `verify/` directory for plugins and post-mortems (#641).
     # A tail is kept, matching every other bound on this output — the merged
@@ -191,8 +197,8 @@ class VerifyPolicy:
     # 256 KiB is chosen against what the store is FOR: a repair session or a
     # plugin reading a failing suite's tail. A verbose pytest/ruff failure runs
     # tens of KB, so the cap is generous enough that the realistic case is never
-    # cut, while a chatty command under COMMAND_TIMEOUT_S (30 minutes) can no
-    # longer emit hundreds of MB per attempt. Worst case is bounded and small:
+    # cut, while a chatty command under [verify] command_timeout_min (default
+    # 30 minutes) can no longer emit hundreds of MB per attempt. Worst case is bounded and small:
     # commands x 2 streams x attempts x 256 KiB. It sits far under the file-store
     # precedent it is modelled on (scm.failed_diff_max_mb = 5) and far above the
     # inline-journal caps, which is the right side of both.
@@ -1062,11 +1068,18 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
 
     verify = VerifyPolicy(
         commands=_typed_str_tuple(verify_d, "verify", "commands") or (),
+        command_timeout_min=_typed_int(
+            verify_d, "verify", "command_timeout_min", VerifyPolicy.command_timeout_min
+        ),
         stream_capture_kb=_typed_int(
             verify_d, "verify", "stream_capture_kb", VerifyPolicy.stream_capture_kb
         ),
         env_fault_rc=_typed_int(verify_d, "verify", "env_fault_rc", VerifyPolicy.env_fault_rc),
     )
+    if verify.command_timeout_min < 1:
+        raise PolicyError(
+            f"verify.command_timeout_min must be >= 1: got {verify.command_timeout_min}"
+        )
     if verify.stream_capture_kb < 0:
         raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
     if not 0 <= verify.env_fault_rc <= 255:
@@ -1456,6 +1469,7 @@ session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to w
 [verify]
 # Deterministic gates run by the orchestrator after a clean review, before commit.
 commands = []                # e.g. ["pytest -q", "ruff check ."]
+command_timeout_min = 30     # per-command wall-clock bound (minutes); a command running past it is killed and fails as an ordinary verify failure
 stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
 env_fault_rc = 0             # exit status a [verify] command uses to declare an environment fault (pause, attempt not charged) instead of a code failure. 0 = disabled; 75 (EX_TEMPFAIL) is a good choice
 

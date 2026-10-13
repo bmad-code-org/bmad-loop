@@ -159,8 +159,9 @@ def config_digest(
       surface. Hashed only when non-empty, for the ``session_id_flag`` reason
       below: an unset list runs nothing, and leaving the key out keeps the payload
       byte-identical to a digest stamped before the field existed.
-      ``verify.env_fault_rc`` and ``environment.probe_timeout_s`` are not: they
-      classify or bound a command's run, and neither can name a program.
+      ``verify.env_fault_rc``, ``verify.command_timeout_min`` and
+      ``environment.probe_timeout_s`` are not: they classify or bound a
+      command's run, and none can name a program.
     * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
     * per :data:`ROLES`, every field that decides **which program runs and with
       what flags and environment**. That rule, not a hand-picked list, is what

@@ -208,6 +208,13 @@ description = "post-implementation verification commands"
 key = "commands"
 kind = "lines"
 [[section.field]]
+key = "command_timeout_min"
+kind = "int"
+minimum = 1
+default_ref = "VerifyPolicy.command_timeout_min"
+label = "command timeout (min)"
+description = "per-command wall-clock bound; a command running past it is killed and counts as an ordinary (fixable) verify failure · a graceful stop waits for the running command"
+[[section.field]]
 key = "stream_capture_kb"
 kind = "int"
 minimum = 0
