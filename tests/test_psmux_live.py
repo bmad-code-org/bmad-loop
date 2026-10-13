@@ -1425,9 +1425,10 @@ def test_adopted_a_backend_session_spawns_no_warm_standby(tmp_path, monkeypatch)
     try:
         mux.new_session(session, tmp_path)
         assert (root / f"{session}.port").is_file(), "probe setup: the session has no port file"
-        # The standby is spawned during the server's boot; give it the time it
-        # takes on a loaded box before reading absence as an answer.
-        deadline = time.monotonic() + 10
+        # The standby is spawned during the server's boot, and a server may take
+        # psmux's whole readiness window to register on a loaded box; reading
+        # absence any sooner could pass while a late standby is still coming.
+        deadline = time.monotonic() + psmux_teardown.PSMUX_READY_DEADLINE_S
         while time.monotonic() < deadline and not standby.exists():
             time.sleep(0.25)
         assert not standby.exists(), (
@@ -1436,6 +1437,18 @@ def test_adopted_a_backend_session_spawns_no_warm_standby(tmp_path, monkeypatch)
         )
     finally:
         _teardown_probe_session(mux, session, env)
+        # A standby that registered late is a server of its own, which the
+        # session teardown never reaches. The root is this test's private
+        # tmp dir, so a kill-server scoped to it cannot touch anyone else's.
+        if standby.exists():
+            assert str(root).startswith(str(tmp_path))
+            subprocess.run(
+                ["psmux", "kill-server"],
+                env={**os.environ, "PSMUX_DATA_DIR": str(root)},
+                capture_output=True,
+                timeout=tmux_base.TMUX_TIMEOUT_S,
+                check=False,
+            )
 
 
 def test_adopted_a_missing_registry_root_self_heals(tmp_path):
