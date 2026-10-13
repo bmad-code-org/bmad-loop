@@ -79,6 +79,8 @@ breaking changes may land in a minor release.
   directory. Under worktree isolation on Windows psmux, the session held the first unit's
   worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
   `worktrees/1` behind (#902).
+- Resolve a miscased full run ref to the run id's on-disk spelling on a case-insensitive
+  filesystem, so `stop` and `attach` reach the run's multiplexer session (#904).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the

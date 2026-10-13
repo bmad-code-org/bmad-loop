@@ -455,6 +455,86 @@ def test_resolve_run_dir_exact_wins_over_ambiguity(tmp_path):
     assert runs.resolve_run_dir(tmp_path, "20260620-143025-a1b2") == exact
 
 
+def _case_insensitive(path):
+    return (path.parent / path.name.upper()).exists()
+
+
+def test_resolve_run_dir_returns_the_listed_spelling_of_a_miscased_ref(tmp_path):
+    """A case-insensitive filesystem answers the exact stat for a miscased ref, and
+    the typed spelling used to leak into `run_dir.name` — and from there into the
+    multiplexer session names a case-exact backend then never finds. Ablation:
+    return the exact hit unconditionally and the name check reddens."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    if not _case_insensitive(target):
+        pytest.skip("needs a case-insensitive filesystem")
+    got = runs.resolve_run_dir(tmp_path, "20260620-143025-A1B2")
+    assert got.name == "20260620-143025-a1b2"
+
+
+def test_resolve_run_dir_refuses_a_miscased_ref_on_a_case_sensitive_fs(tmp_path):
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    if _case_insensitive(target):
+        pytest.skip("needs a case-sensitive filesystem")
+    with pytest.raises(runs.RunRefError, match="no such run"):
+        runs.resolve_run_dir(tmp_path, "20260620-143025-A1B2")
+
+
+def test_resolve_run_dir_maps_an_unlisted_alias_to_the_listed_run(tmp_path, monkeypatch):
+    """The miscased hit simulated portably: a symlink alias the listing does not
+    show stands in for the case-folded spelling, so the samefile mapping runs on
+    any filesystem that can make the link."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    alias = target.parent / "20260620-143025-alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("cannot create a directory symlink here")
+    scan = runs._scan_run_dirs
+
+    def hide_alias(project):
+        listed, unreadable, fault = scan(project)
+        return [d for d in listed if d.name != alias.name], unreadable, fault
+
+    monkeypatch.setattr(runs, "_scan_run_dirs", hide_alias)
+    assert runs.resolve_run_dir(tmp_path, alias.name).name == target.name
+
+
+def test_resolve_run_dir_refuses_an_exact_hit_no_listed_entry_is(tmp_path, monkeypatch):
+    """The stat answers but no listed run dir is that dir: refuse, naming the ref,
+    rather than hand back a spelling the listing cannot vouch for."""
+    _make_run(tmp_path, "20260620-143025-a1b2")
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: ([], [], None))
+    with pytest.raises(runs.RunRefError, match="'20260620-143025-a1b2'.*no listed run dir"):
+        runs.resolve_run_dir(tmp_path, "20260620-143025-a1b2")
+
+
+def test_resolve_run_dir_refuses_an_exact_hit_several_listed_entries_are(tmp_path, monkeypatch):
+    """Two listed aliases of the hit leave its spelling unproven: refuse rather than
+    pick one, whose name could miss the minted session. Ablation: accept any
+    non-empty match set and this reddens."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    aliases = [target.parent / "alias-1", target.parent / "alias-2"]
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: (aliases, [], None))
+    monkeypatch.setattr(runs.os.path, "samefile", lambda _a, _b: True)
+    with pytest.raises(runs.RunRefError, match="2 listed run dirs are it"):
+        runs.resolve_run_dir(tmp_path, target.name)
+
+
+def test_resolve_run_dir_names_a_fault_while_matching_the_exact_hit(tmp_path, monkeypatch):
+    """A listed entry that cannot be stat'd mid-match is a RunRefError naming the
+    ref and the fault — the error every CLI caller catches — never a raw OSError."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    listed = [target.parent / "20260619-101010-c3d4"]
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: (listed, [], None))
+
+    def fault(_a, _b):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(runs.os.path, "samefile", fault)
+    with pytest.raises(runs.RunRefError, match="'20260620-143025-a1b2'.*PermissionError"):
+        runs.resolve_run_dir(tmp_path, target.name)
+
+
 @pytest.mark.parametrize("ref", ["", ".", "...", ".. ", " .."], ids=repr)
 def test_resolve_run_dir_refuses_the_root_naming_refs(tmp_path, ref):
     """#480: `_is_path_escape` was the one member of the guard family omitting
