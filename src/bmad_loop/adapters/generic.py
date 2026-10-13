@@ -655,7 +655,10 @@ class _ResultFileMixin:
         `paths`, or None when every call has its result.
 
         A `tool_use` content item opens a call under its `id`; a `tool_result`
-        whose `tool_use_id` names it closes it. Of the calls still open, the one
+        whose `tool_use_id` names it closes it in EVERY file, whatever the read
+        order: a forked subagent's transcript copies the parent's still-open
+        `Agent` call under the same id, and the parent's later result must close
+        that copy too. Of the calls still open, the one
         whose entry carries the newest `timestamp` wins, across ALL files
         (ISO-8601 strings compare chronologically; a missing one sorts oldest), so
         a parent's open `Agent` loses to its subagent's later open `Bash`: the
@@ -665,7 +668,8 @@ class _ResultFileMixin:
         skipped. A path that is not a regular file is skipped unopened (a FIFO
         would block the wait loop). An ``OSError`` propagates for the caller to
         crumb."""
-        open_calls: dict[str, tuple[str, str]] = {}
+        calls: dict[str, tuple[str, str]] = {}
+        closed: set[str] = set()
         for path in paths:
             if not path.is_file():
                 continue
@@ -691,14 +695,15 @@ class _ResultFileMixin:
                             call_id = item.get("id")
                             name = item.get("name")
                             if isinstance(call_id, str):
-                                open_calls[call_id] = (
+                                calls[call_id] = (
                                     name if isinstance(name, str) else "",
                                     timestamp,
                                 )
                         elif item.get("type") == "tool_result":
                             call_id = item.get("tool_use_id")
                             if isinstance(call_id, str):
-                                open_calls.pop(call_id, None)
+                                closed.add(call_id)
+        open_calls = {call_id: call for call_id, call in calls.items() if call_id not in closed}
         if not open_calls:
             return None
         name, _ = max(open_calls.values(), key=lambda call: call[1])

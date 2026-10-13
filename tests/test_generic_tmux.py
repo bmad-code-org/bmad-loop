@@ -11327,6 +11327,21 @@ def test_open_tool_call_tolerates_torn_and_garbage_lines(tmp_path):
     assert generic.GenericAdapter._open_tool_call([tmp_path / "absent.jsonl"]) is None
 
 
+def test_open_tool_call_closes_a_forked_copy_from_the_parent(tmp_path):
+    """A forked subagent's transcript copies the parent's open `Agent` call
+    under the same id; once the parent records its result, the copy is closed
+    too, though the child is read after the parent.
+
+    ABLATION: close calls per file in read order and this returns "Agent"."""
+    parent = tmp_path / "transcript.jsonl"
+    parent.write_bytes(_tool_use("t1", "Agent", "2026-01-01T00:00:01Z") + _tool_result("t1"))
+    child = tmp_path / "agent.jsonl"
+    child.write_bytes(_tool_use("t1", "Agent", "2026-01-01T00:00:01Z"))
+    assert generic.GenericAdapter._open_tool_call([parent, child]) is None
+    _grow(child, _tool_use("t2", "Bash", "2026-01-01T00:00:02Z"))
+    assert generic.GenericAdapter._open_tool_call([parent, child]) == "Bash"
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes unavailable")
 def test_open_tool_call_skips_a_fifo(tmp_path, monkeypatch):
     """A FIFO among the paths is never opened — the open would block the wait
