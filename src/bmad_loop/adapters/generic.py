@@ -973,7 +973,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # reach is `run_dir.parents[2]` — a shape real run dirs have and test run
         # dirs do not, so a derivation would key the watcher off a directory that
         # is not the project (see `_ensure_session`, which accepts exactly that
-        # weakness for a session tag but must not for the completion channel).
+        # weakness for a session's tag and cwd but must not for the completion
+        # channel).
         # Defaulting to the legacy dir keeps direct construction (tests, any
         # caller outside `runsetup.make_adapters`) working unchanged; the
         # bootstrap always passes one, pinned by a test.
@@ -991,14 +992,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     # --------------------------------------------------------- multiplexer
 
-    def _ensure_session(self, cwd: Path) -> None:
+    def _ensure_session(self) -> None:
+        # run_dir = <project>/.bmad-loop/runs/<id>.
+        project = self.run_dir.parents[2]
         if self.mux.has_session(self.session_name):
             # Reusing it is right for this run's own session (a resume), and
             # wrong for a same-named one of another project's in a shared
             # registry (#729): every window would open inside it, under its tag.
-            refusal = runs.foreign_session_refusal(
-                self.session_name, self.mux, self.run_dir.parents[2]
-            )
+            refusal = runs.foreign_session_refusal(self.session_name, self.mux, project)
             if refusal is not None:
                 raise MultiplexerError(
                     f"refusing to launch into the existing session {self.session_name}: "
@@ -1006,10 +1007,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     "[mux] honor_ambient_psmux_data_dir"
                 )
         else:
-            self.mux.new_session(self.session_name, cwd, PANE_COLUMNS, PANE_LINES)
+            # Minted at the project root, never at the first session's cwd: the
+            # session's server and initial window hold it as their cwd for the
+            # whole run, and on Windows that blocks removing a unit's worktree
+            # (#902). Every window gets its own cwd through `new_window`.
+            self.mux.new_session(self.session_name, project, PANE_COLUMNS, PANE_LINES)
             # Tag the session with its project so a cleanup in another project
-            # never prunes this run (run_dir = <project>/.bmad-loop/runs/<id>).
-            project = self.run_dir.parents[2]
+            # never prunes this run.
             try:
                 self.mux.set_session_option(
                     self.session_name, runs.PROJECT_OPTION, runs.project_tag(project)
@@ -1107,7 +1111,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         for artifact in TASK_CYCLE_ARTIFACTS:
             (task_dir / artifact).unlink(missing_ok=True)
 
-        self._ensure_session(spec.cwd)
+        self._ensure_session()
         # Stamped before launch: hook events carry wall-clock ns, and
         # wait_for_completion ignores anything older than this floor so a reused
         # task_id's earlier Stop event cannot replay.

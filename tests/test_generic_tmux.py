@@ -143,7 +143,7 @@ def test_ensure_session_tags_project(tmp_path, monkeypatch, force_tmux_backend):
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
-    adapter._ensure_session(project)
+    adapter._ensure_session()
 
     assert [c for c in calls if c[2] == "set-option"] == [
         [
@@ -209,7 +209,7 @@ def test_ensure_session_refuses_to_adopt_another_projects_session(tmp_path, tag)
     )
 
     with pytest.raises(MultiplexerError, match="refusing to launch into the existing session"):
-        adapter._ensure_session(tmp_path)
+        adapter._ensure_session()
     assert mux.created == []
     assert mux.killed == []  # a session it FOUND is never torn down
 
@@ -278,7 +278,7 @@ def test_ensure_session_tears_down_a_session_it_could_not_tag(tmp_path):
     adapter = _tag_failing_adapter(tmp_path, mux)
 
     with pytest.raises(MultiplexerError) as caught:
-        adapter._ensure_session(tmp_path)
+        adapter._ensure_session()
 
     assert caught.value is mux.tag_fault
     assert mux.created == mux.killed == ["bmad-loop-RID"]
@@ -310,7 +310,7 @@ def test_ensure_session_says_so_when_the_teardown_did_not_land(tmp_path, teardow
     adapter = _tag_failing_adapter(tmp_path, mux)
 
     with pytest.raises(MultiplexerError) as caught:
-        adapter._ensure_session(tmp_path)
+        adapter._ensure_session()
 
     assert caught.value is not mux.tag_fault
     assert caught.value.__cause__ is mux.tag_fault
@@ -347,7 +347,7 @@ def test_ensure_session_reports_a_silent_teardown_failure_on_the_real_backend(
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
 
     with pytest.raises(MultiplexerError, match="is still there after tearing it down") as caught:
-        adapter._ensure_session(project)
+        adapter._ensure_session()
     assert isinstance(caught.value.__cause__, MultiplexerError)
 
 
@@ -362,7 +362,7 @@ def test_ensure_session_reuses_its_own_session_in_a_shared_registry(tmp_path):
         mux=mux,
     )
 
-    adapter._ensure_session(tmp_path)
+    adapter._ensure_session()
     assert mux.created == []
     assert mux.killed == []  # a session it FOUND is never torn down
 
@@ -5544,7 +5544,7 @@ def test_start_session_refuses_unconfined_task_id_without_side_effects(tmp_path,
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
@@ -5576,7 +5576,7 @@ def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
@@ -5605,7 +5605,7 @@ def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_pat
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "theirs.txt").write_text("theirs", encoding="utf-8")
@@ -5631,7 +5631,7 @@ def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == adapter.tasks_dir)
 
     with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
@@ -5647,7 +5647,7 @@ def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path
 def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
-    adapter._ensure_session = lambda cwd: None
+    adapter._ensure_session = lambda: None
     task_id = "clean-task"
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir()
@@ -5672,7 +5672,7 @@ def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
 def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
-    adapter._ensure_session = lambda cwd: None
+    adapter._ensure_session = lambda: None
     task_id = "clean-task"
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir()
@@ -5695,7 +5695,7 @@ def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
 def test_start_session_preserves_existing_regular_prompt_inode(tmp_path):
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
-    adapter._ensure_session = lambda cwd: None
+    adapter._ensure_session = lambda: None
     task_id = "clean-task"
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir()
@@ -5710,6 +5710,47 @@ def test_start_session_preserves_existing_regular_prompt_inode(tmp_path):
     assert prompt_path.read_text(encoding="utf-8") == spec.prompt + "\n"
 
 
+class _FreshSessionMux(_StartSessionMux):
+    """No session yet: start_session mints one; records the cwd it is minted at."""
+
+    def __init__(self):
+        super().__init__()
+        self.sessions: list[tuple[str, Path]] = []
+
+    def has_session(self, name):
+        return any(n == name for n, _ in self.sessions)
+
+    def new_session(self, name, cwd, cols=None, lines=None):
+        self.sessions.append((name, Path(cwd)))
+
+    def set_session_option(self, name, key, value):
+        pass
+
+
+def test_start_session_mints_the_session_at_the_project_root_not_the_unit_cwd(tmp_path):
+    """#902: the session's server and initial window keep the cwd it is minted
+    at for the whole run, so minting it in the first unit's worktree pins that
+    worktree (Windows then refuses to remove it). The session goes to the
+    project root; the window still opens in the unit's own cwd."""
+    project = tmp_path
+    run_dir = project / ".bmad-loop" / "runs" / "RID"
+    worktree = run_dir / "worktrees" / "1"
+    worktree.mkdir(parents=True)
+    mux = _FreshSessionMux()
+    adapter = GenericTmuxAdapter(
+        run_dir=run_dir,
+        policy=Policy(limits=LimitsPolicy()),
+        profile=get_profile("claude"),
+        mux=mux,
+    )
+
+    adapter.start_session(make_spec(worktree, task_id="1-dev"))
+    adapter.start_session(make_spec(worktree, task_id="1-review"))
+
+    assert mux.sessions == [(adapter.session_name, project)]
+    assert [cwd for _, _, cwd in mux.windows] == [worktree, worktree]
+
+
 @pytest.mark.parametrize(
     "artifact_name",
     ["heartbeat.json", "resultless-stops.jsonl", "session-lifecycle.jsonl"],
@@ -5718,7 +5759,7 @@ def test_start_session_refuses_redirected_task_artifact_before_mutation(tmp_path
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     task_dir = adapter.tasks_dir / "clean-task"
     task_dir.mkdir()
     outside = tmp_path / "outside.txt"
@@ -5746,7 +5787,7 @@ def test_start_session_refuses_redirected_log_path_before_mutation(
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     outside = tmp_path / "outside"
     outside.mkdir()
     outside_file = outside / "theirs.log"
@@ -5785,7 +5826,7 @@ def test_start_session_refuses_junction_like_task_directory_before_mutation(tmp_
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
     ensure_calls = []
-    adapter._ensure_session = lambda cwd: ensure_calls.append(Path(cwd))
+    adapter._ensure_session = lambda: ensure_calls.append(True)
     task_id = "clean-task"
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir()
@@ -5827,7 +5868,7 @@ def test_start_session_resets_reused_task_log(tmp_path):
     this pins is that no stale BYTE survives — not that no file does."""
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
-    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    adapter._ensure_session = lambda: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
     _write_task_log(
         adapter, b"API Error: Unable to connect to API (ECONNREFUSED)\n", task_id=task_id
@@ -5860,7 +5901,7 @@ def test_start_session_drops_every_reused_task_cycle_artifact(tmp_path):
     refuses a bare literal that would let one drift from the other."""
     mux = _StartSessionMux()
     adapter = make_adapter(tmp_path, mux=mux)
-    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    adapter._ensure_session = lambda: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
     task_dir = adapter.tasks_dir / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -8896,7 +8937,7 @@ def test_proof_of_work_dead_on_arrival_window_is_refused(tmp_path, monkeypatch):
     nothing — the faithful stand-in for attaching a tee to a corpse."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    adapter._ensure_session = lambda: None  # skip the tmux server plumbing
     adapter.mux = _StartSessionMux()
 
     handle = adapter.start_session(_dev_spec(tmp_path))
