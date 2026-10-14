@@ -22,11 +22,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 SOURCE_SPRINT: Final = "sprint-status"
 SOURCE_STORIES: Final = "stories"
 SOURCES: Final[tuple[str, ...]] = (SOURCE_SPRINT, SOURCE_STORIES)
+
+QueueMode = Literal["sprint", "stories"]
+"""The ``mode`` values ``validate --json`` reports — one per source, through
+:attr:`SourceTraits.validate_mode`."""
 
 
 class UnknownSource(ValueError):
@@ -53,7 +57,7 @@ class SourceTraits:
 
     name: str
     label: str
-    validate_mode: str
+    validate_mode: QueueMode
     has_epics: bool
     has_spec_folder: bool
     stories_primitive: bool
@@ -121,6 +125,6 @@ def launch_roles(source: str, retrospective: str) -> tuple[str, ...]:
     return ("dev", "review")
 
 
-def validate_mode(source: str) -> str:
+def validate_mode(source: str) -> QueueMode:
     """The ``mode`` value ``validate --json`` reports for ``source``."""
     return traits_for(source).validate_mode

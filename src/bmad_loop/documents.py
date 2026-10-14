@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import policy, runs
+from .worksource import QueueMode
 
 if TYPE_CHECKING:
     from .checks import ValidationReport
@@ -55,9 +56,18 @@ VALIDATE_SCHEMA_VERSION = 1
 
 
 def validate_document(
-    report: ValidationReport, stories_on: bool, spec_folder: str
+    report: ValidationReport,
+    mode: QueueMode,
+    spec_folder: str,
+    *,
+    initiative: str = "",
+    era: str = "",
 ) -> dict[str, object]:
     """The `validate --json` document: the verdict plus every check that produced it.
+
+    ``mode`` is the source's ``validate_mode`` trait (``worksource``).
+    ``initiative`` and ``era`` are accepted but not yet emitted: they are reserved
+    for the ticket-tree source, which adds them to the document additively.
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
     anything breaking bumps VALIDATE_SCHEMA_VERSION). ``ok`` is true when no
@@ -98,10 +108,10 @@ def validate_document(
     return {
         "schema_version": VALIDATE_SCHEMA_VERSION,
         "ok": report.passed,
-        "mode": "stories" if stories_on else "sprint",
+        "mode": mode,
         # "" rather than null in sprint mode, where a spec folder is inapplicable —
         # the same convention as list_document's paused_stage.
-        "spec_folder": spec_folder if stories_on else "",
+        "spec_folder": spec_folder if mode == "stories" else "",
         "counts": report.counts(),
         "findings": [
             {

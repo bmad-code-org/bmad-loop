@@ -783,11 +783,15 @@ class DashboardScreen(Screen[None]):
                 snap.stopping = (
                     snap.status in (data.RUNNING, data.UNKNOWN) and ctx.watcher.stopping()
                 )
-                if snap.state is not None and snap.state.source == "stories":
-                    # per-run board: re-derived each tick (only while a stories run
-                    # is selected) so it tracks the dev sessions writing story specs.
+                # per-run board (`data.BOARD_LOADERS`): re-derived each tick (only while
+                # a stories run is selected) so it tracks the dev sessions writing story
+                # specs.
+                board = (
+                    data.BOARD_LOADERS.get(snap.state.source) if snap.state is not None else None
+                )
+                if snap.state is not None and board is not None:
                     snap.stories_mode = True
-                    snap.stories = data.stories_overview(self.project, snap.state.spec_folder)
+                    snap.stories = board(self.project, snap.state)
                 snap.new_entries = ctx.journal.read_new()
                 ctx.entries.extend(snap.new_entries)
                 del ctx.entries[:-_MAX_ENTRIES]

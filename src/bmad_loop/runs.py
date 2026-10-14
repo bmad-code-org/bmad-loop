@@ -33,7 +33,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, sprintstatus, verify
+from . import (
+    bmadconfig,
+    deferredwork,
+    devcontract,
+    envvars,
+    platform_util,
+    sprintstatus,
+    verify,
+    worksource,
+)
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -4416,7 +4425,7 @@ def validate_restore_latch(
     # implementation to restore, and its re-arm re-dispatches a planning leg.
     # Keyed on the recorded detection verdict (task.sentinel_kind), not the on-disk
     # basename, mirroring rearm_escalation's sentinel-clear branch.
-    if state.source == "stories" and task.sentinel_kind:
+    if worksource.resumed_traits_for(state.source).sentinels and task.sentinel_kind:
         return (
             f"story {story_key} is wedged on a pre-planning {task.sentinel_kind} sentinel — "
             "there is no attempted implementation to restore, and the re-drive starts "
@@ -6294,7 +6303,9 @@ def _rearm_escalation_locked(
             # status-flip path so it is kept, not deleted. Gate on the run source too (the
             # convention exists only in stories mode) and defensively re-confirm the
             # on-disk name still matches the recorded slug before deleting.
-            sentinel_kind = task.sentinel_kind if state.source == "stories" else ""
+            sentinel_kind = (
+                task.sentinel_kind if worksource.resumed_traits_for(state.source).sentinels else ""
+            )
             if sentinel_kind and _sentinel_condition(spec_path, key) == sentinel_kind:
                 # a sentinel is cleared by deletion, not a status flip; drop the stale
                 # spec_file so the re-dispatch starts from PENDING (clean re-plan).
@@ -7205,9 +7216,13 @@ def standalone_replay_refusal(
         )
     if state.run_type == "sweep":
         return f"a finished sweep run's bundle ({story_key}) cannot be replayed; " f"{by_hand}"
-    if state.source == "stories":
+    # An allowlist, not a denylist: only a source whose queue a replay can read is
+    # admitted. A source the registry does not carry is refused here rather than
+    # falling through to the sprint-board read below as if it were a sprint run.
+    traits = worksource.TRAITS.get(state.source)
+    if traits is None or not traits.replay:
         return (
-            f"a finished stories-mode run's story ({story_key}) cannot be replayed "
+            f"a finished {state.source}-mode run's story ({story_key}) cannot be replayed "
             f"(sprint-status runs only); {by_hand}"
         )
     if task.phase != Phase.DEFERRED:

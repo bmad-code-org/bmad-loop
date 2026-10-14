@@ -3,8 +3,8 @@ tables that key on it.
 
 The tables are what force a new source to visit every site that branches per
 source: a source registered in `worksource.SOURCES` without a row in one of them
-fails `test_cli_dispatch_tables_are_exhaustive` here, rather than a `KeyError`
-at the first run that reaches the site.
+fails `test_dispatch_tables_are_exhaustive` here, rather than a `KeyError` at the
+first run that reaches the site.
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ import dataclasses
 
 import pytest
 
-from bmad_loop import cli, policy, worksource
+from bmad_loop import cli, documents, policy, worksource
+from bmad_loop.checks import ValidationReport
 
 
 def test_sources_equal_policy_stories_sources():
@@ -95,17 +96,88 @@ def test_validate_mode():
     assert worksource.validate_mode("stories") == "stories"
 
 
-@pytest.mark.parametrize(
-    "table",
-    ["_DRY_RUNNERS", "_STATUS_PRINTERS", "_QUEUE_VALIDATORS", "_RUN_PREFLIGHTS"],
-)
-def test_cli_dispatch_tables_are_exhaustive(table):
-    """Each cli per-source table carries exactly one row per registered source.
+def _dispatch_tables():
+    """Every per-source table, by display name. The TUI table is imported lazily:
+    the `tui` extra is optional."""
+    tables = {
+        f"cli.{name}": getattr(cli, name)
+        for name in (
+            "_DRY_RUNNERS",
+            "_STATUS_PRINTERS",
+            "_QUEUE_VALIDATORS",
+            "_RUN_PREFLIGHTS",
+            "_ACTIONABLE_KEY_READERS",
+        )
+    }
+    try:
+        from bmad_loop.tui import data
+    except ImportError:  # pragma: no cover - the tui extra is installed in CI
+        return tables
+    tables["tui.data.BOARD_LOADERS"] = data.BOARD_LOADERS
+    return tables
 
-    Ablation (performed): deleting the `stories` row from `_DRY_RUNNERS` turns
-    this red."""
-    assert set(getattr(cli, table)) == set(worksource.SOURCES)
+
+@pytest.mark.parametrize("table", sorted(_dispatch_tables()))
+def test_dispatch_tables_are_exhaustive(table):
+    """Each per-source table (cli dispatch, TUI board loaders) carries exactly one
+    row per registered source.
+
+    Ablation (performed): deleting the `stories` row from `_DRY_RUNNERS`, or from
+    `tui.data.BOARD_LOADERS`, turns this red."""
+    assert set(_dispatch_tables()[table]) == set(worksource.SOURCES)
 
 
-def test_actionable_key_readers_are_exhaustive():
-    assert set(cli._ACTIONABLE_KEY_READERS) == set(worksource.SOURCES)
+@pytest.mark.parametrize("source", worksource.SOURCES)
+def test_validate_document_mode_per_source(source):
+    """`validate --json` reports each source's `validate_mode` trait as `mode`,
+    and carries the spec folder only for a source that pins one."""
+    traits = worksource.traits_for(source)
+    doc = documents.validate_document(ValidationReport(), traits.validate_mode, "specs/feat")
+    assert doc["mode"] == traits.validate_mode
+    assert doc["spec_folder"] == ("specs/feat" if traits.has_spec_folder else "")
+    # Reserved for the ticket-tree source: accepted, not yet emitted.
+    assert (
+        documents.validate_document(
+            ValidationReport(), traits.validate_mode, "specs/feat", initiative="i", era="v7"
+        )
+        == doc
+    )
+
+
+async def test_modal_select_options_match_runnable_traits(tmp_path, monkeypatch):
+    """The start-run modal offers exactly the runnable sources, labelled and
+    ordered by the registry.
+
+    Ablation (in-test): a source flipped to `runnable=False` drops out of the
+    picker — so the options are read from the traits, not a hand-kept list."""
+    pytest.importorskip("textual")
+    from textual.app import App
+    from textual.widgets import Select
+
+    from bmad_loop.tui.screens.modals import StartRunModal
+
+    async def options() -> list[tuple[object, object]]:
+        class _Host(App[None]):
+            def on_mount(self) -> None:
+                self.push_screen(StartRunModal(tmp_path))
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return list(app.screen.query_one("#source", Select)._options)
+
+    def runnable():
+        return [(t.label, t.name) for t in worksource.TRAITS.values() if t.runnable]
+
+    assert await options() == runnable()
+    assert [name for _, name in runnable()] == list(worksource.SOURCES)
+
+    stories = worksource.TRAITS[worksource.SOURCE_STORIES]
+    monkeypatch.setitem(
+        worksource.TRAITS,
+        worksource.SOURCE_STORIES,
+        dataclasses.replace(stories, runnable=False),
+    )
+    assert await options() == [
+        (worksource.TRAITS[worksource.SOURCE_SPRINT].label, worksource.SOURCE_SPRINT)
+    ]

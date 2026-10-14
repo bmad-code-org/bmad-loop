@@ -850,7 +850,7 @@ def machine_json(argv, capsys, *, rc: int = 0, err_contains: str | None = None):
     return json.loads(out)
 
 
-def make_validate_document(findings, *, stories_on: bool = False, spec_folder: str = ""):
+def make_validate_document(findings, *, mode: str = "sprint", spec_folder: str = ""):
     """Build a REAL `validate --json` document from (check, severity, message,
     detail) tuples, for tests that need to *stub* one rather than run validate.
 
@@ -869,7 +869,7 @@ def make_validate_document(findings, *, stories_on: bool = False, spec_folder: s
     report = ValidationReport()
     for check, severity, message, detail in findings:
         report.add(check, severity, message, detail)
-    return documents.validate_document(report, stories_on, spec_folder)
+    return documents.validate_document(report, mode, spec_folder)
 
 
 @pytest.fixture(scope="session", autouse=True)

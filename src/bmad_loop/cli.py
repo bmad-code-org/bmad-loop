@@ -756,7 +756,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
     )
 
     source, spec_folder = _resolve_source(args, pol)
-    stories_on = source == worksource.SOURCE_STORIES
     if paths:
         _QUEUE_VALIDATORS[source](project, paths, spec_folder, dev_trees, report)
 
@@ -1363,7 +1362,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
         # anything holding a hand-built Namespace) that predate the flag.
-        machine.emit(validate_document(report, stories_on, spec_folder))
+        machine.emit(validate_document(report, worksource.validate_mode(source), spec_folder))
     else:
         report.render()
     return 0 if report.passed else 1

@@ -23,6 +23,7 @@ import json
 import math
 import re
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
+from .. import bmadconfig, deferredwork, policy, sprintstatus, stories, worksource
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
@@ -998,6 +999,24 @@ def stories_overview(project: Path, spec_folder: str) -> list[stories.StoryRow] 
         return stories.story_rows(folder)
     except stories.StoriesError:
         return None
+
+
+def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | None:
+    return stories_overview(project, state.spec_folder)
+
+
+BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | None"]
+
+BOARD_LOADERS: Mapping[str, BoardLoader | None] = {
+    worksource.SOURCE_SPRINT: None,
+    worksource.SOURCE_STORIES: _stories_board,
+}
+"""The per-run board each work source shows in the dashboard's board slot, keyed
+by ``RunState.source``. ``None`` means the source has no per-run board: the slot
+shows the project-level sprint tree (:func:`sprint_overview`, painted on rescan).
+A source this table does not carry is shown as sprint, as before the registry.
+One row per ``worksource.SOURCES`` (``tests/test_worksource.py`` holds it
+exhaustive)."""
 
 
 @dataclass(frozen=True)

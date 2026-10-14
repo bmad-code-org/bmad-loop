@@ -37,6 +37,7 @@ from .. import (
     runs,
     stories,
     verify,
+    worksource,
 )
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..journal import load_state, state_lock
@@ -364,20 +365,20 @@ class BmadLoopApp(App[None]):
         try:
             pol = policy.load(self.project / POLICY_FILE)
         except (policy.PolicyError, OSError):
-            return "sprint-status", ""
+            return worksource.SOURCE_SPRINT, ""
         return pol.stories.source, pol.stories.spec_folder
 
     def _start_run_result(self, result: dict | None) -> None:
         if not result:
             return
-        stories_on = result["source"] == "stories"
-        spec_folder = result["spec_folder"] if stories_on else ""
-        if stories_on and not spec_folder:
+        has_spec_folder = worksource.traits_for(result["source"]).has_spec_folder
+        spec_folder = result["spec_folder"] if has_spec_folder else ""
+        if has_spec_folder and not spec_folder:
             self.notify("stories mode needs a spec folder", severity="error")
             return
         if result["dry_run"]:
             tail = ["run", "--project", str(self.project), "--dry-run"]
-            if stories_on:
+            if has_spec_folder:
                 tail += ["--spec", spec_folder]
             if result["epic"] is not None:
                 tail += ["--epic", str(result["epic"])]
@@ -1624,7 +1625,7 @@ class BmadLoopApp(App[None]):
 
     def _story_context(self, state: RunState, key: str) -> tuple[str, str]:
         """(title, description) from stories.yaml in stories mode, else ("", "")."""
-        if state.source != "stories" or not state.spec_folder:
+        if not worksource.resumed_traits_for(state.source).has_spec_folder or not state.spec_folder:
             return "", ""
         # `live_stories_root`, not `self.project` bare, for the reason `_sentinel_kind`
         # states below: BOTH feed one `EscalationModal` — this supplies its title and
@@ -1644,7 +1645,7 @@ class BmadLoopApp(App[None]):
         return (entry.title, entry.description) if entry else ("", "")
 
     def _sentinel_kind(self, state: RunState, key: str) -> str:
-        if state.source != "stories" or not state.spec_folder:
+        if not worksource.resumed_traits_for(state.source).sentinels or not state.spec_folder:
             return ""
         # Anchored on the tree the RUN owns, for the same reason `_paused_spec` is: the
         # sentinel the engine wrote lives in the unit's mount under isolation

@@ -40,6 +40,7 @@ from . import (
     gates,
     sprintstatus,
     verify,
+    worksource,
     workspace_trust,
 )
 from .adapters.profile import ProfileError
@@ -2723,7 +2724,7 @@ class WorktreeFlow:
         # enough. Either shape would HALT a folder+id dispatch before writing a spec.
         stories_support = (
             missing_stories_support(self._mount_roots(unit.path)[1], trees)
-            if self.state.source == "stories"
+            if worksource.resumed_traits_for(self.state.source).stories_primitive
             else []
         )
         if stories_support:

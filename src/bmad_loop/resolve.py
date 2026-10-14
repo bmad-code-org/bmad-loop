@@ -22,6 +22,7 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Any
 
+from . import worksource
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
@@ -349,8 +350,9 @@ def build_context(
     restore_supported = task is not None and (
         validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
+    traits = worksource.resumed_traits_for(state.source)
     stories_ctx: dict[str, Any] | None = None
-    if state.source == "stories":
+    if traits.has_spec_folder:
         # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
         # `runs.live_stories_root` rather than by `task_spec_root`. Sprint mode consumes
         # no stories data, so it must not probe for a stories root at all.
@@ -361,7 +363,7 @@ def build_context(
     # The persisted detection verdict is authoritative, matching re-arm. A real spec
     # may legally have a sentinel-shaped basename, while a recorded sentinel remains a
     # sentinel even when its file is unreadable or has disappeared.
-    sentinel = state.source == "stories" and task is not None and bool(task.sentinel_kind)
+    sentinel = traits.sentinels and task is not None and bool(task.sentinel_kind)
     # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
     # own watermark — 0 for a task never resolved, and for every pre-upgrade
     # `state.json`, which is the unfiltered pre-DW-11 walk.

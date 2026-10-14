@@ -1032,7 +1032,7 @@ def test_validate_header_shows_mode_and_spec_folder_without_markup():
     MarkupError if it were ever interpolated into a markup string."""
     doc = make_validate_document(
         [("git.worktree-clean", "ok", "clean", None)],
-        stories_on=True,
+        mode="stories",
         spec_folder="docs/[wip]-epic-3",
     )
     header = widgets.validate_header(doc)
@@ -2616,7 +2616,7 @@ async def test_validate_findings_modal_fixed_floor_with_long_spec_folder(project
         modal = ValidateFindingsModal(
             make_validate_document(
                 [("bmad-config", "problem", "a finding", None)],
-                stories_on=True,
+                mode="stories",
                 spec_folder=folder,
             )
         )

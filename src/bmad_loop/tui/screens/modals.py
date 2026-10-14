@@ -20,10 +20,16 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
-from ... import stories
+from ... import stories, worksource
 from ...escalation import display_pause_reason
 from ...model import RunState
 from .. import data, widgets
+
+
+def source_options() -> list[tuple[str, str]]:
+    """The start-run modal's source picker: one (label, source) per registered
+    source that ``run`` can launch from, in registry order."""
+    return [(t.label, t.name) for t in worksource.TRAITS.values() if t.runnable]
 
 
 def _int_or_none(value: str) -> int | None:
@@ -189,7 +195,7 @@ class StartRunModal(BaseDialog):
         self,
         project: Path,
         *,
-        default_source: str = "sprint-status",
+        default_source: str = worksource.SOURCE_SPRINT,
         default_spec_folder: str = "",
     ):
         super().__init__()
@@ -204,10 +210,7 @@ class StartRunModal(BaseDialog):
             # in any terminal size (the modal is tall in stories mode).
             with VerticalScroll(id="fields"):
                 yield Select(
-                    [
-                        ("sprint mode — sprint-status.yaml", "sprint-status"),
-                        ("stories mode — folder+id dispatch", "stories"),
-                    ],
+                    source_options(),
                     value=self._default_source,
                     allow_blank=False,
                     id="source",
@@ -257,7 +260,8 @@ class StartRunModal(BaseDialog):
             spec_folder = self.query_one("#spec-folder", Input).value.strip()
         except NoMatches:
             return  # a Changed message during mount, before the tree is built
-        if source != "stories":
+        traits = worksource.TRAITS.get(source) if isinstance(source, str) else None
+        if traits is None or not traits.has_spec_folder:
             body.update(Text("sprint mode — walks sprint-status.yaml", style="dim"))
             return
         if not spec_folder:

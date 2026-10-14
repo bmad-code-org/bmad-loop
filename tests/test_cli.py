@@ -12636,7 +12636,7 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     report.ok("git.worktree-clean", "clean")  # the detail=None leg
 
     # the exact production path: cli.py does `machine.emit(validate_document(...))`.
-    machine.emit(cli.validate_document(report, stories_on=False, spec_folder=""))
+    machine.emit(cli.validate_document(report, mode="sprint", spec_folder=""))
     parsed = json.loads(capsys.readouterr().out)  # whole stdout parses => a pure document
 
     by_check = {f["check"]: f for f in parsed["findings"]}
@@ -14271,7 +14271,7 @@ def test_win32_on_wsl_path_survives_the_render_and_the_json_projection(mux_regis
 
     report = cli.ValidationReport()
     report.extend(cli._platform_preflight(WSL_UNC_PROJECT))  # asserts the id is registered
-    doc = cli.validate_document(report, False, "")
+    doc = cli.validate_document(report, "sprint", "")
 
     rows = [f for f in doc["findings"] if f["check"] == "host.win32-on-wsl-path"]
     assert len(rows) == 1
