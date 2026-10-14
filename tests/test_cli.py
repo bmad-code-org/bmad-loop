@@ -6597,6 +6597,65 @@ def test_resolve_in_ctl_session_detaches_before_resume(tmp_path, monkeypatch, ca
     assert "in the background" in capsys.readouterr().out
 
 
+class _SessionStarted(BaseException):
+    """Raised where the interactive resolve session would be built; a BaseException
+    so `cli.main`'s backstop does not fold it into rc 1."""
+
+
+def _stop_at_the_resolve_session(*_a, **_k):
+    raise _SessionStarted
+
+
+def test_resolve_claims_its_control_window_under_the_state_lock(tmp_path, monkeypatch):
+    # #920: past its entry refusals an interactive resolve hosts its session in
+    # this window, so it publishes the window as the run's, under the lock a
+    # driving resume publishes its pid in, and before the session is built.
+    # Ablation: drop the claim and `claims` stays empty.
+    run_dir = _escalated_run(tmp_path, "r1")
+    claims: list[Path] = []
+
+    def claim(_project, target):
+        assert_run_state_lock_held(target)
+        claims.append(target)
+
+    monkeypatch.setattr(cli, "_claim_ctl_window", claim)
+    monkeypatch.setattr(cli, "_make_adapters", _stop_at_the_resolve_session)
+    with pytest.raises(_SessionStarted):
+        cli.main(["resolve", "--project", str(tmp_path), "r1"])
+    assert claims == [run_dir]
+
+
+def test_resolve_claims_nothing_before_its_entry_refusals(tmp_path, monkeypatch, capsys):
+    # A resolve refused at entry (here: a story it cannot resolve) must leave
+    # the record alone — an interactive resolver may own it, and has no engine
+    # pid to protect it. Ablation: claim ahead of the story gate and this fails.
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli, "_claim_ctl_window", lambda *_a: pytest.fail("claimed"))
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--story", "nope"])
+    assert rc == 1
+    assert "no escalated story" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("later", "fragment"), [("alive", "still live"), ("unknown", "unverifiable pid")]
+)
+def test_resolve_refuses_a_resume_that_accepted_after_its_gate(
+    tmp_path, monkeypatch, capsys, later, fragment
+):
+    # #920's concurrent order through resolve: a resume accepts the run between
+    # resolve's liveness gate and its claim. Re-checked under the lock, resolve
+    # refuses and leaves the record to the window that drives; an unverifiable
+    # pid needs --force there as at the gate. Ablation: drop the in-lock
+    # re-check and resolve claims over the live resume.
+    _escalated_run(tmp_path, "r1")
+    answers = iter(["dead", later])
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _run_dir: next(answers))
+    monkeypatch.setattr(cli, "_claim_ctl_window", lambda *_a: pytest.fail("claimed a live run"))
+    monkeypatch.setattr(cli, "_make_adapters", _stop_at_the_resolve_session)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    assert fragment in capsys.readouterr().err
+
+
 def test_resolve_rearm_only_skips_resume(tmp_path, monkeypatch, capsys):
     _escalated_run(tmp_path, "r1")
     monkeypatch.setattr(
@@ -8044,12 +8103,19 @@ def test_resume_retains_outer_lock_through_pid_publication(project, monkeypatch)
         publications.append("state")
         real_save(target, state)
 
+    def checked_claim(_project, target):
+        # #920: the control-window record follows acceptance in lock order, so a
+        # rival resume refused under this hold can never take it from this one.
+        assert_run_state_lock_held(target)
+        publications.append("claim")
+
     monkeypatch.setattr(cli.runs, "write_pid", checked_write_pid)
     monkeypatch.setattr(cli, "save_state", checked_save)
+    monkeypatch.setattr(cli, "_claim_ctl_window", checked_claim)
     monkeypatch.setattr(cli, "Engine", _StubEngine)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert publications == ["pid", "state"]
+    assert publications == ["pid", "state", "claim"]
 
 
 def _state_reading_engine(seen):
@@ -20853,6 +20919,9 @@ def test_resolve_reverify_finished_run_gates_on_liveness(
     run_dir, project = _finished_reverify_project(tmp_path)
     before = _state_bytes(run_dir)
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: live)
+    # #920: a finished run's window drives a new replay run, which claims its own
+    # record when it resumes; the refused one must not take the finished run's.
+    monkeypatch.setattr(cli, "_claim_ctl_window", lambda *_a: pytest.fail("claimed"))
     _no_replay(monkeypatch)
 
     assert _resolve_reverify(project, "--story", _REVERIFY_KEY, "--resume") == 1

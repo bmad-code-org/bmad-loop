@@ -82,6 +82,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- TUI: record a resume or resolve window as the run's control window only once its child
+  accepts the run, so a resume refused as "still live" no longer sends attach and `x` to
+  its own window while the engine runs in another (#920).
 - Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
   captured, not only after the command exits, so a chatty command's memory no longer
   grows with its runtime (DW-549).

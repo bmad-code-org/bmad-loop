@@ -4478,6 +4478,16 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
+def _claim_ctl_window(project: Path, run_dir: Path) -> None:
+    """Publish the control window this process runs in as the run's, once this
+    process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
+    the run's state lock and has just found no live engine under it (#920)."""
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if (warning := launch.claim_ctl_window(project, run_dir.name)) is not None:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
     """Resume a paused/interrupted run without holding its lock across execution.
 
@@ -4500,8 +4510,9 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
             )
             return 1
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
-    if isinstance(prepared, int):
-        return prepared
+        if isinstance(prepared, int):
+            return prepared
+        _claim_ctl_window(project, run_dir)
     paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
@@ -4977,6 +4988,24 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # same predicate, so an operator who declines still gets no config lecture.
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
                 return rc
+        # Past every entry refusal, this window now hosts the resolve session, so
+        # it becomes the run's control window (#920). Under the lock a driving
+        # resume publishes its pid in, and the liveness gate above is re-taken
+        # there: a resume that accepted after it keeps the record. The other paths
+        # claim when they resume (`_resume_paused_run`), or drive nothing.
+        with state_lock(run_dir):
+            live = runs.engine_liveness(run_dir)
+            if live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-arm; re-run with --force once it is gone",
+                    file=sys.stderr,
+                )
+                return 1
+            _claim_ctl_window(project, run_dir)
         adapters = _make_adapters(project, run_dir, pol)
         dev_cfg = pol.adapter.resolved("dev")
         model = dev_cfg.model

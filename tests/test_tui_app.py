@@ -3408,9 +3408,9 @@ async def test_resume_confirm_launches(project_tree, monkeypatch):
 
 
 async def test_resume_uncaptured_window_id_warns(project_tree, monkeypatch):
-    # The resume itself is running; only the #482 disambiguation record is lost,
-    # so attach/stop may target an older same-run_id window. The success toast
-    # must not mask that (the resolve path already errors on this condition).
+    # The resume itself is running; only reach for its window is lost, so
+    # attach/stop may miss it. The success toast must not mask that (the
+    # resolve path already errors on this condition).
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
@@ -3428,7 +3428,7 @@ async def test_resume_uncaptured_window_id_warns(project_tree, monkeypatch):
         await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
         await click(pilot, await ready(pilot, "#ok"))
         await until(
-            pilot, lambda: any("window id was not recorded" in m for m in notifications(app))
+            pilot, lambda: any("window id was not captured" in m for m in notifications(app))
         )
 
 
@@ -4431,10 +4431,10 @@ async def test_resolve_escalation_launches_and_attaches(project_tree, monkeypatc
     monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
-    # The healthy path: the lookup answers the window the launch minted, so no
+    # The healthy path: the lookup can reach the window the launch minted, so no
     # warning. Stubbed at the same seam every other attach test stubs — the
     # helper's own listing/record logic is pinned in tests/test_tui_launch.py.
-    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: True)
+    monkeypatch.setattr(launch, "ctl_window_reachable", lambda proj, rid, wid: True)
     make_run(
         project_tree.project,
         "20260611-100000-aaaa",
@@ -4449,7 +4449,7 @@ async def test_resolve_escalation_launches_and_attaches(project_tree, monkeypatc
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await click(pilot, await ready(pilot, "#ok"))
         await until(pilot, lambda: bool(calls))
-        assert not any("was not recorded" in m for m in notifications(app))
+        assert not any("tag did not land" in m for m in notifications(app))
     assert launched == ["20260611-100000-aaaa"]
     assert selected == ["@7"]
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
@@ -4458,16 +4458,16 @@ async def test_resolve_escalation_launches_and_attaches(project_tree, monkeypatc
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
-async def test_resolve_warns_when_the_record_did_not_survive(project_tree, monkeypatch):
-    # The resolve path kept the captured id (it attaches with it) but never
-    # asked whether the record landed, so a failed write left `a`/`x` on the
-    # ambiguous scan behind a clean attach. Warn, and attach anyway: this
-    # window is reached by the id in hand, only later verbs are degraded.
+async def test_resolve_warns_when_its_window_is_unreachable(project_tree, monkeypatch):
+    # The resolve path keeps the captured id (it attaches with it), but a tag
+    # that did not land leaves `a`/`x` unable to reach the window behind a
+    # clean attach (#750). Warn, and attach anyway: this window is reached by
+    # the id in hand, only later verbs are degraded.
     selected: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: "@7")
-    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: False)
+    monkeypatch.setattr(launch, "ctl_window_reachable", lambda proj, rid, wid: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     calls, _stamps = _patch_attach_exec(monkeypatch)
     make_run(
@@ -4483,7 +4483,7 @@ async def test_resolve_warns_when_the_record_did_not_survive(project_tree, monke
         await pilot.press("R")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await click(pilot, await ready(pilot, "#ok"))
-        await until(pilot, lambda: any("was not recorded" in m for m in notifications(app)))
+        await until(pilot, lambda: any("tag did not land" in m for m in notifications(app)))
     assert selected == ["@7"]  # still attached to the window it minted
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
 
@@ -10289,7 +10289,7 @@ def _reverify_stubs(monkeypatch, *, liveness: str = "dead", win_id: str | None =
 
     monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
-    monkeypatch.setattr(launch, "ctl_window_recorded", lambda proj, rid, wid: True)
+    monkeypatch.setattr(launch, "ctl_window_reachable", lambda proj, rid, wid: True)
     calls, stamps = _patch_attach_exec(monkeypatch)
     return launched, selected, calls, stamps
 
