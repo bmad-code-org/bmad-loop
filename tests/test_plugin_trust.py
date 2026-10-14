@@ -51,6 +51,7 @@ from bmad_loop.plugins import (
 from bmad_loop.plugins.grants import TrustState
 from bmad_loop.plugins.loader import USER_PLUGINS_REL
 from bmad_loop.plugins.manifest import load_manifest
+from bmad_loop.plugins.model import WORKFLOW_STAGES
 from bmad_loop.plugins.trust import PluginUntrusted
 from bmad_loop.policy import PluginsPolicy, Policy
 
@@ -734,3 +735,79 @@ def test_thirdparty_api_mismatch_is_skipped_with_warning(tmp_path):
     assert "future" not in plugins  # skipped, run survives
     assert "example" in plugins  # the compatible builtin still loaded
     assert "plugin-skipped" in journal.kinds()
+
+
+# ------------------------------------------- static workflow roles (DW-380)
+
+# A workflow-bearing project plugin; `[python]` optional. A workflow is an
+# executable surface, so the plugin runs only under a grant.
+WF_PLUGIN = (
+    '[plugin]\nname = "{name}"\napi_version = 1\n{python}'
+    '[workflows.{name}_wf]\nstage = "pre_commit_gate"\nrole = "{role}"\nprompt = "/{name}"\n'
+)
+WF_PYTHON = '[python]\nmodule = "mod.py"\nclass = "Plugin"\n'
+WF_MODULE_OK = "from bmad_loop.plugins import Plugin as _Base\nclass Plugin(_Base):\n    pass\n"
+
+
+def _write_wf_plugin(root: Path, name: str, role: str, *, module: str | None = None) -> None:
+    pdir = root / USER_PLUGINS_REL / name
+    pdir.mkdir(parents=True)
+    python = WF_PYTHON if module is not None else ""
+    (pdir / "plugin.toml").write_text(WF_PLUGIN.format(name=name, python=python, role=role))
+    if module is not None:
+        (pdir / "mod.py").write_text(module)
+
+
+def _live_workflow_roles(reg: PluginRegistry) -> frozenset[str]:
+    """The roles the live registry would actually inject, read through its own
+    public consumer (`workflows_for`) at every stage — not a re-derivation."""
+    return frozenset(wf.role for stage in WORKFLOW_STAGES for _lp, wf in reg.workflows_for(stage))
+
+
+@pytest.mark.parametrize(
+    ("tea_steps_off", "py_module", "live", "static"),
+    [
+        # tea UNENABLED, granted declarative review, never-granted dev: only the
+        # grant binds a role, so a side admitting REFUSED/UNENABLED shows "dev".
+        (False, None, {"review"}, {"review"}),
+        # tea enabled with its review-role steps switched off by the overlay and
+        # no granted review plugin: only tea's dev-role steps bind.
+        (True, None, {"dev"}, {"dev"}),
+        # a granted [python] project plugin with a dev workflow, constructed
+        (False, WF_MODULE_OK, {"review", "dev"}, {"review", "dev"}),
+        # the same plugin whose module fails to construct: live, its workflow goes
+        # inert; the static walk still counts it — the one, safe, gap.
+        (False, CONSTRUCT_RAISES, {"review"}, {"review", "dev"}),
+    ],
+    ids=["mixed-trust", "tea-review-steps-off", "granted-python", "python-construct-fails"],
+)
+def test_static_workflow_roles_match_the_live_registry(
+    tmp_path, tea_steps_off, py_module, live, static
+):
+    """`static_workflow_roles` (preflight verdicts, no exec) is the live registry's
+    active-workflow role set exactly whenever every module constructs, and a
+    superset only when a `[python]` module fails to — the drift pin for the
+    shared `verdict_admits` / `_workflow_enabled` rules the skills preflight reads
+    (DW-380)."""
+    _write_wf_plugin(tmp_path, "rogue", "dev")  # never granted: REFUSED
+    records = []
+    if not tea_steps_off:
+        _write_wf_plugin(tmp_path, "gate", "review")
+        records += grant_plugin(tmp_path, "gate").records
+    if py_module is not None:
+        _write_wf_plugin(tmp_path, "pyflow", "dev", module=py_module)
+        records += grant_plugin(tmp_path, "pyflow").records
+    if tea_steps_off:
+        off = {"trace_enabled": False, "nfr_enabled": False, "review_enabled": False}
+        pol = Policy(plugins=PluginsPolicy(enabled=("tea",), settings={"tea": off}))
+    else:
+        pol = Policy()  # tea UNENABLED: its dev and review workflows both inert
+    grants = GrantSet(records=tuple(records), snapshot_root=runs.plugin_snapshots_root(tmp_path))
+
+    reg = PluginRegistry.build(tmp_path, policy=pol, grants=grants)
+    live_roles = _live_workflow_roles(reg)
+    static_roles = registry_mod.static_workflow_roles(tmp_path, pol, grants)
+    assert live_roles == live
+    assert static_roles == static
+    assert live_roles <= static_roles
+    assert [r.name for r in reg.refusals] == ["rogue"]

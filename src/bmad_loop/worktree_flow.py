@@ -1862,11 +1862,14 @@ class WorktreeFlow:
         fakes) contribute nothing, so provisioning is a no-op for them.
 
         The role set is :data:`install.DEV_PRIMITIVE_ROLES` — the same constant
-        `cli._skill_trees` gates on — rather than a local pair, so the provisioned
-        set and the gated set cannot drift apart. A tree gated but not provisioned
+        `cli._skill_trees` starts from — rather than a local pair, so the gated set
+        stays a subset of the provisioned one: a tree gated but not provisioned
         ships a session into the `Unknown command` stall the preflight exists to
-        catch; a tree provisioned but not gated refuses runs over a skill no session
-        reads."""
+        catch. The converse is deliberate: `cli._skill_trees` drops the review tree
+        when ``[review]`` is off and no plugin binds a review workflow (DW-380), but
+        provisioning keeps both profiles always — they drive per-CLI Stop-signal
+        hook registration too, and a worktree without one stalls any session of
+        that CLI on a missing completion signal."""
         seen: dict[str, CLIProfile] = {}
         adapters = self._adapters_get()
         for adapter in (adapters[role] for role in DEV_PRIMITIVE_ROLES):

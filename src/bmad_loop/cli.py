@@ -738,7 +738,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # `resolved` never raises, so the except above fires only on a policy that failed
     # to load, and an unguarded call would crash validate instead of reporting the
     # parse failure.
-    dev_trees = _skill_trees(project, pol) if pol is not None else []
+    from .plugins import store as plugin_store
+
+    dev_trees = (
+        _skill_trees(project, pol, plugin_root, plugin_store.load_grants(project))
+        if pol is not None
+        else []
+    )
 
     stories_on, spec_folder = _stories_mode(args, pol)
     if paths:
@@ -1881,7 +1887,39 @@ def _plugins_revoke(project: Path, name: str) -> int:
     return ExitCode.OK
 
 
-def _skill_trees(project: Path, pol) -> list[str]:
+def _review_tree_gated(pol, root: Path, grants: GrantSet) -> bool:
+    """Whether a review-role session can be spawned this run, judged statically
+    (DW-380): ``[review]`` is on, or some statically-active plugin binds a
+    still-enabled ``role = "review"`` workflow at any stage.
+
+    `root` is the run's code root the plugin manifests are read from (a launch's
+    ``paths.repo_root``; validate's ``plugin_root``). `grants` is the caller's
+    frozen set — a launch passes the one `_launch_plugin_grants` read, so the
+    skills preflight and the trust preflight judge the same snapshot; this never
+    reads the store itself. `registry.static_workflow_roles` walks
+    `registry.preflight` verdicts — discovery and hashing only, never the
+    exec-bearing registry build. A discovery
+    fault answers True (keep gating): it is reported loudly by the trust preflight
+    / ``plugins.manifests``, never swallowed into a narrower answer. Manifest-skip
+    warnings are suppressed here for the same reason `_validate_plugin_trust`
+    suppresses them — ``plugins.manifests`` reports them."""
+    if pol.review.enabled:
+        return True
+    import warnings
+
+    from .plugins import PluginError
+    from .plugins.registry import static_workflow_roles
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            roles = static_workflow_roles(root, pol, grants)
+        except PluginError:
+            return True
+    return "review" in roles
+
+
+def _skill_trees(project: Path, pol, root: Path, grants: GrantSet) -> list[str]:
     """The skill trees this run's dev-primitive adapters read, one per distinct name.
 
     Shared by the real preflight and `cmd_validate` so the two cannot drift:
@@ -1891,23 +1929,25 @@ def _skill_trees(project: Path, pol) -> list[str]:
 
     Scoped to :data:`install.DEV_PRIMITIVE_ROLES`, not :data:`ROLES`: every skill
     these trees are asked about is one only a dev or review session dispatches, and
-    triage's whole prompt surface ships in this wheel. It is also the set
-    `WorktreeFlow.worktree_profiles` provisions, so what is gated and what is carried
-    into a worktree stay one decision.
+    triage's whole prompt surface ships in this wheel.
 
-    Deliberately does NOT consult `review.enabled`. Disabling review does not retire
-    the review ADAPTER: a plugin workflow may declare `role = "review"` and dispatch
-    on `adapters["review"]` with review disabled, and `worktree_profiles` drives
-    per-CLI Stop-signal hook registration as well as seeding — a worktree
-    provisioned without the review profile has no completion signal for those
-    sessions and stalls rather than merely missing a skill. See #424 for the narrow
-    residue that IS real."""
+    The review role's tree is dropped when no review session can be spawned
+    (`_review_tree_gated`): ``[review]`` is off and no statically-active plugin
+    under `root`, judged against `grants`, binds a still-enabled
+    ``role = "review"`` workflow. The predicate may over-approximate only toward
+    keeping the tree gated. Gating stays a subset
+    of what `WorktreeFlow.worktree_profiles` provisions, never equal by force:
+    provisioning keeps both dev-primitive profiles regardless, since it drives
+    per-CLI Stop-signal hook registration as well as seeding, and a worktree
+    without the review profile would stall a review-role session on a missing
+    completion signal rather than merely miss a skill."""
     from .adapters.profile import ProfileError, get_profile
 
+    roles = install.DEV_PRIMITIVE_ROLES
+    if not _review_tree_gated(pol, root, grants):
+        roles = tuple(role for role in roles if role != "review")
     trees = []
-    for name in dict.fromkeys(
-        pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
-    ):
+    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in roles):
         try:
             trees.append(get_profile(name, project).skill_tree)
         except ProfileError:
@@ -2106,7 +2146,9 @@ def _warn_preflight_would_abort(
     The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
     fatal verdicts only: an inert never-granted plugin does not abort the launch.
     It reads the grant store the way the launch would, without its warning."""
-    trees = _skill_trees(paths.project, pol)
+    from .plugins import store
+
+    trees = _skill_trees(paths.project, pol, paths.repo_root, store.load_grants(paths.project))
     problems = [
         p.message
         for p in install.missing_base_skills(paths.project, trees)
@@ -2197,7 +2239,9 @@ def cmd_adapters(args: argparse.Namespace) -> int:
     return 0
 
 
-def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
+def _require_base_skills(
+    project: Path, pol, root: Path, grants: GrantSet, *, require_stories: bool = False
+) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
     it invokes inline).
@@ -2213,7 +2257,7 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
-    skill_trees = _skill_trees(project, pol)
+    skill_trees = _skill_trees(project, pol, root, grants)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
         findings += install.missing_stories_support(project, skill_trees)
@@ -3258,15 +3302,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
-    if not _require_base_skills(project, pol, require_stories=stories_on):
+    # #496/#497: the plugin grants are read ONCE, here, and refused against before
+    # the run dir exists; the same frozen set reaches the skills preflight, the
+    # engine's registry build and the auto-sweep factory's closure, so no later
+    # layer reads the store.
+    plugin_grants = _launch_plugin_grants(project)
+    if not _require_base_skills(
+        project, pol, paths.repo_root, plugin_grants, require_stories=stories_on
+    ):
         return 1
 
     _reconcile_stale(project, paths, pol)
 
-    # #496/#497: the plugin grants are read ONCE, here, and refused against before
-    # the run dir exists; the same frozen set reaches the engine's registry build
-    # and the auto-sweep factory's closure, so no later layer reads the store.
-    plugin_grants = _launch_plugin_grants(project)
     if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
         return rc
 
@@ -3745,7 +3792,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
-    if not _require_base_skills(project, pol):
+    # #496/#497: read once and refuse before the run dir exists, as in `cmd_run`.
+    plugin_grants = _launch_plugin_grants(project)
+    if not _require_base_skills(project, pol, paths.repo_root, plugin_grants):
         return 1
 
     if not _require_sweep_skill(project, pol):
@@ -3753,8 +3802,6 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     _reconcile_stale(project, paths, pol)
 
-    # #496/#497: read once and refuse before the run dir exists, as in `cmd_run`.
-    plugin_grants = _launch_plugin_grants(project)
     if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
         return rc
 
@@ -4109,7 +4156,10 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
-    if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
+    plugin_grants = _launch_plugin_grants(project)  # read ONCE; see the trust gate below
+    if not _require_base_skills(
+        project, pol, paths.repo_root, plugin_grants, require_stories=state.source == "stories"
+    ):
         return 1
     # A resumed sweep re-dispatches `/bmad-loop-sweep`; a story run never does, so
     # only the sweep arm is gated. Same placement constraint as the gate above:
@@ -4124,7 +4174,6 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # re-judges (the gate); this only moves the refusal ahead of the side effects.
     # ABLATION GUARD: moving this below `Journal(run_dir)` must fail
     # test_resume_refuses_a_mismatched_plugin_before_any_side_effect.
-    plugin_grants = _launch_plugin_grants(project)
     if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
         return rc
     journal = Journal(run_dir)
@@ -5600,10 +5649,11 @@ def _resolve_reverify_finished(
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
-    if not _require_base_skills(project, pol):
+    plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
+    if not _require_base_skills(project, pol, paths.repo_root, plugin_grants):
         return 1
     # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.
-    if (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None:
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
         return rc
     target = state.target_branch
     try:

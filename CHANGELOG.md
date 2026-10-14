@@ -71,6 +71,10 @@ breaking changes may land in a minor release.
   `bmad-loop-ctl-<digest>` session is still treated as a control session and never pruned,
   but new launches, the TUI's attach and stop keys and the parked-window sweep use
   `bmad-loop-ctl`; end the old session once its windows have parked (#733).
+- With `[review] enabled = false`, `run`, `sweep`, resume, `resolve`'s reverify,
+  `validate` and `--dry-run` no longer require the dev primitive in the review CLI's
+  skill tree unless an active plugin binds an enabled `role = "review"` workflow.
+  Worktrees still provision both profiles (DW-380).
 
 ### Removed
 
