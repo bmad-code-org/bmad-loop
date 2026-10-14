@@ -249,9 +249,15 @@ def _configure_mux(project: Path) -> None:
         # An honoured value is the operator's own stated preference, so it gets
         # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
+            owner = (
+                f"is {runs.FOREIGN_REGISTRY}, left alone; its sessions most likely belong to "
+                "that project"
+                if runs.foreign_registry_root(ambient, project)
+                else "is left for your own sessions"
+            )
             print(
                 f"note: using bmad-loop's own psmux registry {root} — your "
-                f"{runs.PSMUX_DATA_DIR}={ambient} is left for your own sessions "
+                f"{runs.PSMUX_DATA_DIR}={ambient} {owner} "
                 f"(`bmad-loop mux` prints the export that reaches these)",
                 file=sys.stderr,
             )
@@ -6653,7 +6659,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
 
 def _warn_legacy_leftovers(
-    leftovers: dict[str, list[str]], unverified: list[str] | tuple[str, ...] = ()
+    project: Path,
+    leftovers: dict[str, list[str]],
+    unverified: list[str] | tuple[str, ...] = (),
 ) -> None:
     """Name what each legacy multiplexer registry still holds after the sweep.
 
@@ -6687,13 +6695,27 @@ def _warn_legacy_leftovers(
 
     ``unverified`` names each legacy registry that could not be asked at all
     (DW-469): without a line for it, a registry that raised printed exactly what
-    a registry holding nothing prints — nothing."""
+    a registry holding nothing prints — nothing.
+
+    A registry shaped like a root bmad-loop derived from another project path
+    (`runs.foreign_registry_root`, #906) gets its own line: its control session
+    and untagged sessions are not a migration remainder but most likely that
+    project's, which is the one thing to say before anyone removes them. A
+    session tagged as ours there is still named, and is still ours."""
     for line in unverified:
         print(
             f"legacy registry not checked for sessions left behind (not migrated): {line}",
             file=sys.stderr,
         )
     for registry, names in leftovers.items():
+        if runs.foreign_registry_root(registry, project):
+            print(
+                f"left in {registry} ({runs.FOREIGN_REGISTRY}): "
+                + ", ".join(names)
+                + f" — {runs.FOREIGN_REGISTRY_HINT}",
+                file=sys.stderr,
+            )
+            continue
         print(
             f"left in {registry} (not migrated): "
             + ", ".join(names)
@@ -6809,7 +6831,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 print(f"would close ctl window {name}")
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
-        _warn_legacy_leftovers(leftovers, unverified)
+        _warn_legacy_leftovers(project, leftovers, unverified)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -6827,7 +6849,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # Same wording as the TUI toast: one claim, one phrase, so an operator
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
-    _warn_legacy_leftovers(leftovers, unverified)
+    _warn_legacy_leftovers(project, leftovers, unverified)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part

@@ -2108,6 +2108,15 @@ class BmadLoopApp(App[None]):
                 markup=False,
             )
         for registry, names in leftovers.items():
+            if runs.foreign_registry_root(registry, self.project):
+                self.call_from_thread(
+                    self.notify,
+                    f"{len(names)} session(s) left in {registry} ({runs.FOREIGN_REGISTRY}): "
+                    f"{', '.join(names)} — {runs.FOREIGN_REGISTRY_HINT}",
+                    severity="warning",
+                    markup=False,
+                )
+                continue
             self.call_from_thread(
                 self.notify,
                 f"{len(names)} session(s) left in {registry} (not migrated): "

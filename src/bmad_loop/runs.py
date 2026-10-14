@@ -730,6 +730,43 @@ def resolve_psmux_registry_root(derived: str, ambient: str | None, *, honor_ambi
     return ambient
 
 
+# What a root :func:`foreign_registry_root` answers True for is, in the words
+# the CLI and the TUI both print.
+FOREIGN_REGISTRY = "another project's derived registry, or this project's from before a rename"
+# What such a registry's leftovers are: `legacy_registry_leftovers` names a
+# session tagged as ours there too, so only the rest is that project's.
+FOREIGN_REGISTRY_HINT = (
+    "its control session and untagged sessions most likely belong to that project "
+    "(do not remove them from here); a session tagged as this project's is yours"
+)
+
+
+def foreign_registry_root(value: str | None, project: Path) -> bool:
+    """Whether ``value`` is a registry root bmad-loop derived from another
+    project path: ``<project tag>/``:data:`MUX_REGISTRY_DIR` with a tag that is
+    not ``project``'s own.
+
+    What ``bmad-loop mux`` printed for another project, or for this one before a
+    rename (the tag hashes the path), carried into this project's shell. Shape
+    and tag only: the tag is a hash of a path, so whose sessions such a registry
+    holds cannot be proven from here, and callers only *say* what it is.
+
+    Compared case-insensitively where the filesystem folds case: ``<TAG>\\_MUX``
+    is the same registry on Windows. Never raises: when this project's tag
+    cannot be derived, a derived-shaped root answers ``True``. Whose it is is
+    then unknown, and unknown ownership takes the cautious wording, not the
+    plain one that invites removal."""
+    if not value:
+        return False
+    root = Path(os.path.normcase(value))
+    if root.name != MUX_REGISTRY_DIR or not _PROJECT_TAG_RE.fullmatch(root.parent.name):
+        return False
+    try:
+        return root.parent.name != project_tag(project)
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
 # The project this process configured its registry for
 # (`export_psmux_registry_root`), or None before that ran. Process-local, set
 # once ahead of dispatch like the backend's displaced-root record; it is what

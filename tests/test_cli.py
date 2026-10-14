@@ -18736,6 +18736,28 @@ def test_main_says_once_when_it_overrode_an_operators_registry(
     assert captured.out == ""
     assert str(runs.mux_registry_root(tmp_path)) in captured.err
     assert theirs in captured.err
+    assert "left for your own sessions" in captured.err
+
+
+def test_main_names_another_projects_derived_registry_as_theirs(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
+    """#906: the ambient value is the export `bmad-loop mux` printed for another
+    project. Calling it "left for your own sessions" tells the operator a live
+    bmad-loop registry is theirs to tidy. Ablate the `foreign_registry_root`
+    branch of the note and this fails."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "state"))
+    other = tmp_path / "other"
+    other.mkdir()
+    theirs = str(runs.mux_registry_root(other))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert f"{runs.PSMUX_DATA_DIR}={theirs} is {runs.FOREIGN_REGISTRY}" in err
+    assert "most likely belong to that project" in err
+    assert "left for your own sessions" not in err
 
 
 @pytest.mark.parametrize("ambient", ["derived", None])
@@ -19481,6 +19503,46 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
     theirs_line = next(ln for ln in lines if theirs in ln)
     assert "bmad-loop-ctl" in default_line and "bmad-loop-old-1" not in default_line
     assert "bmad-loop-old-1" in theirs_line and "bmad-loop-ctl" not in theirs_line
+
+
+def test_cleanup_says_a_derived_registry_of_another_project_path_is_not_a_remainder(
+    project, capsys, monkeypatch
+):
+    """#906: the shell exports the root `bmad-loop mux` printed for another
+    project, so its control session and untagged sessions are reported here.
+    "not migrated" and the removal hint send the operator after that project's
+    sessions; the line must say whose registry it most likely is. A plain
+    displaced root keeps the old wording. Ablate the `foreign_registry_root`
+    branch of `_warn_legacy_leftovers` and this fails."""
+    from bmad_loop.tui import launch
+
+    other = project.project.parent / "other"
+    theirs = str(project.project.parent / "state" / runs.project_tag(other) / runs.MUX_REGISTRY_DIR)
+    plain = r"D:\their-own-registry"
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): (
+            {theirs: ["bmad-loop-bare-1", "bmad-loop-ctl"], plain: ["bmad-loop-old-1"]},
+            [],
+        ),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    lines = capsys.readouterr().err.splitlines()
+    theirs_line = next(ln for ln in lines if theirs in ln)
+    assert f"left in {theirs} ({runs.FOREIGN_REGISTRY}): bmad-loop-bare-1, bmad-loop-ctl" in (
+        theirs_line
+    )
+    # Leftovers there include a session tagged as ours, so the hint splits the
+    # claim: control and untagged sessions are that project's, tagged ones ours.
+    assert theirs_line.endswith(f" — {runs.FOREIGN_REGISTRY_HINT}")
+    assert "a session tagged as this project's is yours" in theirs_line
+    assert "not migrated" not in theirs_line
+    plain_line = next(ln for ln in lines if plain in ln)
+    assert f"left in {plain} (not migrated): bmad-loop-old-1" in plain_line
 
 
 def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, capsys, monkeypatch):
