@@ -2624,7 +2624,7 @@ def superseded_ctl_may_be_run(
     on_fault: Callable[[str], None] | None = None,
 ) -> bool:
     """True when the pre-upgrade control-session name ``name`` (as listed) may
-    instead be the agent session of a run of ``project`` (#915).
+    instead be a run's agent session (#915).
 
     A run id equal to the old digest, ``ctl-<16 hex>`` (one supplied by hand
     or persisted by an older release), owns ``bmad-loop-<id>`` — the very name
@@ -2635,18 +2635,34 @@ def superseded_ctl_may_be_run(
     variant counts where the transport folds) is enough to withhold a kill or
     attach command for it.
 
-    A runs dir that cannot be listed answers True, the direction that withholds
-    a command, and the fault goes to ``on_fault``."""
+    So is a session-level :data:`PROJECT_OPTION` tag, whatever its value: an
+    agent session carries one from creation, and no release ever set one on a
+    control session (its windows carry the tag). In an honoured root shared
+    with other projects, that is how a neighbour's run with that id shows up
+    while this project has no run dir for it.
+
+    A runs dir or a tag listing that cannot be read answers True, the direction
+    that withholds a command, and the fault goes to ``on_fault``."""
     key = mux.session_name_key(name)
+
+    def _fault(what: str, exc: Exception) -> bool:
+        if on_fault is not None:
+            on_fault(f"could not check whether {name} is a run's own session ({what}): {exc}")
+        return True
+
     try:
         entries = [entry.name for entry in (project / RUNS_DIR).iterdir()]
     except (FileNotFoundError, NotADirectoryError):
-        return False
+        entries = []
     except OSError as exc:
-        if on_fault is not None:
-            on_fault(f"could not check whether {name} is a run's own session: {exc}")
+        return _fault("runs dir", exc)
+    if any(mux.session_name_key(session_name(run_id)) == key for run_id in entries):
         return True
-    return any(mux.session_name_key(session_name(run_id)) == key for run_id in entries)
+    try:
+        tags = mux.session_options(PROJECT_OPTION)
+    except MultiplexerError as exc:
+        return _fault("session tags", exc)
+    return any(value and mux.session_name_key(s) == key for s, value in tags.items())
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:

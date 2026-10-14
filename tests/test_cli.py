@@ -2926,6 +2926,9 @@ class _OtherRegistryMux:
     def session_name_key(self, name):
         return name
 
+    def session_options(self, _option):
+        return {}
+
     def attach_target_argv(self, target):
         return ["othermux", "attach", "-t", target]
 
@@ -2994,7 +2997,7 @@ def test_attach_prints_no_command_for_a_name_a_run_of_this_project_has(
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
     err = capsys.readouterr().err
     assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
-    assert "a run of this project with that id may own it" in err
+    assert "a run with that id may own it" in err
     assert "psmux attach" not in err and "PSMUX_DATA_DIR" not in err
 
 
@@ -19873,7 +19876,7 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
     assert f"pre-upgrade control session {_DIGEST_CTL}" in err
-    assert "a run of this project with that id may own it" in err
+    assert "a run with that id may own it" in err
     assert "kill-session" not in err and "end it with" not in err
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0

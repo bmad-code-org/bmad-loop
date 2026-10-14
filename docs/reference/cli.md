@@ -546,7 +546,7 @@ The `--dry-run` plan and the outcome share this shape.
 | `sessions`    | object | agent sessions (below)         |
 | `ctl_windows` | object | control windows (below)        |
 
-`sessions`: `removed` (run ids whose session kill was attempted), `live` (left alone), `unverifiable_pid` (subset of `removed` whose engine liveness could not be proven), `legacy_leftovers`, `legacy_kill_commands` (a pre-upgrade control session in this project's registry mapped to the command that ends it, `null` when the backend is not psmux; a session a run of this project may own is left out), `legacy_unverified`, and `scan_error` (present only when the scan failed).
+`sessions`: `removed` (run ids whose session kill was attempted), `live` (left alone), `unverifiable_pid` (subset of `removed` whose engine liveness could not be proven), `legacy_leftovers`, `legacy_kill_commands` (a pre-upgrade control session in this project's registry mapped to the command that ends it, `null` when the backend is not psmux; a session a run may own is left out), `legacy_unverified`, and `scan_error` (present only when the scan failed).
 
 `ctl_windows`: `removed` (verified gone, or would close under `--dry-run`), `survived`, `unverifiable` (kill outcome could not be checked), `undetermined` (kept because the window's state could not be read), `scan_error` (str or null; when set, the other lists mean "no answer").
 

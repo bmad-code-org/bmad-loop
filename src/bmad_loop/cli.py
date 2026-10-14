@@ -6452,7 +6452,7 @@ def _note_superseded_ctl_for_attach(project: Path) -> None:
     not passed off as "no such session" after "nothing to attach".
 
     A paste-ready command only on psmux (``_is_psmux``); another backend's
-    session is named without one, and so is a name a run of this project may
+    session is named without one, and so is a name a run may
     own (``runs.superseded_ctl_may_be_run``, #915)."""
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
 
@@ -6755,11 +6755,11 @@ def _superseded_ctl_kill_commands(
     (:func:`_is_psmux`): the session is named, and no command is advertised
     that could not run there.
 
-    ``ambiguous`` holds each such name a run of this project may own
+    ``ambiguous`` holds each such name a run may own
     (``runs.superseded_ctl_may_be_run``, #915): it gets no command at all, so
     it is left out of the dict (and of ``--json`` ``legacy_kill_commands``)
-    while ``legacy_leftovers`` still names it. A runs dir that could not be
-    read for that check goes to ``on_fault``, labelled with the registry."""
+    while ``legacy_leftovers`` still names it. A check that could not be
+    made goes to ``on_fault``, labelled with the registry."""
     if not leftovers:
         return {}, []
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
@@ -6792,7 +6792,7 @@ def _superseded_ctl_kill_commands(
 
 #: Why a pre-upgrade control-session name gets no command (#915), said the
 #: same way by cleanup and attach.
-_MAY_BE_RUN = "a run of this project with that id may own it"
+_MAY_BE_RUN = "a run with that id may own it"
 
 
 def _warn_superseded_ctl(kill_commands: dict[str, str | None], ambiguous: list[str]) -> None:

@@ -143,8 +143,9 @@ the exit banner (see `capture-pane` below). Then run
 (matched by that exact name, since a run id `ctl-<16 hex>` gives an agent session the same
 shape) on stderr and in `sessions.legacy_leftovers`, with that command ready to paste
 (`sessions.legacy_kill_commands` in `--json`). `attach` names it when it finds nothing to
-attach, with `switch-client` instead of `attach` when run inside a psmux pane. A name a run
-of this project has as its id may be that run's own session, so it is named with no command.
+attach, with `switch-client` instead of `attach` when run inside a psmux pane. A name that
+may be a run's own session (a run of this project has that id, or the session carries a run's
+project tag, as a neighbour's run can in a shared registry) is named with no command.
 
 **If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
 path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then

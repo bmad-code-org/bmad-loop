@@ -9243,6 +9243,31 @@ def test_superseded_ctl_may_be_run_when_a_run_has_the_id_its_name_spells(tmp_pat
     assert len(faults) == 1 and name in faults[0] and "access denied" in faults[0]
 
 
+def test_superseded_ctl_may_be_run_when_the_session_carries_a_project_tag(tmp_path):
+    """#915: in a shared registry a neighbour's run with that id leaves no run
+    dir here, but its session carries a session-level project tag, which no
+    control session ever did (ablate the tag check and the neighbour arm
+    fails). An untagged session stays a control session; a tag listing that
+    faults withholds the command and says so."""
+    name = runs.superseded_ctl_name(tmp_path)
+    neighbour = _RegistryMux([name], {name: "0123456789abcdef"}, fold=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name.upper(), neighbour) is True
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, _RegistryMux([name], {name: ""})) is False
+
+    class _Faulting(_RegistryMux):
+        def session_options(self, _option):
+            raise MultiplexerError("server gone")
+
+    faults: list[str] = []
+    assert (
+        runs.superseded_ctl_may_be_run(
+            tmp_path, name, _Faulting([name], {}), on_fault=faults.append
+        )
+        is True
+    )
+    assert len(faults) == 1 and name in faults[0] and "server gone" in faults[0]
+
+
 def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
     assert _healthy_leftovers(tmp_path) == {}
