@@ -399,6 +399,7 @@ def cleanup_document(
     legacy_unverified: list[str] | None = None,
     legacy_kill_commands: dict[str, str | None] | None = None,
     sessions_scan_error: str | None = None,
+    superseded_ctl_unverified: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -464,8 +465,19 @@ def cleanup_document(
     the paste-ready command that ends it, or to ``null`` when the backend is
     not psmux and no command can be spelled for it. No bmad-loop command
     addresses such a session, so this is the only way out; run it once every
-    window in it has parked. Additive, no schema bump; the text mode prints each
-    on stderr.
+    window in it has parked. A session a run may own (a run dir exists for the
+    id its name spells, or the session carries a session-level project tag,
+    #915) gets no command and is left out, though `legacy_leftovers` still
+    names it; a check that could not be made withholds it too. Additive, no
+    schema bump; the text mode prints each on stderr.
+
+    `sessions.superseded_ctl_unverified` is one line per check on this
+    project's own registry for a pre-upgrade control session that could not be
+    made (#915): the scan for it (its name could not be derived, or the
+    registry could not be listed), or a check that withholds its command (a
+    runs dir or a session-tag listing that faulted). That registry is no legacy
+    one, so this is not `legacy_unverified`. Additive, no schema bump; the text
+    mode prints each line on stderr.
 
     `sessions.scan_error` is present only when the session listing could not
     see this project's sessions (#864): the backend is unavailable while a run
@@ -488,6 +500,7 @@ def cleanup_document(
         "legacy_leftovers": list(legacy_leftovers or []),
         "legacy_unverified": list(legacy_unverified or []),
         "legacy_kill_commands": dict(legacy_kill_commands or {}),
+        "superseded_ctl_unverified": list(superseded_ctl_unverified or []),
     }
     if sessions_scan_error is not None:
         sessions["scan_error"] = sessions_scan_error

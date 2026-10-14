@@ -2372,7 +2372,10 @@ DEFAULT_REGISTRY_LABEL = "the multiplexer's own default registry"
 
 
 def legacy_registry_leftovers(
-    project: Path, *, announced: Iterable[str] = ()
+    project: Path,
+    *,
+    announced: Iterable[str] = (),
+    on_primary_fault: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """``(grouped, faults)``: session names a legacy registry **still holds** after
     :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
@@ -2488,9 +2491,16 @@ def legacy_registry_leftovers(
     excluded = {session_name(run_id) for run_id in announced}
     faults: list[str] = []
     try:
-        legacies = _legacy_registries()
+        primary = get_multiplexer()
     except MultiplexerError as exc:
         return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    # Its own try (#915): a legacy discovery that raises must not skip the
+    # primary-registry scan below, which needs only the backend selected above.
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        faults.append(f"no legacy registry could be checked: {exc}")
+        legacies = []
     for legacy in legacies:
         try:
             names = legacy.list_sessions()
@@ -2527,15 +2537,17 @@ def legacy_registry_leftovers(
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
     # The project's own registry is no legacy one, but a control session an
-    # earlier release named there survives the rename too (#733).
-    primary = get_multiplexer()
+    # earlier release named there survives the rename too (#733). Its faults go
+    # to `on_primary_fault` when given (#915): that registry is no legacy one,
+    # so they are not "a legacy registry could not be asked".
     label = primary.registry_root() or DEFAULT_REGISTRY_LABEL
+    primary_fault = on_primary_fault or faults.append
     try:
         stale = superseded_ctl_sessions(
-            project, primary, on_fault=lambda msg: faults.append(f"{label}: {msg}")
+            project, primary, on_fault=lambda msg: primary_fault(f"{label}: {msg}")
         )
     except MultiplexerError as exc:
-        faults.append(f"{label}: could not be listed: {exc}")
+        primary_fault(f"{label}: could not be listed: {exc}")
         stale = []
     if stale:
         grouped[label] = sorted(set(grouped.get(label, []) + stale))
@@ -2609,6 +2621,55 @@ def superseded_ctl_sessions(
         for name in mux.list_sessions_reporting(on_fault=on_fault)
         if mux.session_name_key(name) == old
     )
+
+
+def superseded_ctl_may_be_run(
+    project: Path,
+    name: str,
+    mux: TerminalMultiplexer,
+    *,
+    on_fault: Callable[[str], None] | None = None,
+) -> bool:
+    """True when the pre-upgrade control-session name ``name`` (as listed) may
+    instead be a run's agent session (#915).
+
+    A run id equal to the old digest, ``ctl-<16 hex>`` (one supplied by hand
+    or persisted by an older release), owns ``bmad-loop-<id>`` — the very name
+    the old release minted for the control session — so the name alone cannot
+    say which it is, and that run may be live. Any run dir whose session the
+    transport resolves to ``name`` (``mux``'s
+    :meth:`~.multiplexer.TerminalMultiplexer.session_name_key`, so a case
+    variant counts where the transport folds) is enough to withhold a kill or
+    attach command for it.
+
+    So is a session-level :data:`PROJECT_OPTION` tag, whatever its value: an
+    agent session carries one from creation, and no release ever set one on a
+    control session (its windows carry the tag). In an honoured root shared
+    with other projects, that is how a neighbour's run with that id shows up
+    while this project has no run dir for it.
+
+    A runs dir or a tag listing that cannot be read answers True, the direction
+    that withholds a command, and the fault goes to ``on_fault``."""
+    key = mux.session_name_key(name)
+
+    def _fault(what: str, exc: Exception) -> bool:
+        if on_fault is not None:
+            on_fault(f"could not check whether {name} is a run's own session ({what}): {exc}")
+        return True
+
+    try:
+        entries = [entry.name for entry in (project / RUNS_DIR).iterdir()]
+    except (FileNotFoundError, NotADirectoryError):
+        entries = []
+    except OSError as exc:
+        return _fault("runs dir", exc)
+    if any(mux.session_name_key(session_name(run_id)) == key for run_id in entries):
+        return True
+    try:
+        tags = mux.session_options(PROJECT_OPTION)
+    except MultiplexerError as exc:
+        return _fault("session tags", exc)
+    return any(value and mux.session_name_key(s) == key for s, value in tags.items())
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:
