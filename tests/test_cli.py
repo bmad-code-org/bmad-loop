@@ -3746,6 +3746,22 @@ def test_stop_marks_stopped(tmp_path, monkeypatch, capsys):
     assert load_state(run_dir).stopped is True
 
 
+def test_stop_miscased_ref_kills_the_minted_session(tmp_path, monkeypatch, capsys):
+    """A miscased full ref on a case-insensitive filesystem must reach
+    `kill_session` under the minted spelling: a case-exact multiplexer would
+    otherwise miss the agent session while `stop` reports success."""
+    from bmad_loop import runs
+
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+    run_dir = _make_run_with_state(tmp_path, "20260620-143025-a1b2")
+    if not (run_dir.parent / run_dir.name.upper()).exists():
+        pytest.skip("needs a case-insensitive filesystem")
+    assert cli.main(["stop", "--project", str(tmp_path), "20260620-143025-A1B2"]) == 0
+    assert killed == ["20260620-143025-a1b2"]
+    assert "20260620-143025-a1b2 stopped" in capsys.readouterr().out
+
+
 def test_stop_already_finished(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
 

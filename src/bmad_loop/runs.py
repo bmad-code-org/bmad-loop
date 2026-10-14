@@ -1330,24 +1330,51 @@ def resolve_run_dir(project: Path, ref: str) -> Path:
     naming the fault wherever it could change the answer: when nothing matched
     (an unreadable runs dir is not "no such run") and when an unreadable run
     dir's name matches the ref too (a unique readable match is then not proven
-    unique). A unique match that no unreadable name could rival still resolves."""
+    unique). A unique match that no unreadable name could rival still resolves.
+
+    An exact hit is returned under the spelling the listing shows, not the
+    typed one: a case-insensitive filesystem answers the stat for a miscased
+    ref too, and the typed spelling would then leak into ``run_dir.name`` and
+    every multiplexer session name derived from it, which a case-exact backend
+    then fails to find. The hit is matched to the listed entry it
+    ``os.path.samefile``s; none or several is a refusal, never a guess.
+    ``Path.resolve`` is deliberately not used — it rewrites symlinked or
+    junctioned project and run paths."""
     if not ref:
         raise RunRefError("empty run ref: it would match every run, never name one")
+    exact: Path | None = None
     if not _is_path_escape(ref):
         exact = run_dir_for(project, ref)
         # stat + S_ISREG rather than `is_run`: a fault here (3.11-3.13 raise it
         # from `is_file`, 3.14 swallows it) is not proof either way, so it falls
         # through to the listing below, which names it.
         try:
-            if stat.S_ISREG((exact / STATE_FILE).stat().st_mode):
-                return exact
+            if not stat.S_ISREG((exact / STATE_FILE).stat().st_mode):
+                exact = None
         except OSError:
-            pass
+            exact = None
+
+    listed, unreadable, fault = _scan_run_dirs(project)
+    if exact is not None:
+        # Name equality, not `Path ==`: WindowsPath compares case-insensitively.
+        if any(d.name == ref for d in listed):
+            return exact
+        try:
+            same = [d for d in listed if os.path.samefile(d, exact)]
+        except OSError as exc:
+            raise RunRefError(
+                f"cannot resolve run ref {ref!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+        if len(same) == 1:
+            return same[0]
+        why = "no listed run dir is it" if not same else f"{len(same)} listed run dirs are it"
+        if fault is not None:
+            why += f" (the run listing is incomplete — {fault})"
+        raise RunRefError(f"cannot resolve run ref {ref!r}: {why}")
 
     def _matches(name: str) -> bool:
         return short_ref(name).startswith(ref) or name.endswith(ref)
 
-    listed, unreadable, fault = _scan_run_dirs(project)
     matches = [d for d in listed if _matches(d.name)]
     if fault is not None and (not matches or any(_matches(n) for n in unreadable)):
         raise RunRefError(

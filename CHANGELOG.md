@@ -83,6 +83,8 @@ breaking changes may land in a minor release.
   directory. Under worktree isolation on Windows psmux, the session held the first unit's
   worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
   `worktrees/1` behind (#902).
+- Resolve a miscased full run ref to the run id's on-disk spelling on a case-insensitive
+  filesystem, so `stop` and `attach` reach the run's multiplexer session (#904).
 - Refuse psmux option values shaped `-X=value`, `-t…` or `--`: psmux 3.4.0 rewrites the
   first silently and rejects the others, so the value is now warned about and its key freed
   (#905).
