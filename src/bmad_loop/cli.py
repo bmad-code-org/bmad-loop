@@ -250,8 +250,10 @@ def _configure_mux(project: Path) -> None:
         # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
             owner = (
-                f"is {runs.FOREIGN_REGISTRY}, left alone; its sessions most likely belong to "
-                "that project"
+                # No promise that the registry is left untouched: a session tagged
+                # as this project's there is still swept (`prune_sessions`,
+                # `kill_displaced_session`), so the note says only whose the rest is.
+                f"is {runs.FOREIGN_REGISTRY}: {runs.FOREIGN_REGISTRY_HINT}"
                 if runs.foreign_registry_root(ambient, project)
                 else "is left for your own sessions"
             )

@@ -18758,6 +18758,10 @@ def test_main_names_another_projects_derived_registry_as_theirs(
     assert f"{runs.PSMUX_DATA_DIR}={theirs} is {runs.FOREIGN_REGISTRY}" in err
     assert "most likely belong to that project" in err
     assert "left for your own sessions" not in err
+    # A session tagged as this project's there is still swept, so the note must
+    # not promise the registry is left untouched.
+    assert runs.FOREIGN_REGISTRY_HINT in err
+    assert "left alone" not in err
 
 
 @pytest.mark.parametrize("ambient", ["derived", None])
