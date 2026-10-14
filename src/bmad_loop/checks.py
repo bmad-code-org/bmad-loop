@@ -49,6 +49,10 @@ Severity = Literal["ok", "warning", "problem"]
 VALIDATE_CHECKS: frozenset[str] = frozenset(
     {
         "bmad-config",
+        # BMAD v7 with no `[core] active_initiative`: artifacts fall back to output_folder
+        "bmad-config.initiative-unset",
+        # BMAD v7 resolved under tickets mode past leftover v6 artifact keys
+        "bmad-config.v6-keys-ignored",
         "policy",
         "policy.model-qualified",
         "policy.effort-unsupported",

@@ -156,6 +156,27 @@ def test_run_state_stories_fields_default_when_absent_from_dict():
     assert back.source == "sprint-status" and back.spec_folder == ""
 
 
+def test_run_state_round_trips_initiative_pin():
+    default = _state()
+    assert default.initiative == "" and default.initiative_folder == ""
+    pinned = _state(initiative="initiative-checkout", initiative_folder="/p/_bmad-output/i")
+    d = pinned.to_dict()
+    assert d["initiative"] == "initiative-checkout"
+    assert d["initiative_folder"] == "/p/_bmad-output/i"
+    back = RunState.from_dict(d)
+    assert back.initiative == "initiative-checkout"
+    assert back.initiative_folder == "/p/_bmad-output/i"
+
+
+def test_old_state_json_defaults_initiative_empty():
+    # a state.json written before the v7 pin existed reads as "no initiative pinned"
+    d = _state().to_dict()
+    del d["initiative"]
+    del d["initiative_folder"]
+    back = RunState.from_dict(d)
+    assert back.initiative == "" and back.initiative_folder == ""
+
+
 def test_sweeps_refused_round_trips():
     """#501's visibility record: trigger -> a closed SWEEP_REFUSED_* slug.
 

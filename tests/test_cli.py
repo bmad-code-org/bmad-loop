@@ -34,6 +34,7 @@ from conftest import (
     ignore_before_commit,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     install_build_auto_skill,
     install_dev_base_skills,
     install_dev_shim,
@@ -12493,6 +12494,73 @@ def test_validate_passes_bmad_config_on_a_toml_only_project(project, capsys, mon
     expected = project.project.resolve() / "_bmad-output" / "implementation-artifacts"
     assert finding["detail"]["implementation_artifacts"] == str(expected)
     assert doc["ok"] is True
+
+
+def _validate_v7_findings(project, capsys) -> dict[str, dict]:
+    """`validate --json` findings keyed by check id (first of each), on the `project`
+    sandbox after the test laid down its BMAD v7 install. rc 1: the sprint queue gate
+    has no board on a v7 config."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    findings: dict[str, dict] = {}
+    for f in doc["findings"]:
+        findings.setdefault(f["check"], f)
+    return findings
+
+
+def test_validate_v7_config_is_ok_without_v6_keys(project, capsys):
+    """A fresh v7 install (no `[modules.bmm]` artifact keys) passes `bmad-config`,
+    naming the era and the initiative, with no v7 warning."""
+    install_bmad_v7(project.project)
+    by_check = _validate_v7_findings(project, capsys)
+    finding = by_check["bmad-config"]
+    assert finding["severity"] == "ok"
+    assert "BMAD v7" in finding["message"] and "initiative-demo" in finding["message"]
+    assert finding["detail"]["era"] == "v7"
+    assert finding["detail"]["initiative"] == "initiative-demo"
+    expected = project.project.resolve() / "_bmad-output" / "initiative-demo"
+    assert finding["detail"]["implementation_artifacts"] == str(expected)
+    assert "bmad-config.initiative-unset" not in by_check
+    assert "bmad-config.v6-keys-ignored" not in by_check
+
+
+def test_validate_warns_v7_initiative_unset(project, capsys):
+    """No active initiative is visible, not folded into a healthy-looking ok: the
+    artifact home fell back to `output_folder`. Ablation: drop the warn and this
+    FAILS."""
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "custom" / "config.user.toml").write_text(
+        "# no initiative\n", encoding="utf-8"
+    )
+    by_check = _validate_v7_findings(project, capsys)
+    assert by_check["bmad-config"]["severity"] == "ok"
+    assert by_check["bmad-config"]["detail"]["initiative"] == ""
+    finding = by_check["bmad-config.initiative-unset"]
+    assert finding["severity"] == "warning"
+    assert "active_initiative" in finding["message"]
+
+
+def test_validate_warns_v6_keys_ignored_on_a_mixed_install(project, capsys, monkeypatch):
+    """Decision 8: a mixed install resolved as v7 for tickets mode names each leftover
+    v6 key. `validate` learns the source in a later layer; until then the tickets-mode
+    load is pinned here. Ablation: drop the warn and this FAILS."""
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+    real = bmadconfig.load_paths
+    monkeypatch.setattr(
+        bmadconfig, "load_paths", lambda project, **kw: real(project, want_tickets=True)
+    )
+    by_check = _validate_v7_findings(project, capsys)
+    assert by_check["bmad-config"]["detail"]["era"] == "v7"
+    finding = by_check["bmad-config.v6-keys-ignored"]
+    assert finding["severity"] == "warning"
+    assert len(finding["detail"]["keys"]) == 2
+    assert "modules.bmm.implementation_artifacts" in finding["message"]
 
 
 def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):

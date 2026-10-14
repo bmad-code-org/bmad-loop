@@ -652,6 +652,47 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
         )
 
 
+def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths) -> None:
+    """The `bmad-config` ok line, plus the v7 warnings. A v6 config reports exactly
+    as it always has; a v7 one names the era and the active initiative, warns when
+    none is active (the artifact dirs fell back to `output_folder`), and names each
+    leftover v6 key a mixed install resolved past."""
+    if paths.era != "v7":
+        report.ok(
+            "bmad-config",
+            f"BMAD config OK: artifacts at {paths.implementation_artifacts}",
+            {"implementation_artifacts": str(paths.implementation_artifacts)},
+        )
+        return
+    initiative = paths.active_initiative
+    report.ok(
+        "bmad-config",
+        f"BMAD v7 config OK: initiative {initiative or '(none)'}, "
+        f"artifacts at {paths.implementation_artifacts}",
+        {
+            "implementation_artifacts": str(paths.implementation_artifacts),
+            "era": paths.era,
+            "initiative": initiative,
+        },
+    )
+    if not initiative:
+        report.warn(
+            "bmad-config.initiative-unset",
+            "BMAD v7: no `[core] active_initiative` is set, so artifacts resolve to "
+            f"the output folder {paths.output_folder} — set one in "
+            "_bmad/custom/config.user.toml (or ask the `bmad` skill to switch it)",
+            {"output_folder": str(paths.output_folder)},
+        )
+    if paths.ignored_v6_keys:
+        report.warn(
+            "bmad-config.v6-keys-ignored",
+            "BMAD v7 resolved past leftover v6 keys: "
+            f"{'; '.join(paths.ignored_v6_keys)} — remove them (accept `bmad setup`'s "
+            "v6 cleanup) so every mode reads the same artifact home",
+            {"keys": list(paths.ignored_v6_keys)},
+        )
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from .install import relay_registered
 
@@ -660,11 +701,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     try:
         paths = bmadconfig.load_paths(project)
-        report.ok(
-            "bmad-config",
-            f"BMAD config OK: artifacts at {paths.implementation_artifacts}",
-            {"implementation_artifacts": str(paths.implementation_artifacts)},
-        )
+        _report_bmad_config(report, paths)
     except bmadconfig.BmadConfigError as e:
         report.fail("bmad-config", str(e))
         paths = None

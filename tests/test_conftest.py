@@ -192,9 +192,14 @@ def test_state_root_override_is_restored(tmp_path, operator):
 
 
 def _project_shape(paths: bmadconfig.ProjectPaths) -> dict[str, str]:
+    """Every path-valued member as a project-relative spelling (the v7 era fields
+    are strings, and `initiative_folder` is None on v6)."""
     root = paths.project.resolve()
+    members = {f.name: getattr(paths, f.name) for f in fields(paths)}
     return {
-        f.name: getattr(paths, f.name).resolve().relative_to(root).as_posix() for f in fields(paths)
+        name: value.resolve().relative_to(root).as_posix()
+        for name, value in members.items()
+        if isinstance(value, Path)
     }
 
 

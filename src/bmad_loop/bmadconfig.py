@@ -34,7 +34,30 @@ puts it. The legacy per-module `_bmad/bmm/config.yaml` may or may not be beside 
 - With no TOML layer at all the YAML is read exactly as it always was.
 
 `{project-root}` is substituted with the renderer's spelling (a literal replace
-with the canonical root) by `_resolve`, for both sources."""
+with the canonical root) by `_resolve`, for both sources.
+
+**BMAD v7** drops the two `[modules.bmm]` keys: the artifact home is the initiative
+folder, ``{output_folder}/{active_initiative}``, both read strictly from ``[core]``
+by the project's ``_bmad/method/scripts/tickets.py``. :func:`load_paths` picks the
+era (``ProjectPaths.era``):
+
+- **v6** when both v6 keys resolve, unless tickets mode asks for v7 on a mixed
+  install — exactly the behavior above.
+- **v7** when the marker FILE :data:`V7_MARKER_REL` exists and either no v6 key
+  resolves or the caller wants tickets (``want_tickets``). Both artifact dirs become
+  the initiative folder, or `output_folder` when no initiative is active, so every
+  consumer of `implementation_artifacts` (the deferred-work ledger, artifact scans)
+  follows without a per-site change. `output_folder` and `active_initiative` come
+  from :func:`read_core_value` — upstream's three layers (:data:`V7_CENTRAL_LAYERS_REL`)
+  and the dotted ``[core]`` key, as `tickets.py` reads them; a relative
+  `output_folder` resolves against the project, as `tickets.py` joins it. `repo_root`
+  keeps the short-key lookup: it is bmad-loop's own key on either era. A v6 key left
+  beside a v7 resolution is reported in ``ProjectPaths.ignored_v6_keys`` for
+  `validate` to warn about, never silently honored.
+- Otherwise the missing-key error, with a hint naming the v7 marker.
+
+The marker is the script file, not the `_bmad/method` folder: an install can carry
+an empty ``_bmad/method/scripts/`` without being a v7 project."""
 
 from __future__ import annotations
 
@@ -43,6 +66,7 @@ import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -52,6 +76,9 @@ from .platform_util import resolve_or_lexical
 
 class BmadConfigError(Exception):
     pass
+
+
+BmadEra = Literal["v6", "v7"]
 
 
 def _diagnostic_text(text: str) -> str:
@@ -72,6 +99,18 @@ class ProjectPaths:
     # the git root code/git work happens against; defaults to `project`. Phase 1
     # foundation for worktree isolation — see ProjectPaths.rebased and Workspace.
     repo_root: Path = field(default=None)  # type: ignore[assignment]
+    # which BMAD config shape `load_paths` resolved: "v6" (the `[modules.bmm]` artifact
+    # keys) or "v7" (the `[core]` initiative tree) — see the module docstring
+    era: BmadEra = "v6"
+    # v7 only: `[core] active_initiative` as resolved at load time, and its canonical
+    # folder (`implementation_artifacts` and `planning_artifacts` on v7). "" and None
+    # mean no active initiative — an explicit signal, not a fallback: the artifact
+    # dirs then fall back to `output_folder` and validate warns.
+    active_initiative: str = ""
+    initiative_folder: Path | None = None
+    # v7 only: the origin of each v6 artifact key that is configured but ignored
+    # because tickets mode resolved the project as v7 (a mixed install)
+    ignored_v6_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.output_folder is None:
@@ -109,6 +148,14 @@ class ProjectPaths:
             planning_artifacts=self.artifact_at(self.planning_artifacts, new_project),
             output_folder=self.artifact_at(self.output_folder, new_project),
             repo_root=new_root,
+            era=self.era,
+            active_initiative=self.active_initiative,
+            initiative_folder=(
+                None
+                if self.initiative_folder is None
+                else self.artifact_at(self.initiative_folder, new_project)
+            ),
+            ignored_v6_keys=self.ignored_v6_keys,
         )
 
     def artifact_at(self, artifact: Path, mount_project: Path) -> Path:
@@ -261,6 +308,17 @@ CENTRAL_LAYERS_REL: tuple[Path, ...] = (
     Path("_bmad") / "custom" / "config.toml",
     Path("_bmad") / "custom" / "config.user.toml",
 )
+# Lowest to highest — upstream v7 `config_utils.load_central_config`: three layers.
+# v7 `bmad setup` deletes `_bmad/config.user.toml` as a v6 leftover, and `tickets.py`
+# never reads it, so the v7 `[core]` reader must not either.
+V7_CENTRAL_LAYERS_REL: tuple[Path, ...] = (
+    Path("_bmad") / "config.toml",
+    Path("_bmad") / "custom" / "config.toml",
+    Path("_bmad") / "custom" / "config.user.toml",
+)
+# The v7 era marker: the ticket-tree script v7 setup installs. A FILE — the folder
+# around it can exist empty on a v6 install.
+V7_MARKER_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
 _REQUIRED_KEYS = ("implementation_artifacts", "planning_artifacts")
 _PATH_KEYS = (*_REQUIRED_KEYS, "repo_root", "output_folder")
 
@@ -314,11 +372,11 @@ def _load_layer(path: Path) -> dict[str, object] | None:
         raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
 
 
-def _legacy_is_file(path: Path) -> bool:
-    """`path.is_file()` for the legacy YAML, with its probe failures typed. A missing
-    entry (or a dangling/looping link) is not a file, as `is_file()` always said;
-    any other failure — an unreadable `_bmad/bmm`, a dead share — raises, where
-    `is_file()` raises it untyped through 3.13 and reads it as absent on 3.14+,
+def _is_file(path: Path) -> bool:
+    """`path.is_file()` for the legacy YAML and the v7 marker, with its probe failures
+    typed. A missing entry (or a dangling/looping link) is not a file, as `is_file()`
+    always said; any other failure — an unreadable `_bmad/bmm`, a dead share — raises,
+    where `is_file()` raises it untyped through 3.13 and reads it as absent on 3.14+,
     misreporting an unreadable fallback as a missing key."""
     try:
         return stat.S_ISREG(path.stat().st_mode)
@@ -353,14 +411,71 @@ def _overlay(base: dict[str, object], layer: dict[str, object], source: Path) ->
     return merged
 
 
-def _load_central(project: Path) -> dict[str, object] | None:
-    """The merged four-layer central config, or None when no layer exists."""
+def _load_central(
+    project: Path, layers: tuple[Path, ...] = CENTRAL_LAYERS_REL
+) -> dict[str, object] | None:
+    """The merged central config over `layers` (the four v6 layers by default), or
+    None when no layer exists."""
     merged: dict[str, object] | None = None
-    for rel in CENTRAL_LAYERS_REL:
+    for rel in layers:
         layer = _load_layer(project / rel)
         if layer is not None:
             merged = _overlay(merged or {}, layer, project / rel)
     return merged
+
+
+def _core_value(central: dict[str, object], key: str) -> tuple[str, str] | None:
+    """(value, origin) for the dotted `core.<key>` in a merged config, or None when
+    unset. Present but unusable — `core` not a table, the value not a non-blank
+    string — raises: upstream's renderer refuses the same value, and `tickets.py`
+    would read it as unset and run against a folder the operator did not choose."""
+    core = central.get("core")
+    if core is None:
+        return None
+    if not isinstance(core, _Table):
+        assert isinstance(core, _Leaf)
+        raise BmadConfigError(
+            _diagnostic_text(
+                f"`core` in {core.layer} must be a table, got {type(core.value).__name__}"
+            )
+        )
+    node = core.get(key)
+    if node is None:
+        return None
+    if isinstance(node, _Table):
+        layers = ", ".join(str(layer) for layer in node.layers)
+        raise BmadConfigError(
+            _diagnostic_text(f"`core.{key}` in {layers} must be a string, got table")
+        )
+    assert isinstance(node, _Leaf)
+    origin = f"`core.{key}` in {node.layer}"
+    if not isinstance(node.value, str):
+        raise BmadConfigError(
+            _diagnostic_text(f"{origin} must be a string, got {type(node.value).__name__}")
+        )
+    if not node.value.strip():
+        raise BmadConfigError(_diagnostic_text(f"{origin} must not be empty"))
+    return node.value, origin
+
+
+def read_core_value(project: Path, key: str) -> tuple[str, str] | None:
+    """(value, origin) for ``[core] <key>`` the way BMAD v7's `tickets.py` reads it:
+    the three upstream layers (:data:`V7_CENTRAL_LAYERS_REL`) merged, then the dotted
+    key — strict where the v6 short-key lookup is not, so an entry of the same name
+    under another table (``[modules.bmm] active_initiative``, the pre-v7 home) is not
+    this key. None when unset; raises :class:`BmadConfigError` on an unreadable
+    layer or a present value that is not a non-blank string."""
+    central = _load_central(Path(project), V7_CENTRAL_LAYERS_REL)
+    return None if central is None else _core_value(central, key)
+
+
+def active_initiative(project: Path) -> str | None:
+    """The project's live ``[core] active_initiative`` (stripped, as `tickets.py`
+    strips it), or None when none is active. Read fresh on every call: the value is
+    personal config the operator may switch under a paused run, and the run's pinned
+    copy (``RunState.initiative``) is compared against this."""
+    hit = read_core_value(project, "active_initiative")
+    return None if hit is None else hit[0].strip()
 
 
 def _find(tree: dict[str, object], key: str, prefix: str = "") -> list[tuple[str, object]]:
@@ -439,7 +554,9 @@ def _load_legacy(config_path: Path) -> dict[object, object]:
     return doc
 
 
-def load_paths(project: Path) -> ProjectPaths:
+def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
+    # `want_tickets`: the caller is about to drive the v7 ticket tree, so a mixed
+    # install (v6 keys left beside the v7 marker) resolves as v7 — module docstring.
     # The root must canonicalize or there is no consistent ProjectPaths to hand back
     # (#552). Every member is compared against `project` — `rebased` decides "is this
     # artifact dir inside the tree" with `relative_to` — so a lexical root next to a
@@ -464,7 +581,7 @@ def load_paths(project: Path) -> ProjectPaths:
     config_path = project / LEGACY_CONFIG_REL
     central = _load_central(project)
     if central is None:
-        if not _legacy_is_file(config_path):
+        if not _is_file(config_path):
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
                 f"BMAD config not found: neither the central TOML ({layers}) nor "
@@ -482,20 +599,83 @@ def load_paths(project: Path) -> ProjectPaths:
         if hit is not None:
             return hit
         if legacy is None:
-            legacy = _load_legacy(config_path) if _legacy_is_file(config_path) else {}
+            legacy = _load_legacy(config_path) if _is_file(config_path) else {}
         raw = legacy.get(key)
         return (str(raw), f"`{key}` in {config_path}") if raw else None
 
-    found = {key: lookup(key) for key in _PATH_KEYS}
+    v6 = {key: lookup(key) for key in _REQUIRED_KEYS}
+    v6_hits = [hit for hit in v6.values() if hit is not None]
+    marker = project / V7_MARKER_REL
+    # The marker is probed only when it can change the answer: a complete v6 config
+    # outside tickets mode resolves exactly as it always did.
+    if (want_tickets or not v6_hits) and _is_file(marker):
+        return _assemble_v7(project, lookup("repo_root"), tuple(origin for _, origin in v6_hits))
+    found = {**v6, "repo_root": lookup("repo_root"), "output_folder": lookup("output_folder")}
     for key in _REQUIRED_KEYS:
         if found[key] is None:
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
                 _diagnostic_text(
-                    f"missing `{key}`: not in the central TOML ({layers}) nor in {config_path}"
+                    f"missing `{key}`: not in the central TOML ({layers}) nor in "
+                    f"{config_path}{_v7_hint(marker, v6_hits)}"
                 )
             )
     return _assemble(project, found)
+
+
+def _v7_hint(marker: Path, v6_hits: list[tuple[str, str]]) -> str:
+    """The BMAD v7 half of the missing-key error: what would have made this a v7
+    project, so an operator on a fresh v7 install is not sent hunting for v6 keys."""
+    if v6_hits and _is_file(marker):
+        return (
+            f" — {marker} marks a BMAD v7 install, but the leftover v6 key "
+            f"{v6_hits[0][1]} keeps it on v6: remove it (accept `bmad setup`'s v6 "
+            "cleanup) to resolve the project as v7"
+        )
+    return (
+        f" — a BMAD v7 project is recognized by the file {marker}, which is absent; "
+        "on a v7 install, run `bmad setup` to finish it"
+    )
+
+
+def _assemble_v7(
+    project: Path, repo_root_hit: tuple[str, str] | None, ignored_v6_keys: tuple[str, ...]
+) -> ProjectPaths:
+    """The v7 snapshot: `output_folder` and `active_initiative` from the strict
+    ``[core]`` reader, both artifact dirs on the initiative folder (or on
+    `output_folder` when none is active), `repo_root` from the short-key lookup."""
+    central = _load_central(project, V7_CENTRAL_LAYERS_REL) or {}
+    out_hit = _core_value(central, "output_folder")
+    output_folder = (
+        # `tickets.py` joins the raw value onto the project root, so a relative
+        # folder is project-relative here too, not cwd-relative.
+        _canonical(
+            project / out_hit[0].replace("{project-root}", str(project)),
+            f"configured path {out_hit[0]!r} ({out_hit[1]})",
+        )
+        if out_hit
+        else _canonical(project / "_bmad-output", "default output folder")
+    )
+    name_hit = _core_value(central, "active_initiative")
+    initiative = name_hit[0].strip() if name_hit else ""
+    initiative_folder = (
+        _canonical(output_folder / initiative, f"initiative folder ({name_hit[1]})")
+        if name_hit
+        else None
+    )
+    repo_root = _resolve(repo_root_hit[0], project, repo_root_hit[1]) if repo_root_hit else project
+    artifacts = initiative_folder or output_folder
+    return ProjectPaths(
+        project=project,
+        implementation_artifacts=artifacts,
+        planning_artifacts=artifacts,
+        output_folder=output_folder,
+        repo_root=repo_root,
+        era="v7",
+        active_initiative=initiative,
+        initiative_folder=initiative_folder,
+        ignored_v6_keys=ignored_v6_keys,
+    )
 
 
 def _paths_from_legacy(project: Path, config_path: Path, doc: dict[object, object]) -> ProjectPaths:

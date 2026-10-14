@@ -38,6 +38,7 @@ from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
     BMAD_DIR,
+    BMAD_FLOOR_TEXT,
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     CUSTOMIZE_DIR,
@@ -2783,6 +2784,17 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
     assert (wt / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").is_file()
 
 
+def test_floor_message_names_v7(tmp_path):
+    """The base-skill floor text names both config eras: a v7 project gets its skills
+    from the method module, so a v6-only floor would send its operator after bmm."""
+    claude = get_profile("claude")
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert problems
+    for problem in problems:
+        assert "BMAD-METHOD >= 6.10.0" in problem.message
+        assert "on BMAD v7, the method module" in problem.message
+
+
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     claude = get_profile("claude")
     # nothing installed → dev primitive + the two inline review layers reported
@@ -2792,6 +2804,7 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     assert len(problems) == 3
     assert {p.check for p in problems} == {"skills.base-missing"}
     assert all("BMAD-METHOD >= 6.10.0" in p.message for p in problems)
+    assert all(BMAD_FLOOR_TEXT in p.message for p in problems)
 
     # install everything → no problems
     _install_base_skills(tmp_path, claude.skill_tree)

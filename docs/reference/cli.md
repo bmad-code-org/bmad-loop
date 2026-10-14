@@ -583,7 +583,9 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 
 | Check id                               | Severity               | What it checks                                                                                                                    |
 | -------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `bmad-config`                          | ok / problem           | BMAD config loads and artifact paths resolve                                                                                      |
+| `bmad-config`                          | ok / problem           | BMAD config loads and artifact paths resolve; on BMAD v7 the ok line names the era and the active initiative                      |
+| `bmad-config.initiative-unset`         | warning                | BMAD v7 with no `[core] active_initiative`: artifacts resolve to the output folder                                                |
+| `bmad-config.v6-keys-ignored`          | warning                | a mixed install resolved as BMAD v7 for tickets mode, ignoring leftover v6 artifact keys                                          |
 | `policy`                               | ok / problem           | `.bmad-loop/policy.toml` loads                                                                                                    |
 | `policy.isolation-repo-root`           | problem                | `isolation = "worktree"` with the project outside the code root                                                                   |
 | `policy.isolation-shared-artifact-dir` | warning                | under worktree isolation, an artifact dir shared with the main checkout                                                           |

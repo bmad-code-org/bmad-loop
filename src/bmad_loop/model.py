@@ -1255,6 +1255,13 @@ class RunState:
     # stories mode only: the project-relative (or absolute) spec folder holding
     # stories.yaml + SPEC.md. Empty under sprint-status.
     spec_folder: str = ""
+    # BMAD v7 only: the `[core] active_initiative` the run picked from, and its
+    # canonical folder, pinned at run start (bmadconfig.ProjectPaths). The live
+    # value can change under a paused run; tickets mode compares the two so a
+    # resume never builds another initiative's ticket. Empty on v6 runs and on
+    # state written before the pin existed.
+    initiative: str = ""
+    initiative_folder: str = ""
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -1431,6 +1438,8 @@ class RunState:
             "sweep_options_digest": self.sweep_options_digest,
             "source": self.source,
             "spec_folder": self.spec_folder,
+            "initiative": self.initiative,
+            "initiative_folder": self.initiative_folder,
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
@@ -1473,6 +1482,8 @@ class RunState:
             sweep_options_digest=str(d.get("sweep_options_digest", "")),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
+            initiative=str(d.get("initiative", "")),
+            initiative_folder=str(d.get("initiative_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],

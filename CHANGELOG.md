@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Resolve BMAD v7 `[core] output_folder` / `active_initiative` config. A project with
+  `_bmad/method/scripts/tickets.py` and no v6 artifact keys validates and resolves its
+  artifacts to the active initiative folder. New `bmad-config.initiative-unset` and
+  `bmad-config.v6-keys-ignored` validate warnings.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 - Add `bmad-loop plugins [list|enable|accept|revoke] [name]`: list plugins with origin,

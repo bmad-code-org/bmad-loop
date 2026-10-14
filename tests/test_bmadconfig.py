@@ -3,7 +3,9 @@ Workspace-seam foundation. repo_root defaults to project (today's behavior);
 rebased re-roots artifacts onto a worktree-style checkout, keeping a nested project's
 offset (DW-379). Plus worktree_isolation_conflict, the #414 refusal predicate built
 on the same pair (narrowed by DW-379 to a project outside repo_root), and load_paths'
-two sources: the four-layer central TOML and the legacy YAML (#769)."""
+two sources: the four-layer central TOML and the legacy YAML (#769). Plus the BMAD v7
+era: the strict three-layer `[core]` reader, the `tickets.py` marker and the
+mixed-install rule (the `v7` section at the end)."""
 
 from __future__ import annotations
 
@@ -20,8 +22,11 @@ from conftest import (
     NESTED_SUBDIR,
     NUL_PATH_RESOLVE_FAULTS,
     UNRESOLVABLE,
+    V7_TICKETS_REL,
+    V7_USER_CONFIG_REL,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     nested_repo_root_paths,
     refuse_to_resolve,
 )
@@ -1066,3 +1071,240 @@ def test_rebased_reroots_a_toml_sourced_config(tmp_path: Path) -> None:
     assert rebased.implementation_artifacts == (wt / _DEFAULT_IMPL).resolve()
     assert rebased.output_folder == (wt / "_bmad-output").resolve()
     assert rebased.sprint_status == (wt / _DEFAULT_IMPL / "sprint-status.yaml").resolve()
+
+
+# --------------------------------------------------------------------- BMAD v7 era
+#
+# `install_bmad_v7` writes what upstream `bmad setup` leaves: `_bmad/config.toml`
+# `[core] output_folder`, `[core] active_initiative` in the personal layer, the
+# vendored `tickets.py` at the marker path. No git: `load_paths` never consults one.
+
+V6_KEYS_TOML = """\
+[modules.bmm]
+planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"
+implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"
+"""
+
+
+def _v7(tmp_path: Path, **kw) -> Path:
+    root = tmp_path / "v7"
+    root.mkdir()
+    install_bmad_v7(root, **kw)
+    return root
+
+
+def _write_user_config(root: Path, text: str) -> None:
+    (root / V7_USER_CONFIG_REL).write_text(text, encoding="utf-8")
+
+
+def test_v7_layout_resolves_initiative_and_era(tmp_path: Path) -> None:
+    root = _v7(tmp_path, initiative="initiative-checkout")
+    paths = bmadconfig.load_paths(root)
+    assert paths.era == "v7"
+    assert paths.active_initiative == "initiative-checkout"
+    assert paths.output_folder == (root / "_bmad-output").resolve()
+    assert paths.initiative_folder == (root / "_bmad-output" / "initiative-checkout").resolve()
+    assert paths.repo_root == root.resolve()
+    assert paths.ignored_v6_keys == ()
+
+
+def test_v7_implementation_artifacts_is_initiative_folder(tmp_path: Path) -> None:
+    """R8: both artifact dirs ARE the initiative folder, so `deferred_work` and every
+    other `implementation_artifacts` consumer follows with no per-site change."""
+    paths = bmadconfig.load_paths(_v7(tmp_path))
+    assert paths.initiative_folder is not None
+    assert paths.implementation_artifacts == paths.initiative_folder
+    assert paths.planning_artifacts == paths.initiative_folder
+    assert paths.deferred_work == paths.initiative_folder / "deferred-work.md"
+
+
+def test_v7_without_initiative_falls_back_to_output_folder_with_none(tmp_path: Path) -> None:
+    root = _v7(tmp_path)
+    _write_user_config(root, "# no initiative\n")
+    paths = bmadconfig.load_paths(root)
+    assert paths.era == "v7"
+    assert paths.active_initiative == ""
+    assert paths.initiative_folder is None
+    assert paths.implementation_artifacts == paths.output_folder
+    assert paths.planning_artifacts == paths.output_folder
+    assert bmadconfig.active_initiative(root) is None
+
+
+def test_v6_keys_present_keep_v6_era_even_with_tickets_py(project) -> None:
+    """A complete v6 config resolves exactly as before when the v7 marker appears
+    beside it: the marker alone never flips the era. Ablation: gate the v7 branch on
+    the marker alone (drop `not v6_hits`) and this FAILS."""
+    install_bmad_central_config(project)
+    before = bmadconfig.load_paths(project.project)
+    marker = project.project / V7_TICKETS_REL
+    marker.parent.mkdir(parents=True)
+    marker.write_text("# tickets.py\n", encoding="utf-8")
+    after = bmadconfig.load_paths(project.project)
+    assert after == before
+    assert after.era == "v6" and after.initiative_folder is None
+
+
+def test_neither_key_nor_v7_marker_still_raises_missing(project) -> None:
+    install_bmad_central_config(project)
+    (project.project / "_bmad" / "config.toml").write_text(
+        '[core]\noutput_folder = "{project-root}/_bmad-output"\n', encoding="utf-8"
+    )
+    with pytest.raises(bmadconfig.BmadConfigError) as exc:
+        bmadconfig.load_paths(project.project)
+    message = str(exc.value)
+    assert message.startswith("missing `implementation_artifacts`")
+    assert "a BMAD v7 project is recognized by the file" in message
+    assert str(V7_TICKETS_REL) in message
+
+
+def test_empty_method_scripts_dir_is_not_v7(tmp_path: Path) -> None:
+    """Critique #6's shape, which this very repository has: `_bmad/method/scripts/`
+    exists but is EMPTY and no v6 key is set — not v7, so today's missing-key error,
+    plus the v7 hint. Ablation: probe the folder instead of the `tickets.py` file
+    and this FAILS (it would resolve v7)."""
+    root = _v7(tmp_path)
+    (root / V7_TICKETS_REL).unlink()
+    assert (root / V7_TICKETS_REL).parent.is_dir()
+    with pytest.raises(
+        bmadconfig.BmadConfigError, match="missing `implementation_artifacts`"
+    ) as exc:
+        bmadconfig.load_paths(root)
+    assert "which is absent" in str(exc.value)
+
+
+def test_one_v6_key_beside_the_marker_names_the_leftover(tmp_path: Path) -> None:
+    """Half a v6 config beside the marker outside tickets mode is neither era: the
+    error names the leftover key that keeps the project off v7."""
+    root = _v7(tmp_path)
+    (root / "_bmad" / "custom" / "config.toml").write_text(
+        '[modules.bmm]\nplanning_artifacts = "{project-root}/plan"\n', encoding="utf-8"
+    )
+    with pytest.raises(bmadconfig.BmadConfigError) as exc:
+        bmadconfig.load_paths(root)
+    message = str(exc.value)
+    assert message.startswith("missing `implementation_artifacts`")
+    assert "modules.bmm.planning_artifacts" in message
+    assert "leftover v6 key" in message
+
+
+def test_mixed_install_tickets_mode_resolves_v7_and_warns(tmp_path: Path) -> None:
+    """Decision 8: under tickets mode a v7 install with the v6 keys left behind (a
+    declined `bmad setup` cleanup) resolves v7 and records each ignored key for
+    validate's `bmad-config.v6-keys-ignored` warning."""
+    root = _v7(tmp_path)
+    (root / "_bmad" / "custom" / "config.toml").write_text(V6_KEYS_TOML, encoding="utf-8")
+    paths = bmadconfig.load_paths(root, want_tickets=True)
+    assert paths.era == "v7"
+    assert paths.implementation_artifacts == paths.initiative_folder
+    assert len(paths.ignored_v6_keys) == 2
+    assert any("modules.bmm.implementation_artifacts" in k for k in paths.ignored_v6_keys)
+    assert any("modules.bmm.planning_artifacts" in k for k in paths.ignored_v6_keys)
+
+
+def test_mixed_install_sprint_mode_stays_v6(tmp_path: Path) -> None:
+    """The same mixed install outside tickets mode keeps today's v6 resolution, with
+    no v7 field filled. Ablation: drop the `not v6_hits` half of the v7 gate (the
+    marker alone decides) and this FAILS."""
+    root = _v7(tmp_path)
+    (root / "_bmad" / "custom" / "config.toml").write_text(V6_KEYS_TOML, encoding="utf-8")
+    paths = bmadconfig.load_paths(root)
+    assert paths.era == "v6"
+    assert (
+        paths.implementation_artifacts
+        == (root / "_bmad-output" / "implementation-artifacts").resolve()
+    )
+    assert paths.active_initiative == "" and paths.initiative_folder is None
+    assert paths.ignored_v6_keys == ()
+
+
+def test_v7_relative_output_folder_resolves_against_project(tmp_path: Path, monkeypatch) -> None:
+    """`tickets.py` joins `output_folder` onto the project root, so a relative value is
+    project-relative regardless of the process cwd (v6 `_resolve` is not, and stays
+    as it is)."""
+    root = _v7(tmp_path)
+    (root / "_bmad" / "config.toml").write_text(
+        '[core]\noutput_folder = "out/docs"\n', encoding="utf-8"
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    paths = bmadconfig.load_paths(root)
+    assert paths.output_folder == (root / "out" / "docs").resolve()
+    assert paths.initiative_folder == (root / "out" / "docs" / "initiative-demo").resolve()
+
+
+def test_v7_unset_output_folder_defaults_like_v6(tmp_path: Path) -> None:
+    root = _v7(tmp_path)
+    (root / "_bmad" / "config.toml").write_text('[core]\nproject_name = "x"\n', encoding="utf-8")
+    assert bmadconfig.load_paths(root).output_folder == (root / "_bmad-output").resolve()
+
+
+def test_core_reader_ignores_modules_bmm_active_initiative(tmp_path: Path) -> None:
+    """The pre-v7 home `[modules.bmm] active_initiative` is not `[core]`'s key: the
+    short-key lookup would find it, `tickets.py` would not."""
+    root = _v7(tmp_path)
+    _write_user_config(root, '[modules.bmm]\nactive_initiative = "initiative-old"\n')
+    assert bmadconfig.read_core_value(root, "active_initiative") is None
+    assert bmadconfig.load_paths(root).active_initiative == ""
+
+
+def test_core_reader_ignores_legacy_config_user_toml_layer(tmp_path: Path) -> None:
+    """`_bmad/config.user.toml` is a v6 layer v7 setup deletes; upstream's three-layer
+    merge never reads it, so neither does the v7 reader."""
+    root = _v7(tmp_path)
+    _write_user_config(root, "# cleared\n")
+    (root / "_bmad" / "config.user.toml").write_text(
+        '[core]\nactive_initiative = "initiative-stale"\n', encoding="utf-8"
+    )
+    assert bmadconfig.active_initiative(root) is None
+
+
+def test_core_reader_layers_and_strips(tmp_path: Path) -> None:
+    root = _v7(tmp_path)
+    (root / "_bmad" / "custom" / "config.toml").write_text(
+        '[core]\nactive_initiative = "initiative-team"\n', encoding="utf-8"
+    )
+    _write_user_config(root, '[core]\nactive_initiative = " initiative-me "\n')
+    value, origin = bmadconfig.read_core_value(root, "active_initiative") or ("", "")
+    assert value == " initiative-me "
+    assert "core.active_initiative" in origin and "config.user.toml" in origin
+    assert bmadconfig.active_initiative(root) == "initiative-me"
+
+
+@pytest.mark.parametrize(
+    ("user_toml", "match"),
+    [
+        ('[core]\nactive_initiative = ""\n', "must not be empty"),
+        ("[core]\nactive_initiative = 3\n", "must be a string, got int"),
+        ("[core.active_initiative]\nname = 'x'\n", "must be a string, got table"),
+        ('core = "x"\n', "must be a table"),
+    ],
+)
+def test_core_reader_refuses_unusable_values(tmp_path: Path, user_toml: str, match: str) -> None:
+    """A present but unusable value raises rather than reading as "no initiative",
+    which would silently move the artifact home to `output_folder`."""
+    root = _v7(tmp_path)
+    _write_user_config(root, user_toml)
+    with pytest.raises(bmadconfig.BmadConfigError, match=match):
+        bmadconfig.load_paths(root)
+
+
+def test_rebased_moves_initiative_folder(tmp_path: Path) -> None:
+    paths = bmadconfig.load_paths(_v7(tmp_path))
+    checkout = tmp_path / "wt"
+    checkout.mkdir()
+    moved = paths.rebased(checkout)
+    assert moved.era == "v7"
+    assert moved.active_initiative == paths.active_initiative
+    assert moved.initiative_folder == (checkout / "_bmad-output" / "initiative-demo").resolve()
+    assert moved.implementation_artifacts == moved.initiative_folder
+
+
+def test_rebased_keeps_v6_defaults(tmp_path: Path) -> None:
+    paths = ProjectPaths(
+        project=tmp_path / "p",
+        implementation_artifacts=tmp_path / "p" / "impl",
+        planning_artifacts=tmp_path / "p" / "plan",
+    )
+    moved = paths.rebased(tmp_path / "wt")
+    assert moved.era == "v6" and moved.initiative_folder is None and moved.active_initiative == ""

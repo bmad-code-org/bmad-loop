@@ -64,6 +64,13 @@ MODULE_SKILLS = (
     "bmad-loop-setup",
 )
 
+# Which upstream install ships the skills the base-skill findings require, in both
+# BMAD config eras (bmadconfig.ProjectPaths.era): v6 installs them with the bmm
+# module, v7 with the method module (`_bmad/method`, the bmod-method record).
+BMAD_FLOOR_TEXT = (
+    "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the method module (bmod-method >= 6.13)"
+)
+
 # The inner dev primitive, in both upstream eras. BMAD-METHOD PR #2651 (shipped in
 # bmad-method 6.10.1-next.33) renamed `bmad-dev-auto` -> `bmad-build-auto` and left a
 # forwarding SHIM behind under the old name: a lone SKILL.md whose customization
@@ -827,8 +834,8 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                     "skills.base-missing",
                     "problem",
                     f"{tree}/{DEV_PRIMITIVE_NEW} not found — the orchestrator drives this "
-                    f"upstream dev primitive directly; it ships with the bmm module "
-                    f"(BMAD-METHOD >= 6.10.0); install or update bmm in this project "
+                    f"upstream dev primitive directly; it ships with {BMAD_FLOOR_TEXT}; "
+                    f"install or update bmm (on v7, method) in this project "
                     f"(older installs name it {DEV_PRIMITIVE_LEGACY})",
                     {"tree": tree, "skill": DEV_PRIMITIVE_NEW},
                 )
@@ -1300,10 +1307,10 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
             Finding(
                 "skills.base-missing",
                 "problem",
-                f"{tree}/{skill} not found — this review layer ships with the bmm module "
-                f"(BMAD-METHOD >= 6.10.0), as does the consolidated {MERGED_REVIEW_SKILL} "
-                f"skill that supersedes it in newer releases; install or update bmm in "
-                f"this project",
+                f"{tree}/{skill} not found — this review layer ships with "
+                f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
+                f"skill that supersedes it in newer releases; install or update bmm "
+                f"(on v7, method) in this project",
                 {"tree": tree, "skill": skill},
             )
             for skill in sorted(_REVIEW_LAYER_SKILLS)
