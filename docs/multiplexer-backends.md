@@ -101,7 +101,10 @@ session-qualified (`session:@N`).
 
 **Refused option values.** An `@` option value must read back verbatim. A value that is
 empty, contains a double quote or a line break, or has leading or trailing whitespace is
-refused with a stderr warning, and the option reads as unset. Ordinary
+refused with a stderr warning, and the option reads as unset. So are three `-`-leading
+shapes that psmux's client rewrites before parsing: `-X=value` (one
+letter, `=`, then at least one character), any value starting with `-t`, and `--`. Other
+`-`-leading values (`-u`, `-1=x`, `--x=y`) pass. Ordinary
 Windows paths (spaced, UNC, apostrophed, trailing separator) pass. The project ownership
 tag is a hex digest of the project path, so it always passes.
 

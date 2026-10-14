@@ -644,6 +644,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         }
         env["PSMUX_ALLOW_NESTING"] = "1"
+        # psmux's warm pool (spare shells per server) and its hidden `__warm__`
+        # standby server serve only default-shell creates: every window this
+        # backend opens carries a command and every session passes `-c`, so
+        # neither is ever claimed, yet together they cost about 0.75 GiB of
+        # summed working sets per idle project (#903). The server reads this at
+        # boot, and this call is the one that boots it; scoped to the spawn, so
+        # the operator's own psmux keeps its pool. Ceilings: the server's panes
+        # inherit it, so a psmux session started from inside one starts cold;
+        # and a psmux config that says `set -g warm on` re-enables the pool at
+        # load, which stays the operator's call (forcing `warm off` at runtime
+        # would also kill the registry's shared standby).
+        env["PSMUX_NO_WARM"] = "1"
         # The initial window is a window launch too: the same PowerShell floor
         # as `_shell_wrap`, checked before psmux creates anything.
         self._require_pwsh_floor()
@@ -947,9 +959,20 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # the wire now carries them — a value that reads back different is the
         # same silently-unprunable window whichever hop mangled it. An empty
         # value is a silent server-side no-op (`-u` is the verb for that).
+        #
+        # A few `-`-leading shapes still lose the WIRE half, to the client's
+        # argv normalizers that run before `set-option` parses (psmux/psmux#795,
+        # cli.rs at v3.4.0): `normalize_flag_equals` splits `-X=value` (one
+        # ASCII letter, a nonempty suffix) into `-X value` and the write
+        # succeeds silently; `normalize_attached_target_flag` splits `-t…` into
+        # a target flag, and `--` ends the options, so those two fail rc 1 and
+        # would leave a stale value in place. Other `-` values (`-u`, `-1=x`,
+        # `--x=y`, `-x=`) are stored verbatim since #583.
         if not value:
             return False
         if '"' in value or value != value.strip():
+            return False
+        if value == "--" or value.startswith("-t") or re.match(r"-[A-Za-z]=.", value):
             return False
         return value.splitlines() == [value]
 

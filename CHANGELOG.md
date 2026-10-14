@@ -46,6 +46,10 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Start bmad-loop's psmux servers with `PSMUX_NO_WARM=1`: their warm pool and hidden
+  `__warm__` standby were never used, and dropping them cuts an idle project from 16 psmux
+  processes and about 935 MiB of summed working sets to 4 and about 175 MiB. The operator's
+  own psmux keeps its pool (#903).
 - Make an un-enabled builtin `[python]` plugin wholly inert: its hooks, workflows and
   seeds no longer run without its module (#496, #497).
 - Run granted project plugins from a verified out-of-tree snapshot: `{scripts}` points
@@ -81,6 +85,9 @@ breaking changes may land in a minor release.
   `worktrees/1` behind (#902).
 - Resolve a miscased full run ref to the run id's on-disk spelling on a case-insensitive
   filesystem, so `stop` and `attach` reach the run's multiplexer session (#904).
+- Refuse psmux option values shaped `-X=value`, `-t…` or `--`: psmux 3.4.0 rewrites the
+  first silently and rejects the others, so the value is now warned about and its key freed
+  (#905).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the

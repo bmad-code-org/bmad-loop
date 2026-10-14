@@ -968,6 +968,37 @@ def test_adopted_a_dash_leading_option_value_is_stored(probe):
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "outcome"),
+    [
+        ("-x=foo", (0, "-x foo")),  # rewritten, and the write reports success
+        ("-tx", (1, "seed")),  # read as a target flag: refused, the seed stays
+        ("--", (1, "seed")),  # read as the end of options: same
+    ],
+)
+def test_premise_an_argv_flag_shaped_option_value_is_not_stored(probe, value, outcome):
+    # psmux's client argv normalizers rewrite `-X=value` to `-X value` and read
+    # `-t…`/`--` as flags before `set-option` sees its value (psmux/psmux#795).
+    # One row per family, so each retires on its own: red means psmux handles
+    # that shape differently now, and if it reads back verbatim,
+    # _transportable's matching refusal is droppable behind a floor bump. The
+    # write's rc is part of the premise, so a probe whose write never ran
+    # cannot pass on the seed alone.
+    mux, session, _ = probe
+    seeded = mux._run(["set-option", "-t", session, "@k", "seed"], check=False)
+    assert seeded.returncode == 0, f"probe setup: seeding @k failed: {seeded.stderr.strip()!r}"
+    written = mux._run(["set-option", "-t", session, "@k", value], check=False)
+    got = mux._run(["show-options", "-qv", "-t", session, "@k"], check=False)
+    assert got.returncode == 0, f"probe setup: reading @k back failed: {got.stderr.strip()!r}"
+    observed = (written.returncode, got.stdout.strip())
+    assert observed == outcome, (
+        f"psmux now answers the option value {value!r} with (rc, read back) {observed!r}, "
+        f"not {outcome!r} (psmux/psmux#795) — if it reads back verbatim, "
+        "psmux_backend._transportable's refusal of that shape is droppable behind a "
+        "floor bump"
+    )
+
+
 def test_adopted_a_pane_inherits_the_servers_start_path(tmp_path):
     """A pane inherits the PATH of the process that started its server, and a
     bare `psmux` in the pane resolves through it (psmux/psmux#773); 3.3.8
@@ -1363,6 +1394,61 @@ def test_premise_a_port_and_key_pair_is_answered_by_whichever_server_it_names(
     finally:
         for suffix in ("port", "key"):
             (root / f"{forged}.{suffix}").unlink(missing_ok=True)
+
+
+def test_adopted_a_backend_session_spawns_no_warm_standby(tmp_path, monkeypatch):
+    """A session the backend starts boots its server with ``PSMUX_NO_WARM=1``,
+    so no hidden ``__warm__`` standby joins the registry (#903): a booting
+    server with warm enabled spawns one and publishes ``__warm__.port`` beside
+    its own. Red means the create env lost the variable, or psmux stopped
+    honoring it at boot, and every idle project carries the standby again.
+
+    Its own root, not the module fixture's: the raw probe sessions there boot
+    with warm on, so their standby would answer for this one. And an empty
+    config of its own: an inherited `set -g warm off` would suppress the
+    standby whatever the env says.
+    """
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    root = tmp_path / "registry"
+    root.mkdir()
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(root))
+    monkeypatch.delenv("PSMUX_NO_WARM", raising=False)  # the backend must supply it
+    monkeypatch.delenv("PSMUX_WARM_POOL_SIZE", raising=False)
+    config = tmp_path / "empty.conf"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PSMUX_CONFIG_FILE", str(config))
+    env = _new_session_env()
+    session = f"bmad-loop-nowarm-probe-{uuid.uuid4().hex[:8]}"
+    standby = root / "__warm__.port"
+    try:
+        mux.new_session(session, tmp_path)
+        assert (root / f"{session}.port").is_file(), "probe setup: the session has no port file"
+        # The standby is spawned during the server's boot, and a server may take
+        # psmux's whole readiness window to register on a loaded box; reading
+        # absence any sooner could pass while a late standby is still coming.
+        deadline = time.monotonic() + psmux_teardown.PSMUX_READY_DEADLINE_S
+        while time.monotonic() < deadline and not standby.exists():
+            time.sleep(0.25)
+        assert not standby.exists(), (
+            "a session the psmux backend started spawned a `__warm__` standby — "
+            "new_session's PSMUX_NO_WARM no longer reaches the server it boots"
+        )
+    finally:
+        _teardown_probe_session(mux, session, env)
+        # A standby that registered late is a server of its own, which the
+        # session teardown never reaches. The root is this test's private
+        # tmp dir, so a kill-server scoped to it cannot touch anyone else's.
+        if standby.exists():
+            assert str(root).startswith(str(tmp_path))
+            subprocess.run(
+                ["psmux", "kill-server"],
+                env={**os.environ, "PSMUX_DATA_DIR": str(root)},
+                capture_output=True,
+                timeout=tmux_base.TMUX_TIMEOUT_S,
+                check=False,
+            )
 
 
 def test_adopted_a_missing_registry_root_self_heals(tmp_path):
