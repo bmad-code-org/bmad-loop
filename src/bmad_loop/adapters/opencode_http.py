@@ -649,9 +649,13 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             raise
         last_error = "server did not become healthy"
         died_at_startup = False
+        attempt_offset = 0
         try:
             for _ in range(SPAWN_ATTEMPTS):
                 port = _free_port()
+                # Where this attempt's output starts in the shared server log, so a
+                # startup-death diagnosis reads the final attempt only.
+                attempt_offset = os.fstat(server_fh.fileno()).st_size
                 process = subprocess.Popen(  # argv built from profile
                     self._serve_argv(resolved, port),
                     cwd=str(spec.cwd),
@@ -690,7 +694,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             raise
         self._close_spawn_sinks(log_fh, server_fh, event_fh)
         if died_at_startup and protocol.major == 1:
-            cause = self._startup_death_cause(spec.task_id, server_path, env)
+            cause = self._startup_death_cause(spec.task_id, server_path, env, attempt_offset)
             if cause:
                 last_error = f"{last_error}: {cause}"
         launched = " ".join((self.binary, *self.profile.launch_args))
@@ -699,11 +703,13 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             f"({last_error}); server log: {server_path}"
         )
 
-    def _startup_death_cause(self, task_id: str, server_path: Path, env: dict[str, str]) -> str:
+    def _startup_death_cause(
+        self, task_id: str, server_path: Path, env: dict[str, str], start: int
+    ) -> str:
         """The known cause of a 1.x server's death during startup, read from
-        the bounded server-log tail, or "" when none is recognised. The log
-        holds only this session's spawns: `start_session` unlinks it before
-        spawning.
+        the bounded server-log tail past ``start`` (the final attempt's first
+        byte), or "" when none is recognised. Every attempt appends to the same
+        log, so an earlier attempt's marker never explains the final death.
 
         Only the database-downgrade refusal is recognised. An unreadable log
         is crumbed (``server-log-unread``) and reads as no cause — the give-up
@@ -711,7 +717,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         try:
             with server_path.open("rb") as fh:
                 size = fh.seek(0, os.SEEK_END)
-                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
+                fh.seek(max(start, size - ENV_FAULT_TAIL_BYTES))
                 tail = fh.read()
         except OSError as e:
             self._note_lifecycle(

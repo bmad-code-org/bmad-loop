@@ -1919,7 +1919,9 @@ def _review_tree_gated(pol, root: Path, grants: GrantSet) -> bool:
     return "review" in roles
 
 
-def _skill_trees(project: Path, pol, root: Path, grants: GrantSet) -> list[str]:
+def _skill_trees(
+    project: Path, pol, root: Path, grants: GrantSet, *, review_owed: bool = False
+) -> list[str]:
     """The skill trees this run's dev-primitive adapters read, one per distinct name.
 
     Shared by the real preflight and `cmd_validate` so the two cannot drift:
@@ -1935,7 +1937,10 @@ def _skill_trees(project: Path, pol, root: Path, grants: GrantSet) -> list[str]:
     (`_review_tree_gated`): ``[review]`` is off and no statically-active plugin
     under `root`, judged against `grants`, binds a still-enabled
     ``role = "review"`` workflow. The predicate may over-approximate only toward
-    keeping the tree gated. Gating stays a subset
+    keeping the tree gated. ``review_owed`` is a resume's persisted evidence that
+    a review session can run regardless of policy: a latched
+    ``salvage_refile_pending`` re-enters the review loop with ``[review]`` off, and
+    a salvage that no longer applies retries as a fresh review pass. Gating stays a subset
     of what `WorktreeFlow.worktree_profiles` provisions, never equal by force:
     provisioning keeps both dev-primitive profiles regardless, since it drives
     per-CLI Stop-signal hook registration as well as seeding, and a worktree
@@ -1944,7 +1949,7 @@ def _skill_trees(project: Path, pol, root: Path, grants: GrantSet) -> list[str]:
     from .adapters.profile import ProfileError, get_profile
 
     roles = install.DEV_PRIMITIVE_ROLES
-    if not _review_tree_gated(pol, root, grants):
+    if not review_owed and not _review_tree_gated(pol, root, grants):
         roles = tuple(role for role in roles if role != "review")
     trees = []
     for name in dict.fromkeys(pol.adapter.resolved(role).name for role in roles):
@@ -2240,7 +2245,13 @@ def cmd_adapters(args: argparse.Namespace) -> int:
 
 
 def _require_base_skills(
-    project: Path, pol, root: Path, grants: GrantSet, *, require_stories: bool = False
+    project: Path,
+    pol,
+    root: Path,
+    grants: GrantSet,
+    *,
+    require_stories: bool = False,
+    review_owed: bool = False,
 ) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
@@ -2256,8 +2267,8 @@ def _require_base_skills(
     ``require_stories`` additionally content-probes the resolved primitive for
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
-    dispatch time."""
-    skill_trees = _skill_trees(project, pol, root, grants)
+    dispatch time. ``review_owed`` keeps the review tree gated (`_skill_trees`)."""
+    skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
         findings += install.missing_stories_support(project, skill_trees)
@@ -4158,7 +4169,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE; see the trust gate below
     if not _require_base_skills(
-        project, pol, paths.repo_root, plugin_grants, require_stories=state.source == "stories"
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=state.source == "stories",
+        review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
     ):
         return 1
     # A resumed sweep re-dispatches `/bmad-loop-sweep`; a story run never does, so
@@ -5650,7 +5666,9 @@ def _resolve_reverify_finished(
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
-    if not _require_base_skills(project, pol, paths.repo_root, plugin_grants):
+    if not _require_base_skills(
+        project, pol, paths.repo_root, plugin_grants, review_owed=task.salvage_refile_pending
+    ):
         return 1
     # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.
     if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:

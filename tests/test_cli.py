@@ -15845,6 +15845,44 @@ def test_require_base_skills_passes_review_off_without_the_review_tree(project):
     )
 
 
+@pytest.mark.parametrize("latched", [True, False], ids=["salvage-latched", "no-latch"])
+def test_resume_gates_the_review_tree_for_a_latched_salvage(project, monkeypatch, capsys, latched):
+    """A resume owing a latched review-timeout salvage keeps the review tree gated
+    even with ``[review]`` turned off during the pause (DW-380): the engine
+    re-enters the review loop for the latch, and a salvage that no longer applies
+    retries as a fresh review-role session. Review off, dev=claude/review=codex,
+    and codex's tree empty — the latched resume is refused over ``.agents/skills``;
+    the unlatched row is the control and launches.
+
+    Ablation: drop ``review_owed`` from `_prepare_resume_locked`'s
+    `_require_base_skills` call and the salvage-latched row launches."""
+    import shutil
+
+    from bmad_loop.model import Phase, StoryTask
+
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        salvage_refile_pending=latched,
+    )
+    run_dir = _paused_run_for_resume(project, monkeypatch, tasks={"1-1-a": task})
+    _write_policy(project.project, RESUME_POLICY + REVIEW_DISABLED_POLICY)
+    shutil.rmtree(project.project / ".agents" / "skills")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    capsys.readouterr()
+
+    rc = cli._resume_paused_run(project.project, run_dir)
+    err = capsys.readouterr().err
+    agents_fails = [ln for ln in err.splitlines() if ln.startswith("FAIL: .agents/skills")]
+    if latched:
+        assert rc == 1
+        assert agents_fails, err
+    else:
+        assert rc == 0, err
+        assert not agents_fails
+
+
 @pytest.mark.parametrize("grant", [True, False], ids=["granted", "never-granted"])
 def test_validate_judges_review_plugins_under_the_code_root(project, monkeypatch, capsys, grant):
     """The review-tree predicate reads plugin manifests from the run's CODE root,

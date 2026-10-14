@@ -5379,7 +5379,7 @@ def test_startup_death_cause_crumbs_an_unreadable_server_log(tmp_path):
     adapter = make_adapter(tmp_path)
     missing = tmp_path / "run" / "logs" / "gone.server.out"
 
-    assert adapter._startup_death_cause("t-1", missing, {}) == ""
+    assert adapter._startup_death_cause("t-1", missing, {}, 0) == ""
 
     crumbs = [e for e in _lifecycle(tmp_path) if e["event"] == "server-log-unread"]
     assert len(crumbs) == 1
@@ -5434,6 +5434,45 @@ def test_spawn_give_up_skips_the_db_cause_on_v2(tmp_path, monkeypatch):
         adapter._spawn_server(spec)
     assert "rc=1" in str(excinfo.value)
     assert "opencode.db" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("marker_on_final", [False, True], ids=["earlier-only", "final"])
+def test_spawn_give_up_reads_the_db_cause_from_the_final_attempt_only(
+    tmp_path, monkeypatch, marker_on_final
+):
+    """Every attempt appends to one server log, so the diagnosis must read only
+    the final attempt's output: a downgrade refusal an earlier attempt logged
+    never explains a later, different death. The `final` row is the control.
+
+    ABLATION: seek from 0 instead of the attempt offset in `_startup_death_cause`
+    and the `earlier-only` row reddens."""
+    adapter = make_adapter(tmp_path)
+    calls = 0
+
+    class _DeadProcess:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    def fake_popen(_argv, stdout, **_kw):
+        nonlocal calls
+        calls += 1
+        final = calls == opencode_http.SPAWN_ATTEMPTS
+        line = _DB_DOWNGRADE_LINE if (calls == 1 or (final and marker_on_final)) else "boom"
+        stdout.write(line.encode() + b"\n")
+        stdout.flush()
+        return _DeadProcess()
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V1Protocol(), (1, 14, 0)))
+    monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter._spawn_server(spec)
+    assert calls == opencode_http.SPAWN_ATTEMPTS
+    assert ("opencode.db" in str(excinfo.value)) is marker_on_final
 
 
 def test_spawn_open_failure_closes_the_sinks_already_open(tmp_path, fake_opencode, monkeypatch):
