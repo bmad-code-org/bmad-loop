@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -4478,6 +4479,33 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
+class _CtlLaunch:
+    """A TUI-launched resume/resolve in flight (`--ctl-launch`, see
+    `_drive_ctl_launch`): whether it has accepted its run yet, and the last line
+    it wrote to stderr — the refusal, when it exits before accepting. A
+    pass-through for every other stream attribute."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self.accepted = False
+        self.last_line = ""
+
+    def write(self, text: str) -> int:
+        if text.strip():
+            self.last_line = text.strip().splitlines()[-1]
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+# ponytail: process-wide, which is what the flag is — one command per process.
+_ctl_launch: _CtlLaunch | None = None
+
+
 def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
@@ -4494,8 +4522,11 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # import-safe: launch.py has no textual imports
 
+    ctl = _ctl_launch
+    if ctl is not None:
+        ctl.accepted = True
     try:
-        warning = launch.claim_ctl_window(project, run_dir.name)
+        warning = launch.claim_ctl_window(project, run_dir.name, launched=ctl is not None)
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
@@ -4504,6 +4535,58 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
             Journal(run_dir).append("ctl-window-claim-failed", error=warning)
         except OSError as exc:
             print(f"warning: could not journal it: {exc}", file=sys.stderr)
+
+
+def _drive_ctl_launch(args: argparse.Namespace) -> int:
+    """Run a TUI-launched resume/resolve, and journal it when it exits non-zero
+    before accepting the run (#925). Such a child refuses into a detached window
+    nobody is watching, and leaves the record with an older window, so without
+    this its refusal is on no durable record. Acceptance is `_claim_ctl_window`,
+    the point every drive path passes under the run's state lock; a child that
+    accepted and then failed is the run's own story, already journaled."""
+    global _ctl_launch
+    ctl = _ctl_launch = _CtlLaunch(sys.stderr)
+    rc: int = ExitCode.FAILURE
+    try:
+        with contextlib.redirect_stderr(ctl):
+            rc = args.func(args)
+    except BaseException as e:
+        ctl.last_line = str(e) or type(e).__name__
+        raise
+    finally:
+        _ctl_launch = None
+        if rc != ExitCode.OK and not ctl.accepted:
+            _journal_unaccepted_launch(args, ctl.last_line or f"exit {rc}")
+    return rc
+
+
+def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
+    """Journal why a TUI-launched child did not drive its run, under the run's
+    state lock and only into a run that still exists (cleanup removes one under
+    the same hold). Best-effort, and loudly so: the child is already exiting.
+
+    Re-resolved through `resolve_run_dir`, which never recomposes a ref that
+    could escape the runs dir (a command can refuse its ref before normalizing
+    `args.run_id`), and kept only on an exact-name hit: the command normalized
+    `args.run_id` to the run it resolved, and a removed run's id would otherwise
+    fall back to a suffix match and journal into another run."""
+    try:
+        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
+    except runs.RunRefError:
+        return  # no run to record against
+    if run_dir.name != args.run_id:
+        return  # a partial match, not the run this command resolved
+    try:
+        with state_lock(run_dir):
+            if runs.is_run(run_dir):
+                Journal(run_dir).append(
+                    "ctl-window-claim-failed",
+                    error=f"a TUI-launched {args.command} exited before driving the run: "
+                    f"{reason} — attach and stop from the TUI may target an older window "
+                    "for this run",
+                )
+    except Exception as e:
+        print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
@@ -7758,6 +7841,9 @@ def main(argv: list[str] | None = None) -> int:
     # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
     parser.add_argument("--state-root", help=argparse.SUPPRESS)
     parser.add_argument("--registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: this process runs in a window the launcher
+    # minted (`_drive_ctl_launch`, `tui.launch.claim_ctl_window`, #925).
+    parser.add_argument("--ctl-launch", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -8278,6 +8364,8 @@ def main(argv: list[str] | None = None) -> int:
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
         # without ever loading policy, so this is the one reliable seam.
         _configure_mux(_project(args))
+        if args.ctl_launch and args.func in (cmd_resume, cmd_resolve):
+            return _drive_ctl_launch(args)
         return args.func(args)
     except (
         bmadconfig.BmadConfigError,

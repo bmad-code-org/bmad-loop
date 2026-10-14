@@ -111,10 +111,18 @@ def fake_run(monkeypatch) -> FakeRun:
 
 
 def expected_cli(*tail: str) -> str:
-    """The parked command line: the launcher's state root rides ahead of the
-    subcommand (#731)."""
+    """The parked command line: the launch marker (#925) and the launcher's
+    state root (#731) ride ahead of the subcommand. Ablate the marker in
+    start_detached and every launch argv assertion through this fails."""
     return shlex.join(
-        [sys.executable, "-m", "bmad_loop.cli", f"--state-root={runs.state_root()}", *tail]
+        [
+            sys.executable,
+            "-m",
+            "bmad_loop.cli",
+            "--ctl-launch",
+            f"--state-root={runs.state_root()}",
+            *tail,
+        ]
     )
 
 
@@ -1124,6 +1132,44 @@ def test_claim_outside_a_control_session_leaves_the_record(tmp_path: Path, monke
     monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
     assert launch.claim_ctl_window(tmp_path, "RID") is None
     assert record.read_text(encoding="utf-8") == "@2"
+
+
+def test_a_launched_claim_whose_session_probe_went_unanswered_drops_the_record(
+    tmp_path: Path, monkeypatch
+):
+    # #925: current_session() answers None when the display-message probe fails
+    # inside the multiplexer too, so a launched child reads as an operator's
+    # shell. Its launch marker says otherwise: the previous launch's record
+    # names a window this run no longer drives from, so it goes, and the
+    # operator hears. Ablation: drop the `launched` arm and the claim answers
+    # None with the record kept.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
+    assert "could not be recorded" in (
+        launch.claim_ctl_window(tmp_path, "RID", launched=True) or ""
+    )
+    assert not record.exists()
+
+
+def test_a_launched_claim_whose_probe_raised_drops_the_record(tmp_path: Path, monkeypatch):
+    # A probe that raises (an unregistered backend `_configure_mux` tolerated)
+    # went unanswered as surely as one answering None; unlaunched, the raise
+    # still propagates. Ablation: drop the `except` and the launched claim raises.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+
+    def raises():
+        raise MultiplexerError("no such backend")
+
+    monkeypatch.setattr(launch, "in_ctl_session", raises)
+    with pytest.raises(MultiplexerError):
+        launch.claim_ctl_window(tmp_path, "RID")
+    assert record.exists()
+    assert "could not be recorded" in (
+        launch.claim_ctl_window(tmp_path, "RID", launched=True) or ""
+    )
+    assert not record.exists()
 
 
 def test_claim_without_a_window_id_drops_the_record_and_says_so(
@@ -2876,6 +2922,7 @@ def test_start_detached_forwards_the_displaced_registry(monkeypatch, tmp_path):
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(derived))
 
     assert argv == launch.cli_argv(
+        "--ctl-launch",
         f"--state-root={runs.state_root()}",
         f"--registry-root={derived}",
         f"--displaced-registry-root={theirs}",
@@ -2903,7 +2950,12 @@ def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path,
 
     registry = [] if case == "namespace-less" else [f"--registry-root={in_force}"]
     assert argv == launch.cli_argv(
-        f"--state-root={runs.state_root()}", *registry, "resume", "--project", str(tmp_path)
+        "--ctl-launch",
+        f"--state-root={runs.state_root()}",
+        *registry,
+        "resume",
+        "--project",
+        str(tmp_path),
     )
 
 
@@ -2930,7 +2982,7 @@ def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path
 
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", below)
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
-    assert argv[5] == f"--displaced-registry-root={below}"
+    assert argv[6] == f"--displaced-registry-root={below}"
 
 
 def test_start_detached_hands_the_window_an_honoured_registry_root(monkeypatch, tmp_path):
@@ -2943,7 +2995,7 @@ def test_start_detached_hands_the_window_an_honoured_registry_root(monkeypatch, 
 
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(pinned))
 
-    assert argv[3:6] == [f"--state-root={runs.state_root()}", f"--registry-root={pinned}", "resume"]
+    assert argv[4:7] == [f"--state-root={runs.state_root()}", f"--registry-root={pinned}", "resume"]
 
 
 def test_start_detached_on_an_out_of_tree_backend_uses_the_released_verbs(monkeypatch, tmp_path):
@@ -2982,7 +3034,7 @@ def test_start_detached_on_an_out_of_tree_backend_uses_the_released_verbs(monkey
         launch.RETURN_OPTION,
     )
     assert argv == launch.cli_argv(
-        f"--state-root={runs.state_root()}", "run", "--project", str(tmp_path)
+        "--ctl-launch", f"--state-root={runs.state_root()}", "run", "--project", str(tmp_path)
     )
     assert stub.tagged == [("@9", runs.PROJECT_OPTION, runs.project_tag(tmp_path))]
 
