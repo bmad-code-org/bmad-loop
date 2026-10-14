@@ -6767,7 +6767,8 @@ def _superseded_ctl_kill_commands(
     (``runs.superseded_ctl_may_be_run``, #915): it gets no command at all, so
     it is left out of the dict (and of ``--json`` ``legacy_kill_commands``)
     while ``legacy_leftovers`` still names it. A check that could not be
-    made goes to ``on_fault``, labelled with the registry."""
+    made goes to ``on_fault``, labelled with the registry (``cleanup`` keeps
+    it apart from ``legacy_unverified``: the registry itself was listed)."""
     if not leftovers:
         return {}, []
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
@@ -6803,7 +6804,11 @@ def _superseded_ctl_kill_commands(
 _MAY_BE_RUN = "a run with that id may own it"
 
 
-def _warn_superseded_ctl(kill_commands: dict[str, str | None], ambiguous: list[str]) -> None:
+def _warn_superseded_ctl(
+    kill_commands: dict[str, str | None], ambiguous: list[str], faults: list[str]
+) -> None:
+    for fault in faults:
+        print(f"note: {fault}", file=sys.stderr)
     for name in ambiguous:
         print(
             f"pre-upgrade control session {name} is still running in this project's "
@@ -6905,8 +6910,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    # Not `unverified`: the registry was listed, only a command was withheld.
+    ctl_command_faults: list[str] = []
     kill_commands, ambiguous_ctl = _superseded_ctl_kill_commands(
-        project, leftovers, unverified.append
+        project, leftovers, ctl_command_faults.append
     )
     # The listing behind prune_sessions reads an unavailable backend as no
     # sessions; this names the cases where that is not a clean answer (#864).
@@ -6985,6 +6992,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 legacy_unverified=unverified,
                 legacy_kill_commands=kill_commands,
                 sessions_scan_error=sessions_scan_error,
+                legacy_command_unverified=ctl_command_faults,
             )
         )
         return 0
@@ -6999,7 +7007,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         _warn_legacy_leftovers(project, leftovers, unverified)
-        _warn_superseded_ctl(kill_commands, ambiguous_ctl)
+        _warn_superseded_ctl(kill_commands, ambiguous_ctl, ctl_command_faults)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -7018,7 +7026,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
     _warn_legacy_leftovers(project, leftovers, unverified)
-    _warn_superseded_ctl(kill_commands, ambiguous_ctl)
+    _warn_superseded_ctl(kill_commands, ambiguous_ctl, ctl_command_faults)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part

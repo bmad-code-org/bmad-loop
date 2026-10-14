@@ -7323,6 +7323,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "legacy_command_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": ["sweep-fin-1"],
@@ -7382,6 +7383,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "legacy_command_unverified": [],
     }
     assert doc["ctl_windows"] == {
         "removed": [],
@@ -19914,9 +19916,11 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
 def test_cleanup_reports_a_runs_dir_it_could_not_check_for_that_id(project, capsys, monkeypatch):
     """#915: when the runs dir cannot be read to rule out a run owning the
     pre-upgrade control-session name, the command is withheld and the failed
-    check is said, in `legacy_unverified` under this registry's label, never
-    folded into a bare omission. Ablate the `on_fault` handed to
-    `superseded_ctl_may_be_run` in `_superseded_ctl_kill_commands` and this fails."""
+    check is said, in `legacy_command_unverified` under this registry's label
+    (and on stderr in text mode), never folded into a bare omission, and never
+    into `legacy_unverified`, which means the registry itself was not listed.
+    Ablate the `on_fault` handed to `superseded_ctl_may_be_run` in
+    `_superseded_ctl_kill_commands` and this fails."""
     from bmad_loop.tui import launch
 
     def _unreadable(_project, _name, _mux, *, on_fault=None):
@@ -19936,7 +19940,13 @@ def test_cleanup_reports_a_runs_dir_it_could_not_check_for_that_id(project, caps
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["sessions"]["legacy_kill_commands"] == {}
-    assert doc["sessions"]["legacy_unverified"] == [f"{_OWN_REG}: runs dir unreadable"]
+    assert doc["sessions"]["legacy_command_unverified"] == [f"{_OWN_REG}: runs dir unreadable"]
+    assert doc["sessions"]["legacy_unverified"] == []
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f"note: {_OWN_REG}: runs dir unreadable" in err
+    assert "not checked" not in err
 
 
 def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys, monkeypatch):
@@ -20615,6 +20625,7 @@ def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "legacy_command_unverified": [],
     }
     assert doc["ctl_windows"]["scan_error"] is None
 
