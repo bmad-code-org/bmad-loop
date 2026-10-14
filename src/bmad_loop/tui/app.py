@@ -2099,9 +2099,22 @@ class BmadLoopApp(App[None]):
         # registry (psmux's default, and any root this process displaced), and
         # the operator's next action is to open the one holding these.
         ctl_faults: list[str] = []
-        leftovers, unverified = runs.legacy_registry_leftovers(
+        leftovers, unverified, superseded = runs.legacy_registry_leftovers(
             self.project, on_primary_fault=ctl_faults.append
         )
+        # Named on its own (#917), never in a "left in <registry> (not migrated)"
+        # toast: it stands in this project's own registry, no legacy one. No
+        # ownership claim either way: a run with that id may own the name
+        # (#915), and the docs say how to tell.
+        for name in superseded:
+            self.call_from_thread(
+                self.notify,
+                f"pre-upgrade control session {name} is still running in this "
+                "project's registry, unless a run with that id owns it — see "
+                "docs/multiplexer-backends.md before removing it",
+                severity="warning",
+                markup=False,
+            )
         # This project's own registry is no legacy one (#915): its scan for a
         # pre-upgrade control session gets its own wording.
         for line in ctl_faults:

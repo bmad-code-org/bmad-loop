@@ -3818,6 +3818,7 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
                 r"D:	heir-own-registry": ["bmad-loop-old-1"],
             },
             [],
+            [],
         ),
     )
     make_run(project.project, "20260611-100000-aaaa")
@@ -3865,7 +3866,7 @@ async def test_cleanup_toast_names_another_projects_derived_registry(project, mo
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(
-        runs, "legacy_registry_leftovers", lambda _p, **_kw: ({theirs: ["bmad-loop-ctl"]}, [])
+        runs, "legacy_registry_leftovers", lambda _p, **_kw: ({theirs: ["bmad-loop-ctl"]}, [], [])
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -3886,6 +3887,36 @@ async def test_cleanup_toast_names_another_projects_derived_registry(project, mo
         assert not any("not migrated" in m for m in notifications(app))
 
 
+async def test_cleanup_toast_names_a_pre_upgrade_control_session_on_its_own(project, monkeypatch):
+    """#917, the cli arm's twin: the session stands in this project's own
+    registry, no legacy one, so it gets its own toast and never a "left in ...
+    (not migrated)" one. Ablate the toast and this fails."""
+    from bmad_loop import runs
+
+    old = runs.CTL_SESSION + "-0123456789abcdef"
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, **_kw: ({}, [], [old]))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(f"pre-upgrade control session {old}" in m for m in notifications(app)),
+        )
+        # #915: the name may be a run's own session, so no claim that nothing
+        # addresses it.
+        (toast,) = [m for m in notifications(app) if old in m]
+        assert "unless a run with that id owns it" in toast
+        assert "no bmad-loop command addresses it" not in toast
+        assert not any("left in" in m for m in notifications(app))
+
+
 async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(project, monkeypatch):
     """DW-469, the cli arm's twin: a registry whose listing raised used to toast
     exactly what an empty one toasts — nothing. Ablate the `unverified` toast and
@@ -3898,7 +3929,7 @@ async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(pro
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, **_kw: ({}, ["/reg/broken: could not be listed: no server"]),
+        lambda _p, **_kw: ({}, ["/reg/broken: could not be listed: no server"], []),
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)

@@ -400,6 +400,7 @@ def cleanup_document(
     legacy_kill_commands: dict[str, str | None] | None = None,
     sessions_scan_error: str | None = None,
     superseded_ctl_unverified: list[str] | None = None,
+    superseded_ctl_sessions: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -460,15 +461,20 @@ def cleanup_document(
     `legacy_unverified` means "not looked at", not "nothing left". Additive, no
     schema bump; the text mode prints each line on stderr.
 
-    `sessions.legacy_kill_commands` maps each pre-upgrade control session in
-    this project's own registry (#733) — also named in `legacy_leftovers` — to
-    the paste-ready command that ends it, or to ``null`` when the backend is
+    `sessions.superseded_ctl_sessions` names each pre-upgrade control session
+    an earlier release minted for this project in its own registry (#733),
+    as listed. That registry is no legacy one, so these are never in
+    `legacy_leftovers` (#917). Additive, no schema bump; the text mode names
+    each on stderr.
+
+    `sessions.legacy_kill_commands` maps each session in
+    `superseded_ctl_sessions` to the paste-ready command that ends it, or to ``null`` when the backend is
     not psmux and no command can be spelled for it. No bmad-loop command
     addresses such a session, so this is the only way out; run it once every
     window in it has parked. A session a run may own (a run dir exists for the
     id its name spells, or the session carries a session-level project tag,
-    #915) gets no command and is left out, though `legacy_leftovers` still
-    names it; a check that could not be made withholds it too. Additive, no
+    #915) gets no command and is left out, though `superseded_ctl_sessions`
+    still names it; a check that could not be made withholds it too. Additive, no
     schema bump; the text mode prints each on stderr.
 
     `sessions.superseded_ctl_unverified` is one line per check on this
@@ -500,6 +506,7 @@ def cleanup_document(
         "legacy_leftovers": list(legacy_leftovers or []),
         "legacy_unverified": list(legacy_unverified or []),
         "legacy_kill_commands": dict(legacy_kill_commands or {}),
+        "superseded_ctl_sessions": list(superseded_ctl_sessions or []),
         "superseded_ctl_unverified": list(superseded_ctl_unverified or []),
     }
     if sessions_scan_error is not None:

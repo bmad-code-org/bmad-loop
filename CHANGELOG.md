@@ -82,6 +82,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Report a pre-upgrade control session in this project's own registry at
+  `cleanup --json` `sessions.superseded_ctl_sessions` and in its own TUI toast, not in
+  `sessions.legacy_leftovers` or the `not migrated` line, which again name only what a
+  legacy registry still holds (#917).
 - Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
   captured, not only after the command exits, so a chatty command's memory no longer
   grows with its runtime (DW-549).

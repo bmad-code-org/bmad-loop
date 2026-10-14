@@ -7327,6 +7327,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -7387,6 +7388,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -19894,6 +19896,7 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
         lambda _p, announced=(), **_kw: (
             {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]},
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -19914,7 +19917,11 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
+        lambda _p, announced=(), **_kw: (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+            [],
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: ([], []))
 
@@ -19943,7 +19950,7 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
 
     def _leftovers(_p, announced=(), **_kw):
         seen.append(sorted(announced))
-        return {}, []
+        return {}, [], []
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p, **_kw: ([], []))
@@ -19966,7 +19973,11 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
+        lambda _p, announced=(), **_kw: (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+            [],
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
@@ -20005,6 +20016,7 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
                 theirs: ["bmad-loop-old-1"],
             },
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20040,6 +20052,7 @@ def test_cleanup_says_a_derived_registry_of_another_project_path_is_not_a_remain
         "legacy_registry_leftovers",
         lambda _p, announced=(), **_kw: (
             {theirs: ["bmad-loop-bare-1", "bmad-loop-ctl"], plain: ["bmad-loop-old-1"]},
+            [],
             [],
         ),
     )
@@ -20081,6 +20094,7 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
                 r"D:\theirs": ["bmad-loop-old-1"],
             },
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20096,7 +20110,9 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(), **_kw: ({}, []))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(), **_kw: ({}, [], [])
+    )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
@@ -20116,7 +20132,7 @@ def test_cleanup_names_a_pre_upgrade_control_session_without_a_command_off_psmux
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
@@ -20151,13 +20167,11 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
         runs,
         "legacy_registry_leftovers",
         lambda _p, announced=(), **_kw: (
-            {
-                # A run's agent session for run id `ctl-<16 hex>` shares the
-                # digest shape; it is not the old control session.
-                _OWN_REG: [runs.CTL_SESSION, _DIGEST_CTL, runs.CTL_SESSION + "-fedcba9876543210"],
-                "/reg/default": ["bmad-loop-old-1"],
-            },
+            {"/reg/default": ["bmad-loop-old-1"]},
             [],
+            # A run's agent session for run id `ctl-<16 hex>` shares the
+            # digest shape; it is not the old control session.
+            [runs.CTL_SESSION, _DIGEST_CTL, runs.CTL_SESSION + "-fedcba9876543210"],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20174,8 +20188,92 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     captured = capsys.readouterr()
     doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: command}
-    assert _DIGEST_CTL in doc["sessions"]["legacy_leftovers"]
+    assert _DIGEST_CTL in doc["sessions"]["superseded_ctl_sessions"]
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
+    # #917: a listed name that does not match gets no command but is not
+    # dropped either: the mismatch is said. Ablate that report and this fails.
+    other = runs.CTL_SESSION + "-fedcba9876543210"
+    assert (
+        f"{_OWN_REG}: {other} no longer matches the pre-upgrade control-session name"
+        in doc["sessions"]["superseded_ctl_unverified"]
+    )
     assert captured.err == ""
+
+
+def test_cleanup_keeps_a_pre_upgrade_control_session_out_of_the_legacy_leftovers(
+    project, capsys, monkeypatch
+):
+    """#917: the session stands in this project's own registry, which is no
+    legacy one, so it is reported at `sessions.superseded_ctl_sessions` and
+    never in `legacy_leftovers` or a `not migrated` line; text mode names it
+    exactly once, with its command. Drives the real reader. Merge it back into
+    the legacy grouping in `runs.legacy_registry_leftovers`, or drop the
+    document field, and this fails."""
+    from bmad_loop.tui import launch
+
+    class _Holding(_OwnRegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            return [_DIGEST_CTL]
+
+    own = _Holding()
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: own)
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: own)
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+    monkeypatch.setattr(runs, "superseded_ctl_may_be_run", lambda *_a, **_kw: False)
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    sessions = json.loads(capsys.readouterr().out)["sessions"]
+    assert sessions["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert sessions["legacy_leftovers"] == []
+    assert list(sessions["legacy_kill_commands"]) == [_DIGEST_CTL]
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    (line,) = [ln for ln in err.splitlines() if _DIGEST_CTL in ln]
+    assert line.startswith(f"pre-upgrade control session {_DIGEST_CTL}")
+    assert "kill-session" in line
+    assert "not migrated" not in err
+
+
+def test_cleanup_still_names_a_pre_upgrade_control_session_whose_name_cannot_be_rederived(
+    project, capsys, monkeypatch
+):
+    """#917: the listing matched the session, but deriving its name again for
+    the command lookup faults. The session is no longer in the legacy grouping
+    to fall back on, so it must still be named once, with no command, and the
+    fault said. Ablate the `ambiguous` fallback in the `except` of
+    `_superseded_ctl_kill_commands` and this fails."""
+    from bmad_loop.tui import launch
+
+    def _boom(_p, _r=None):
+        raise OSError("unresolvable")
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", _boom)
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    (line,) = [ln for ln in err.splitlines() if _DIGEST_CTL in ln]
+    assert "no command is printed" in line
+    assert "could not derive the pre-upgrade control-session name: unresolvable" in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    sessions = json.loads(capsys.readouterr().out)["sessions"]
+    assert sessions["legacy_kill_commands"] == {}
+    assert sessions["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert sessions["superseded_ctl_unverified"] == [
+        "could not derive the pre-upgrade control-session name: unresolvable"
+    ]
 
 
 def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
@@ -20194,7 +20292,7 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
@@ -20210,7 +20308,8 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
     captured = capsys.readouterr()
     doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_kill_commands"] == {}
-    assert doc["sessions"]["legacy_leftovers"] == [_DIGEST_CTL]
+    assert doc["sessions"]["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert doc["sessions"]["legacy_leftovers"] == []
     assert captured.err == ""
 
 
@@ -20233,7 +20332,7 @@ def test_cleanup_reports_a_runs_dir_it_could_not_check_for_that_id(project, caps
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
@@ -20263,7 +20362,7 @@ def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({}, ["/reg/broken: could not be listed: no server"]),
+        lambda _p, announced=(), **_kw: ({}, ["/reg/broken: could not be listed: no server"], []),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
@@ -20928,6 +21027,7 @@ def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"]["scan_error"] is None

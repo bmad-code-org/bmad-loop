@@ -6818,14 +6818,15 @@ def _psmux_command(registry: str | None, verb: str) -> str:
 
 
 def _superseded_ctl_kill_commands(
-    project: Path, leftovers: dict[str, list[str]], on_fault: Callable[[str], None]
+    project: Path, superseded: list[str], on_fault: Callable[[str], None]
 ) -> tuple[dict[str, str | None], list[str]]:
     """``({name: command that ends it}, ambiguous)`` for each control session
     in the registry in force under the name an earlier release minted for this
     project there (#733, ``runs.superseded_ctl_name``), picked out of
-    ``leftovers`` rather than listed a second time.
+    ``superseded`` (``runs.legacy_registry_leftovers``' own-registry answer)
+    rather than listed a second time.
 
-    A command here and none for the other leftovers, because this session is
+    A command here and none for the legacy leftovers, because this session is
     ours beyond doubt — its name is a digest of this project's derived root —
     and nothing else will ever end it: no bmad-loop command addresses it. The
     caveat travels with the command: ending it kills whatever its windows
@@ -6836,10 +6837,13 @@ def _superseded_ctl_kill_commands(
     ``ambiguous`` holds each such name a run may own
     (``runs.superseded_ctl_may_be_run``, #915): it gets no command at all, so
     it is left out of the dict (and of ``--json`` ``legacy_kill_commands``)
-    while ``legacy_leftovers`` still names it. A check that could not be
-    made goes to ``on_fault``, labelled with the registry (``cleanup`` keeps
-    it apart from ``legacy_unverified``: the registry itself was listed)."""
-    if not leftovers:
+    while ``superseded_ctl_sessions`` still names it. A check that could not
+    be made goes to ``on_fault``, labelled with the registry (``cleanup`` keeps
+    it apart from ``legacy_unverified``: the registry itself was listed); a
+    name that can no longer be derived withholds every command, and each
+    session lands in ``ambiguous``, as does a listed name that no longer
+    matches it (each said through ``on_fault``)."""
+    if not superseded:
         return {}, []
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
 
@@ -6847,20 +6851,25 @@ def _superseded_ctl_kill_commands(
         mux = get_multiplexer()
         root = mux.registry_root()
         old = mux.session_name_key(runs.superseded_ctl_name(project, root))
-    except (MultiplexerError, runs.StateRootError, OSError, RuntimeError):
-        # Already reported: the same derivation in `legacy_registry_leftovers`
-        # put this fault in `legacy_unverified`, and named no session for it.
-        return {}, []
+    except (MultiplexerError, runs.StateRootError, OSError, RuntimeError) as exc:
+        # The listing derived it moments ago, so this is a fault, not "no such
+        # session": withhold every command, and keep each name in `ambiguous`
+        # so the text mode still names it.
+        on_fault(f"could not derive the pre-upgrade control-session name: {exc}")
+        return {}, list(superseded)
     # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
     # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
     psmux = _is_psmux(mux)
     commands: dict[str, str | None] = {}
     ambiguous: list[str] = []
     label = root or runs.DEFAULT_REGISTRY_LABEL
-    for name in leftovers.get(label, []):
+    for name in superseded:
         if mux.session_name_key(name) != old:
-            continue
-        if runs.superseded_ctl_may_be_run(
+            # Listed under a name that no longer derives (the root moved in
+            # between): no command, but still named.
+            on_fault(f"{label}: {name} no longer matches the pre-upgrade control-session name")
+            ambiguous.append(name)
+        elif runs.superseded_ctl_may_be_run(
             project, name, mux, on_fault=lambda msg: on_fault(f"{label}: {msg}")
         ):
             ambiguous.append(name)
@@ -6981,13 +6990,13 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     # are checks on this project's own registry for a pre-upgrade control
     # session (#915), its scan or a check that withheld its command.
     ctl_command_faults: list[str] = []
-    leftovers, unverified = runs.legacy_registry_leftovers(
+    leftovers, unverified, superseded_ctl = runs.legacy_registry_leftovers(
         project,
         announced=killed if args.dry_run else (),
         on_primary_fault=ctl_command_faults.append,
     )
     kill_commands, ambiguous_ctl = _superseded_ctl_kill_commands(
-        project, leftovers, ctl_command_faults.append
+        project, superseded_ctl, ctl_command_faults.append
     )
     # The listing behind prune_sessions reads an unavailable backend as no
     # sessions; this names the cases where that is not a clean answer (#864).
@@ -7066,6 +7075,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 legacy_unverified=unverified,
                 legacy_kill_commands=kill_commands,
                 sessions_scan_error=sessions_scan_error,
+                superseded_ctl_sessions=superseded_ctl,
                 superseded_ctl_unverified=ctl_command_faults,
             )
         )

@@ -2376,11 +2376,18 @@ def legacy_registry_leftovers(
     *,
     announced: Iterable[str] = (),
     on_primary_fault: Callable[[str], None] | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    """``(grouped, faults)``: session names a legacy registry **still holds** after
-    :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
-    frontends to print — and one operator-facing line per registry that could not
-    be asked. ``({}, [])`` when there is no legacy registry or they hold nothing.
+) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """``(grouped, faults, superseded)``: session names a legacy registry **still
+    holds** after :func:`prune_sessions` ran — the migration's honest remainder, for
+    the cleanup frontends to print — one operator-facing line per registry that
+    could not be asked, and the pre-upgrade control session standing in the
+    project's **own** registry (:func:`superseded_ctl_sessions`, #733). ``({}, [],
+    [])`` when there is no legacy registry, they hold nothing and the own registry
+    holds no such session.
+
+    ``superseded`` is kept out of ``grouped`` (#917): the own registry is no
+    legacy one, and ``grouped`` is what ``cleanup --json`` reports as
+    ``legacy_leftovers``.
 
     **An unanswerable registry is a fault, not an empty one** (DW-469). A backend
     that cannot be selected (so no legacy registry could even be named) or a
@@ -2493,7 +2500,11 @@ def legacy_registry_leftovers(
     try:
         primary = get_multiplexer()
     except MultiplexerError as exc:
-        return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+        return (
+            grouped,
+            [f"no legacy registry could be checked: backend selection failed: {exc}"],
+            [],
+        )
     # Its own try (#915): a legacy discovery that raises must not skip the
     # primary-registry scan below, which needs only the backend selected above.
     try:
@@ -2549,9 +2560,7 @@ def legacy_registry_leftovers(
     except MultiplexerError as exc:
         primary_fault(f"{label}: could not be listed: {exc}")
         stale = []
-    if stale:
-        grouped[label] = sorted(set(grouped.get(label, []) + stale))
-    return grouped, faults
+    return grouped, faults, stale
 
 
 def superseded_ctl_name(project: Path, registry: str | None = None) -> str:
@@ -7204,7 +7213,7 @@ def standalone_replay_refusal(
             f"`bmad-loop resolve {run_id} --reverify --story {story_key}`"
         )
     if state.run_type == "sweep":
-        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; " f"{by_hand}"
+        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; {by_hand}"
     if state.source == "stories":
         return (
             f"a finished stories-mode run's story ({story_key}) cannot be replayed "

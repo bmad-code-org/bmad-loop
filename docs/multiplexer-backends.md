@@ -141,7 +141,8 @@ the exit banner (see `capture-pane` below). Then, unless the name may be a run's
 
 `cleanup` names the one an earlier release started for this project in its registry
 (matched by that exact name, since a run id `ctl-<16 hex>` gives an agent session the same
-shape) on stderr and in `sessions.legacy_leftovers`, with that command ready to paste
+shape) on stderr, in a TUI cleanup toast and in `sessions.superseded_ctl_sessions`, never
+with the `not migrated` leftovers; the command is ready to paste
 (`sessions.legacy_kill_commands` in `--json`). `attach` names it when it finds no run or nothing to
 attach, with `switch-client` instead of `attach` when run inside a psmux pane. A name that
 may be a run's own session (a run of this project has that id, or the session carries a run's
