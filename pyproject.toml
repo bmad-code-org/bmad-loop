@@ -139,6 +139,7 @@ strict = [
   "src/bmad_loop/sanitize.py",
   "src/bmad_loop/plugins/digest.py",
   "src/bmad_loop/plugins/grants.py",
+  "src/bmad_loop/worksource.py",
 ]
 # Check against the floor of requires-python so we never lean on 3.12+ typing.
 pythonVersion = "3.11"

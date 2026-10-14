@@ -1796,6 +1796,69 @@ def test_done_checkpoint_skipped_when_graceful_stop_pending(project):
     assert stops and stops[-1]["graceful"] is True
 
 
+def _write_story_status(paths, story_id: str, status: str) -> None:
+    """An on-disk story spec carrying just the frontmatter `status:` the
+    scheduler's classifier reads."""
+    story_spec(paths, story_id).write_text(f"---\nstatus: {status}\n---\n", encoding="utf-8")
+
+
+def test_remaining_estimate_skips_retired_and_stops_at_first_wedge(project):
+    """Characterization pin for the WorkSource refactor: the stories
+    `_remaining_estimate` walks the manifest in list order, skips entries retired
+    this run (DONE / DEFERRED in `state.tasks`) or done on disk, counts pending and
+    resumable ones, and stops at the first wedged (blocked) entry — later entries
+    are unreachable until `resolve`, so they never count. A task in any other phase
+    (here DEV_RUNNING) is not retired and still counts."""
+    setup_stories(project, [entry(str(i)) for i in range(1, 8)])
+    _write_story_status(project, "2", "done")  # done on disk: skipped
+    _write_story_status(project, "4", "in-progress")  # resumable: counts
+    _write_story_status(project, "6", "blocked")  # the wedge: scan stops here
+    engine, _ = make_engine(project, [])
+    engine.state.tasks["1"] = StoryTask(story_key="1", epic=0, phase=Phase.DEFERRED)
+    engine.state.tasks["3"] = StoryTask(story_key="3", epic=0, phase=Phase.DONE)
+    engine.state.tasks["5"] = StoryTask(story_key="5", epic=0, phase=Phase.DEV_RUNNING)
+
+    assert engine._remaining_estimate() == 2  # 4 and 5; 7 sits behind the wedge
+
+    _write_story_status(project, "6", "ready-for-dev")  # wedge cleared
+    assert engine._remaining_estimate() == 4  # 4, 5, 6, 7
+
+
+def test_remaining_estimate_honors_story_id_filter(project):
+    """Characterization pin for the WorkSource refactor: under `--story <id>` the
+    estimate considers only that manifest entry — 1 while it is still actionable,
+    0 once it is done on disk — and an earlier wedged entry does not stop it."""
+    setup_stories(project, [entry("1"), entry("2"), entry("3")])
+    _write_story_status(project, "1", "blocked")
+    engine, _ = make_engine(project, [], story_filter="2")
+
+    assert engine._remaining_estimate() == 1
+
+    _write_story_status(project, "2", "done")
+    assert engine._remaining_estimate() == 0
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate-id"])
+def test_remaining_estimate_none_on_broken_manifest(project, fault):
+    """Characterization pin for the WorkSource refactor: a manifest the engine
+    cannot load makes `_remaining_estimate` return None (a hint, never a raise) —
+    not 0, which would read as "nothing left"."""
+    folder = setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    manifest = folder / "stories.yaml"
+    if fault == "missing":
+        manifest.unlink()
+    elif fault == "malformed":
+        manifest.write_text("- id: [unclosed\n", encoding="utf-8")
+    else:
+        manifest.write_text(
+            yaml.safe_dump([entry("1"), entry("1", title="dup")], sort_keys=False),
+            encoding="utf-8",
+        )
+
+    assert engine._remaining_estimate() is None
+
+
 def test_both_checkpoints_pause_twice(project):
     """A story with BOTH flags pauses at the plan checkpoint, then (after the
     resumed implement leg commits) again at the story checkpoint — two pauses for

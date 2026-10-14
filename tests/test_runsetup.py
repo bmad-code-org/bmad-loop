@@ -1194,7 +1194,7 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=_accepting_adapters,
@@ -1258,7 +1258,7 @@ def test_composition_records_the_run_dir_mint_identity(tmp_path, monkeypatch, ru
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=_accepting_adapters,
@@ -1309,7 +1309,7 @@ def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, compos
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=make_adapters,
@@ -1337,6 +1337,143 @@ def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, compos
 
     assert composed.engine.kwargs["retro_adapter"] is built["retro"]
     assert composed.engine.kwargs["adapter"] is built["dev"]
+
+
+class _SprintCapturingEngine(_CapturingEngine):
+    """`engine_cls` stand-in distinguishable from the stories one by type."""
+
+
+class _StoriesCapturingEngine(_CapturingEngine):
+    """`stories_engine_cls` stand-in distinguishable from the sprint one by type."""
+
+
+# The kwargs both story composers hand either engine class; the stories class
+# additionally receives `spec_folder`.
+_STORY_ENGINE_KWARGS = {
+    "paths",
+    "policy",
+    "adapter",
+    "review_adapter",
+    "retro_adapter",
+    "run_dir",
+    "journal",
+    "state",
+    "max_stories",
+    "epic_filter",
+    "story_filter",
+    "sweep_factory",
+    "plugin_grants",
+}
+
+
+def _compose_run_for_source(project, *, source, spec_folder):
+    """The one `compose_run` call the per-source pin makes — kept in a single
+    helper so a signature change to `compose_run` is a one-line edit."""
+    return runsetup.compose_run(
+        project=project,
+        paths=_fake_paths(project),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_SprintCapturingEngine,
+        stories_engine_cls=_StoriesCapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+
+def _build_run_state_for_source(project, *, source, spec_folder):
+    """The one `build_run_state` call the per-source pin makes (see above)."""
+    return runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=project,
+        repo_root=project,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "engine_type", "extra_kwargs", "persisted_folder"),
+    [
+        ("sprint-status", _SprintCapturingEngine, set(), ""),
+        ("stories", _StoriesCapturingEngine, {"spec_folder"}, "epic-1"),
+    ],
+    ids=["sprint", "stories"],
+)
+def test_compose_run_engine_class_per_source(
+    tmp_path, source, engine_type, extra_kwargs, persisted_folder
+):
+    """Characterization pin for the WorkSource refactor: `compose_run` builds
+    `engine_cls` for a sprint launch and `stories_engine_cls` (plus `spec_folder`)
+    for a stories launch, stamping `source` / `spec_folder` on the state — in
+    memory, on disk, and on the `run-start` journal row. `build_run_state` drops a
+    spec folder handed to a sprint launch (persists "")."""
+    composed = _compose_run_for_source(tmp_path, source=source, spec_folder="epic-1")
+
+    assert type(composed.engine) is engine_type
+    assert set(composed.engine.kwargs) == _STORY_ENGINE_KWARGS | extra_kwargs
+    if source == "stories":
+        assert composed.engine.kwargs["spec_folder"] == "epic-1"
+    assert composed.engine.kwargs["state"] is composed.state
+    assert (composed.state.source, composed.state.spec_folder) == (source, persisted_folder)
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.spec_folder) == (source, persisted_folder)
+    (start,) = [e for e in composed.journal.entries() if e["kind"] == "run-start"]
+    assert start["source"] == source
+
+    state = _build_run_state_for_source(tmp_path, source=source, spec_folder="epic-1")
+    assert (state.source, state.spec_folder) == (source, persisted_folder)
+
+
+def test_compose_resume_unknown_source_falls_back_to_sprint_engine(tmp_path, monkeypatch, capsys):
+    """Characterization pin for the WorkSource refactor: `compose_resume`
+    builds the stories engine only for `source == "stories"`, so a persisted run whose `source`
+    is any other string — here an unknown "bogus" — silently rebuilds the sprint
+    `engine_cls`: no stories class, no journal row, no output."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+    monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
+    journal = Journal(run_dir)
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        source="bogus",
+        spec_folder="epic-1",
+    )
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=journal,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_SprintCapturingEngine,
+        stories_engine_cls=_StoriesCapturingEngine,
+        sweep_engine_cls=_NeverBuilt,
+    )
+
+    assert type(composed.engine) is _SprintCapturingEngine
+    assert set(composed.engine.kwargs) == _STORY_ENGINE_KWARGS  # no spec_folder
+    assert composed.engine.kwargs["state"].source == "bogus"  # left as persisted
+    assert journal.entries() == []
+    assert capsys.readouterr() == ("", "")
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
@@ -1376,7 +1513,7 @@ def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch,
                     epic_filter=None,
                     story_filter=None,
                     max_stories=None,
-                    stories_on=False,
+                    source="sprint-status",
                     spec_folder="",
                     sweep_factory=lambda _trigger, *, started: None,
                     make_adapters=_accepting_adapters,
@@ -1484,7 +1621,7 @@ def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1641,7 +1778,7 @@ def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monk
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1754,7 +1891,7 @@ def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1978,7 +2115,7 @@ def _compose(composer: str, tmp_path: Path, monkeypatch, **extra):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             engine_cls=_CapturingEngine,

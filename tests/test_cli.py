@@ -212,7 +212,7 @@ def test_dry_run_stories_warns_when_preflight_would_abort(project, capsys):
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out, err = capsys.readouterr()
     assert "NOT runnable" in err and "bmad-build-auto" in err
     assert "Story id: 1." in out
@@ -506,6 +506,64 @@ def test_dry_run_reports_targeted_not_actionable(project, capsys):
     assert "3-2 matched 3-2-foo" in err and "not actionable" in err
 
 
+def _cli_project_root(project) -> Path:
+    """The canonical project root `main` hands every handler (`cli._project`), so
+    pinned output that embeds a path or a path-derived digest compares like with
+    like on a host whose tmp dir is reached through a symlink."""
+    return cli._project(argparse.Namespace(project=str(project.project)))
+
+
+def test_dry_run_sprint_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: the WHOLE sprint-mode
+    `run --dry-run` stdout, byte for byte, driven through `main` so the pin does
+    not depend on `_dry_run`'s signature. Only actionable stories (backlog +
+    ready-for-dev) are listed, in file order; `done`, `in-progress` and epic keys
+    are not. A complete install keeps stderr empty."""
+    from conftest import install_base_skills
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "backlog",
+            "1-3-c": "done",
+            "epic-2": "backlog",
+            "2-1-d": "in-progress",
+        },
+    )
+    _write_policy(project.project)
+    events_dir = runs.events_dir_for(_cli_project_root(project), "<run-id>")
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    review = (
+        'codex "Use the $bmad-build-auto skill now, and use subagents as needed: '
+        '<done spec from dev>" --dangerously-bypass-approvals-and-sandbox --model gpt-5-codex'
+    )
+    assert rc == 0
+    assert out == (
+        "would process 2 stories (gates=per-epic):\n"
+        f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}\n"
+        "\n"
+        "  1-1-a (epic 1, status ready-for-dev)\n"
+        '    dev:    claude "/bmad-build-auto 1-1-a" --permission-mode bypassPermissions'
+        " --model opus --session-id <auto>\n"
+        f"    review: {review}\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1-1-a\n"
+        "\n"
+        "  1-2-b (epic 1, status backlog)\n"
+        '    dev:    claude "/bmad-build-auto 1-2-b" --permission-mode bypassPermissions'
+        " --model opus --session-id <auto>\n"
+        f"    review: {review}\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1-2-b\n"
+    )
+    assert err == ""
+
+
 # ------------------------------------------------------------ stories mode
 
 
@@ -565,7 +623,7 @@ def test_dry_run_stories_prints_linear_schedule(project, capsys):
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "linear schedule" in out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
@@ -580,9 +638,54 @@ def test_dry_run_stories_filters_by_story_id(project, capsys):
     _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story="2", max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "Story id: 2." in out and "Story id: 1." not in out
+
+
+def test_dry_run_stories_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: the WHOLE stories-mode
+    `run --spec ... --dry-run` stdout, byte for byte, driven through `main` so the
+    pin does not depend on `_dry_run`'s signature. A spec_checkpoint story with no
+    plan on disk previews its leg-1 dispatch (`Halt after planning.` +
+    `BMAD_LOOP_PLAN_HALT=1`). A claude-only policy over a folder+id-capable install
+    keeps stderr empty."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, folder_id=True)
+    _setup_stories_fixture(
+        project,
+        [_stories_entry("1", spec_checkpoint=True, done_checkpoint=True), _stories_entry("2")],
+    )
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    root = _cli_project_root(project)
+    events_dir = runs.events_dir_for(root, "<run-id>")
+    folder = root / STORIES_SPEC_FOLDER
+
+    rc = cli.main(
+        ["run", "--project", str(project.project), "--spec", STORIES_SPEC_FOLDER, "--dry-run"]
+    )
+
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert out == (
+        f"stories mode: 2 stories from {folder}/stories.yaml (gates=per-epic)\n"
+        f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}\n"
+        "linear schedule (list order — no depends_on, strictly serial):\n"
+        "\n"
+        "  1. 1  (pending) [spec-checkpoint, done-checkpoint]  Story 1\n"
+        '    dev:    claude "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.'
+        ' Halt after planning." --permission-mode bypassPermissions --model opus'
+        " --session-id <auto>\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1"
+        " BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1 BMAD_LOOP_PLAN_HALT=1\n"
+        "\n"
+        "  2. 2  (pending)  Story 2\n"
+        '    dev:    claude "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."'
+        " --permission-mode bypassPermissions --model opus --session-id <auto>\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=2"
+        " BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1\n"
+    )
+    assert err == ""
 
 
 def test_run_warns_when_epic_passed_with_spec(project, capsys):
@@ -612,7 +715,7 @@ def test_run_warns_when_epic_passed_with_spec(project, capsys):
 def test_dry_run_stories_bad_folder_errors(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 1
     assert "no stories.yaml found" in capsys.readouterr().err
 
 
@@ -629,7 +732,7 @@ def test_stories_non_utf8_manifest_clean_error_not_crash(project, capsys):
 
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 1
     err = capsys.readouterr().err
     assert "stories mode:" in err and "not valid UTF-8" in err
 
@@ -1774,6 +1877,76 @@ def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
     _make_stories_run(project)
     assert cli.main(["status", "--project", str(project.project)]) == 0
     assert "no stories.yaml found" in capsys.readouterr().out
+
+
+def test_status_sprint_prints_backlog_remaining(project, capsys):
+    """Characterization pin for the WorkSource refactor: a sprint run's `status`
+    ends with the `sprint backlog remaining: N` line, where N counts every
+    actionable (backlog / ready-for-dev) board story — including one this run
+    already touched (unlike `Engine._remaining_estimate`), and excluding done,
+    in-progress and epic keys. The whole stdout is pinned."""
+    from bmad_loop.model import Phase, StoryTask
+
+    install_bmad_config(project)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "backlog",
+            "1-3-c": "done",
+            "2-1-d": "in-progress",
+        },
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING)
+    _make_run_with_tokens(project, {"1-1-a": task}, weight=0.1, run_id="20260101-000000-sp01")
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out, err = capsys.readouterr()
+    assert out == (
+        "run 20260101-000000-sp01  started 2026-01-01T00:00:00\n"
+        "status: finished\n"
+        f"  {'1-1-a':40s} {'dev-running':17s} dev×0 review×0 - \n"
+        "sprint backlog remaining: 2\n"
+    )
+    assert err == ""
+
+
+def test_status_stories_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: a stories run's `status`
+    prints the stories board (done count, manifest path, one row per entry with
+    live on-disk state + checkpoint badges) in place of the sprint backlog line.
+    The whole stdout is pinned."""
+    from bmad_loop.stories import STORIES_SUBDIR
+
+    install_bmad_config(project)
+    _setup_stories_fixture(
+        project,
+        [
+            _stories_entry("1", spec_checkpoint=True),
+            _stories_entry("2"),
+            _stories_entry("3", done_checkpoint=True),
+        ],
+    )
+    (project.project / STORIES_SPEC_FOLDER / STORIES_SUBDIR / "1-slug.md").write_text(
+        "---\nstatus: done\n---\n", encoding="utf-8"
+    )
+    _make_stories_run(project)
+    folder = _cli_project_root(project) / STORIES_SPEC_FOLDER
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out, err = capsys.readouterr()
+    assert out == (
+        "run 20260101-000000-st01  started now\n"
+        "status: in progress (or interrupted)\n"
+        f"stories: 1/3 done  ({folder}/stories.yaml)\n"
+        "   1. 1            done             [spec-checkpoint]  Story 1\n"
+        "   2. 2            pending           Story 2\n"
+        "   3. 3            pending          [done-checkpoint]  Story 3\n"
+    )
+    assert err == ""
 
 
 # ------------------------------------------- status: a sweep's effective options
@@ -12502,6 +12675,82 @@ def test_validate_json_mode_and_spec_folder_reflect_the_flag(project, capsys, sp
     assert gate in {f["check"] for f in doc["findings"]}
 
 
+# The check-id families `cmd_validate`'s per-source queue block can emit: the
+# sprint branch (deferred ledger, operator registry, sprint-status, nested specs)
+# vs the stories branch (manifest, folder+id dispatch probe, deferred ledger).
+_QUEUE_BLOCK_PREFIXES = ("queue.", "operator.", "deferred.", "skills.stories-dispatch")
+
+
+def test_validate_queue_check_per_source_is_pinned(project, capsys, monkeypatch):
+    """Characterization pin for the WorkSource refactor: on one project carrying
+    BOTH a sprint board and a stories manifest, the queue block of
+    `validate --json` emits exactly these findings, in this order, per source.
+
+    The board deliberately carries an unparseable key and an `awaiting-operator`
+    story no park record claims, so the sprint-only gates (unknown-keys warning,
+    operator registry) are observable — and observably ABSENT under `--spec`,
+    where only the manifest + dispatch probe run. Both legs exit 0 (warnings only).
+    """
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "awaiting-operator",
+            "totally-weird": "huh",
+        },
+    )
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    git(project.project, "add", "-A")  # keep git.worktree-clean green: rc stays the verdict
+    git(project.project, "commit", "-q", "-m", "per-source queue fixture")
+    folder = bmadconfig.load_paths(project.project).project / STORIES_SPEC_FOLDER
+
+    def queue_block(*extra):
+        argv = ["validate", "--project", str(project.project), "--json", *extra]
+        doc = machine_json(argv, capsys)
+        rows = [
+            (f["check"], f["severity"], f["message"], f["detail"])
+            for f in doc["findings"]
+            if f["check"].startswith(_QUEUE_BLOCK_PREFIXES)
+        ]
+        return doc["mode"], doc["spec_folder"], rows
+
+    mode, spec_folder, rows = queue_block()
+    assert (mode, spec_folder) == ("sprint", "")
+    assert [(check, severity) for check, severity, _m, _d in rows] == [
+        ("operator.park-record-missing", "warning"),
+        ("queue.sprint-status", "ok"),
+        ("queue.sprint-status-unknown-keys", "warning"),
+    ]
+    assert rows[0][3] == {"story_keys": ["1-2-b"]}
+    assert rows[1][2:] == (
+        "sprint-status OK: 2 stories, 1 actionable",
+        {"stories": 2, "actionable": 1},
+    )
+    assert rows[2][2:] == (
+        "unknown keys ignored: totally-weird",
+        {"unknown_keys": ["totally-weird"]},
+    )
+
+    mode, spec_folder, rows = queue_block("--spec", STORIES_SPEC_FOLDER)
+    assert (mode, spec_folder) == ("stories", STORIES_SPEC_FOLDER)
+    assert rows == [
+        (
+            "queue.stories-manifest",
+            "ok",
+            f"stories mode OK: 2 stories in {folder}/stories.yaml, SPEC.md present",
+            {"spec_folder": str(folder), "stories": 2},
+        ),
+        (
+            "skills.stories-dispatch",
+            "ok",
+            "bmad-dev-auto supports folder+id dispatch (stories mode)",
+            {"trees": [".claude/skills"], "dev_primitive": ["bmad-dev-auto"]},
+        ),
+    ]
+
+
 def test_validate_json_every_emitted_check_is_registered(project, capsys, monkeypatch):
     """The `add` assert enforces registration per executed call site; this unions the
     ids a real passing and failing run emit and asserts them registered. Exercised
@@ -13349,7 +13598,7 @@ def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "Halt after planning." in out
     assert "BMAD_LOOP_PLAN_HALT=1" in out
@@ -13363,7 +13612,7 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, abs_folder) == 0
+    assert cli._dry_run(project, pol, args, "stories", abs_folder) == 0
     out = capsys.readouterr().out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
@@ -13382,7 +13631,7 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     Measured ablations:
     - B3 (delete the `try`/`except stories_mod.StoriesError` around the
       `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
-      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      cli._dry_run(project, pol, args, "stories", abs_folder) == 1` — the
       `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
       that line and the two stderr assertions are never reached. That line alone
       carries this row.
@@ -13398,7 +13647,7 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
     refuse_to_resolve(monkeypatch, Path(abs_folder))
 
-    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+    assert cli._dry_run(project, pol, args, "stories", abs_folder) == 1
 
     cap = capsys.readouterr()
     assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err

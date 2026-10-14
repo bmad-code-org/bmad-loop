@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
-from . import runs
+from . import runs, worksource
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
@@ -822,7 +822,7 @@ def build_run_state(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     trusted_config_digest: str,
     run_dir_identity: tuple[int, int] | None,
@@ -831,7 +831,8 @@ def build_run_state(
 
     ``policy_snapshot`` freezes ``policy`` at launch so every later display reads
     the weights the run actually launched under; ``source`` / ``spec_folder``
-    record which queue the run dispatches (a stories manifest vs sprint-status).
+    record which queue the run dispatches (a stories manifest vs sprint-status);
+    ``spec_folder`` is dropped for a source without one.
 
     ``trusted_config_digest`` is carried here **as well as** stamped out of the
     tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
@@ -857,10 +858,30 @@ def build_run_state(
         epic_filter=epic_filter,
         story_filter=story_filter,
         max_stories=max_stories,
-        source="stories" if stories_on else "sprint-status",
-        spec_folder=spec_folder if stories_on else "",
+        source=source,
+        spec_folder=spec_folder if worksource.traits_for(source).has_spec_folder else "",
         trusted_config_digest=trusted_config_digest,
     )
+
+
+def _engine_cls_for(
+    source: str,
+    spec_folder: str,
+    *,
+    engine_cls: type[Engine],
+    stories_engine_cls: type[StoriesEngine],
+) -> tuple[type[Engine], dict[str, str]]:
+    """The engine class a story run from ``source`` is built with, and the extra
+    constructor kwargs that class takes beyond the shared ones.
+
+    Keyed on the source name rather than :func:`worksource.traits_for`: an
+    unrecognised source (a run state persisted by another version) builds the
+    sprint ``engine_cls``, which is how resume has always treated it. The classes
+    are injected so ``cli``'s module-level names — and the tests' monkeypatches of
+    them — stay the ones built."""
+    if source == worksource.SOURCE_STORIES:
+        return stories_engine_cls, {"spec_folder": spec_folder}
+    return engine_cls, {}
 
 
 @dataclass
@@ -1198,7 +1219,7 @@ def compose_run(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
@@ -1259,7 +1280,7 @@ def compose_run(
             epic_filter=epic_filter,
             story_filter=story_filter,
             max_stories=max_stories,
-            stories_on=stories_on,
+            source=source,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
             run_dir_identity=_claim_identity(composer_claim),
@@ -1298,12 +1319,11 @@ def compose_run(
             sweep_factory=sweep_factory,
             plugin_grants=plugin_grants,
         )
-        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine: Engine = (
-            stories_engine_cls(**common, spec_folder=spec_folder)
-            if stories_on
-            else engine_cls(**common)  # pyright: ignore[reportArgumentType]
+        cls, extra = _engine_cls_for(
+            source, spec_folder, engine_cls=engine_cls, stories_engine_cls=stories_engine_cls
         )
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
+        engine: Engine = cls(**common, **extra)  # pyright: ignore[reportArgumentType]
     except BaseException:
         _unwind_composition(project, run_dir, journal, composer_claim)
         raise
@@ -1603,13 +1623,16 @@ def compose_resume(
             plugin_grants=plugin_grants,
         )
         # stories mode is pinned in run state at launch, so resume rebuilds the
-        # same picker (StoriesEngine) without any flag.
-        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine = (
-            stories_engine_cls(**story_common, spec_folder=state.spec_folder)
-            if state.source == "stories"
-            else engine_cls(**story_common)  # pyright: ignore[reportArgumentType]
+        # same picker (StoriesEngine) without any flag. An unrecognised persisted
+        # source resumes as a sprint run (see `_engine_cls_for`).
+        cls, extra = _engine_cls_for(
+            state.source,
+            state.spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
         )
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
+        engine = cls(**story_common, **extra)  # pyright: ignore[reportArgumentType]
     return ComposedRun(
         engine=engine, run_id=run_dir.name, run_dir=run_dir, state=state, journal=journal
     )

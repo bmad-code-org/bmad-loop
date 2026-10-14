@@ -39,6 +39,7 @@ from . import (
 from . import stories as stories_mod
 from . import (
     verify,
+    worksource,
 )
 
 # Re-exported for the test suite, which stubs `_platform_preflight` with
@@ -754,31 +755,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else []
     )
 
-    stories_on, spec_folder = _stories_mode(args, pol)
+    source, spec_folder = _resolve_source(args, pol)
+    stories_on = source == worksource.SOURCE_STORIES
     if paths:
-        if stories_on:
-            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
-            _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
-        else:
-            _validate_deferred_ledger(paths, report)
-            _validate_operator_registry(project, paths, report)
-            try:
-                ss = sprintstatus.load(paths.sprint_status)
-                actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-                report.ok(
-                    "queue.sprint-status",
-                    f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
-                    {"stories": len(ss.stories), "actionable": len(actionable)},
-                )
-                if ss.unknown_keys:
-                    report.warn(
-                        "queue.sprint-status-unknown-keys",
-                        f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
-                        {"unknown_keys": list(ss.unknown_keys)},
-                    )
-                _validate_nested_specs(paths.implementation_artifacts, report)
-            except sprintstatus.SprintStatusError as e:
-                report.fail("queue.sprint-status", str(e))
+        _QUEUE_VALIDATORS[source](project, paths, spec_folder, dev_trees, report)
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
     # whether the tree was clean, but whether the binary answered at all. A
@@ -2047,7 +2027,7 @@ def _sprint_launch_roles(pol) -> tuple[str, ...]:
     """The roles a SPRINT-mode story run launches: dev + review, plus the auto
     retrospective's ``retro`` session when ``gates.retrospective = "auto"``
     (DW-389). Stories mode never crosses an epic boundary, so it stays dev + review."""
-    return ("dev", "review", "retro") if pol.gates.retrospective == "auto" else ("dev", "review")
+    return worksource.launch_roles(worksource.SOURCE_SPRINT, pol.gates.retrospective)
 
 
 def _warn_bypass_dropped(
@@ -2329,19 +2309,29 @@ def _require_sweep_skill(project: Path, pol) -> bool:
     return False
 
 
-def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
-    """Resolve whether this run is stories mode and its spec folder.
+def _resolve_source(args: argparse.Namespace, pol) -> tuple[str, str]:
+    """Resolve the work source this run dispatches from and its spec folder.
 
     ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
-    run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
-    folder is "" in sprint mode. ``pol`` may be None (e.g. a policy that failed to
-    load in ``validate``): then only an explicit ``--spec`` can force stories mode."""
+    run follows ``[stories].source``. Returns ``(source, spec_folder)`` — the
+    folder is "" for a source without one. ``pol`` may be None (e.g. a policy that
+    failed to load in ``validate``): then only an explicit ``--spec`` can move the
+    run off the sprint source."""
     spec = getattr(args, "spec", None)
     if spec:
-        return True, spec
-    if pol is not None and pol.stories.source == "stories":
-        return True, pol.stories.spec_folder
-    return False, ""
+        return worksource.SOURCE_STORIES, spec
+    if pol is None:
+        return worksource.SOURCE_SPRINT, ""
+    source = pol.stories.source
+    if worksource.traits_for(source).has_spec_folder:
+        return source, pol.stories.spec_folder
+    return source, ""
+
+
+def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
+    """:func:`_resolve_source` as ``(is_stories, spec_folder)``."""
+    source, spec_folder = _resolve_source(args, pol)
+    return source == worksource.SOURCE_STORIES, spec_folder
 
 
 def _validate_stories_folder(
@@ -2639,6 +2629,61 @@ def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
     )
 
 
+def _validate_sprint_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+) -> None:
+    """``validate``'s queue checks for a sprint-status run: the ledger, the park
+    records, and the sprint board itself."""
+    _validate_deferred_ledger(paths, report)
+    _validate_operator_registry(project, paths, report)
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        report.ok(
+            "queue.sprint-status",
+            f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
+            {"stories": len(ss.stories), "actionable": len(actionable)},
+        )
+        if ss.unknown_keys:
+            report.warn(
+                "queue.sprint-status-unknown-keys",
+                f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
+                {"unknown_keys": list(ss.unknown_keys)},
+            )
+        _validate_nested_specs(paths.implementation_artifacts, report)
+    except sprintstatus.SprintStatusError as e:
+        report.fail("queue.sprint-status", str(e))
+
+
+def _validate_stories_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+) -> None:
+    """``validate``'s queue checks for a stories run: the manifest and the
+    ledger, read against the spec folder."""
+    _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
+    _validate_deferred_ledger(
+        paths, report, source=worksource.SOURCE_STORIES, spec_folder=spec_folder
+    )
+
+
+# `validate`'s queue checks, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_QUEUE_VALIDATORS: dict[
+    str, Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport], None]
+] = {
+    worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
+    worksource.SOURCE_STORIES: _validate_stories_mode_queue,
+}
+
+
 def _validate_operator_registry(
     project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
 ) -> None:
@@ -2740,6 +2785,7 @@ def _validate_deferred_ledger(
     paths: bmadconfig.ProjectPaths,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """Read the deferred-work ledger once, then run every check that needs it.
@@ -2806,7 +2852,7 @@ def _validate_deferred_ledger(
             {"ledger": str(ledger), "error": str(e)},
         )
         return
-    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_hard_gates(paths, text, report, source=source, spec_folder=spec_folder)
     _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
 
 
@@ -2913,6 +2959,7 @@ def _validate_hard_gates(
     text: str,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
@@ -2957,7 +3004,7 @@ def _validate_hard_gates(
     # test so a project that gates nothing pays neither the walk nor its failure modes.
     if not any(entry_gates.tokens for _, entry_gates in declared):
         return
-    story_keys = _actionable_story_keys(paths, spec_folder)
+    story_keys = _actionable_story_keys(paths, source, spec_folder or "")
     if story_keys is None:
         # The queue could not be read, so nothing was compared. `queue.sprint-status`
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
@@ -3080,9 +3127,10 @@ def _report_unstructured_gate(
 
 
 def _actionable_story_keys(
-    paths: bmadconfig.ProjectPaths, spec_folder: str | None
+    paths: bmadconfig.ProjectPaths, source: str, spec_folder: str
 ) -> list[str] | None:
-    """The story keys this queue could dispatch, in queue order, in either mode.
+    """The story keys ``source``'s queue could dispatch, in queue order — one
+    reader per work source in ``_ACTIONABLE_KEY_READERS``.
 
     ``None`` when the queue could not be read, which is not the same answer as an
     empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
@@ -3117,23 +3165,38 @@ def _actionable_story_keys(
     resolution first is the cheaper wrong answer, and dispatch still refuses
     independently.
     """
-    if spec_folder is not None:
-        keys: list[str] = []
-        try:
-            folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
-            for entry in stories_mod.load_stories(folder).entries:
-                state = stories_mod.resolve_story_spec(folder, entry.id)
-                if stories_mod._classify(state) != "actionable":
-                    continue
-                keys.append(entry.id)
-        except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
-            return None
-        return keys
+    return _ACTIONABLE_KEY_READERS[source](paths, spec_folder)
+
+
+def _actionable_sprint_keys(paths: bmadconfig.ProjectPaths, spec_folder: str) -> list[str] | None:
+    """Sprint half of :func:`_actionable_story_keys`: the board's actionable keys."""
     try:
         ss = sprintstatus.load(paths.sprint_status)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return None
     return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+
+
+def _actionable_stories_keys(paths: bmadconfig.ProjectPaths, spec_folder: str) -> list[str] | None:
+    """Stories half of :func:`_actionable_story_keys`: the manifest entries the
+    scheduler's per-entry predicate calls actionable."""
+    keys: list[str] = []
+    try:
+        folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+        for entry in stories_mod.load_stories(folder).entries:
+            state = stories_mod.resolve_story_spec(folder, entry.id)
+            if stories_mod._classify(state) != "actionable":
+                continue
+            keys.append(entry.id)
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        return None
+    return keys
+
+
+_ACTIONABLE_KEY_READERS: dict[str, Callable[[bmadconfig.ProjectPaths, str], list[str] | None]] = {
+    worksource.SOURCE_SPRINT: _actionable_sprint_keys,
+    worksource.SOURCE_STORIES: _actionable_stories_keys,
+}
 
 
 def _validate_closes_deferred(
@@ -3267,15 +3330,53 @@ def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
         )
 
 
+def _preflight_sprint_queue(
+    paths: bmadconfig.ProjectPaths, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a sprint-status run: the board parses and the
+    ``--epic`` / ``--story`` selection resolves. An exit code refuses the run."""
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        _warn_unknown_keys(ss)
+        sprintstatus.select_actionable(ss, args.epic, args.story)
+    except sprintstatus.SprintStatusError as e:
+        print(e, file=sys.stderr)
+        return 1
+    return None
+
+
+def _preflight_stories_queue(
+    paths: bmadconfig.ProjectPaths, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a stories run: the manifest and SPEC.md pass
+    and the ``--story`` selector names an entry. An exit code refuses the run."""
+    problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 1
+    return None
+
+
+# `run`'s queue preflight, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_RUN_PREFLIGHTS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, argparse.Namespace, str], int | None]
+] = {
+    worksource.SOURCE_SPRINT: _preflight_sprint_queue,
+    worksource.SOURCE_STORIES: _preflight_stories_queue,
+}
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_bad_run_id(args.run_id)) is not None:
         return rc
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
-    stories_on, spec_folder = _stories_mode(args, pol)
+    source, spec_folder = _resolve_source(args, pol)
+    traits = worksource.traits_for(source)
 
-    if stories_on and args.epic is not None:
+    if not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
         # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
         # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
@@ -3286,7 +3387,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     if args.dry_run:
-        return _dry_run(paths, pol, args, stories_on, spec_folder)
+        return _dry_run(paths, pol, args, source, spec_folder)
 
     # The HOST refusal leads the configuration ones: an under-floor git is a fact
     # about the machine that no edit to policy.toml can answer, so telling the
@@ -3303,19 +3404,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
 
-    if stories_on:
-        problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
-        if problem:
-            print(problem, file=sys.stderr)
-            return 1
-    else:
-        try:
-            ss = sprintstatus.load(paths.sprint_status)
-            _warn_unknown_keys(ss)
-            sprintstatus.select_actionable(ss, args.epic, args.story)
-        except sprintstatus.SprintStatusError as e:
-            print(e, file=sys.stderr)
-            return 1
+    if (rc := _RUN_PREFLIGHTS[source](paths, args, spec_folder)) is not None:
+        return rc
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
@@ -3327,7 +3417,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # layer reads the store.
     plugin_grants = _launch_plugin_grants(project)
     if not _require_base_skills(
-        project, pol, paths.repo_root, plugin_grants, require_stories=stories_on
+        project, pol, paths.repo_root, plugin_grants, require_stories=traits.stories_primitive
     ):
         return 1
 
@@ -3361,7 +3451,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         epic_filter=args.epic,
         story_filter=args.story,
         max_stories=args.max_stories,
-        stories_on=stories_on,
+        source=source,
         spec_folder=spec_folder,
         sweep_factory=_sweep_factory(project, paths, trusted_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
@@ -3374,7 +3464,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     _warn_bypass_dropped(
         pol,
         project,
-        ("dev", "review") if stories_on else _sprint_launch_roles(pol),
+        worksource.launch_roles(source, pol.gates.retrospective),
         profiles=profiles,
         journal=composed.journal,
     )
@@ -3450,12 +3540,18 @@ def _dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
     args: argparse.Namespace,
-    stories_on: bool = False,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str = "",
 ) -> int:
-    if stories_on:
-        return _dry_run_stories(paths, pol, args, spec_folder)
+    """``run --dry-run``: print what ``source``'s queue would dispatch, spawning
+    nothing — one printer per work source in ``_DRY_RUNNERS``."""
+    return _DRY_RUNNERS[source](paths, pol, args, spec_folder)
 
+
+def _dry_run_sprint(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print the sprint-status queue ``run`` would process, one story per block."""
     _warn_preflight_would_abort(paths, pol)
     _warn_bypass_dropped(pol, paths.project, _sprint_launch_roles(pol))
 
@@ -3552,6 +3648,26 @@ def _dry_run_stories(
     return 0
 
 
+# `run --dry-run`'s queue printer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_DRY_RUNNERS: dict[str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int]] = {
+    worksource.SOURCE_SPRINT: _dry_run_sprint,
+    worksource.SOURCE_STORIES: _dry_run_stories,
+}
+
+
+def _print_sprint_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a sprint-status run: the board's remaining
+    actionable stories, or nothing when the config or board cannot be read."""
+    try:
+        paths = bmadconfig.load_paths(project)
+        ss = sprintstatus.load(paths.sprint_status)
+        remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        print(f"sprint backlog remaining: {len(remaining)}")
+    except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
+        pass
+
+
 def _print_stories_status(state: RunState, project: Path) -> None:
     """The stories-mode board for `status`: id, live on-disk state, checkpoint
     markers and title, read from the run's pinned spec folder. Mode-aware
@@ -3570,6 +3686,14 @@ def _print_stories_status(state: RunState, project: Path) -> None:
             f"  {row.position:2d}. {row.id:12s} {row.label:16s}"
             f"{_checkpoint_badge(row)}  {row.title}"
         )
+
+
+# `status`'s queue footer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_STATUS_PRINTERS: dict[str, Callable[[RunState, Path], None]] = {
+    worksource.SOURCE_SPRINT: _print_sprint_status,
+    worksource.SOURCE_STORIES: _print_stories_status,
+}
 
 
 def _start_sweep(
@@ -4181,7 +4305,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         pol,
         paths.repo_root,
         plugin_grants,
-        require_stories=state.source == "stories",
+        require_stories=worksource.resumed_traits_for(state.source).stories_primitive,
         review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
     ):
         return 1
@@ -4529,7 +4653,9 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         (
             ("triage", "dev", "review")
             if state.run_type == "sweep"
-            else ("dev", "review") if state.source == "stories" else _sprint_launch_roles(pol)
+            else worksource.launch_roles(
+                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+            )
         ),
         profiles=profiles,
         journal=composed.journal,
@@ -6464,16 +6590,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"
         )
-    if state.source == "stories":
-        _print_stories_status(state, project)
-    else:
-        try:
-            paths = bmadconfig.load_paths(project)
-            ss = sprintstatus.load(paths.sprint_status)
-            remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-            print(f"sprint backlog remaining: {len(remaining)}")
-        except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
-            pass
+    _STATUS_PRINTERS[worksource.resumed_traits_for(state.source).name](state, project)
     try:
         missed = decisions.pending_missed_decisions(project)
         if missed:

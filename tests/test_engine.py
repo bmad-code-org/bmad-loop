@@ -189,6 +189,27 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
     return new_engine, adapter
 
 
+def test_make_engine_selects_sprint_engine(project):
+    """Characterization pin for the WorkSource refactor: the default story engine
+    is the sprint `Engine` (not a subclass), and a sprint run's state carries
+    `source == "sprint-status"` with no spec folder — in memory and as persisted
+    after a run."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+    )
+
+    assert type(engine) is Engine
+    assert (engine.state.source, engine.state.spec_folder) == ("sprint-status", "")
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    persisted = load_state(engine.run_dir)
+    assert (persisted.source, persisted.spec_folder) == ("sprint-status", "")
+    assert persisted.current_epic == 1
+
+
 def test_the_resumed_engine_reopens_the_journal_off_disk(project):
     """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
     builds rather than handing the pre-pause engine's object back (DW-241), the
@@ -17045,6 +17066,29 @@ def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
     assert engine._pick_next().key == "5-1-e5"
 
 
+def test_pick_next_journals_unknown_sprint_keys_on_every_pick(project):
+    """Characterization pin for the WorkSource refactor: `Engine._pick_next`
+    re-reads the board on every pick and journals `sprint-status-unknown-keys`
+    each time it carries unparseable keys — not once per run. A board with none
+    journals nothing."""
+    write_sprint(
+        project,
+        {"1-1-a": "ready-for-dev", "totally-weird": "huh", "2-6.1-nested-split": "backlog"},
+    )
+    engine, _ = make_engine(project, [])
+
+    assert engine._pick_next().key == "1-1-a"
+    assert engine._pick_next().key == "1-1-a"
+
+    rows = [e for e in engine.journal.entries() if e["kind"] == "sprint-status-unknown-keys"]
+    assert [r["keys"] for r in rows] == [["totally-weird", "2-6.1-nested-split"]] * 2
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    assert engine._pick_next().key == "1-1-a"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("sprint-status-unknown-keys") == 2  # clean board: no third row
+
+
 @requires_descriptor_restoration
 def test_resolved_redrive_reescalates_instead_of_deferring(project):
     """Fix C (Bug 1): a story from a human-resolved CRITICAL escalation whose
@@ -17144,6 +17188,48 @@ def test_graceful_stop_finishes_current_story_then_stops(project, monkeypatch):
     stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
     assert stops[-1]["remaining"] == 1  # 1-2-b still actionable, never picked
+
+
+def test_remaining_estimate_counts_actionable_untouched_sprint_stories(project):
+    """Characterization pin for the WorkSource refactor: the sprint
+    `_remaining_estimate` counts board stories that are actionable (backlog /
+    ready-for-dev) AND absent from `state.tasks` — whatever phase a touched task
+    is in. done / in-progress / review stories and epic keys never count."""
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",  # touched below: excluded
+            "1-2-b": "backlog",
+            "1-3-c": "ready-for-dev",
+            "1-4-d": "done",
+            "epic-2": "backlog",
+            "2-1-e": "in-progress",
+            "2-2-f": "review",
+            "2-3-g": "backlog",  # touched below (deferred): excluded
+        },
+    )
+    engine, _ = make_engine(project, [])
+    assert engine._remaining_estimate() == 4
+
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING)
+    engine.state.tasks["2-3-g"] = StoryTask(story_key="2-3-g", epic=2, phase=Phase.DEFERRED)
+    assert engine._remaining_estimate() == 2  # 1-2-b, 1-3-c
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed"])
+def test_remaining_estimate_is_none_when_board_unreadable(project, fault):
+    """Characterization pin for the WorkSource refactor: a sprint board that
+    cannot be loaded makes `_remaining_estimate` return None (a hint, never a
+    raise) — not 0, which would read as "nothing left"."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    if fault == "missing":
+        project.sprint_status.unlink()
+    else:
+        project.sprint_status.write_text("development_status: [unclosed\n", encoding="utf-8")
+
+    assert engine._remaining_estimate() is None
 
 
 def test_boundary_consume_does_not_swallow_a_concurrent_escalation(project, monkeypatch):
@@ -23883,6 +23969,25 @@ def _commit_of(project, subject: str) -> list[str]:
     shas = [line.split(" ", 1)[0] for line in log if line.split(" ", 1)[1] == subject]
     assert len(shas) == 1, (subject, log)
     return sorted(git(project.project, "show", "--name-only", "--format=", shas[0]).split())
+
+
+def test_retro_prompt_bytes_are_pinned():
+    """Characterization pin for the WorkSource refactor: the exact bytes of the
+    auto-retrospective prompt for an epic — the `/bmad-retrospective -H N` command
+    plus the result.json completion clause (escaped braces rendered literally)."""
+    from bmad_loop.engine import RETRO_AUTO_PROMPT, _retro_auto_prompt
+
+    expected = (
+        "/bmad-retrospective -H 7\n"
+        "\n"
+        "## Completion signal (required)\n"
+        "When the retrospective is finished — or blocked — write\n"
+        "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json as\n"
+        '{"workflow": "bmad-retrospective", "status": "done"} (or "blocked" plus "reason"), '
+        "then end your turn."
+    )
+    assert _retro_auto_prompt(7) == expected
+    assert RETRO_AUTO_PROMPT.format(epic=7) == expected
 
 
 def test_auto_retro_happy_path_runs_on_the_retro_adapter_and_commits_its_files(
