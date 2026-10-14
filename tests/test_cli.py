@@ -2897,13 +2897,11 @@ _DIGEST_CTL = runs.CTL_SESSION + "-0123456789abcdef"
 _OWN_REG = r"C:\state\0123456789abcdef\_mux"
 
 
-class _OwnRegistryMux:
-    """The primary backend as the #733 readers see it: bound to this project's
-    registry, which holds a control session under the pre-rename digest name."""
-
-    _BINARY = "psmux"
-    # The real client verb choice, so the printed command follows it.
-    attach_target_argv = PsmuxMultiplexer.attach_target_argv
+class _OwnRegistryMux(PsmuxMultiplexer):
+    """The primary backend as the #733 readers see it: psmux, bound to this
+    project's registry, which holds a control session under the pre-rename
+    digest name. A real `PsmuxMultiplexer` subclass, so the client verb is the
+    backend's own and the paste-ready command is psmux's."""
 
     def has_registry_namespace(self):
         return False  # keeps `_configure_mux` from exporting a root over this fake
@@ -2913,6 +2911,43 @@ class _OwnRegistryMux:
 
     def session_name_key(self, name):
         return name
+
+
+class _OtherRegistryMux:
+    """An out-of-tree registry-namespaced backend holding the same session: not
+    psmux, so no psmux command may be printed for it."""
+
+    def has_registry_namespace(self):
+        return False
+
+    def registry_root(self):
+        return _OWN_REG
+
+    def session_name_key(self, name):
+        return name
+
+    def attach_target_argv(self, target):
+        return ["othermux", "attach", "-t", target]
+
+
+def test_attach_names_a_pre_upgrade_control_session_without_a_command_off_psmux(
+    project, monkeypatch, capsys
+):
+    """On a backend that is not psmux the session is still named, but no psmux
+    PowerShell line is advertised: it would fail there, or reach the wrong
+    registry. Ablate `_is_psmux` (answer True) and this fails."""
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+    assert "this run's window may be there\n" in err
+    assert "psmux" not in err and "PSMUX_DATA_DIR" not in err
 
 
 def test_attach_names_a_pre_upgrade_control_session_it_cannot_see_into(
@@ -19689,6 +19724,35 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
     assert "not migrated" not in err and "not checked" not in err
+
+
+def test_cleanup_names_a_pre_upgrade_control_session_without_a_command_off_psmux(
+    project, capsys, monkeypatch
+):
+    """Off psmux the session is still named, in text and in --json, but its
+    command is `null` and the text line advertises none. Ablate `_is_psmux`
+    (answer True) and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): ({_OWN_REG: [_DIGEST_CTL]}, []),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL}" in err
+    assert "end it with your multiplexer" in err
+    assert "psmux" not in err and "PSMUX_DATA_DIR" not in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: None}
 
 
 def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(

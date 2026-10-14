@@ -6449,7 +6449,10 @@ def _note_superseded_ctl_for_attach(project: Path) -> None:
     The verb is the one attach itself would run here: inside a multiplexer
     client a nested attach is refused, so the backend switches the client
     instead (``attach_target_argv``). A listing that could not be taken is said,
-    not passed off as "no such session" after "nothing to attach"."""
+    not passed off as "no such session" after "nothing to attach".
+
+    A paste-ready command only on psmux (``_is_psmux``); another backend's
+    session is named without one."""
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
 
     def _fault(msg: str) -> None:
@@ -6465,13 +6468,15 @@ def _note_superseded_ctl_for_attach(project: Path) -> None:
     except MultiplexerError as exc:
         _fault(str(exc))
         return
+    psmux = _is_psmux(mux)
     for name in stale:
-        verb = mux.attach_target_argv(f"={name}")[1]
-        command = _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
+        where = "this run's window may be there"
+        if psmux:
+            verb = mux.attach_target_argv(f"={name}")[1]
+            where += ": " + _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
         print(
             f"note: pre-upgrade control session {name} is still running in this "
-            f"project's registry, and attach does not look inside it; this run's "
-            f"window may be there: {command}",
+            f"project's registry, and attach does not look inside it; {where}",
             file=sys.stderr,
         )
 
@@ -6701,12 +6706,20 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_psmux(mux: object) -> bool:
+    """Whether ``mux`` is the bundled psmux backend, the one transport whose
+    commands :func:`_psmux_command` can spell. ponytail: no generic renderer;
+    an out-of-tree registry-namespaced backend gets its sessions named, not a
+    command, until one needs more."""
+    from .adapters.psmux_backend import PsmuxMultiplexer
+
+    return isinstance(mux, PsmuxMultiplexer)
+
+
 def _psmux_command(registry: str | None, verb: str) -> str:
     """A paste-ready PowerShell line running ``psmux <verb>`` against
     ``registry`` (psmux's own default when ``None``). Quoted the way
-    ``_mux_info`` quotes its export line. ponytail: psmux is the only bundled
-    transport with a registry namespace, which is the only place the
-    sessions this spells a command for can exist."""
+    ``_mux_info`` quotes its export line. psmux only (:func:`_is_psmux`)."""
     run = f"psmux {verb}"
     if registry is None:
         return run
@@ -6714,7 +6727,9 @@ def _psmux_command(registry: str | None, verb: str) -> str:
     return f"$env:{runs.PSMUX_DATA_DIR} = '{quoted}'; {run}"
 
 
-def _superseded_ctl_kill_commands(project: Path, leftovers: dict[str, list[str]]) -> dict[str, str]:
+def _superseded_ctl_kill_commands(
+    project: Path, leftovers: dict[str, list[str]]
+) -> dict[str, str | None]:
     """``{name: command that ends it}`` for each control session in the
     registry in force under the name an earlier release minted for this
     project there (#733, ``runs.superseded_ctl_name``), picked out of
@@ -6724,7 +6739,9 @@ def _superseded_ctl_kill_commands(project: Path, leftovers: dict[str, list[str]]
     ours beyond doubt — its name is a digest of this project's derived root —
     and nothing else will ever end it: no bmad-loop command addresses it. The
     caveat travels with the command: ending it kills whatever its windows
-    still run."""
+    still run. ``None`` for the command when the backend is not psmux
+    (:func:`_is_psmux`): the session is named, and no command is advertised
+    that could not run there."""
     if not leftovers:
         return {}
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
@@ -6739,20 +6756,22 @@ def _superseded_ctl_kill_commands(project: Path, leftovers: dict[str, list[str]]
         return {}
     # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
     # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
+    psmux = _is_psmux(mux)
     return {
-        name: _psmux_command(root, f"kill-session -t '={name}'")
+        name: _psmux_command(root, f"kill-session -t '={name}'") if psmux else None
         for name in leftovers.get(root or runs.DEFAULT_REGISTRY_LABEL, [])
         if mux.session_name_key(name) == old
     }
 
 
-def _warn_superseded_ctl(kill_commands: dict[str, str]) -> None:
+def _warn_superseded_ctl(kill_commands: dict[str, str | None]) -> None:
     for name, command in kill_commands.items():
+        how = f"end it with: {command}" if command else "end it with your multiplexer"
         print(
             f"pre-upgrade control session {name} is still running in this project's "
             "registry, and no bmad-loop command addresses it; once its runs have "
             "finished and every window in it shows the exit banner (ending it kills "
-            f"what they still run), end it with: {command}",
+            f"what they still run), {how}",
             file=sys.stderr,
         )
 

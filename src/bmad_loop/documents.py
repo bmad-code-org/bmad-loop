@@ -397,7 +397,7 @@ def cleanup_document(
     windows_undetermined: list[str] | None = None,
     legacy_leftovers: list[str] | None = None,
     legacy_unverified: list[str] | None = None,
-    legacy_kill_commands: dict[str, str] | None = None,
+    legacy_kill_commands: dict[str, str | None] | None = None,
     sessions_scan_error: str | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
@@ -461,9 +461,11 @@ def cleanup_document(
 
     `sessions.legacy_kill_commands` maps each pre-upgrade control session in
     this project's own registry (#733) — also named in `legacy_leftovers` — to
-    the paste-ready command that ends it. No bmad-loop command addresses such a
-    session, so this is the only way out; run it once every window in it has
-    parked. Additive, no schema bump; the text mode prints each on stderr.
+    the paste-ready command that ends it, or to ``null`` when the backend is
+    not psmux and no command can be spelled for it. No bmad-loop command
+    addresses such a session, so this is the only way out; run it once every
+    window in it has parked. Additive, no schema bump; the text mode prints each
+    on stderr.
 
     `sessions.scan_error` is present only when the session listing could not
     see this project's sessions (#864): the backend is unavailable while a run
