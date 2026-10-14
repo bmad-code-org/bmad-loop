@@ -1396,6 +1396,61 @@ def test_premise_a_port_and_key_pair_is_answered_by_whichever_server_it_names(
             (root / f"{forged}.{suffix}").unlink(missing_ok=True)
 
 
+def test_adopted_a_backend_session_spawns_no_warm_standby(tmp_path, monkeypatch):
+    """A session the backend starts boots its server with ``PSMUX_NO_WARM=1``,
+    so no hidden ``__warm__`` standby joins the registry (#903): a booting
+    server with warm enabled spawns one and publishes ``__warm__.port`` beside
+    its own. Red means the create env lost the variable, or psmux stopped
+    honoring it at boot, and every idle project carries the standby again.
+
+    Its own root, not the module fixture's: the raw probe sessions there boot
+    with warm on, so their standby would answer for this one. And an empty
+    config of its own: an inherited `set -g warm off` would suppress the
+    standby whatever the env says.
+    """
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    root = tmp_path / "registry"
+    root.mkdir()
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(root))
+    monkeypatch.delenv("PSMUX_NO_WARM", raising=False)  # the backend must supply it
+    monkeypatch.delenv("PSMUX_WARM_POOL_SIZE", raising=False)
+    config = tmp_path / "empty.conf"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PSMUX_CONFIG_FILE", str(config))
+    env = _new_session_env()
+    session = f"bmad-loop-nowarm-probe-{uuid.uuid4().hex[:8]}"
+    standby = root / "__warm__.port"
+    try:
+        mux.new_session(session, tmp_path)
+        assert (root / f"{session}.port").is_file(), "probe setup: the session has no port file"
+        # The standby is spawned during the server's boot, and a server may take
+        # psmux's whole readiness window to register on a loaded box; reading
+        # absence any sooner could pass while a late standby is still coming.
+        deadline = time.monotonic() + psmux_teardown.PSMUX_READY_DEADLINE_S
+        while time.monotonic() < deadline and not standby.exists():
+            time.sleep(0.25)
+        assert not standby.exists(), (
+            "a session the psmux backend started spawned a `__warm__` standby — "
+            "new_session's PSMUX_NO_WARM no longer reaches the server it boots"
+        )
+    finally:
+        _teardown_probe_session(mux, session, env)
+        # A standby that registered late is a server of its own, which the
+        # session teardown never reaches. The root is this test's private
+        # tmp dir, so a kill-server scoped to it cannot touch anyone else's.
+        if standby.exists():
+            assert str(root).startswith(str(tmp_path))
+            subprocess.run(
+                ["psmux", "kill-server"],
+                env={**os.environ, "PSMUX_DATA_DIR": str(root)},
+                capture_output=True,
+                timeout=tmux_base.TMUX_TIMEOUT_S,
+                check=False,
+            )
+
+
 def test_adopted_a_missing_registry_root_self_heals(tmp_path):
     """The derived root is a path under the state root that nothing creates in
     advance, so the design leans on psmux ``create_dir_all``-ing it itself
