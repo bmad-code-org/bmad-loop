@@ -6640,6 +6640,34 @@ def test_a_claim_that_did_not_land_is_journaled(tmp_path, monkeypatch, capsys):
     assert [e["error"] for e in entries] == ["record not written"]
 
 
+def test_a_claim_that_raises_does_not_abort_the_resume(tmp_path, monkeypatch, capsys):
+    # #920: the claim runs after the resume published its pid and state, so a
+    # backend that cannot be selected, or a journal write that fails, is said
+    # and never raised. Ablation: let the claim's exception through and this
+    # raises.
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.journal import Journal
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+
+    def boom(_project, _run_id):
+        raise MultiplexerError("no such backend: gone")
+
+    monkeypatch.setattr(launch, "claim_ctl_window", boom)
+    cli._claim_ctl_window(tmp_path, run_dir)
+    assert "no such backend: gone" in capsys.readouterr().err
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    assert kinds.count("ctl-window-claim-failed") == 1
+
+    def unwritable(self, *_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Journal, "append", unwritable)
+    cli._claim_ctl_window(tmp_path, run_dir)
+    assert "could not journal it: disk full" in capsys.readouterr().err
+
+
 def test_resolve_claims_nothing_before_its_entry_refusals(tmp_path, monkeypatch, capsys):
     # A resolve refused at entry (here: a story it cannot resolve) must leave
     # the record alone — an interactive resolver may own it, and has no engine

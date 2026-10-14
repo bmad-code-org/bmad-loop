@@ -4485,12 +4485,25 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
 
     A claim that did not land is journaled as well as printed: a TUI-launched
     resume prints into a detached window nobody is looking at, while the
-    journal is the run's durable record."""
+    journal is the run's durable record.
+
+    Never raises: the caller has already published this process's pid and the
+    resumed state, so a fault here (a backend that cannot be selected, a record
+    or journal write that fails) must not abort a resume past that point. It is
+    said instead."""
+    from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # import-safe: launch.py has no textual imports
 
-    if (warning := launch.claim_ctl_window(project, run_dir.name)) is not None:
+    try:
+        warning = launch.claim_ctl_window(project, run_dir.name)
+    except (MultiplexerError, OSError) as exc:
+        warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
+    if warning is not None:
         print(f"warning: {warning}", file=sys.stderr)
-        Journal(run_dir).append("ctl-window-claim-failed", error=warning)
+        try:
+            Journal(run_dir).append("ctl-window-claim-failed", error=warning)
+        except OSError as exc:
+            print(f"warning: could not journal it: {exc}", file=sys.stderr)
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
