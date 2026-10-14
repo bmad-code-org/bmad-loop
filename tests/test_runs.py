@@ -9016,6 +9016,48 @@ def test_superseded_ctl_sessions_claims_nothing_outside_our_own_registry(tmp_pat
     assert runs.superseded_ctl_sessions(tmp_path, mux) == []
 
 
+def test_superseded_ctl_sessions_follows_an_alias_of_our_own_registry(tmp_path):
+    """An honoured operator root that is a symlink or junction to this project's
+    derived registry is that registry: the old mint resolved both and gave it
+    the derived root's name. Compared as spelled, the alias reads as somebody
+    else's root and the old control session goes unnamed. Ablate the resolved
+    comparison in `superseded_ctl_sessions` back to `Path(root) == derived` and
+    this fails."""
+    derived = runs.mux_registry_root(tmp_path)
+    derived.mkdir(parents=True, exist_ok=True)
+    alias = tmp_path / "alias-mux"
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module; a junction needs no privilege
+
+        _winapi.CreateJunction(str(derived), str(alias))
+    else:
+        alias.symlink_to(derived, target_is_directory=True)
+    old = runs.superseded_ctl_name(tmp_path)
+    mux = _RegistryMux([runs.CTL_SESSION, old], {}, root=str(alias))
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [old]
+
+
+def test_superseded_ctl_sessions_says_when_it_compared_the_root_as_spelled(tmp_path, monkeypatch):
+    """A registry root that cannot be resolved keeps the as-spelled comparison
+    and never raises, but the degrade is reported, not folded into a clean
+    answer. Ablate the `on_fault` report, or the as-spelled fallback, and this
+    fails."""
+    root = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p: _DIGEST_CTL)
+    real_resolve = Path.resolve
+
+    def _resolve(self, strict=False):
+        if str(self) == root:
+            raise OSError("symlink loop")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", _resolve)
+    faults: list[str] = []
+    mux = _RegistryMux([_DIGEST_CTL], {}, root=root)
+    assert runs.superseded_ctl_sessions(tmp_path, mux, on_fault=faults.append) == [_DIGEST_CTL]
+    assert faults == ["could not resolve the registry root, compared as spelled: symlink loop"]
+
+
 def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry(
     tmp_path, monkeypatch
 ):

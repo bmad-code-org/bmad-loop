@@ -2580,17 +2580,32 @@ def superseded_ctl_sessions(
     (:func:`mux_registry_root`): a control session in it is this project's.
     psmux's shared default registry, an operator's own root, and a
     machine-wide server (tmux, which never minted the digest shape) prove
-    nothing about whose a session spelled that way is.
+    nothing about whose a session spelled that way is. Compared as the old mint
+    compared them, resolved and then case-folded: an honoured root that is a
+    symlink, junction or other spelling of the derived one is that registry,
+    and the old mint gave it the same name. A root that cannot be resolved is
+    compared as spelled, and that degrade goes to ``on_fault``.
 
     A listing that could not be taken goes to ``on_fault`` and answers ``[]``
     (:meth:`~.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
     mux = mux or get_multiplexer()
     root = mux.registry_root()
+    if root is None:
+        return []
     try:
-        if root is None or Path(root) != mux_registry_root(project):
-            return []
+        derived = mux_registry_root(project)
         old = mux.session_name_key(superseded_ctl_name(project))
     except (StateRootError, OSError, RuntimeError):
+        return []
+    try:
+        own = os.path.normcase(str(Path(root).resolve())) == os.path.normcase(
+            str(derived.resolve())
+        )
+    except (OSError, RuntimeError) as exc:
+        own = Path(root) == derived
+        if on_fault is not None:
+            on_fault(f"could not resolve the registry root, compared as spelled: {exc}")
+    if not own:
         return []
     return sorted(
         name
