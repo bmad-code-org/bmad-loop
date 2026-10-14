@@ -762,6 +762,9 @@ blocking = false           # true: a non-completed session defers the unit
   about to commit). `pre_commit_gate` is **defer-safe**: it fires before the unit
   enters COMMITTING, so a _blocking_ workflow whose session doesn't complete
   still defers cleanly. Other stages lack a worktree or run after teardown.
+- **`role = "review"` keeps the review CLI in the skills preflight** when
+  `[review] enabled = false`, which otherwise skips it. A workflow switched off with
+  `<workflow-name>_enabled = false` does not count.
 - **`prompt`** expands `{story_key}`, `{run_id}`, and `{scripts}`.
 - **The orchestrator appends two sections to what you write**, and appends them
   _after_ the session gates fire, so a `pre_workflow_session` / `pre_session`

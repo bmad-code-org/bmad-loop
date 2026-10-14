@@ -214,6 +214,91 @@ def test_discover_location_redacts_username(tmp_path, monkeypatch):
     assert "abc-123.jsonl" in found.location  # the id-like filename survives
 
 
+def _codex_homes(tmp_path, monkeypatch):
+    """A user home and a separate CODEX_HOME, each holding one codex rollout.
+
+    HOME and USERPROFILE both move: `tokens.codex_home` and os.path.expanduser
+    read HOME on POSIX but USERPROFILE on Windows."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    day = Path("sessions", "2026", "10", "12")
+    default = _write_jsonl(home / ".codex" / day / "rollout-default.jsonl", CODEX_ROWS)
+    relocated = _write_jsonl(tmp_path / "codex-home" / day / "rollout-relocated.jsonl", CODEX_ROWS)
+    return default, relocated
+
+
+def test_discover_codex_rollout_honours_codex_home(tmp_path, monkeypatch):
+    """The probe searches the codex root live sessions tally from (DW-546).
+
+    Ablation: replace `_convention_glob`'s codex routing with the plain
+    `os.path.expanduser(pattern)` and this fails. The `~/.codex` decoy is then
+    the only match."""
+    _default, relocated = _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    # The usage-parser glob and the family fallback both route through it.
+    for parser in ("codex-rollout", "none"):
+        found = probe.discover_transcript(parser, cli="codex", hints=probe.Hints())
+        assert found.real_path == relocated
+        assert found.multiple is False
+        # The display names the variable, never the configured path.
+        assert found.glob == "$CODEX_HOME/sessions/*/*/*/rollout-*.jsonl"
+
+
+@pytest.mark.parametrize("codex_home", [None, ""], ids=["unset", "empty"])
+def test_discover_codex_rollout_defaults_to_home(tmp_path, monkeypatch, codex_home):
+    default, _relocated = _codex_homes(tmp_path, monkeypatch)
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path == default
+    assert found.glob == "~/.codex/sessions/*/*/*/rollout-*.jsonl"
+
+
+def test_discover_codex_rollout_matches_root_literally(tmp_path, monkeypatch):
+    """A CODEX_HOME holding glob metacharacters is a path, not a pattern."""
+    _codex_homes(tmp_path, monkeypatch)
+    root = tmp_path / "codex[x]"
+    rollout = _write_jsonl(root / "sessions" / "2026" / "10" / "12" / "rollout-a.jsonl", CODEX_ROWS)
+    monkeypatch.setenv("CODEX_HOME", str(root))
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path == rollout
+
+
+def test_discover_codex_rollout_without_a_root_notes(tmp_path, monkeypatch):
+    _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(probe, "codex_home", lambda _env: None)
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path is None
+    assert "no existing transcript matched" in found.note
+    assert found.glob == "~/.codex/sessions/*/*/*/rollout-*.jsonl"
+
+
+def test_scan_codex_rollout_honours_profile_codex_home(tmp_path, monkeypatch):
+    """A profile env's CODEX_HOME relocates the scan's search, as it does the
+    live tally's (`{**os.environ, **profile.env}`)."""
+    from dataclasses import replace
+
+    from bmad_loop import codex_trust
+
+    _default, relocated = _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(probe, "run_version_help", lambda binary: probe.FlagFinding(binary, True))
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: codex_trust.TrustResult("trusted", ""),
+    )
+    profile = replace(get_profile("codex"), env={"CODEX_HOME": str(tmp_path / "codex-home")})
+    finding = probe.scan(cli="codex", profile=profile, project=tmp_path, hints=probe.Hints())
+    assert finding.transcript is not None
+    assert finding.transcript.real_path == relocated
+    assert finding.transcript.glob == "$CODEX_HOME/sessions/*/*/*/rollout-*.jsonl"
+
+
 # ----------------------------------------------------------- registration
 
 

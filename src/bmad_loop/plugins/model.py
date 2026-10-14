@@ -296,13 +296,23 @@ class LoadedPlugin:
         was not left untrusted (an un-enabled builtin ``[python]`` is wholly
         inert). A construct error keeps it active — its declarative hooks are
         out-of-process and independent of the module that failed."""
-        return (self.verdict is None or self.verdict.active) and self.trusted
+        return verdict_admits(self.verdict) and self.trusted
 
     @property
     def live_instance_or_declarative(self) -> bool:
         """Active, and either codeless or with its in-process instance built —
         the gate for workflows and seeds, which follow the module's fate."""
         return self.active and (self.manifest.python is None or self.instance is not None)
+
+
+def verdict_admits(verdict: Verdict | None) -> bool:
+    """Whether a trust verdict lets its plugin take part at all: no verdict (a
+    registry built without the gate) or an active one. THE active-set rule —
+    `LoadedPlugin.active` reads it, and so does the static, exec-free walk
+    (`registry.static_workflow_roles`) that only has `preflight` verdicts, so the
+    two cannot drift. A registry-built ``trusted=False`` only ever co-occurs with
+    a REFUSED/UNENABLED verdict, which this already rejects."""
+    return verdict is None or verdict.active
 
 
 # re-exported by manifest.py for parser convenience
@@ -321,4 +331,5 @@ __all__ = [
     "PluginManifest",
     "Plugin",
     "LoadedPlugin",
+    "verdict_admits",
 ]

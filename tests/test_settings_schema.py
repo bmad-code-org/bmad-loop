@@ -212,6 +212,15 @@ def test_every_policy_dataclass_is_classified():
     assert policy_dcs <= classified, f"unclassified policy dataclasses: {policy_dcs - classified}"
 
 
+def test_core_widget_ids_stay_section_dash_key():
+    """Core fields carry no explicit id: their widget ids stay ``<section>-<key>``
+    with dots dashed — only plugin fields go through `plugin_field_wid`."""
+    specs = [f for s in load_core_schema() for f in s.fields]
+    assert all(f.id == "" for f in specs)
+    ids = {f.widget_id for f in specs}
+    assert {"limits-max_review_cycles", "adapter-review-model"} <= ids
+
+
 # --------------------------------------------------------------- packaging
 
 
@@ -242,7 +251,7 @@ def test_every_discovered_plugin_is_listed_with_settings():
     assert [f.key for f in example.fields] == ["greeting"]
     greeting = example.fields[0]
     assert greeting.section == "plugins.example"
-    assert greeting.widget_id == "plugins-example-greeting"  # dotted -> dashed, unchanged
+    assert greeting.widget_id == "plugins-example-greeting"  # safe name and key read as-is
     assert greeting.kind == "str" and greeting.default == "hello"
     # plugin_schemas cover every plugin contributing settings, so [plugins.<name>]
     # tables are typed on save even when the plugin is not enabled.
@@ -391,7 +400,7 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     editor_mode = next(f for f in unity.fields if f.key == "editor_mode")
     assert editor_mode.kind == "select"
     assert editor_mode.options == ("shared", "per_worktree")
-    assert editor_mode.widget_id == "plugins-unity-editor_mode"  # dotted -> dashed
+    assert editor_mode.widget_id == "plugins-unity-editor_5fmode"  # plugin_field_wid-encoded
 
 
 def test_deprecated_engine_block_folds_into_unity_plugin():

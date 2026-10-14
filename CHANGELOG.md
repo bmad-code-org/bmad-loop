@@ -71,6 +71,9 @@ breaking changes may land in a minor release.
   `bmad-loop-ctl-<digest>` session is still treated as a control session and never pruned,
   but new launches, the TUI's attach and stop keys and the parked-window sweep use
   `bmad-loop-ctl`; end the old session once its windows have parked (#733).
+- With `[review] enabled = false`, the skills preflight (`run`, `sweep`, resume,
+  `resolve --reverify`, `validate`, `--dry-run`) no longer checks the review CLI's skill
+  tree unless an active plugin binds an enabled `role = "review"` workflow (DW-380).
 
 ### Removed
 
@@ -79,6 +82,16 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
+  captured, not only after the command exits, so a chatty command's memory no longer
+  grows with its runtime (DW-549).
+- Make `bmad-loop probe-adapter` search for codex rollouts under `$CODEX_HOME/sessions`,
+  as live sessions do, instead of always `~/.codex/sessions` (DW-546).
+- Name `opencode.db` and say to move it aside when an OpenCode 1.x server dies at
+  startup on a database a 2.x server created, instead of reporting only `rc=1` (DW-544).
+- Save a dotted plugin name's settings from the TUI under `[plugins."<name>"]`, not in
+  nested tables the policy loader never reads. Values saved the old way are not
+  migrated — re-enter them (DW-550).
 - Start a run's mux session at the project root, not in the first session's working
   directory. Under worktree isolation on Windows psmux, the session held the first unit's
   worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
@@ -118,8 +131,9 @@ breaking changes may land in a minor release.
 - Bind the re-drive's own spec on a fixable repair when a resolved re-drive
   began with no spec, instead of crashing the engine with "attempt-owned spec
   became unreadable" (#860).
-- Open the TUI settings screen when a toggled plugin's name is not a valid widget id
-  (a space or a dot): its toggle, status and settings-group ids are encoded (#496, #497).
+- Open the TUI settings screen when a plugin's name or `[[settings]]` key is not a valid
+  widget id (a space or a dot): its toggle, status, settings-group and setting-field ids
+  are encoded (#496, #497, DW-539).
 - Spawn tmux with `-u` so window and session listings parse when bmad-loop runs
   without a UTF-8 locale (`LANG` unset, `LC_ALL=C`, cron, systemd). tmux printed
   each field tab as `_`, so every window read as nameless and untagged (#881).

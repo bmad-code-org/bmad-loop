@@ -56,25 +56,11 @@ from ...plugins.grants import TRUSTED_SOURCES, GrantRecord, GrantSet, missing_me
 from ...plugins.model import PluginError
 from ...plugins.registry import preflight, read_bound_tree
 from ...policy import POLICY_FILE
-from ...settings_schema import PluginInfo, SettingSpec, build_registry
+from ...settings_schema import PluginInfo, SettingSpec, build_registry, plugin_wid
 from ..settings import PolicyDoc
 
 # collect() sentinel for a field whose widget holds an unusable value
 _INVALID = object()
-
-
-def plugin_wid(name: str) -> str:
-    """A plugin name as a widget-id fragment. A manifest name is any non-empty
-    string, but a Textual id takes only ``[A-Za-z0-9_-]``, so an unsafe name
-    would stop the screen from opening. ASCII letters, digits and ``-`` pass
-    through; every other character's UTF-8 bytes (``_`` included, which keeps the
-    encoding injective) become ``_xx`` hex.
-    ABLATION (test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants):
-    return ``name`` unchanged and the screen fails to open."""
-    return "".join(
-        c if c.isascii() and (c.isalnum() or c == "-") else "".join(f"_{b:02x}" for b in c.encode())
-        for c in name
-    )
 
 
 class SettingsScreen(Screen[None]):

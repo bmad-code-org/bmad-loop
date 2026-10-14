@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import types
+import warnings
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -60,6 +61,7 @@ from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
 from bmad_loop.plugins import GrantSet
+from bmad_loop.plugins.store import load_grants
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
 
@@ -409,7 +411,7 @@ def test_dry_run_banner_stays_silent_for_a_warning_only_finding(project, capsys)
         'id = "adversarial"\n'
         'instruction = "Invoke the `bmad-review` skill with only the `adversarial` lens."\n'
     )
-    for tree in cli._skill_trees(project.project, pol):
+    for tree in cli._skill_trees(project.project, pol, project.project, GrantSet.empty()):
         primitive = project.project / tree / install.DEV_PRIMITIVE_NEW
         (primitive / "customize.toml").write_text(layer, encoding="utf-8")
 
@@ -418,7 +420,9 @@ def test_dry_run_banner_stays_silent_for_a_warning_only_finding(project, capsys)
     custom.mkdir(parents=True, exist_ok=True)
     (custom / f"{install.DEV_PRIMITIVE_NEW}.toml").write_text("not = [toml\n", encoding="utf-8")
 
-    findings = install.missing_base_skills(project.project, cli._skill_trees(project.project, pol))
+    findings = install.missing_base_skills(
+        project.project, cli._skill_trees(project.project, pol, project.project, GrantSet.empty())
+    )
     severities = {f.severity for f in findings}
     assert severities == {"warning"}, f"fixture no longer produces a warning-only set: {findings}"
     assert {f.check for f in findings} == {"skills.customize-unreadable"}
@@ -3373,7 +3377,7 @@ def test_cmd_sweep_forwards_selector_to_start_sweep(
     monkeypatch.setattr(cli, "_reject_under_floor_git", lambda _project: None)
     monkeypatch.setattr(cli, "_reject_isolation_conflict", lambda _paths, _pol: None)
     monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root, **_kw: True)
-    monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol: True)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol, _root, _grants: True)
     monkeypatch.setattr(cli, "_require_sweep_skill", lambda _project, _pol: True)
     monkeypatch.setattr(cli, "_reconcile_stale", lambda *_args: None)
     monkeypatch.setattr(
@@ -9643,7 +9647,7 @@ def test_require_base_skills_warnings_do_not_block_the_run(tmp_path, monkeypatch
     warning = Finding("skills.review-layer-unresolved", "warning", "conditional layer", {})
     monkeypatch.setattr(install_mod, "missing_base_skills", lambda *a, **k: [warning])
 
-    assert cli._require_base_skills(tmp_path, pol) is True
+    assert cli._require_base_skills(tmp_path, pol, tmp_path, GrantSet.empty()) is True
     err = capsys.readouterr().err
     assert "conditional layer" in err
     assert "FAIL" not in err
@@ -9651,7 +9655,7 @@ def test_require_base_skills_warnings_do_not_block_the_run(tmp_path, monkeypatch
     # ...and a real problem alongside it still aborts
     problem = Finding("skills.review-layer-missing", "problem", "missing reviewer", {})
     monkeypatch.setattr(install_mod, "missing_base_skills", lambda *a, **k: [warning, problem])
-    assert cli._require_base_skills(tmp_path, pol) is False
+    assert cli._require_base_skills(tmp_path, pol, tmp_path, GrantSet.empty()) is False
     assert "FAIL: missing reviewer" in capsys.readouterr().err
 
 
@@ -12944,29 +12948,52 @@ def test_validate_passes_a_valid_project_plugin(project, capsys, monkeypatch):
     assert "fine" in finding["detail"]["plugins"]
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [CLAUDE_ONLY_POLICY, CLAUDE_ONLY_POLICY + "[review]\nenabled = false\n"],
+    ids=["review-on", "review-off"],
+)
 def test_validate_warns_on_an_api_mismatched_plugin_without_leaking_the_warning(
-    project, capsys, monkeypatch
+    project, capsys, monkeypatch, policy
 ):
     """`load_plugins` skips a third-party manifest on an unsupported api_version via
     `warnings.warn`. Validate reports it as a warning finding instead — rc stays 0 —
-    and the Python warning itself must not reach stderr, in either output mode."""
+    and the Python warning itself must not reach stderr, in either output mode.
+
+    The review-off row also walks the manifests in the skills preflight's
+    review-tree predicate (`cli._review_tree_gated`, DW-380), which must suppress
+    the same warning. Ablation: drop its `warnings.catch_warnings` and the
+    review-off row's leaked-warning assertion fails (``err`` alone cannot see it:
+    pytest's warning capture swallows a leak first)."""
     _validate_with_plugin(
-        project, monkeypatch, capsys, "future", '[plugin]\nname = "future"\napi_version = 999\n'
+        project,
+        monkeypatch,
+        capsys,
+        "future",
+        '[plugin]\nname = "future"\napi_version = 999\n',
+        policy=policy,
     )
 
-    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
-    warned = [f for f in _plugin_findings(doc) if f["severity"] == "warning"]
-    assert len(warned) == 1
-    assert "'future'" in warned[0]["message"] and "api_version 999" in warned[0]["message"]
-    assert (
-        "future"
-        not in next(f for f in _plugin_findings(doc) if f["severity"] == "ok")["detail"]["plugins"]
-    )
+    # pytest's own warning capture would swallow a leak before it reached stderr,
+    # so record what escapes validate directly as well.
+    with warnings.catch_warnings(record=True) as leaked:
+        warnings.simplefilter("always")
+        doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+        warned = [f for f in _plugin_findings(doc) if f["severity"] == "warning"]
+        assert len(warned) == 1
+        assert "'future'" in warned[0]["message"] and "api_version 999" in warned[0]["message"]
+        assert (
+            "future"
+            not in next(f for f in _plugin_findings(doc) if f["severity"] == "ok")["detail"][
+                "plugins"
+            ]
+        )
 
-    assert cli.main(["validate", "--project", str(project.project)]) == 0
-    out, err = capsys.readouterr()
+        assert cli.main(["validate", "--project", str(project.project)]) == 0
+        out, err = capsys.readouterr()
     assert err == ""
     assert "warning: plugin 'future' declares api_version 999" in out
+    assert not [w for w in leaked if "api_version 999" in str(w.message)]
 
 
 def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypatch, tmp_path):
@@ -15659,7 +15686,8 @@ TRIAGE_SPLIT_POLICY = (
 )
 
 # Two CLIs across two trees, with the review STAGE switched off. The adapter is
-# still resolved, still provisioned, and still hooked — see #424 below.
+# still resolved, provisioned and hooked; its tree is gated only while a plugin
+# can still spawn a review-role session — see DW-380 below.
 REVIEW_DISABLED_POLICY = DUAL_CLIENT_POLICY + "[review]\nenabled = false\n"
 
 
@@ -15687,82 +15715,345 @@ def test_require_base_skills_does_not_gate_a_triage_only_skill_tree(project):
     install_build_auto_skill(project.project, ".claude/skills")  # claude's tree ONLY
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
 
-    assert cli._require_base_skills(project.project, pol) is True
+    assert cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is True
     # ...because triage's tree was never asked about. Asserting the whole list, not
     # `".agents/skills" not in`: the point is which trees ARE gated, and an empty
     # list would satisfy the negative form while gating nothing at all.
-    assert cli._skill_trees(project.project, pol) == [".claude/skills"]
+    assert cli._skill_trees(project.project, pol, project.project, GrantSet.empty()) == [
+        ".claude/skills"
+    ]
 
     # The structural half, so a `triage` that creeps back into the constant fails
-    # here by name rather than only through a filesystem shape. The two sets are one
-    # decision — `WorktreeFlow.worktree_profiles` reads the same constant — so the
-    # dev-primitive set being a STRICT subset is what keeps "gated" and "provisioned"
-    # from drifting apart in either direction.
+    # here by name rather than only through a filesystem shape.
+    # `WorktreeFlow.worktree_profiles` reads the same constant, so the dev-primitive
+    # set being a STRICT subset of `ROLES` is what keeps "gated" within
+    # "provisioned".
     assert DEV_PRIMITIVE_ROLES == ("dev", "review")
     assert set(DEV_PRIMITIVE_ROLES) < set(ROLES)
 
 
-def test_skill_trees_covers_review_even_when_review_is_disabled(project):
-    """``review.enabled = false`` must NOT narrow the gated trees (#424).
+# A project plugin binding a `role = "review"` workflow — an executable surface,
+# so it runs (and binds the review adapter) only under an operator grant.
+REVIEW_PLUGIN_TOML = (
+    '[plugin]\nname = "gatekeeper"\napi_version = 1\n'
+    '[workflows.gate]\nstage = "pre_commit_gate"\nrole = "review"\nprompt = "/gate {story_key}"\n'
+)
 
-    This test exists to make a future narrowing FAIL. The obvious follow-on to the
-    role-scoping above is "and drop review's tree when the review stage is off" — it
-    is wrong, and it is wrong quietly. Disabling the review stage does not retire the
-    review ADAPTER: a plugin workflow can declare ``role = "review"`` and dispatch on
-    ``adapters["review"]`` with review disabled, and the same profile list drives
-    per-CLI Stop-signal hook registration as well as worktree seeding. A worktree
-    provisioned without the review profile has no completion signal for those
-    sessions, so narrowing here would convert a clean, actionable preflight refusal
-    into a silent stall that burns the run's whole budget."""
-    _write_policy(project.project, REVIEW_DISABLED_POLICY)
+TEA_ENABLED = '[plugins]\nenabled = ["tea"]\n'
+# tea's three review-role workflows switched off by the settings overlay; its
+# dev-role ones (td/atdd/automate) stay on and bind nothing on the review side.
+TEA_REVIEW_STEPS_OFF = (
+    TEA_ENABLED + "[plugins.tea]\ntrace_enabled = false\nnfr_enabled = false\n"
+    "review_enabled = false\n"
+)
+
+
+def _write_review_plugin(root: Path) -> None:
+    pdir = root / ".bmad-loop" / "plugins" / "gatekeeper"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(REVIEW_PLUGIN_TOML, encoding="utf-8")
+
+
+def _grant_review_plugin(root: Path) -> None:
+    from conftest import grant_plugin
+
+    _write_review_plugin(root)
+    grant_plugin(root, "gatekeeper", store_project=root)
+
+
+def _break_plugin_discovery(root: Path) -> None:
+    # not valid UTF-8: `loader._read_manifest_text` raises PluginError — a
+    # discovery fault, not a skipped manifest
+    pdir = root / ".bmad-loop" / "plugins" / "broken"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_bytes(b"\xff\xfe[plugin]\n")
+
+
+@pytest.mark.parametrize(
+    ("extra_policy", "arrange", "expected"),
+    [
+        ("", None, [".claude/skills"]),
+        (TEA_ENABLED, None, [".claude/skills", ".agents/skills"]),
+        (TEA_REVIEW_STEPS_OFF, None, [".claude/skills"]),
+        ("", _grant_review_plugin, [".claude/skills", ".agents/skills"]),
+        ("", _write_review_plugin, [".claude/skills"]),
+        ("", _break_plugin_discovery, [".claude/skills", ".agents/skills"]),
+    ],
+    ids=[
+        "no-review-bound-plugin",
+        "enabled-tea",
+        "tea-review-steps-disabled",
+        "granted-project-review-plugin",
+        "never-granted-project-review-plugin",
+        "discovery-fault",
+    ],
+)
+def test_skill_trees_drop_review_only_when_no_review_session_can_spawn(
+    project, extra_policy, arrange, expected
+):
+    """``review.enabled = false`` drops the review tree only when nothing can still
+    spawn a review-role session (DW-380).
+
+    Disabling the review stage does not by itself retire the review ADAPTER: a
+    plugin workflow can declare ``role = "review"`` and dispatch on
+    ``adapters["review"]`` with review off. So the review tree stays gated while any
+    statically-active plugin binds a still-enabled review workflow — an enabled
+    builtin (tea), or a granted project plugin. A never-granted one is refused in a
+    real run too, and a workflow its settings disable never fires, so neither keeps
+    the tree. A discovery fault keeps it: the predicate may over-approximate only
+    toward gating, and the fault is reported loudly elsewhere — never raised here."""
+    _write_policy(project.project, REVIEW_DISABLED_POLICY + extra_policy)
+    if arrange is not None:
+        arrange(project.project)
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
-    assert pol.review.enabled is False, "the fixture only bites with the stage off"
+    assert pol.review.enabled is False, "the matrix only bites with the stage off"
 
-    trees = cli._skill_trees(project.project, pol)
-    assert trees == [".claude/skills", ".agents/skills"]  # dev=claude, review=codex
+    # Asserting the whole list, not `".agents/skills" not in`: an empty list would
+    # satisfy the negative form while gating nothing at all.
+    assert (
+        cli._skill_trees(project.project, pol, project.project, load_grants(project.project))
+        == expected
+    )
 
 
-def test_gated_trees_and_provisioned_trees_stay_one_decision(project):
-    """Constraint 1, pinned from BOTH sides rather than asserted in a comment.
+def test_require_base_skills_passes_review_off_without_the_review_tree(project):
+    """The behavior change end to end: review off, dev=claude/review=codex, no plugin
+    binding a review workflow, and ``bmad-build-auto`` installed only in claude's
+    tree — the preflight passes. Enabling tea (three review-role workflows) gates
+    ``.agents/skills`` again.
+
+    Ablation: with `_skill_trees` reverted to gate both `DEV_PRIMITIVE_ROLES` trees
+    unconditionally (the `_review_tree_gated` check removed), the first
+    ``is True`` goes False — nothing installed ``.agents/skills/bmad-build-auto``."""
+    _write_policy(project.project, REVIEW_DISABLED_POLICY)
+    install_build_auto_skill(project.project, ".claude/skills")  # claude's tree ONLY
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert (
+        cli._require_base_skills(
+            project.project, pol, project.project, load_grants(project.project)
+        )
+        is True
+    )
+
+    _write_policy(project.project, REVIEW_DISABLED_POLICY + TEA_ENABLED)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert (
+        cli._require_base_skills(
+            project.project, pol, project.project, load_grants(project.project)
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("latched", [True, False], ids=["salvage-latched", "no-latch"])
+def test_resume_gates_the_review_tree_for_a_latched_salvage(project, monkeypatch, capsys, latched):
+    """A resume owing a latched review-timeout salvage keeps the review tree gated
+    even with ``[review]`` turned off during the pause (DW-380): the engine
+    re-enters the review loop for the latch, and a salvage that no longer applies
+    retries as a fresh review-role session. Review off, dev=claude/review=codex,
+    and codex's tree empty — the latched resume is refused over ``.agents/skills``;
+    the unlatched row is the control and launches.
+
+    Ablation: drop ``review_owed`` from `_prepare_resume_locked`'s
+    `_require_base_skills` call and the salvage-latched row launches."""
+    import shutil
+
+    from bmad_loop.model import Phase, StoryTask
+
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        salvage_refile_pending=latched,
+    )
+    run_dir = _paused_run_for_resume(project, monkeypatch, tasks={"1-1-a": task})
+    _write_policy(project.project, RESUME_POLICY + REVIEW_DISABLED_POLICY)
+    shutil.rmtree(project.project / ".agents" / "skills")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    capsys.readouterr()
+
+    rc = cli._resume_paused_run(project.project, run_dir)
+    err = capsys.readouterr().err
+    agents_fails = [ln for ln in err.splitlines() if ln.startswith("FAIL: .agents/skills")]
+    if latched:
+        assert rc == 1
+        assert agents_fails, err
+    else:
+        assert rc == 0, err
+        assert not agents_fails
+
+
+@pytest.mark.parametrize("grant", [True, False], ids=["granted", "never-granted"])
+def test_validate_judges_review_plugins_under_the_code_root(project, monkeypatch, capsys, grant):
+    """The review-tree predicate reads plugin manifests from the run's CODE root,
+    not the project dir (DW-380). Nested monorepo layout: the project at
+    ``<repo>/app``, a granted ``role = "review"`` plugin under ``<repo>``, review
+    off, and ``bmad-build-auto`` only in claude's tree. validate must still gate
+    ``.agents/skills`` — a caller passing the project as the root would look under
+    ``app/.bmad-loop/plugins``, find nothing, and drop the tree.
+
+    The never-granted row is the control: same plugin, no grant, the review tree
+    is not gated — so the granted row's problem is the plugin's doing."""
+    paths = nested_repo_root_paths(project)
+    _write_review_plugin(paths.repo_root)  # committed by the pass fixture below
+    _make_validate_pass(
+        paths,
+        monkeypatch,
+        capsys,
+        policy=REVIEW_DISABLED_POLICY,
+        skills=lambda root: install_build_auto_skill(root, ".claude/skills"),  # claude's ONLY
+        bmad_config=lambda _p: None,
+    )
+    assert paths.project == paths.repo_root / "app", "premise: nested roots"
+    if grant:
+        from conftest import grant_plugin
+
+        grant_plugin(paths.repo_root, "gatekeeper", store_project=paths.project)
+
+    doc = machine_json(["validate", "--project", str(paths.project), "--json"], capsys, rc=1)
+    agents_problems = [
+        f
+        for f in doc["findings"]
+        if f["check"].startswith("skills.")
+        and f["severity"] == "problem"
+        and (f["detail"] or {}).get("tree") == ".agents/skills"
+    ]
+    if grant:
+        assert agents_problems, doc["findings"]
+    else:
+        assert not agents_problems
+        base = next(f for f in doc["findings"] if f["check"] == "skills.base")
+        assert base["detail"]["trees"] == [".claude/skills"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "grant"),
+    [(["run"], True), (["run", "--dry-run"], True), (["run", "--dry-run"], False)],
+    ids=["run-granted", "dry-run-granted", "dry-run-never-granted"],
+)
+def test_launch_judges_review_plugins_under_the_code_root(
+    project, monkeypatch, capsys, argv, grant
+):
+    """The launch-side twin of the validate test above: `cmd_run` and the dry-run
+    banner hand the review-tree predicate ``paths.repo_root`` and the launch's
+    grants, not the project dir (DW-380). Same nested layout and granted
+    ``role = "review"`` plugin; the run must abort over ``.agents/skills`` and the
+    banner must predict that abort. The never-granted banner row is the control
+    (a never-granted real run would launch, so it is not driven).
+
+    ABLATION GUARD: passing ``project`` instead of ``paths.repo_root`` at
+    `cmd_run`'s `_require_base_skills` call must fail the run-granted row."""
+    paths = nested_repo_root_paths(project)
+    _write_review_plugin(paths.repo_root)
+    _make_validate_pass(
+        paths,
+        monkeypatch,
+        capsys,
+        policy=REVIEW_DISABLED_POLICY,
+        skills=lambda root: install_build_auto_skill(root, ".claude/skills"),  # claude's ONLY
+        bmad_config=lambda _p: None,
+    )
+    assert paths.project == paths.repo_root / "app", "premise: nested roots"
+    if grant:
+        from conftest import grant_plugin
+
+        grant_plugin(paths.repo_root, "gatekeeper", store_project=paths.project)
+    capsys.readouterr()
+
+    def launched(*_a, **_k):  # the gate after the skills preflight: never reach a launch
+        raise AssertionError("the skills preflight passed and the run went on to launch")
+
+    monkeypatch.setattr(cli, "_reconcile_stale", launched)
+    rc = cli.main([*argv, "--project", str(paths.project)])
+    err = capsys.readouterr().err
+    agents_fails = [ln for ln in err.splitlines() if ".agents/skills" in ln]
+    if "--dry-run" in argv:
+        assert rc == 0
+        assert bool(agents_fails) is grant, err
+    else:
+        assert rc == 1
+        assert agents_fails, err
+
+
+def test_skill_trees_with_review_on_never_read_plugins(project, monkeypatch):
+    """``review.enabled = true`` gates both trees without consulting plugins at all:
+    a discovery walk that would raise is never reached."""
+    from bmad_loop.plugins import registry as registry_mod
+
+    def boom(*_a, **_k):
+        raise AssertionError("plugins were read with review on")
+
+    monkeypatch.setattr(registry_mod, "static_workflow_roles", boom)
+    _write_policy(project.project, DUAL_CLIENT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert pol.review.enabled is True
+    assert cli._skill_trees(project.project, pol, project.project, GrantSet.empty()) == [
+        ".claude/skills",
+        ".agents/skills",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("policy_text", "gated_trees"),
+    [
+        (TRIAGE_SPLIT_POLICY, [".claude/skills"]),
+        (REVIEW_DISABLED_POLICY, [".claude/skills"]),
+    ],
+    ids=["triage-split", "review-disabled"],
+)
+def test_gated_trees_are_a_subset_of_provisioned_trees(project, policy_text, gated_trees):
+    """Gated ⊆ provisioned, pinned from BOTH sides rather than asserted in a comment.
 
     ``cli._skill_trees`` decides which trees can REFUSE a run;
     ``WorktreeFlow.worktree_profiles`` decides which profiles get carried INTO a
-    worktree. The only thing making those one decision is that both iterate
-    :data:`install.DEV_PRIMITIVE_ROLES` — nothing enforced it, so a one-sided edit
-    used to be invisible here. Either direction ships a silent bug: gated but not
-    provisioned drops the session into the `Unknown command` stall the preflight
-    exists to catch, provisioned but not gated refuses runs over a skill nothing
-    reads.
+    worktree. A tree gated but not provisioned drops the session into the
+    `Unknown command` stall the preflight exists to catch, so gating may never
+    exceed provisioning. The converse is deliberate (DW-380): with review off and no
+    review-bound plugin the review tree is not gated, but provisioning still carries
+    the review profile — it drives per-CLI Stop-signal hook registration as well as
+    seeding, and a worktree without it stalls any review-role session on a missing
+    completion signal.
 
-    The triage split is what makes the two sets separable at all — with one CLI
-    everywhere, both readings agree by construction and the test proves nothing.
+    The triage split is the equal case (one CLI for dev+review; triage's tree is
+    neither gated nor provisioned); the review-disabled split is the strict subset.
 
     ``worktree_profiles`` is called unbound on a stub carrying only
-    ``_adapters_get``, which is the entirety of the ``self`` it touches: building a
-    whole `WorktreeFlow` here would drag in the engine callbacks without making the
-    assertion any stronger. The adapters dict carries ALL of `runsetup.ROLES`, so a
-    one-sided revert to `ROLES` fails on the set comparison below rather than
-    escaping as a `KeyError` on a missing triage key."""
+    ``_adapters_get``, which is the entirety of the ``self`` it touches. The adapters
+    dict carries ALL of `runsetup.ROLES`, so a one-sided revert to `ROLES` fails on
+    the set comparison below rather than escaping as a `KeyError`."""
     from types import SimpleNamespace
 
     from bmad_loop.adapters.profile import get_profile
     from bmad_loop.runsetup import ROLES
     from bmad_loop.worktree_flow import WorktreeFlow
 
-    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    _write_policy(project.project, policy_text)
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     adapters = {
         role: SimpleNamespace(profile=get_profile(pol.adapter.resolved(role).name, project.project))
         for role in ROLES
     }
 
-    gated = cli._skill_trees(project.project, pol)
-    provisioned = WorktreeFlow.worktree_profiles(SimpleNamespace(_adapters_get=lambda: adapters))
+    gated = cli._skill_trees(project.project, pol, project.project, GrantSet.empty())
+    provisioned = {
+        p.skill_tree
+        for p in WorktreeFlow.worktree_profiles(SimpleNamespace(_adapters_get=lambda: adapters))
+    }
+    # the dev + review adapters' trees, whatever is gated
+    dev_primitive = {
+        get_profile(pol.adapter.resolved(role).name, project.project).skill_tree
+        for role in ("dev", "review")
+    }
 
-    # Pin the value, not just the agreement: two empty sets would satisfy the
-    # equality below while gating and provisioning nothing at all.
-    assert gated == [".claude/skills"]
-    assert {p.skill_tree for p in provisioned} == set(gated)
+    # Pin the values, not just the relation: two empty sets satisfy any subset check.
+    assert gated == gated_trees
+    assert set(gated) <= provisioned
+    assert provisioned == dev_primitive
+    if pol.review.enabled:
+        assert set(gated) == provisioned
+    else:
+        assert set(gated) < provisioned
+        assert ".agents/skills" in provisioned  # the review profile is still carried
 
 
 @pytest.mark.parametrize(
@@ -16289,12 +16580,14 @@ def test_require_base_skills_ignores_a_broken_renderer_in_a_triage_only_tree(pro
     install_build_auto_skill(project.project, ".agents/skills", renderer_stub=True)
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
 
-    assert cli._require_base_skills(project.project, pol) is True
+    assert cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is True
     assert "render_skill.py" not in capsys.readouterr().err
 
     # Move the identical broken shape onto the dev tree: the problem now gates.
     install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
-    assert cli._require_base_skills(project.project, pol) is False
+    assert (
+        cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is False
+    )
     assert "render_skill.py" in capsys.readouterr().err
 
 

@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -314,15 +315,23 @@ def test_hard_stop_kills_a_cmd_rooted_tree(tmp_path, reap_leftovers):
 
 
 @WIN32_ONLY
-def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cap", [None, 64], ids=["uncapped", "capped"])
+def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch, cap):
     """DW-478: the root exits at once, leaving an orphan holder with the pipes, and
     the harvest never sees it (patched to `{}`), so no kill reaches it. CPython's
     win32 `communicate` reads each pipe in a thread blocked inside `read()` with
     the BufferedReader lock held; closing the stream then waits on that lock for
     the holder's whole life. The runner must return well before the holder dies.
+    The capped row drives the same give-up through `_CappedCapture`: its readers
+    block in `os.read` too, so `_StreamReader.close` must defer the close to the
+    reader, which closes its own stream once the holder lets the read return.
+    Either way the close is deferred, not dropped: once the holder is killed,
+    both of the root's streams must end up closed rather than leaked.
 
     Ablation: close every stream in `_close_pipes` regardless of its reader
-    thread and, where close() blocks, the return waits out the holder's 30 s."""
+    thread and, where close() blocks, the return waits out the holder's 30 s.
+    Ablation (capped): drop the `close_now` self-close in `_StreamReader._run`
+    and the root's streams stay open after the holder dies."""
     pid_file = tmp_path / "holder.pid"
     holder = tmp_path / "holder.py"
     holder.write_text(
@@ -339,6 +348,15 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
         "                 stdout=sys.stdout, stderr=sys.stderr)\n",
         encoding="utf-8",
     )
+    spawned: list[subprocess.Popen[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
     monkeypatch.setattr(get_process_host(), "descendants", lambda pid: {})
     started = time.monotonic()
     holder_alive_after = False
@@ -348,6 +366,7 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
                 f'"{sys.executable}" "{parent}" "{holder}" "{pid_file}"',
                 cwd=tmp_path,
                 timeout=1.0,
+                max_stream_bytes=cap,
             )
         elapsed = time.monotonic() - started
         deadline = time.monotonic() + 5.0
@@ -371,6 +390,18 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch):
     assert holder_alive_after, "the kill reached the holder; the unreachable-holder arm never ran"
     assert run.timed_out is True
     assert elapsed < 1.0 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
+    # the holder is dead, so each deferred reader's read has returned and the
+    # reader closed its own stream
+    # the runner's spawn is the first Popen; the patch is module-global, so the
+    # timeout kill's `taskkill` runs are recorded after it
+    root = spawned[0]
+    streams = (root.stdout, root.stderr)
+    deadline = time.monotonic() + 5.0
+    while not all(s is not None and s.closed for s in streams):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    assert all(s is not None and s.closed for s in streams), "a deferred pipe close leaked"
 
 
 # ---- run_argv: the executable-argv sibling ------------------------------------------
@@ -1148,4 +1179,352 @@ def test_drain_timeout_output_goes_through_timeout_stream(tmp_path):
     assert observed["drained_stdout"] == observed["completed_stdout"]
     assert observed["drained_stderr"] == ""
     # timeout + kill steps + the (patched) drain — never the holder's 30 s
+    assert observed["elapsed"] < 1.0 + 3 * childrun.KILL_WAIT_S + 0.3 + 2.0
+
+
+# ---- the capped capture (DW-549) ---------------------------------------------------
+#
+# `max_stream_bytes` bounds what the runner HOLDS of a stream while the child runs,
+# not just what it returns. The pure rows grade `_TailBuffer` against `byte_tail` of
+# the whole decoded stream — the definition the capped path must reproduce — and
+# its held-bytes bound after every feed; the real rows drive `run_child` itself.
+
+# Two-, three- and four-byte characters, CRLF pairs and lone CRs, so a sweep of
+# chunk sizes splits every one of them across a read boundary somewhere.
+_TAIL_RAW = ("abé\r\n€\rcd\U0001f600\r\n" * 7 + "tail\r").encode("utf-8")
+
+
+def _text_mode(raw: bytes, encoding: str = "utf-8") -> str:
+    """What the completed text-mode path makes of ``raw``: decode with replace,
+    then universal newlines (``Popen._translate_newlines``)."""
+    return raw.decode(encoding, errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7, 16, len(_TAIL_RAW)])
+@pytest.mark.parametrize("cap", [0, 1, 3, 4, 9, 40, 10_000])
+def test_tail_buffer_equals_byte_tail_of_the_whole_and_stays_bounded(chunk, cap):
+    """Fed in `chunk`-byte reads, the buffer returns exactly `byte_tail` of the
+    whole decoded stream — a multibyte character or `\\r\\n` split across reads
+    decodes as if read whole — and after EVERY feed it holds at most the cap plus
+    one coalesced piece: under `min(cap, _READ_CHUNK)` bytes plus the decoded read
+    that closed it. A `chunk`-byte read of valid UTF-8 decodes to at most `chunk`
+    bytes plus the up-to-3-byte partial carried from the read before.
+
+    Ablation: drop the leading-piece trim in `_TailBuffer._append` and the
+    held-bytes bound fails on every small-cap row; decode each chunk on its own
+    (`data.decode(...)`, no incremental decoder) and the split-character rows
+    gain U+FFFD where the whole decode has none."""
+    expected_whole = _text_mode(_TAIL_RAW)
+    buffer = childrun._TailBuffer(cap, "utf-8", "replace")  # pyright: ignore[reportPrivateUsage]
+    coalesce = max(1, min(cap, childrun._READ_CHUNK))  # pyright: ignore[reportPrivateUsage]
+    for start in range(0, len(_TAIL_RAW), chunk):
+        buffer.feed(_TAIL_RAW[start : start + chunk])
+        assert buffer.held_bytes <= max(cap, 0) + coalesce + chunk + 3
+    buffer.finish()
+
+    assert buffer.snapshot() == childrun.byte_tail(expected_whole, cap)
+    # premise: the payload really is over the small caps and really splits pairs
+    assert len(expected_whole.encode("utf-8")) > 40 and "\r" not in expected_whole
+
+
+def test_tail_buffer_holds_one_cut_piece_and_ignores_feeds_after_finish():
+    """A single piece far over the cap is cut on arrival rather than held whole,
+    a dangling `\\r` is settled by `finish`, and a feed arriving after `finish` —
+    a win32 reader returning from a read the drain gave up on — is ignored."""
+    buffer = childrun._TailBuffer(8, "utf-8", "replace")  # pyright: ignore[reportPrivateUsage]
+    buffer.feed(b"x" * 100_000 + b"\r")
+    assert buffer.held_bytes <= 8
+    buffer.finish()
+    buffer.finish()  # idempotent
+    buffer.feed(b"late")
+
+    assert buffer.snapshot() == ("x" * 7 + "\n", 100_001)
+
+
+def test_tail_buffer_coalesces_tiny_reads(monkeypatch):
+    """A child flushing one byte at a time must not cost one held object per
+    read: small decoded pieces coalesce into runs of `min(cap, _READ_CHUNK)`
+    bytes, so the held piece count stays O(cap / _READ_CHUNK) — plus the open
+    run's parts — however many reads arrive. `_READ_CHUNK` is lowered so a small
+    cap still spans many coalesced pieces.
+
+    Ablation: close every piece on arrival (coalesce threshold 1) and the count
+    climbs to ~cap one-byte pieces, past the bound on the first few hundred feeds."""
+    monkeypatch.setattr(childrun, "_READ_CHUNK", 64)
+    cap = 1000
+    raw = bytes(ord("a") + i % 26 for i in range(10_000))
+    buffer = childrun._TailBuffer(cap, "utf-8", "replace")  # pyright: ignore[reportPrivateUsage]
+    most = 0
+    for byte in raw:
+        buffer.feed(bytes([byte]))
+        most = max(most, buffer.piece_count)
+    buffer.finish()
+
+    assert most <= cap // 64 + 2 + 64  # closed pieces + the open run's parts
+    assert buffer.snapshot() == childrun.byte_tail(raw.decode("ascii"), cap)
+
+
+def test_tail_buffer_decodes_with_the_resolved_codec():
+    """The capped decode is the completed path's codec, not a hardcoded UTF-8:
+    under an ASCII codec the two-byte `é` reads back as two U+FFFD, exactly as
+    `communicate` would have returned it."""
+    raw = b"caf\xc3\xa9\r\nsecond\rthird\n"
+    buffer = childrun._TailBuffer(  # pyright: ignore[reportPrivateUsage]
+        1 << 20, "ascii", "replace"
+    )
+    for byte in raw:
+        buffer.feed(bytes([byte]))
+    buffer.finish()
+
+    expected = _text_mode(raw, "ascii")
+    assert expected != _text_mode(raw)  # premise: the codec choice is observable
+    assert buffer.snapshot() == (expected, len(expected.encode("utf-8")))
+
+
+def _writer(directory: Path, body: str) -> str:
+    script = directory / "writer.py"
+    script.write_text("import sys, time\n" + body, encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def test_capped_run_keeps_the_tail_and_the_emitted_size(tmp_path, monkeypatch):
+    """Over the cap: each stream comes back as `byte_tail` of what the child wrote,
+    with its emitted size, across many pipe reads — and the cap holds WHILE the
+    streams are read, not only on the result: after every feed the buffer holds
+    at most the cap plus one coalesced piece (`min(cap, _READ_CHUNK)`) plus one
+    decoded read (`_READ_CHUNK` + a 3-byte carried partial).
+
+    Ablations: pass `max_stream_bytes` nowhere in `run_child` and the stream comes
+    back whole with `stdout_bytes` None; make `_TailBuffer._append` keep every
+    piece uncut and untrimmed (cutting only in `snapshot`) and the final values
+    still match, but the recorded held maximum is the whole stream."""
+    real_feed = childrun._TailBuffer.feed  # pyright: ignore[reportPrivateUsage]
+    held: list[int] = []
+
+    def recording_feed(self, data: bytes) -> None:
+        real_feed(self, data)
+        held.append(self.held_bytes)
+
+    tail_buffer = childrun._TailBuffer  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(tail_buffer, "feed", recording_feed)
+    command = _writer(
+        tmp_path,
+        "for i in range(10000):\n"
+        "    sys.stdout.write('line %05d \\u00e9\\n' % i)\n"
+        "sys.stderr.write('e' * 300)\n"
+        "sys.exit(2)\n",
+    )
+    whole_out = "".join("line %05d é\n" % i for i in range(10000))
+    with stop_probe(lambda: False):
+        run = childrun.run_child(command, cwd=tmp_path, timeout=30, max_stream_bytes=101)
+
+    assert run.returncode == 2 and not run.timed_out and not run.interrupted
+    assert (run.stdout, run.stdout_bytes) == childrun.byte_tail(whole_out, 101)
+    assert (run.stderr, run.stderr_bytes) == ("e" * 101, 300)
+    chunk = childrun._READ_CHUNK  # pyright: ignore[reportPrivateUsage]
+    assert run.stdout_bytes is not None
+    assert run.stdout_bytes > chunk * 2  # premise: more than one read chunk
+    assert held and max(held) <= 101 + min(101, chunk) + chunk + 3
+
+
+def test_a_failing_reader_surfaces_from_run_child(tmp_path, monkeypatch):
+    """A reader thread that fails mid-stream is loud: its exception propagates
+    from `run_child`, never folded into a healthy-looking short stream. Injected
+    at the reader's read loop (both platform arms), after its first chunk.
+
+    Ablation: delete the `raise reader.error` loop in `_CappedCapture.result` and
+    the call returns normally with a truncated stream."""
+
+    def first_chunk_then_fail(self, fd: int) -> None:
+        self.buffer.feed(os.read(fd, childrun._READ_CHUNK))  # pyright: ignore[reportPrivateUsage]
+        raise OSError("reader broke")
+
+    reader_cls = childrun._StreamReader  # pyright: ignore[reportPrivateUsage]
+    for name in ("_read_selected", "_read_blocking"):
+        monkeypatch.setattr(reader_cls, name, first_chunk_then_fail)
+    command = _writer(tmp_path, "print('out')\n")
+    with stop_probe(lambda: False), pytest.raises(OSError, match="reader broke"):
+        childrun.run_child(command, cwd=tmp_path, timeout=30, max_stream_bytes=64)
+
+
+def test_capped_run_under_the_cap_returns_the_streams_whole(tmp_path):
+    command = _writer(tmp_path, "print('out')\nprint('err', file=sys.stderr)\nsys.exit(3)\n")
+    with stop_probe(lambda: False):
+        run = childrun.run_child(command, cwd=tmp_path, timeout=30, max_stream_bytes=1 << 20)
+
+    assert run == childrun.ChildRun(3, "out\n", "err\n", stdout_bytes=4, stderr_bytes=4)
+
+
+def test_capped_timeout_retains_the_tail_of_what_was_written(tmp_path):
+    """A child still running at its timeout is killed and its flags set, and the
+    tail of what it wrote before the kill survives with its emitted size."""
+    command = _writer(
+        tmp_path,
+        "sys.stdout.write('x' * 5000 + 'END')\nsys.stdout.flush()\ntime.sleep(60)\n",
+    )
+    with stop_probe(lambda: False):
+        run = childrun.run_child(command, cwd=tmp_path, timeout=1.0, max_stream_bytes=16)
+
+    assert run.timed_out is True and run.interrupted is False
+    assert (run.stdout, run.stdout_bytes) == ("x" * 13 + "END", 5003)
+    assert (run.stderr, run.stderr_bytes) == ("", 0)
+
+
+def test_uncapped_callers_apply_no_cap(tmp_path, monkeypatch):
+    """`run_argv` (the probe) and a `run_child` call without the keyword (the
+    plugin bus) stay on the `communicate` path: no cap reaches `_supervise`, and
+    the result carries no emitted sizes.
+
+    Ablation: default `max_stream_bytes` to a number in `run_child`, or pass one
+    from `run_argv`, and the spy records it."""
+    seen: list[int | None] = []
+    real = childrun._supervise  # pyright: ignore[reportPrivateUsage]
+
+    def spy(spawn, timeout, max_stream_bytes=None):
+        seen.append(max_stream_bytes)
+        return real(spawn, timeout, max_stream_bytes)
+
+    monkeypatch.setattr(childrun, "_supervise", spy)
+    with stop_probe(lambda: False):
+        shell = childrun.run_child(_writer(tmp_path, "print('x')\n"), cwd=tmp_path, timeout=30)
+        argv = childrun.run_argv([sys.executable, "-c", "print('y')"], cwd=tmp_path, timeout=30)
+
+    assert seen == [None, None]
+    assert shell.stdout == "x\n" and argv.stdout == "y\n"
+    assert (shell.stdout_bytes, shell.stderr_bytes) == (None, None)
+    assert (argv.stdout_bytes, argv.stderr_bytes) == (None, None)
+
+
+@POSIX_ONLY
+def test_capped_unwind_kills_the_tree_and_closes_the_pipes(tmp_path, monkeypatch):
+    """An exception unwinding through the capped loop kills the tree like the
+    uncapped one, and its teardown stops the readers before closing the pipes.
+
+    Ablation: drop `capture.release()` from `_supervise`'s `finally` and the
+    reader threads outlive the call with both pipes open."""
+    pid_file = tmp_path / "grandchild.pid"
+    spawned: list[subprocess.Popen[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", recording_popen)
+
+    def exploding_probe() -> bool:
+        if read_pid(pid_file) is not None:
+            raise RuntimeError("unwinding")
+        return False
+
+    with stop_probe(exploding_probe), pytest.raises(RuntimeError, match="unwinding"):
+        childrun.run_child(_sh_tree(pid_file), cwd=tmp_path, timeout=120, max_stream_bytes=64)
+
+    (root,) = spawned
+    grandchild = read_pid(pid_file)
+    assert grandchild is not None
+    try:
+        assert root.poll() is not None, "the root survived the unwinding exception"
+        assert wait_pid_gone(grandchild), f"grandchild {grandchild} survived the unwind"
+        assert root.stdout is not None and root.stdout.closed
+        assert root.stderr is not None and root.stderr.closed
+        assert not [t for t in threading.enumerate() if t.name.startswith("bmad-loop-child-")]
+    finally:
+        with contextlib.suppress(Exception):
+            get_process_host().force_kill(grandchild)
+
+
+@POSIX_ONLY
+def test_capped_drain_timeout_decodes_like_the_completed_path(tmp_path):
+    """The capped twin of `test_drain_timeout_output_goes_through_timeout_stream`:
+    a pipe-holder the kill cannot reach forces the capped drain to give up. What
+    the tree wrote must read back exactly as the completed (uncapped) run's output
+    — locale codec, newlines collapsed — with its emitted size, the readers must
+    be stopped and both pipes closed, and the runner must return within the same
+    latency bound rather than wait on the holder.
+
+    Ablation: build `_TailBuffer` with a hardcoded "utf-8" codec and `drained`
+    stops matching `completed`; drop the reader stop in `_CappedCapture.release`
+    and the join backstop times out, leaving the readers live and both pipes
+    open. The `settles` anti-vacuity check fails if the drain ever settled, i.e.
+    if the give-up arm was not reached."""
+    emit = tmp_path / "emit.py"
+    emit.write_text(
+        "import sys\n" f"sys.stdout.buffer.write({_DRAIN_RAW!r})\n" "sys.stdout.buffer.flush()\n",
+        encoding="utf-8",
+    )
+    holder_pid = tmp_path / "holder.pid"
+    driver = tmp_path / "drive.py"
+    driver.write_text(
+        "import json, locale, subprocess, sys, threading, time\n"
+        "from bmad_loop import childrun\n"
+        "emit, holder_pid, cwd = sys.argv[1:4]\n"
+        "settles = []\n"
+        "real_settle = childrun._CappedCapture.settle\n"
+        "def settle(self, timeout):\n"
+        "    settled = real_settle(self, timeout)\n"
+        "    settles.append(settled)\n"
+        "    return settled\n"
+        "childrun._CappedCapture.settle = settle\n"
+        "procs = []\n"
+        "real_popen = subprocess.Popen\n"
+        "def popen(*a, **k):\n"
+        "    procs.append(real_popen(*a, **k))\n"
+        "    return procs[-1]\n"
+        "childrun.subprocess.Popen = popen\n"
+        "childrun.DRAIN_S = 0.3\n"
+        'py = \'"%s" "%s"\' % (sys.executable, emit)\n'
+        "done = childrun.run_child(py, cwd=cwd, timeout=30)\n"
+        "cmd = \"%s; (sleep 30 & echo $! > '%s'); sleep 60\" % (py, holder_pid)\n"
+        "settles.clear()\n"
+        "started = time.monotonic()\n"
+        "hung = childrun.run_child(cmd, cwd=cwd, timeout=1.0, max_stream_bytes=1 << 20)\n"
+        "elapsed = time.monotonic() - started\n"
+        "readers = [t.name for t in threading.enumerate()\n"
+        "           if t.name.startswith('bmad-loop-child-')]\n"
+        "json.dump({'encoding': locale.getpreferredencoding(False),\n"
+        "           'completed': done.stdout, 'drained': hung.stdout,\n"
+        "           'drained_bytes': hung.stdout_bytes, 'drained_stderr': hung.stderr,\n"
+        "           'timed_out': hung.timed_out, 'elapsed': elapsed,\n"
+        "           'settles': settles, 'live_readers': readers,\n"
+        "           'closed': [procs[-1].stdout.closed, procs[-1].stderr.closed]},\n"
+        "          sys.stdout)\n",
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "LANG", "LC_CTYPE")}
+    env["LC_ALL"] = "C"
+    env["PYTHONUTF8"] = "0"  # without this the C locale would resolve to UTF-8 (PEP 540)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(driver), str(emit), str(holder_pid), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=120,
+        )
+    finally:
+        holder = read_pid(holder_pid)
+        if holder is not None and not pid_gone(holder):
+            with contextlib.suppress(Exception):
+                get_process_host().force_kill(holder)
+
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout)
+    decoded = _DRAIN_RAW.decode(observed["encoding"], errors="replace")
+    # anti-vacuity: a UTF-8 codec or a payload without CRs would pass with the bug in
+    assert decoded != _DRAIN_RAW.decode("utf-8", errors="replace")
+    assert "\r" in decoded
+    # the give-up arm was taken: the drain's settle (the last one) never settled
+    assert observed["settles"] and observed["settles"][-1] is False
+
+    assert observed["completed"] == decoded.replace("\r\n", "\n").replace("\r", "\n")
+    assert observed["timed_out"] is True
+    assert observed["drained"] == observed["completed"]
+    assert observed["drained_bytes"] == len(observed["completed"].encode("utf-8"))
+    assert observed["drained_stderr"] == ""
+    assert observed["live_readers"] == [] and observed["closed"] == [True, True]
+    # timeout + kill steps + the (patched) drain + one reader stop — never the holder's 30 s
     assert observed["elapsed"] < 1.0 + 3 * childrun.KILL_WAIT_S + 0.3 + 2.0

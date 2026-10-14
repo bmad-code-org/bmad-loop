@@ -31,17 +31,33 @@ dir. Outside an engine run no probe is installed (``cli._reverify``, tests,
 probes) and the runner never interrupts. The runner only READS the channel;
 consuming a hard request stays with the engine's hard-stop arm.
 
+A caller may also bound what it HOLDS of each stream while the child runs
+(``max_stream_bytes``, DW-549): the streams then feed rolling tail buffers as
+they are read instead of being collected whole by ``communicate``, so what a
+chatty child's output costs is O(cap), not proportional to how long it is
+allowed to run. Verify commands and ``[environment]`` probes opt in (both run
+through ``verify._run_shell_command``); the plugin bus and :func:`run_argv`
+keep the uncapped ``communicate`` path. The cut itself is :func:`byte_tail`,
+which lives here so the runner and the engine's disk cap share one
+implementation.
+
 Leaf module: imports nothing from ``runs``, ``verify`` or ``engine``.
 """
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import contextvars
+import io
 import locale
+import os
+import selectors
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +91,17 @@ _REAP_POLL_S = 0.05
 # the root exits.
 HARVEST_S = 1.0
 
+# Bytes per raw pipe read on the capped path — CPython's own POSIX
+# ``_communicate`` chunk. One read decodes to at most this many characters, so it
+# is also the slack the rolling tail may hold above its cap.
+_READ_CHUNK = 32768
+
+# Upper bound on joining a stopped POSIX reader before its pipe may be closed. A
+# stopped reader leaves its selector wait within ``_REAP_POLL_S`` and only reads
+# a pipe the selector reported readable, so this is a backstop, never a wait the
+# runner is expected to spend.
+_READER_JOIN_S = 1.0
+
 KnownTree = dict[int, float | None]
 
 StopProbe = Callable[[], bool]
@@ -97,13 +124,18 @@ class ChildRun:
     ``returncode`` is ``None`` only when nothing was spawned (an interrupt that
     was already pending) or the killed root could not be reaped. ``timed_out``
     and ``interrupted`` are exclusive; on either, the streams hold whatever the
-    tree wrote before it was killed."""
+    tree wrote before it was killed (on a capped run, its tail)."""
 
     returncode: int | None
     stdout: str
     stderr: str
     timed_out: bool = False
     interrupted: bool = False
+    # What each stream EMITTED, as UTF-8 bytes of its decoded text — set only on
+    # a capped run (``max_stream_bytes``), where ``stdout``/``stderr`` hold just
+    # the tail. ``None`` on an uncapped run: the streams are the whole of it.
+    stdout_bytes: int | None = None
+    stderr_bytes: int | None = None
 
 
 def install_stop_probe(probe: StopProbe) -> contextvars.Token[StopProbe | None]:
@@ -160,12 +192,305 @@ def timeout_stream(value: str | bytes | None) -> str:
     return value
 
 
+def byte_tail(text: str, max_bytes: int) -> tuple[str, int]:
+    """``(tail, full_bytes)`` — ``text`` cut to its last ``max_bytes`` UTF-8 bytes.
+
+    The one implementation of a rule applied at several bounds (verify's
+    in-memory ceiling, both while a capped :func:`run_child` reads and on the
+    result, and the engine's `stream_capture_kb` disk cap), because the subtle
+    half is easy to get wrong twice: a byte cut can land mid-character, and the
+    leading partial is DROPPED rather than decoded into a ``\\ufffd`` this
+    function would be inventing. Decoding with ``errors="replace"`` instead would
+    also break the cap it is enforcing — ``\\ufffd`` is three UTF-8 bytes standing
+    in for the one it replaces, so the result can exceed ``max_bytes``.
+
+    ``full_bytes`` always measures the input, so a caller can report what was
+    emitted even after keeping less of it. The TAIL is kept: a failing suite
+    puts its failure at the end. ``max_bytes <= 0`` needs no branch — the slice
+    is empty by construction, which is exactly "keep nothing".
+    """
+    encoded = text.encode("utf-8")
+    full_bytes = len(encoded)
+    if full_bytes <= max_bytes:
+        return text, full_bytes
+    return encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore"), full_bytes
+
+
+class _TailBuffer:
+    """The rolling, capped capture of one stream (DW-549).
+
+    Raw chunks are decoded as they arrive, exactly as the completed text-mode path
+    decodes a whole stream: the codec and errors policy the ``Popen`` resolved,
+    then universal newlines (``\\r\\n`` and a lone ``\\r`` become ``\\n``). Both run
+    through one :class:`io.IncrementalNewlineDecoder`, so a multibyte character or
+    a ``\\r\\n`` pair split across two reads decodes as if read whole; a dangling
+    partial is settled by :meth:`finish`.
+
+    The cap is measured as :func:`byte_tail` measures it — UTF-8 bytes of the
+    decoded text — so :meth:`snapshot` returns exactly ``byte_tail(whole, cap)``
+    for the ``whole`` decoded stream, without ever holding it. Decoded pieces are
+    coalesced: small ones accumulate in an OPEN run that is joined into one
+    closed piece once it reaches ``min(cap, _READ_CHUNK)`` UTF-8 bytes, so a child
+    flushing one byte at a time costs one closed piece per threshold's worth of
+    reads, not one per read — the closed count stays O(cap / that threshold), plus
+    at most one open part per read since the run last closed. Closed leading pieces
+    are dropped while the rest still covers the cap, and a single decoded piece at
+    or over the cap is cut with :func:`byte_tail` on arrival.
+
+    The bound is on the HELD decoded text: at most the cap plus one coalesced
+    piece (under ``min(cap, _READ_CHUNK)`` plus the decoded read that closed it),
+    i.e. O(cap). It is not a promise about process memory — ``str`` storage is
+    not UTF-8, one raw read can decode to more UTF-8 bytes than it had (a
+    replacement character is three), and :meth:`snapshot` transiently builds
+    cap-sized copies. ``total`` counts every decoded byte.
+
+    Thread-safe: a reader thread feeds while the supervisor may finish or
+    snapshot. Once finished, later feeds are ignored — a win32 reader the drain
+    gave up on may still return from its read, and the result is already taken."""
+
+    def __init__(self, cap: int, encoding: str, errors: str) -> None:
+        self._cap = cap
+        # Read at construction so a test can lower the module constant.
+        self._coalesce = max(1, min(cap, _READ_CHUNK))
+        self._decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder(encoding)(errors=errors), translate=True
+        )
+        self._pieces: deque[tuple[str, int]] = deque()
+        self._closed_bytes = 0
+        self._open: list[str] = []
+        self._open_bytes = 0
+        self._total = 0
+        self._finished = False
+        self._lock = threading.Lock()
+
+    @property
+    def held_bytes(self) -> int:
+        """UTF-8 bytes currently held (before the snapshot's final cut)."""
+        with self._lock:
+            return self._closed_bytes + self._open_bytes
+
+    @property
+    def piece_count(self) -> int:
+        """Objects holding the tail: closed pieces plus each open-run part."""
+        with self._lock:
+            return len(self._pieces) + len(self._open)
+
+    def feed(self, data: bytes) -> None:
+        """Decode one raw chunk and fold it into the tail."""
+        with self._lock:
+            if self._finished:
+                return
+            self._append(self._decoder.decode(data))
+
+    def finish(self) -> None:
+        """Flush the decoder (a dangling ``\\r`` or partial character) and stop
+        accepting feeds. Idempotent."""
+        with self._lock:
+            if self._finished:
+                return
+            self._append(self._decoder.decode(b"", final=True))
+            self._finished = True
+
+    def snapshot(self) -> tuple[str, int]:
+        """``(tail, total)``: the decoded tail within the cap, and the UTF-8 size
+        of everything decoded so far."""
+        with self._lock:
+            joined = "".join([text for text, _ in self._pieces] + self._open)
+            tail, _ = byte_tail(joined, self._cap)
+            return tail, self._total
+
+    def _append(self, text: str) -> None:
+        if not text:
+            return
+        size = len(text.encode("utf-8"))
+        self._total += size
+        if size >= self._cap:
+            # This piece alone covers the cap, so the tail lies wholly inside it.
+            text, _ = byte_tail(text, self._cap)
+            self._pieces.clear()
+            self._closed_bytes = 0
+            self._open.clear()
+            self._open_bytes = 0
+            size = len(text.encode("utf-8"))
+            if not text:
+                return  # a zero cap keeps nothing; never hold empty parts
+        self._open.append(text)
+        self._open_bytes += size
+        if self._open_bytes >= self._coalesce:
+            self._pieces.append(("".join(self._open), self._open_bytes))
+            self._closed_bytes += self._open_bytes
+            self._open.clear()
+            self._open_bytes = 0
+        held = self._closed_bytes + self._open_bytes
+        while self._pieces and held - self._pieces[0][1] >= self._cap:
+            dropped = self._pieces.popleft()[1]
+            self._closed_bytes -= dropped
+            held -= dropped
+
+
+class _StreamReader:
+    """One pipe's reader thread on the capped path.
+
+    Reads the RAW fd with ``os.read`` — never the ``TextIOWrapper`` or its
+    ``BufferedReader`` — as CPython's own POSIX ``_communicate`` does, so no
+    buffer lock is held that a later ``close()`` would contend for. On POSIX it
+    waits on a selector with a :data:`_REAP_POLL_S` timeout and honours the stop
+    event, so the supervisor can stop and join it before closing the pipe (a fd
+    closed under a live ``os.read`` may be reused by an unrelated open). win32
+    pipes cannot be selected, so its reader blocks in the read; such a reader is
+    never stopped, and its stream is never closed under it (DW-478) — once
+    ``abandoned`` the reader closes the stream itself when its read returns."""
+
+    def __init__(self, stream: io.TextIOWrapper, buffer: _TailBuffer, name: str) -> None:
+        self.stream = stream
+        self.buffer = buffer
+        self.error: BaseException | None = None
+        self.eof = False
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._done = False
+        self._abandoned = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def join(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the thread to end; True once it has (or
+        never started)."""
+        if self._thread.ident is None:
+            return True
+        self._thread.join(max(timeout, 0.0))
+        return not self._thread.is_alive()
+
+    def close(self) -> None:
+        """Close the stream now if the reader is done (or never started);
+        otherwise leave it for the reader to close when it ends."""
+        with self._lock:
+            self._abandoned = True
+            if not self._done and self._thread.ident is not None:
+                return
+        with contextlib.suppress(Exception):
+            self.stream.close()
+
+    def _run(self) -> None:
+        try:
+            fd = self.stream.fileno()
+            if sys.platform == "win32":
+                self._read_blocking(fd)
+            else:
+                self._read_selected(fd)
+        except BaseException as exc:  # surfaced by the supervisor, never swallowed
+            self.error = exc
+        finally:
+            if self.eof:
+                self.buffer.finish()
+            with self._lock:
+                self._done = True
+                close_now = self._abandoned
+            if close_now:
+                with contextlib.suppress(Exception):
+                    self.stream.close()
+
+    def _read_blocking(self, fd: int) -> None:
+        while True:
+            data = os.read(fd, _READ_CHUNK)
+            if not data:
+                self.eof = True
+                return
+            self.buffer.feed(data)
+
+    def _read_selected(self, fd: int) -> None:
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_READ)
+            while not self._stop.is_set():
+                if not selector.select(timeout=_REAP_POLL_S):
+                    continue
+                data = os.read(fd, _READ_CHUNK)
+                if not data:
+                    self.eof = True
+                    return
+                self.buffer.feed(data)
+
+
+class _CappedCapture:
+    """Both streams of one capped child: their readers, the settle wait that
+    stands in for ``communicate(timeout=...)``, and the teardown."""
+
+    def __init__(self, proc: subprocess.Popen[str], cap: int) -> None:
+        self._proc = proc
+        self._readers: list[_StreamReader] = []
+        for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+            if not isinstance(stream, io.TextIOWrapper):
+                raise TypeError("a capped child needs text-mode stdout/stderr pipes")
+            buffer = _TailBuffer(cap, stream.encoding, stream.errors or "strict")
+            self._readers.append(_StreamReader(stream, buffer, f"bmad-loop-child-{name}"))
+
+    def start(self) -> None:
+        for reader in self._readers:
+            reader.start()
+
+    def settle(self, timeout: float) -> bool:
+        """The ``communicate(timeout=...)`` stand-in: True once both readers hit
+        EOF (or failed) and the root has been waited, all within ``timeout``."""
+        deadline = time.monotonic() + timeout
+        for reader in self._readers:
+            if not reader.join(deadline - time.monotonic()):
+                return False
+        try:
+            self._proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def drain(self) -> None:
+        """Collect what the killed tree wrote, bounded by :data:`DRAIN_S`; give up
+        on a holder the kill could not reach."""
+        self.settle(DRAIN_S)
+        self.release()
+
+    def release(self) -> None:
+        """Stop and join the POSIX readers, settle every buffer, and close each
+        pipe whose reader is done — a live win32 reader closes its own."""
+        if sys.platform != "win32":
+            for reader in self._readers:
+                reader.stop()
+            for reader in self._readers:
+                reader.join(_READER_JOIN_S)
+        for reader in self._readers:
+            reader.buffer.finish()
+            reader.close()
+
+    def result(
+        self, returncode: int | None, *, timed_out: bool = False, interrupted: bool = False
+    ) -> ChildRun:
+        for reader in self._readers:
+            if reader.error is not None:
+                raise reader.error
+        (stdout, stdout_bytes), (stderr, stderr_bytes) = (
+            reader.buffer.snapshot() for reader in self._readers
+        )
+        return ChildRun(
+            returncode,
+            stdout,
+            stderr,
+            timed_out=timed_out,
+            interrupted=interrupted,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+        )
+
+
 def run_child(
     command: str,
     *,
     cwd: str | Path | None,
     timeout: float | None,
     env: dict[str, str] | None = None,
+    max_stream_bytes: int | None = None,
 ) -> ChildRun:
     """Run ``command`` through the host shell, stop-aware and tree-killing.
 
@@ -196,7 +521,22 @@ def run_child(
     longer be enumerated from the root. The tree stays bounded over a long run:
     an entry a fresh harvest no longer lists is pruned once it is gone or reused
     (or was never stamped). A host that cannot be resolved skips harvesting —
-    the kill then raises that fault loudly, as it always has."""
+    the kill then raises that fault loudly, as it always has.
+
+    ``max_stream_bytes`` (DW-549) bounds each stream WHILE it is read: instead of
+    ``communicate``, which keeps every chunk until it returns, a reader thread per
+    pipe feeds a rolling tail of that many UTF-8 bytes (see :func:`byte_tail`), so
+    the decoded text held is bounded by the cap plus one coalesced piece
+    (:class:`_TailBuffer`) — O(cap) however long the child runs. The decode is the
+    completed path's — the codec and errors policy the text-mode ``Popen``
+    resolved, then universal newlines — and the returned :class:`ChildRun` carries
+    each stream's emitted size in ``stdout_bytes``/``stderr_bytes``. Polling,
+    harvest, kill, the :data:`DRAIN_S`-bounded drain and the unwinding kill are
+    unchanged; "settled" means both readers hit EOF and the root was waited
+    within the poll's wait. A drain that gives up stops and joins the POSIX
+    readers before their pipes are closed; a win32 reader still blocked in its
+    read closes its own stream when the read returns (DW-478). ``None`` (the
+    default) keeps the ``communicate`` path exactly, with ``*_bytes`` ``None``."""
     # Operator-authored shell strings (verify commands, declarative plugin hooks);
     # the shell is the contract, so shell=True is intentional here.
     return _supervise(
@@ -211,6 +551,7 @@ def run_child(
             errors="replace",
         ),
         timeout,
+        max_stream_bytes,
     )
 
 
@@ -264,20 +605,30 @@ def run_argv(
     )
 
 
-def _supervise(spawn: Callable[[], subprocess.Popen[str]], timeout: float | None) -> ChildRun:
+def _supervise(
+    spawn: Callable[[], subprocess.Popen[str]],
+    timeout: float | None,
+    max_stream_bytes: int | None = None,
+) -> ChildRun:
     """The shared body of :func:`run_child` and :func:`run_argv`: the pre-spawn
     probe read, the poll loop, the timeout/interrupt tree kill, the bounded drain,
     and the unwinding ``finally`` kill — everything documented on
-    :func:`run_child` except the spawn itself, which ``spawn`` performs."""
+    :func:`run_child` except the spawn itself, which ``spawn`` performs. With
+    ``max_stream_bytes`` the streams go through a :class:`_CappedCapture` in place
+    of ``communicate``; every other step is shared."""
     if hard_stop_pending():
         return ChildRun(None, "", "", interrupted=True)
     settled = False
     proc = spawn()
+    capture: _CappedCapture | None = None
     known: KnownTree = {}
     harvester: ProcessHost | None = None
     try:
         # Everything after the spawn sits inside the try, so an exception landing
         # anywhere past `Popen` (SIGTERM's RunStopped) still reaches the kill below.
+        if max_stream_bytes is not None:
+            capture = _CappedCapture(proc, max_stream_bytes)
+            capture.start()
         with contextlib.suppress(ProcessHostError):
             # Unresolvable host: no loop harvest. kill_tree re-resolves it and
             # raises loudly there, exactly as before DW-477.
@@ -298,6 +649,12 @@ def _supervise(spawn: Callable[[], subprocess.Popen[str]], timeout: float | None
                 if remaining <= 0:
                     break
                 wait = min(wait, remaining)
+            if capture is not None:
+                if not capture.settle(wait):
+                    continue
+                capture.release()
+                settled = True
+                return capture.result(proc.returncode)
             try:
                 stdout, stderr = proc.communicate(timeout=wait)
             except subprocess.TimeoutExpired:
@@ -305,6 +662,12 @@ def _supervise(spawn: Callable[[], subprocess.Popen[str]], timeout: float | None
             settled = True
             return ChildRun(proc.returncode, stdout or "", stderr or "")
         kill_tree(proc, known=known)
+        if capture is not None:
+            capture.drain()
+            settled = True
+            return capture.result(
+                proc.returncode, timed_out=not interrupted, interrupted=interrupted
+            )
         stdout, stderr = _drain(proc)
         settled = True
         return ChildRun(
@@ -324,7 +687,11 @@ def _supervise(spawn: Callable[[], subprocess.Popen[str]], timeout: float | None
             # the ones an unwind mid-grace or mid-reap left standing.
             with contextlib.suppress(Exception):
                 kill_tree(proc, known=known)
-            _close_pipes(proc)
+            if capture is None:
+                _close_pipes(proc)
+            else:
+                with contextlib.suppress(Exception):
+                    capture.release()
 
 
 def _drain(proc: subprocess.Popen[str]) -> tuple[str, str]:

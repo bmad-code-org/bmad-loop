@@ -30,6 +30,7 @@ import yaml
 
 from . import childrun, deferredwork, platform_util
 from .bmadconfig import ProjectPaths
+from .childrun import byte_tail  # re-export: engine and tests reach it as verify.byte_tail
 from .frontmatter import FileIdentity  # noqa: F401 — re-export
 from .frontmatter import FrontmatterTargetChangedError  # noqa: F401 — re-export
 from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
@@ -9223,41 +9224,20 @@ def _stories_relpaths(root: Path, spec_folder: Path) -> tuple[str, ...]:
 
 # A hard ceiling on how much of one verifier stream is held in memory, separate
 # from and far above `[verify] stream_capture_kb` (which bounds what reaches
-# disk). `subprocess.run(capture_output=True)` already materialises a command's
-# whole output, but before this bound the full streams were then RETAINED in the
-# results list while every later command ran, so peak memory grew with the number
-# of configured verify commands rather than with the largest one. Plugins are
-# meant to see the streams essentially whole, so this is a backstop against a
-# pathologically chatty suite, not a tuning knob — deliberately a constant, and
-# deliberately high enough that ordinary suites never reach it.
+# disk). Plugins are meant to see the streams essentially whole, so this is a
+# backstop against a pathologically chatty suite, not a tuning knob —
+# deliberately a constant, and deliberately high enough that ordinary suites
+# never reach it.
 #
-# It bounds retention, not capture: while command N runs, memory still holds the
-# capped earlier results plus whatever N itself emits.
+# It bounds capture, not just retention (DW-549): `_run_shell_command` hands it
+# to `childrun.run_child`, which keeps a rolling tail of each stream WHILE the
+# command runs. The decoded text held per stream is bounded by the cap plus one
+# coalesced piece (see `childrun._TailBuffer`) — O(cap), however long
+# `[verify] command_timeout_min` lets a command run, not a byte-exact
+# peak-memory figure — and the capped results list never grows with the number
+# of configured commands either. Applies to `[environment]` probes too: they run
+# through the same `_run_shell_command`. Read at call time (tests lower it).
 MAX_STREAM_MEMORY_BYTES = 32 * 1024 * 1024
-
-
-def byte_tail(text: str, max_bytes: int) -> tuple[str, int]:
-    """``(tail, full_bytes)`` — ``text`` cut to its last ``max_bytes`` UTF-8 bytes.
-
-    The one implementation of a rule this feature applies at two different
-    bounds (this in-memory ceiling and the engine's `stream_capture_kb` disk
-    cap), because the subtle half is easy to get wrong twice: a byte cut can
-    land mid-character, and the leading partial is DROPPED rather than decoded
-    into a ``\ufffd`` this function would be inventing. Decoding with
-    ``errors="replace"`` instead would also break the cap it is enforcing —
-    ``\ufffd`` is three UTF-8 bytes standing in for the one it replaces, so the
-    result can exceed ``max_bytes``.
-
-    ``full_bytes`` always measures the input, so a caller can report what was
-    emitted even after keeping less of it. The TAIL is kept: a failing suite
-    puts its failure at the end. ``max_bytes <= 0`` needs no branch — the slice
-    is empty by construction, which is exactly "keep nothing".
-    """
-    encoded = text.encode("utf-8")
-    full_bytes = len(encoded)
-    if full_bytes <= max_bytes:
-        return text, full_bytes
-    return encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore"), full_bytes
 
 
 @dataclass(frozen=True)
@@ -9532,12 +9512,13 @@ def _timeout_stream(value: str | bytes | None) -> str:
     """Normalize optional timeout output — see :func:`childrun.timeout_stream`,
     where the normalisation moved with the runner (DW-353).
 
-    Only tests reach this name now; no production caller does. A timed-out
-    command's output normally comes from the completed post-kill
-    ``communicate`` inside ``childrun.run_child``, which is already text-mode
-    decoded. ``childrun.timeout_stream`` runs only on that runner's drain-timeout
-    arm — a straggler still holding a pipe past ``childrun.DRAIN_S``. The name is
-    kept so the existing shape tests keep pinning that normalisation."""
+    Only tests reach this name now; no production caller does. Verify commands
+    run on ``childrun.run_child``'s capped path (DW-549), whose readers decode
+    incrementally and never produce a ``TimeoutExpired`` payload at all;
+    ``childrun.timeout_stream`` runs only on the UNCAPPED runner's drain-timeout
+    arm (plugin hooks, the probe) — a straggler still holding a pipe past
+    ``childrun.DRAIN_S``. The name is kept so the existing shape tests keep
+    pinning that normalisation."""
     return childrun.timeout_stream(value)
 
 
@@ -9593,7 +9574,11 @@ def _run_shell_command(command: str, cwd: Path, timeout: float) -> CommandResult
     (``interrupted``). Not spawning anything after an interrupt is the CALLER's
     loop latch, not this function's."""
     try:
-        child = childrun.run_child(command, cwd=cwd, timeout=timeout)
+        # Capped while read (DW-549): the runner never holds more of a stream
+        # than this, so a chatty command cannot grow memory with its runtime.
+        child = childrun.run_child(
+            command, cwd=cwd, timeout=timeout, max_stream_bytes=MAX_STREAM_MEMORY_BYTES
+        )
     except (OSError, ValueError) as exc:
         # The child was never started, so no exit status exists to classify:
         # `Popen` raises out of the fork/exec (or CreateProcess)
@@ -9636,9 +9621,15 @@ def _run_shell_command(command: str, cwd: Path, timeout: float) -> CommandResult
     # must remain fail-loud rather than being mislabeled as an environment
     # fault.
     if child.interrupted:
-        return _interrupted_result(command, child.stdout, child.stderr)
-    stdout, stdout_full = byte_tail(child.stdout, MAX_STREAM_MEMORY_BYTES)
-    stderr, stderr_full = byte_tail(child.stderr, MAX_STREAM_MEMORY_BYTES)
+        return _interrupted_result(
+            command,
+            child.stdout,
+            child.stderr,
+            stdout_emitted=child.stdout_bytes,
+            stderr_emitted=child.stderr_bytes,
+        )
+    stdout, stdout_full = _bounded_stream(child.stdout, child.stdout_bytes)
+    stderr, stderr_full = _bounded_stream(child.stderr, child.stderr_bytes)
     if child.timed_out or child.returncode is None:
         # the timeout leg is bounded too: a command killed at its timeout is
         # exactly the one that may have been spewing output when it died.
@@ -9662,15 +9653,32 @@ _INTERRUPTED_TAIL = "interrupted by a hard stop request"
 _NOT_STARTED_TAIL = "not started: an earlier command was interrupted by a hard stop request"
 
 
+def _bounded_stream(text: str, emitted: int | None) -> tuple[str, int]:
+    """``(stream, emitted_bytes)`` for one captured stream, held to
+    :data:`MAX_STREAM_MEMORY_BYTES`. ``emitted`` is the runner's own count from a
+    capped capture — the only figure that still knows what the command wrote once
+    the runner kept just the tail; ``None`` (an uncapped capture) falls back to
+    measuring ``text``, which is then the whole stream."""
+    held, measured = byte_tail(text, MAX_STREAM_MEMORY_BYTES)
+    return held, measured if emitted is None else emitted
+
+
 def _interrupted_result(
-    command: str, stdout: str, stderr: str, *, tail: str = _INTERRUPTED_TAIL
+    command: str,
+    stdout: str,
+    stderr: str,
+    *,
+    tail: str = _INTERRUPTED_TAIL,
+    stdout_emitted: int | None = None,
+    stderr_emitted: int | None = None,
 ) -> CommandResult:
     """The one result an interrupted (or, after an interrupt, unspawned) command
     yields: :data:`INTERRUPTED_RC` with ``interrupted=True`` and whatever the
     killed tree wrote, bounded like every other leg. ``tail`` says which of the
-    two it was."""
-    out, out_full = byte_tail(stdout, MAX_STREAM_MEMORY_BYTES)
-    err, err_full = byte_tail(stderr, MAX_STREAM_MEMORY_BYTES)
+    two it was; ``*_emitted`` carry a capped capture's emitted sizes (none for a
+    command that never started)."""
+    out, out_full = _bounded_stream(stdout, stdout_emitted)
+    err, err_full = _bounded_stream(stderr, stderr_emitted)
     return CommandResult(
         command,
         INTERRUPTED_RC,

@@ -11,8 +11,9 @@ Two shapes mirror the old screen vocabulary:
 
   * ``SettingSpec`` — one field (the old ``_Field``): section, key, widget kind,
     options, resolved default, placeholder, numeric bounds, label, description.
-    ``widget_id`` is unchanged so every existing widget id (``#limits-max_review_cycles``,
-    ``#adapter-review-model`` …) is byte-identical.
+    A core field's ``widget_id`` is ``<section>-<key>`` with dots dashed, so every
+    core widget id (``#limits-max_review_cycles``, ``#adapter-review-model`` …) is
+    byte-identical; a plugin field's is ``plugin_field_wid`` (name and key encoded).
   * ``SectionSpec`` — a collapsible group: name (the TOML section key), display
     label, description, its fields, and the owning plugin ("" for core).
 
@@ -52,10 +53,36 @@ from .policy import STAGES
 _PLUGIN_KIND = {"bool": "switch", "int": "int", "float": "float", "str": "str", "select": "select"}
 
 
+def plugin_wid(name: str) -> str:
+    """A plugin name as a widget-id fragment. A manifest name is any non-empty
+    string, but a Textual id takes only ``[A-Za-z0-9_-]``, so an unsafe name
+    would stop the screen from opening. ASCII letters, digits and ``-`` pass
+    through; every other character's UTF-8 bytes (``_`` included, which keeps the
+    encoding injective) become ``_xx`` hex.
+    ABLATION (test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants):
+    return ``name`` unchanged and the screen fails to open."""
+    return "".join(
+        c if c.isascii() and (c.isalnum() or c == "-") else "".join(f"_{b:02x}" for b in c.encode())
+        for c in name
+    )
+
+
+def plugin_field_wid(name: str, key: str) -> str:
+    """The widget id of plugin ``name``'s setting ``key``. Both go through
+    `plugin_wid`, and the key's ``-`` is escaped too (``_2d``), so the last ``-``
+    splits name from key: plugin ``a`` key ``b-c`` and plugin ``a-b`` key ``c``
+    stay distinct.
+    ABLATION (test_a_plugin_setting_unsafe_as_a_widget_id_still_opens_and_saves):
+    drop the ``id=`` `_plugin_fields` sets from it and the screen fails to open."""
+    return f"plugins-{plugin_wid(name)}-{plugin_wid(key).replace('-', '_2d')}"
+
+
 @dataclass(frozen=True)
 class SettingSpec:
     """One settings field. Same vocabulary as the screen's former ``_Field`` so
-    the generic compose/collect/save logic is untouched."""
+    the generic compose/collect/save logic is untouched. ``id`` overrides the
+    derived ``widget_id`` (plugin fields, whose name and key are arbitrary
+    manifest strings); core fields leave it empty."""
 
     section: str
     key: str
@@ -67,10 +94,11 @@ class SettingSpec:
     maximum: float | None = None
     label: str = ""  # display override; falls back to key when empty
     description: str = ""  # muted caption shown below the field row
+    id: str = ""
 
     @property
     def widget_id(self) -> str:
-        return f"{self.section}-{self.key}".replace(".", "-")
+        return self.id or f"{self.section}-{self.key}".replace(".", "-")
 
 
 @dataclass(frozen=True)
@@ -238,6 +266,7 @@ def _plugin_fields(name: str, specs: tuple[PluginSettingSpec, ...]) -> tuple[Set
             maximum=s.max,
             label=s.label,
             description=s.help,
+            id=plugin_field_wid(name, s.key),
         )
         for s in specs
     )

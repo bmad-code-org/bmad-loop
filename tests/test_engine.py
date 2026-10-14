@@ -534,7 +534,7 @@ def test_a_ceilinged_stream_still_reports_what_the_command_emitted(project):
     """When the in-memory ceiling already cut a stream, the record reports what
     the COMMAND emitted — not what the engine still holds.
 
-    `MAX_STREAM_MEMORY_BYTES` bounds retention in the results list, so by the time
+    `MAX_STREAM_MEMORY_BYTES` bounds what is held of each stream, so by the time
     a record is built the string in hand can be far smaller than what ran. Sizing
     the record off that string would under-report emission and, worse, compute
     `*_truncated` against a false baseline — calling a cut stream whole, which is

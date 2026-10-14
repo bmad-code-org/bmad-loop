@@ -64,6 +64,7 @@ from .model import (
     PluginManifest,
     SettingSpec,
     WorkflowSpec,
+    verdict_admits,
 )
 from .trust import PluginTrustError, Refusal
 
@@ -76,6 +77,13 @@ def _resolve_settings(manifest: PluginManifest, policy) -> dict:
     overrides = getattr(plugins_pol, "settings", {}).get(manifest.name, {}) if plugins_pol else {}
     resolved.update(overrides)
     return resolved
+
+
+def _workflow_enabled(settings: dict, wf: WorkflowSpec) -> bool:
+    """A workflow runs unless its plugin's resolved settings turn it off
+    (``<workflow-name>_enabled = false``; the settings-overlay convention, see
+    ``WorkflowSpec``). Shared by the live registry and `static_workflow_roles`."""
+    return settings.get(f"{wf.name}_enabled") is not False
 
 
 def _load_module(manifest: PluginManifest, tree: VerifiedTree | None):
@@ -258,6 +266,27 @@ def preflight(
     return [(m, v, rel) for m, v, _live, rel in judged]
 
 
+def static_workflow_roles(project: Path | None, policy, grants: GrantSet) -> frozenset[str]:
+    """The ``role`` of every still-enabled workflow some statically-active plugin
+    declares, at any stage — judged from `preflight` verdicts, so no plugin code
+    runs. The skills preflight reads it to decide whether a review-role session
+    can be spawned when ``[review]`` is off.
+
+    Shares the live registry's rules: `verdict_admits` (the same active-set rule
+    `LoadedPlugin.active` reads) and `_workflow_enabled` over the same resolved
+    settings. The one gap is a ``[python]`` plugin whose module would fail to
+    construct — live, its workflows go inert; here they still count. So this
+    over-approximates only toward "role bound", never narrower than a real run.
+    Raises `PluginError` on a discovery fault."""
+    return frozenset(
+        wf.role
+        for m, verdict, _rel in preflight(project, policy, grants)
+        if verdict_admits(verdict)
+        for wf in m.workflows
+        if _workflow_enabled(_resolve_settings(m, policy), wf)
+    )
+
+
 def _resolve(
     manifest: PluginManifest,
     policy,
@@ -437,7 +466,7 @@ class PluginRegistry:
             w.stage
             for lp in self._active_for_seeds()
             for w in lp.manifest.workflows
-            if lp.settings.get(f"{w.name}_enabled") is not False
+            if _workflow_enabled(lp.settings, w)
         )
 
     def workflows_for(self, stage: str) -> list[tuple[LoadedPlugin, WorkflowSpec]]:
@@ -458,7 +487,7 @@ class PluginRegistry:
         out: list[tuple[LoadedPlugin, WorkflowSpec]] = []
         for lp in self._active_for_seeds():
             for wf in lp.manifest.workflows_for(stage):
-                if lp.settings.get(f"{wf.name}_enabled") is False:
+                if not _workflow_enabled(lp.settings, wf):
                     continue  # a setting can disable a step
                 blocking = bool(lp.settings.get(f"{wf.name}_blocking", wf.blocking))
                 out.append((lp, wf if blocking == wf.blocking else replace(wf, blocking=blocking)))
@@ -474,7 +503,11 @@ class PluginRegistry:
         plugins, and active in-process plugins whose instance was built. A
         refused project plugin, or an un-enabled or errored ``[python]`` one, is
         inert — its module never ran, so its seeds must not leak into a worktree
-        (e.g. the Unity plugin's skill tree when unity isn't enabled)."""
+        (e.g. the Unity plugin's skill tree when unity isn't enabled).
+
+        ``active`` is `verdict_admits` (the shared active-set rule) plus
+        ``trusted``; `static_workflow_roles` applies the same rule to bare
+        `preflight` verdicts, differing only on a module that fails to construct."""
         return [lp for lp in self._loaded if lp.live_instance_or_declarative]
 
     def seed_files(self) -> list[str]:
