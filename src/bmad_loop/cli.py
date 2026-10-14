@@ -4481,11 +4481,16 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
 def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
-    the run's state lock and has just found no live engine under it (#920)."""
+    the run's state lock and has just found no live engine under it (#920).
+
+    A claim that did not land is journaled as well as printed: a TUI-launched
+    resume prints into a detached window nobody is looking at, while the
+    journal is the run's durable record."""
     from .tui import launch  # import-safe: launch.py has no textual imports
 
     if (warning := launch.claim_ctl_window(project, run_dir.name)) is not None:
         print(f"warning: {warning}", file=sys.stderr)
+        Journal(run_dir).append("ctl-window-claim-failed", error=warning)
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:

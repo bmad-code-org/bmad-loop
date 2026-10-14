@@ -6625,6 +6625,21 @@ def test_resolve_claims_its_control_window_under_the_state_lock(tmp_path, monkey
     assert claims == [run_dir]
 
 
+def test_a_claim_that_did_not_land_is_journaled(tmp_path, monkeypatch, capsys):
+    # #920: a TUI-launched resume prints into a detached window nobody watches,
+    # so a claim that did not land also goes to the run's journal.
+    # Ablation: drop the journal append and the entry is missing.
+    from bmad_loop.journal import Journal
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(launch, "claim_ctl_window", lambda _p, _rid: "record not written")
+    cli._claim_ctl_window(tmp_path, run_dir)
+    assert "warning: record not written" in capsys.readouterr().err
+    entries = [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
+    assert [e["error"] for e in entries] == ["record not written"]
+
+
 def test_resolve_claims_nothing_before_its_entry_refusals(tmp_path, monkeypatch, capsys):
     # A resolve refused at entry (here: a story it cannot resolve) must leave
     # the record alone — an interactive resolver may own it, and has no engine
