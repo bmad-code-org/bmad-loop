@@ -173,7 +173,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `done_checkpoint: true` pauses after the story commits. It is skipped for the last story to dispatch, at `--max-stories`, or when a graceful stop is pending.
   - `[gates] on_escalation` is reserved. It is parsed but has no effect, and CRITICAL escalations always pause whatever its value.
 - **Config:** `[gates] mode`, `[gates] on_escalation` (reserved); stories.yaml per-entry `spec_checkpoint` / `done_checkpoint`; `bmad-loop resume <run_id>`
-- **Tested by:** `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_policy.py`, `tests/test_settings_schema.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_checkpoints.py`, `tests/test_policy.py`, `tests/test_settings_schema.py`
 - **Docs:** [Configuration: [gates]](reference/configuration.md#gates), [Where a pause shows up](escalations-guide.md#where-a-pause-shows-up), [Reviewing a paused run in the TUI](tui-guide.md#reviewing-a-paused-run-p), [bmad-loop resume](reference/cli.md#resume)
 
 ### Retrospective handling

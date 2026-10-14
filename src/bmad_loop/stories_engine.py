@@ -23,20 +23,22 @@ dev/verify/review/commit, crash resume, worktree isolation, gates — is inherit
 unchanged.
 
 HITL checkpoints (Phase 3) are per-story and independent (a story may set both
-and pause twice):
+and pause twice). Their flow is shared with other per-unit sources through
+:class:`~bmad_loop.checkpoints.CheckpointFlowMixin`; this class supplies the seam
+(``_entry_checkpoint_flags``, ``_plan_produced``, ``_schedule_complete``):
 
 * ``spec_checkpoint`` — a two-leg dispatch. Leg 1 sends ``Halt after planning.``
-  (:meth:`_plan_halt_leg`); the skill HALTs at ``ready-for-dev``, the plan is
-  verified, and the run pauses at :data:`PAUSE_PLAN_CHECKPOINT` for human plan
+  (``_plan_halt_leg``); the skill HALTs at ``ready-for-dev``, the plan is
+  verified, and the run pauses at ``PAUSE_PLAN_CHECKPOINT`` for human plan
   review. Resume re-drives leg 2 (a plain folder+id dispatch that the skill routes
-  straight to implementation) via :meth:`_resume_after_dev_verify`.
+  straight to implementation) via ``_resume_after_dev_verify``.
 * ``done_checkpoint`` — after the story commits, the run pauses at
-  :data:`PAUSE_STORY_CHECKPOINT` (:meth:`_after_story`), skipped when the story was
+  ``PAUSE_STORY_CHECKPOINT`` (``_after_story``), skipped when the story was
   the last one to dispatch.
 
 A blocked / sentinel / ambiguous story stops the scan and escalates for resolve
-(:meth:`_pause_wedged`); sentinel auto-clear on re-arm lives in
-``runs.rearm_escalation``.
+(:meth:`_pause_wedged_story` → ``_pause_wedged``); sentinel auto-clear on re-arm
+lives in ``runs.rearm_escalation``.
 """
 
 from __future__ import annotations
@@ -46,17 +48,15 @@ from typing import Any, NoReturn
 
 from . import gates, stories, verify
 from .adapters.base import SessionResult
+from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused
 from .model import (
     PAUSE_ESCALATION,
-    PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
-    PAUSE_STORY_CHECKPOINT,
     Phase,
     StoryTask,
     result_mapping,
 )
-from .runs import graceful_stop_requested
 from .stories_source import (
     HALT_UNKNOWN_SELECTOR,
     HALT_WEDGED,
@@ -66,7 +66,17 @@ from .stories_source import (
 from .worksource import Halt, WorkRef, WorkSource
 
 
-class StoriesEngine(Engine):
+def _checkpoint_flags(entry: stories.StoryEntry | None) -> CheckpointFlags | None:
+    """A manifest entry's checkpoint flags; None for an absent entry. Stories
+    entries are never refined."""
+    if entry is None:
+        return None
+    return CheckpointFlags(
+        plan_checkpoint=entry.spec_checkpoint, done_checkpoint=entry.done_checkpoint
+    )
+
+
+class StoriesEngine(CheckpointFlowMixin, Engine):
     def __init__(self, *args: Any, spec_folder: str, **kwargs: Any):
         # `--story` is a plain story id here, not a sprint E-S ref — keep it out of
         # the base's sprint-style parse_selector (which would reject a bare "2")
@@ -155,52 +165,8 @@ class StoriesEngine(Engine):
             # escalation viewer + rearm act on the same key.
             self._pause_unknown_selector(halt.key)  # always raises RunPaused
         if halt.cause == HALT_WEDGED and isinstance(halt.payload, stories.Schedule):
-            self._pause_wedged(halt.payload)  # always raises RunPaused
+            self._pause_wedged_story(halt.payload)  # always raises RunPaused
         super()._halt_pick(halt)
-
-    def _repause_inrun_escalation(self) -> None:
-        """Re-pause on a story that escalated *after a session ran* (``attempt > 0``)
-        instead of re-deriving its fate from disk.
-
-        A pick-time wedge / unknown-selector task (attempt == 0) is a pure disk
-        projection, and re-classifying it every pick is its designed lifecycle:
-        fix the blocked spec / duplicate file / manifest by hand and a bare
-        resume proceeds. An in-run escalation is not disk-derivable — a CRITICAL
-        verify outcome (e.g. a proof-of-work GitError) or a resolved-redrive
-        exhaustion pause escalates with the spec at a *resumable or even done*
-        status, so the disk scan would silently re-dispatch the story (a fresh
-        StoryTask overwrites the escalated one, destroying its escalation record
-        and ``resolved_redrive`` guard — a later exhaustion then DEFERs the
-        human-resolved work) or, at ``done``, leapfrog the unresolved escalation
-        entirely. Only ``runs.rearm_escalation`` (`bmad-loop resolve`) discharges
-        it: the re-arm resets the task to PENDING, after which this guard no
-        longer matches and the normal re-drive proceeds. Never mutates the task —
-        the escalation context must survive for resolve to act on."""
-        for key, task in self.state.tasks.items():
-            if task.phase == Phase.ESCALATED and task.attempt > 0:
-                reason = (
-                    f"story {key!r} escalated during this run and was not resolved — "
-                    f"run `bmad-loop resolve {self.state.run_id}`, then resume"
-                )
-                self.journal.append("stories-escalation-unresolved", story_key=key)
-                gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
-                raise RunPaused(reason, PAUSE_ESCALATION, key)
-
-    def _unresolved_escalation_key(self) -> str | None:
-        """Only an in-run escalation (``attempt > 0``) blocks ``finished``. A
-        pick-time wedge / unknown-selector task (``attempt == 0``) is re-classified
-        from disk every pick (see ``_repause_inrun_escalation``), so reaching run end
-        means the human fixed it by hand; its stale ESCALATED record must not
-        re-pause the run, whose only way past would be a re-arm that re-drives the
-        fixed story."""
-        return next(
-            (
-                k
-                for k, t in self.state.tasks.items()
-                if t.phase == Phase.ESCALATED and t.attempt > 0
-            ),
-            None,
-        )
 
     def _pause_unknown_selector(self, selector: str) -> None:
         """The ``--story`` selector resolves to no manifest entry: pause for
@@ -218,48 +184,29 @@ class StoriesEngine(Engine):
         self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, selector)
 
-    def _pause_wedged(self, sched: stories.Schedule) -> None:
-        """A blocked / sentinel / ambiguous story stopped the scan before any
-        session ran this pick — it was already in that state on disk (a prior
-        run, or a resume of one that halted). A blocked story cannot be
-        leapfrogged, so pause for resolve.
-
-        Records an ESCALATED task keyed by the story id — the same shape an in-run
-        escalation leaves — so ``bmad-loop resolve`` (``runs.rearm_escalation`` +
-        ``resolve.build_context``) and the sentinel auto-clear act on it uniformly,
-        and the resolved re-drive flows through ``_finish_inflight`` exactly like a
-        rearmed escalation. A PRESENT/SENTINEL wedge carries its spec path so
-        resolve can open it; an AMBIGUOUS wedge leaves it unset (no single file to
-        pick — the human removes the duplicate)."""
+    def _pause_wedged_story(self, sched: stories.Schedule) -> None:
+        """Pause for resolve on the story a wedged schedule stopped at, through the
+        shared :meth:`_pause_wedged`. A PRESENT/SENTINEL wedge carries its spec path
+        so resolve can open it; an AMBIGUOUS wedge leaves it unset (no single file
+        to pick — the human removes the duplicate). A sentinel is journaled
+        (``sentinel-detected``) before the wedge record. Always raises."""
         entry = sched.entry
         state = sched.state
         assert entry is not None and state is not None
-        task = StoryTask(story_key=entry.id, epic=0)
-        task.phase = Phase.ESCALATED  # deliberate: a wedge has no legal advance from PENDING
+        spec_file = None
         if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path is not None:
-            task.spec_file = str(state.path)
-        self.state.tasks[entry.id] = task
-        detail = self._wedged_detail(state)
-        reason = f"story {entry.id!r} needs resolution before the run can continue: {detail}"
+            spec_file = str(state.path)
+        sentinel_kind = ""
         if state.kind == stories.KIND_SENTINEL:
-            # record the sentinel verdict on the task so rearm_escalation clears it by
-            # this recorded kind, not by re-deriving from the spec_file basename.
-            task.sentinel_kind = state.sentinel_kind
+            sentinel_kind = state.sentinel_kind
             self._journal_sentinel_detected(entry.id, state)
-        self.journal.append(
-            "stories-wedged",
-            story_key=entry.id,
+        self._pause_wedged(
+            entry.id,
             state_kind=state.kind,
-            sentinel_kind=state.sentinel_kind or None,
+            detail=self._wedged_detail(state),
+            spec_file=spec_file,
+            sentinel_kind=sentinel_kind,
         )
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"story blocked: {entry.id}",
-            f"{detail} — resolve, then `bmad-loop resume {self.state.run_id}`",
-        )
-        self._save()
-        raise RunPaused(reason, PAUSE_ESCALATION, entry.id)
 
     @staticmethod
     def _wedged_detail(state: stories.StoryState) -> str:
@@ -350,7 +297,7 @@ class StoriesEngine(Engine):
         # as a *successful* terminal (plan done), not died-mid-flight. Keyed off the
         # same on-disk state as the prompt's `Halt after planning.` leg, so the two
         # never disagree (both read before the session writes the spec).
-        if role == "dev" and self._plan_halt_leg(task, self._entry_for(task)):
+        if role == "dev" and self._plan_halt_leg(task, _checkpoint_flags(self._entry_for(task))):
             env["BMAD_LOOP_PLAN_HALT"] = "1"
         return env
 
@@ -396,7 +343,7 @@ class StoriesEngine(Engine):
             f"/{self._dev_skill()} Spec folder: {self._spec_folder_rel}. "
             f"Story id: {task.story_key}."
         )
-        if self._plan_halt_leg(task, entry):
+        if self._plan_halt_leg(task, _checkpoint_flags(entry)):
             prompt += " Halt after planning."
         prompt += env_sentence
         if entry is not None and entry.invoke_dev_with:
@@ -428,20 +375,29 @@ class StoriesEngine(Engine):
                 )
             return None
 
-    def _plan_halt_leg(self, task: StoryTask, entry: stories.StoryEntry | None) -> bool:
-        """Whether this dispatch HALTs after planning for a human plan review.
+    # ------------------------------------------------------ checkpoint seam
 
-        True only for a ``spec_checkpoint`` story whose plan has not yet reached
-        ``ready-for-dev`` on disk — i.e. leg 1. Once the plan exists (leg 2 after
-        the plan-checkpoint resume, or a mid-flight repair that reset the spec to
-        in-progress) this is False and the story dispatches straight to
-        implementation. Reading on-disk state (not a task flag) is what keeps the
-        prompt's ``Halt after planning.`` leg and the env's ``BMAD_LOOP_PLAN_HALT``
-        in lock-step: both call this before the session writes the spec."""
-        if entry is None:
-            return False
+    def _plan_produced(self, task: StoryTask) -> bool:
+        """Whether the id-keyed story spec is on disk at a plan-produced status —
+        the predicate the CLI dry-run shares (``stories.is_plan_halt_leg``)."""
         state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
-        return stories.is_plan_halt_leg(entry.spec_checkpoint, state)
+        return not stories.is_plan_halt_leg(True, state)
+
+    def _entry_checkpoint_flags(self, task: StoryTask) -> CheckpointFlags | None:
+        """The manifest entry's flags, re-read fresh at the commit boundary for the
+        done_checkpoint. Not ``_entry_for``: that dispatch helper warns once per
+        story and falls back to "no checkpoints", while here an unreadable manifest
+        must pause for review rather than silently drop a checkpoint it may well set
+        (mirroring :meth:`_schedule_complete`'s conservative default), and says so
+        every time."""
+        try:
+            entry = self._load_stories().get(task.story_key)
+        except stories.StoriesError as e:
+            self.journal.append(
+                "stories-manifest-unreadable", story_key=task.story_key, error=str(e)
+            )
+            return CheckpointFlags(plan_checkpoint=False, done_checkpoint=True)
+        return _checkpoint_flags(entry)
 
     # ---------------------------------------------------------- sync + verify
 
@@ -598,7 +554,9 @@ class StoriesEngine(Engine):
             # latch and journal below so an `environment` pause writes neither (a
             # passing probe is fresh, so `_dev_phase` does not probe twice).
             self._gate_dispatch(task, "dev")
-        if dev_resume is None and self._plan_halt_leg(task, self._entry_for(task)):
+        if dev_resume is None and self._plan_halt_leg(
+            task, _checkpoint_flags(self._entry_for(task))
+        ):
             # Latch the plan-review obligation BEFORE the session runs, so it
             # survives a crash in the post-session window, a non-fixable retry that
             # advanced the on-disk plan status, or a skill that overran the Halt
@@ -638,137 +596,6 @@ class StoriesEngine(Engine):
             )
         self._review_and_commit(task)
 
-    def _pause_plan_checkpoint(self, task: StoryTask) -> None:
-        """Leg 1 of a spec_checkpoint story verified (plan at ready-for-dev): pause
-        for human plan review. The task stays at DEV_VERIFY with
-        ``plan_checkpoint_pending`` set, so on resume _finish_inflight routes it to
-        :meth:`_resume_after_dev_verify` for the implement leg. Always raises."""
-        task.plan_review_owed = False  # discharged: we are pausing for the review now
-        self.journal.append(
-            "checkpoint-pause",
-            story_key=task.story_key,
-            checkpoint="plan",
-            spec=self._operator_spec_path(task),
-        )
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"plan ready for review: {task.story_key}",
-            f"review the planned spec {self._operator_spec_path(task)}, then "
-            f"`bmad-loop resume {self.state.run_id}`",
-        )
-        self._save()
-        raise RunPaused(
-            f"plan checkpoint for {task.story_key}: review the spec, then resume",
-            PAUSE_PLAN_CHECKPOINT,
-            task.story_key,
-        )
-
-    def _pause_plan_review_owed(self, task: StoryTask) -> None:
-        """A spec_checkpoint story reached implementation without ever pausing for
-        its plan review (the skill overran ``Halt after planning.``, or a crash /
-        non-fixable retry re-drove straight to implementation on an already-planned
-        spec). The plan review is still owed, so pause before commit — distinct from
-        :meth:`_pause_plan_checkpoint` in that the code is already written.
-
-        ``plan_checkpoint_pending`` is deliberately NOT set: on resume the story is
-        already implemented, so :meth:`_resume_after_dev_verify` proceeds to
-        review+commit (the human approved) rather than re-driving an implement leg.
-        Reuses PAUSE_PLAN_CHECKPOINT so the CLI/TUI resume handling is unchanged.
-        Always raises."""
-        task.plan_review_owed = False  # discharged: we are pausing for the review now
-        self.journal.append(
-            "checkpoint-pause",
-            story_key=task.story_key,
-            checkpoint="plan",
-            spec=self._operator_spec_path(task),
-            owed_after_implement=True,
-        )
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"plan review owed (already implemented): {task.story_key}",
-            f"the story was implemented before its plan checkpoint fired — review "
-            f"{self._operator_spec_path(task)}, then `bmad-loop resume {self.state.run_id}`",
-        )
-        self._save()
-        raise RunPaused(
-            f"plan review owed for {task.story_key}: the skill implemented before the "
-            f"plan checkpoint — review the spec, then resume",
-            PAUSE_PLAN_CHECKPOINT,
-            task.story_key,
-        )
-
-    def _resume_after_dev_verify(self, task: StoryTask) -> None:
-        # A plan-checkpoint pause re-drives the implement leg here rather than the
-        # base review+commit. The on-disk status is now ready-for-dev, so _drive_story
-        # dispatches a plain folder+id leg (implement) and, once it commits, the
-        # done_checkpoint fires from _after_story like any other story.
-        if task.plan_checkpoint_pending:
-            task.plan_checkpoint_pending = False
-            task.phase = Phase.PENDING  # deliberate reset for the re-drive
-            self.journal.append("checkpoint-resume", story_key=task.story_key, checkpoint="plan")
-            self._save()
-            self._drive_story(task)
-            return
-        super()._resume_after_dev_verify(task)
-
-    def _after_story(self, task: StoryTask) -> None:
-        # done_checkpoint: after a committed story, pause for review — but skip when
-        # this was the last story to dispatch (the run ends here anyway). Fires from
-        # both _loop and _finish_inflight, always after any worktree integration.
-        if task.phase != Phase.DONE:
-            return
-        try:
-            entry = self._load_stories().get(task.story_key)
-        except stories.StoriesError as e:
-            # The manifest went unreadable between the commit and this check, so
-            # the done_checkpoint flag is unknowable. Mirror _schedule_complete's
-            # conservative default: pause for review rather than silently drop a
-            # checkpoint the manifest may well set — the run cannot proceed past
-            # a broken manifest anyway (the next pick would halt on it loud), so
-            # the only thing a skip could save is the human review itself.
-            self.journal.append(
-                "stories-manifest-unreadable", story_key=task.story_key, error=str(e)
-            )
-        else:
-            if entry is None or not entry.done_checkpoint:
-                return
-        # skip-if-last: no further story will dispatch. Either the schedule is
-        # complete OR this committed story is the run's --max-stories-th (the bound
-        # stops the loop next iteration). Honoring the cap here — durably, from
-        # committed-story count, not the resume-reset _loop counter — is what keeps
-        # a done_checkpoint pause from letting a resume leapfrog past the bound (the
-        # pause+resume would otherwise reset the local counter and dispatch more).
-        # A pending graceful stop also skips the done_checkpoint pause: the
-        # loop-head check will end the run as `stopped` on the next iteration, so
-        # pausing here would strand it `paused` instead — the stop must win (see
-        # the plan's "done_checkpoint + graceful after same story" disposition).
-        graceful = graceful_stop_requested(self.run_dir)
-        if self._schedule_complete() or self._max_stories_reached() or graceful:
-            fields: dict[str, Any] = {"story_key": task.story_key, "checkpoint": "story"}
-            if graceful:
-                # tag the cause so the journal distinguishes a graceful-stop skip
-                # from a natural last-story / --max-stories skip.
-                fields["reason"] = "graceful-stop"
-            self.journal.append("checkpoint-skip-last", **fields)
-            return
-        self.journal.append(
-            "checkpoint-pause", story_key=task.story_key, checkpoint="story", commit=task.commit_sha
-        )
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"story committed — review checkpoint: {task.story_key}",
-            f"review {task.story_key}, then `bmad-loop resume {self.state.run_id}`",
-        )
-        self._save()
-        raise RunPaused(
-            f"story checkpoint for {task.story_key}: review, then resume",
-            PAUSE_STORY_CHECKPOINT,
-            task.story_key,
-        )
-
     def _schedule_complete(self) -> bool:
         """Whether the schedule has no more actionable stories. Guarded: a manifest
         that went unreadable (or a --story id that vanished) between the commit and
@@ -779,12 +606,3 @@ class StoriesEngine(Engine):
             return self._compute_schedule().is_complete
         except (StoriesModeError, stories.StoriesError):
             return False
-
-    def _max_stories_reached(self) -> bool:
-        """Whether the run has dispatched its ``--max-stories`` allotment. Consults the
-        same durable :meth:`Engine._dispatched_count` the loop's dispatch gate uses, so
-        the done_checkpoint's skip-if-last fires exactly when the loop will stop next
-        iteration — no drift between the two guards across a pause/resume."""
-        if self.max_stories is None:
-            return False
-        return self._dispatched_count() >= self.max_stories

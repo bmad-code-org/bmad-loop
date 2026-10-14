@@ -1209,6 +1209,12 @@ JOURNAL_KINDS = frozenset(
         # `in_tool`, a closed slug the adapter chose (declared benign).
         "session-active",
         "session-idle",
+        # checkpoints.py
+        "checkpoint-pause",
+        "checkpoint-resume",
+        "checkpoint-skip-last",
+        "stories-escalation-unresolved",
+        "stories-wedged",
         # cli.py
         # DW-410: a real launch whose resolved `[adapter] extra_args` drops the
         # profile's bypass tokens — one per affected launched role. `role`,
@@ -1530,18 +1536,13 @@ JOURNAL_KINDS = frozenset(
         "session-kill-refused",
         "run-start",
         # stories_engine.py
-        "checkpoint-pause",
-        "checkpoint-resume",
-        "checkpoint-skip-last",
         "deferred-close-declaration-unreadable",
         "plan-halt",
         "plan-halt-proof-of-work-skipped",
         "sentinel-detected",
-        "stories-escalation-unresolved",
         "stories-manifest-unreadable",
         "stories-selector-unknown",
         "stories-validated",
-        "stories-wedged",
         # sweep.py
         # DW-273. The bundle path's artifact-only receipt was ACCEPTED at the dev
         # proof-of-work gate: the ordinary probe positively found nothing, the
