@@ -1562,7 +1562,7 @@ class Engine:
         backlog count, minus anything already in ``state.tasks``). It is a hint,
         never a contract — the whole body is guarded so an unreadable/invalid
         sprint-status file returns None rather than derailing a graceful stop.
-        StoriesEngine overrides this against the manifest scheduler."""
+        Stories mode counts against the manifest scheduler through its own source."""
         try:
             return self.source.remaining_estimate(self._phases())
         except Exception:  # a hint must never break the stop

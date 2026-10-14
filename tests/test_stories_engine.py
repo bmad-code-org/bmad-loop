@@ -319,8 +319,9 @@ def test_run_end_retrospective_is_inert_in_stories_mode(project, monkeypatch):
     epic-0 stories all read done, which the Engine's gate would take as a
     complete epic.
 
-    Ablation: delete `StoriesEngine._run_end_retrospective` and the nudge fires
-    and `retro-run-end` is journaled."""
+    Ablation: delete the `has_epics` guard at the top of
+    `Engine._run_end_retrospective` and the gate reads the stories source's epic
+    progress, journaling `retro-run-end-skipped`."""
     from bmad_loop import gates
 
     sent: list[tuple[str, str]] = []
