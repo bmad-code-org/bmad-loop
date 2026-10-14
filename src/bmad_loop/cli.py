@@ -6907,11 +6907,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     # this command printed, never a second sample of it. Never raises: a registry
     # that could not be asked lands in `unverified` (DW-469), never in an empty
     # `leftovers` that reads as "nothing left".
-    leftovers, unverified = runs.legacy_registry_leftovers(
-        project, announced=killed if args.dry_run else ()
-    )
-    # Not `unverified`: the registry was listed, only a command was withheld.
+    # Not `unverified`, which means a legacy registry could not be asked: these
+    # are checks on this project's own registry for a pre-upgrade control
+    # session (#915), its scan or a check that withheld its command.
     ctl_command_faults: list[str] = []
+    leftovers, unverified = runs.legacy_registry_leftovers(
+        project,
+        announced=killed if args.dry_run else (),
+        on_primary_fault=ctl_command_faults.append,
+    )
     kill_commands, ambiguous_ctl = _superseded_ctl_kill_commands(
         project, leftovers, ctl_command_faults.append
     )
@@ -6992,7 +6996,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 legacy_unverified=unverified,
                 legacy_kill_commands=kill_commands,
                 sessions_scan_error=sessions_scan_error,
-                legacy_command_unverified=ctl_command_faults,
+                superseded_ctl_unverified=ctl_command_faults,
             )
         )
         return 0

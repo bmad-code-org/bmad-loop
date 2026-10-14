@@ -3812,7 +3812,7 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p: (
+        lambda _p, **_kw: (
             {
                 runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
                 r"D:	heir-own-registry": ["bmad-loop-old-1"],
@@ -3865,7 +3865,7 @@ async def test_cleanup_toast_names_another_projects_derived_registry(project, mo
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(
-        runs, "legacy_registry_leftovers", lambda _p: ({theirs: ["bmad-loop-ctl"]}, [])
+        runs, "legacy_registry_leftovers", lambda _p, **_kw: ({theirs: ["bmad-loop-ctl"]}, [])
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -3898,7 +3898,7 @@ async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(pro
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p: ({}, ["/reg/broken: could not be listed: no server"]),
+        lambda _p, **_kw: ({}, ["/reg/broken: could not be listed: no server"]),
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)

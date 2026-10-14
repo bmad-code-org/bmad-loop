@@ -2098,7 +2098,20 @@ class BmadLoopApp(App[None]):
         # One toast per registry, naming it: there is more than one legacy
         # registry (psmux's default, and any root this process displaced), and
         # the operator's next action is to open the one holding these.
-        leftovers, unverified = runs.legacy_registry_leftovers(self.project)
+        ctl_faults: list[str] = []
+        leftovers, unverified = runs.legacy_registry_leftovers(
+            self.project, on_primary_fault=ctl_faults.append
+        )
+        # This project's own registry is no legacy one (#915): its scan for a
+        # pre-upgrade control session gets its own wording.
+        for line in ctl_faults:
+            self.call_from_thread(
+                self.notify,
+                f"could not check this project's registry for a pre-upgrade control "
+                f"session: {line}",
+                severity="warning",
+                markup=False,
+            )
         # DW-469: a registry that could not be asked is not one holding nothing.
         for line in unverified:
             self.call_from_thread(

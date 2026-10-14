@@ -2371,7 +2371,10 @@ DEFAULT_REGISTRY_LABEL = "the multiplexer's own default registry"
 
 
 def legacy_registry_leftovers(
-    project: Path, *, announced: Iterable[str] = ()
+    project: Path,
+    *,
+    announced: Iterable[str] = (),
+    on_primary_fault: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """``(grouped, faults)``: session names a legacy registry **still holds** after
     :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
@@ -2533,14 +2536,17 @@ def legacy_registry_leftovers(
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
     # The project's own registry is no legacy one, but a control session an
-    # earlier release named there survives the rename too (#733).
+    # earlier release named there survives the rename too (#733). Its faults go
+    # to `on_primary_fault` when given (#915): that registry is no legacy one,
+    # so they are not "a legacy registry could not be asked".
     label = primary.registry_root() or DEFAULT_REGISTRY_LABEL
+    primary_fault = on_primary_fault or faults.append
     try:
         stale = superseded_ctl_sessions(
-            project, primary, on_fault=lambda msg: faults.append(f"{label}: {msg}")
+            project, primary, on_fault=lambda msg: primary_fault(f"{label}: {msg}")
         )
     except MultiplexerError as exc:
-        faults.append(f"{label}: could not be listed: {exc}")
+        primary_fault(f"{label}: could not be listed: {exc}")
         stale = []
     if stale:
         grouped[label] = sorted(set(grouped.get(label, []) + stale))

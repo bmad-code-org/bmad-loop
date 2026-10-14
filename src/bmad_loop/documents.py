@@ -399,7 +399,7 @@ def cleanup_document(
     legacy_unverified: list[str] | None = None,
     legacy_kill_commands: dict[str, str | None] | None = None,
     sessions_scan_error: str | None = None,
-    legacy_command_unverified: list[str] | None = None,
+    superseded_ctl_unverified: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -471,11 +471,13 @@ def cleanup_document(
     names it; a check that could not be made withholds it too. Additive, no
     schema bump; the text mode prints each on stderr.
 
-    `sessions.legacy_command_unverified` is one line per such check that could
-    not be made (a runs dir or a session-tag listing that faulted, #915). The
-    registry itself was listed, so this is not `legacy_unverified`: the session
-    is in `legacy_leftovers`, only its command was withheld. Additive, no schema
-    bump; the text mode prints each line on stderr.
+    `sessions.superseded_ctl_unverified` is one line per check on this
+    project's own registry for a pre-upgrade control session that could not be
+    made (#915): the scan for it (its name could not be derived, or the
+    registry could not be listed), or a check that withholds its command (a
+    runs dir or a session-tag listing that faulted). That registry is no legacy
+    one, so this is not `legacy_unverified`. Additive, no schema bump; the text
+    mode prints each line on stderr.
 
     `sessions.scan_error` is present only when the session listing could not
     see this project's sessions (#864): the backend is unavailable while a run
@@ -498,7 +500,7 @@ def cleanup_document(
         "legacy_leftovers": list(legacy_leftovers or []),
         "legacy_unverified": list(legacy_unverified or []),
         "legacy_kill_commands": dict(legacy_kill_commands or {}),
-        "legacy_command_unverified": list(legacy_command_unverified or []),
+        "superseded_ctl_unverified": list(superseded_ctl_unverified or []),
     }
     if sessions_scan_error is not None:
         sessions["scan_error"] = sessions_scan_error

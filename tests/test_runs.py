@@ -9212,6 +9212,28 @@ def test_legacy_registry_leftovers_still_scans_our_own_registry_when_discovery_f
     )
 
 
+def test_legacy_registry_leftovers_routes_own_registry_faults_apart(tmp_path, monkeypatch):
+    """#915: the project's own registry is no legacy one, so a fault in its scan
+    for the pre-upgrade control session goes to `on_primary_fault` when given,
+    not into the legacy fault list; without the hook it still lands there, so
+    no caller loses it. Ablate the routing and the first half fails."""
+
+    class _Unlistable(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            raise MultiplexerError("no server")
+
+    own = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _Unlistable([], {}, root=own))
+    routed: list[str] = []
+    assert runs.legacy_registry_leftovers(tmp_path, on_primary_fault=routed.append) == ({}, [])
+    assert routed == [f"{own}: could not be listed: no server"]
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {},
+        [f"{own}: could not be listed: no server"],
+    )
+
+
 def test_superseded_ctl_may_be_run_when_a_run_has_the_id_its_name_spells(tmp_path, monkeypatch):
     """#915: a run dir whose session the transport resolves to the listed name
     means that name may be the run's own agent session; none means it cannot
