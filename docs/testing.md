@@ -257,7 +257,7 @@ be removed with it.
 
 - **Staged pyright, deliberate.** `typeCheckingMode = "basic"` over `src/bmad_loop`, with the
   strict list covering the pure/leaf modules (`model`, `statemachine`, `policy`, `documents`,
-  `machine`, `checks`, `sanitize`, `plugins/digest`, `plugins/grants`). Strictness lives where
+  `machine`, `checks`, `sanitize`, `plugins/digest`, `plugins/grants`, `worksource`). Strictness lives where
   the code is pure. `src/bmad_loop/data`
   is excluded: data-shipped scripts are standalone templates outside the import graph.
 - **Three `os` surfaces.** CI also runs pyright with `--pythonplatform Windows` and `Darwin`,

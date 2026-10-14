@@ -24422,8 +24422,9 @@ def test_auto_retro_undecodable_board_is_a_failed_retro_not_a_crash(project):
     (`sprint-status unreadable`) and the tree is still settled — the undecodable
     board is left dirty, so the boundary pauses on it.
 
-    Ablation: drop `UnicodeDecodeError` from `_verify_retro`'s except tuple and
-    this reddens — the decode error escapes before the tree is settled."""
+    Ablation: drop `UnicodeDecodeError` from `SprintWorkSource.retro_artifact_errors`'s
+    except tuple and this reddens — the decode error escapes before the tree is
+    settled."""
     after = retro_effect(project)
 
     def effect(spec):

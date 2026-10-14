@@ -110,22 +110,18 @@ from .runs import (
     set_owner_run_dir,
     task_spec_path,
 )
+from .sprint_source import SprintWorkSource
 from .sprintstatus import (
-    ACTIONABLE_STATUSES,
     STATUS_ORDER,
     SprintStatusError,
     SprintStatusWriteRefused,
 )
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import advanced_bytes as sprint_advanced_bytes
-from .sprintstatus import load as load_sprint_status
-from .sprintstatus import (
-    next_actionable,
-    parse_selector,
-)
 from .sprintstatus import status_in_bytes as sprint_status_in_bytes
 from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
+from .worksource import Halt, SourceUnreadable, WorkRef, WorkSource
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
 
@@ -527,8 +523,10 @@ RETRO_VERDICT_REJECTED = "rejected"
 RETRO_VERDICT_UNKNOWN = "unknown"
 
 
-def _retro_auto_prompt(epic: int) -> str:
-    return RETRO_AUTO_PROMPT.format(epic=epic)
+def _retro_auto_prompt(target: str) -> str:
+    """The auto-retro session prompt for ``target``, the source's
+    ``retro_target(epic)`` (the sprint source's is ``str(epic)``)."""
+    return RETRO_AUTO_PROMPT.format(epic=target)
 
 
 def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
@@ -912,9 +910,10 @@ class Engine:
         self.max_stories = max_stories
         self.epic_filter = epic_filter
         self.story_filter = story_filter
-        # widen --story interpretation: full key, short ref (3-1/3.1), bare
-        # number (+ --epic), or slug fragment. See sprintstatus.StorySelector.
-        self._selector = parse_selector(epic_filter, story_filter)
+        # the runtime work source this engine picks from (worksource.WorkSource).
+        # Built without I/O — SweepEngine inherits this __init__ — but it parses
+        # the --epic/--story selector here, so a bad --story still raises now.
+        self.source: WorkSource = self._make_work_source()
         # spawns a child deferred-work sweep run (injected by the CLI to
         # avoid an engine -> sweep import cycle); see _maybe_auto_sweep
         self.sweep_factory = sweep_factory
@@ -1565,12 +1564,7 @@ class Engine:
         sprint-status file returns None rather than derailing a graceful stop.
         StoriesEngine overrides this against the manifest scheduler."""
         try:
-            ss = load_sprint_status(self.paths.sprint_status)
-            return sum(
-                1
-                for s in ss.stories
-                if s.status in ACTIONABLE_STATUSES and s.key not in self.state.tasks
-            )
+            return self.source.remaining_estimate(self._phases())
         except Exception:  # a hint must never break the stop
             return None
 
@@ -1790,34 +1784,27 @@ class Engine:
         gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
         raise RunPaused(reason, PAUSE_STORY_GATE, story_key)
 
-    def _pick_next(self):
-        ss = load_sprint_status(self.paths.sprint_status)
-        if ss.unknown_keys:
-            self.journal.append("sprint-status-unknown-keys", keys=list(ss.unknown_keys))
-        base_skip = set(self.state.tasks)  # anything this run already touched
+    def _make_work_source(self) -> WorkSource:
+        """The work source this engine picks from. The base engine reads the
+        sprint board through the live ``self.paths`` (the main checkout)."""
+        return SprintWorkSource(lambda: self.paths, self.epic_filter, self.story_filter)
 
-        def _first(epic: int | None):
-            # local skip copy so selector-rejections in this pass don't leak into
-            # the next one (a story rejected here may still match the fallback).
-            skip = set(base_skip)
-            while True:
-                story = next_actionable(ss, skip, epic=epic)
-                if story is None:
-                    return None
-                if not self._selector.matches(story):
-                    skip.add(story.key)
-                    continue
-                return story
+    def _phases(self) -> dict[str, Phase]:
+        """Every unit this run already touched, by key, with its phase."""
+        return {key: task.phase for key, task in self.state.tasks.items()}
 
-        # Exhaust the current epic before advancing. Selection is otherwise
-        # strict file order, and epics need not be file-ordered by number (an
-        # epic can be appended out of place); without this, a still-open earlier-
-        # in-file epic would "steal" the pick and fire a spurious epic boundary.
-        if self.state.current_epic is not None:
-            story = _first(self.state.current_epic)
-            if story is not None:
-                return story
-        return _first(None)
+    def _pick_next(self) -> WorkRef | None:
+        pick = self.source.pick(self._phases(), self.state.current_epic)
+        if pick.unknown_keys:
+            self.journal.append("sprint-status-unknown-keys", keys=list(pick.unknown_keys))
+        if pick.halt is not None:
+            self._halt_pick(pick.halt)
+        return pick.ref
+
+    def _halt_pick(self, halt: Halt) -> NoReturn:
+        """Stop the run on a pick the source halted. The sprint source never
+        halts; an engine whose source does overrides this to pause."""
+        raise AssertionError(f"{self.source.name} source halted the pick: {halt!r}")
 
     # --------------------------------------- attempt rollback / recovery refs
 
@@ -10879,21 +10866,10 @@ class Engine:
             )
 
     def _retro_docs(self, epic: int) -> list[Path]:
-        """The regular files matching ``epic-{epic}-retro-*.md`` in the
-        implementation-artifacts dir, sorted. ``lstat``-checked, so a symlink or a
-        directory of that name is not a retro doc. Raises ``OSError`` when the
-        directory cannot be listed; a single entry that vanishes or cannot be
-        stat'd is simply not counted."""
-        docs: list[Path] = []
-        for candidate in sorted(
-            self.paths.implementation_artifacts.glob(f"epic-{epic}-retro-*.md")
-        ):
-            try:
-                if S_ISREG(candidate.lstat().st_mode):
-                    docs.append(candidate)
-            except OSError:
-                continue
-        return docs
+        """``epic``'s retrospective docs on disk, sorted — the source's
+        :meth:`~bmad_loop.worksource.WorkSource.retro_docs`. Raises ``OSError``
+        when their directory cannot be listed."""
+        return self.source.retro_docs(epic)
 
     def _verify_retro(
         self, epic: int, result: SessionResult | None
@@ -10911,21 +10887,9 @@ class Engine:
                 errors.append(f"session status {result.status}, not completed")
             elif result_mapping(result.result_json).get("status") != "done":
                 errors.append("result.json status is not done")
-        try:
-            board = load_sprint_status(self.paths.sprint_status).retros.get(epic)
-        except (SprintStatusError, OSError, UnicodeDecodeError):
-            errors.append("sprint-status unreadable")
-        else:
-            if board != "done":
-                errors.append(f"sprint-status epic-{epic}-retrospective is {board or 'absent'}")
-        try:
-            docs = self._retro_docs(epic)
-        except OSError:
-            docs = []
-            errors.append("implementation-artifacts unreadable")
-        else:
-            if not docs:
-                errors.append(f"no epic-{epic}-retro-*.md retrospective doc")
+        # the board and doc checks belong to the source; they follow the session's
+        artifact_errors, docs = self.source.retro_artifact_errors(epic)
+        errors.extend(artifact_errors)
         return errors, docs
 
     def _retro_verdict(self, docs: list[Path]) -> tuple[str, Path | None]:
@@ -10979,7 +10943,7 @@ class Engine:
         try:
             dirty = verify.dirty_paths(repo)
             if ok:
-                expected = {self.paths.sprint_status, *docs}
+                expected = self.source.retro_commit_paths(docs)
                 wanted = {rel for p in expected if (rel := self._repo_relpath(p)) is not None}
                 to_commit = sorted(rel for rel in dirty if rel in wanted)
                 if to_commit:
@@ -11042,11 +11006,11 @@ class Engine:
         if self.policy.gates.retrospective != "auto":
             return
         try:
-            board = load_sprint_status(self.paths.sprint_status)
-        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            retro_done = self.source.retro_done(epic)
+        except SourceUnreadable as e:
             self._skip_auto_retro(epic, "board-unreadable", str(e))
             return
-        if board.retros.get(epic) == "done":
+        if retro_done:
             self._skip_auto_retro(epic, "already-done")
             return
         if graceful_stop_requested(self.run_dir):
@@ -11071,7 +11035,9 @@ class Engine:
         result: SessionResult | None = None
         raised: Exception | None = None
         try:
-            result = self._run_session(task, role="retro", prompt=_retro_auto_prompt(epic), seq=1)
+            result = self._run_session(
+                task, role="retro", prompt=_retro_auto_prompt(self.source.retro_target(epic)), seq=1
+            )
         except (RunStopped, RunPaused):
             raise
         except Exception as e:  # a failed retro, never a failed run
@@ -11157,22 +11123,26 @@ class Engine:
         :meth:`_maybe_auto_retro` (its failures notify and never fail the run; a
         dirty tree after it pauses at ``PAUSE_EPIC_BOUNDARY``, and resume re-enters
         here, where an already-done retro is skipped) and ``notify`` sends
-        :meth:`_nudge_retrospective`'s nudge."""
+        :meth:`_nudge_retrospective`'s nudge.
+
+        A source without epics (``has_epics`` false) never crosses an epic
+        boundary, so it never fires this gate either."""
+        if not self.source.has_epics:
+            return
         epic = self.state.current_epic
         if epic is None or self.policy.gates.retrospective == "never":
             return  # no epic dispatched, or no gate to fire: leave the board unread
         try:
-            board = load_sprint_status(self.paths.sprint_status)
-        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            progress = self.source.epic_progress(epic)
+        except SourceUnreadable as e:
             self.journal.append(
                 "retro-run-end-skipped", epic=epic, reason="board-unreadable", error=str(e)
             )
             return
-        stories = [s for s in board.stories if s.epic == epic]
-        if not stories or any(s.status != "done" for s in stories):
+        if not progress.complete:
             self.journal.append("retro-run-end-skipped", epic=epic, reason="epic-incomplete")
             return
-        if board.retros.get(epic) == "done":
+        if progress.retro_done:
             self.journal.append("retro-run-end-skipped", epic=epic, reason="already-done")
             return
         self.journal.append("retro-run-end", epic=epic)
@@ -11185,7 +11155,7 @@ class Engine:
         # Before the per-epic sweep, so the sweep starts on a clean tree and sees
         # the retro's committed action items (DW-388 ingests them).
         self._maybe_auto_retro(finished_epic)
-        self._maybe_auto_sweep("per-epic", f"epic-{finished_epic}")
+        self._maybe_auto_sweep("per-epic", self.source.epic_label(finished_epic))
         self._nudge_retrospective(finished_epic)
         self._emit("post_epic_boundary", epic=finished_epic)
         if gates.pause_at_epic_boundary(self.policy):

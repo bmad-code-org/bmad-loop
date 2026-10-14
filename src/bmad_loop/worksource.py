@@ -15,14 +15,25 @@ policy.py deliberately does not import this module: the settings sync test
 resolves ``options_ref = "STORIES_SOURCES"`` inside policy.py, and the pure core
 stays free of a dependency on this registry.
 
+The second half is the *runtime* seam: the :class:`WorkSource` protocol an
+Engine composes (``Engine.source``) to read its queue — the next unit to pick,
+the remaining estimate, epic identity and progress, and the retrospective
+artifacts. A source is a read model: it never journals, notifies or pauses. It
+returns data (a :class:`Pick`, possibly carrying a :class:`Halt`), and the engine
+keeps every ``journal.append``, ``gates.notify`` and ``RunPaused`` in its own
+``(file, function)``, where ``tests/test_portability_guard.py`` keys them.
+
 Pure data and lookups — no I/O, no journal writes.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final, Literal
+from pathlib import Path
+from typing import Final, Literal, Protocol, TypeAlias
+
+from .model import Phase
 
 SOURCE_SPRINT: Final = "sprint-status"
 SOURCE_STORIES: Final = "stories"
@@ -128,3 +139,125 @@ def launch_roles(source: str, retrospective: str) -> tuple[str, ...]:
 def validate_mode(source: str) -> QueueMode:
     """The ``mode`` value ``validate --json`` reports for ``source``."""
     return traits_for(source).validate_mode
+
+
+# ------------------------------------------------------------ runtime protocol
+
+EpicId: TypeAlias = int
+"""A unit's epic. An int for every source today; a source without epics uses 0."""
+
+
+class WorkRef(Protocol):
+    """A unit a source hands the engine to dispatch: its run-unique, resume-stable
+    key and its epic. ``sprintstatus.Story`` and :class:`UnitRef` both match it
+    structurally."""
+
+    @property
+    def key(self) -> str: ...
+
+    @property
+    def epic(self) -> EpicId: ...
+
+
+@dataclass(frozen=True)
+class UnitRef:
+    """A plain :class:`WorkRef`, for a source whose queue has no richer row type."""
+
+    key: str
+    epic: EpicId = 0
+
+
+@dataclass(frozen=True)
+class Halt:
+    """A pick that must stop the run instead of dispatching: the unit ``key`` it
+    stopped on, a source-defined ``cause``, and a ``payload`` the engine's
+    ``_halt_pick`` turns into the pause."""
+
+    key: str
+    cause: str
+    payload: object = None
+
+
+@dataclass(frozen=True)
+class Pick:
+    """One pick's answer. ``ref`` is the unit to dispatch, ``halt`` a reason to
+    stop; both ``None`` means the queue is exhausted. ``unknown_keys`` are queue
+    keys the source could not classify and ``loaded_count`` how many units it
+    read — reported for the engine to journal, since a source never journals."""
+
+    ref: WorkRef | None = None
+    halt: Halt | None = None
+    unknown_keys: tuple[str, ...] = ()
+    loaded_count: int | None = None
+
+
+@dataclass(frozen=True)
+class EpicProgress:
+    """Whether every unit of an epic is done (at least one unit, all done), and
+    whether its retrospective is already done."""
+
+    complete: bool
+    retro_done: bool
+
+
+class SourceUnreadable(Exception):
+    """The source's queue could not be read. ``str()`` is the underlying error's
+    text, unchanged, so a journal line built from it reads as it always has."""
+
+
+class WorkSource(Protocol):
+    """The runtime read model an Engine dispatches from (``Engine.source``).
+
+    Constructing one does no I/O: ``SweepEngine`` inherits ``Engine.__init__``
+    and never reads the queue. Every method re-reads the source on call."""
+
+    @property
+    def name(self) -> str:
+        """The registry name (a :data:`SOURCES` member)."""
+        ...
+
+    @property
+    def has_epics(self) -> bool:
+        """The queue is grouped into epics, so a run crosses epic boundaries and
+        fires the retrospective gate."""
+        ...
+
+    def pick(self, phases: Mapping[str, Phase], current_epic: EpicId | None) -> Pick:
+        """The next unit to dispatch. ``phases`` maps every unit this run already
+        touched to its phase; ``current_epic`` is the epic of the last one."""
+        ...
+
+    def remaining_estimate(self, phases: Mapping[str, Phase]) -> int:
+        """How many units a resume would still have to run. A hint: it may raise,
+        and the engine reads any exception as "no estimate"."""
+        ...
+
+    def epic_progress(self, epic: EpicId) -> EpicProgress:
+        """``epic``'s completion and retro state; raises :class:`SourceUnreadable`."""
+        ...
+
+    def retro_done(self, epic: EpicId) -> bool:
+        """Whether ``epic``'s retrospective is done; raises :class:`SourceUnreadable`."""
+        ...
+
+    def retro_artifact_errors(self, epic: EpicId) -> tuple[list[str], list[Path]]:
+        """Every failed artifact check of a finished retro session as one error
+        line, plus the retro docs found (:meth:`retro_docs`)."""
+        ...
+
+    def retro_docs(self, epic: EpicId) -> list[Path]:
+        """``epic``'s retrospective docs on disk, sorted; raises ``OSError`` when
+        their directory cannot be listed."""
+        ...
+
+    def retro_commit_paths(self, docs: Sequence[Path]) -> set[Path]:
+        """The paths a succeeded retro session owns and the engine commits."""
+        ...
+
+    def retro_target(self, epic: EpicId) -> str:
+        """The ``/bmad-retrospective -H <target>`` argument for ``epic``."""
+        ...
+
+    def epic_label(self, epic: EpicId) -> str:
+        """``epic``'s label as a sweep trigger."""
+        ...
