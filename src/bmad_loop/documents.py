@@ -464,8 +464,11 @@ def cleanup_document(
     the paste-ready command that ends it, or to ``null`` when the backend is
     not psmux and no command can be spelled for it. No bmad-loop command
     addresses such a session, so this is the only way out; run it once every
-    window in it has parked. Additive, no schema bump; the text mode prints each
-    on stderr.
+    window in it has parked. A session a run of this project may own (a run dir
+    exists for the id its name spells, #915) gets no command and is left out,
+    though `legacy_leftovers` still names it; a runs dir that could not be read
+    for that check withholds it too, and lands in `legacy_unverified`. Additive, no schema bump; the text
+    mode prints each on stderr.
 
     `sessions.scan_error` is present only when the session listing could not
     see this project's sessions (#864): the backend is unavailable while a run

@@ -9191,6 +9191,58 @@ def test_legacy_registry_leftovers_reports_a_backend_that_cannot_be_selected(tmp
     assert len(faults) == 1 and "no backend" in faults[0]
 
 
+def test_legacy_registry_leftovers_still_scans_our_own_registry_when_discovery_fails(
+    tmp_path, monkeypatch
+):
+    """#915: a legacy discovery that raises used to return early, so the scan of
+    the project's own registry for the pre-upgrade control session never ran.
+    Both results are kept: that session named, the discovery fault reported.
+    Ablate the discovery's own `try` back to the early return and this fails."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+
+    def boom():
+        raise MultiplexerError("legacy discovery failed")
+
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _RegistryMux([old], {}, root=own))
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {own: [old]},
+        ["no legacy registry could be checked: legacy discovery failed"],
+    )
+
+
+def test_superseded_ctl_may_be_run_when_a_run_has_the_id_its_name_spells(tmp_path, monkeypatch):
+    """#915: a run dir whose session the transport resolves to the listed name
+    means that name may be the run's own agent session; none means it cannot
+    be. A case variant counts where the transport folds (ablate the
+    `session_name_key` comparison back to the spelled id and the folding arm
+    fails), and not where it is exact. A runs dir that cannot be listed answers
+    True, the direction that withholds a command, and says so (ablate the
+    `on_fault` report or answer False there and this fails)."""
+    name = runs.superseded_ctl_name(tmp_path)
+    exact = _RegistryMux([], {})
+    folding = _RegistryMux([], {}, fold=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact) is False
+    run_id = name[len(runs.session_name("")) :]
+    runs.run_dir_for(tmp_path, run_id.upper()).mkdir(parents=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, folding) is True
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact) is False
+    # The exact spelling, in a project of its own: on a case-folding store a
+    # second mkdir here would reuse the upper-case dir.
+    spelled = tmp_path / "spelled"
+    runs.run_dir_for(spelled, run_id).mkdir(parents=True)
+    assert runs.superseded_ctl_may_be_run(spelled, name, exact) is True
+
+    def _denied(self):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(Path, "iterdir", _denied)
+    faults: list[str] = []
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact, on_fault=faults.append) is True
+    assert len(faults) == 1 and name in faults[0] and "access denied" in faults[0]
+
+
 def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
     assert _healthy_leftovers(tmp_path) == {}

@@ -2974,6 +2974,56 @@ def test_attach_names_a_pre_upgrade_control_session_it_cannot_see_into(
     )
 
 
+def test_attach_prints_no_command_for_a_name_a_run_of_this_project_has(
+    project, monkeypatch, capsys
+):
+    """#915: with a run dir for the id `ctl-<the old digest>`, the listed name may
+    be that run's own agent session, so attach names it without labelling it
+    only a control session to attach into: no command, and the clause says why.
+    Ablate the `superseded_ctl_may_be_run` branch in
+    `_note_superseded_ctl_for_attach` and this fails."""
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    runs.run_dir_for(project.project, _DIGEST_CTL[len(runs.session_name("")) :]).mkdir(parents=True)
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+    monkeypatch.delenv("TMUX", raising=False)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+    assert "a run of this project with that id may own it" in err
+    assert "psmux attach" not in err and "PSMUX_DATA_DIR" not in err
+
+
+def test_attach_says_when_it_could_not_check_the_runs_dir_for_that_id(project, monkeypatch, capsys):
+    """#915: a runs dir that could not be read to rule out a run owning the
+    pre-upgrade control-session name withholds the attach command, and the
+    failed check is said on stderr rather than left as the ambiguity clause
+    alone. Ablate the `on_fault` handed to `superseded_ctl_may_be_run` in
+    `_note_superseded_ctl_for_attach` and this fails."""
+    from bmad_loop.tui import launch
+
+    def _unreadable(_project, _name, _mux, *, on_fault=None):
+        assert on_fault is not None
+        on_fault("runs dir unreadable")
+        return True
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+    monkeypatch.setattr(runs, "superseded_ctl_may_be_run", _unreadable)
+    monkeypatch.delenv("TMUX", raising=False)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert "note: runs dir unreadable" in err
+    assert "psmux attach" not in err and "PSMUX_DATA_DIR" not in err
+
+
 def test_attach_inside_a_client_names_switch_client_not_a_nested_attach(
     project, monkeypatch, capsys
 ):
@@ -19798,6 +19848,68 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: command}
     assert _DIGEST_CTL in doc["sessions"]["legacy_leftovers"]
     assert captured.err == ""
+
+
+def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
+    project, capsys, monkeypatch
+):
+    """#915: a run whose id is `ctl-<the old digest>` owns `bmad-loop-<id>`, the
+    very name the old release minted for the control session, and that run may
+    be live. It is still named, but with no command: absent from
+    `legacy_kill_commands`, and the text says why. Ablate the
+    `superseded_ctl_may_be_run` branch in `_superseded_ctl_kill_commands` and
+    this fails."""
+    from bmad_loop.tui import launch
+
+    runs.run_dir_for(project.project, _DIGEST_CTL[len(runs.session_name("")) :]).mkdir(parents=True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(): ({_OWN_REG: [_DIGEST_CTL]}, [])
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL}" in err
+    assert "a run of this project with that id may own it" in err
+    assert "kill-session" not in err and "end it with" not in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_kill_commands"] == {}
+    assert doc["sessions"]["legacy_leftovers"] == [_DIGEST_CTL]
+    assert captured.err == ""
+
+
+def test_cleanup_reports_a_runs_dir_it_could_not_check_for_that_id(project, capsys, monkeypatch):
+    """#915: when the runs dir cannot be read to rule out a run owning the
+    pre-upgrade control-session name, the command is withheld and the failed
+    check is said, in `legacy_unverified` under this registry's label, never
+    folded into a bare omission. Ablate the `on_fault` handed to
+    `superseded_ctl_may_be_run` in `_superseded_ctl_kill_commands` and this fails."""
+    from bmad_loop.tui import launch
+
+    def _unreadable(_project, _name, _mux, *, on_fault=None):
+        assert on_fault is not None
+        on_fault("runs dir unreadable")
+        return True
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(): ({_OWN_REG: [_DIGEST_CTL]}, [])
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+    monkeypatch.setattr(runs, "superseded_ctl_may_be_run", _unreadable)
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["sessions"]["legacy_kill_commands"] == {}
+    assert doc["sessions"]["legacy_unverified"] == [f"{_OWN_REG}: runs dir unreadable"]
 
 
 def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys, monkeypatch):

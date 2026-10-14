@@ -2487,9 +2487,16 @@ def legacy_registry_leftovers(
     excluded = {session_name(run_id) for run_id in announced}
     faults: list[str] = []
     try:
-        legacies = _legacy_registries()
+        primary = get_multiplexer()
     except MultiplexerError as exc:
         return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+    # Its own try (#915): a legacy discovery that raises must not skip the
+    # primary-registry scan below, which needs only the backend selected above.
+    try:
+        legacies = _legacy_registries()
+    except MultiplexerError as exc:
+        faults.append(f"no legacy registry could be checked: {exc}")
+        legacies = []
     for legacy in legacies:
         try:
             names = legacy.list_sessions()
@@ -2527,7 +2534,6 @@ def legacy_registry_leftovers(
             grouped[label] = sorted(set(grouped.get(label, []) + here))
     # The project's own registry is no legacy one, but a control session an
     # earlier release named there survives the rename too (#733).
-    primary = get_multiplexer()
     label = primary.registry_root() or DEFAULT_REGISTRY_LABEL
     try:
         stale = superseded_ctl_sessions(
@@ -2608,6 +2614,39 @@ def superseded_ctl_sessions(
         for name in mux.list_sessions_reporting(on_fault=on_fault)
         if mux.session_name_key(name) == old
     )
+
+
+def superseded_ctl_may_be_run(
+    project: Path,
+    name: str,
+    mux: TerminalMultiplexer,
+    *,
+    on_fault: Callable[[str], None] | None = None,
+) -> bool:
+    """True when the pre-upgrade control-session name ``name`` (as listed) may
+    instead be the agent session of a run of ``project`` (#915).
+
+    A run id equal to the old digest, ``ctl-<16 hex>`` (one supplied by hand
+    or persisted by an older release), owns ``bmad-loop-<id>`` — the very name
+    the old release minted for the control session — so the name alone cannot
+    say which it is, and that run may be live. Any run dir whose session the
+    transport resolves to ``name`` (``mux``'s
+    :meth:`~.multiplexer.TerminalMultiplexer.session_name_key`, so a case
+    variant counts where the transport folds) is enough to withhold a kill or
+    attach command for it.
+
+    A runs dir that cannot be listed answers True, the direction that withholds
+    a command, and the fault goes to ``on_fault``."""
+    key = mux.session_name_key(name)
+    try:
+        entries = [entry.name for entry in (project / RUNS_DIR).iterdir()]
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        if on_fault is not None:
+            on_fault(f"could not check whether {name} is a run's own session: {exc}")
+        return True
+    return any(mux.session_name_key(session_name(run_id)) == key for run_id in entries)
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:

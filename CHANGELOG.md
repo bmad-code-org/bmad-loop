@@ -97,6 +97,9 @@ breaking changes may land in a minor release.
   psmux registry: `cleanup` names it on stderr and in `sessions.legacy_leftovers` with the
   command that ends it (`sessions.legacy_kill_commands`), and `attach` names it when it finds
   nothing to attach (#733).
+- Print no kill or attach command for a pre-upgrade control-session name that a run of this
+  project has as its id (it may be that run's own session), and still check the project's own
+  registry when legacy-registry discovery fails (#915).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
