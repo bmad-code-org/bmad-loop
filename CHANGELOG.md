@@ -75,6 +75,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Start a run's mux session at the project root, not in the first session's working
+  directory. Under worktree isolation on Windows psmux, the session held the first unit's
+  worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
+  `worktrees/1` behind (#902).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
