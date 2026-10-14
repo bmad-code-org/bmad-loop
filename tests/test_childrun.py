@@ -392,7 +392,9 @@ def test_drain_gives_up_on_a_holder_nothing_can_reach(tmp_path, monkeypatch, cap
     assert elapsed < 1.0 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
     # the holder is dead, so each deferred reader's read has returned and the
     # reader closed its own stream
-    (root,) = spawned
+    # the runner's spawn is the first Popen; the patch is module-global, so the
+    # timeout kill's `taskkill` runs are recorded after it
+    root = spawned[0]
     streams = (root.stdout, root.stderr)
     deadline = time.monotonic() + 5.0
     while not all(s is not None and s.closed for s in streams):
