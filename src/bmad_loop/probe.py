@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
@@ -65,7 +66,7 @@ from .process_host import ProcessHostError, get_process_host
 # diagnostics — the noqa keeps ruff's F401 autofix from deleting the re-export.
 from .sanitize import LeakDetected  # noqa: F401 — re-export
 from .signals import SignalWatcher
-from .tokens import _jsonl_entries, read_usage
+from .tokens import _jsonl_entries, codex_home, read_usage
 
 # Version of the `--json` document (machine.py contract). Distinct from the
 # document's `version` key, which holds the *probed CLI's* `--version` output.
@@ -98,6 +99,10 @@ FAMILY_GLOBS = {
         "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
     ),
 }
+# Codex relocates its whole state root with CODEX_HOME. The live tally resolves
+# that root through `tokens.codex_home`, so the convention globs above that are
+# rooted here follow it too (see `_convention_glob`).
+_CODEX_ROOT_PREFIX = "~/.codex/"
 
 _TOKEN_KEY_RE = re.compile(
     r"(token|tokens|cached|input|output|prompt|completion|thoughts|usage)", re.I
@@ -356,14 +361,35 @@ def _newest(paths: list[Path]) -> Path:
     return max(paths, key=lambda p: p.stat().st_mtime if p.exists() else 0)
 
 
+def _convention_glob(pattern: str, env: Mapping[str, str]) -> tuple[str | None, str]:
+    """The ``(search, display)`` forms of a convention glob.
+
+    A ``~/.codex/``-rooted pattern searches under ``tokens.codex_home(env)``, the
+    root live sessions tally from; the root is escaped, so it matches literally
+    as live resolution does. Its display names ``$CODEX_HOME`` rather than the
+    configured path: the glob renders verbatim, without `_redact_location`.
+    ``search`` is None when no codex root can be determined."""
+    if not pattern.startswith(_CODEX_ROOT_PREFIX):
+        return os.path.expanduser(pattern), pattern
+    rest = pattern[len(_CODEX_ROOT_PREFIX) :]
+    root = codex_home(env)
+    search = None if root is None else os.path.join(glob.escape(str(root)), rest)
+    display = f"$CODEX_HOME/{rest}" if env.get("CODEX_HOME") else pattern
+    return search, display
+
+
 def discover_transcript(
     parser: str,
     *,
     cli: str,
     hints: Hints,
     aliases: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> TranscriptFinding | None:
-    """Locate the newest existing transcript via override or convention glob."""
+    """Locate the newest existing transcript via override or convention glob.
+
+    ``env`` is the environment the CLI runs under (default: this process's);
+    the codex globs resolve CODEX_HOME from it."""
     if hints.transcript:
         path = Path(hints.transcript).expanduser()
         if not path.is_file():
@@ -385,16 +411,17 @@ def discover_transcript(
             note="no transcript-location convention for this CLI; "
             "pass --transcript PATH or --session-dir DIR"
         )
-    matches = [Path(p) for p in glob.glob(os.path.expanduser(pattern))]
+    search, display = _convention_glob(pattern, os.environ if env is None else env)
+    matches = [Path(p) for p in glob.glob(search)] if search is not None else []
     matches = [p for p in matches if p.is_file()]
     if not matches:
         return TranscriptFinding(
-            glob=pattern,
+            glob=display,
             note="no existing transcript matched the convention glob; "
             "use --transcript / --session-dir, or run --probe",
         )
     return _describe_transcript(
-        _newest(matches), glob_pat=pattern, multiple=len(matches) > 1, aliases=aliases
+        _newest(matches), glob_pat=display, multiple=len(matches) > 1, aliases=aliases
     )
 
 
@@ -606,7 +633,11 @@ def scan(
                 "or re-run with --probe"
             )
 
-    finding.transcript = discover_transcript(parser, cli=cli, hints=hints, aliases=aliases)
+    # The profile's env overlays this process's, as it does for live sessions.
+    cli_env = {**os.environ, **profile.env} if profile is not None else None
+    finding.transcript = discover_transcript(
+        parser, cli=cli, hints=hints, aliases=aliases, env=cli_env
+    )
     if finding.transcript and finding.transcript.note:
         finding.warnings.append(finding.transcript.note)
     if finding.transcript and finding.transcript.real_path is not None:
@@ -884,7 +915,11 @@ def probe(
             )
         else:
             finding.transcript = discover_transcript(
-                profile.usage_parser, cli=cli, hints=hints, aliases=aliases
+                profile.usage_parser,
+                cli=cli,
+                hints=hints,
+                aliases=aliases,
+                env={**os.environ, **profile.env},
             )
         if finding.transcript and finding.transcript.note:
             finding.warnings.append(finding.transcript.note)

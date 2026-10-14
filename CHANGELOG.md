@@ -83,6 +83,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make `bmad-loop probe-adapter` search for codex rollouts under `$CODEX_HOME/sessions`,
+  as live sessions do, instead of always `~/.codex/sessions` (DW-546).
 - Name the cause when an OpenCode 1.x server dies during startup on a database a 2.x
   server created: the spawn give-up error now names `opencode.db` and says to move it
   aside, instead of only `rc=1` (DW-544).
