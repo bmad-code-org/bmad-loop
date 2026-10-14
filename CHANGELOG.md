@@ -83,6 +83,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bound verify-command and `[environment]`-probe output while it is captured, not only
+  after the command exits: each stream keeps a rolling tail of the 32 MiB cap as it is
+  read, so a chatty command's held output stays O(cap) instead of growing with
+  `[verify] command_timeout_min` (DW-549).
 - Make `bmad-loop probe-adapter` search for codex rollouts under `$CODEX_HOME/sessions`,
   as live sessions do, instead of always `~/.codex/sessions` (DW-546).
 - Name the cause when an OpenCode 1.x server dies during startup on a database a 2.x
