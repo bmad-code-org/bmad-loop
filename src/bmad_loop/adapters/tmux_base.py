@@ -322,11 +322,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
         """
         if not shutil.which(self._BINARY):
             return
+        consequence = "reading it as empty"
         if isinstance(proc, BaseException):
             outcome, detail = "failed", f"{type(proc).__name__}: {proc}"
         elif isinstance(proc, list):
             outcome = "printed a row that cannot be a session name"
             detail = ", ".join(repr(row) for row in proc)
+            # The names that did answer are kept (#919), so the listing is not
+            # read as empty: only the sessions behind these rows are unknown.
+            consequence = "keeping the names that answered"
         else:
             if self._session_proved_gone(proc):
                 return
@@ -337,7 +341,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return
         print(
             f"warning: {self._BINARY} {verb} {outcome} without proving "
-            f"the session gone; reading it as empty: {detail}",
+            f"the session gone; {consequence}: {detail}",
             file=sys.stderr,
         )
 

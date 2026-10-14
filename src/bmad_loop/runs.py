@@ -3411,12 +3411,15 @@ def live_session_may_be_ours(
     if key(name) == key(ctl_session_for(project, mux)):
         return False
 
-    def folded(fault: str) -> None:
-        _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
-
+    # A fault is said only when the session is then read as absent: a partial
+    # listing that still names it (#919) goes on to the tag check below, so
+    # "proceeding as if none is live" would be the opposite of what happens.
+    faults: list[str] = []
     try:
-        listing = mux_sessions(on_fault=folded if warn is not None else None)
+        listing = mux_sessions(on_fault=faults.append if warn is not None else None)
         if key(name) not in {key(s) for s in listing}:
+            for fault in faults:
+                _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
             return False
     except MultiplexerError as exc:
         _warn_unasked_session_guard(run_id, "the session listing raised", exc, warn)
