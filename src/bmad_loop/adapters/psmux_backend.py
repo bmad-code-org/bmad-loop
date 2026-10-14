@@ -195,6 +195,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
     _ERRORS = "backslashreplace"
+    # list-sessions prints any server reply other than `ERROR: Authentication
+    # required` as a row, so a server whose key file does not match lists as a
+    # session named `ERROR: Invalid session key` (measured on 3.4.0, #919).
+    _NON_SESSION_ROW_PREFIXES = ("ERROR:",)
 
     def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
         """``default_registry=True`` binds this instance to psmux's OWN registry

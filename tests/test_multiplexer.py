@@ -719,6 +719,73 @@ def test_list_sessions_reporting_hands_the_fault_to_the_sink(monkeypatch, capsys
     assert capsys.readouterr().err == unrouted != ""
 
 
+def _answering_listing(monkeypatch, stdout: str) -> None:
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=""),
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "bad"),
+    [
+        # a server that did not answer the client's 500 ms read (psmux 3.4.0)
+        ("bmad-loop-a\n\n", "''"),
+        # a server whose key file does not match (psmux 3.4.0)
+        ("ERROR: Invalid session key\nbmad-loop-a\n", "'ERROR: Invalid session key'"),
+    ],
+)
+def test_psmux_session_listings_report_a_row_that_cannot_be_a_session_name(
+    monkeypatch, capsys, stdout, bad
+):
+    """psmux's list-sessions exits 0 and prints its own row for a server it could
+    not read (#919): that row is a listing fault, reported like an unproven
+    exit, while the names that did answer are kept. `session_options` reads the
+    same listing, so it reports alike (on stderr, its only channel).
+
+    Ablation: make `_warn_non_session_rows` a no-op and every fault assertion
+    fails; drop `ERROR:` from psmux's `_NON_SESSION_ROW_PREFIXES` and the key
+    row comes back as a session."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    _answering_listing(monkeypatch, stdout)
+    mux = PsmuxMultiplexer()
+    fault = (
+        "psmux list-sessions printed a row that cannot be a session name "
+        f"without proving the session gone: {bad}"
+    )
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == ["bmad-loop-a"]
+    assert faults == [fault]
+    assert capsys.readouterr().err == ""
+    assert mux.list_sessions() == ["bmad-loop-a"]
+    assert capsys.readouterr().err.startswith(
+        "warning: psmux list-sessions printed a row that cannot be a session name"
+    )
+    _answering_listing(monkeypatch, stdout.replace("bmad-loop-a", "bmad-loop-a\tP1"))
+    assert mux.session_options("@opt") == {"bmad-loop-a": "P1"}
+    assert bad in capsys.readouterr().err
+
+
+def test_tmux_session_listings_read_every_named_row_as_a_session(monkeypatch, capsys):
+    """tmux never prints a row for a server it could not read, so its listings
+    are unchanged by #919: a name that merely starts `ERROR:` is a session (the
+    prefix is psmux's alone), and an answered listing is silent.
+
+    Ablation: give the base class psmux's `("ERROR:",)` prefix and this fails
+    on the dropped name and the warning."""
+    _answering_listing(monkeypatch, "ERROR: x\nb\n")
+    mux = TmuxMultiplexer()
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == ["ERROR: x", "b"]
+    _answering_listing(monkeypatch, "ERROR: x\tv\nb\t\n")
+    assert mux.session_options("@opt") == {"ERROR: x": "v", "b": ""}
+    assert faults == []
+    assert capsys.readouterr().err == ""
+
+
 def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
     """A byte the codec cannot decode is a transport failure like a timeout: the
     liveness probe must answer MultiplexerError ("unknowable"), not leak the raw
