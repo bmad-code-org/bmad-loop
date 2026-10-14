@@ -6505,7 +6505,10 @@ def cmd_attach(args: argparse.Namespace) -> int:
         try:
             run_dir = runs.resolve_run_dir(project, args.run_id)
         except runs.RunRefError as e:
+            # The run dir may be archived or cleaned while its window stays
+            # parked in a pre-upgrade control session (#915).
             print(str(e), file=sys.stderr)
+            _note_superseded_ctl_for_attach(project, "a run's window may be there")
             return 1
     else:
         run_dir = _latest_run_dir(project)

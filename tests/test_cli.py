@@ -2969,6 +2969,13 @@ def test_attach_with_no_runs_left_still_names_a_pre_upgrade_control_session(
     assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
     assert "a run's window may be there\n" in err and "this run's" not in err
 
+    # The same for a run id given explicitly whose run dir is gone (ablate the
+    # call on the RunRefError exit and this half fails).
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-gone"]) == 1
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+    assert "a run's window may be there\n" in err
+
 
 def test_attach_names_a_pre_upgrade_control_session_it_cannot_see_into(
     project, monkeypatch, capsys
