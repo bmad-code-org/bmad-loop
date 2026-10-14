@@ -947,9 +947,20 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # the wire now carries them — a value that reads back different is the
         # same silently-unprunable window whichever hop mangled it. An empty
         # value is a silent server-side no-op (`-u` is the verb for that).
+        #
+        # A few `-`-leading shapes still lose the WIRE half, to the client's
+        # argv normalizers that run before `set-option` parses (psmux/psmux#795,
+        # cli.rs at v3.4.0): `normalize_flag_equals` splits `-X=value` (one
+        # ASCII letter, a nonempty suffix) into `-X value` and the write
+        # succeeds silently; `normalize_attached_target_flag` splits `-t…` into
+        # a target flag, and `--` ends the options, so those two fail rc 1 and
+        # would leave a stale value in place. Other `-` values (`-u`, `-1=x`,
+        # `--x=y`, `-x=`) are stored verbatim since #583.
         if not value:
             return False
         if '"' in value or value != value.strip():
+            return False
+        if value == "--" or value.startswith("-t") or re.match(r"-[A-Za-z]=.", value):
             return False
         return value.splitlines() == [value]
 

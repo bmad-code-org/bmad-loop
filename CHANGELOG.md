@@ -79,6 +79,9 @@ breaking changes may land in a minor release.
   directory. Under worktree isolation on Windows psmux, the session held the first unit's
   worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
   `worktrees/1` behind (#902).
+- Refuse psmux option values shaped `-X=value`, `-t…` or `--`: psmux 3.4.0 rewrites the
+  first silently and rejects the others, so the value is now warned about and its key freed
+  (#905).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
