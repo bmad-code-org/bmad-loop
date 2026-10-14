@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -1078,6 +1079,13 @@ def _project_template(
     disposable copies via `project`. (Do not chmod it read-only either: copytree
     preserves modes, so the copies would inherit it and break every write.)"""
     root = seed_project_files(tmp_path_factory.mktemp("project-template") / "sandbox").project
+    _commit_template(root)
+    return root
+
+
+def _commit_template(root: Path) -> None:
+    """Turn a seeded template tree into its one-commit `main` repo: the setup every
+    session template shares, so the v7 template cannot drift from `_project_template`."""
     git(root, "init", "-q", "-b", "main")
     # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
     # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
@@ -1102,7 +1110,6 @@ def _project_template(
     git(root, "config", "maintenance.auto", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
-    return root
 
 
 def copy_project(template: Path, root: Path) -> ProjectPaths:
@@ -1145,6 +1152,35 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
     clone of the per-worker template, so no git subprocesses per test (git spawn
     plus fsync made this fixture ~3s per test on Windows CI)."""
     return copy_project(_project_template, tmp_path / "sandbox")
+
+
+V7_GITIGNORE = ".bmad-loop/runs/\n_bmad/custom/*.user.toml\n"
+
+
+@pytest.fixture(scope="session")
+def _project_template_v7(
+    tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
+) -> Path:
+    """The v7 twin of `_project_template`, built once per xdist worker and never
+    handed to a test: a committed v7 install with `DEFAULT_TREE` as a tracked store
+    inside the checkout (layout T1, upstream's default). The personal config layer is
+    gitignored as `bmad setup` leaves it, so it exists in every copy but is never
+    committed — which is what makes a worktree miss `active_initiative`."""
+    root = tmp_path_factory.mktemp("project-template-v7") / "sandbox"
+    root.mkdir()
+    (root / "src.txt").write_text("original\n", encoding="utf-8")
+    (root / ".gitignore").write_text(V7_GITIGNORE, encoding="utf-8")
+    write_ticket_tree(install_bmad_v7(root), DEFAULT_TREE)
+    _commit_template(root)
+    return root
+
+
+@pytest.fixture
+def project_v7(tmp_path: Path, _project_template_v7: Path) -> V7Layout:
+    """A private copytree of the v7 template at `tmp_path / "sandbox"`, like `project`."""
+    root = tmp_path / "sandbox"
+    shutil.copytree(_project_template_v7, root)
+    return v7_layout(root)
 
 
 @pytest.fixture
@@ -1554,6 +1590,296 @@ def install_bmad_central_config(paths: ProjectPaths) -> None:
     (bmad / "config.user.toml").write_text(CENTRAL_USER_CONFIG, encoding="utf-8")
     (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
     (bmad / "custom" / "config.user.toml").write_text(CENTRAL_CUSTOM_USER_STUB, encoding="utf-8")
+
+
+# BMAD-METHOD v7: the initiative ticket tree. `tests/fixtures/bmad_v7` holds upstream's
+# `tickets.py` and `config_utils.py` byte-for-byte at the commit `PIN.toml` names, so
+# every v7 sandbox runs the real script with no network and no `uv`. The layout below
+# is what upstream's `bmad setup` writes (`skills/bmad/assets/config.template.toml`,
+# `skills/bmad/references/initiative.md`) and what `tickets.py` reads: the three
+# config layers via `_bmad/scripts/config_utils.py`, `[core] active_initiative` in the
+# personal (gitignored) layer, and `{output_folder}/{initiative}/` as the tree.
+V7_FIXTURE = Path(__file__).parent / "fixtures" / "bmad_v7"
+V7_TICKETS_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
+V7_CONFIG_UTILS_REL = Path("_bmad") / "scripts" / "config_utils.py"
+V7_USER_CONFIG_REL = Path("_bmad") / "custom" / "config.user.toml"
+V7_STORE_CONFIG_REL = Path("_bmad") / "custom" / "ticketing-store-config.toml"
+V7_DEFAULT_INITIATIVE = "initiative-demo"
+
+
+@dataclass(frozen=True)
+class EntrySpec:
+    """One `[[entry]]` of an epic's `tickets.toml`. ``after`` holds upstream refs: a
+    bare int is a sibling id, ``"E.M"`` another epic's entry, ``"epic-<x>"`` a whole
+    epic. ``refine=None`` leaves the key out (upstream then refines bugs only).
+    ``refined=True`` also writes the pulled leaf file with ``refined: true``, the only
+    way upstream ever reports a ticket as refined."""
+
+    id: int
+    title: str
+    type: str = "story"
+    after: tuple[int | str, ...] = ()
+    hitl: bool = False
+    refine: bool | None = None
+    refined: bool = False
+    plan_checkpoint: bool = False
+    done_checkpoint: bool = False
+
+
+@dataclass(frozen=True)
+class EpicSpec:
+    """One epic folder. ``slug`` is the folder name (``epic-<x>``), which is also
+    upstream's `[[epic]] slug`. ``gated_by`` names epic slugs that must be closed
+    (`status: done` in their epic file) first: it is written as the epic file's
+    `after:`, the only epic gate `next` enforces, plus the advisory initiative-level
+    `after` that keeps `unpinned_after` empty."""
+
+    id: int
+    slug: str
+    title: str
+    entries: tuple[EntrySpec, ...]
+    gated_by: tuple[str, ...] = ()
+    status: str = "in-progress"
+
+
+@dataclass(frozen=True)
+class V7Layout:
+    project: Path
+    initiative: str
+    output_folder: Path
+    initiative_folder: Path
+    tickets_script: Path
+    store: str
+
+
+# 2 epics x 2 entries, one of each kind a tickets run treats differently, in build
+# order: 1.1 is the only ready ticket (an unrefined plan_checkpoint, so two legs, and
+# a done_checkpoint); 1.2 waits on 1.1 and is hitl; epic 2 is gated on epic 1's
+# closure; 2.1 is a refined plan_checkpoint; 2.2 is a bug, so it needs refinement.
+DEFAULT_TREE: tuple[EpicSpec, ...] = (
+    EpicSpec(
+        1,
+        "epic-cart",
+        "Cart",
+        (
+            EntrySpec(1, "Cart model", plan_checkpoint=True, done_checkpoint=True),
+            EntrySpec(2, "Cart rules", after=(1,), hitl=True),
+        ),
+    ),
+    EpicSpec(
+        2,
+        "epic-checkout",
+        "Checkout",
+        (
+            EntrySpec(1, "Checkout form", plan_checkpoint=True, refined=True),
+            EntrySpec(2, "Checkout crash", type="bug", after=(1,)),
+        ),
+        gated_by=("epic-cart",),
+    ),
+)
+
+
+def v7_layout(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+) -> V7Layout:
+    """The paths `install_bmad_v7` writes under ``root``, computed without touching disk."""
+    out = Path(output_folder) if Path(output_folder).is_absolute() else root / output_folder
+    return V7Layout(
+        project=root,
+        initiative=initiative,
+        output_folder=out,
+        initiative_folder=out / initiative,
+        tickets_script=root / V7_TICKETS_REL,
+        store=store,
+    )
+
+
+def install_bmad_v7(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+    bmod_version: str = "7.0.0",
+    skill_tree: str = ".claude/skills",
+) -> V7Layout:
+    """Install a v7 project under ``root``: the config layers, the vendored scripts at
+    their installed paths, the `bmod-method` module record and the store config, plus
+    an empty initiative folder. No tree: `write_ticket_tree` writes that."""
+    layout = v7_layout(root, initiative=initiative, output_folder=output_folder, store=store)
+    bmad = root / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    folder = (
+        output_folder if Path(output_folder).is_absolute() else f"{{project-root}}/{output_folder}"
+    )
+    (bmad / "config.toml").write_text(
+        f"[core]\nproject_name = {json.dumps(root.name)}\noutput_folder = {json.dumps(folder)}\n",
+        encoding="utf-8",
+    )
+    (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
+    (root / V7_USER_CONFIG_REL).write_text(
+        f"[core]\nactive_initiative = {json.dumps(initiative)}\n", encoding="utf-8"
+    )
+    (root / V7_STORE_CONFIG_REL).write_text(
+        f"[tickets]\nstore = {json.dumps(store)}\n", encoding="utf-8"
+    )
+    for rel, name in ((V7_CONFIG_UTILS_REL, "config_utils.py"), (V7_TICKETS_REL, "tickets.py")):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(V7_FIXTURE / name, root / rel)
+    record = root / skill_tree / "bmod-method" / "bmod.toml"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        "[bmod]\n"
+        'code = "method"\n'
+        f"version = {json.dumps(bmod_version)}\n"
+        'update_source = "github:bmad-code-org/BMAD-METHOD/skills"\n'
+        'skills = ["bmad-build-auto", "bmad-ticket"]\n',
+        encoding="utf-8",
+    )
+    layout.initiative_folder.mkdir(parents=True, exist_ok=True)
+    return layout
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise TypeError(f"no TOML rendering for {value!r}")
+
+
+def _frontmatter_value(value: object) -> str:
+    """A value as upstream's frontmatter parser reads it: inline lists, bare
+    true/false and ints, and plain text."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(str(v) for v in value) + "]"
+    return str(value)
+
+
+def _frontmatter(fields: dict[str, object], body: str) -> str:
+    lines = "".join(f"{k}: {_frontmatter_value(v)}\n" for k, v in fields.items())
+    return f"---\n{lines}---\n\n{body}"
+
+
+def ticket_slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
+def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicSpec]) -> None:
+    """Hand-write the initiative's breakdown: its own frontmatter file, the
+    `[[epic]]` table in build order, and per epic its `epic-<x>.md` and `tickets.toml`
+    (plus a pulled leaf file for every ``refined`` entry). Plans are separate:
+    `write_plan`."""
+    folder = layout.initiative_folder
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{layout.initiative}.md").write_text(
+        _frontmatter(
+            {"type": "initiative", "title": layout.initiative, "parent": "none"},
+            f"# {layout.initiative}\n",
+        ),
+        encoding="utf-8",
+    )
+    ids = {epic.slug: epic.id for epic in epics}
+    table = []
+    for epic in epics:
+        block = f"[[epic]]\nid = {epic.id}\nslug = {json.dumps(epic.slug)}\n"
+        if epic.gated_by:
+            gates = ", ".join(
+                f"{{ epic = {ids[g]}, needs = {json.dumps(f'{g} closed')} }}" for g in epic.gated_by
+            )
+            block += f"after = [{gates}]\n"
+        table.append(block)
+    (folder / "tickets.toml").write_text("\n".join(table), encoding="utf-8")
+    for epic in epics:
+        epic_dir = folder / epic.slug
+        epic_dir.mkdir(exist_ok=True)
+        fields: dict[str, object] = {"type": "epic", "title": epic.title, "status": epic.status}
+        if epic.gated_by:
+            fields["after"] = list(epic.gated_by)
+        (epic_dir / f"{epic.slug}.md").write_text(
+            _frontmatter(fields, f"# {epic.title}\n"), encoding="utf-8"
+        )
+        entries = []
+        for e in epic.entries:
+            block = (
+                f"[[entry]]\nid = {e.id}\ntype = {json.dumps(e.type)}\n"
+                f"title = {json.dumps(e.title, ensure_ascii=False)}\n"
+            )
+            if e.after:
+                block += f"after = {_toml_value(e.after)}\n"
+            for key in ("hitl", "plan_checkpoint", "done_checkpoint"):
+                if getattr(e, key):
+                    block += f"{key} = true\n"
+            if e.refine is not None:
+                block += f"refine = {_toml_value(e.refine)}\n"
+            entries.append(block)
+            if e.refined:
+                (epic_dir / f"{e.type}-{ticket_slug(e.title)}.md").write_text(
+                    _frontmatter(
+                        {
+                            "id": e.id,
+                            "type": e.type,
+                            "title": json.dumps(e.title, ensure_ascii=False),
+                            "parent": epic.slug,
+                            "after": list(e.after),
+                            "refined": True,
+                            "hitl": e.hitl,
+                        },
+                        f"# {e.title}\n",
+                    ),
+                    encoding="utf-8",
+                )
+        (epic_dir / "tickets.toml").write_text("\n".join(entries), encoding="utf-8")
+
+
+def write_plan(
+    layout: V7Layout, epic_slug: str, stem: str, ticket: int | str, status: str, **fm: object
+) -> Path:
+    """Write ``<epic>/<stem>.md``, a build plan for entry ``ticket``, with frontmatter
+    `ticket` and `status` plus ``fm``. Upstream names plans
+    ``<type>-<title slug>-plan.md``; pass that stem to look like a real build."""
+    path = layout.initiative_folder / epic_slug / f"{stem}.md"
+    fields: dict[str, object] = {"ticket": ticket, "status": status, **fm}
+    path.write_text(_frontmatter(fields, f"# {stem}\n"), encoding="utf-8")
+    return path
+
+
+def run_tickets(layout: V7Layout, *argv: str, rc: int = 0) -> dict[str, object]:
+    """Run the sandbox's installed `tickets.py` the way bmad-loop will (isolated, no
+    bytecode, UTF-8 mode) and return its JSON document: stdout on rc 0, stderr
+    otherwise. Every call is a real spawn: count it against the calling file's
+    real-spawn budget."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            "utf8",
+            str(layout.tickets_script),
+            "--project-root",
+            str(layout.project),
+            *argv,
+        ],
+        cwd=layout.project,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert proc.returncode == rc, f"tickets.py {argv}: rc {proc.returncode}\n{proc.stderr}"
+    doc = json.loads(proc.stdout if rc == 0 else proc.stderr)
+    assert isinstance(doc, dict)
+    return doc
 
 
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:

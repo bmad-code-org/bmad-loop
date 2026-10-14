@@ -42,6 +42,11 @@ lint:
     - linters: [markdownlint, prettier]
       paths:
         - .github/CODE_OF_CONDUCT.md
+    # Vendored upstream BMAD-METHOD files, pinned byte-for-byte by sha256 in
+    # tests/fixtures/bmad_v7/PIN.toml: no linter or formatter may touch them.
+    - linters: [ALL]
+      paths:
+        - tests/fixtures/bmad_v7/**
 actions:
   disabled:
     - trunk-announce

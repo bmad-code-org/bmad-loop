@@ -1,3 +1,6 @@
 # Raw pipe-pane captures are byte-exact evidence (CR CR LF line ends): never
 # convert their line endings on checkout.
 tests/fixtures/*.pipe-pane.log -text
+# Vendored upstream BMAD-METHOD files are pinned by sha256 (PIN.toml): never
+# convert their line endings on checkout.
+tests/fixtures/bmad_v7/** -text
