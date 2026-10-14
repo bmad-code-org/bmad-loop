@@ -92,6 +92,10 @@ breaking changes may land in a minor release.
 - Name the cause when an OpenCode 1.x server dies during startup on a database a 2.x
   server created: the spawn give-up error now names `opencode.db` and says to move it
   aside, instead of only `rc=1` (DW-544).
+- Save a plugin's edited settings under `[plugins."<name>"]` when its name contains a dot.
+  The TUI settings editor split the section on every dot, so `acme.tools` landed in nested
+  `[plugins.acme.tools]` tables the policy loader never reads; values saved there earlier
+  are not migrated — re-enter them (DW-550).
 - Encode plugin setting-field widget ids, so a plugin whose name or `[[settings]]` key
   holds a space, dot or other non-identifier character no longer stops the TUI settings
   screen from opening (`BadIdentifier`) (DW-539).

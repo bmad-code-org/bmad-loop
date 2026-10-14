@@ -27,7 +27,8 @@ from ..policy import STAGES  # noqa: F401 — re-export
 
 class PolicyDoc:
     """A policy.toml document under edit. Sections may be dotted
-    ("adapter.dev") to address the per-stage override tables."""
+    ("adapter.dev") to address the per-stage override tables; a
+    "plugins.<name>" section is always the two-part path (see `_path`)."""
 
     def __init__(self, doc: tomlkit.TOMLDocument):
         self._doc = doc
@@ -44,9 +45,23 @@ class PolicyDoc:
             text = policy_mod.POLICY_TEMPLATE if template_when_missing else ""
         return cls(tomlkit.parse(text))
 
+    @staticmethod
+    def _path(section: str) -> list[str]:
+        """Table path for a section. A ``plugins.<name>`` section splits only
+        once: a manifest name is any non-empty string, so ``acme.tools`` is the
+        one table ``[plugins."acme.tools"]`` that policy.py's per-plugin parse
+        reads, never nested ``[plugins.acme.tools]`` tables."""
+        head, dot, name = section.partition(".")
+        if head == "plugins" and dot:
+            return [head, name]
+        return section.split(".")
+
     def _table(self, section: str, create: bool) -> Any | None:
+        return self._walk(self._path(section), create)
+
+    def _walk(self, path: list[str], create: bool) -> Any | None:
         node: Any = self._doc
-        for part in section.split("."):
+        for part in path:
             if part not in node:
                 if not create:
                     return None
@@ -62,15 +77,18 @@ class PolicyDoc:
         return table[key]
 
     def set(self, section: str, key: str, value: Any | None) -> None:
-        """Set a key; None deletes it. A per-stage adapter table emptied by a
-        delete is dropped entirely, restoring 'unset = inherit'."""
+        """Set a key; None deletes it. A sub-table (per-stage adapter or
+        per-plugin) emptied by a delete is dropped entirely, restoring
+        'unset = inherit'."""
         if value is None:
             table = self._table(section, create=False)
             if table is not None and key in table:
                 del table[key]
-            parent, _, stage = section.partition(".")
-            if stage and table is not None and len(table) == 0:
-                del self._doc[parent][stage]
+            path = self._path(section)
+            if len(path) > 1 and table is not None and len(table) == 0:
+                # The parent exists: the emptied table was just found under it.
+                parent = self._walk(path[:-1], create=False)
+                del parent[path[-1]]  # pyright: ignore[reportOptionalSubscript]
             return
         # _table(create=True) never returns None (it creates missing tables), but
         # its return type is Any | None.

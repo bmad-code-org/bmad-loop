@@ -249,6 +249,40 @@ def test_validate_with_project_skips_disabled_plugin_coupling(tmp_path):
     assert doc.validate(schemas, project=tmp_path) is None
 
 
+def test_dotted_plugin_name_round_trips_as_one_quoted_table(tmp_path):
+    """A manifest name is any non-empty string, so the settings section
+    ``plugins.acme.tools`` names the ONE table [plugins."acme.tools"] that
+    policy.py's per-plugin parse reads — get, set and delete alike — while an
+    undotted plugin keeps its plain [plugins.<name>] header.
+
+    ABLATION: split every section on "." in `PolicyDoc._path` and the value
+    lands in nested [plugins.acme.tools] tables policy.py never matches."""
+    path = tmp_path / "policy.toml"
+    path.write_text(
+        '[plugins]\nenabled = []\n\n[plugins."acme.tools"]\nretries = 2\n', encoding="utf-8"
+    )
+    doc = PolicyDoc.load(path)
+    assert doc.get("plugins.acme.tools", "retries") == 2  # reads the existing quoted table
+
+    doc.set("plugins.acme.tools", "retries", 7)
+    doc.set("plugins.web.ui.v2", "port", 8080)  # a table created fresh
+    doc.set("plugins.plain", "mode", "x")
+    text = doc.dumps()
+    parsed = tomllib.loads(text)["plugins"]
+    assert parsed["acme.tools"] == {"retries": 7}
+    assert parsed["web.ui.v2"] == {"port": 8080}
+    assert set(parsed) == {"enabled", "acme.tools", "web.ui.v2", "plain"}  # nothing nested
+    assert "[plugins.plain]" in text  # undotted output unchanged
+    pol = policy_mod.loads(text)
+    assert pol.plugin_setting("acme.tools", "retries") == 7
+    assert pol.plugin_setting("web.ui.v2", "port") == 8080
+
+    doc.set("plugins.web.ui.v2", "port", None)  # emptied table is dropped
+    doc.set("plugins.acme.tools", "retries", None)
+    assert doc.get("plugins.acme.tools", "retries") is None
+    assert set(tomllib.loads(doc.dumps())["plugins"]) == {"enabled", "plain"}
+
+
 # ----------------------------------------------------------- settings screen
 
 
@@ -879,7 +913,10 @@ async def test_a_plugin_setting_unsafe_as_a_widget_id_still_opens_and_saves(proj
     its real name and key.
 
     ABLATION: drop the ``id=plugin_field_wid(...)`` in `_plugin_fields` and the
-    screen fails to open (Textual rejects the raw id)."""
+    screen fails to open (Textual rejects the raw id). Split every section on "."
+    in `PolicyDoc._path` and the save never lands: the dotted plugin's value nests
+    as an unknown key ``v2`` of ``[plugins."acme tools"]``, validation refuses it,
+    and the wait for the dashboard times out."""
     assert (
         plugin_field_wid("acme tools", "max.retries x") == "plugins-acme_20tools-max_2eretries_20x"
     )
@@ -896,15 +933,14 @@ async def test_a_plugin_setting_unsafe_as_a_widget_id_still_opens_and_saves(proj
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
-        assert screen.query("#plugins-acme_20tools_2ev2-dotted_2ekey")
         screen.query_one("#plugins-acme_20tools-max_2eretries_20x", Input).value = "7"
+        screen.query_one("#plugins-acme_20tools_2ev2-dotted_2ekey", Input).value = "9"
         await pilot.press("ctrl+s")
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
-    assert (
-        policy_mod.load(project.project / POLICY_FILE).plugin_setting("acme tools", "max.retries x")
-        == 7
-    )
+    pol = policy_mod.load(project.project / POLICY_FILE)
+    assert pol.plugin_setting("acme tools", "max.retries x") == 7
+    assert pol.plugin_setting("acme tools.v2", "dotted.key") == 9  # [plugins."acme tools.v2"]
 
 
 async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, monkeypatch):
