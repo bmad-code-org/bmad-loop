@@ -24,6 +24,7 @@ from bmad_loop.plugins import GrantSet, load_plugins, store
 from bmad_loop.plugins.digest import read_tree
 from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
+from bmad_loop.settings_schema import plugin_field_wid
 from bmad_loop.tui import settings as settings_mod
 from bmad_loop.tui.app import BmadLoopApp
 from bmad_loop.tui.screens.dashboard import DashboardScreen
@@ -435,7 +436,7 @@ async def test_settings_screen_blocks_invalid_plugin_coupling(project):
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
-        screen.query_one("#plugins-unity-editor_mode", Select).value = "shared"
+        screen.query_one(f"#{plugin_field_wid('unity', 'editor_mode')}", Select).value = "shared"
         screen.query_one("#scm-isolation", Select).value = "worktree"
         await pilot.press("ctrl+s")
         await pilot.pause()
@@ -450,8 +451,10 @@ async def test_settings_screen_unity_editor_mode_roundtrip(project):
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
-        screen.query_one("#plugins-unity-editor_mode", Select).value = "per_worktree"
-        screen.query_one("#plugins-unity-mcp", Select).value = "coplaydev"
+        screen.query_one(f"#{plugin_field_wid('unity', 'editor_mode')}", Select).value = (
+            "per_worktree"
+        )
+        screen.query_one(f"#{plugin_field_wid('unity', 'mcp')}", Select).value = "coplaydev"
         screen.query_one("#scm-isolation", Select).value = "worktree"  # valid per_worktree combo
         await pilot.press("ctrl+s")
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -466,8 +469,8 @@ async def test_settings_screen_unity_ready_fields_roundtrip(project):
     app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
-        screen.query_one("#plugins-unity-ready_timeout_sec", Input).value = "300"
-        screen.query_one("#plugins-unity-ready_grace_sec", Input).value = "30"
+        screen.query_one(f"#{plugin_field_wid('unity', 'ready_timeout_sec')}", Input).value = "300"
+        screen.query_one(f"#{plugin_field_wid('unity', 'ready_grace_sec')}", Input).value = "30"
         await pilot.press("ctrl+s")
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         pol = policy_mod.load(project.project / POLICY_FILE)
@@ -869,6 +872,41 @@ async def test_a_plugin_name_unsafe_as_a_widget_id_still_opens_and_grants(projec
     assert store.load_grants(project.project).get(name) is not None
 
 
+async def test_a_plugin_setting_unsafe_as_a_widget_id_still_opens_and_saves(project):
+    """A manifest name and setting key are any non-empty strings, so data-only
+    project plugins whose name and key hold a space and a dot still open the
+    screen with each field under its encoded id, and an edited field saves under
+    its real name and key.
+
+    ABLATION: drop the ``id=plugin_field_wid(...)`` in `_plugin_fields` and the
+    screen fails to open (Textual rejects the raw id)."""
+    assert (
+        plugin_field_wid("acme tools", "max.retries x") == "plugins-acme_20tools-max_2eretries_20x"
+    )
+    assert plugin_field_wid("a", "b-c") != plugin_field_wid("a-b", "c")  # last '-' splits
+    write_policy(project)
+    for name, key in (("acme tools", "max.retries x"), ("acme tools.v2", "dotted.key")):
+        pdir = project.project / USER_PLUGINS_REL / name.replace(" ", "-")
+        pdir.mkdir(parents=True)
+        (pdir / PLUGIN_FILE).write_text(
+            f'[plugin]\nname = "{name}"\napi_version = 1\n\n'
+            f'[[settings]]\nkey = "{key}"\ntype = "int"\ndefault = 3\n',
+            encoding="utf-8",
+        )
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        assert screen.query("#plugins-acme_20tools_2ev2-dotted_2ekey")
+        screen.query_one("#plugins-acme_20tools-max_2eretries_20x", Input).value = "7"
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+    assert (
+        policy_mod.load(project.project / POLICY_FILE).plugin_setting("acme tools", "max.retries x")
+        == 7
+    )
+
+
 async def test_toggle_on_refuses_a_manifest_swapped_after_discovery(project, monkeypatch):
     """The save's grant binds the manifest its discovery parsed: a plugin.toml
     swapped in before the hash blocks the save instead of granting those bytes.
@@ -974,7 +1012,7 @@ async def test_failed_validate_records_no_grant(project):
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugin-enabled-hooky", Switch).value = True
-        screen.query_one("#plugins-unity-editor_mode", Select).value = "shared"
+        screen.query_one(f"#{plugin_field_wid('unity', 'editor_mode')}", Select).value = "shared"
         screen.query_one("#scm-isolation", Select).value = "worktree"  # invalid with shared
         await pilot.press("ctrl+s")
         await until(pilot, lambda: "isolation" in _errors(screen))

@@ -83,6 +83,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Encode plugin setting-field widget ids, so a plugin whose name or `[[settings]]` key
+  holds a space, dot or other non-identifier character no longer stops the TUI settings
+  screen from opening (`BadIdentifier`) (DW-539).
 - Start a run's mux session at the project root, not in the first session's working
   directory. Under worktree isolation on Windows psmux, the session held the first unit's
   worktree, so its teardown journaled `worktree-teardown-degraded` and left an empty
