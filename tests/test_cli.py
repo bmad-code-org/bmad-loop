@@ -2953,6 +2953,23 @@ def test_attach_names_a_pre_upgrade_control_session_without_a_command_off_psmux(
     assert "psmux" not in err and "PSMUX_DATA_DIR" not in err
 
 
+def test_attach_with_no_runs_left_still_names_a_pre_upgrade_control_session(
+    project, monkeypatch, capsys
+):
+    """#915: runs archived or cleaned while their windows stay parked in the
+    pre-upgrade control session leave attach with no run dir, and that exit
+    still names the session, with wording that assumes no selected run.
+    Ablate the call on the no-runs exit and this fails."""
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+
+    assert cli.main(["attach", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "no runs found" in err
+    assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+    assert "a run's window may be there\n" in err and "this run's" not in err
+
+
 def test_attach_names_a_pre_upgrade_control_session_it_cannot_see_into(
     project, monkeypatch, capsys
 ):

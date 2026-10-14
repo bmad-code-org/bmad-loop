@@ -6434,10 +6434,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _note_superseded_ctl_for_attach(project: Path) -> None:
-    """After "nothing to attach": name each pre-upgrade control session still
-    standing in this project's registry (#733), with the command that attaches
-    to it, because a run window parked there is one attach cannot see.
+def _note_superseded_ctl_for_attach(
+    project: Path, where: str = "this run's window may be there"
+) -> None:
+    """After "nothing to attach" (or "no runs found", whose runs may have been
+    archived while their windows stay parked, with a ``where`` that names no
+    run): name each pre-upgrade control session still standing in this
+    project's registry (#733), with the command that attaches to it, because a
+    run window parked there is one attach cannot see.
 
     Named, not adopted. attach, stop and the parked-window sweep address
     ``runs.ctl_session_for`` only (see ``runs.is_ctl_session_name``); finding
@@ -6482,13 +6486,13 @@ def _note_superseded_ctl_for_attach(project: Path) -> None:
                 file=sys.stderr,
             )
             continue
-        where = "this run's window may be there"
+        how = where
         if psmux:
             verb = mux.attach_target_argv(f"={name}")[1]
-            where += ": " + _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
+            how += ": " + _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
         print(
             f"note: pre-upgrade control session {name} is still running in this "
-            f"project's registry, and attach does not look inside it; {where}",
+            f"project's registry, and attach does not look inside it; {how}",
             file=sys.stderr,
         )
 
@@ -6507,6 +6511,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         run_dir = _latest_run_dir(project)
     if run_dir is None:
         print("no runs found", file=sys.stderr)
+        _note_superseded_ctl_for_attach(project, "a run's window may be there")
         return 1
     # A ctl listing that could not be read is said, then the attach carries on
     # to the agent session rather than failing on a window it could not check.

@@ -99,8 +99,9 @@ breaking changes may land in a minor release.
   nothing to attach (#733).
 - Print no kill or attach command for a pre-upgrade control-session name that may be a run's
   own session (a run of this project has that id, or the session carries a run's project tag,
-  as a neighbour's run can in a shared registry), and still check the project's own registry
-  when legacy-registry discovery fails (#915).
+  as a neighbour's run can in a shared registry), still check the project's own registry
+  when legacy-registry discovery fails, and have `attach` name the pre-upgrade control session
+  when it finds no run at all (#915).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the
