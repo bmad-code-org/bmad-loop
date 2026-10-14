@@ -202,9 +202,11 @@ repeats the warning. A server already running with it on is not detected. Unset
 before the per-project root: psmux's default registry, and any `PSMUX_DATA_DIR` root
 bmad-loop displaced. It kills only sessions that carry this project's ownership tag and
 whose run is not still going. Whatever it leaves is named on stderr as
-`left in <registry> (not migrated): …` and in `cleanup --json` at
+`left in <registry> (<label>): …` and in `cleanup --json` at
 `sessions.legacy_leftovers`; a registry that could not be asked at all is named as
 `legacy registry not checked …` (`sessions.legacy_unverified`, a toast in the TUI).
+The label is `not migrated`, except for a registry derived from another project path,
+which gets its own label (below).
 
 Three kinds stay behind by design:
 
@@ -212,6 +214,19 @@ Three kinds stay behind by design:
   a matching run directory is not proof of ownership in a shared registry.
 - **A live session of your own.** Cleanup never kills a run whose engine is still going.
 - The shared **`bmad-loop-ctl` control session** in that registry.
+
+**Sessions in another registry.** A displaced root shaped like one bmad-loop derived
+(`<project tag>/_mux`) under a tag that is not this project's is reported in full like any
+other, but its line reads `left in <registry> (another project's derived registry, or this
+project's from before a rename): …` instead of `(not migrated)`. That is the root
+`bmad-loop mux` printed for another project, or for this one before it was renamed or moved,
+still exported in the shell. Its control session and untagged sessions most likely belong to
+that project: do not remove them from here. A session tagged as this project's is yours, but
+it may still be running (cleanup never kills a live run's session), so check it before removing
+it. A
+derived-shaped root whose tag cannot be compared gets the same wording. The
+`note: using bmad-loop's own psmux registry …` line that names the displaced root says it is
+such a registry, and `cleanup --json` is unchanged.
 
 To inspect one, put the shell on the registry the message named:
 

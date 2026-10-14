@@ -101,6 +101,12 @@ breaking changes may land in a minor release.
 - Refuse psmux option values shaped `-X=value`, `-t…` or `--`: psmux 3.4.0 rewrites the
   first silently and rejects the others, so the value is now warned about and its key freed
   (#905).
+- Stop `cleanup` and the TUI from calling the sessions in a displaced registry `not migrated`
+  when it is another project's derived `PSMUX_DATA_DIR` (or this project's from before a
+  rename): name it as such and say its control session and untagged sessions most likely
+  belong to that project, while a session tagged as this project's is yours but may still be
+  running; the stderr
+  note names it too (#906).
 - Fire the TUI's stale state-root note on psmux too: the psmux backend now answers which
   value a new pane inherits through psmux 3.4.0's named `show-environment` (#660).
 - Fix the OpenCode V2 SSE-reconnect end-to-end test failing on slow runners (Windows): the

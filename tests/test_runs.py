@@ -8899,6 +8899,69 @@ def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, m
     assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]}
 
 
+def test_legacy_leftovers_report_another_projects_derived_registry_in_full(tmp_path, monkeypatch):
+    """#906: whose sessions a derived registry of another project path holds
+    cannot be proven (the tag hashes a path; a renamed project's own old root
+    looks the same), so nothing in it is hidden: its control session and
+    untagged sessions are reported like any displaced registry's, and only the
+    wording says what it is. Another project's *tagged* session is still
+    skipped, as everywhere. Reintroduce a skip for such a root and this fails."""
+    theirs = str(tmp_path / "state" / runs.project_tag(tmp_path / "other") / runs.MUX_REGISTRY_DIR)
+    legacy = _RegistryMux(
+        [runs.CTL_SESSION, "bmad-loop-bare-1", "bmad-loop-b-1"],
+        {"bmad-loop-b-1": runs.project_tag(tmp_path / "other")},
+        root=theirs,
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.foreign_registry_root(theirs, tmp_path)
+    assert _healthy_leftovers(tmp_path) == {theirs: ["bmad-loop-bare-1", runs.CTL_SESSION]}
+
+
+def test_foreign_registry_root_is_a_shape_and_tag_check(tmp_path):
+    """True only for `<16-hex tag>/_mux` under a tag that is not this project's.
+    Ablate the tag comparison (or the shape check) and this fails."""
+    other_tag = runs.project_tag(tmp_path / "other")
+    state = tmp_path / "state"
+    assert runs.foreign_registry_root(str(state / other_tag / runs.MUX_REGISTRY_DIR), tmp_path)
+    # Our own tag, under any state root, is not another project path's.
+    mine = state / runs.project_tag(tmp_path) / runs.MUX_REGISTRY_DIR
+    assert not runs.foreign_registry_root(str(mine), tmp_path)
+    # Not the derived shape: wrong leaf, short tag, non-hex tag, empty, None.
+    assert not runs.foreign_registry_root(str(state / other_tag / "mux"), tmp_path)
+    assert not runs.foreign_registry_root(str(state / other_tag[:15] / "_mux"), tmp_path)
+    assert not runs.foreign_registry_root(str(state / ("g" * 16) / "_mux"), tmp_path)
+    assert not runs.foreign_registry_root(r"D:\their-own-registry", tmp_path)
+    assert not runs.foreign_registry_root("", tmp_path)
+    assert not runs.foreign_registry_root(None, tmp_path)
+
+
+def test_foreign_registry_root_never_raises(tmp_path, monkeypatch):
+    """When this project's tag cannot be derived, a derived-shaped root is of
+    unknown ownership, so it answers True (the cautious wording) rather than
+    failing the command that prints the note, or answering False (the plain
+    wording, which invites removal). Ablate the `except` and this raises;
+    answer False there and this fails."""
+
+    def _boom(_p):
+        raise OSError("unresolvable")
+
+    monkeypatch.setattr(runs, "project_tag", _boom)
+    root = str(tmp_path / ("a" * 16) / runs.MUX_REGISTRY_DIR)
+    assert runs.foreign_registry_root(root, tmp_path) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the registry path folds case on Windows only")
+def test_foreign_registry_root_folds_case_where_the_filesystem_does(tmp_path):
+    """`<TAG>\\_MUX` addresses the same registry as `<tag>\\_mux` on Windows, so
+    a case-varied spelling of this project's own root is not another project
+    path's, and of another's still is. Ablate the `normcase` and this fails."""
+    state = tmp_path / "state"
+    other = runs.project_tag(tmp_path / "other").upper()
+    assert runs.foreign_registry_root(str(state / other / "_MUX"), tmp_path)
+    mine = runs.project_tag(tmp_path).upper()
+    assert not runs.foreign_registry_root(str(state / mine / "_MUX"), tmp_path)
+
+
 def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
     """psmux resolves a session by opening `<data dir>\\<name>.port`, and NTFS
     opens names case-insensitively, so in ITS registry `bmad-loop-CTL-<hex>` is

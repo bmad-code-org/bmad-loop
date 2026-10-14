@@ -3848,6 +3848,44 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
         )
 
 
+async def test_cleanup_toast_names_another_projects_derived_registry(project, monkeypatch):
+    """#906, the cli arm's twin: a displaced root bmad-loop derived from another
+    project path holds that project's sessions most likely, and "not migrated"
+    sends the operator after them. Ablate the `foreign_registry_root` branch of
+    the toast and this fails."""
+    from bmad_loop import runs
+
+    theirs = str(
+        project.project.parent
+        / "state"
+        / runs.project_tag(project.project.parent / "other")
+        / runs.MUX_REGISTRY_DIR
+    )
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p: ({theirs: ["bmad-loop-ctl"]}, [])
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(
+            pilot,
+            lambda: any(
+                f"left in {theirs} ({runs.FOREIGN_REGISTRY})" in m
+                and "bmad-loop-ctl" in m
+                and runs.FOREIGN_REGISTRY_HINT in m
+                for m in notifications(app)
+            ),
+        )
+        assert not any("not migrated" in m for m in notifications(app))
+
+
 async def test_cleanup_warns_about_a_legacy_registry_that_could_not_be_asked(project, monkeypatch):
     """DW-469, the cli arm's twin: a registry whose listing raised used to toast
     exactly what an empty one toasts — nothing. Ablate the `unverified` toast and
