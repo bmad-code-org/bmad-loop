@@ -19544,6 +19544,8 @@ def test_cleanup_says_a_derived_registry_of_another_project_path_is_not_a_remain
     # claim: control and untagged sessions are that project's, tagged ones ours.
     assert theirs_line.endswith(f" — {runs.FOREIGN_REGISTRY_HINT}")
     assert "a session tagged as this project's is yours" in theirs_line
+    # Ours may still be live (cleanup never kills a running run): keep the caveat.
+    assert "may still be running: check it before removing it" in theirs_line
     assert "not migrated" not in theirs_line
     plain_line = next(ln for ln in lines if plain in ln)
     assert f"left in {plain} (not migrated): bmad-loop-old-1" in plain_line

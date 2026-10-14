@@ -221,7 +221,9 @@ other, but its line reads `left in <registry> (another project's derived registr
 project's from before a rename): …` instead of `(not migrated)`. That is the root
 `bmad-loop mux` printed for another project, or for this one before it was renamed or moved,
 still exported in the shell. Its control session and untagged sessions most likely belong to
-that project: do not remove them from here. A session tagged as this project's is yours. A
+that project: do not remove them from here. A session tagged as this project's is yours, but
+it may still be running (cleanup never kills a live run's session), so check it before removing
+it. A
 derived-shaped root whose tag cannot be compared gets the same wording. The
 `note: using bmad-loop's own psmux registry …` line that names the displaced root says it is
 such a registry, and `cleanup --json` is unchanged.

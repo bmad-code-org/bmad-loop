@@ -737,7 +737,8 @@ FOREIGN_REGISTRY = "another project's derived registry, or this project's from b
 # session tagged as ours there too, so only the rest is that project's.
 FOREIGN_REGISTRY_HINT = (
     "its control session and untagged sessions most likely belong to that project "
-    "(do not remove them from here); a session tagged as this project's is yours"
+    "(do not remove them from here); a session tagged as this project's is yours, but it "
+    "may still be running: check it before removing it"
 )
 
 
