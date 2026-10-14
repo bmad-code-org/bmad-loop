@@ -19720,7 +19720,7 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
-    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p: _DIGEST_CTL)
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
     command = f"$env:PSMUX_DATA_DIR = '{_OWN_REG}'; psmux kill-session -t '={_DIGEST_CTL}'"
 
     assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0

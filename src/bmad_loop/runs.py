@@ -2541,19 +2541,26 @@ def legacy_registry_leftovers(
     return grouped, faults
 
 
-def superseded_ctl_name(project: Path) -> str:
-    """The control-session name an earlier release minted for ``project`` in its
-    own derived registry (#733): ``bmad-loop-ctl-`` plus the first 16 hex of the
-    SHA-256 of that root, resolved and case-folded where the filesystem folds.
+def superseded_ctl_name(project: Path, registry: str | None = None) -> str:
+    """The control-session name an earlier release minted for ``project`` in
+    ``registry``, the root the backend was bound to (#733): ``bmad-loop-ctl-``
+    plus the first 16 hex of the SHA-256 of the project's derived root, resolved
+    and case-folded where the filesystem folds.
 
-    The formula that release used, kept verbatim for this one reader. Its
-    honoured-operator-root arm salted the digest with that root too, but
-    :func:`superseded_ctl_sessions` only reads the derived registry, where the
-    salt was never added.
+    The formula that release used, kept verbatim for this one reader. When
+    ``registry`` is an absolute root that resolves to a different registry (an
+    operator's own root honoured by ``[mux] honor_ambient_psmux_data_dir``), the
+    digest is salted with it too; a symlink, junction or other spelling of the
+    derived root resolves to it and is not salted.
 
-    Raises :class:`StateRootError` or ``OSError`` when the root cannot be
-    derived."""
+    Raises :class:`StateRootError`, ``OSError`` or ``RuntimeError`` when a root
+    cannot be derived or resolved. That release then minted the fixed name, so
+    no digest-named session can exist for it."""
     scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+    if registry and Path(registry).is_absolute():
+        pinned = os.path.normcase(str(Path(registry).resolve()))
+        if pinned != scope:
+            scope += "\0" + pinned
     return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
 
 
@@ -2576,36 +2583,25 @@ def superseded_ctl_sessions(
     name (:func:`is_ctl_session_name`). A run window parked in one is reached by
     no command, so this is what the cleanup and attach frontends name.
 
-    Only when the registry in force is this project's derived one
-    (:func:`mux_registry_root`): a control session in it is this project's.
-    psmux's shared default registry, an operator's own root, and a
-    machine-wide server (tmux, which never minted the digest shape) prove
-    nothing about whose a session spelled that way is. Compared as the old mint
-    compared them, resolved and then case-folded: an honoured root that is a
-    symlink, junction or other spelling of the derived one is that registry,
-    and the old mint gave it the same name. A root that cannot be resolved is
-    compared as spelled, and that degrade goes to ``on_fault``.
+    The name is the registry's own: unsalted in this project's derived
+    registry (or any spelling of it), salted with the root in an operator's
+    root honoured over it. Either digest covers this project's derived root, so
+    a session under it is this project's wherever it stands. psmux's shared
+    default registry (no root) and a machine-wide server (tmux, which never
+    minted the digest shape) are not read.
 
-    A listing that could not be taken goes to ``on_fault`` and answers ``[]``
+    A name that could not be derived, and a listing that could not be taken,
+    go to ``on_fault`` and answer ``[]``
     (:meth:`~.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
     mux = mux or get_multiplexer()
     root = mux.registry_root()
     if root is None:
         return []
     try:
-        derived = mux_registry_root(project)
-        old = mux.session_name_key(superseded_ctl_name(project))
-    except (StateRootError, OSError, RuntimeError):
-        return []
-    try:
-        own = os.path.normcase(str(Path(root).resolve())) == os.path.normcase(
-            str(derived.resolve())
-        )
-    except (OSError, RuntimeError) as exc:
-        own = Path(root) == derived
+        old = mux.session_name_key(superseded_ctl_name(project, root))
+    except (StateRootError, OSError, RuntimeError) as exc:
         if on_fault is not None:
-            on_fault(f"could not resolve the registry root, compared as spelled: {exc}")
-    if not own:
+            on_fault(f"could not derive the pre-upgrade control-session name: {exc}")
         return []
     return sorted(
         name

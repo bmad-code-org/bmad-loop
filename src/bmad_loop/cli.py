@@ -6715,24 +6715,28 @@ def _psmux_command(registry: str | None, verb: str) -> str:
 
 
 def _superseded_ctl_kill_commands(project: Path, leftovers: dict[str, list[str]]) -> dict[str, str]:
-    """``{name: command that ends it}`` for each control session in this
-    project's own registry under a name this release no longer mints (#733),
-    picked out of ``leftovers`` rather than listed a second time.
+    """``{name: command that ends it}`` for each control session in the
+    registry in force under the name an earlier release minted for this
+    project there (#733, ``runs.superseded_ctl_name``), picked out of
+    ``leftovers`` rather than listed a second time.
 
     A command here and none for the other leftovers, because this session is
-    ours beyond doubt — the registry is the project's own — and nothing else
-    will ever end it: no bmad-loop command addresses it. The caveat travels
-    with the command: ending it kills whatever its windows still run."""
+    ours beyond doubt — its name is a digest of this project's derived root —
+    and nothing else will ever end it: no bmad-loop command addresses it. The
+    caveat travels with the command: ending it kills whatever its windows
+    still run."""
     if not leftovers:
         return {}
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
 
     try:
         mux = get_multiplexer()
-        old = mux.session_name_key(runs.superseded_ctl_name(project))
+        root = mux.registry_root()
+        old = mux.session_name_key(runs.superseded_ctl_name(project, root))
     except (MultiplexerError, runs.StateRootError, OSError, RuntimeError):
+        # Already reported: the same derivation in `legacy_registry_leftovers`
+        # put this fault in `legacy_unverified`, and named no session for it.
         return {}
-    root = mux.registry_root()
     # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
     # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
     return {
