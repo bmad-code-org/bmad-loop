@@ -2068,6 +2068,17 @@ POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
 # while a sequence literal headed by "git" is not.
 SPAWN_CALL_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
 
+# The one module that may spawn a v7 project's `tickets.py`: `TicketTree._call`
+# is the single spawn point, so every read and mark shares its launcher, UTF-8
+# decoding, timeout, pin check and error contract. A spawn elsewhere is a
+# `tickets` finding (see `_tickets_script_spawns`).
+TICKETS_SCRIPT_OWNERS = {"tickettree.py"}
+# What names the script in source: a string ending in "tickets.py", or the
+# bmadconfig marker constant that spells its installed path.
+TICKETS_SCRIPT_NAMES = {"V7_MARKER_REL"}
+# Spawn helpers beyond `subprocess`: the stop-aware runners in `childrun`.
+CHILDRUN_SPAWN_NAMES = {"run_argv", "run_child"}
+
 # Prefix that makes an environment variable this project's to register.
 ENV_PREFIX = "BMAD_LOOP_"
 
@@ -3314,6 +3325,80 @@ def _function_body_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast
     return [node for stmt in fn.body for node in ast.walk(stmt)]
 
 
+def _tickets_script_spawns(tree: ast.AST, docs: set[int]) -> list[int]:
+    """Line numbers of spawn calls whose arguments name the tickets script.
+
+    A spawn is ``subprocess.<SPAWN_CALL_NAMES>(...)`` (the module under any
+    ``import … as`` alias) or its bare from-import spelling, or ``run_argv``/``run_child`` by name or attribute. The script is
+    named by a string constant ending in ``tickets.py`` (docstrings excluded), by
+    :data:`TICKETS_SCRIPT_NAMES`, or by a module-level or local name whose
+    assignment mentions either (``script = root / V7_MARKER_REL`` then
+    ``Popen([py, str(script)])``) — taint follows plain assignments to a fixed
+    point, unscoped, which over-approximates and never under-reports a direct
+    rebinding. NOT COVERED: a path that arrives as a parameter or an attribute
+    (``self.script``), built in another module — the reason the owner module is
+    the only one that holds a script path at all."""
+
+    def names_script(node: ast.AST, tainted: set[str]) -> bool:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Constant)
+                and isinstance(sub.value, str)
+                and id(sub) not in docs
+                and sub.value.endswith("tickets.py")
+            ):
+                return True
+            if isinstance(sub, ast.Name) and (sub.id in TICKETS_SCRIPT_NAMES or sub.id in tainted):
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr in TICKETS_SCRIPT_NAMES:
+                return True
+        return False
+
+    tainted: set[str] = set()
+    assigns = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    changed = True
+    while changed:
+        changed = False
+        for node in assigns:
+            if node.value is None or not names_script(node.value, tainted):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Name) and sub.id not in tainted:
+                        tainted.add(sub.id)
+                        changed = True
+
+    # `import subprocess as sp` spells the module `sp`.
+    subprocess_names = {"subprocess"} | {
+        alias.asname
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Import)
+        for alias in n.names
+        if alias.name == "subprocess" and alias.asname
+    }
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_spawn = (
+            isinstance(func, ast.Attribute)
+            and func.attr in SPAWN_CALL_NAMES
+            and isinstance(func.value, ast.Name)
+            and func.value.id in subprocess_names
+        ) or (isinstance(func, ast.Name) and func.id in SPAWN_CALL_NAMES | CHILDRUN_SPAWN_NAMES)
+        is_spawn = is_spawn or (
+            isinstance(func, ast.Attribute) and func.attr in CHILDRUN_SPAWN_NAMES
+        )
+        if not is_spawn:
+            continue
+        operands = [*node.args, *(kw.value for kw in node.keywords)]
+        if any(names_script(arg, tainted) for arg in operands):
+            hits.append(node.lineno)
+    return hits
+
+
 def _scan_source(src: str, rel: str):
     """The whole per-file scan, over one source string → the same
     ``(kind, rel, lineno, line_text)`` tuples ``_scan`` collects.
@@ -4158,6 +4243,10 @@ def _scan_source(src: str, rel: str):
                 )
             )
 
+    # tickets.py spawns outside the tickettree chokepoint — see
+    # `_tickets_script_spawns` for the shapes.
+    findings.extend(("tickets", rel, ln, line_at(ln)) for ln in _tickets_script_spawns(tree, docs))
+
     return findings
 
 
@@ -4182,6 +4271,94 @@ def test_no_tmux_invocation_outside_backend():
         "adapters/tmux_backend.py) — route it through get_multiplexer() instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_tickets_script_spawned_only_in_tickettree():
+    """Only ``tickettree.py`` may spawn a v7 project's ``tickets.py``: every other
+    module reads the tree through ``TicketTree`` (or the ``TicketTreeLike`` seam),
+    so the launcher, UTF-8 decoding, timeout, initiative pin and error mapping
+    are never bypassed. Shapes and what stays uncovered: ``_tickets_script_spawns``;
+    the probe tables below keep this green for a reason."""
+    offenders = [
+        (rel, ln, txt) for _, rel, ln, txt in _of("tickets") if rel not in TICKETS_SCRIPT_OWNERS
+    ]
+    assert not offenders, (
+        "tickets.py spawned outside tickettree.py — read the tree through "
+        "tickettree.TicketTree instead:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_tickettree_has_a_single_spawn_point():
+    """The owner's own half of the invariant: ``tickettree.py`` spawns through
+    exactly one ``childrun.run_argv`` call, inside ``TicketTree._call``, and
+    nothing else in it spawns. Ablation: a second ``run_argv`` call (say, a
+    ``capability`` that spawns ``--help`` itself) turns this red."""
+    tree = ast.parse((SRC / "tickettree.py").read_text(encoding="utf-8"))
+    spawns: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in _function_body_nodes(fn):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in SPAWN_CALL_NAMES | CHILDRUN_SPAWN_NAMES:
+                    spawns.append(f"{fn.name}:{name}")
+    assert spawns == ["_call:run_argv"], spawns
+
+
+TICKETS_SPAWN_PROBES = [
+    (
+        "literal-path",
+        'import subprocess, sys\nsubprocess.run([sys.executable, "_bmad/method/scripts/tickets.py"])\n',
+    ),
+    (
+        "marker-attribute",
+        "from bmad_loop import bmadconfig, childrun\n"
+        "childrun.run_argv([py, str(root / bmadconfig.V7_MARKER_REL), 'next'], cwd=None, timeout=5)\n",
+    ),
+    (
+        "tainted-name",
+        "import subprocess, sys\nscript = root / V7_MARKER_REL\nsubprocess.Popen([sys.executable, str(script)])\n",
+    ),
+    (
+        "tainted-argv",
+        "from bmad_loop.childrun import run_argv\n"
+        "argv = [py, str(p / 'tickets.py'), 'find', ref]\nrun_argv(argv, cwd=None, timeout=1)\n",
+    ),
+    (
+        "bare-check-output",
+        "from subprocess import check_output\ncheck_output(['uv', 'run', 'x/tickets.py'])\n",
+    ),
+    ("keyword-argv", "import subprocess\nsubprocess.run(args=['python', 'tickets.py', 'next'])\n"),
+    ("aliased-module", "import subprocess as sp\nsp.run([py, 'tickets.py', 'next'])\n"),
+]
+TICKETS_SPAWN_NON_PROBES = [
+    ("marker-existence", "marker = project / V7_MARKER_REL\nok = marker.is_file()\n"),
+    ("unrelated-spawn", "import subprocess\nsubprocess.run(['uv', '--version'])\n"),
+    (
+        "prose-beside-a-spawn",
+        '"""Drives tickets.py."""\nimport subprocess\nmsg = "see tickets.py."\nsubprocess.run(["true"])\n',
+    ),
+    ("tainted-name-not-spawned", "script = root / V7_MARKER_REL\nlog.info('using %s', script)\n"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TICKETS_SPAWN_PROBES, ids=[p[0] for p in TICKETS_SPAWN_PROBES]
+)
+def test_tickets_spawn_detector_flags_every_spawn_shape(label, source):
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "tickets"]
+    assert found, f"the {label!r} shape produced no `tickets` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TICKETS_SPAWN_NON_PROBES, ids=[p[0] for p in TICKETS_SPAWN_NON_PROBES]
+)
+def test_tickets_spawn_detector_stays_silent_on_lookalikes(label, source):
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "tickets"]
+    assert not found, f"the {label!r} shape was flagged; it spawns no tickets.py:\n{source}"
 
 
 def _git_offenders(findings) -> list[tuple[str, int, str]]:

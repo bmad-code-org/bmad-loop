@@ -4,6 +4,7 @@ that simulate the side effects skill sessions would have on disk."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -23,13 +24,23 @@ import perf_report
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
+from bmad_loop import cli, documents, envvars, platform_util, runs, ticketmodel, win32_at
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
 from bmad_loop.journal import STATE_FILE, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
 from bmad_loop.plugins.grants import GrantSet
+from bmad_loop.ticketmodel import (
+    Capability,
+    EpicRow,
+    FindResult,
+    MarkReport,
+    NextView,
+    StatusView,
+    TicketRow,
+)
+from bmad_loop.tickettree import TicketsNoMatch, TicketsPinMismatch
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
@@ -1880,6 +1891,276 @@ def run_tickets(layout: V7Layout, *argv: str, rc: int = 0) -> dict[str, object]:
     doc = json.loads(proc.stdout if rc == 0 else proc.stderr)
     assert isinstance(doc, dict)
     return doc
+
+
+# ---- FakeTicketTree: the in-memory `tickettree.TicketTreeLike` engine tests inject.
+
+_FAKE_STATE_OF = {
+    "": "planned",
+    "draft": "backlog",
+    "ready-for-dev": "backlog",
+    "in-progress": "in-progress",
+    "blocked": "in-progress",
+    "in-review": "review",
+    "built": "review",
+    "done": "done",
+    "dropped": "dropped",
+}
+
+
+def ticket_row(
+    ref: str, *, epic: str = "epic-cart", status: str = "", **fields: object
+) -> TicketRow:
+    """A `TicketRow` with upstream-shaped defaults: ``ref`` ``"E.M"`` gives id
+    ``M``, the title is derived from the ref, and ``state`` follows ``status``
+    (``planned`` with no plan). Any field can be overridden."""
+    _, _, n = ref.rpartition(".")
+    base: dict[str, object] = {
+        "ref": ref,
+        "epic": epic,
+        "id": n or ref,
+        "file": None,
+        "type": "story",
+        "tracker_id": "",
+        "title": f"Ticket {ref}",
+        "status": status,
+        "tracker_status": "",
+        "state": _FAKE_STATE_OF[status],
+        "assignee": "",
+        "hitl": False,
+        "risk": "",
+        "refine": False,
+        "refined": False,
+        "blocked_at": "",
+        "blocked_reason": "",
+        "after": (),
+        "gated_by": (),
+        "waiting_on": (),
+        "unknown": "",
+        "plan_checkpoint": False,
+        "done_checkpoint": False,
+        "drift": False,
+        "blocks": (),
+    }
+    base.update(fields)
+    return TicketRow(**base)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class FakeMark:
+    """One `FakeTicketTree.mark` call, as recorded."""
+
+    ref: str
+    target: str
+    reason: str
+    expected_plan: Path | None
+    blocked: str | None
+
+
+class FakeTicketTree:
+    """An in-memory `tickettree.TicketTreeLike`: canned views, find results keyed
+    by ref, recorded calls and marks, and configurable faults — so engine tests
+    never spawn `tickets.py`.
+
+    Build it with `from_rows` (groups as `next` would print them; `status` lists
+    every row; `find` answers each row's ref with a plan path under
+    ``project_root/_bmad-output/<initiative>/<epic>/``), or pass views directly.
+    ``faults[verb]`` (``"next"``, ``"status"``, ``"find"``, ``"capability"``,
+    ``"mark"``) is raised on every call of that verb until removed. With a
+    ``pinned_initiative``, set ``live_initiative`` to simulate the operator
+    switching initiatives: every tree read then raises `TicketsPinMismatch`
+    before recording a call, as the real tree refuses before spawning."""
+
+    def __init__(
+        self,
+        project_root: Path = Path("."),
+        *,
+        next_view: NextView | None = None,
+        status_view: StatusView | None = None,
+        finds: dict[str, FindResult] | None = None,
+        capability: Capability | None = None,
+        pinned_initiative: str | None = None,
+    ) -> None:
+        self._project_root = Path(project_root)
+        self._pinned_initiative = pinned_initiative
+        self.live_initiative: str | None = pinned_initiative
+        self.next_view = next_view or fake_next_view()
+        self.status_view = status_view or fake_status_view(())
+        self.finds: dict[str, FindResult] = dict(finds or {})
+        self.cap = capability or Capability(
+            verbs=frozenset({"next", "status", "find", "pull", "mark", "mirror"}),
+            statuses=frozenset(ticketmodel.PLAN_STATUSES),
+            requires_python=">=3.11",
+        )
+        self.faults: dict[str, Exception] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.marks: list[FakeMark] = []
+
+    @classmethod
+    def from_rows(
+        cls,
+        project_root: Path = Path("."),
+        *,
+        initiative: str = V7_DEFAULT_INITIATIVE,
+        ready_to_refine: tuple[TicketRow, ...] = (),
+        ready_to_start: tuple[TicketRow, ...] = (),
+        in_progress: tuple[TicketRow, ...] = (),
+        blocked: tuple[TicketRow, ...] = (),
+        others: tuple[TicketRow, ...] = (),
+        pinned_initiative: str | None = None,
+    ) -> FakeTicketTree:
+        """``others`` are rows `next` does not list (done, dropped) but `status`
+        and `find` do."""
+        project_root = Path(project_root)
+        rows = (*ready_to_refine, *ready_to_start, *in_progress, *blocked, *others)
+        folder = project_root / "_bmad-output" / initiative
+        return cls(
+            project_root,
+            next_view=fake_next_view(
+                folder=initiative,
+                ready_to_refine=ready_to_refine,
+                ready_to_start=ready_to_start,
+                in_progress=in_progress,
+                blocked=blocked,
+            ),
+            status_view=fake_status_view(rows, folder=initiative),
+            finds={r.ref: fake_find(r, folder / r.epic) for r in rows if r.ref is not None},
+            pinned_initiative=pinned_initiative,
+        )
+
+    @property
+    def project_root(self) -> Path:
+        return self._project_root
+
+    @property
+    def pinned_initiative(self) -> str | None:
+        return self._pinned_initiative
+
+    def _enter(self, verb: str, *args: str, tree: bool = True) -> None:
+        if (
+            tree
+            and self._pinned_initiative is not None
+            and self.live_initiative != self._pinned_initiative
+        ):
+            raise TicketsPinMismatch(self._pinned_initiative, self.live_initiative)
+        self.calls.append((verb, *args))
+        fault = self.faults.get(verb)
+        if fault is not None:
+            raise fault
+
+    def capability(self) -> Capability:
+        self._enter("capability", tree=False)
+        return self.cap
+
+    def next(self) -> NextView:
+        self._enter("next")
+        return self.next_view
+
+    def status(self, folder: Path | None = None) -> StatusView:
+        self._enter("status", *(() if folder is None else (str(folder),)))
+        return self.status_view
+
+    def find(self, ref: str) -> FindResult:
+        self._enter("find", ref)
+        try:
+            return self.finds[ref]
+        except KeyError:
+            raise TicketsNoMatch(f"no ticket matches {ref!r}") from None
+
+    def mark(
+        self,
+        ref: str,
+        target: str,
+        *,
+        reason: str,
+        expected_plan: Path | None = None,
+        blocked: str | None = None,
+        journal: object = None,
+    ) -> MarkReport:
+        """Record the mark and reflect it in `find` (status, blocked fields).
+        Transition legality is not modelled: that lives in the real chokepoint."""
+        self._enter("mark", ref, target)
+        found = self.find(ref)
+        self.calls.pop()  # the inner find is not a call of its own
+        self.marks.append(FakeMark(ref, target, reason, expected_plan, blocked))
+        row = dataclasses.replace(
+            found.row,
+            status=target,
+            state=_FAKE_STATE_OF[target],
+            blocked_at="2026-01-01" if blocked is not None else "",
+            blocked_reason=blocked or "",
+        )
+        self.finds[ref] = dataclasses.replace(found, row=row)
+        return MarkReport(
+            plan=found.plan,
+            created=not Path(found.plan).is_file(),
+            status=target,
+            assignee=row.assignee,
+            blocked_at=row.blocked_at,
+            blocked_reason=row.blocked_reason,
+        )
+
+
+def fake_next_view(
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    ready_to_refine: tuple[TicketRow, ...] = (),
+    ready_to_start: tuple[TicketRow, ...] = (),
+    in_progress: tuple[TicketRow, ...] = (),
+    blocked: tuple[TicketRow, ...] = (),
+) -> NextView:
+    return NextView(
+        store=store,
+        folder=folder,
+        ready_to_refine=ready_to_refine,
+        ready_to_start=ready_to_start,
+        in_progress=in_progress,
+        blocked=blocked,
+        problems=(),
+        unpinned_after=(),
+        undeclared_after=(),
+        order_conflict=(),
+    )
+
+
+def fake_status_view(
+    tickets: tuple[TicketRow, ...],
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    epics: tuple[EpicRow, ...] = (),
+) -> StatusView:
+    counts: dict[str, int] = {"total": len(tickets)}
+    for t in tickets:
+        counts[t.state] = counts.get(t.state, 0) + 1
+    return StatusView(
+        store=store,
+        folder=folder,
+        tickets=tickets,
+        counts=counts,
+        epics=epics,
+        next_id=None,
+        longest_remaining_chain=(),
+        problems=(),
+    )
+
+
+def fake_find(row: TicketRow, epic_dir: Path) -> FindResult:
+    """`find`'s answer for ``row``: the plan where a build would write it
+    (``<type>-<title slug>-plan.md`` in ``epic_dir``), the epic file beside it."""
+    return FindResult(
+        row=row,
+        folder=row.epic,
+        description="",
+        verify="",
+        references=(),
+        notes=(),
+        unknown=row.unknown,
+        epic_file=str(epic_dir / f"{row.epic}.md"),
+        story_file=str(epic_dir / row.file) if row.file else None,
+        plan=str(epic_dir / f"{row.type}-{ticket_slug(row.title)}-plan.md"),
+    )
 
 
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:
