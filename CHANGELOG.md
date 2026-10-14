@@ -83,6 +83,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name the cause when an OpenCode 1.x server dies during startup on a database a 2.x
+  server created: the spawn give-up error now names `opencode.db` and says to move it
+  aside, instead of only `rc=1` (DW-544).
 - Encode plugin setting-field widget ids, so a plugin whose name or `[[settings]]` key
   holds a space, dot or other non-identifier character no longer stops the TUI settings
   screen from opening (`BadIdentifier`) (DW-539).

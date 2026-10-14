@@ -114,7 +114,8 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   provider-quota-settling  provider-quota in 2.0.27's real order: the session
 #                      stays on `/api/session/active` ~0.5s AFTER its
 #                      `session.execution.failed` is published
-# FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
+# FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind;
+# FAKE_OPENCODE_START_FAILURE_LINE is printed to stdout just before each such exit.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
 # turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
 # post-mortem reads (NOT <task_id>.log, the curated conversation transcript).
@@ -186,6 +187,8 @@ if START_FAILURES:
     with open(counter, "w", encoding="utf-8") as fh:
         fh.write(str(n + 1))
     if n < START_FAILURES:
+        if os.environ.get("FAKE_OPENCODE_START_FAILURE_LINE"):
+            print(os.environ["FAKE_OPENCODE_START_FAILURE_LINE"], flush=True)
         sys.exit(1)
 
 SESSION_ID = "ses_fake0000000000000000000001"
@@ -5315,6 +5318,122 @@ def test_e2e_spawn_gives_up_after_attempts(tmp_path, fake_opencode):
     assert server_out.count("FAKE_STDOUT_CANARY") == 3
     # the transcript is the file that would have been useless here
     assert (logs / "t-1.log").read_bytes() == b""
+
+
+_DB_DOWNGRADE_LINE = (
+    "Error: Unexpected error, check log file at /x/opencode.log for more details\n"
+    "Database is not empty and has no session table"
+)
+
+
+def test_e2e_spawn_give_up_names_the_v1_db_downgrade_cause(tmp_path, fake_opencode):
+    """DW-544: a 1.x server dying at startup on a database a 2.x server created
+    gets a give-up error naming that database and the remedy, not just rc=1.
+
+    ABLATION: make `_startup_death_cause` return "" and this reddens."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    data_home = tmp_path / "xdg-data"
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "completed",
+        extra_env={
+            "FAKE_OPENCODE_START_FAILURES": "99",
+            "FAKE_OPENCODE_START_FAILURE_LINE": _DB_DOWNGRADE_LINE,
+            "XDG_DATA_HOME": str(data_home),
+        },
+    )
+
+    with pytest.raises(OpencodeServerError, match="after 3 attempts") as excinfo:
+        adapter.run(spec)
+
+    message = str(excinfo.value)
+    assert "rc=1 during startup" in message
+    assert str(tmp_path / "run" / "logs" / "t-1.server.out") in message
+    assert str(data_home / "opencode" / "opencode.db") in message
+    assert "Database is not empty and has no session table" in message
+    assert "move that file aside" in message
+    assert "docs/setup-guide.md#opencode-versions" in message
+
+
+def test_e2e_spawn_give_up_without_the_marker_names_no_db_cause(tmp_path, fake_opencode):
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "completed", extra_env={"FAKE_OPENCODE_START_FAILURES": "99"})
+
+    with pytest.raises(OpencodeServerError, match="after 3 attempts") as excinfo:
+        adapter.run(spec)
+
+    message = str(excinfo.value)
+    assert message.rstrip().endswith("t-1.server.out")
+    assert "opencode.db" not in message
+    assert "setup-guide" not in message
+
+
+def test_startup_death_cause_crumbs_an_unreadable_server_log(tmp_path):
+    """An unreadable log degrades visibly — a `server-log-unread` crumb — and
+    reads as no cause, so the generic give-up message stands.
+
+    ABLATION: drop the `_note_lifecycle` call and this reddens."""
+    adapter = make_adapter(tmp_path)
+    missing = tmp_path / "run" / "logs" / "gone.server.out"
+
+    assert adapter._startup_death_cause("t-1", missing, {}) == ""
+
+    crumbs = [e for e in _lifecycle(tmp_path) if e["event"] == "server-log-unread"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["path"] == str(missing)
+    assert crumbs[0]["error"].startswith("FileNotFoundError: ")
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        pytest.param(
+            {"XDG_DATA_HOME": "/d", "HOME": "/h"}, Path("/d/opencode/opencode.db"), id="xdg"
+        ),
+        pytest.param(
+            {"XDG_DATA_HOME": "", "HOME": "/h"},
+            Path("/h/.local/share/opencode/opencode.db"),
+            id="home",
+        ),
+    ],
+)
+def test_opencode_db_path_follows_the_spawn_env(env, expected):
+    assert opencode_http._opencode_db_path(env) == expected
+
+
+def test_opencode_db_path_falls_back_to_the_user_home():
+    """No XDG_DATA_HOME and no HOME (the usual Windows env): `Path.home()`."""
+    expected = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    assert opencode_http._opencode_db_path({}) == expected
+
+
+def test_spawn_give_up_skips_the_db_cause_on_v2(tmp_path, monkeypatch):
+    """The downgrade refusal is a 1.x startup death; a V2 spawn never reads it."""
+    adapter = make_adapter(tmp_path)
+
+    class _DeadProcess:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    def fake_popen(_argv, stdout, **_kw):
+        stdout.write(_DB_DOWNGRADE_LINE.encode() + b"\n")
+        stdout.flush()
+        return _DeadProcess()
+
+    monkeypatch.setattr(opencode_http.shutil, "which", lambda name: f"/resolved/{name}")
+    monkeypatch.setattr(opencode_http.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_protocol_for", lambda _resolved: (V2Protocol(), (2, 0, 27)))
+    monkeypatch.setattr(adapter, "_await_healthy", lambda _sess: False)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    with pytest.raises(OpencodeServerError) as excinfo:
+        adapter._spawn_server(spec)
+    assert "rc=1" in str(excinfo.value)
+    assert "opencode.db" not in str(excinfo.value)
 
 
 def test_spawn_open_failure_closes_the_sinks_already_open(tmp_path, fake_opencode, monkeypatch):

@@ -96,7 +96,7 @@ from .base import (
     validate_adapter_artifact_paths,
     validated_task_directory,
 )
-from .env_fault import EnvFaultMixin
+from .env_fault import ENV_FAULT_TAIL_BYTES, EnvFaultMixin
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -189,6 +189,13 @@ _PROTOCOLS: dict[int, type[OpencodeProtocol]] = {1: V1Protocol, 2: V2Protocol}
 
 # Where every version refusal sends the operator.
 _VERSION_REMEDY = "see docs/setup-guide.md#opencode-versions"
+
+# What a 1.x server prints before it exits during startup on a database a 2.x
+# server initialised: both majors keep their store at the same
+# `$XDG_DATA_HOME/opencode/opencode.db`, so this is the downgrade path back from
+# 2.x. `_spawn_server` scans the spawn's own server-log tail for it so the
+# give-up error names the database and the remedy, not just "rc=1".
+_V1_DB_DOWNGRADE_MARKER = b"Database is not empty and has no session table"
 
 # `opencode --version` budget for the pre-spawn protocol detection — probe's
 # `binary_runs` default, which bounds the same call in `bmad-loop validate`.
@@ -346,6 +353,17 @@ def _parse_sse_lines(
             continue
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
+
+
+def _opencode_db_path(env: dict[str, str]) -> Path:
+    """The sqlite store a server spawned with ``env`` opens — the one both
+    majors share: ``$XDG_DATA_HOME/opencode/opencode.db``, with the XDG default
+    ``$HOME/.local/share`` when the variable is unset or empty."""
+    data_home = env.get("XDG_DATA_HOME") or ""
+    if not data_home:
+        home = env.get("HOME") or str(Path.home())
+        data_home = str(Path(home) / ".local" / "share")
+    return Path(data_home) / "opencode" / "opencode.db"
 
 
 @dataclass
@@ -630,6 +648,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
         last_error = "server did not become healthy"
+        died_at_startup = False
         try:
             for _ in range(SPAWN_ATTEMPTS):
                 port = _free_port()
@@ -661,17 +680,53 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # unhealthy server is killed too — never leak what we spawned.
                 if process.poll() is None:
                     last_error = sess.health_fault or "server did not become healthy in time"
+                    died_at_startup = False
                     self._kill_process(sess)
                 else:
                     last_error = f"server exited rc={process.returncode} during startup"
+                    died_at_startup = True
         except BaseException:
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
         self._close_spawn_sinks(log_fh, server_fh, event_fh)
+        if died_at_startup and protocol.major == 1:
+            cause = self._startup_death_cause(spec.task_id, server_path, env)
+            if cause:
+                last_error = f"{last_error}: {cause}"
         launched = " ".join((self.binary, *self.profile.launch_args))
         raise OpencodeServerError(
             f"could not start `{launched} serve` after {SPAWN_ATTEMPTS} attempts "
             f"({last_error}); server log: {server_path}"
+        )
+
+    def _startup_death_cause(self, task_id: str, server_path: Path, env: dict[str, str]) -> str:
+        """The known cause of a 1.x server's death during startup, read from
+        the bounded server-log tail, or "" when none is recognised. The log
+        holds only this session's spawns: `start_session` unlinks it before
+        spawning.
+
+        Only the database-downgrade refusal is recognised. An unreadable log
+        is crumbed (``server-log-unread``) and reads as no cause — the give-up
+        error still names the log, so the generic message stays accurate."""
+        try:
+            with server_path.open("rb") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
+                tail = fh.read()
+        except OSError as e:
+            self._note_lifecycle(
+                task_id,
+                "server-log-unread",
+                path=str(server_path),
+                error=f"{type(e).__name__}: {e}",
+            )
+            return ""
+        if _V1_DB_DOWNGRADE_MARKER not in tail:
+            return ""
+        return (
+            f"OpenCode 1.x refuses the database at {_opencode_db_path(env)} because a "
+            f'2.x server initialised it ("{_V1_DB_DOWNGRADE_MARKER.decode()}"); '
+            f"move that file aside, {_VERSION_REMEDY}"
         )
 
     def _protocol_for(self, resolved: str) -> tuple[OpencodeProtocol, tuple[int, int, int]]:
