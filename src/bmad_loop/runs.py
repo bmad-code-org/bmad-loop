@@ -2526,7 +2526,89 @@ def legacy_registry_leftovers(
             # rows are merged rather than overwritten.
             label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
             grouped[label] = sorted(set(grouped.get(label, []) + here))
+    # The project's own registry is no legacy one, but a control session an
+    # earlier release named there survives the rename too (#733).
+    primary = get_multiplexer()
+    label = primary.registry_root() or DEFAULT_REGISTRY_LABEL
+    try:
+        stale = superseded_ctl_sessions(
+            project, primary, on_fault=lambda msg: faults.append(f"{label}: {msg}")
+        )
+    except MultiplexerError as exc:
+        faults.append(f"{label}: could not be listed: {exc}")
+        stale = []
+    if stale:
+        grouped[label] = sorted(set(grouped.get(label, []) + stale))
     return grouped, faults
+
+
+def superseded_ctl_name(project: Path, registry: str | None = None) -> str:
+    """The control-session name an earlier release minted for ``project`` in
+    ``registry``, the root the backend was bound to (#733): ``bmad-loop-ctl-``
+    plus the first 16 hex of the SHA-256 of the project's derived root, resolved
+    and case-folded where the filesystem folds.
+
+    The formula that release used, kept verbatim for this one reader. When
+    ``registry`` is an absolute root that resolves to a different registry (an
+    operator's own root honoured by ``[mux] honor_ambient_psmux_data_dir``), the
+    digest is salted with it too; a symlink, junction or other spelling of the
+    derived root resolves to it and is not salted.
+
+    Raises :class:`StateRootError`, ``OSError`` or ``RuntimeError`` when a root
+    cannot be derived or resolved. That release then minted the fixed name, so
+    no digest-named session can exist for it."""
+    scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+    if registry and Path(registry).is_absolute():
+        pinned = os.path.normcase(str(Path(registry).resolve()))
+        if pinned != scope:
+            scope += "\0" + pinned
+    return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
+
+
+def superseded_ctl_sessions(
+    project: Path,
+    mux: TerminalMultiplexer | None = None,
+    *,
+    on_fault: Callable[[str], None] | None = None,
+) -> list[str]:
+    """The control session standing in this process's own registry under the
+    name an earlier release minted for this project on psmux,
+    :func:`superseded_ctl_name` (#733), as each spelling is listed.
+
+    That exact name, not every ``bmad-loop-ctl-<16 hex>`` shape: a run's own
+    agent session for run id ``ctl-<16 hex>`` is spelled the same way, and
+    naming it here would publish a kill command for a live run.
+
+    Nothing addresses them: launches, attach, stop and the parked-window sweep
+    use :func:`ctl_session_for` only, and the prune spares every ctl-shaped
+    name (:func:`is_ctl_session_name`). A run window parked in one is reached by
+    no command, so this is what the cleanup and attach frontends name.
+
+    The name is the registry's own: unsalted in this project's derived
+    registry (or any spelling of it), salted with the root in an operator's
+    root honoured over it. Either digest covers this project's derived root, so
+    a session under it is this project's wherever it stands. psmux's shared
+    default registry (no root) and a machine-wide server (tmux, which never
+    minted the digest shape) are not read.
+
+    A name that could not be derived, and a listing that could not be taken,
+    go to ``on_fault`` and answer ``[]``
+    (:meth:`~.multiplexer.TerminalMultiplexer.list_sessions_reporting`)."""
+    mux = mux or get_multiplexer()
+    root = mux.registry_root()
+    if root is None:
+        return []
+    try:
+        old = mux.session_name_key(superseded_ctl_name(project, root))
+    except (StateRootError, OSError, RuntimeError) as exc:
+        if on_fault is not None:
+            on_fault(f"could not derive the pre-upgrade control-session name: {exc}")
+        return []
+    return sorted(
+        name
+        for name in mux.list_sessions_reporting(on_fault=on_fault)
+        if mux.session_name_key(name) == old
+    )
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:

@@ -6504,6 +6504,53 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _note_superseded_ctl_for_attach(project: Path) -> None:
+    """After "nothing to attach": name each pre-upgrade control session still
+    standing in this project's registry (#733), with the command that attaches
+    to it, because a run window parked there is one attach cannot see.
+
+    Named, not adopted. attach, stop and the parked-window sweep address
+    ``runs.ctl_session_for`` only (see ``runs.is_ctl_session_name``); finding
+    a window here would land the operator in a session `stop` cannot then
+    close the window of, and a decision answered there would hand its client
+    back to nowhere. So the operator is pointed at it and the session ends when
+    they end it (`cleanup` prints how).
+
+    The verb is the one attach itself would run here: inside a multiplexer
+    client a nested attach is refused, so the backend switches the client
+    instead (``attach_target_argv``). A listing that could not be taken is said,
+    not passed off as "no such session" after "nothing to attach".
+
+    A paste-ready command only on psmux (``_is_psmux``); another backend's
+    session is named without one."""
+    from .adapters.multiplexer import MultiplexerError, get_multiplexer
+
+    def _fault(msg: str) -> None:
+        print(
+            f"note: could not check this project's registry for a pre-upgrade control "
+            f"session: {msg}",
+            file=sys.stderr,
+        )
+
+    try:
+        mux = get_multiplexer()
+        stale = runs.superseded_ctl_sessions(project, mux, on_fault=_fault)
+    except MultiplexerError as exc:
+        _fault(str(exc))
+        return
+    psmux = _is_psmux(mux)
+    for name in stale:
+        where = "this run's window may be there"
+        if psmux:
+            verb = mux.attach_target_argv(f"={name}")[1]
+            where += ": " + _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
+        print(
+            f"note: pre-upgrade control session {name} is still running in this "
+            f"project's registry, and attach does not look inside it; {where}",
+            file=sys.stderr,
+        )
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     from .tui import launch  # import-safe: launch.py has no textual imports
 
@@ -6540,6 +6587,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
             # Not after a ctl fault: "nothing to attach" would claim the
             # unchecked ctl window absent (#750). The warning above stands.
             print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
+            _note_superseded_ctl_for_attach(project)
         return 1
     argv, return_window = plan
     # Record where to send the client once the sweep finishes this cycle's
@@ -6728,6 +6776,76 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_psmux(mux: object) -> bool:
+    """Whether ``mux`` is the bundled psmux backend, the one transport whose
+    commands :func:`_psmux_command` can spell. ponytail: no generic renderer;
+    an out-of-tree registry-namespaced backend gets its sessions named, not a
+    command, until one needs more."""
+    from .adapters.psmux_backend import PsmuxMultiplexer
+
+    return isinstance(mux, PsmuxMultiplexer)
+
+
+def _psmux_command(registry: str | None, verb: str) -> str:
+    """A paste-ready PowerShell line running ``psmux <verb>`` against
+    ``registry`` (psmux's own default when ``None``). Quoted the way
+    ``_mux_info`` quotes its export line. psmux only (:func:`_is_psmux`)."""
+    run = f"psmux {verb}"
+    if registry is None:
+        return run
+    quoted = registry.replace("'", "''")
+    return f"$env:{runs.PSMUX_DATA_DIR} = '{quoted}'; {run}"
+
+
+def _superseded_ctl_kill_commands(
+    project: Path, leftovers: dict[str, list[str]]
+) -> dict[str, str | None]:
+    """``{name: command that ends it}`` for each control session in the
+    registry in force under the name an earlier release minted for this
+    project there (#733, ``runs.superseded_ctl_name``), picked out of
+    ``leftovers`` rather than listed a second time.
+
+    A command here and none for the other leftovers, because this session is
+    ours beyond doubt — its name is a digest of this project's derived root —
+    and nothing else will ever end it: no bmad-loop command addresses it. The
+    caveat travels with the command: ending it kills whatever its windows
+    still run. ``None`` for the command when the backend is not psmux
+    (:func:`_is_psmux`): the session is named, and no command is advertised
+    that could not run there."""
+    if not leftovers:
+        return {}
+    from .adapters.multiplexer import MultiplexerError, get_multiplexer
+
+    try:
+        mux = get_multiplexer()
+        root = mux.registry_root()
+        old = mux.session_name_key(runs.superseded_ctl_name(project, root))
+    except (MultiplexerError, runs.StateRootError, OSError, RuntimeError):
+        # Already reported: the same derivation in `legacy_registry_leftovers`
+        # put this fault in `legacy_unverified`, and named no session for it.
+        return {}
+    # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
+    # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
+    psmux = _is_psmux(mux)
+    return {
+        name: _psmux_command(root, f"kill-session -t '={name}'") if psmux else None
+        for name in leftovers.get(root or runs.DEFAULT_REGISTRY_LABEL, [])
+        if mux.session_name_key(name) == old
+    }
+
+
+def _warn_superseded_ctl(kill_commands: dict[str, str | None]) -> None:
+    for name, command in kill_commands.items():
+        how = f"end it with: {command}" if command else "end it with your multiplexer"
+        print(
+            f"pre-upgrade control session {name} is still running in this project's "
+            "registry, and no bmad-loop command addresses it; once its runs have "
+            "finished and every window in it shows the exit banner (ending it kills "
+            f"what they still run), {how}",
+            file=sys.stderr,
+        )
+
+
 def _warn_legacy_leftovers(
     project: Path,
     leftovers: dict[str, list[str]],
@@ -6812,6 +6930,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     leftovers, unverified = runs.legacy_registry_leftovers(
         project, announced=killed if args.dry_run else ()
     )
+    kill_commands = _superseded_ctl_kill_commands(project, leftovers)
     # The listing behind prune_sessions reads an unavailable backend as no
     # sessions; this names the cases where that is not a clean answer (#864).
     # A misconfigured process host fails the liveness read behind it: a scan
@@ -6887,6 +7006,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
                 legacy_unverified=unverified,
+                legacy_kill_commands=kill_commands,
                 sessions_scan_error=sessions_scan_error,
             )
         )
@@ -6902,6 +7022,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         _warn_legacy_leftovers(project, leftovers, unverified)
+        _warn_superseded_ctl(kill_commands)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -6920,6 +7041,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
     _warn_legacy_leftovers(project, leftovers, unverified)
+    _warn_superseded_ctl(kill_commands)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part

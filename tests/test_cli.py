@@ -60,6 +60,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.plugins import GrantSet
 from bmad_loop.plugins.store import load_grants
 
@@ -2894,6 +2895,142 @@ def test_attach_nothing_to_attach(project, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "nothing to attach" in err
     assert "no readable project tag" not in err
+
+
+_DIGEST_CTL = runs.CTL_SESSION + "-0123456789abcdef"
+_OWN_REG = r"C:\state\0123456789abcdef\_mux"
+
+
+class _OwnRegistryMux(PsmuxMultiplexer):
+    """The primary backend as the #733 readers see it: psmux, bound to this
+    project's registry, which holds a control session under the pre-rename
+    digest name. A real `PsmuxMultiplexer` subclass, so the client verb is the
+    backend's own and the paste-ready command is psmux's."""
+
+    def has_registry_namespace(self):
+        return False  # keeps `_configure_mux` from exporting a root over this fake
+
+    def registry_root(self):
+        return _OWN_REG
+
+    def session_name_key(self, name):
+        return name
+
+
+class _OtherRegistryMux:
+    """An out-of-tree registry-namespaced backend holding the same session: not
+    psmux, so no psmux command may be printed for it."""
+
+    def has_registry_namespace(self):
+        return False
+
+    def registry_root(self):
+        return _OWN_REG
+
+    def session_name_key(self, name):
+        return name
+
+    def attach_target_argv(self, target):
+        return ["othermux", "attach", "-t", target]
+
+
+def test_attach_names_a_pre_upgrade_control_session_without_a_command_off_psmux(
+    project, monkeypatch, capsys
+):
+    """On a backend that is not psmux the session is still named, but no psmux
+    PowerShell line is advertised: it would fail there, or reach the wrong
+    registry. Ablate `_is_psmux` (answer True) and this fails."""
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+    assert "this run's window may be there\n" in err
+    assert "psmux" not in err and "PSMUX_DATA_DIR" not in err
+
+
+def test_attach_names_a_pre_upgrade_control_session_it_cannot_see_into(
+    project, monkeypatch, capsys
+):
+    """#733: a run window parked in the pre-rename control session is one attach
+    does not look at, so "nothing to attach" alone tells the operator nothing is
+    there. The session is named with the command that reaches it. Ablate the
+    `_note_superseded_ctl_for_attach` call in `cmd_attach` and this fails."""
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+    monkeypatch.delenv("TMUX", raising=False)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert "nothing to attach" in err
+    assert (
+        f"pre-upgrade control session {_DIGEST_CTL} is still running" in err
+        and f"$env:PSMUX_DATA_DIR = '{_OWN_REG}'; psmux attach -t '={_DIGEST_CTL}'" in err
+    )
+
+
+def test_attach_inside_a_client_names_switch_client_not_a_nested_attach(
+    project, monkeypatch, capsys
+):
+    """Run from inside a psmux pane (`TMUX` set), a pasted `psmux attach` is a
+    nested attach, which is refused; the backend's own attach switches the
+    client instead, and the printed command must too. Ablate the
+    `attach_target_argv` verb in `_note_superseded_ctl_for_attach` (back to a
+    fixed `attach`) and this fails."""
+    from bmad_loop.tui import launch
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", lambda _p, _m=None, **_kw: [_DIGEST_CTL])
+    monkeypatch.setenv("TMUX", "/tmp/psmux,1,0")
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert f"psmux switch-client -t '={_DIGEST_CTL}'" in err
+    assert "psmux attach" not in err
+
+
+@pytest.mark.parametrize("how", ["raises", "reports"])
+def test_attach_says_when_it_could_not_look_for_a_pre_upgrade_control_session(
+    project, monkeypatch, capsys, how
+):
+    """After "nothing to attach", a listing that could not be taken must not read
+    as "no pre-upgrade control session either". Both ways a backend can fail it
+    are said: a raised `MultiplexerError` (an out-of-tree backend inheriting the
+    default `list_sessions_reporting`) and a reported fault. Ablate either the
+    `except` report or the `on_fault` handed to `superseded_ctl_sessions` in
+    `_note_superseded_ctl_for_attach` and this fails."""
+    from bmad_loop.tui import launch
+
+    def _stale(_p, _m=None, *, on_fault=None):
+        if how == "raises":
+            raise mux_mod.MultiplexerError("list-sessions timed out")
+        assert on_fault is not None
+        on_fault("list-sessions timed out")
+        return []
+
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    monkeypatch.setattr(launch, "attach_plan", lambda proj, rid, **_kw: (None, 0))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_sessions", _stale)
+
+    assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 1
+    err = capsys.readouterr().err
+    assert "nothing to attach" in err
+    assert (
+        "could not check this project's registry for a pre-upgrade control session: "
+        "list-sessions timed out"
+    ) in err
 
 
 def test_attach_explains_an_unproven_ctl_window(project, monkeypatch, capsys):
@@ -7111,6 +7248,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "live": ["live-1"],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_kill_commands": {},
         "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -7169,6 +7307,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "live": [],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_kill_commands": {},
         "legacy_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -19886,6 +20025,80 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     assert "not migrated" not in err and "not checked" not in err
 
 
+def test_cleanup_names_a_pre_upgrade_control_session_without_a_command_off_psmux(
+    project, capsys, monkeypatch
+):
+    """Off psmux the session is still named, in text and in --json, but its
+    command is `null` and the text line advertises none. Ablate `_is_psmux`
+    (answer True) and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): ({_OWN_REG: [_DIGEST_CTL]}, []),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL}" in err
+    assert "end it with your multiplexer" in err
+    assert "psmux" not in err and "PSMUX_DATA_DIR" not in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: None}
+
+
+def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
+    project, capsys, monkeypatch
+):
+    """#733: a control session the previous release named `bmad-loop-ctl-<hex>`
+    in this project's own registry is addressed by no command, so cleanup gives
+    the one that ends it — on stderr in text mode, at
+    `sessions.legacy_kill_commands` in --json with stderr empty. Only for that
+    session: the current control session and the other leftovers get none.
+    Nor for another `bmad-loop-ctl-<16 hex>`: only the exact name the previous
+    release minted for this project gets one. Ablate `_superseded_ctl_kill_commands`
+    to `{}`, or its exact-name match back to the shape check, and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): (
+            {
+                # A run's agent session for run id `ctl-<16 hex>` shares the
+                # digest shape; it is not the old control session.
+                _OWN_REG: [runs.CTL_SESSION, _DIGEST_CTL, runs.CTL_SESSION + "-fedcba9876543210"],
+                "/reg/default": ["bmad-loop-old-1"],
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+    command = f"$env:PSMUX_DATA_DIR = '{_OWN_REG}'; psmux kill-session -t '={_DIGEST_CTL}'"
+
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert f"pre-upgrade control session {_DIGEST_CTL}" in err and command in err
+    assert err.count("kill-session") == 1
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: command}
+    assert _DIGEST_CTL in doc["sessions"]["legacy_leftovers"]
+    assert captured.err == ""
+
+
 def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys, monkeypatch):
     """DW-469: a registry whose listing raised used to print exactly what an empty
     one prints — nothing. Text names it on stderr; --json carries it as
@@ -20560,6 +20773,7 @@ def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
         "live": [],
         "unverifiable_pid": [],
         "legacy_leftovers": [],
+        "legacy_kill_commands": {},
         "legacy_unverified": [],
     }
     assert doc["ctl_windows"]["scan_error"] is None

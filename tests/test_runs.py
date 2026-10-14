@@ -8962,6 +8962,167 @@ def test_foreign_registry_root_folds_case_where_the_filesystem_does(tmp_path):
     assert not runs.foreign_registry_root(str(state / mine / "_MUX"), tmp_path)
 
 
+_DIGEST_CTL = runs.CTL_SESSION + "-0123456789abcdef"
+
+
+def test_superseded_ctl_sessions_names_the_pre_rename_session_in_our_registry(tmp_path):
+    """#733: the control session the previous release named `bmad-loop-ctl-<hex>`
+    survives the rename in this project's own registry, and nothing addresses
+    it — under the spelling it was listed with, read through the transport's
+    fold (ablate `session_name_key` there and the upper-case one drops out).
+    The current one, under any spelling the transport folds onto it, and a run's
+    agent session are not superseded. Nor is another digest-shaped name: a run
+    id `ctl-<16 hex>` mints exactly that shape for a live agent session (ablate
+    the exact-name match back to `is_ctl_session_name` and this fails)."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+    assert old != _DIGEST_CTL and runs.is_ctl_session_name(old)
+    mux = _RegistryMux(
+        [
+            runs.CTL_SESSION,
+            runs.CTL_SESSION.upper(),
+            old,
+            old.upper(),
+            _DIGEST_CTL,
+            "bmad-loop-run-1",
+        ],
+        {},
+        root=own,
+        fold=True,
+    )
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [old.upper(), old]
+
+
+def test_superseded_ctl_name_is_the_previous_releases_mint(tmp_path):
+    """The name the previous release's `ctl_session_for` minted in a project's
+    own derived registry: the digest of that root, resolved and case-folded.
+    Pinned against the formula spelled out here, so a drift in either the root
+    derivation or the hashing fails."""
+    import hashlib
+
+    derived = runs.mux_registry_root(tmp_path)
+    scope = os.path.normcase(str(derived.resolve()))
+    digest = hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]
+    assert runs.superseded_ctl_name(tmp_path) == f"{runs.CTL_SESSION}-{digest}"
+    assert runs.superseded_ctl_name(tmp_path, str(derived)) == f"{runs.CTL_SESSION}-{digest}"
+    # An honoured operator root that is another registry salts the digest.
+    honoured = tmp_path / "operator-reg"
+    salted = scope + "\0" + os.path.normcase(str(honoured.resolve()))
+    salted_digest = hashlib.sha256(os.fsencode(salted)).hexdigest()[:16]
+    assert runs.superseded_ctl_name(tmp_path, str(honoured)) == (
+        f"{runs.CTL_SESSION}-{salted_digest}"
+    )
+
+
+def test_superseded_ctl_sessions_names_the_salted_name_in_an_honoured_root(tmp_path):
+    """With `[mux] honor_ambient_psmux_data_dir` keeping an operator's own root,
+    the previous release minted the control session there under a digest salted
+    with that root. That name, and not the derived registry's, is the one to
+    find there. Ablate the root handed to `superseded_ctl_name` in
+    `superseded_ctl_sessions` and this fails."""
+    honoured = str(tmp_path / "operator-reg")
+    salted = runs.superseded_ctl_name(tmp_path, honoured)
+    unsalted = runs.superseded_ctl_name(tmp_path)
+    assert salted != unsalted
+    mux = _RegistryMux([runs.CTL_SESSION, unsalted, salted, _DIGEST_CTL], {}, root=honoured)
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [salted]
+
+
+@pytest.mark.parametrize("root", [None, "elsewhere"])
+def test_superseded_ctl_sessions_names_no_other_digest(tmp_path, root):
+    """psmux's shared default registry (`None`) is not read at all, and in any
+    other root only this project's exact name is: a digest-named session that
+    is not it proves nothing about whose it is."""
+    reg = None if root is None else str(tmp_path / root)
+    mux = _RegistryMux([_DIGEST_CTL], {}, root=reg)
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == []
+
+
+def test_superseded_ctl_sessions_follows_an_alias_of_our_own_registry(tmp_path):
+    """An honoured operator root that is a symlink or junction to this project's
+    derived registry is that registry: the old mint resolved both and gave it
+    the derived root's name, unsalted. Compared as spelled, the alias reads as
+    another registry and the name to find goes salted. Ablate the `resolve()`
+    of the registry in `superseded_ctl_name` and this fails."""
+    derived = runs.mux_registry_root(tmp_path)
+    derived.mkdir(parents=True, exist_ok=True)
+    alias = tmp_path / "alias-mux"
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module; a junction needs no privilege
+
+        _winapi.CreateJunction(str(derived), str(alias))
+    else:
+        alias.symlink_to(derived, target_is_directory=True)
+    old = runs.superseded_ctl_name(tmp_path)
+    mux = _RegistryMux([runs.CTL_SESSION, old], {}, root=str(alias))
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [old]
+
+
+@pytest.mark.parametrize("fails", ["registry", "derived"])
+def test_superseded_ctl_sessions_reports_a_name_it_could_not_derive(tmp_path, monkeypatch, fails):
+    """The registry in force, or this project's derived root, could not be
+    resolved, so the name cannot be derived. It never raises, and the fault is
+    reported rather than folded into a clean "no such session". Ablate the
+    `on_fault` report in `superseded_ctl_sessions` and this fails."""
+    root = str(tmp_path / "operator-reg")
+    if fails == "derived":
+
+        def _no_root(_p):
+            raise runs.StateRootError("no writable state root")
+
+        monkeypatch.setattr(runs, "mux_registry_root", _no_root)
+        detail = "no writable state root"
+    else:
+        real_resolve = Path.resolve
+
+        def _resolve(self, strict=False):
+            if str(self) == root:
+                raise OSError("symlink loop")
+            return real_resolve(self, strict)
+
+        monkeypatch.setattr(Path, "resolve", _resolve)
+        detail = "symlink loop"
+    faults: list[str] = []
+    mux = _RegistryMux([_DIGEST_CTL], {}, root=root)
+    assert runs.superseded_ctl_sessions(tmp_path, mux, on_fault=faults.append) == []
+    assert faults == [f"could not derive the pre-upgrade control-session name: {detail}"]
+
+
+def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry(
+    tmp_path, monkeypatch
+):
+    """#733: `cleanup` said "nothing to clean up" and `legacy_leftovers: []`
+    while the pre-rename control session held a parked run window, because the
+    reader walked the legacy registries only. Ablate the primary pass in
+    `legacy_registry_leftovers` and this fails."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _RegistryMux([runs.CTL_SESSION, old, _DIGEST_CTL], {}, root=own),
+    )
+    assert _healthy_leftovers(tmp_path) == {own: [old]}
+
+
+def test_legacy_leftovers_report_an_unreadable_own_registry(tmp_path, monkeypatch):
+    """A listing of the project's own registry that failed is "not looked at",
+    never "nothing left" (the DW-469 rule the legacy registries already follow).
+    Ablate the `on_fault` handed to `superseded_ctl_sessions` and this fails."""
+
+    class _Faulting(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            assert on_fault is not None
+            on_fault("list-sessions failed")
+            return []
+
+    own = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _Faulting([], {}, root=own))
+    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [f"{own}: list-sessions failed"])
+
+
 def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
     """psmux resolves a session by opening `<data dir>\\<name>.port`, and NTFS
     opens names case-insensitively, so in ITS registry `bmad-loop-CTL-<hex>` is
