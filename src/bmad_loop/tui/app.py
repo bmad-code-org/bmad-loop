@@ -376,6 +376,17 @@ class BmadLoopApp(App[None]):
         if has_spec_folder and not spec_folder:
             self.notify("stories mode needs a spec folder", severity="error")
             return
+        # `run` takes tickets mode from policy alone (no flag selects it, as
+        # `--spec` selects stories), so a pick that disagrees with `[stories]
+        # source` would launch the other mode.
+        tickets = worksource.SOURCE_TICKETS
+        if (result["source"] == tickets) != (self._stories_defaults()[0] == tickets):
+            self.notify(
+                'tickets mode is chosen in policy: set [stories] source = "tickets" in '
+                ".bmad-loop/policy.toml to run it, or another source to leave it",
+                severity="error",
+            )
+            return
         if result["dry_run"]:
             tail = ["run", "--project", str(self.project), "--dry-run"]
             if has_spec_folder:

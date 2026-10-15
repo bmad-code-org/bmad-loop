@@ -111,6 +111,7 @@ from .sweep import (
     resolve_sweep_override,
     select_entries,
 )
+from .tickets_engine import TicketsEngine
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -807,7 +808,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     if paths:
         _QUEUE_VALIDATORS[source](
-            project, paths, spec_folder, dev_trees, report, bool(getattr(args, "probes", False))
+            project,
+            paths,
+            spec_folder,
+            dev_trees,
+            report,
+            bool(getattr(args, "probes", False)),
+            pol,
         )
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
@@ -2702,6 +2709,7 @@ def _validate_sprint_mode_queue(
     dev_trees: list[str],
     report: ValidationReport,
     probes: bool,
+    pol,
 ) -> None:
     """``validate``'s queue checks for a sprint-status run: the ledger, the park
     records, and the sprint board itself."""
@@ -2733,6 +2741,7 @@ def _validate_stories_mode_queue(
     dev_trees: list[str],
     report: ValidationReport,
     probes: bool,
+    pol,
 ) -> None:
     """``validate``'s queue checks for a stories run: the manifest and the
     ledger, read against the spec folder."""
@@ -2749,13 +2758,21 @@ def _validate_tickets_mode_queue(
     dev_trees: list[str],
     report: ValidationReport,
     probes: bool,
+    pol,
 ) -> None:
     """``validate``'s queue checks for a tickets run: the v7 ticket tree's
     preflight (:func:`install.tickets_preflight`; the script's capability probe
     only under ``--probes``, since it executes the project's script) and the dev
     primitive's ticket route. The deferred-work ledger is not read here: the v7
     ledger lands with a later release layer."""
-    report.extend(install.tickets_preflight(paths, dev_trees, probe_capability=probes))
+    report.extend(
+        install.tickets_preflight(
+            paths,
+            dev_trees,
+            probe_capability=probes,
+            branch_per=pol.scm.branch_per if pol is not None else None,
+        )
+    )
     tickets_probs = install.missing_tickets_support(project, dev_trees)
     if dev_trees and not tickets_probs:
         probed = list(
@@ -2775,7 +2792,8 @@ def _validate_tickets_mode_queue(
 # `worksource.SOURCES` by tests/test_worksource.py). The last argument is
 # `validate --probes`.
 _QUEUE_VALIDATORS: dict[
-    str, Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport, bool], None]
+    str,
+    Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport, bool, Any], None],
 ] = {
     worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
     worksource.SOURCE_STORIES: _validate_stories_mode_queue,
@@ -3435,7 +3453,7 @@ def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
 
 
 def _preflight_sprint_queue(
-    paths: bmadconfig.ProjectPaths, args: argparse.Namespace, spec_folder: str
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
 ) -> int | None:
     """``run``'s queue preflight for a sprint-status run: the board parses and the
     ``--epic`` / ``--story`` selection resolves. An exit code refuses the run."""
@@ -3450,7 +3468,7 @@ def _preflight_sprint_queue(
 
 
 def _preflight_stories_queue(
-    paths: bmadconfig.ProjectPaths, args: argparse.Namespace, spec_folder: str
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
 ) -> int | None:
     """``run``'s queue preflight for a stories run: the manifest and SPEC.md pass
     and the ``--story`` selector names an entry. An exit code refuses the run."""
@@ -3461,16 +3479,35 @@ def _preflight_stories_queue(
     return None
 
 
+def _preflight_tickets_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a tickets run: the v7 tree's checks
+    (:func:`install.tickets_preflight`, the script's capability probe included —
+    the run executes the script anyway). Warnings print; a problem refuses the
+    run."""
+    findings = install.tickets_preflight(
+        paths, [], probe_capability=True, branch_per=pol.scm.branch_per
+    )
+    for warning in (f for f in findings if f.severity == "warning"):
+        print(f"warning: {warning.message}", file=sys.stderr)
+    problems = [f for f in findings if f.severity == "problem"]
+    if not problems:
+        return None
+    for problem in problems:
+        print(f"FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate --probes` for details", file=sys.stderr)
+    return 1
+
+
 # `run`'s queue preflight, one entry per work source (held exhaustive over
 # `worksource.SOURCES` by tests/test_worksource.py).
 _RUN_PREFLIGHTS: dict[
-    str, Callable[[bmadconfig.ProjectPaths, argparse.Namespace, str], int | None]
+    str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int | None]
 ] = {
     worksource.SOURCE_SPRINT: _preflight_sprint_queue,
     worksource.SOURCE_STORIES: _preflight_stories_queue,
-    worksource.SOURCE_TICKETS: lambda _paths, _args, _folder: worksource.refuse_unrunnable(
-        worksource.SOURCE_TICKETS
-    ),
+    worksource.SOURCE_TICKETS: _preflight_tickets_queue,
 }
 
 
@@ -3515,7 +3552,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
 
-    if (rc := _RUN_PREFLIGHTS[source](paths, args, spec_folder)) is not None:
+    if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
         return rc
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
@@ -3528,7 +3565,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # layer reads the store.
     plugin_grants = _launch_plugin_grants(project)
     if not _require_base_skills(
-        project, pol, paths.repo_root, plugin_grants, require_stories=traits.stories_primitive
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=traits.stories_primitive,
+        require_tickets=source == worksource.SOURCE_TICKETS,
     ):
         return 1
 
@@ -3568,6 +3610,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        tickets_engine_cls=TicketsEngine,
         trusted_config_digest=trusted_digest,
         profiles=profiles,
         plugin_grants=plugin_grants,
@@ -3900,14 +3943,21 @@ def _print_stories_status(state: RunState, project: Path) -> None:
         )
 
 
+def _print_tickets_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a tickets run: the initiative the run is
+    pinned to and its folder, read from run state alone — the per-run task rows
+    above already carry each ticket's phase; no ticket tree is read here."""
+    del project
+    folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
+    print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
+
+
 # `status`'s queue footer, one entry per work source (held exhaustive over
 # `worksource.SOURCES` by tests/test_worksource.py).
 _STATUS_PRINTERS: dict[str, Callable[[RunState, Path], None]] = {
     worksource.SOURCE_SPRINT: _print_sprint_status,
     worksource.SOURCE_STORIES: _print_stories_status,
-    worksource.SOURCE_TICKETS: lambda _state, _project: worksource.refuse_unrunnable(
-        worksource.SOURCE_TICKETS
-    ),
+    worksource.SOURCE_TICKETS: _print_tickets_status,
 }
 
 
@@ -4879,6 +4929,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        tickets_engine_cls=TicketsEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,

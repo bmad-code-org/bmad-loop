@@ -89,10 +89,9 @@ def test_v6_traits_are_pinned():
 
 
 def test_tickets_traits_are_pinned():
-    """The ticket-tree source is registered but not runnable yet: it has no
-    numbered epics (its epics are keyed by slug), no spec folder, no stories
-    primitive, no sentinels, no replay and no sprint board; it parks at
-    awaiting-operator."""
+    """The ticket-tree source runs: it has no numbered epics (its epics are keyed
+    by slug), no spec folder, no stories primitive, no sentinels, no replay and
+    no sprint board; it parks at awaiting-operator."""
     assert dataclasses.asdict(worksource.TRAITS["tickets"]) == {
         "name": "tickets",
         "label": "tickets mode — BMAD v7 ticket tree",
@@ -103,7 +102,7 @@ def test_tickets_traits_are_pinned():
         "sentinels": False,
         "operator_park": True,
         "replay": False,
-        "runnable": False,
+        "runnable": True,
         "sprint_board": False,
     }
 
@@ -179,34 +178,37 @@ def test_validate_document_mode_per_source(source):
     assert (bare["initiative"], bare["era"]) == ("", "")
 
 
-def _run_side_tickets_rows():
-    """Every run-side dispatch row of the tickets source, called with dummy
-    arguments: each must refuse before it reads any of them."""
-    rows = {
-        "cli._STATUS_PRINTERS": lambda: cli._STATUS_PRINTERS["tickets"](None, None),
-        "cli._RUN_PREFLIGHTS": lambda: cli._RUN_PREFLIGHTS["tickets"](None, None, ""),
-        "cli._ACTIONABLE_KEY_READERS": lambda: cli._ACTIONABLE_KEY_READERS["tickets"](None, ""),
-        "runsetup._engine_cls_for": lambda: runsetup._engine_cls_for(
-            "tickets", "", engine_cls=object, stories_engine_cls=object
-        ),
-    }
+def test_tickets_run_side_rows_are_live(tmp_path, capsys):
+    """Tickets runs are enabled, so its run-side rows are real: the engine map
+    builds `TicketsEngine`, the run preflight is the tickets one, the status
+    footer names the pinned initiative, and the TUI shows no per-run board. The
+    actionable-keys row stays a refusal: tickets validate reads no ledger gate
+    yet, so nothing reaches it. Ablation (performed): point the tickets
+    `_RUN_PREFLIGHTS` row at `_preflight_sprint_queue` and this FAILS."""
+    from bmad_loop.model import RunState
+    from bmad_loop.tickets_engine import TicketsEngine
+
+    assert runsetup._engine_cls_for(
+        "tickets", "", engine_cls=object, stories_engine_cls=object
+    ) == (TicketsEngine, {})
+    assert cli._RUN_PREFLIGHTS["tickets"] is cli._preflight_tickets_queue
+    state = RunState(
+        run_id="r",
+        project=str(tmp_path),
+        started_at="now",
+        source="tickets",
+        initiative="shop",
+        initiative_folder=str(tmp_path / "shop"),
+    )
+    cli._STATUS_PRINTERS["tickets"](state, tmp_path)
+    assert capsys.readouterr().out == f"tickets: initiative shop  ({tmp_path / 'shop'})\n"
+    with pytest.raises(worksource.SourceNotRunnable):
+        cli._ACTIONABLE_KEY_READERS["tickets"](None, "")
     try:
         from bmad_loop.tui import data
     except ImportError:  # pragma: no cover - the tui extra is installed in CI
-        return rows
-    rows["tui.data.BOARD_LOADERS"] = lambda: data.BOARD_LOADERS["tickets"](None, None)
-    return rows
-
-
-@pytest.mark.parametrize("row", sorted(_run_side_tickets_rows()))
-def test_tickets_run_side_rows_refuse(row):
-    """Tickets runs land in a later release layer: every run-side row refuses with
-    the typed `SourceNotRunnable`, which `cli.main` reports at exit 1.
-
-    Ablation (performed): pointing the tickets `_RUN_PREFLIGHTS` row at
-    `_preflight_sprint_queue` turns its row red (it reads the board instead)."""
-    with pytest.raises(worksource.SourceNotRunnable, match="tickets mode cannot run yet"):
-        _run_side_tickets_rows()[row]()
+        return
+    assert data.BOARD_LOADERS["tickets"] is None
 
 
 async def test_modal_select_options_match_runnable_traits(tmp_path, monkeypatch):
@@ -235,8 +237,7 @@ async def test_modal_select_options_match_runnable_traits(tmp_path, monkeypatch)
         return [(t.label, t.name) for t in worksource.TRAITS.values() if t.runnable]
 
     assert await options() == runnable()
-    # Tickets is registered but not runnable yet, so the picker must not offer it.
-    assert [name for _, name in runnable()] == ["sprint-status", "stories"]
+    assert [name for _, name in runnable()] == ["sprint-status", "stories", "tickets"]
 
     stories = worksource.TRAITS[worksource.SOURCE_STORIES]
     monkeypatch.setitem(
@@ -245,5 +246,6 @@ async def test_modal_select_options_match_runnable_traits(tmp_path, monkeypatch)
         dataclasses.replace(stories, runnable=False),
     )
     assert await options() == [
-        (worksource.TRAITS[worksource.SOURCE_SPRINT].label, worksource.SOURCE_SPRINT)
+        (worksource.TRAITS[source].label, source)
+        for source in (worksource.SOURCE_SPRINT, worksource.SOURCE_TICKETS)
     ]

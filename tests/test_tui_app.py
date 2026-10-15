@@ -2793,6 +2793,30 @@ async def test_start_run_modal_launches(project, monkeypatch):
         )
 
 
+async def test_start_run_modal_refuses_tickets_against_the_policy_source(project, monkeypatch):
+    """`run` reads tickets mode from policy alone, so picking tickets in the
+    modal while `[stories] source` is sprint launches nothing and says why,
+    instead of starting a sprint run. Ablation (performed): drop the source
+    check in `_start_run_result` and the launch fires — this FAILS."""
+    from textual.widgets import Select
+
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#source", Select).value = "tickets"
+        await pilot.click("#ok")
+        await until(
+            pilot, lambda: any("tickets mode is chosen in policy" in m for m in notifications(app))
+        )
+        assert not calls
+
+
 async def test_dirty_worktree_blocks_launch(project, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)

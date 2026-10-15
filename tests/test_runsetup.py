@@ -1347,6 +1347,10 @@ class _StoriesCapturingEngine(_CapturingEngine):
     """`stories_engine_cls` stand-in distinguishable from the sprint one by type."""
 
 
+class _TicketsCapturingEngine(_CapturingEngine):
+    """`tickets_engine_cls` stand-in distinguishable from the other two by type."""
+
+
 # The kwargs both story composers hand either engine class; the stories class
 # additionally receives `spec_folder`.
 _STORY_ENGINE_KWARGS = {
@@ -1383,6 +1387,7 @@ def _compose_run_for_source(project, *, source, spec_folder):
         make_adapters=_accepting_adapters,
         engine_cls=_SprintCapturingEngine,
         stories_engine_cls=_StoriesCapturingEngine,
+        tickets_engine_cls=_TicketsCapturingEngine,
         trusted_config_digest="deadbeef",
     )
 
@@ -1439,15 +1444,16 @@ def _build_run_state_for_source(project, *, source, spec_folder):
     [
         ("sprint-status", _SprintCapturingEngine, set(), ""),
         ("stories", _StoriesCapturingEngine, {"spec_folder"}, "epic-1"),
+        ("tickets", _TicketsCapturingEngine, set(), ""),
     ],
-    ids=["sprint", "stories"],
+    ids=["sprint", "stories", "tickets"],
 )
 def test_compose_run_engine_class_per_source(
     tmp_path, source, engine_type, extra_kwargs, persisted_folder
 ):
     """Characterization pin for the WorkSource refactor: `compose_run` builds
-    `engine_cls` for a sprint launch and `stories_engine_cls` (plus `spec_folder`)
-    for a stories launch, stamping `source` / `spec_folder` on the state — in
+    `engine_cls` for a sprint launch, `stories_engine_cls` (plus `spec_folder`)
+    for a stories launch and `tickets_engine_cls` for a tickets launch, stamping `source` / `spec_folder` on the state — in
     memory, on disk, and on the `run-start` journal row. `build_run_state` drops a
     spec folder handed to a sprint launch (persists "")."""
     composed = _compose_run_for_source(tmp_path, source=source, spec_folder="epic-1")
@@ -1467,10 +1473,45 @@ def test_compose_run_engine_class_per_source(
     assert (state.source, state.spec_folder) == (source, persisted_folder)
 
 
-@pytest.mark.parametrize(
-    ("source", "error"),
-    [("bogus", worksource.UnknownSource), ("tickets", worksource.SourceNotRunnable)],
-)
+def test_compose_run_tickets_builds_tickets_engine(project_v7):
+    """A tickets launch with no injected class builds the real `TicketsEngine`
+    on the v7 sandbox, pinned to the active initiative — and a resume of that
+    run selects the same class from the persisted source. Ablation (performed):
+    drop the tickets arm of `_engine_cls_for` and the sprint `Engine` is built —
+    this FAILS; flip `TRAITS["tickets"].runnable` back and both launches refuse."""
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.engine import Engine
+    from bmad_loop.stories_engine import StoriesEngine
+    from bmad_loop.tickets_engine import TicketsEngine
+
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    composed = runsetup.compose_run(
+        project=project_v7.project,
+        paths=paths,
+        policy=policy_mod.loads('[stories]\nsource = "tickets"\n'),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source="tickets",
+        spec_folder="",
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=lambda *_a, **_k: {role: MockAdapter([]) for role in runsetup.ROLES},
+        engine_cls=Engine,
+        stories_engine_cls=StoriesEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+    assert type(composed.engine) is TicketsEngine
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.initiative) == ("tickets", project_v7.initiative)
+    assert persisted.initiative_folder == str(paths.initiative_folder)
+    assert runsetup._engine_cls_for(
+        persisted.source, "", engine_cls=Engine, stories_engine_cls=StoriesEngine
+    ) == (TicketsEngine, {})
+
+
+@pytest.mark.parametrize(("source", "error"), [("bogus", worksource.UnknownSource)])
 def test_compose_resume_refuses_a_source_it_cannot_drive(tmp_path, monkeypatch, source, error):
     """`compose_resume` refuses a persisted story run whose source this version
     cannot drive — unknown to the registry (a newer bmad-loop wrote it), or
@@ -1495,7 +1536,7 @@ def test_compose_resume_refuses_a_source_it_cannot_drive(tmp_path, monkeypatch, 
         spec_folder="epic-1",
     )
 
-    with pytest.raises(error, match=repr(source) if source == "bogus" else "cannot run yet"):
+    with pytest.raises(error, match=repr(source)):
         runsetup.compose_resume(
             project=tmp_path,
             paths=_fake_paths(tmp_path),

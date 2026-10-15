@@ -1034,6 +1034,7 @@ class Engine:
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
+            unit_branch_epic=lambda task: self._unit_branch_epic(task),
         )
         # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
         # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
@@ -4619,12 +4620,16 @@ class Engine:
         # reopen no matter where in the window a raise lands.
         snapshot: list[_ArmedClose] = []
         park_record: tuple[Path, str | None] | None = None
+        plan_undo: object | None = None
         try:
             self._close_declared_deferred(task, snapshot)
             # A parked story's record rides this same commit (#356): written into
             # the workspace ahead of the `git add -A`, it reaches every clone the
             # story's commit does — including through the worktree merge-back.
             park_record = self._write_park_record(task)
+            # The work source's own terminal write to the unit's plan (tickets
+            # mode marks `done`) rides the commit the same way; base: none.
+            plan_undo = self._terminal_plan_write(task)
 
             # bmad-build-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
@@ -4680,6 +4685,7 @@ class Engine:
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
+            self._undo_terminal_plan_write(task, plan_undo)
             self._escalate(task, f"commit failed: {e}")
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
@@ -4691,6 +4697,7 @@ class Engine:
             # does not exist. Restore, then re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
+            self._undo_terminal_plan_write(task, plan_undo)
             raise
         if task.dw_ids and task.worktree_path:
             self._worktree_flow.prepare_publication(task, self.workspace.paths)
@@ -4716,6 +4723,30 @@ class Engine:
             self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
+
+    def _unit_branch_epic(self, task: StoryTask) -> str | None:
+        """The epic segment of ``task``'s unit branch under worktree isolation
+        (``bmad-loop/<run>/<epic>/<unit>``). Base: None — the unit key alone
+        names the branch."""
+        del task
+        return None
+
+    def _terminal_plan_write(self, task: StoryTask) -> object | None:
+        """The work source's terminal write to ``task``'s plan, made inside the
+        commit window — after every gate, before ``finalize_commit``'s ``git add
+        -A`` — so it rides the unit's own commit and lands only with its code.
+        Returns the token :meth:`_undo_terminal_plan_write` takes, None when
+        nothing was written. Base: no write (the sprint board and a stories spec
+        are finished by the session and the board advance, not here)."""
+        del task
+        return None
+
+    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> None:
+        """Put back what :meth:`_terminal_plan_write` wrote, for the commit
+        window's failure arms: a plan marked finished for a commit that does not
+        exist would unblock work on code that is not there. Never raises, like
+        :meth:`_restore_park_record`. Base: nothing to undo."""
+        del task, undo
 
     def _park_spec_relpath(self, task: StoryTask) -> str:
         """The parked story's spec as a path relative to the WORKSPACE root, so

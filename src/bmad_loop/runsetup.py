@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
+    from .tickets_engine import TicketsEngine
 
     class MakeAdapters(Protocol):
         """Call shape of :func:`make_adapters`, which ``compose_*`` takes injected.
@@ -462,7 +463,9 @@ def make_adapters(
     # synthesizes the result from the spec, and so needs the project paths to
     # find that spec — rebasing onto the active worktree's implementation-
     # artifacts dir under isolation, not just the main checkout's.
-    paths = bmadconfig.load_paths(project)
+    paths = bmadconfig.load_paths(
+        project, want_tickets=policy.stories.source == worksource.SOURCE_TICKETS
+    )
     mux = None
     adapters: dict[str, CodingCLIAdapter] = {}
     by_cfg: dict = {}
@@ -880,6 +883,7 @@ def _engine_cls_for(
     *,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
 ) -> tuple[type[Engine], dict[str, str]]:
     """The engine class a story run from ``source`` is built with, and the extra
     constructor kwargs that class takes beyond the shared ones.
@@ -888,11 +892,18 @@ def _engine_cls_for(
     version) raises :class:`worksource.UnknownSource`, and a registered source
     that cannot run yet raises :class:`worksource.SourceNotRunnable` — neither is
     rebuilt as a sprint run. The classes are injected so ``cli``'s module-level
-    names — and the tests' monkeypatches of them — stay the ones built."""
+    names — and the tests' monkeypatches of them — stay the ones built.
+    ``tickets_engine_cls`` None is :class:`~bmad_loop.tickets_engine.TicketsEngine`."""
     if not worksource.resumable_traits_for(source).runnable:
         worksource.refuse_unrunnable(source)
     if source == worksource.SOURCE_STORIES:
         return stories_engine_cls, {"spec_folder": spec_folder}
+    if source == worksource.SOURCE_TICKETS:
+        if tickets_engine_cls is None:
+            from .tickets_engine import TicketsEngine
+
+            tickets_engine_cls = TicketsEngine
+        return tickets_engine_cls, {}
     return engine_cls, {}
 
 
@@ -1238,6 +1249,7 @@ def compose_run(
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
 ) -> ComposedRun:
@@ -1336,7 +1348,11 @@ def compose_run(
             plugin_grants=plugin_grants,
         )
         cls, extra = _engine_cls_for(
-            source, spec_folder, engine_cls=engine_cls, stories_engine_cls=stories_engine_cls
+            source,
+            spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
         )
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
         engine: Engine = cls(**common, **extra)  # pyright: ignore[reportArgumentType]
@@ -1531,6 +1547,7 @@ def compose_resume(
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     sweep_options: SweepResumeOptions | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
@@ -1575,6 +1592,7 @@ def compose_resume(
             state.spec_folder,
             engine_cls=engine_cls,
             stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
         )
     resolved_sweep_options = (
         sweep_options

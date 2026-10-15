@@ -17,7 +17,14 @@ breaking changes may land in a minor release.
   tree). `validate` checks a tickets project: the `tickets.*` preflight (script, config
   reader, uv, active initiative, repo store; tracker stores are refused) and the dev
   primitive's ticket route (`skills.tickets-dispatch*`). `validate --probes` also probes
-  the project's `tickets.py`. `run` and `resume` refuse tickets mode until its engine lands.
+  the project's `tickets.py`.
+- Add the tickets work source: dispatch `bmad-build-auto ticket <ref>` from the v7 ticket
+  tree (tracked in-repo store). The run picks in initiative build order, pauses on hitl
+  and unrefined tickets, verifies each plan at `built`, and marks it `done` inside the
+  unit's own commit (`[tickets] mark_done = "auto"`). A worktree unit's branch is
+  `bmad-loop/<run>/<epic-slug>/<ref>`. `run` refuses an initiative folder not tracked
+  in the code checkout (`tickets.layout-unsupported`) and warns on `branch_per = "run"`
+  (`tickets.branch-per-run`).
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

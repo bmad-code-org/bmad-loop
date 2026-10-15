@@ -12120,6 +12120,63 @@ def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
     assert problem.detail["initiative"] == project_v7.initiative
 
 
+@pytest.mark.parametrize("layout", ["ignored", "uncommitted", "outside"])
+def test_untracked_store_refused_until_topology_layer(project_v7, monkeypatch, tmp_path, layout):
+    """Tickets runs drive a ticket tree tracked inside the code checkout, so a
+    plan marked `done` rides its unit's own commit. An initiative folder that is
+    gitignored, never committed, or outside `repo_root` is a store layout a later
+    release layer supports: one `tickets.layout-unsupported` problem naming why.
+    Ablation (performed): drop the layout check in `tickets_preflight` and every
+    row FAILS."""
+    import dataclasses
+
+    rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
+    paths = _tickets_paths(project_v7)
+    if layout in ("ignored", "uncommitted"):
+        git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+        if layout == "ignored":
+            (project_v7.project / ".gitignore").write_text(f"/{rel}/\n", encoding="utf-8")
+            git(project_v7.project, "add", ".gitignore")
+        git(project_v7.project, "commit", "-q", "-m", "untrack the initiative")
+    else:
+        other = tmp_path / "code"
+        other.mkdir()
+        git(other, "init", "-q")
+        paths = dataclasses.replace(paths, repo_root=other)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
+
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.layout-unsupported"
+    assert problem.detail == {
+        "path": str(paths.initiative_folder),
+        "repo_root": str(paths.repo_root),
+    }
+    why = {"ignored": "no tracked files", "uncommitted": "no tracked files", "outside": "outside"}
+    assert why[layout] in problem.message and "later release layer" in problem.message
+
+
+@pytest.mark.parametrize(("branch_per", "warned"), [("run", True), ("story", False), (None, False)])
+def test_tickets_preflight_warns_branch_per_run(project_v7, monkeypatch, branch_per, warned):
+    """`branch_per = "run"` builds every ticket on one branch, and build-auto's
+    branch-fit check may HALT a ticket it judges the branch does not fit: a
+    warning, never a problem. Ablation (performed): drop the check and the `run`
+    row FAILS."""
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(
+        _tickets_paths(project_v7),
+        [".claude/skills"],
+        probe_capability=False,
+        branch_per=branch_per,
+    )
+    warnings = [f for f in findings if f.check == "tickets.branch-per-run"]
+    assert [(f.severity, f.detail) for f in warnings] == (
+        [("warning", {"branch_per": "run"})] if warned else []
+    )
+    assert not [f for f in findings if f.severity == "problem"]
+
+
 @pytest.mark.parametrize(
     ("config", "store"),
     [('[tickets]\nstore = "jira"\n', "jira"), ("[tickets\nstore = ", None)],

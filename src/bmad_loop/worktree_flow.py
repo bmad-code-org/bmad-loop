@@ -1783,6 +1783,7 @@ class WorktreeFlow:
         escalation_pause: Callable[..., NoReturn],
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
+        unit_branch_epic: Callable[[StoryTask], str | None] = lambda task: None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -1803,6 +1804,9 @@ class WorktreeFlow:
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
+        # The unit branch's epic segment (`workspace.unit_branch_name`); None —
+        # every mode but tickets — keeps the two-segment name.
+        self._unit_branch_epic = unit_branch_epic
         verify.reconcile_integration_state_roots(
             run_dir, (task.integration_attempt for task in state.tasks.values())
         )
@@ -2458,6 +2462,8 @@ class WorktreeFlow:
         accepted_spec_before = task.spec_file
         task.relativize_project_local_accepted_spec(self.paths.project)
         accepted_spec_relocated = task.spec_file != accepted_spec_before
+        epic_segment = self._unit_branch_epic(task)
+        branch_kw = {"epic_segment": epic_segment} if epic_segment else {}
         try:
             unit = self._open_unit_workspace(
                 self.paths.repo_root,
@@ -2484,6 +2490,7 @@ class WorktreeFlow:
                     worktree=worktree,
                     ref=ref,
                 ),
+                **branch_kw,
             )
         except verify.GitSpawnError as e:
             # a spawn fault is machine-wide, not this unit's: deferring would

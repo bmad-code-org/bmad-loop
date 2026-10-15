@@ -11,11 +11,12 @@ used to test ``source == "stories"`` reads the trait that names *why* it
 branches, and a site that dispatches whole functions per source keys a table on
 :data:`SOURCES` (``tests/test_worksource.py`` holds every such table exhaustive).
 
-A registered source that cannot run yet (``SourceTraits.runnable`` false: tickets,
-until its engine lands) still has a row in every table. Its rows for the run-side
-sites — dry-run, run preflight, the engine map, the status footer and the TUI
-board — raise :class:`SourceNotRunnable`, which the CLI reports as a one-line
-error at exit 1; ``validate`` checks such a source fully.
+Every registered source runs today. One that cannot run yet
+(``SourceTraits.runnable`` false, as tickets was until its engine landed) still
+has a row in every table: its rows for the run-side sites — dry-run, run
+preflight, the engine map, the status footer and the TUI board — raise
+:class:`SourceNotRunnable`, which the CLI reports as a one-line error at exit 1,
+while ``validate`` checks the source fully.
 
 A *persisted* source this registry does not carry (a run state written by a newer
 bmad-loop) is refused at resume (:func:`resumable_traits_for`), never rebuilt as
@@ -151,7 +152,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         sentinels=False,
         operator_park=True,
         replay=False,
-        runnable=False,
+        runnable=True,
         sprint_board=False,
     ),
 }

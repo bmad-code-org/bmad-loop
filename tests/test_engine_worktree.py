@@ -2131,6 +2131,54 @@ def test_branch_per_run_naming(project):
     assert branch_exists(project.project, "bmad-loop/test-run")
 
 
+def test_unit_branch_embeds_epic_slug(project, monkeypatch):
+    """A work source that names the unit's epic (tickets mode: the epic slug,
+    through `Engine._unit_branch_epic`) gets `bmad-loop/<run>/<epic>/<unit>`, each
+    segment ref-sanitized on its own, and real git accepts it; the seam reaches
+    the mount through `WorktreeFlow`. Ablation (performed): drop the
+    `epic_segment` pass-through in `WorktreeFlow` and the run's branch has no
+    epic segment — this FAILS."""
+    from bmad_loop.workspace import open_unit_workspace, unit_branch_name
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    unit = open_unit_workspace(
+        project.project,
+        project,
+        "test-run",
+        "1.1",
+        "main",
+        "story",
+        run_dir,
+        epic_segment="epic cart",
+    )
+    assert unit.branch == unit_branch_name("test-run", "1.1", "story", epic_segment="epic cart")
+    assert unit.branch.startswith("bmad-loop/test-run/epic_cart-") and unit.branch.endswith("/1.1")
+    assert branch_exists(project.project, unit.branch)  # real git accepted the name
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(branch_per="story", delete_branch=False),
+    )
+    monkeypatch.setattr(engine, "_unit_branch_epic", lambda task: "epic-cart")
+    engine.run()
+    assert engine.state.tasks["1-1-a"].branch == "bmad-loop/test-run/epic-cart/1-1-a"
+    assert branch_exists(project.project, "bmad-loop/test-run/epic-cart/1-1-a")
+
+
+def test_unit_branch_unchanged_without_epic():
+    """No epic segment — every mode but tickets — keeps today's names byte for
+    byte, and `branch_per = "run"` ignores the segment: one branch per run."""
+    from bmad_loop.workspace import unit_branch_name
+
+    for epic in (None, ""):
+        assert unit_branch_name("r1", "1-1-a", "story", epic_segment=epic) == "bmad-loop/r1/1-1-a"
+    assert unit_branch_name("r1", "1-1-a", "story") == "bmad-loop/r1/1-1-a"
+    assert unit_branch_name("r1", "1.1", "run", epic_segment="epic-cart") == "bmad-loop/r1"
+    assert Engine._unit_branch_epic(object.__new__(Engine), StoryTask("1-1-a", 1)) is None
+
+
 def test_dirty_unit_key_branch_is_created_by_real_git(project):
     """#102: a unit key carrying ref-illegal sequences reached `git branch` raw and
     blew up at worktree-mount time. `unit_branch_name` now ref-sanitizes both

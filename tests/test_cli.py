@@ -12750,30 +12750,64 @@ def test_dry_run_tickets_never_writes(project, capsys, monkeypatch):
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 
 
-def test_run_tickets_refused_until_runnable(project, capsys, monkeypatch):
-    """Tickets mode is registered (validate checks it, `run --dry-run` previews it)
-    but its runs land in a later release layer: `run` refuses with one clear line
-    at exit 1 and leaves no run behind. Ablation (performed): point the tickets
-    `_RUN_PREFLIGHTS` row at the sprint preflight and this test FAILS."""
-    from bmad_loop import runs
+def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
+    """A tickets project that validates runs: the tickets preflight passes (its
+    capability probe executes the vendored script — 2 real spawns), and `run`
+    builds `cli.TicketsEngine` on a state pinned to the active initiative.
+    Ablation (performed): drop `tickets_engine_cls=TicketsEngine` from
+    `cmd_run`'s `compose_run` call and the real engine is built instead of the
+    stub — this FAILS."""
+    from bmad_loop.journal import load_state
 
     _make_tickets_validate_pass(project, monkeypatch, capsys)
-    argv = ["run", "--project", str(project.project)]
+    built: list[dict] = []
 
-    assert cli.main(argv) == 1
-    out, err = capsys.readouterr()
-    assert out == ""
-    assert err.strip() == (
-        "error: tickets mode cannot run yet: it lands in a later release layer of "
-        "bmad-loop — `bmad-loop validate` checks a tickets project today"
-    )
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    run_id = "20990101-000000-cafe"
+
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+
+    assert len(built) == 1
+    state = load_state(project.project / ".bmad-loop" / "runs" / run_id)
+    assert (state.source, state.initiative) == ("tickets", V7_DEFAULT_INITIATIVE)
+    assert "stub summary" in capsys.readouterr().out
+
+
+def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
+    """`run`'s tickets preflight refuses a store layout tickets runs do not drive
+    yet — here an initiative folder that was never committed — with a FAIL line
+    and no run left behind. Ablation (performed): point the tickets
+    `_RUN_PREFLIGHTS` row at the stories preflight and the run starts — this
+    FAILS."""
+    from conftest import git
+
+    from bmad_loop import bmadconfig, runs
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    folder = bmadconfig.load_paths(project.project, want_tickets=True).initiative_folder
+    rel = folder.relative_to(project.project).as_posix()
+    git(project.project, "rm", "-r", "-q", "--cached", rel)
+    (project.project / ".gitignore").write_text(f"/{rel}/\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "untrack the initiative")
+    monkeypatch.setattr(cli, "TicketsEngine", _StubEngine)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+
+    err = capsys.readouterr().err
+    assert "FAIL: the initiative folder" in err and "later release layer" in err
     runs_dir = project.project / runs.RUNS_DIR
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 
 
 @pytest.mark.parametrize(
     ("source", "said"),
-    [("bogus", "unknown to this bmad-loop"), ("tickets", "tickets mode cannot run yet")],
+    [("bogus", "unknown to this bmad-loop")],
 )
 def test_resume_unknown_source_refused(project, monkeypatch, capsys, source, said):
     """R16: a paused story run whose persisted source this version cannot drive is

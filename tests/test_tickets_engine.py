@@ -1,9 +1,10 @@
 """`TicketsEngine`: the tickets-mode pick, its pick-time pauses, and the
 dispatch, verify and review path of a picked ticket.
 
-`compose_run` still refuses tickets runs, so every test builds the engine
-directly (`make_engine`) on the `project_v7` sandbox with the mock adapter and an
-injected `FakeTicketTree`. Real-spawn budget: none.
+Every test builds the engine directly (`make_engine`) on the `project_v7`
+sandbox with the mock adapter and an injected `FakeTicketTree`
+(`compose_run`'s own wiring is pinned in tests/test_runsetup.py). Real-spawn
+budget: none.
 """
 
 from __future__ import annotations
@@ -37,11 +38,12 @@ from bmad_loop.policy import (
     OperatorPolicy,
     Policy,
     ReviewPolicy,
+    ScmPolicy,
     TicketsPolicy,
 )
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
-from bmad_loop.tickettree import TicketsCrashed
+from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -370,10 +372,12 @@ def _probe_session(engine: TicketsEngine, adapter: MockAdapter, task: StoryTask,
 
 def test_dev_prompt_uses_ticket_ref(project_v7):
     """Every dev leg dispatches `ticket <ref>`: the fresh leg is exactly the
-    dry-run's line plus the tickets clauses (park last, no backticks), and the
-    repair leg keeps the feedback file as its last backticked token. Ablation
-    (performed): fall back to the base `_dev_prompt` and the fresh prompt
-    dispatches the bare key `1.1` with the sprint-board clause — this FAILS."""
+    dry-run's line plus the tickets clauses (no backticks; no park clause, which
+    tickets mode does not offer yet — and which stays last when it is on), and
+    the repair leg keeps the feedback file as its last backticked token.
+    Ablation (performed): fall back to the base `_dev_prompt` and the fresh
+    prompt dispatches the bare key `1.1` with the sprint-board clause — this
+    FAILS."""
     tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
     engine, _ = make_engine(project_v7, tree)
     task = _bound(engine, tree)
@@ -381,12 +385,15 @@ def test_dev_prompt_uses_ticket_ref(project_v7):
 
     fresh = engine._dev_prompt(task, None)
 
-    assert fresh == (
-        f"/{skill} ticket 1.1 — {engine._sprint_board_instruction()} "
-        f"{engine._operator_park_instruction()}"
-    )
+    assert engine._operator_park_instruction() == ""
+    assert fresh == f"/{skill} ticket 1.1 — {engine._sprint_board_instruction()}"
     assert "`" not in fresh and "sprint-status" not in fresh
-    assert "tickets.py mark" in fresh and fresh.endswith(engine._operator_park_instruction())
+    assert "tickets.py mark" in fresh and "awaiting-operator" not in fresh
+    engine._operator_park_enabled = lambda: True  # type: ignore[method-assign]
+    park = engine._operator_park_instruction()
+    assert park and "`" not in park
+    assert engine._dev_prompt(task, None) == f"{fresh} {park}"
+    del engine._operator_park_enabled
 
     plan = Path(tree.finds["1.1"].plan)
     _write_plan(plan, "built")
@@ -518,7 +525,7 @@ def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     assert "board" not in prompt.lower() and "sprint-status" not in prompt
     assert "`" not in prompt and str(plan) not in prompt
     assert prompt.endswith(engine._board_handback_redirect())
-    assert engine._operator_park_instruction() not in prompt
+    assert "awaiting-operator" not in prompt
 
 
 def test_expected_spec_pinned_on_attempt_one(project_v7):
@@ -579,26 +586,95 @@ def test_verify_rejects_done_from_dev(project_v7):
     assert task.spec_file == str(plan)
 
 
-def test_tickets_unit_reaches_commit_with_the_plan_at_built(project_v7):
-    """A picked ticket runs end to end on the mock adapter: one dev session,
-    pointed at the bound plan, builds it; verify accepts `built`; the unit commits
-    with the plan at `built` in the commit — never `done`, which nothing marks
-    yet — and the tree is never written."""
-    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
-    plan = Path(tree.finds["1.1"].plan)
+def _builds(
+    layout: V7Layout,
+    tree: FakeTicketTree,
+    plan: Path,
+    *,
+    ticket: str = "1",
+    seen: list | None = None,
+):
+    """A dev session that builds the ticket: code in the tree and the plan at
+    `built`, the fake's row following as `tickets.py` would derive it. ``seen``
+    collects the plan's status at each launch."""
 
     def build(spec: SessionSpec) -> SessionResult:
-        assert spec.expected_spec == str(plan)
         cwd = Path(spec.cwd)
+        # the workspace's copy: the plan itself in place, the mount's under isolation
+        here = cwd / plan.relative_to(layout.project)
+        assert spec.expected_spec == str(here)
+        if seen is not None:
+            seen.append(
+                status_of(parse_frontmatter(here.read_text(encoding="utf-8")))
+                if here.is_file()
+                else ""
+            )
         baseline = verify.rev_parse_head(cwd)
         (cwd / "src.txt").write_bytes(b"cart model\n")
-        _write_plan(plan, "built", baseline=baseline)
+        _write_plan(here, "built", ticket=ticket, baseline=baseline)
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
         # the ticket now reads as finished in the tree, as `tickets.py` derives it
-        tree.next_view = _tree(project_v7).next_view
-        result = {"workflow": "auto-dev", "spec_file": str(plan), "status": "built"}
+        tree.next_view = _tree(layout).next_view
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "built"}
         return SessionResult(status="completed", result_json=result)
 
-    engine, adapter = make_engine(project_v7, tree, script=[build], max_stories=1)
+    return build
+
+
+def _committed_status(layout: V7Layout, sha: str, plan: Path) -> str:
+    rel = plan.relative_to(layout.project).as_posix()
+    return status_of(parse_frontmatter(git(layout.project, "show", f"{sha}:{rel}")))
+
+
+def _disk_restores(tree: FakeTicketTree, monkeypatch) -> None:
+    """Make the fake's `restore_preimage` put the bytes back on disk, as the real
+    chokepoint does, while still recording the call."""
+    real = tree.restore_preimage
+
+    def restore(plan, data, journal=None):
+        real(plan, data, journal)
+        if data is None:
+            Path(plan).unlink(missing_ok=True)
+        else:
+            Path(plan).write_bytes(data)
+
+    monkeypatch.setattr(tree, "restore_preimage", restore)
+
+
+def _reject_commits(layout: V7Layout) -> None:
+    """A native `pre-commit` hook that rejects every commit: `finalize_commit`
+    fails the way a lint or secret hook makes it fail."""
+    hook = layout.project / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+
+def test_mark_done_rides_squash_commit(project_v7, monkeypatch):
+    """Under `mark_done = "auto"` the orchestrator accepts the verified ticket
+    inside the commit window: `mark 1.1 done` (reason `accept`, the bound plan)
+    runs with the code in the tree and HEAD still at the baseline, and the
+    squashed unit commit carries the plan at `done` together with that code.
+    Ablation (performed): drop the `_terminal_plan_write` call from
+    `_finalize_commit_phase` and the commit carries `built` with no mark — this
+    FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    at_mark: list[tuple[str, bool]] = []
+    marking = tree.mark
+
+    def mark(ref, target, **kw):
+        at_mark.append(
+            (verify.rev_parse_head(project_v7.project), (project_v7.project / "src.txt").is_file())
+        )
+        return marking(ref, target, **kw)
+
+    monkeypatch.setattr(tree, "mark", mark)
+    engine, adapter = make_engine(project_v7, tree, script=[_builds(project_v7, tree, plan)])
+    engine.state.max_stories = 1
 
     engine.run()
 
@@ -606,10 +682,252 @@ def test_tickets_unit_reaches_commit_with_the_plan_at_built(project_v7):
     assert task.phase == Phase.DONE and task.commit_sha
     assert len(adapter.sessions) == 1
     assert adapter.sessions[0].prompt.startswith(f"/{engine._dev_skill()} ticket 1.1")
-    rel = plan.relative_to(project_v7.project).as_posix()
-    committed = git(project_v7.project, "show", f"{task.commit_sha}:{rel}")
-    assert status_of(parse_frontmatter(committed)) == "built"
-    assert tree.marks == []
+    assert [(m.ref, m.target, m.reason, m.expected_plan, m.outcome) for m in tree.marks] == [
+        ("1.1", "done", "accept", plan, "written")
+    ]
+    assert at_mark == [(task.baseline_commit, True)]
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+    assert git(project_v7.project, "show", f"{task.commit_sha}:src.txt").strip() == "cart model"
+    assert git(project_v7.project, "status", "--porcelain") == ""
+
+
+def test_mark_done_never_policy_leaves_built(project_v7):
+    """`mark_done = "never"`: the unit commits with the plan at `built` — a
+    person accepts it — and the tree is never written. Ablation (performed):
+    drop the `mark_done` check in `_terminal_plan_write` and the plan is marked
+    `done` — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    pol = dataclasses.replace(_policy(), tickets=TicketsPolicy(mark_done="never"))
+    engine, adapter = make_engine(
+        project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert len(adapter.sessions) == 1
+    assert _committed_status(project_v7, task.commit_sha, plan) == "built"
+    assert tree.marks == [] and tree.restores == []
+
+
+def test_mark_done_undone_on_commit_failure(project_v7, monkeypatch):
+    """The mark is made just BEFORE `finalize_commit` so it rides the unit's
+    commit — but that commit can still fail. A plan left `done` for a commit that
+    does not exist would let `next` unblock dependents of absent code, so the
+    `GitError` arm puts the plan's exact pre-mark bytes back through
+    `restore_preimage` before escalating. Ablation (performed): delete the
+    `_undo_terminal_plan_write` calls in `_finalize_commit_phase` and the plan
+    stays `done` — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    built: list[bytes] = []
+    marking = tree.mark
+
+    def mark(ref, target, **kw):
+        built.append(plan.read_bytes())
+        return marking(ref, target, **kw)
+
+    monkeypatch.setattr(tree, "mark", mark)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    _reject_commits(project_v7)
+
+    summary = engine.run()
+
+    assert summary.paused  # the commit really did fail
+    assert engine.state.tasks["1.1"].phase == Phase.ESCALATED
+    assert [m.target for m in tree.marks] == ["done"]
+    assert tree.restores == [(plan, built[0])]
+    assert plan.read_bytes() == built[0]  # byte-for-byte
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
+
+
+def test_mark_done_undone_when_the_window_is_interrupted(project_v7, monkeypatch):
+    """The window's other failure arm: anything else raised out of
+    `finalize_commit` (an FS fault here, or a stop signal) also puts the plan
+    back, then travels on untouched. Ablation (performed): delete the
+    `_undo_terminal_plan_write` call in the `BaseException` arm — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+
+    def faulted(*a, **kw):
+        raise OSError("disk fault outside _run_git")
+
+    monkeypatch.setattr(verify, "finalize_commit", faulted)
+
+    engine.run()
+
+    assert _kinds(engine, "run-crash")  # the fault travelled on, untouched
+
+    assert [m.target for m in tree.marks] == ["done"] and len(tree.restores) == 1
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
+
+
+def test_mark_done_failure_pauses_and_resume_marks_again(project_v7, monkeypatch):
+    """A mark the chokepoint cannot make (here a held plan lock) pauses at
+    `ticket-tree` with the unit verified but uncommitted, still COMMITTING; a
+    resume re-drives the window and the mark rides the commit then. A fault
+    after a partial write is put back first. Ablation (performed): swallow the
+    `TicketsError` in `_terminal_plan_write` and the unit commits at `built` with
+    no pause — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    tree.faults["mark"] = TicketsLockBusy("the lock on the plan is held elsewhere")
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+
+    summary = engine.run()
+
+    state = load_state(engine.run_dir)
+    task = state.tasks["1.1"]
+    assert summary.paused and state.paused_stage == PAUSE_TICKET_TREE
+    assert state.paused_story_key == "1.1" and "marking 1.1 done failed" in state.paused_reason
+    assert task.phase == Phase.COMMITTING and not task.commit_sha
+    assert verify.rev_parse_head(project_v7.project) == task.baseline_commit
+    assert tree.marks == [] and tree.restores == []  # nothing was written to undo
+
+    del tree.faults["mark"]
+    state.clear_pause()
+    resumed = TicketsEngine(
+        paths=engine.paths,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    resumed.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert [(m.target, m.reason) for m in tree.marks] == [("done", "accept")]
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+
+
+class _MountTree:
+    """The fake as a unit mount's own tree, as `tickets.py --project-root
+    <mount>` reads it: `find` names the mount's copy of the plan, and a written
+    mark lands on that copy; the rows stay the shared fake's."""
+
+    def __init__(self, tree: FakeTicketTree, main: Path, root: Path) -> None:
+        self.tree, self.main, self.root = tree, main, root
+        self.project_root, self.pinned_initiative = root, tree.pinned_initiative
+
+    def _here(self, plan) -> Path:
+        return self.root / Path(plan).relative_to(self.main)
+
+    def find(self, ref):
+        found = self.tree.find(ref)
+        return dataclasses.replace(found, plan=str(self._here(found.plan)))
+
+    def mark(self, ref, target, *, expected_plan, **kw):
+        main_plan = self.main / Path(expected_plan).relative_to(self.root)
+        result = self.tree.mark(ref, target, expected_plan=main_plan, **kw)
+        if result.outcome == "written":
+            _write_plan(Path(expected_plan), target)
+        return result
+
+    def restore_preimage(self, plan, data, journal=None):
+        self.tree.restore_preimage(plan, data, journal)
+
+
+def test_worktree_unit_marks_the_mounts_plan_on_an_epic_branch(project_v7):
+    """Under worktree isolation the unit branch is `bmad-loop/<run>/<epic-slug>/<ref>`,
+    the mark is made by the mount's own tree on the mount's copy of the plan —
+    so `done` rides the unit commit — and the merge-back carries it to the
+    target with the code. Ablation (performed): mark through the run's main tree
+    (`self.ticket_tree` in `_terminal_plan_write`) and the cross-check refuses
+    the mount's plan — the unit pauses and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    main = project_v7.project
+    pol = dataclasses.replace(_policy(), scm=ScmPolicy(isolation="worktree", delete_branch=False))
+    engine, _ = make_engine(
+        project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    engine._ticket_tree_factory = lambda root, pin: (  # type: ignore[method-assign]
+        tree if root == main else _MountTree(tree, main, root)
+    )
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert task.branch == f"bmad-loop/test-run/{task.ticket.epic_slug}/1.1"
+    assert task.ticket.epic_slug and verify.branch_exists(main, task.branch)
+    assert [(m.target, m.reason, m.expected_plan) for m in tree.marks] == [("done", "accept", plan)]
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "done"
+    assert (main / "src.txt").read_bytes() == b"cart model\n"
+
+
+def test_never_mark_before_code_lands(project_v7, monkeypatch):
+    """A unit that never reaches its commit is never marked `done`: here every
+    dev leg builds the plan but names another ticket, so verification retries
+    and then escalates with the code uncommitted. The only marks are the repair
+    leg's re-open; `done` would let `next` unblock dependents of code that is
+    not in any commit. Ablation (performed): call `_terminal_plan_write` from
+    `_record_dev_spec` (after every dev session, before verify) and a `done`
+    mark appears — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    wrong = _builds(project_v7, tree, plan, ticket="9")
+    engine, adapter = make_engine(project_v7, tree, script=[wrong, wrong], max_stories=1)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert len(adapter.sessions) == 2 and not task.commit_sha
+    assert task.phase in (Phase.ESCALATED, Phase.DEFERRED)
+    assert "done" not in [m.target for m in tree.marks]
+    assert [(m.target, m.reason) for m in tree.marks] == [("in-progress", "repair")]
+
+
+def test_repair_leg_regresses_via_chokepoint_reason_repair(project_v7, monkeypatch):
+    """A repair leg re-opens the built plan through the chokepoint — `mark 1.1
+    in-progress`, reason `repair` — before it launches, so the session resumes
+    an `in-progress` plan with the feedback file as its last backticked token;
+    the repaired unit is then accepted (`done`, reason `accept`). The failed leg
+    never recorded its spec, so the re-open keys on the bound plan. Ablations
+    (performed): drop the tickets `_reset_spec_for_repair` override and the plan
+    is never re-opened; drop the `_spec_status_write` override and the re-open
+    is a raw status write with no mark — each FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    seen: list[str] = []
+    wrong = _builds(project_v7, tree, plan, ticket="9", seen=seen)
+    right = _builds(project_v7, tree, plan, seen=seen)
+    engine, adapter = make_engine(project_v7, tree, script=[wrong, right], max_stories=1)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and len(adapter.sessions) == 2
+    assert [(m.target, m.reason) for m in tree.marks] == [
+        ("in-progress", "repair"),
+        ("done", "accept"),
+    ]
+    assert seen == ["", "in-progress"]
+    repair = adapter.sessions[1].prompt
+    assert repair.startswith(f"/{engine._dev_skill()} ticket 1.1 — resume")
+    assert repair.rsplit("`", 2)[-2].endswith(".md") and "Verification evidence" in repair
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
 
 
 # ------------------------------------------------- plan-status writers (R19)

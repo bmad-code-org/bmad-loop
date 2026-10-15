@@ -138,6 +138,11 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "tickets.uv-missing",
         "tickets.initiative-unset",
         "tickets.initiative-missing",
+        # the initiative folder is not tracked inside the code checkout (other store
+        # layouts land with the store-topology layer)
+        "tickets.layout-unsupported",
+        # `[scm] branch_per = "run"`: build-auto's branch-fit check may HALT a ticket
+        "tickets.branch-per-run",
         # a tracker store (or an unreadable store config): bmad-loop drives repo stores only
         "tickets.store-not-repo",
         # `validate --probes`: the script's `--help` offers every verb and mark status

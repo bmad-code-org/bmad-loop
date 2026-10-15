@@ -44,6 +44,7 @@ and the orchestrator alone owns ``done``.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -52,7 +53,7 @@ from .adapters.base import SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
 from .frontmatter import parse_frontmatter, status_of
-from .model import StoryTask, TicketBinding, VerifyOutcome, result_mapping
+from .model import PAUSE_TICKET_TREE, StoryTask, TicketBinding, VerifyOutcome, result_mapping
 from .statemachine import PlanWriteReason
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
@@ -92,6 +93,22 @@ PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
 """The engine status writes tickets mode makes, as ``(engine reason, target) →
 plan-transition reason``; every other pair is refused
 (:meth:`TicketsEngine._spec_status_write`)."""
+
+
+@dataclass(frozen=True)
+class _PlanUndo:
+    """A plan's bytes before the commit window marked it (None: no file)."""
+
+    plan: Path
+    data: bytes | None
+
+
+def _bytes_or_none(path: Path) -> bytes | None:
+    """``path``'s bytes; None when it is absent or unreadable."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -708,6 +725,91 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             cause=why,
         )
         raise SpecStatusWriteRefused(reason, target, why)
+
+    def _unit_branch_epic(self, task: StoryTask) -> str | None:
+        """The ticket's epic slug, so a unit branch reads
+        ``bmad-loop/<run>/<epic-slug>/<ref>``; None for an unbound task."""
+        ticket = task.ticket
+        if ticket is None or not ticket.epic_slug:
+            return None
+        return ticket.epic_slug
+
+    def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | None:
+        """The orchestrator's acceptance: ``mark <ref> done`` (reason ``accept``)
+        on the bound plan, inside the commit window, under ``[tickets] mark_done =
+        "auto"``. The store is tracked inside the code checkout (preflight refuses
+        every other layout for now), so the marked plan rides the unit's own
+        squash and reaches the target branch only with the code it describes —
+        never before: ``next`` unblocks a done ticket's dependents.
+
+        Nothing is written under ``"never"`` (the plan stays ``built`` for a
+        person to accept), for an unbound task, or for a plan already ``done``
+        (a no-op mark). A failed mark puts back whatever it may have written,
+        then pauses at ``ticket-tree`` with the task still COMMITTING, so a
+        resume re-drives the window and marks again. Returns the pre-image for
+        :meth:`_undo_terminal_plan_write`."""
+        plan = self._bound_plan(task)
+        ticket = task.ticket
+        if self.policy.tickets.mark_done != "auto" or plan is None or ticket is None:
+            return None
+        try:
+            preimage = plan.read_bytes() if plan.is_file() else None
+        except OSError as e:
+            self._pause_mark_done(task, f"cannot read {plan}: {e}")
+        undo = _PlanUndo(plan, preimage)
+        try:
+            mark = self._workspace_ticket_tree().mark(
+                ticket.ref, "done", reason="accept", expected_plan=plan, journal=self.journal
+            )
+        except TicketsError as e:
+            if _bytes_or_none(plan) != preimage:
+                self._undo_terminal_plan_write(task, undo)
+            self._pause_mark_done(task, f"tickets.py {e.kind}: {e}")
+        return undo if mark.outcome == "written" else None
+
+    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> None:
+        """Put the plan back to its pre-mark bytes through
+        :meth:`~bmad_loop.tickettree.TicketTree.restore_preimage`, which journals
+        ``ticket-plan-restored`` with its outcome either way; a failed restore is
+        that row, never a raise out of the commit window's failure arm."""
+        del task
+        if not isinstance(undo, _PlanUndo):
+            return
+        try:
+            self._workspace_ticket_tree().restore_preimage(undo.plan, undo.data, self.journal)
+        except (TicketsError, OSError):
+            pass
+
+    def _pause_mark_done(self, task: StoryTask, detail: str) -> NoReturn:
+        reason = (
+            f"marking {task.story_key} done failed ({detail}) — the unit is verified "
+            f"but not committed; fix the ticket tree, then {self._resume_hint()}"
+        )
+        gates.notify(self.policy, self.run_dir, f"mark done failed: {task.story_key}", reason)
+        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+
+    def _operator_park_enabled(self) -> bool:
+        """False: a session-declared ``awaiting-operator`` plan has no ticket-tree
+        meaning (``tickets.py`` reads it as a problems row), and its conversion to
+        a ``blocked`` park through ``mark`` lands with the ticket lifecycle — so,
+        like stories and sweep, no tickets prompt offers the park and both gates
+        refuse the status."""
+        return False
+
+    def _reset_spec_for_repair(self, task: StoryTask) -> None:
+        """Re-open the bound plan before a repair leg: ``mark <ref> in-progress``
+        (reason ``repair``, through :meth:`_spec_status_write`), then strip the
+        stale terminal section — the base's trusted-file checks and strip, on the
+        plan ``find`` named. That plan is known before launch, so a leg whose
+        verification failed before the spec was recorded is still re-opened:
+        build-auto routes a ``built`` plan to review, not to a resumed build.
+        No-op while the plan is absent (a pre-plan HALT)."""
+        if not task.spec_file:
+            plan = self._bound_plan(task)
+            if plan is None or not plan.is_file():
+                return
+            task.spec_file = str(plan)
+        super()._reset_spec_for_repair(task)
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """No-op: tickets mode has no sprint board to mirror the plan onto, so no

@@ -41,7 +41,14 @@ from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import ProcessHostError, get_process_host
-from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
+from .verify import (
+    GitError,
+    git_below_floor,
+    git_bytes,
+    git_floor_text,
+    git_version_at_least,
+    path_tracked_kind,
+)
 
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
 # probe re-merge must stay idempotent) and never counts as a relay
@@ -785,19 +792,53 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     )
 
 
+def _tickets_layout_problem(paths: bmadconfig.ProjectPaths, folder: Path) -> str:
+    """Why the initiative folder is not a store tickets runs drive today — a
+    folder tracked inside the code checkout (``repo_root``), so a plan marked
+    ``done`` rides its unit's own commit — or "" when it is one. Outside the
+    checkout, untracked or gitignored, or a nested repo (a gitlink, not a tree)
+    is a store layout a later release layer of bmad-loop supports."""
+    repo_root = paths.repo_root
+    try:
+        rel = folder.resolve().relative_to(repo_root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return f"it lies outside the code checkout {repo_root}"
+    try:
+        kind = path_tracked_kind(repo_root, rel)
+    except GitError as e:
+        return f"git cannot say whether it is tracked in {repo_root}: {e}"
+    if kind == "file":
+        return f"{rel} is a nested repository (a gitlink in {repo_root}), not a tracked folder"
+    if kind == "untracked":
+        return (
+            f"{rel} has no tracked files in {repo_root} (gitignored, or never "
+            "committed) — commit the initiative folder"
+        )
+    return ""
+
+
 def tickets_preflight(
-    paths: bmadconfig.ProjectPaths, trees: Sequence[str], *, probe_capability: bool
+    paths: bmadconfig.ProjectPaths,
+    trees: Sequence[str],
+    *,
+    probe_capability: bool,
+    branch_per: str | None = None,
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
-    paths loaded for tickets mode, ``trees`` the dev skill trees).
+    paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
+    the policy's ``[scm] branch_per``; None skips its check).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
     (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
     bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
-    / ``tickets.initiative-missing``), and a repo store (``tickets.store-not-repo``:
-    tracker stores are refused). ``tickets.era`` is the ok line that names what was
-    found once the script is present.
+    / ``tickets.initiative-missing``), the store layout
+    (``tickets.layout-unsupported``: the initiative folder must be tracked inside
+    the code checkout), a repo store (``tickets.store-not-repo``: tracker stores
+    are refused), and a warning for ``branch_per = "run"``
+    (``tickets.branch-per-run``: build-auto checks that the checked-out branch
+    fits the ticket, and one branch for the whole run may not). ``tickets.era`` is
+    the ok line that names what was found once the script is present.
 
     ``probe_capability`` runs the script's ``--help`` and checks every verb and
     ``mark`` status bmad-loop needs (``tickets.capability``). It executes the
@@ -885,6 +926,18 @@ def tickets_preflight(
                         },
                     )
                 )
+            elif folder is not None and (why := _tickets_layout_problem(paths, folder)):
+                findings.append(
+                    Finding(
+                        "tickets.layout-unsupported",
+                        "problem",
+                        f"the initiative folder {paths.initiative_folder} is not a store "
+                        f"tickets runs support yet: {why}. bmad-loop drives a ticket tree "
+                        "tracked inside the code checkout; other store layouts land in a "
+                        "later release layer",
+                        {"path": str(paths.initiative_folder), "repo_root": str(paths.repo_root)},
+                    )
+                )
     store, store_error = _ticket_store(project)
     if store != "repo":
         findings.append(
@@ -900,6 +953,18 @@ def tickets_preflight(
                     '`store = "repo"`'
                 ),
                 {"path": TICKETS_STORE_CONFIG_REL, "store": store},
+            )
+        )
+    if branch_per == "run":
+        findings.append(
+            Finding(
+                "tickets.branch-per-run",
+                "warning",
+                '`[scm] branch_per = "run"` runs every ticket on one branch — '
+                "bmad-build-auto checks that the checked-out branch fits the ticket "
+                "it builds and HALTs when it judges it does not; "
+                '`branch_per = "story"` gives each ticket its own branch',
+                {"branch_per": branch_per},
             )
         )
     if not script_ok:

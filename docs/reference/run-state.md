@@ -82,6 +82,8 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
 
+A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals` and `ticket_epic_closures` hold the epic selector, the refs whose story file an operator approved, and epic closure verdicts. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree`.
+
 ## Task directory
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.
