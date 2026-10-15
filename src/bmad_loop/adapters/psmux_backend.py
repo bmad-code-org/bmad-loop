@@ -718,7 +718,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # the base's return rather than reformatting `-F` so the argv stays
         # byte-identical to the base's.
         window_id = super().new_window(session, name, cwd, env, command)
-        return self._qualified_window_id(session, window_id)
+        qualified = self._qualified_window_id(session, window_id)
+        panes = self._launched_panes()
+        if window_id in panes:
+            # pane_target is asked with the qualified id this returns.
+            panes[qualified] = panes.pop(window_id)
+        return qualified
 
     def list_window_ids(self, session: str) -> list[str]:
         # psmux's list-windows emits bare `@N` lines; qualify them identically

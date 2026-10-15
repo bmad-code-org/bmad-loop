@@ -98,7 +98,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
         str(tmp_path),
         "-P",
         "-F",
-        "#{window_id}",
+        "#{window_id} #{pane_id}",
     ]
     assert len(rec.argv) == 12
     assert "-e" not in rec.argv
@@ -2813,6 +2813,18 @@ def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatc
     while the real registry was unreachable would read as "nothing to clean"."""
     monkeypatch.setenv("PSMUX_DATA_DIR", bad)
     assert PsmuxMultiplexer().legacy_registries() == []
+
+
+def test_pane_target_uses_the_pane_read_at_create(rec, tmp_path):
+    """#948: new_window reads the launched pane in the same create, so
+    pane_target needs no later listing that a split or swap could have
+    reordered. Ablation: drop the stash lookup and this lists panes."""
+    mux = PsmuxMultiplexer()
+    rec.stdout = "@2 %2\n"
+    assert mux.new_window("s", "n", tmp_path, {}, "cmd") == "s:@2"
+    rec.stdout = "0 %9\n"
+    assert mux.pane_target("s:@2") == "s:@2.%2"
+    assert rec.argv[1] == "new-window"
 
 
 def test_pane_target_keeps_the_session_qualified_window(rec):

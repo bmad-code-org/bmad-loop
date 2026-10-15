@@ -540,7 +540,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def new_window(
         self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
     ) -> str:
-        return self._tmux(
+        # The launched pane's id comes back in the same create, so pane_target
+        # pins exactly the pane this window started with, whatever splits or
+        # swaps an operator or a hook makes before it is read (#948).
+        window_id, _, pane_id = self._tmux(
             "new-window",
             "-t",
             f"={session}:",
@@ -550,9 +553,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
             str(cwd),
             "-P",
             "-F",
-            "#{window_id}",
+            "#{window_id} #{pane_id}",
             *self._window_launch(env, command),
-        )
+        ).partition(" ")
+        if pane_id.startswith("%"):
+            self._launched_panes()[window_id] = pane_id
+        return window_id
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
@@ -637,6 +643,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # caller reads as "no match" (DW-350).
         return self._tmux("capture-pane", "-p", "-t", window_id)
 
+    def _launched_panes(self) -> dict[str, str]:
+        # Launched pane per window id, as new_window read it at create time;
+        # per instance, created on first use (subclasses need not call
+        # an __init__ for it).
+        return self.__dict__.setdefault("_launched_pane_ids", {})
+
     def pane_target(self, window_id: str) -> str:
         # `<window>.%N` rather than a bare `%N`: psmux runs one server per session
         # and only reaches the right one through the session the window id
@@ -647,6 +659,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # (display-message would answer it), while a split never takes the
         # lowest index (psmux 3.4.0 and tmux 3.4 list panes by index). A dead
         # window lists nothing, so no pane id is a failure too.
+        if launched := self._launched_panes().get(window_id):
+            return f"{window_id}.{launched}"
         rows = self._tmux("list-panes", "-t", window_id, "-F", "#{pane_index} #{pane_id}")
         panes = []
         for row in rows.splitlines():
