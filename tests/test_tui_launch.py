@@ -162,6 +162,13 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         # no `-e` pairs: session env is not part of the released verb, and on
         # tmux this ONE ctl session is shared by every project on the machine,
         # so no single project's value could be right for its window 0 anyway.
+        # The same invocation turns a user's destroy-unattached off (#951).
+        ";",
+        "set-option",
+        "-t",
+        "bmad-loop-ctl",
+        "destroy-unattached",
+        "off",
     ]
     # window 0 of the shared ctl session must never list as a run window
     assert launch._CTL_WINDOW_RE.match(ns[ns.index("-n") + 1]) is None
