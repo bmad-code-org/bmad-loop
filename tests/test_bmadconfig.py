@@ -1250,6 +1250,51 @@ def test_v7_missing_base_layer_refuses(tmp_path: Path) -> None:
         bmadconfig.load_paths(root)
 
 
+def _v7_without_toml(tmp_path: Path, *, legacy_yaml: bool) -> Path:
+    """A v7 marker with every central TOML layer gone, optionally beside a leftover
+    legacy `_bmad/bmm/config.yaml` carrying both v6 keys."""
+    root = _v7(tmp_path)
+    for rel in bmadconfig.CENTRAL_LAYERS_REL:
+        (root / rel).unlink(missing_ok=True)
+    if legacy_yaml:
+        (root / bmadconfig.LEGACY_CONFIG_REL).parent.mkdir(parents=True, exist_ok=True)
+        (root / bmadconfig.LEGACY_CONFIG_REL).write_text(
+            "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
+            "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_v7_tickets_mode_with_no_toml_refuses_over_legacy_yaml(tmp_path: Path) -> None:
+    """No central TOML at all, so `tickets.py` fails on the missing base layer: under
+    tickets mode a leftover legacy YAML must not hand back a healthy v6 snapshot.
+
+    Ablation: drop the no-TOML v7 route and this resolves v6 instead of raising."""
+    root = _v7_without_toml(tmp_path, legacy_yaml=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match=r"config\.toml is missing.*bmad setup"):
+        bmadconfig.load_paths(root, want_tickets=True)
+
+
+def test_v7_marker_with_no_toml_stays_v6_on_legacy_yaml_outside_tickets(tmp_path: Path) -> None:
+    """The same install outside tickets mode keeps the legacy v6 resolution."""
+    root = _v7_without_toml(tmp_path, legacy_yaml=True)
+    paths = bmadconfig.load_paths(root)
+    assert paths.era == "v6"
+    assert (
+        paths.implementation_artifacts
+        == (root / "_bmad-output" / "implementation-artifacts").resolve()
+    )
+
+
+def test_v7_marker_with_no_config_names_the_base_layer(tmp_path: Path) -> None:
+    """Marker but neither TOML nor YAML: the refusal names v7's base layer and
+    `bmad setup`, not the generic "is BMAD installed here?" error."""
+    root = _v7_without_toml(tmp_path, legacy_yaml=False)
+    with pytest.raises(bmadconfig.BmadConfigError, match=r"config\.toml is missing.*bmad setup"):
+        bmadconfig.load_paths(root)
+
+
 def test_core_reader_ignores_modules_bmm_active_initiative(tmp_path: Path) -> None:
     """The pre-v7 home `[modules.bmm] active_initiative` is not `[core]`'s key: the
     short-key lookup would find it, `tickets.py` would not."""

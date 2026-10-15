@@ -579,8 +579,14 @@ def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
         )
         raise BmadConfigError(_diagnostic_text(message)) from e
     config_path = project / LEGACY_CONFIG_REL
+    marker = project / V7_MARKER_REL
     central = _load_central(project)
     if central is None:
+        # No TOML layer at all, so v7's required base layer is absent too: a v7
+        # install (the marker, under tickets mode or with no legacy YAML to fall back
+        # on) gets `_assemble_v7`'s refusal, never a healthy-looking v6 snapshot.
+        if (want_tickets or not _is_file(config_path)) and _is_file(marker):
+            return _assemble_v7(project, None, ())
         if not _is_file(config_path):
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
@@ -605,7 +611,6 @@ def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
 
     v6 = {key: lookup(key) for key in _REQUIRED_KEYS}
     v6_hits = [hit for hit in v6.values() if hit is not None]
-    marker = project / V7_MARKER_REL
     # The marker is probed only when it can change the answer: a complete v6 config
     # outside tickets mode resolves exactly as it always did.
     if (want_tickets or not v6_hits) and _is_file(marker):
