@@ -688,6 +688,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"{self._BINARY} new-session exited 0 but session {name!r} was not "
                 "created (nesting guard no-op?)"
             )
+        # A user config with `destroy-unattached on` would tear this session
+        # down when its last client detaches (psmux reaps only on that edge, not
+        # at a detached create as tmux does), so turn it off on the session
+        # itself; the user's global stays (#951).
+        self.set_session_option(name, "destroy-unattached", "off")
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
@@ -739,6 +744,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             self._qualified_window_id(session, window_id)
             for window_id in super().list_window_ids(session)
         ]
+
+    def window_alive(self, session: str, window_id: str) -> bool:
+        # The base matches against psmux's bare `@N` rows, so strip the
+        # qualification new_window added before it compares (a degraded bare id
+        # passes through unchanged). The base also reads `#{pane_dead}`, which
+        # psmux serves, so a `remain-on-exit` corpse reads dead (#950).
+        return super().window_alive(session, window_id.removeprefix(f"{session}:"))
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
@@ -1589,7 +1601,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             "$out.Dispose()\n"
         )
         try:
-            self._tmux("pipe-pane", "-t", window_id, "-o", *self._shell_wrap(sink))
+            # No `-o`, as the base: replace a user-opened pipe, never toggle it
+            # off (#947).
+            self._tmux("pipe-pane", "-t", window_id, *self._shell_wrap(sink))
         except (TmuxError, UnicodeEncodeError) as exc:
             # Best-effort, as the base: a window that died on launch (or psmux's
             # first-pipe-after-new-window spawn race, noted in psmux/psmux#482)

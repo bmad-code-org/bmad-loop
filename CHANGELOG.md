@@ -82,6 +82,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Replace a pane's existing pipe instead of toggling it, so a tmux or psmux config hook that
+  already logs the pane no longer leaves the run log empty (#947).
+- Read a window whose pane exited as dead even when a `remain-on-exit on` config keeps it
+  listed, so the session ends `crashed` instead of `stalled` (#950).
+- Turn `destroy-unattached` off on each session bmad-loop creates, so a config that sets it
+  globally no longer destroys the detached session (#951).
 - Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
   captured, not only after the command exits, so a chatty command's memory no longer
   grows with its runtime (DW-549).

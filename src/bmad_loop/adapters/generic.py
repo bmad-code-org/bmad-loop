@@ -2275,7 +2275,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 idle.open_since = idle.last_change_wall
 
     def _window_alive(self, handle: SessionHandle) -> bool:
-        return handle.native_id in self.mux.list_window_ids(self.session_name)
+        return self.mux.window_alive(self.session_name, handle.native_id)
 
     def _probe_liveness(self, handle: SessionHandle, site: str) -> bool | None:
         """`_window_alive` for a one-shot verdict site (DW-454): True/False as

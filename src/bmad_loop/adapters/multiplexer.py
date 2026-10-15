@@ -344,7 +344,11 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
-        """True iff ``window_id`` is still a window of ``session``.
+        """True iff ``window_id`` is still a window of ``session`` whose pane is
+        alive. A window the multiplexer keeps listed after its pane exited (a
+        user's ``remain-on-exit on``) is NOT alive: the CLI is gone (#950). That
+        is the one place this differs from membership in :meth:`list_window_ids`,
+        which still lists such a window.
 
         May raise :class:`MultiplexerError` when liveness is unknowable — a
         transport timeout / missing binary, or any other failure to take the

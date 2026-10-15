@@ -310,6 +310,22 @@ def test_window_alive_accepts_new_window_id(monkeypatch, tmp_path):
     assert mux.window_alive("s", mux.new_window("s", "n", tmp_path, {}, "prog")) is True
 
 
+@pytest.mark.parametrize(
+    ("listed", "alive"),
+    [("@1 0\n@2 1\n", False), ("@2 0\n", True), ("@2 0\n@2 1\n", True)],
+)
+def test_window_alive_reads_a_retained_dead_pane_as_dead(monkeypatch, tmp_path, listed, alive):
+    # A user's `remain-on-exit on` keeps an exited CLI's window listed with a
+    # dead pane (#950): the qualified id must match psmux's bare rows, and any
+    # live pane of the window keeps it alive (a split's exited pane does not
+    # kill the CLI beside it; measured on psmux 3.4.0 with list-panes -s).
+    _window_fake(monkeypatch, listed=listed)
+    mux = PsmuxMultiplexer()
+    window_id = mux.new_window("s", "n", tmp_path, {}, "prog")
+    assert window_id == "s:@2"
+    assert mux.window_alive("s", window_id) is alive
+
+
 def test_qualified_id_reaches_the_pipe_pane_target(rec, tmp_path):
     # #254 is about the `-t` argv, not the return value: the consumer must replay
     # the minted id verbatim, and this backend's pipe_pane override (the one verb
@@ -358,8 +374,13 @@ def test_new_session_bypasses_nesting_guard(rec, monkeypatch, tmp_path):
         "-y",
         "24",
     ]
-    # the no-op belt: create is verified by a has-session probe afterwards
-    assert rec.argv == ["psmux", "has-session", "-t", "=s"]
+    # the no-op belt: create is verified by a has-session probe afterwards, then
+    # a user's `destroy-unattached on` is turned off on this session alone, or
+    # its last client detaching would reap it (#951)
+    assert [argv for argv, _ in rec.calls[1:]] == [
+        ["psmux", "has-session", "-t", "=s"],
+        ["psmux", "set-option", "-t", "s", "destroy-unattached", "off"],
+    ]
     assert create_kwargs["env"]["PSMUX_ALLOW_NESTING"] == "1"
     # the server this call boots keeps no warm pool and spawns no `__warm__`
     # standby: neither serves a `-c` session or a command-bearing window (#903)
@@ -627,10 +648,14 @@ def test_pipe_pane_ships_the_sink_as_an_encoded_flag_transport(rec, tmp_path, na
     PsmuxMultiplexer().pipe_pane("@1", log)
 
     assert len(rec.calls) == 1
-    assert rec.argv[:5] == ["psmux", "pipe-pane", "-t", "@1", "-o"]
-    # One `-o` string, a call-operator line for psmux's PowerShell sink shell:
-    # the pinned pwsh path holds a space, so it travels quoted (#863).
-    assert len(rec.argv) == 6
+    # No `-o`: it toggles a pipe a user's config hook already opened off and
+    # opens none, so the run log stays empty; without it the pipe is replaced
+    # (#947).
+    assert rec.argv[:4] == ["psmux", "pipe-pane", "-t", "@1"]
+    assert "-o" not in rec.argv
+    # One command string, a call-operator line for psmux's PowerShell sink
+    # shell: the pinned pwsh path holds a space, so it travels quoted (#863).
+    assert len(rec.argv) == 5
     sink = _pwsh_payload(rec.argv)
     # byte-exact raw stream copy (no console decode / re-encode / CRLF mangling),
     # flushed per chunk so the live tail sees bytes incrementally

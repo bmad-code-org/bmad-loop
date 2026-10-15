@@ -72,6 +72,10 @@ class StubMux(TerminalMultiplexer):
         self.calls.append("list_window_ids")
         return list(self._windows.get(session, []))
 
+    def window_alive(self, session, window_id):
+        self.calls.append("window_alive")
+        return window_id in self._windows.get(session, [])
+
     def send_text(self, window_id, text):
         self.calls.append("send_text")
 
@@ -99,9 +103,6 @@ class StubMux(TerminalMultiplexer):
 
     def list_windows(self, session, fields):
         raise AssertionError("adapter must not call list_windows")
-
-    def window_alive(self, session, window_id):
-        raise AssertionError("adapter must not call window_alive")
 
     def select_window(self, target):
         raise AssertionError("adapter must not call select_window")
@@ -1466,7 +1467,62 @@ def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
         "shell",
         "-c",
         str(tmp_path),
+        # same invocation, session-local: a user's `destroy-unattached on`
+        # cannot reap the detached session before the next verb (#951)
+        ";",
+        "set-option",
+        "-t",
+        "s",
+        "destroy-unattached",
+        "off",
     ]
+
+
+def test_pipe_pane_replaces_rather_than_toggles_the_pipe(monkeypatch, tmp_path):
+    """`-o` toggles: a pipe a user's config hook already opened would be closed
+    and none opened, leaving the run log empty (#947)."""
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().pipe_pane("@1", tmp_path / "run.log")
+
+    assert rec.argv[2:5] == ["pipe-pane", "-t", "@1"]
+    assert "-o" not in rec.argv
+
+
+@pytest.mark.parametrize(
+    ("rows", "alive"),
+    [
+        ("@1 1\n", False),
+        ("@1 0\n", True),
+        ("@2 0\n", False),
+        # A user's split: the exited, retained pane is the active one while
+        # the CLI's pane beside it still runs. Any live pane keeps the window.
+        ("@1 1\n@1 0\n", True),
+        ("@1 0\n@1 1\n", True),
+        ("@1 1\n@1 1\n", False),
+        ("@1\n", True),  # an empty field is not an explicit death
+    ],
+)
+def test_window_alive_reads_a_retained_dead_pane_as_dead(monkeypatch, rows, alive):
+    """A user's `remain-on-exit on` keeps an exited CLI's window listed, so
+    membership alone never sees the death (#950). Every pane is read, since
+    list-windows' `#{pane_dead}` answers for the active pane only.
+    list_window_ids still lists the window — the prune's kill verdicts depend
+    on that membership."""
+    seen: list[list[str]] = []
+
+    def fake(argv, **_k):
+        seen.append(argv)
+        out = rows if argv[2] == "list-panes" else rows.split()[0] + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    mux = TmuxMultiplexer()
+
+    assert mux.window_alive("s", "@1") is alive
+    assert seen[-1][2:] == ["list-panes", "-s", "-t", "=s", "-F", "#{window_id} #{pane_dead}"]
+    assert mux.list_window_ids("s") == [rows.split()[0]]  # membership unchanged
 
 
 def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):

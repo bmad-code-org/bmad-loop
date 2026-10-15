@@ -381,6 +381,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
             "-c",
             str(cwd),
             *geometry,
+            # Same invocation, so a user config with `destroy-unattached on`
+            # cannot destroy the detached session before bmad-loop's next verb
+            # reaches it (#951). Session-local: the user's global stays.
+            ";",
+            "set-option",
+            "-t",
+            name,
+            "destroy-unattached",
+            "off",
         )
 
     def set_session_option(self, name: str, option: str, value: str) -> None:
@@ -603,28 +612,40 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # callers rely on — prune_ctl_windows takes its post-kill verdict from this
         # probe and only a MultiplexerError lands the candidates in `unverifiable`
         # rather than aborting cleanup mid-receipt (#435).
+        return [
+            wid
+            for row in self._list_session_rows(["list-windows"], session, "#{window_id}")
+            for wid in row.split()
+        ]
+
+    def _list_session_rows(self, verb: list[str], session: str, fmt: str) -> list[str]:
+        # The strict listing behind list_window_ids AND window_alive: one row
+        # per listed object in `fmt`, [] only when the session is proved gone,
+        # raising on everything else (the honesty contract above).
         try:
-            probe = self._run(
-                ["list-windows", "-t", f"={session}", "-F", "#{window_id}"], check=False
-            )
+            probe = self._run([*verb, "-t", f"={session}", "-F", fmt], check=False)
         except (subprocess.TimeoutExpired, OSError, UnicodeError) as exc:
-            raise TmuxError(f"{self._BINARY} list-windows failed: {exc}") from exc
+            raise TmuxError(f"{self._BINARY} {verb[0]} failed: {exc}") from exc
         if probe.returncode != 0:
             if self._session_proved_gone(probe):
                 return []
             raise TmuxError(
-                f"{self._BINARY} list-windows on {session} exited {probe.returncode} "
+                f"{self._BINARY} {verb[0]} on {session} exited {probe.returncode} "
                 f"without proving the session gone: {probe.stderr.strip() or '(no stderr)'}"
             )
-        return probe.stdout.split()
+        return probe.stdout.splitlines()
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         # A CLI that crashes on launch (bad args, instant auth failure) can take
         # its window down before pipe-pane attaches, which races as "can't find
         # window". That is not a setup failure, so tolerate it instead of raising
         # — but say so, or an empty run log is unexplainable.
+        #
+        # No `-o`: it toggles, so a pipe the user's config already opened on the
+        # pane (an auto-logging hook) is closed and none opened, leaving the run
+        # log empty (#947). Without it pipe-pane replaces the existing pipe.
         try:
-            self._tmux("pipe-pane", "-t", window_id, "-o", f"cat >> {shlex.quote(str(log_file))}")
+            self._tmux("pipe-pane", "-t", window_id, f"cat >> {shlex.quote(str(log_file))}")
         except TmuxError as exc:
             print(
                 f"warning: pipe-pane log capture failed for {window_id}: {exc}",
@@ -800,7 +821,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return rows
 
     def window_alive(self, session: str, window_id: str) -> bool:
-        return window_id in self.list_window_ids(session)
+        # Membership alone is not liveness: a user config with `remain-on-exit
+        # on` keeps an exited CLI's window listed with a dead pane, so window
+        # death never fires and the session stalls instead of crashing (#950).
+        # list_window_ids stays pure membership — prune kill verdicts read it,
+        # and a dead-but-listed window is still there to kill. Every pane is
+        # read, not list-windows' active-pane `#{pane_dead}`: a user's split
+        # whose exited pane is active must not declare the CLI beside it dead.
+        rows = self._list_session_rows(["list-panes", "-s"], session, "#{window_id} #{pane_dead}")
+        # Only an explicit `1` is dead, as on a backend that leaves the field empty.
+        return any(row.split()[:1] == [window_id] and row.split()[1:2] != ["1"] for row in rows)
 
     def select_window(self, target: str) -> None:
         # Best-effort focus change: swallow a transport failure to the no-op sentinel.

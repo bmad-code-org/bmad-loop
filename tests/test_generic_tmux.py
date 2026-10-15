@@ -574,7 +574,7 @@ def test_await_result_grace_expires_fast(tmp_path):
 
 
 class _TeardownMux:
-    """Only the ops kill() drives — kill_window, list_window_ids (liveness),
+    """Only the ops kill() drives — kill_window, window_alive (liveness),
     window_pane_pids — with scriptable survival: the window stays alive until
     ``survives_kills`` kill_window calls have landed."""
 
@@ -588,9 +588,9 @@ class _TeardownMux:
     def kill_window(self, target):
         self.kill_windows += 1
 
-    def list_window_ids(self, session):
+    def window_alive(self, session, window_id):
         self.liveness_probes += 1
-        return ["@w1"] if self.kill_windows <= self.survives_kills else []
+        return self.kill_windows <= self.survives_kills
 
     def window_pane_pids(self, target):
         self.pane_pid_reads += 1
@@ -649,6 +649,24 @@ class _RecordingHost:
 
 def _kill_handle() -> SessionHandle:
     return SessionHandle(task_id="3-1-dev-1", native_id="@w1")
+
+
+class _RetainedDeadPaneMux:
+    """A window a user's `remain-on-exit on` keeps listed after its CLI exited."""
+
+    def list_window_ids(self, session):
+        return ["@w1"]
+
+    def window_alive(self, session, window_id):
+        return False
+
+
+def test_window_alive_asks_the_mux_not_window_membership(tmp_path):
+    """#950: membership in list_window_ids cannot see a dead pane the
+    multiplexer retains, so the probe must route through `mux.window_alive` or
+    the session stalls instead of crashing."""
+    adapter = make_adapter(tmp_path, mux=_RetainedDeadPaneMux())
+    assert adapter._window_alive(_kill_handle()) is False
 
 
 def _lifecycle_lines(adapter, task_id="3-1-dev-1"):
