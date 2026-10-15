@@ -314,7 +314,7 @@ def test_capability_flags_missing_verb(tmp_path: Path):
     body = (
         "import sys\n"
         "if sys.argv[-2:] == ['mark', '--help']:\n"
-        "    print('usage: tickets.py mark [-h] ref {draft,in-progress,done,blocked}')\n"
+        "    print('usage: tickets.py mark [-h] ref {draft,ready-for-dev,in-progress,in-review,done,blocked}')\n"
         "else:\n"
         "    print('usage: tickets.py [-h] {next,status,mark} ...')\n"
     )

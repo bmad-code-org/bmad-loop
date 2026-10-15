@@ -40,7 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
-from .statemachine import PLAN_BLOCKED, PLAN_DROPPED, PLAN_STATUS_ORDER
+from .statemachine import PLAN_BLOCKED, PLAN_DROPPED, PLAN_STATUS_ORDER, PLAN_TRANSITIONS
 
 # Every plan `status` upstream accepts (`tickets.py` STATUSES). The builds write
 # draft..built, build-auto writes blocked, an orchestrator writes done, and
@@ -69,9 +69,13 @@ NEXT_GROUPS: Final[tuple[str, ...]] = (
     "in_progress",
     "blocked",
 )
-# What bmad-loop drives: the read verbs and `mark`, and the statuses it marks.
+# What bmad-loop drives: the read verbs and `mark`, and every status `mark` may
+# write — each target of the plan transition table, so a recovery write (replan,
+# rearm, repair, rollback) never meets a status the probe let through unchecked.
 REQUIRED_VERBS: Final[frozenset[str]] = frozenset({"next", "find", "status", "mark"})
-REQUIRED_STATUSES: Final[frozenset[str]] = frozenset({"built", "done", "blocked"})
+REQUIRED_STATUSES: Final[frozenset[str]] = frozenset(
+    s for rule in PLAN_TRANSITIONS.values() for s in rule.targets
+)
 
 _ROW_STATUSES: Final[frozenset[str]] = frozenset(("", *PLAN_STATUSES))
 

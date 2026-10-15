@@ -364,6 +364,22 @@ def test_capability_problems_names_missing_built():
     assert capability_problems(no_find) == ["tickets.py has no `find` command"]
 
 
+def test_required_statuses_cover_every_plan_transition_target():
+    """The probe checks every status `mark` may write, not just the happy path.
+    Ablation: pin REQUIRED_STATUSES back to {built, done, blocked} and this FAILS
+    (replan's `draft`, rearm/rollback's `ready-for-dev`, ... go unprobed)."""
+    from bmad_loop.statemachine import PLAN_TRANSITIONS
+
+    targets = {s for rule in PLAN_TRANSITIONS.values() for s in rule.targets}
+    assert REQUIRED_STATUSES == targets
+    assert {"draft", "ready-for-dev", "in-progress", "in-review"} <= REQUIRED_STATUSES
+    cap = Capability(verbs=REQUIRED_VERBS, statuses=frozenset({"built", "done", "blocked"}))
+    assert capability_problems(cap) == [
+        f"tickets.py mark does not accept status `{s}`"
+        for s in ("draft", "in-progress", "in-review", "ready-for-dev")
+    ]
+
+
 def test_parse_requires_python_reads_the_pep723_block():
     script = (
         '#!/usr/bin/env python3\n# /// script\n# requires-python = ">=3.11"\n# ///\n"""doc"""\n'
