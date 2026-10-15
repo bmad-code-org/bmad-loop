@@ -9211,6 +9211,36 @@ def test_budget_exhausted_unfinalized_defers(project):
     assert deferred_entry["preserve_ref"] == ref
 
 
+def test_v6_review_ending_at_built_does_not_converge(project):
+    """`Engine._review_converged_statuses` stays the v6 `{"done"}`: a review pass
+    that leaves a v6 spec at `built` (a v7 plan status, which tickets mode
+    converges on) is a non-terminal pass, so the loop spends its budget and
+    defers naming the non-terminal status. Ablation (performed): add `built` to
+    the base set and the defer detail turns into "finalized but its verification
+    failed" — this FAILS."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def review_built(spec: SessionSpec) -> SessionResult:
+        sp = spec_path(project, "1-1-a")
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "built", baseline)
+        result = {"workflow": "auto-dev", "story_key": "1-1-a", "spec_file": str(sp)}
+        result |= {"baseline_commit": baseline, "status": "built", "escalations": []}
+        return SessionResult(status="completed", result_json=result)
+
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")] + [review_built] * 3)
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.paused
+    assert len(adapter.sessions) == 4  # dev + max_review_cycles review passes
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.defer_reason == (
+        "review did not converge within budget "
+        "(last review pass ended at non-terminal status 'built')"
+    )
+
+
 def test_defer_notification_stays_bare_when_nothing_was_parked(project):
     """Ablation target: make `_defer_recovery_note`'s tail unconditional and this
     fails. Over-budget sessions touch no files, so the exhaustion defer's rollback

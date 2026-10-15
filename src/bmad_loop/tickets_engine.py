@@ -548,6 +548,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return (verify.PLAN_BUILT, verify.PLAN_DONE)
         return (verify.PLAN_BUILT,)
 
+    def _review_converged_statuses(self) -> frozenset[str]:
+        """A review pass converges on the statuses that end a review session
+        (``built``, or ``done`` on a plan a human accepted), so the two cannot
+        drift: a review that finishes its plan at ``built`` is final, not a
+        non-terminal pass that burns ``max_review_cycles`` and defers."""
+        return frozenset(self._session_success_statuses("review", None))
+
     def _session_fallback_dirs(self, role: str, label: str | None) -> tuple[Path, ...]:
         """A build that cannot resolve its ticket HALTs into the initiative folder
         (``bmad-build-auto-result-*``), never into the plan: probe it there."""

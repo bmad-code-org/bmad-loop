@@ -712,6 +712,53 @@ def test_mark_done_never_policy_leaves_built(project_v7):
     assert tree.marks == [] and tree.restores == []
 
 
+def _reviews(layout: V7Layout, plan: Path):
+    """A follow-up review pass that leaves the plan where the build left it, at
+    `built`, and recommends no further pass."""
+
+    def review(spec: SessionSpec) -> SessionResult:
+        here = Path(spec.cwd) / plan.relative_to(layout.project)
+        assert status_of(parse_frontmatter(here.read_text(encoding="utf-8"))) == "built"
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "built"}
+        result["followup_review_recommended"] = False
+        return SessionResult(status="completed", result_json=result)
+
+    return review
+
+
+def test_review_converges_on_a_built_plan(project_v7, monkeypatch):
+    """A tickets review finishes its plan at `built`, and that converges: one
+    review pass, then the verify gate, the mark-done and the unit commit — no
+    second cycle and no defer. The converged set is exactly the review session's
+    success statuses (`built`, or `done` on a plan a human accepted). Ablation
+    (performed): drop `TicketsEngine._review_converged_statuses` and the base
+    `{"done"}` reads `built` as non-terminal — the loop burns `max_review_cycles`
+    and defers, and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    pol = dataclasses.replace(_policy(), review=ReviewPolicy(enabled=True, trigger="always"))
+    script = [_builds(project_v7, tree, plan)] + [_reviews(project_v7, plan)] * 3
+    engine, adapter = make_engine(project_v7, tree, policy=pol, script=script, max_stories=1)
+
+    assert engine._review_converged_statuses() == frozenset(
+        engine._session_success_statuses("review", None)
+    )
+    assert engine._review_converged_statuses() == {"built", "done"}
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha and not task.defer_reason
+    assert len(adapter.sessions) == 2  # the build and one review pass
+    assert adapter.sessions[1].prompt.startswith(f"/{engine._dev_skill('review')} ticket 1.1")
+    assert [(e["cycle"], e["status"]) for e in _kinds(engine, "review-result")] == [(1, "built")]
+    assert _kinds(engine, "review-retry") == []
+    assert [(m.ref, m.target, m.reason) for m in tree.marks] == [("1.1", "done", "accept")]
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+    assert git(project_v7.project, "status", "--porcelain") == ""
+
+
 def test_mark_done_undone_on_commit_failure(project_v7, monkeypatch):
     """The mark is made just BEFORE `finalize_commit` so it rides the unit's
     commit — but that commit can still fail. A plan left `done` for a commit that

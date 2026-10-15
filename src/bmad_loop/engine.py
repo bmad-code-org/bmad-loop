@@ -1807,6 +1807,12 @@ class Engine:
         sprint board through the live ``self.paths`` (the main checkout)."""
         return SprintWorkSource(lambda: self.paths, self.epic_filter, self.story_filter)
 
+    def _review_converged_statuses(self) -> frozenset[str]:
+        """The review result statuses that finalize a pass: the review loop
+        converges on them (verify, then commit) unless the pass recommends a
+        follow-up. Base: the v6 ``done``."""
+        return frozenset({devcontract.DONE})
+
     def _phases(self) -> dict[str, Phase]:
         """Every unit this run already touched, by key, with its phase."""
         return {key: task.phase for key, task in self.state.tasks.items()}
@@ -3957,7 +3963,8 @@ class Engine:
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
             task.followup_review_recommended = followup  # latest pass wins
-            refileable_followup = status == "done" and followup
+            converged = status in self._review_converged_statuses()
+            refileable_followup = converged and followup
             # Damping: a finalized round that still recommends its own follow-up is
             # honored only while the story has damping grants left. Once
             # followup_reviews_spent has reached limits.max_followup_reviews, such a
@@ -3988,7 +3995,7 @@ class Engine:
             # latched actions). Under the default "escalate" it is not taken: the
             # status falls through as non-terminal, exactly as before.
             demoted = status == verify.AWAITING_OPERATOR and self._review_demotion_parks()
-            if demoted or (status == "done" and (not followup or damped)):
+            if demoted or (converged and (not followup or damped)):
                 if demoted:
                     outcome = self._park_review_demotion(task, result)
                 else:
@@ -4123,7 +4130,7 @@ class Engine:
             # (callers grep it).
             if refileable_followup:
                 detail = "still recommending a follow-up pass"
-            elif last_status == "done":
+            elif last_status in self._review_converged_statuses():
                 detail = "last review pass finalized but its verification failed"
             elif last_status is not None:
                 # A pass completed but its status is non-terminal — or "" when the
