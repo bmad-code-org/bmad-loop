@@ -24,6 +24,13 @@ touched decides the pick:
 A candidate in an epic that follows an epic whose recorded closure is
 ``rejected`` (and that is not closed yet) halts ``epic-rejected`` instead.
 
+**A selector** (``run --epic`` / ``--story``, persisted as
+``RunState.ticket_epic_filter`` / ``story_filter``) narrows every row the pick
+reads — candidates, foreign active rows and blocked rows — to that epic's
+tickets or that one ref. The epic-level causes below (awaiting closure, an open
+epic with no tickets) then look at the selected epic only, and at none under a
+ref selector, so a selected run finishes once its scope has nothing left.
+
 **Rows this run touched** (every phase but ESCALATED) are routed by their task
 state, never re-dispatched: a ticket that rollback re-armed to ``ready-for-dev``
 shows up as a candidate again and is skipped. An ESCALATED task is a pick-time
@@ -493,12 +500,34 @@ def _rejected_gate(
     return None
 
 
+@dataclass(frozen=True)
+class PickScope:
+    """The run's selector: ``epic`` an epic slug (``epic-<x>``), ``ref`` one
+    ticket ref; ``""`` selects everything."""
+
+    epic: str = ""
+    ref: str = ""
+
+    def admits(self, row: TicketRow) -> bool:
+        if self.epic and row.epic != self.epic:
+            return False
+        return not self.ref or row_label(row) == self.ref
+
+    def admits_epic(self, slug: str) -> bool:
+        """Whether an epic-level cause on ``slug`` belongs to this scope."""
+        return not self.ref and (not self.epic or slug == self.epic)
+
+
+EVERYTHING: Final = PickScope()
+
+
 def decide_pick(
     next_view: NextView,
     status_view: StatusView,
     task_phases: Mapping[str, Phase],
     epic_closures: Mapping[str, str],
     approvals: Sequence[str] | frozenset[str],
+    scope: PickScope = EVERYTHING,
     *,
     acked: Sequence[str] | frozenset[str] = (),
 ) -> PickDecision:
@@ -508,12 +537,13 @@ def decide_pick(
     rank = build_order(status_view)
     notes: list[PickNote] = []
 
-    foreign = [
-        row for row in _ordered(next_view.in_progress, rank) if row_label(row) not in touched
-    ]
+    def scoped(*groups: Sequence[TicketRow]) -> list[TicketRow]:
+        return _ordered([row for group in groups for row in group if scope.admits(row)], rank)
+
+    foreign = [row for row in scoped(next_view.in_progress) if row_label(row) not in touched]
     notes.extend(PickNote(NOTE_FOREIGN_ACTIVE, row_label(row), row.status) for row in foreign)
 
-    candidates = _ordered((*next_view.ready_to_refine, *next_view.ready_to_start), rank)
+    candidates = scoped(next_view.ready_to_refine, next_view.ready_to_start)
     for row in candidates:
         if row.ref is None:
             notes.append(PickNote(NOTE_SKIPPED, row_label(row), "no-ref"))
@@ -548,7 +578,7 @@ def decide_pick(
         return Dispatch(row, held)
 
     held_notes = tuple(notes)
-    blocked = _ordered(next_view.blocked, rank)
+    blocked = scoped(next_view.blocked)
     for row in blocked:
         if plan_blocked(row) and row_label(row) not in touched:
             reason = row.blocked_reason or "no reason recorded"
@@ -568,7 +598,7 @@ def decide_pick(
                 f"{row_label(row)} has an open unknown: {row.unknown}",
                 held_notes,
             )
-    awaiting = _awaiting_closure(status_view)
+    awaiting = [slug for slug in _awaiting_closure(status_view) if scope.admits_epic(slug)]
     for row in blocked:
         for wait in row.waiting_on:
             if wait in awaiting:
@@ -632,7 +662,7 @@ def decide_pick(
             f"every ticket of {awaiting[0]} is done; close {awaiting[0]}",
             held_notes,
         )
-    unbroken = _unbroken_epics(status_view)
+    unbroken = [slug for slug in _unbroken_epics(status_view) if scope.admits_epic(slug)]
     if unbroken:
         return Halt(
             HALT_STALLED,
@@ -661,12 +691,14 @@ class TicketsWorkSource:
         tree_get: Callable[[], TicketTreeLike],
         approvals_get: Callable[[], Sequence[str]],
         closures_get: Callable[[], Mapping[str, str]],
+        scope_get: Callable[[], PickScope] = lambda: EVERYTHING,
         *,
         acked_get: Callable[[], Sequence[str]] = lambda: (),
     ):
         self._tree_get = tree_get
         self._approvals_get = approvals_get
         self._closures_get = closures_get
+        self._scope_get = scope_get
         self._acked_get = acked_get
 
     @property
@@ -701,6 +733,7 @@ class TicketsWorkSource:
             phases,
             self._closures_get(),
             frozenset(self._approvals_get()),
+            self._scope_get(),
             acked=frozenset(self._acked_get()),
         )
 

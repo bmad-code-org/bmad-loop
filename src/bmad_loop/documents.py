@@ -42,11 +42,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import policy, runs
-from .worksource import QueueMode
+from .worksource import SOURCE_TICKETS, QueueMode
 
 if TYPE_CHECKING:
     from .checks import ValidationReport
-    from .model import RunState
+    from .model import RunState, StoryTask
     from .operatoractions import ParkedStory
     from .runs import RunInfo
     from .sweep import Decision
@@ -255,6 +255,46 @@ def run_token_totals(state: RunState) -> tuple[int, int, float]:
     return raw, weighted, weight
 
 
+def _ticket_projection(task: StoryTask) -> dict[str, object] | None:
+    """A task's ``ticket`` object in the status document: the ticket-tree identity
+    the unit was dispatched for (its persisted :class:`~bmad_loop.model.TicketBinding`)
+    and the shared-store writes still owed after its code landed. None for a task
+    with no binding — every sprint, stories and sweep unit."""
+    binding = task.ticket
+    if binding is None:
+        return None
+    return {
+        "ref": binding.ref,
+        "id": binding.id,
+        "epic_slug": binding.epic_slug,
+        "epic_id": binding.epic_id,
+        "title": binding.title,
+        # the absolute plan path `find` named at the pick, verbatim
+        "plan": binding.plan,
+        "done_pending": task.ticket_done_pending,
+        # the owed park's `blocked_reason`, or null when no park is owed
+        "park_pending": task.ticket_park_pending or None,
+    }
+
+
+def _tickets_projection(state: RunState) -> dict[str, object] | None:
+    """The run-level ``tickets`` object: the initiative the run is pinned to, its
+    ``--epic`` selector, the classified ticket store and the epic closures it
+    recorded. None unless the run's source is ``tickets``."""
+    if state.source != SOURCE_TICKETS:
+        return None
+    return {
+        "initiative": state.initiative,
+        "initiative_folder": state.initiative_folder,
+        # the `--epic` selector as an epic slug, or null for every epic
+        "epic_filter": state.ticket_epic_filter or None,
+        # `ticketstore.StoreTopology.to_dict`, or null when none was recorded
+        "store_topology": dict(state.store_topology) if state.store_topology else None,
+        "epic_closures": dict(state.ticket_epic_closures),
+        "epic_closures_acked": list(state.ticket_epic_closure_acked),
+    }
+
+
 def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> dict[str, object]:
     """The `status --json` document: the stable machine-readable contract.
 
@@ -284,6 +324,14 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
       sessions, ``{role: {"name", "model"}}``. ``{}`` for a task whose sessions
       predate stamping (``adapter == ""``). Configured need not equal used — a
       policy edited mid-run, or a role that never ran, diverge.
+
+    Tickets mode adds two keys, additive with no schema bump: per task
+    ``ticket`` (:func:`_ticket_projection`, null for a task with no ticket) and
+    run-level ``tickets`` (:func:`_tickets_projection`, null unless ``source`` is
+    ``tickets``). Both are always present. ``epic`` stays an int: a tickets unit's
+    is 0, as a stories or sweep unit's is, and its epic is named by
+    ``ticket.epic_slug``. A plan's live ``status`` is not projected — it is not
+    in state.json; the text board reads it from the tree.
     """
     raw_total, weighted_total, weight = run_token_totals(state)
     adapter_policy = policy.adapter_policy_from_snapshot(state.policy_snapshot)
@@ -329,6 +377,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 # against git here (retention may since have pruned it).
                 "preserve_ref": task.preserve_ref,
                 "adapters_used": adapters_used,
+                "ticket": _ticket_projection(task),
             }
         )
     return {
@@ -358,6 +407,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         # between "swept fine" and "old state.json". Additive per machine.py, so
         # STATUS_SCHEMA_VERSION does not move.
         "sweeps_refused": dict(state.sweeps_refused),
+        "tickets": _tickets_projection(state),
         "tasks": tasks,
     }
 

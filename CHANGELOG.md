@@ -140,6 +140,13 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   discover, install and update-check bmad-loop. Each bundled skill carries a `[skill]`
   `bmod.toml`, `bmad-loop init` lays the record down, and `npx skills add
 bmad-code-org/bmad-loop` lists it.
+- Add `run --epic` / `--story` selectors in tickets mode: `--epic` takes an epic id,
+  slug or `epic-<slug>`, and `--story` a ticket ref resolved through `tickets.py find`.
+  An unknown, ambiguous or unstartable selection exits 1.
+- Add the tickets board to `status`: the initiative's tickets grouped by epic in build
+  order, with plan status, flags and the run's phase. A tree it cannot read is printed.
+- Add `ticket` (per task) and `tickets` (run) objects to `status --json`, null outside
+  tickets runs. Additive: the schema version stays 1.
 
 ### Changed
 

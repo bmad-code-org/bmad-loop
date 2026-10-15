@@ -790,7 +790,7 @@ class StoryTask:
     token_budget_warned: bool = False
     # tickets mode only: the ticket this unit was picked for (TicketsEngine binds it
     # right after registration). None for sprint, stories and sweep units.
-    # Deliberately absent from `documents.py`'s `--json` projection (schema 1).
+    # `status --json` projects it as the task's `ticket` object (additive, schema 1).
     ticket: TicketBinding | None = None
     # tickets mode, shared ticket store only (T2–T4: a store no code checkout
     # carries): the ticket's terminal mark, owed once the unit's code has LANDED on
@@ -1336,7 +1336,9 @@ class RunState:
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,
     # `--story`, `--max-stories`). Persisted so `resume` rebuilds the Engine with
     # the SAME selector — otherwise a resumed `--epic N` run silently widens to
-    # every epic and can jump out of its scope at the next pick.
+    # every epic and can jump out of its scope at the next pick. A tickets run
+    # stores its resolved `--story` ticket ref here and its `--epic` slug in
+    # `ticket_epic_filter` (`epic_filter` stays None).
     epic_filter: int | None = None
     story_filter: str | None = None
     max_stories: int | None = None

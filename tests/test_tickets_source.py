@@ -373,17 +373,91 @@ CASES = [
 ]
 
 
-@pytest.mark.parametrize(("views", "phases", "closures", "approvals", "expected"), CASES)
-def test_decide_pick_table(views, phases, closures, approvals, expected):
+# `run --epic` / `--story` (a `PickScope`): the same table, with a selector. Each
+# row's unscoped answer differs, which the `*-unscoped` comments name.
+SCOPE_CASES = [
+    pytest.param(
+        _views(start=(ticket_row("1.1"), ticket_row("2.1", epic=CHECKOUT))),
+        {},
+        {},
+        (),
+        ("dispatch", "2.1"),
+        ts.PickScope(epic=CHECKOUT),
+        id="epic-filter-passes-earlier-epics",  # unscoped: dispatch 1.1
+    ),
+    pytest.param(
+        _views(
+            in_progress=(ticket_row("1.2", status="built"),),
+            others=(_done("2.1", CHECKOUT),),
+            epics=(_epic(CART, "1"), _epic(CHECKOUT, "2", status="done")),
+        ),
+        {},
+        {},
+        (),
+        ("skip", ts.SKIP_EMPTY, (), ()),
+        ts.PickScope(epic=CHECKOUT),
+        id="epic-filter-ignores-foreign-rows-outside-it",  # unscoped: foreign-active
+    ),
+    pytest.param(
+        _views(others=(_done("1.1"), _done("2.1", CHECKOUT))),
+        {},
+        {},
+        (),
+        ("halt", ts.HALT_AWAITING_CLOSURE, CHECKOUT, PAUSE_EPIC_BOUNDARY),
+        ts.PickScope(epic=CHECKOUT),
+        id="epic-filter-scopes-awaiting-closure",  # unscoped: awaiting epic-cart
+    ),
+    pytest.param(
+        _views(
+            start=(ticket_row("2.1", epic=CHECKOUT),),
+            others=(_done("1.1"),),
+            epics=(_epic(CART, "1"), _epic(CHECKOUT, "2")),
+        ),
+        {},
+        {CART: ts.CLOSURE_REJECTED},
+        (),
+        ("halt", ts.HALT_EPIC_REJECTED, CART, PAUSE_EPIC_BOUNDARY),
+        ts.PickScope(epic=CHECKOUT),
+        id="epic-filter-still-held-by-a-rejected-epic",  # same unscoped
+    ),
+    pytest.param(
+        _views(start=(ticket_row("1.1"), ticket_row("1.2"))),
+        {},
+        {},
+        (),
+        ("dispatch", "1.2"),
+        ts.PickScope(ref="1.2"),
+        id="ref-filter-dispatches-only-its-ticket",  # unscoped: dispatch 1.1
+    ),
+    pytest.param(
+        _views(others=(_done("1.1"),), epics=(_epic(CART, "1"),)),
+        {"1.1": Phase.DONE},
+        {},
+        (),
+        ("skip", ts.SKIP_EMPTY, (), ()),
+        ts.PickScope(ref="1.1"),
+        id="ref-filter-finishes-without-epic-halts",  # unscoped: awaiting epic-cart
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("views", "phases", "closures", "approvals", "expected", "scope"),
+    [pytest.param(*case.values, ts.EVERYTHING, id=case.id) for case in CASES] + SCOPE_CASES,
+)
+def test_decide_pick_table(views, phases, closures, approvals, expected, scope):
     """R17 and critique #5 as one table. Ablation (performed), each turning its
     rows red: route touched rows to dispatch (touched-* rows); drop the foreign
     halt (foreign-*-blocks); drop the parked arm (blocked-behind-own-*); drop the
     gated-wait arm (gated-by-awaiting-closure); drop the trailing open-epic arm
     (empty-with-open-epic-halts, which then finishes); drop the approvals test
     (refined-plan-checkpoint-approved); drop the `refined` test from the plan
-    checkpoint arm (unrefined-plan-checkpoint-dispatches-its-halt-leg)."""
+    checkpoint arm (unrefined-plan-checkpoint-dispatches-its-halt-leg); make
+    `PickScope.admits` admit every row (epic-filter-passes-*,
+    epic-filter-ignores-*, ref-filter-dispatches-*); make `admits_epic` admit
+    every epic (epic-filter-scopes-*, ref-filter-finishes-*)."""
     next_view, status_view = views
-    decision = ts.decide_pick(next_view, status_view, phases, closures, approvals)
+    decision = ts.decide_pick(next_view, status_view, phases, closures, approvals, scope)
 
     if expected[0] == "dispatch":
         assert isinstance(decision, ts.Dispatch), decision

@@ -2211,8 +2211,11 @@ def test_status_json_for_a_sweep_run_is_unchanged(project, capsys):
         "tokens",
         "adapters",
         "sweeps_refused",
+        "tickets",
         "tasks",
     }
+    # the tickets-mode object is additive and null outside a tickets run
+    assert document["tickets"] is None
 
 
 def test_status_story_run_prints_no_sweep_options(project, capsys):
@@ -2996,21 +2999,265 @@ def test_list_json_paused_run_carries_stage(project, capsys):
 # where a list belongs is a real defect the round-trip would hide.
 
 
-def test_status_document_library_call_matches_the_cli(project, capsys):
+@pytest.mark.parametrize("source", ["sprint-status", "tickets"])
+def test_status_document_library_call_matches_the_cli(project, capsys, source):
+    """The library builder and `status --json` agree — for a tickets run too, whose
+    `ticket`/`tickets` objects are projected from state.json alone."""
     from bmad_loop.documents import status_document
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase, StoryTask, TokenUsage
 
-    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
-    task.tokens = TokenUsage(
-        input_tokens=100, output_tokens=50, cache_creation_tokens=10, cache_read_tokens=1000
-    )
-    run_dir = _make_run_with_tokens(project, {"1-1-login": task}, weight=0.5)
+    if source == "tickets":
+        run_dir = _make_tickets_status_run(project.project)
+    else:
+        task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+        task.tokens = TokenUsage(
+            input_tokens=100, output_tokens=50, cache_creation_tokens=10, cache_read_tokens=1000
+        )
+        run_dir = _make_run_with_tokens(project, {"1-1-login": task}, weight=0.5)
 
     from_cli = _status_json(project, capsys)
     from_library = status_document(load_state(run_dir))
 
     assert from_library == from_cli
+    assert from_cli["source"] == source
+
+
+_TICKETS_TOPOLOGY = {
+    "layout": "T1",
+    "placement": "in-checkout",
+    "versioning": "tracked",
+    "store_root": "/p/_bmad-output",
+    "store_repo": None,
+}
+
+
+def _binding(ref: str, epic_slug: str = "epic-cart", **fields):
+    from bmad_loop.model import TicketBinding
+
+    base = dict(
+        ref=ref,
+        id=ref.rpartition(".")[2],
+        epic_slug=epic_slug,
+        epic_id=ref.rpartition(".")[0],
+        title=f"Ticket {ref}",
+        plan=f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}/{epic_slug}/story-{ref}-plan.md",
+        risk="",
+        refined=False,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    return TicketBinding(**{**base, **fields})
+
+
+def _make_tickets_status_run(project_dir, run_id="20990101-000000-0001", **state_kwargs):
+    """A tickets run on disk: 1.1 committed with its shared-store mark still owed,
+    1.2 parked with the park owed, and an epic closure recorded."""
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1.1", epic=0, phase=Phase.DONE, ticket=_binding("1.1"))
+    done.ticket_done_pending = True
+    parked = StoryTask(
+        story_key="1.2",
+        epic=0,
+        phase=Phase.AWAITING_OPERATOR,
+        ticket=_binding("1.2", hitl=True),
+        ticket_park_pending="awaiting operator: needs a decision",
+    )
+    kwargs = dict(
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        initiative_folder=f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}",
+        ticket_epic_filter="epic-cart",
+        store_topology=dict(_TICKETS_TOPOLOGY),
+        ticket_epic_closures={"epic-cart": "accepted"},
+        ticket_epic_closure_acked=["epic-cart"],
+        tasks={"1.1": done, "1.2": parked},
+    )
+    return _make_run_with_state(project_dir, run_id, **{**kwargs, **state_kwargs})
+
+
+def test_status_json_tickets_run_is_additive(project, capsys):
+    """A tickets run's document keeps every key a sprint run's has, at schema 1,
+    and adds per-task `ticket` and run-level `tickets` objects read from state.json.
+    `epic` stays an int (0): a type change would have to bump the schema.
+    Ablation (performed): drop the `ticket` key from the task entries and this
+    FAILS; emit the binding's `epic_id` as `epic` and the int assertion FAILS."""
+    from bmad_loop.model import Phase, StoryTask
+
+    sprint_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-0000",
+        tasks={"1-1-login": StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)},
+    )
+    sprint = _status_json(project, capsys, sprint_dir.name)
+    _make_tickets_status_run(project.project)
+
+    doc = _status_json(project, capsys)
+
+    assert doc["schema_version"] == cli.STATUS_SCHEMA_VERSION == 1
+    assert set(sprint) <= set(doc) and set(sprint["tasks"][0]) <= set(doc["tasks"][0])
+    assert doc["source"] == "tickets"
+    assert doc["tickets"] == {
+        "initiative": V7_DEFAULT_INITIATIVE,
+        "initiative_folder": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}",
+        "epic_filter": "epic-cart",
+        "store_topology": _TICKETS_TOPOLOGY,
+        "epic_closures": {"epic-cart": "accepted"},
+        "epic_closures_acked": ["epic-cart"],
+    }
+    first, second = doc["tasks"]
+    assert first["epic"] == 0 and isinstance(first["epic"], int)
+    assert first["ticket"] == {
+        "ref": "1.1",
+        "id": "1",
+        "epic_slug": "epic-cart",
+        "epic_id": "1",
+        "title": "Ticket 1.1",
+        "plan": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}/epic-cart/story-1.1-plan.md",
+        "done_pending": True,
+        "park_pending": None,
+    }
+    assert second["ticket"]["done_pending"] is False
+    assert second["ticket"]["park_pending"] == "awaiting operator: needs a decision"
+
+
+@pytest.mark.parametrize("source", ["sprint-status", "stories"])
+def test_status_json_ticket_keys_null_outside_tickets(project, capsys, source):
+    """Outside a tickets run both keys are present and null — even when the state
+    carries leftover ticket fields — so "absent" never has to be told apart from
+    "old state.json". Ablation (performed): drop the source gate in
+    `_tickets_projection` and this FAILS on the run-level `tickets` object."""
+    from bmad_loop.model import Phase, StoryTask
+
+    _make_run_with_state(
+        project.project,
+        "20990101-000000-0002",
+        source=source,
+        initiative="leftover",
+        store_topology=dict(_TICKETS_TOPOLOGY),
+        tasks={"1-1-login": StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)},
+    )
+
+    doc = _status_json(project, capsys)
+
+    assert "tickets" in doc and doc["tickets"] is None
+    (task,) = doc["tasks"]
+    assert "ticket" in task and task["ticket"] is None
+
+
+@pytest.mark.parametrize(
+    ("stage", "key"),
+    [
+        ("ticket-hitl", "1.2"),
+        ("ticket-refine", "2.2"),
+        ("ticket-tree", ""),
+        ("plan-checkpoint", "2.1"),
+        ("epic-boundary", "epic-cart"),
+    ],
+)
+def test_status_json_paused_at_ticket_stages(project, capsys, stage, key):
+    """A tickets run paused at any of its stages reports the stage verbatim (an
+    open string, no schema bump) with the key it paused on — a ticket ref, or an
+    epic slug for the epic boundary — and its `tickets` object."""
+    _make_tickets_status_run(
+        project.project,
+        paused_stage=stage,
+        paused_reason=f"paused at {stage}",
+        paused_story_key=key,
+    )
+
+    doc = _status_json(project, capsys)
+
+    assert doc["schema_version"] == 1
+    assert (doc["status"], doc["paused_stage"], doc["paused_story_key"]) == ("paused", stage, key)
+    assert doc["paused_reason"] == f"paused at {stage}"
+    assert doc["tickets"]["initiative"] == V7_DEFAULT_INITIATIVE
+
+
+def _board_tree(monkeypatch, tree):
+    """Point `status`'s tickets board at ``tree``; returns the pins it was built with."""
+    pins: list[str | None] = []
+
+    def build(state, _project):
+        pins.append(state.initiative or None)
+        return tree
+
+    monkeypatch.setattr(cli, "_status_ticket_tree", build)
+    return pins
+
+
+def test_status_text_tickets_board_groups_by_epic(project, capsys, monkeypatch):
+    """The text board reads the tree pinned to the run's initiative and prints the
+    state counts, then one block per epic in the initiative's build order, each
+    ticket under its own epic with its plan status, flags and this run's phase —
+    whatever order `status` listed the rows in; a ticket of no listed epic comes
+    last. No real spawn. Ablation (performed): print the rows in `status` order
+    instead of grouping them and this FAILS."""
+    from bmad_loop.ticketmodel import EpicRow
+
+    def epic(slug, eid, status="in-progress"):
+        return EpicRow(
+            slug=slug, id=eid, status=status, after=(), gated_by=(), blocks=(), next_id=3
+        )
+
+    rows = (
+        ticket_row("1.1", status="built", title="Cart model"),
+        ticket_row("2.1", epic="epic-checkout", title="Checkout form", hitl=True),
+        ticket_row("1.2", status="blocked", title="Cart rules"),
+        ticket_row("3.1", epic="epic-loose", status="done", title="Loose end"),
+    )
+    tree = FakeTicketTree(
+        project.project,
+        status_view=fake_status_view(
+            rows, epics=(epic("epic-cart", "1"), epic("epic-checkout", "2"))
+        ),
+    )
+    pins = _board_tree(monkeypatch, tree)
+    _make_tickets_status_run(project.project)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert pins == [V7_DEFAULT_INITIATIVE]
+    board = out[out.index("tickets: initiative") :].splitlines()
+    assert board[1] == "tickets: this run is limited to --epic epic-cart"
+    assert board[2] == "tickets: 1 review · 1 planned · 1 in-progress · 1 done  (4 total)"
+    body = [line.split() for line in board[3:9]]
+    assert [line[0] for line in body] == [
+        "epic-cart",
+        "1.1",
+        "1.2",
+        "epic-checkout",
+        "2.1",
+        "epic-loose",
+    ]
+    assert board[3] == "  epic-cart  0/2 done  (in-progress, closure accepted)"
+    assert body[1][:3] == ["1.1", "review", "built"] and body[1][-2:] == ["[run:", "done]"]
+    assert body[2][-2:] == ["[run:", "awaiting-operator]"]
+    assert "[hitl]" in board[7] and "[run:" not in board[7]
+    assert board[8] == "  epic-loose  1/1 done  (not in the initiative table)"
+    assert "mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)" in out
+
+
+def test_status_text_tickets_board_reports_wrapper_fault(project, capsys, monkeypatch):
+    """A tree the board cannot read is printed as such — the wrapper's kind and
+    message — never dropped, and `status` still exits 0 with the rest of its
+    report. Ablation (performed): swallow `TicketsError` without printing and
+    this FAILS."""
+    from bmad_loop.tickettree import TicketsCrashed
+
+    tree = FakeTicketTree(project.project)
+    tree.faults["status"] = TicketsCrashed("exit 3: boom")
+    _board_tree(monkeypatch, tree)
+    _make_tickets_status_run(project.project)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "tickets board unavailable: tickets.py crashed: exit 3: boom\n" in out
+    assert "mark or store commit owed after landing" in out
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
@@ -13232,6 +13479,222 @@ def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
     assert "stub summary" in capsys.readouterr().out
 
 
+def test_epic_selector_keeps_ints_and_passes_text():
+    """`--epic`'s argparse type returns what `int()` reads (sprint mode unchanged,
+    signs and padding included) and the text otherwise."""
+    assert [cli._epic_selector(t) for t in ("3", "03", "-1", "cart", "epic-cart")] == [
+        3,
+        3,
+        -1,
+        "cart",
+        "epic-cart",
+    ]
+
+
+@pytest.mark.parametrize("stories", [False, True], ids=["sprint", "stories"])
+def test_run_epic_non_integer_sprint_mode_is_usage_error(project, capsys, stories):
+    """Outside tickets mode a non-integer `--epic` is still a usage error (exit 2,
+    as argparse's `type=int` gave), refused before any run directory exists.
+    Ablation (performed): drop the `isinstance(args.epic, str)` refusal and the
+    run goes on to fail elsewhere with exit 1 — this FAILS."""
+    argv = ["run", "--project", str(project.project), "--epic", "cart", "--dry-run"]
+    if stories:
+        argv += ["--spec", "specs/demo"]
+
+    assert cli.main(argv) == cli.ExitCode.USAGE
+
+    err = capsys.readouterr().err
+    assert "argument --epic: invalid int value: 'cart'" in err
+    assert not (project.project / runs.RUNS_DIR).exists()
+
+
+def _selector_tree(epics=("epic-cart", "epic-checkout")):
+    """A fake tree for the selector resolver: two epics (ids 1, 2); 1.1 ready to
+    start, 1.2 in progress, 2.1 ready to refine, a backlog row without a ref."""
+    from dataclasses import replace
+
+    from bmad_loop.ticketmodel import EpicRow
+
+    start = ticket_row("1.1")
+    active = ticket_row("1.2", status="in-progress")
+    refine = ticket_row("2.1", epic="epic-checkout", refine=True)
+    backlog = replace(ticket_row("x", epic="backlog", file="story-x.md"), ref=None)
+    folder = Path("/p/_bmad-output") / V7_DEFAULT_INITIATIVE
+    tree = FakeTicketTree(
+        next_view=fake_next_view(
+            ready_to_start=(start,), ready_to_refine=(refine,), in_progress=(active,)
+        ),
+        status_view=fake_status_view(
+            (start, active, refine),
+            epics=tuple(
+                EpicRow(
+                    slug=slug,
+                    id=str(i),
+                    status="in-progress",
+                    after=(),
+                    gated_by=(),
+                    blocks=(),
+                    next_id=3,
+                )
+                for i, slug in enumerate(epics, 1)
+            ),
+        ),
+        finds={
+            **{r.ref: fake_find(r, folder / r.epic) for r in (start, active, refine)},
+            "story-x": fake_find(backlog, folder),
+        },
+    )
+    return tree
+
+
+@pytest.mark.parametrize(
+    ("epic", "story", "want"),
+    [
+        (2, None, ("epic-checkout", "")),
+        ("02", None, ("epic-checkout", "")),
+        ("checkout", None, ("epic-checkout", "")),
+        ("epic-checkout", None, ("epic-checkout", "")),
+        (None, "1.1", ("", "1.1")),
+        (None, "2.1", ("", "2.1")),
+        ("cart", "1.1", ("epic-cart", "1.1")),
+    ],
+)
+def test_resolve_ticket_scope_accepts(epic, story, want, capsys):
+    """`--epic` resolves an epic id, slug or `epic-<slug>` to the slug; `--story`
+    resolves a ticket ref through `find` to a startable ticket's ref (ready to
+    start or to refine). No real spawn."""
+    args = argparse.Namespace(epic=epic, story=story)
+
+    scope = cli._resolve_ticket_scope(_selector_tree(), args)
+
+    assert (scope.epic, scope.ref) == want, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("epic", "story", "said"),
+    [
+        ("shipping", None, "--epic 'shipping' names no epic of the initiative"),
+        (None, "9.9", "tickets.py no-match: no ticket matches '9.9'"),
+        (None, "1.2", "names 1.2, which is not startable (state in-progress"),
+        (None, "story-x", "which has no ref: a tickets run never dispatches a backlog"),
+        ("checkout", "1.1", "names 1.1, which is not in epic-checkout"),
+    ],
+)
+def test_resolve_ticket_scope_refuses(epic, story, said, capsys):
+    """An unknown epic, a ref `find` cannot match, a ticket that is not startable,
+    a backlog ticket, and a ticket outside the selected epic each exit 1 with the
+    reason. Ablation (performed): drop the startable check and the `1.2` row
+    FAILS (it resolves)."""
+    args = argparse.Namespace(epic=epic, story=story)
+
+    assert cli._resolve_ticket_scope(_selector_tree(), args) == 1
+
+    assert said in capsys.readouterr().err
+
+
+def test_resolve_ticket_scope_refuses_an_ambiguous_ref(capsys):
+    """`find`'s own ambiguity fault (exit 1 with JSON, "matches more than one")
+    refuses the run."""
+    from bmad_loop.tickettree import TicketsFault
+
+    tree = _selector_tree()
+    tree.faults["find"] = TicketsFault("'cart' matches more than one ticket: 1.1, 1.2")
+
+    assert cli._resolve_ticket_scope(tree, argparse.Namespace(epic=None, story="cart")) == 1
+
+    assert "matches more than one ticket" in capsys.readouterr().err
+
+
+def test_resolve_ticket_scope_refuses_two_epics_one_selector(capsys):
+    """A selector that names one epic by id and another by slug is ambiguous."""
+    tree = _selector_tree(epics=("epic-2", "epic-cart"))
+    tree.status_view = dataclasses.replace(
+        tree.status_view,
+        epics=(
+            dataclasses.replace(tree.status_view.epics[0], id="7"),
+            dataclasses.replace(tree.status_view.epics[1], id="2"),
+        ),
+    )
+
+    assert cli._resolve_ticket_scope(tree, argparse.Namespace(epic=2, story=None)) == 1
+
+    assert "names more than one epic: epic-2, epic-cart" in capsys.readouterr().err
+
+
+def test_run_epic_slug_tickets_mode_filters(project, capsys, monkeypatch):
+    """`run --epic cart` in tickets mode resolves the slug against the initiative
+    and persists it as `ticket_epic_filter` (the int `epic_filter` stays None), and
+    the engine's source picks within it: the run's first dispatch is epic 2's
+    ticket though epic 1's leads the build order. 2 real spawns (the preflight's
+    capability probe); the selector reads a fake tree. Ablation (performed): drop
+    `ticket_epic_filter=scope.epic` from `compose_run` and this FAILS."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.tickets_engine import TicketsEngine
+    from bmad_loop.tickets_source import TicketsWorkSource
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = _selector_tree()
+    monkeypatch.setattr(cli, "_selector_ticket_tree", lambda _project: tree)
+    picked: list[object] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            engine = types.SimpleNamespace(
+                state=kw["state"], ticket_tree=tree, _ticket_tree_factory=None
+            )
+            source = TicketsEngine._make_work_source(engine)
+            assert isinstance(source, TicketsWorkSource)
+            picked.append(source.decide({}))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    run_id = "20990101-000000-beef"
+
+    argv = ["run", "--project", str(project.project), "--run-id", run_id, "--epic", "checkout"]
+    assert cli.main(argv) == 0, capsys.readouterr().err
+
+    state = load_state(project.project / ".bmad-loop" / "runs" / run_id)
+    assert (state.ticket_epic_filter, state.epic_filter, state.story_filter) == (
+        "epic-checkout",
+        None,
+        None,
+    )
+    (decision,) = picked
+    assert decision.key == "2.1"  # a refine halt on epic 2's ticket, not 1.1's dispatch
+    assert "ignored in tickets mode" not in capsys.readouterr().err
+
+
+def test_run_story_unknown_ticket_ref_exits_1(project, capsys, monkeypatch):
+    """`run --story` in tickets mode names a ticket through `find`; a ref that
+    matches nothing exits 1 before any run directory exists. 2 real spawns (the
+    preflight's capability probe). Ablation (performed): skip the selector
+    resolution in `cmd_run` and the run starts — this FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    monkeypatch.setattr(cli, "_selector_ticket_tree", lambda _project: _selector_tree())
+    monkeypatch.setattr(cli, "TicketsEngine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main(["run", "--project", str(project.project), "--story", "9.9"]) == 1
+
+    assert "no ticket matches '9.9'" in capsys.readouterr().err
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_dry_run_tickets_epic_filter_lists_only_that_epic(project, capsys, monkeypatch):
+    """The dry-run honors `--epic`: only that epic's startable tickets are listed
+    and the predicted pause is the scoped pick's. No real spawn."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    _fake_dry_run_tree(monkeypatch, _selector_tree())
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run", "--epic", "2"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "ticket 2.1" in out and "ticket 1.1" not in out
+    assert "predicted: run would pause before 2.1 (ticket-refine)" in out
+
+
 @pytest.mark.parametrize("registered", [False, True], ids=["refined-pick-pause", "unit-pause"])
 def test_resume_records_a_refined_story_file_approval(project, capsys, monkeypatch, registered):
     """Resuming a tickets run paused at the pick's `plan-checkpoint` (a refined
@@ -13498,7 +13961,8 @@ def test_tickets_status_lists_owed_post_landing_writes(tmp_path, capsys):
 
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "tickets: initiative (none)"
-    assert lines[1].startswith(
+    assert lines[1].startswith("tickets board unavailable:")
+    assert lines[2].startswith(
         "tickets: mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)"
     )
 

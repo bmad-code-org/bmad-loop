@@ -832,6 +832,7 @@ def build_run_state(
     initiative: str = "",
     initiative_folder: str = "",
     store_topology: dict[str, str | None] | None = None,
+    ticket_epic_filter: str = "",
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -859,7 +860,8 @@ def build_run_state(
     folder (``ProjectPaths.active_initiative`` / ``initiative_folder``), pinned only
     for a tickets run, whose tree reads refuse once the live initiative differs;
     every other source records them empty. ``store_topology`` is the classified
-    ticket store (``ticketstore.StoreTopology.to_dict``), likewise tickets only."""
+    ticket store (``ticketstore.StoreTopology.to_dict``), and ``ticket_epic_filter``
+    the ``--epic`` selector resolved to an epic slug, likewise tickets only."""
     tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
@@ -876,6 +878,7 @@ def build_run_state(
         initiative=initiative if tickets else "",
         initiative_folder=initiative_folder if tickets else "",
         store_topology=dict(store_topology or {}) if tickets else {},
+        ticket_epic_filter=ticket_epic_filter if tickets else "",
         trusted_config_digest=trusted_config_digest,
     )
 
@@ -1314,6 +1317,7 @@ def compose_run(
     tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
+    ticket_epic_filter: str = "",
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1339,6 +1343,10 @@ def compose_run(
     once by the caller and handed to the engine's registry build. The default is
     no grants (fail closed), never "read the store" — this layer does not read it.
     A fatal plugin verdict raises out of the engine build and unwinds the run.
+
+    ``ticket_epic_filter`` is a tickets run's ``--epic`` selector, already resolved
+    to an epic slug by the caller (``epic_filter`` stays None for such a run, and
+    ``story_filter`` carries the resolved ticket ref).
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
@@ -1377,6 +1385,7 @@ def compose_run(
                 str(paths.initiative_folder) if paths.initiative_folder is not None else ""
             ),
             store_topology=store_topology,
+            ticket_epic_filter=ticket_epic_filter,
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering

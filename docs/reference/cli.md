@@ -151,15 +151,17 @@ Runs the story loop (dev → review → verify → commit) over actionable stori
 bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] [--max-stories MAX_STORIES] [--dry-run]
 ```
 
-| Option                      | Description                                                                                                                |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `--spec FOLDER`             | Stories mode: dispatch from `FOLDER/stories.yaml`. Overrides `[stories] source`.                                           |
-| `--epic EPIC`               | Only stories of this epic (integer). Sprint mode only; ignored with a note in stories and tickets modes.                   |
-| `--story STORY`             | Sprint mode: `E-S` / `E.S`, a slug fragment, or a full key. Stories mode: a story id. Ignored with a note in tickets mode. |
-| `--max-stories MAX_STORIES` | Stop after N stories.                                                                                                      |
-| `--dry-run`                 | Print the per-story plan and spawn nothing.                                                                                |
+| Option                      | Description                                                                                                                               |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `--spec FOLDER`             | Stories mode: dispatch from `FOLDER/stories.yaml`. Overrides `[stories] source`.                                                          |
+| `--epic EPIC`               | Only stories of this epic. Sprint mode: an integer. Tickets mode: an epic id, slug or `epic-<slug>`. Ignored with a note in stories mode. |
+| `--story STORY`             | Sprint mode: `E-S` / `E.S`, a slug fragment, or a full key. Stories mode: a story id. Tickets mode: a ticket ref.                         |
+| `--max-stories MAX_STORIES` | Stop after N stories.                                                                                                                     |
+| `--dry-run`                 | Print the per-story plan and spawn nothing.                                                                                               |
 
 - Sprint mode selects stories at `backlog` or `ready-for-dev`. A `--story` that matches nothing, matches several stories, or is not actionable exits 1.
+- A non-integer `--epic` exits 2 outside tickets mode.
+- In tickets mode `run` resolves the selectors against the active initiative before anything is created. `--epic` must name one epic of the initiative table. `--story` goes through `tickets.py find` and must name one ticket that `next` lists as ready to start or to refine (and that is in the `--epic` epic, when both are given). Anything else exits 1. The run then picks only within the selection, and finishes once it has nothing left to start there. `--dry-run` applies the same selection.
 - Refused with exit 1 before anything is created on: git below the supported floor, a dirty worktree, a worktree-isolation conflict, missing base skills, or a failing plugin-trust verdict.
 - `[stories] source = "tickets"` runs the active initiative's ticket tree. Before anything is created, `run` executes the `tickets.*` preflight (capability probe included) and refuses with exit 1 on a problem, including a ticket store it cannot classify or drive (`tickets.store-topology` and the refusals below). The classified topology is recorded on the run, and `resume`, `resolve` and the TUI refuse a store that changed since; `branch_per = "run"` prints the `tickets.branch-per-run` warning. Each picked ticket is dispatched as `ticket <ref>` and, once verified at `built`, marked `done` under `[tickets] mark_done = "auto"` (left at `built` under `"never"`): inside its unit's commit for a store tracked in the code checkout (T1), after the code lands for a shared store, with a plan-only commit in a store that is its own repository (T3/T4). Under worktree isolation a unit's branch is `bmad-loop/<run>/<epic-slug>/<ref>`.
 - `--dry-run` in tickets mode reads the active initiative through its `tickets.py` and marks nothing. It prints the startable tickets in build order (initiative epic table, then entry order), each with its badges, its `ticket <ref>` dispatch (`thorough` when `[tickets] thorough_review` selects it, `Halt after planning.` on an unrefined plan-checkpoint ticket) and its env, then the first pause a run would reach (`predicted:`), the `next` group counts and the tree's problems. A `tickets.py` failure exits 1.
@@ -287,13 +289,14 @@ JSON: [`list --json`](#list---json).
 
 ### `status`
 
-Shows a run's state: status line, token totals, one row per story (phase, dev and review counts, tokens, commit or defer reason, preserve ref), the sprint backlog remaining (stories mode: the stories done count), and the count of pending decisions.
+Shows a run's state: status line, token totals, one row per story (phase, dev and review counts, tokens, commit or defer reason, preserve ref), the sprint backlog remaining (stories mode: the stories done count; tickets mode: the tickets board), and the count of pending decisions.
 
 ```text
 bmad-loop status [--project PROJECT] [--json] [run_id]
 ```
 
 - The status line (`status: …`) is `finished`, `PAUSED (<stage>) — <reason>`, `in progress — graceful stop pending (will stop after the current item)`, or `in progress (or interrupted)`.
+- For a tickets run, the footer is the tickets board, read live through the project's `tickets.py status` and pinned to the run's initiative. It shows the run's selectors, the ticket counts by state, then one block per epic in build order: done count, epic status and any recorded closure, and each ticket's state, plan status, flags and this run's phase. A tree that cannot be read prints `tickets board unavailable: <reason>`, and `status` still exits 0. Marks or store commits still owed after landing are listed last.
 - Exits 1 with `no runs found`, or on a bad or ambiguous ref (stdout stays empty under `--json`).
 
 JSON: [`status --json`](#status---json).
@@ -532,9 +535,18 @@ Built from the run's `state.json`.
 | `tokens`                                            | object         | `{raw, weighted}` run totals                                           |
 | `adapters`                                          | object \| null | `{dev, review, triage, retro: {name, model}}` from the policy snapshot |
 | `sweeps_refused`                                    | object         | auto-sweep trigger → refusal reason; `{}` when none                    |
+| `tickets`                                           | object \| null | tickets runs only, below; null for every other source                  |
 | `tasks`                                             | array          | one entry per story                                                    |
 
-Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `adapters_used` (`{role: {name, model}}`).
+Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+
+`epic` is always an integer. A unit of a source with no integer epics (stories, sweep, tickets) reports `0`; a ticket's epic is in its `ticket` object.
+
+`tickets` (run level): `initiative` and `initiative_folder` (the pinned initiative), `epic_filter` (the `--epic` slug, or null), `store_topology` (`{layout, placement, versioning, store_root, store_repo}`, or null when none was recorded), `epic_closures` (epic slug → recorded closure verdict) and `epic_closures_acked` (epic slugs whose closure pause was resumed past).
+
+`ticket` (per task): `ref`, `id`, `epic_slug`, `epic_id`, `title`, `plan` (the absolute plan path recorded at the pick), `done_pending` (bool: a shared-store `done` mark is still owed) and `park_pending` (the owed park's reason, or null). It is null for a task with no ticket. A plan's live status is not part of the document, because it is not in `state.json`; the text board reads it.
+
+Both objects are additive, so the schema version stays 1. Tickets pause stages (`ticket-hitl`, `ticket-refine`, `ticket-tree`) are new values of `paused_stage`, an open string.
 
 ### `diagnose --json`
 

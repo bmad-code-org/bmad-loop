@@ -207,7 +207,10 @@ def test_tickets_run_side_rows_are_live(tmp_path, capsys):
         initiative_folder=str(tmp_path / "shop"),
     )
     cli._STATUS_PRINTERS["tickets"](state, tmp_path)
-    assert capsys.readouterr().out == f"tickets: initiative shop  ({tmp_path / 'shop'})\n"
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"tickets: initiative shop  ({tmp_path / 'shop'})"
+    # no v7 install under tmp_path: the pinned board read refuses, and says so
+    assert lines[1].startswith("tickets board unavailable: tickets.py pin-mismatch:")
     assert cli._ACTIONABLE_KEY_READERS["tickets"] is cli._actionable_ticket_keys
     try:
         from bmad_loop.tui import data

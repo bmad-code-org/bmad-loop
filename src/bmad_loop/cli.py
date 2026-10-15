@@ -3712,13 +3712,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     pol = policy_mod.load(_policy_path(project))
     source, spec_folder = _resolve_source(args, pol)
     traits = worksource.traits_for(source)
-    paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
+    tickets = source == worksource.SOURCE_TICKETS
+    if not tickets and isinstance(args.epic, str):
+        # `_epic_selector` lets a non-integer through for tickets mode only; every
+        # other source keeps the exit code argparse's `type=int` gave it, ahead of
+        # any project read as argparse's was.
+        print(
+            f"error: argument --epic: invalid int value: {args.epic!r} "
+            "(an epic slug selects only in tickets mode)",
+            file=sys.stderr,
+        )
+        return ExitCode.USAGE
+    paths = bmadconfig.load_paths(project, want_tickets=tickets)
 
-    if source == worksource.SOURCE_TICKETS and (args.epic is not None or args.story):
-        # tickets mode picks the initiative's build order whole; TicketsEngine
-        # nulls both selectors, so warn rather than silently run unfiltered.
-        print("note: --epic and --story are ignored in tickets mode", file=sys.stderr)
-    elif not traits.has_epics and args.epic is not None:
+    if not tickets and not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
         # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
         # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
@@ -3750,6 +3757,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
         return rc
+    scope = tickets_source.EVERYTHING
+    if tickets:
+        resolved = _resolve_ticket_scope(_selector_ticket_tree(paths.project), args)
+        if isinstance(resolved, int):
+            return resolved
+        scope = resolved
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
@@ -3797,8 +3810,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         paths=paths,
         policy=pol,
         run_id=args.run_id,
-        epic_filter=args.epic,
-        story_filter=args.story,
+        # a tickets run's selectors are resolved: an epic slug and a ticket ref
+        epic_filter=None if tickets else args.epic,
+        story_filter=(scope.ref or None) if tickets else args.story,
+        ticket_epic_filter=scope.epic,
         max_stories=args.max_stories,
         source=source,
         spec_folder=spec_folder,
@@ -3998,6 +4013,99 @@ def _dry_run_stories(
     return 0
 
 
+def _epic_selector(text: str) -> int | str:
+    """``run --epic``'s argparse type: an int whenever ``int()`` reads one (sprint
+    mode's epic number, unchanged), else the text — an epic id, slug or
+    ``epic-<slug>`` that only tickets mode accepts (``cmd_run`` refuses it with
+    ``ExitCode.USAGE`` elsewhere)."""
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+class _TicketSelectorError(Exception):
+    """A ``--epic``/``--story`` selector that names no ticket a tickets run can start."""
+
+
+def _ticket_epic_slug(status_view: ticketmodel.StatusView, selector: int | str) -> str:
+    """The epic slug ``selector`` names in the initiative: an epic id (numbers
+    compare as numbers), a slug, or a slug without its ``epic-`` prefix."""
+    text = str(selector).strip()
+    hits: list[str] = []
+    for epic in status_view.epics:
+        by_id = epic.id is not None and (
+            epic.id == text or (text.isdigit() and epic.id.isdigit() and int(epic.id) == int(text))
+        )
+        if by_id or epic.slug in (text, f"epic-{text}"):
+            hits.append(epic.slug)
+    hits = list(dict.fromkeys(hits))
+    if not hits:
+        known = ", ".join(e.slug for e in status_view.epics) or "none"
+        raise _TicketSelectorError(
+            f"--epic {text!r} names no epic of the initiative (epics: {known})"
+        )
+    if len(hits) > 1:
+        raise _TicketSelectorError(f"--epic {text!r} names more than one epic: {', '.join(hits)}")
+    return hits[0]
+
+
+def _ticket_story_ref(
+    tree: tickettree.TicketTreeLike, next_view: ticketmodel.NextView, selector: str, epic: str
+) -> str:
+    """The ref of the one startable ticket ``selector`` names, through ``find``:
+    a ticket ``next`` lists as ready to start or to refine (in ``epic`` when one
+    is selected). ``find``'s no-match and ambiguity faults propagate."""
+    row = tree.find(selector).row
+    ref = row.ref
+    label = tickets_source.row_label(row)
+    if ref is None:
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {label}, which has no ref: a tickets run never "
+            "dispatches a backlog ticket"
+        )
+    if epic and row.epic != epic:
+        raise _TicketSelectorError(f"--story {selector!r} names {ref}, which is not in {epic}")
+    ready = (*next_view.ready_to_refine, *next_view.ready_to_start)
+    if not any(r.ref == ref for r in ready):
+        status = row.status or "no plan"
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {ref}, which is not startable "
+            f"(state {row.state}, plan {status})"
+        )
+    return ref
+
+
+def _selector_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``run`` resolves a tickets run's selectors against: the project's
+    installed ``tickets.py``, unpinned — no run exists yet."""
+    return tickettree.TicketTree(project)
+
+
+def _resolve_ticket_scope(
+    tree: tickettree.TicketTreeLike,
+    args: argparse.Namespace,
+    views: tuple[ticketmodel.NextView, ticketmodel.StatusView] | None = None,
+) -> tickets_source.PickScope | int:
+    """A tickets run's ``--epic``/``--story`` selectors resolved against the active
+    initiative (``views`` when the caller already read them), or exit 1 with the
+    reason on stderr: no match, an ambiguous match, a ticket that is not
+    startable, or a tree that cannot be read."""
+    if args.epic is None and not args.story:
+        return tickets_source.EVERYTHING
+    try:
+        next_view, status_view = views if views is not None else (tree.next(), tree.status())
+        epic = _ticket_epic_slug(status_view, args.epic) if args.epic is not None else ""
+        ref = _ticket_story_ref(tree, next_view, args.story, epic) if args.story else ""
+    except _TicketSelectorError as e:
+        print(f"tickets mode: {e}", file=sys.stderr)
+        return 1
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    return tickets_source.PickScope(epic, ref)
+
+
 def _ticket_badge(row: ticketmodel.TicketRow) -> str:
     """`` [hitl, refine, plan-checkpoint, done-checkpoint]`` for the flags a tickets
     run pauses on, or ``""`` when it sets none. Shared spelling for the dry-run
@@ -4052,14 +4160,17 @@ def _dry_run_tickets(
     except tickettree.TicketsError as e:
         print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
         return 1
-    decision = tickets_source.decide_pick(next_view, status_view, {}, {}, ())
+    scope = _resolve_ticket_scope(tree, args, (next_view, status_view))
+    if isinstance(scope, int):
+        return scope
+    decision = tickets_source.decide_pick(next_view, status_view, {}, {}, (), scope)
     rank = tickets_source.build_order(status_view)
     last = len(rank)
     ready = sorted(
         (
             row
             for row in (*next_view.ready_to_refine, *next_view.ready_to_start)
-            if row.ref is not None
+            if row.ref is not None and scope.admits(row)
         ),
         key=lambda row: rank.get(tickets_source.row_label(row), last),
     )
@@ -4147,15 +4258,40 @@ def _owed_post_landing_label(task: StoryTask) -> str:
     return "done" if task.ticket_done_pending else "built"
 
 
+def _status_ticket_tree(state: RunState, project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``status`` reads a tickets run's board from: the project's
+    installed ``tickets.py``, pinned to the run's initiative, so a board for
+    another initiative is never shown under this run."""
+    return tickettree.TicketTree(project, pinned_initiative=state.initiative or None)
+
+
 def _print_tickets_status(state: RunState, project: Path) -> None:
-    """``status``'s queue footer for a tickets run: the initiative the run is
-    pinned to and its folder, read from run state alone — the per-run task rows
-    above already carry each ticket's phase; no ticket tree is read here. Then
-    every shared-store write still owed after its code landed: a latched mark,
-    or a store-repository commit that failed (the latch is kept until it lands)."""
-    del project
+    """``status``'s queue footer for a tickets run: the initiative's board, read
+    live through ``tickets.py status`` (pinned to the run's initiative) — the
+    state counts, then one block per epic in build order with each ticket's plan
+    status, flags and this run's phase for the tickets it touched. A tree that
+    cannot be read is printed as such, never dropped (``status`` still exits 0).
+    Then every shared-store write still owed after its code landed: a latched
+    mark, or a store-repository commit that failed (the latch is kept until it
+    lands)."""
     folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
     print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
+    if state.ticket_epic_filter or state.story_filter:
+        selected = " ".join(
+            f"{flag} {value}"
+            for flag, value in (
+                ("--epic", state.ticket_epic_filter),
+                ("--story", state.story_filter),
+            )
+            if value
+        )
+        print(f"tickets: this run is limited to {selected}")
+    try:
+        status_view = _status_ticket_tree(state, project).status()
+    except tickettree.TicketsError as e:
+        print(f"tickets board unavailable: tickets.py {e.kind}: {e}")
+    else:
+        _print_tickets_board(state, status_view)
     owed = [
         f"{key} ({_owed_post_landing_label(task)})"
         for key, task in state.tasks.items()
@@ -4166,6 +4302,38 @@ def _print_tickets_status(state: RunState, project: Path) -> None:
             f"tickets: mark or store commit owed after landing: {', '.join(owed)} "
             "— see the journal's store-commit-* rows; a resume retries"
         )
+
+
+def _print_tickets_board(state: RunState, status_view: ticketmodel.StatusView) -> None:
+    """The board body: counts by derived state, then the tickets grouped by epic
+    in the initiative's build order (tickets of no listed epic last)."""
+    rows = status_view.tickets
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.state] = counts.get(row.state, 0) + 1
+    tally = " · ".join(f"{n} {name}" for name, n in counts.items()) or "no tickets"
+    print(f"tickets: {tally}  ({len(rows)} total)")
+    groups: dict[str, list[ticketmodel.TicketRow]] = {e.slug: [] for e in status_view.epics}
+    for row in rows:
+        groups.setdefault(row.epic, []).append(row)
+    epic_status = {e.slug: e.status for e in status_view.epics}
+    for slug, members in groups.items():
+        done = sum(1 for r in members if r.state in ("done", "dropped"))
+        closure = state.ticket_epic_closures.get(slug)
+        notes = [epic_status.get(slug) or "not in the initiative table"]
+        if closure:
+            notes.append(f"closure {closure}")
+        print(f"  {slug}  {done}/{len(members)} done  ({', '.join(notes)})")
+        for row in members:
+            label = tickets_source.row_label(row)
+            task = state.tasks.get(label)
+            mine = f"  [run: {task.phase}]" if task is not None else ""
+            plan = row.status or "no plan"
+            print(
+                f"    {label:8s} {row.state:12s} {plan:14s}{_ticket_badge(row)}  {row.title}{mine}"
+            )
+    for problem in status_view.problems:
+        print(f"tickets: problem: {problem}")
 
 
 # `status`'s queue footer, one entry per work source (held exhaustive over
@@ -8763,11 +8931,17 @@ def main(argv: list[str] | None = None) -> int:
         help="force stories mode: dispatch the epic spec folder's stories.yaml by "
         "folder+id (overrides [stories].source)",
     )
-    run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--epic",
+        type=_epic_selector,
+        help="only stories from this epic: its number (sprint mode); its id, slug "
+        "or epic-<slug> (tickets mode)",
+    )
     run_p.add_argument(
         "--story",
         help="story: E-S / E.S (split suffix ok, e.g. 2-6a), a slug fragment, "
-        "or full key (sprint mode); a story id (stories mode)",
+        "or full key (sprint mode); a story id (stories mode); a ticket ref "
+        "(tickets mode)",
     )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
