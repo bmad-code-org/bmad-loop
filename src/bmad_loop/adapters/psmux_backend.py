@@ -691,8 +691,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # A user config with `destroy-unattached on` would tear this session
         # down when its last client detaches (psmux reaps only on that edge, not
         # at a detached create as tmux does), so turn it off on the session
-        # itself; the user's global stays (#951).
-        self.set_session_option(name, "destroy-unattached", "off")
+        # itself; the user's global stays (#951). Best-effort: the session
+        # exists, and raising here would leave it untagged (the caller's tag
+        # write never runs), which a shared registry's cleanup refuses to own.
+        # psmux reaps only on a last-client detach, so a failed write is said,
+        # not fatal.
+        try:
+            self.set_session_option(name, "destroy-unattached", "off")
+        except TmuxError as exc:
+            print(
+                f"warning: could not set destroy-unattached off on {name}: {exc}",
+                file=sys.stderr,
+            )
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
