@@ -5146,6 +5146,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
+
+        def hand_back() -> None:
+            # This window is about to exit without a usable session, so the
+            # window the record named before it is the run's again.
+            if claimed is not None and claimed != predecessor:
+                with state_lock(run_dir):
+                    fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
+                    if fault is not None:
+                        _report_ctl_window_fault(run_dir, fault)
+
         try:
             produced = resolve.run_session(
                 adapters["dev"],
@@ -5166,14 +5176,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"then: bmad-loop resolve {args.run_id} --no-interactive",
                 file=sys.stderr,
             )
-            # This window is about to exit without having hosted a session, so
-            # the window the record named before it is the run's again.
-            if claimed is not None and claimed != predecessor:
-                with state_lock(run_dir):
-                    fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
-                    if fault is not None:
-                        _report_ctl_window_fault(run_dir, fault)
+            hand_back()
             return 1
+        except BaseException:
+            # The dev CLI could not be spawned, or the session died: the window
+            # exits all the same, so hand the record back before it does.
+            hand_back()
+            raise
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
         # covers every recorded session, INCLUDING the ones whose artifacts this walk

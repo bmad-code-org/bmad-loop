@@ -6230,6 +6230,35 @@ def test_a_resolve_whose_session_cannot_start_hands_the_record_back(
     assert ("warning: hand-back failed" in capsys.readouterr().err) is restore_fails
 
 
+def test_resolve_hands_the_record_back_when_its_cli_cannot_spawn(tmp_path, monkeypatch):
+    # The dev CLI was removed: run_session raises FileNotFoundError, past the
+    # claim. The window exits all the same, so the record goes back to the
+    # window it named before, and the error still propagates. Ablation: drop
+    # the hand-back from the generic arm and the record keeps naming @7.
+    from bmad_loop import resolve
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    monkeypatch.setattr(
+        launch,
+        "claim_ctl_window",
+        lambda project, run_id, **_kw: launch._record_ctl_window(project, run_id, "@7"),
+    )
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def missing_cli(*a, **k):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(resolve, "run_session", missing_cli)
+    try:
+        rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
+    except FileNotFoundError:
+        rc = None
+    assert rc != 0
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+
+
 def _withheld_line(out: str) -> str:
     (line,) = [ln for ln in out.splitlines() if "were not shown" in ln]
     return line
