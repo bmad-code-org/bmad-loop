@@ -147,6 +147,10 @@ bmad-code-org/bmad-loop` lists it.
   order, with plan status, flags and the run's phase. A tree it cannot read is printed.
 - Add `ticket` (per task) and `tickets` (run) objects to `status --json`, null outside
   tickets runs. Additive: the schema version stays 1.
+- Add tickets-mode pause review to the TUI: `hitl`, `refine` and `tree` badges, a
+  pause-reason viewer for those stages, and an epic-closure viewer that shows the
+  retrospective verdict and path. **Request replan** on a ticket plan marks it `draft`
+  through `tickets.py mark` instead of editing its frontmatter.
 
 ### Changed
 

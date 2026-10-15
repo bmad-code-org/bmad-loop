@@ -53,7 +53,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
 from bmad_loop import verify
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
-from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ENVIRONMENT,
     Phase,
@@ -4609,6 +4609,26 @@ def test_pause_tag_and_label_render_environment():
     assert pause_label(PAUSE_ENVIRONMENT) == ("environment fault", "bold red")
 
 
+def test_pause_tag_and_label_render_ticket_stages():
+    """The three tickets pick-time stages get their own badges, and a tickets run's
+    `epic-boundary` reads as an epic closure in the full label (the run header and
+    the gate viewer's title) while the runs-table tag stays "epic". Ablation: drop a
+    ticket row from `_PAUSE_BADGES` (the raw stage renders) or the tickets label
+    override ("epic gate") and this FAILS."""
+    assert pause_tag("ticket-hitl").plain == "hitl"
+    assert pause_tag("ticket-refine").plain == "refine"
+    tree = pause_tag("ticket-tree")
+    assert tree.plain == "tree" and "red" in str(tree.style)
+    assert pause_label("ticket-hitl") == ("hitl ticket", "yellow")
+    assert pause_label("ticket-refine") == ("ticket needs refining", "yellow")
+    assert pause_label("ticket-tree") == ("ticket tree", "bold red")
+    assert pause_label("epic-boundary", source="tickets") == ("epic closure", "yellow")
+    # sprint and stories runs keep the gate wording; other stages ignore the source
+    assert pause_label("epic-boundary", source="sprint-status")[0] == "epic gate"
+    assert pause_label("epic-boundary")[0] == "epic gate"
+    assert pause_label("escalation", source="tickets")[0] == "escalation"
+
+
 def test_stopping_tag_renders():
     # glyph + style match STOPPED (the end state a graceful stop lands in)
     tag = widgets.stopping_tag()
@@ -4881,6 +4901,273 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project_tree, monkeypat
         # own parent would be lexically confined and behaviourally inert (#593).
         assert resets == [(spec, "draft", project_tree.project)]
         assert strips == [(spec, project_tree.project)]
+
+
+def _ticket_binding(plan: Path, ref: str = "1.1"):
+    from bmad_loop.model import TicketBinding
+
+    return TicketBinding(
+        ref=ref,
+        id=ref.rpartition(".")[2],
+        epic_slug="epic-cart",
+        epic_id="1",
+        title="Cart model",
+        plan=str(plan),
+        risk="",
+        refined=False,
+        plan_checkpoint=True,
+        done_checkpoint=False,
+        hitl=False,
+    )
+
+
+def _tickets_paused_run(
+    root: Path,
+    *,
+    stage: str,
+    key: str | None = "1.1",
+    reason: str = "",
+    plan_status: str | None = None,
+    initiative: str = "init-a",
+    closures: dict[str, str] | None = None,
+    run_id: str = "20260611-100000-aaaa",
+) -> tuple[Path, Path]:
+    """A tickets-mode run paused at `stage` with key `key`, pinned to `initiative`.
+    With `plan_status`, ticket `key` is a recorded task bound to its plan (written
+    with that frontmatter status), as `TicketsEngine` records a planned ticket.
+    Canned state only: nothing here (or in the app under test) runs `tickets.py`.
+    Returns (run_dir, plan path)."""
+    folder = root / "_bmad-output" / initiative
+    plan = folder / "epic-cart" / "story-cart-model-plan.md"
+    tasks: dict[str, StoryTask] = {}
+    if plan_status is not None and key is not None:
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(
+            f"---\ntitle: Cart model\nstatus: {plan_status}\n---\n\n# Cart model plan\n",
+            encoding="utf-8",
+        )
+        task = StoryTask(story_key=key, epic=0, phase=Phase.DEV_VERIFY, spec_file=str(plan))
+        task.ticket = _ticket_binding(plan, key)
+        tasks[key] = task
+    run_dir = make_run(
+        root,
+        run_id,
+        source="tickets",
+        paused_stage=stage,
+        paused_reason=reason or f"{stage} for {key}",
+        paused_story_key=key,
+        tasks=tasks,
+    )
+    state = load_state(run_dir)
+    state.initiative = initiative
+    state.initiative_folder = str(folder)
+    state.ticket_epic_closures = dict(closures or {})
+    save_state(run_dir, state)
+    return run_dir, plan
+
+
+@pytest.mark.parametrize(
+    ("stage", "key", "reason", "title"),
+    [
+        (
+            "ticket-hitl",
+            "1.2",
+            "1.2 is a hitl ticket — build it with a person in the loop, then resume",
+            "hitl ticket",
+        ),
+        (
+            "ticket-refine",
+            "1.3",
+            "1.3 needs refining (a bug) — refine it with bmad-ticket, then resume",
+            "ticket needs refining",
+        ),
+        (
+            "ticket-tree",
+            None,
+            "tickets.py crashed: boom — then resume",
+            "ticket tree",
+        ),
+        (
+            # a refined ticket's story-file approval: no plan, no task yet
+            "plan-checkpoint",
+            "1.4",
+            "approve story file /s/1.4.md — 1.4 has a plan checkpoint; then resume",
+            "plan checkpoint",
+        ),
+    ],
+)
+async def test_review_pause_routes_ticket_hitl_to_gate_viewer(
+    project_tree, monkeypatch, stage, key, reason, title
+):
+    """The tickets pick-time pauses fire before the ticket is in state.tasks (and a
+    tree fault has no ticket at all), so `p` opens the pause-reason viewer with the
+    reason as its payload and never reads a spec; resume is its only action. A
+    refined ticket's plan checkpoint (story-file approval, no task yet) takes the
+    same viewer. Ablation (performed): drop the stage from `_SPECLESS_STAGES` and `p`
+    finds no viewer, or drop `_ticket_pick_pause` and the plan viewer opens (FAILS)."""
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _tickets_paused_run(project_tree.project, stage=stage, key=key, reason=reason)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        assert spec_reads == []
+        assert render(app.screen.query_one(".title").content).strip() == f"{title} — pause reason"
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert reason in body
+        await click(pilot, await ready(pilot, "#act-resume"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
+    """A tickets run paused at `epic-boundary` is an epic awaiting closure: the
+    viewer is titled for closure and leads with the verdict the engine recorded and
+    the retrospective's path, read from state.json alone. Ablation: drop the
+    `closure` summary in `_review_gate` and the verdict line is missing (FAILS)."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, _plan = _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason="close epic-cart with bmad-ticket (closure check; retrospective verdict: "
+        "rejected) — then resume",
+        closures={"epic-cart": "rejected"},
+    )
+    retro = (
+        project_tree.project
+        / "_bmad-output"
+        / "init-a"
+        / "epic-cart"
+        / "epic-cart-retrospective.md"
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        assert (
+            render(app.screen.query_one(".title").content).strip() == "epic closure — pause reason"
+        )
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert "retrospective verdict: rejected" in body
+        # the render wraps a long path; compare with whitespace dropped
+        assert f"retrospective:{retro}" in "".join(body.split())
+        assert "close epic-cart with bmad-ticket" in body
+
+
+async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
+    """R13: "Request replan" on a tickets run re-opens the plan to `draft` only
+    through `TicketTree.mark(reason="replan")` — pinned to the run's initiative, on
+    the plan's live root — and never through the raw frontmatter writers, then
+    resumes. Ablation (performed): drop the `ticket` branch in `_do_replan` and the
+    raw `reset_spec_status` runs with no mark — this FAILS."""
+    from conftest import FakeMark, FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop import devcontract
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    raw: list[object] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "reset_spec_status", lambda *a, **kw: raw.append(a) or True)
+    monkeypatch.setattr(
+        devcontract, "strip_auto_run_result", lambda *a, **kw: raw.append(a) or True
+    )
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    before = plan.read_bytes()
+    row = ticket_row("1.1", status="ready-for-dev")
+    tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    opened: list[tuple[Path, str | None]] = []
+
+    def factory(root: Path, pin: str | None):
+        opened.append((root, pin))
+        return tree
+
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", factory)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert tree.marks == [FakeMark("1.1", "draft", "replan", plan, None, "written")]
+    assert opened == [(project_tree.project, "init-a")]
+    assert raw == [], "a tickets replan must not reach the raw frontmatter writers"
+    assert plan.read_bytes() == before  # the fake marks in memory; no raw write
+    marks = [
+        e for e in runs_mod.journal_entries_or_none(run_dir) or [] if e["kind"] == "ticket-mark"
+    ]
+    assert [(e["reason"], e["after"]) for e in marks] == [("replan", "draft")]
+
+
+async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree, monkeypatch):
+    """A transition the chokepoint refuses (here: the plan is already `draft`, a
+    no-op) or a `tickets.py` fault leaves the run paused with a visible error.
+    Ablation: drop the `outcome != "written"` check and the run resumes (FAILS)."""
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="draft"
+    )
+    row = ticket_row("1.1", status="draft")
+    tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("not resuming" in m for m in notifications(app)),
+        )
+    assert calls == []
+
+
+def test_story_context_tickets_spawns_nothing(project_tree, monkeypatch):
+    """The tickets `_story_context` renders on the UI thread, so it reads state.json
+    and the plan's frontmatter only: every process spawn is booby-trapped here. A
+    key with no recorded task (a pick-time pause) has no title. Ablation: drop the
+    tickets branch and the title is "" (FAILS)."""
+    from bmad_loop import childrun, tickettree
+
+    def boom(*a, **kw):
+        raise AssertionError("the UI thread spawned a process")
+
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(childrun, "run_argv", boom)
+    monkeypatch.setattr(tickettree, "TicketTree", boom)
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="in-review"
+    )
+    state = load_state(run_dir)
+    app = BmadLoopApp(project_tree.project)
+    assert app._story_context(state, "1.1") == (
+        "Cart model",
+        "ticket 1.1 · epic-cart · plan in-review",
+    )
+    assert app._story_context(state, "1.9") == ("", "")
 
 
 async def test_plan_checkpoint_replan_restores_preimage_when_result_strip_fails(

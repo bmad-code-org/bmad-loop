@@ -288,6 +288,9 @@ RUN_STATE_TRANSACTIONS = {
     ("runsetup.py", "compose_run"),
     ("runsetup.py", "compose_sweep"),
     ("tui/app.py", "_do_rearm"),
+    # the tickets "Request replan": a locked re-check of the pause, then the plan's
+    # `mark(reason="replan")` to draft (the resume launches after the lock is released)
+    ("tui/app.py", "_ticket_replan_worker"),
     # DW-525: the locked re-check + worktree move under the FINISHED run's lock
     ("unitreplay.py", "mint_replay_run"),
     # DW-535: the re-check, snapshot, teardown and `finished` write of an abandon
@@ -399,7 +402,9 @@ SPEC_STATUS_WRITERS = {
     # `_apply_adoption`, `_reset_spec_for_repair`.
     ("engine.py", "_spec_status_write"): 2,
     # the writer's own callee chain: `reset_spec_for_replan` re-opens a spec for the
-    # TUI's "Request replan" (tickets mode: `mark(reason="replan")`, the TUI session).
+    # TUI's "Request replan". A ticket plan never reaches it: `tui/app.py`
+    # `_do_replan` hands a tickets run to `_ticket_replan_worker`, which marks the
+    # plan `mark(reason="replan")` to draft.
     ("devcontract.py", "reset_spec_for_replan"): 1,
     # `bmad-loop confirm`'s v6 spec flip. A ticket park never reaches it: its
     # plan is marked `mark(reason="confirm")` in `_mark_ticket_confirmed`.

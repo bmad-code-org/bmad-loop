@@ -187,7 +187,9 @@ Situational banners below that:
 - `⏸ paused [<stage>] — <reason>`, then `press p to review · e to resume`: the
   run stopped at a checkpoint, gate or escalation. Stage labels are
   `plan checkpoint`, `story checkpoint`, `spec-approval gate`, `epic gate`,
-  `story gate`, `escalation` and `environment fault`. At an escalation, `e`
+  `story gate`, `escalation` and `environment fault`, plus the tickets-mode
+  `hitl ticket`, `ticket needs refining`, `ticket tree` and `epic closure`
+  (see [Tickets mode](#tickets-mode)). At an escalation, `e`
   skips the escalated story; press `R` to resolve it instead. At an environment
   fault an `[environment]` probe failed; fix the environment and press `e` to
   re-probe and continue.
@@ -482,6 +484,24 @@ which viewer `p` opens.
 
 A viewer whose spec cannot be read says so and disables the actions that would
 act on it. Every action that resumes refuses a still-live engine.
+
+### Tickets mode
+
+A tickets run (the BMAD v7 ticket tree) reuses most viewers. The views read
+`state.json` and plan frontmatter only; the TUI never runs `tickets.py` on the
+UI thread.
+
+| Stage             | Badge    | What `p` shows                                                                                                                                                                                                 |
+| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ticket-hitl`     | `hitl`   | The pause reason: the next ticket needs a person in the loop. Build it, then **Resume**.                                                                                                                       |
+| `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-ticket`. Refine it, then **Resume**.                                                                                                               |
+| `ticket-tree`     | `tree`   | The pause reason: the pinned initiative changed, `tickets.py` failed, the initiative folder is dirty, or only other tickets block progress.                                                                    |
+| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer.                                                                                          |
+| `plan-checkpoint` | `plan`   | The plan viewer. **Request replan** marks the plan `draft` through `tickets.py mark` (reason `replan`) and then resumes. It never edits the plan's frontmatter. A refused or no-op mark leaves the run paused. |
+
+The run header labels an `epic-boundary` pause `epic closure` in tickets mode.
+A ticket's title and description come from the task the run recorded, so a
+pick-time pause shows only the ref.
 
 ## Attaching (`a`) and the sweep decision flow
 

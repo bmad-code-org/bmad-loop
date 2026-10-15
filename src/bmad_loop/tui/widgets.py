@@ -35,11 +35,15 @@ from ..model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     Phase,
     RunState,
 )
 from ..sprintstatus import SprintStatus, Story
 from ..stories import StoryRow
+from ..worksource import SOURCE_TICKETS
 from . import data
 
 STATUS_GLYPHS = {
@@ -80,6 +84,16 @@ _PAUSE_BADGES: dict[str, tuple[str, str, str]] = {
     PAUSE_STORY_GATE: ("gate", "story gate", "yellow"),
     PAUSE_ESCALATION: ("esc", "escalation", "bold red"),
     PAUSE_ENVIRONMENT: ("env", "environment fault", "bold red"),
+    PAUSE_TICKET_HITL: ("hitl", "hitl ticket", "yellow"),
+    PAUSE_TICKET_REFINE: ("refine", "ticket needs refining", "yellow"),
+    PAUSE_TICKET_TREE: ("tree", "ticket tree", "bold red"),
+}
+
+# Tickets mode reuses `epic-boundary` for an epic awaiting closure (its
+# retrospective verdict), not a sprint epic gate. The runs table has no source
+# per row, so only the full label (run header, gate viewer title) says so.
+_TICKETS_PAUSE_LABELS: dict[str, str] = {
+    PAUSE_EPIC_BOUNDARY: "epic closure",
 }
 
 
@@ -92,9 +106,13 @@ def pause_tag(stage: str) -> Text:
     return Text(tag, style=style)
 
 
-def pause_label(stage: str) -> tuple[str, str]:
-    """(full label, rich style) for a pause stage, for the run-header badge."""
+def pause_label(stage: str, *, source: str = "") -> tuple[str, str]:
+    """(full label, rich style) for a pause stage, for the run-header badge.
+    `source` is the run's `RunState.source`: a tickets run words a reused stage
+    for what it means there."""
     _tag, label, style = _PAUSE_BADGES.get(stage, (stage, stage, "yellow"))
+    if source == SOURCE_TICKETS:
+        label = _TICKETS_PAUSE_LABELS.get(stage, label)
     return label, style
 
 
@@ -285,7 +303,7 @@ class RunHeader(Static):
         if status == data.PAUSED:
             text.append("\n⏸ paused", style="bold yellow")
             if state.paused_stage:
-                label, badge_style = pause_label(state.paused_stage)
+                label, badge_style = pause_label(state.paused_stage, source=state.source)
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:

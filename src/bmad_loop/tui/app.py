@@ -32,17 +32,19 @@ from .. import (
     decisions,
     deferredwork,
     devcontract,
+    frontmatter,
     policy,
     resolve,
     runs,
     runsetup,
     stories,
     ticketstore,
+    tickettree,
     verify,
     worksource,
 )
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
-from ..journal import load_state, state_lock
+from ..journal import Journal, load_state, state_lock
 from ..model import (
     PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
@@ -51,6 +53,9 @@ from ..model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     Phase,
     RunState,
     StoryTask,
@@ -88,6 +93,27 @@ def _engine_possibly_live(run_dir: Path) -> bool:
     # whose pid exists but is unreadable). A legacy pid-less run's 'unknown' just
     # means no session was found — it must not flag every old finished run.
     return live == "unknown" and runs.read_pid(run_dir) is not None
+
+
+def _replan_ticket_tree(
+    project_root: Path, pinned_initiative: str | None
+) -> tickettree.TicketTreeLike:
+    """The tree a tickets-mode "Request replan" marks the plan through: the installed
+    ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
+    initiative. Tests replace it with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+
+
+# Pause stages whose payload is the pause reason, never a spec: the viewer is
+# `PauseReasonModal`. The three ticket stages are raised at pick time, before the
+# ticket is recorded in state.tasks, or (ticket-tree) about the tree itself.
+_SPECLESS_STAGES = (
+    PAUSE_STORY_GATE,
+    PAUSE_ENVIRONMENT,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
+)
 
 
 def _deferred_units(state: RunState) -> list[str]:
@@ -909,18 +935,17 @@ class BmadLoopApp(App[None]):
             return
         run_id, run_dir, state = selected
         stage = state.paused_stage
-        if stage == PAUSE_PLAN_CHECKPOINT:
+        if stage == PAUSE_PLAN_CHECKPOINT and self._ticket_pick_pause(state):
+            # a refined ticket's story-file approval: no plan yet, the reason names
+            # the story file, and resume approves it
+            self._review_gate(run_id, run_dir, state)
+        elif stage == PAUSE_PLAN_CHECKPOINT:
             self._review_plan_checkpoint(run_id, run_dir, state)
         elif stage == PAUSE_STORY_CHECKPOINT:
             self._review_story_checkpoint(run_id, run_dir, state)
         elif stage == PAUSE_ESCALATION:
             self._review_escalation(run_id, run_dir, state)
-        elif stage in (
-            PAUSE_SPEC_APPROVAL,
-            PAUSE_EPIC_BOUNDARY,
-            PAUSE_STORY_GATE,
-            PAUSE_ENVIRONMENT,
-        ):
+        elif stage in (PAUSE_SPEC_APPROVAL, PAUSE_EPIC_BOUNDARY, *_SPECLESS_STAGES):
             self._review_gate(run_id, run_dir, state)
         else:
             self.notify(f"no review viewer for pause stage {stage!r}", severity="warning")
@@ -962,20 +987,36 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
+                ticket: tuple[str, str | None] | None = None
+                if state.source == worksource.SOURCE_TICKETS:
+                    # R13: a ticket's plan is re-opened only through the chokepoint,
+                    # so a paused task with no recorded binding has no ref to mark.
+                    task = self._paused_task(state)
+                    if task is None or task.ticket is None:
+                        self.notify(
+                            "replan: the paused ticket has no recorded binding — not resuming",
+                            severity="error",
+                        )
+                        return
+                    ticket = (task.ticket.ref, state.initiative or None)
                 self._do_replan(
                     run_id,
                     spec_path,
                     self._paused_spec_root(state),
                     root_identity=self._paused_spec_root_identity(state),
+                    ticket=ticket,
                 )
 
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
+        label = widgets.pause_label(state.paused_stage or "", source=state.source)[0] or "gate"
+        closure = (
+            state.source == worksource.SOURCE_TICKETS and state.paused_stage == PAUSE_EPIC_BOUNDARY
+        )
         spec_path, spec_text, readable = (
             (None, "", True)
-            if state.paused_stage in (PAUSE_STORY_GATE, PAUSE_ENVIRONMENT)
+            if closure or state.paused_stage in _SPECLESS_STAGES or self._ticket_pick_pause(state)
             else self._paused_spec(state)
         )
 
@@ -993,17 +1034,24 @@ class BmadLoopApp(App[None]):
             # intent-regeneration refusal pauses at this stage) — the repair steer
             # is in the reason, which the spec viewer would hide. An environment
             # pause (DW-523) is the same shape: the failed probe and its remedy
-            # are the reason, and the only action is resume.
+            # are the reason, and the only action is resume. So are the tickets
+            # pick pauses (hitl, refine, tree): the ticket is not in state.tasks yet.
+            # A tickets epic boundary is an epic awaiting closure: its paused key
+            # is the epic slug, and the viewer leads with the recorded verdict and
+            # the retrospective's path, read from state.json alone.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key
                 else Text(f"run {run_id}", style="bold")
             )
+            reason = state.paused_reason or ""
+            if closure:
+                reason = f"{self._epic_closure_summary(state)}\n\n{reason}"
             self.push_screen(
                 PauseReasonModal(
                     title=f"{label} — pause reason",
                     subtitle=subtitle,
-                    reason=state.paused_reason or "",
+                    reason=reason,
                 ),
                 done,
             )
@@ -1017,6 +1065,31 @@ class BmadLoopApp(App[None]):
             actions=[("resume", "Approve & resume", "primary")],
         )
         self.push_screen(modal, done)
+
+    def _ticket_pick_pause(self, state: RunState) -> bool:
+        """A tickets pause raised at pick time, before its ticket is recorded in
+        state.tasks: there is no plan to show, and the reason is the payload."""
+        return state.source == worksource.SOURCE_TICKETS and self._paused_task(state) is None
+
+    @staticmethod
+    def _epic_closure_summary(state: RunState) -> str:
+        """The epic-closure viewer's head: the retrospective verdict the engine
+        recorded for the paused epic (`RunState.ticket_epic_closures`) and the path
+        the retrospective lives at (`<initiative folder>/<slug>/<slug>-retrospective.md`,
+        as `TicketsEngine._retro_doc` spells it). No file or tree is read."""
+        slug = state.paused_story_key or ""
+        verdict = state.ticket_epic_closures.get(slug) if slug else None
+        lines = [
+            (
+                f"retrospective verdict: {verdict}"
+                if verdict
+                else "retrospective verdict: none recorded for this epic"
+            )
+        ]
+        if slug and state.initiative_folder:
+            retro = Path(state.initiative_folder) / slug / f"{slug}-retrospective.md"
+            lines.append(f"retrospective: {retro}")
+        return "\n".join(lines)
 
     @staticmethod
     def _checkpoint_gate_line(review_cycle: int) -> str:
@@ -1177,10 +1250,16 @@ class BmadLoopApp(App[None]):
         confine_root: Path,
         *,
         root_identity: os.stat_result | None = None,
+        ticket: tuple[str, str | None] | None = None,
     ) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses.
+
+        `ticket` is `(ref, pinned initiative)` for a tickets-mode run. The plan is
+        then re-opened to `draft` only through `TicketTree.mark(reason="replan")`,
+        on a worker thread (`_ticket_replan_worker`), never by a raw frontmatter
+        write; the Auto Run Result is left alone.
 
         `confine_root` arrives from the caller (`_paused_spec_root`) rather than being
         `self.project` here: this method has no task in scope, and the root these two
@@ -1214,6 +1293,10 @@ class BmadLoopApp(App[None]):
             # earns its own message naming the path actually consulted.
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
+        if ticket is not None:
+            ref, initiative = ticket
+            self._ticket_replan_worker(run_id, run_dir, spec_path, confine_root, ref, initiative)
+            return
         try:
             reset = devcontract.reset_spec_for_replan(
                 spec_path, confine_root=confine_root, root_identity=root_identity
@@ -1245,6 +1328,75 @@ class BmadLoopApp(App[None]):
             return
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
+
+    @work(thread=True, group="lifecycle")
+    def _ticket_replan_worker(
+        self,
+        run_id: str,
+        run_dir: Path,
+        plan: Path,
+        tree_root: Path,
+        ref: str,
+        initiative: str | None,
+    ) -> None:
+        """Re-open a ticket's plan to `draft` through the chokepoint, then resume.
+
+        A worker because `mark` spawns `tickets.py` (bounded by its timeout), which
+        must not run on the message loop. The state lock is taken without waiting,
+        as `_do_rearm` takes it, and the pause and liveness are re-read under it: a
+        resume that won the race owns the run. `tree_root` is the plan's live root
+        (`_paused_spec_root`), the tree a re-arm marks through too. Every UI update
+        marshals through `call_from_thread`."""
+        try:
+            with state_lock(run_dir, blocking=False):
+                if _engine_possibly_live(run_dir):
+                    self.call_from_thread(
+                        self.notify,
+                        f"run {run_id} may still be live — stop it first",
+                        severity="warning",
+                    )
+                    return
+                fresh = load_state(run_dir)
+                if fresh.paused_stage != PAUSE_PLAN_CHECKPOINT:
+                    self.call_from_thread(
+                        self.notify,
+                        f"run {run_id} is no longer paused at a plan checkpoint — not replanning",
+                        severity="warning",
+                    )
+                    return
+                mark = _replan_ticket_tree(tree_root, initiative).mark(
+                    ref, "draft", reason="replan", expected_plan=plan, journal=Journal(run_dir)
+                )
+        except LockUnavailableError:
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id} is busy (another resume or re-arm holds it) — not replanning",
+                severity="warning",
+            )
+            return
+        except tickettree.TicketsError as e:
+            self.call_from_thread(
+                self.notify,
+                f"replan failed: tickets.py {e.kind}: {e} — not resuming",
+                severity="error",
+            )
+            return
+        except (OSError, KeyError, ValueError) as e:
+            self.call_from_thread(
+                self.notify, f"replan failed: {e} — not resuming", severity="error"
+            )
+            return
+        if mark.outcome != "written":
+            self.call_from_thread(
+                self.notify,
+                f"replan: ticket {ref}'s plan is already `{mark.after}` — not resuming",
+                severity="error",
+            )
+            return
+        self.call_from_thread(
+            self.notify, f"ticket {ref}'s plan reset to draft — the next dispatch re-plans"
+        )
+        self.call_from_thread(self._do_resume, run_id)
 
     def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> None:
         """Toast the re-arm records `cli._echo_rearm_events` prints, same table.
@@ -1673,7 +1825,10 @@ class BmadLoopApp(App[None]):
         return text
 
     def _story_context(self, state: RunState, key: str) -> tuple[str, str]:
-        """(title, description) from stories.yaml in stories mode, else ("", "")."""
+        """(title, description) from stories.yaml in stories mode, from the recorded
+        ticket in tickets mode, else ("", "")."""
+        if state.source == worksource.SOURCE_TICKETS:
+            return self._ticket_context(state, key)
         if not worksource.resumed_traits_for(state.source).has_spec_folder or not state.spec_folder:
             return "", ""
         # `live_stories_root`, not `self.project` bare, for the reason `_sentinel_kind`
@@ -1692,6 +1847,28 @@ class BmadLoopApp(App[None]):
         except stories.StoriesError:
             return "", ""
         return (entry.title, entry.description) if entry else ("", "")
+
+    def _ticket_context(self, state: RunState, key: str) -> tuple[str, str]:
+        """(title, description) for a tickets-mode key, from state.json and the
+        plan's frontmatter only. This renders on the UI thread, so it never asks
+        `tickets.py`: a key with no recorded task (a pick-time pause, an epic slug)
+        has no title here. The description names the ref, the epic and the plan's
+        live status, which says `unreadable` when the plan cannot be read."""
+        task = state.tasks.get(key)
+        if task is None or task.ticket is None:
+            return "", ""
+        binding = task.ticket
+        plan = runs.live_spec_path(task, state, self.project) if task.spec_file else None
+        if plan is None:
+            plan = Path(binding.plan) if binding.plan else None
+        try:
+            fm = frontmatter.read_frontmatter(plan) if plan is not None else {}
+        except OSError:
+            fm = None
+        title = binding.title or str((fm or {}).get("title") or "")
+        status = "unreadable" if fm is None else frontmatter.status_of(fm) or "no status"
+        epic = binding.epic_slug or "no epic"
+        return title, f"ticket {binding.ref} · {epic} · plan {status}"
 
     def _sentinel_kind(self, state: RunState, key: str) -> str:
         if not worksource.resumed_traits_for(state.source).sentinels or not state.spec_folder:
