@@ -829,8 +829,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # read, not list-windows' active-pane `#{pane_dead}`: a user's split
         # whose exited pane is active must not declare the CLI beside it dead.
         rows = self._list_session_rows(["list-panes", "-s"], session, "#{window_id} #{pane_dead}")
+        # The rows carry bare `@N` ids, while a backend may mint session-qualified
+        # ones (`session:@N`, as psmux does) through its own new_window and
+        # list_window_ids. A tmux window id never holds a `:`, so the bare id is
+        # what follows the last one.
+        bare = window_id.rpartition(":")[2]
         # Only an explicit `1` is dead, as on a backend that leaves the field empty.
-        return any(row.split()[:1] == [window_id] and row.split()[1:2] != ["1"] for row in rows)
+        return any(row.split()[:1] == [bare] and row.split()[1:2] != ["1"] for row in rows)
 
     def select_window(self, target: str) -> None:
         # Best-effort focus change: swallow a transport failure to the no-op sentinel.

@@ -755,13 +755,6 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             for window_id in super().list_window_ids(session)
         ]
 
-    def window_alive(self, session: str, window_id: str) -> bool:
-        # The base matches against psmux's bare `@N` rows, so strip the
-        # qualification new_window added before it compares (a degraded bare id
-        # passes through unchanged). The base also reads `#{pane_dead}`, which
-        # psmux serves, so a `remain-on-exit` corpse reads dead (#950).
-        return super().window_alive(session, window_id.removeprefix(f"{session}:"))
-
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
     ) -> str:

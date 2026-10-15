@@ -159,6 +159,20 @@ def _spec(tmp_path):
     )
 
 
+def test_window_alive_matches_a_session_qualified_id(monkeypatch):
+    """A tmux-family backend may mint `session:@N` ids (psmux does, and a plugin
+    subclass may too) while list-panes rows carry bare `@N`; the base compares
+    the bare id, so a live qualified window is not read as dead. Ablation:
+    compare the id as given and this reads False."""
+    rows = ["@3 0"]
+    monkeypatch.setattr(tmux_base.BaseTmuxBackend, "_list_session_rows", lambda self, *a, **k: rows)
+
+    assert TmuxMultiplexer().window_alive("s", "s:@3")
+    assert TmuxMultiplexer().window_alive("s", "@3")
+    rows[:] = ["@3 1"]
+    assert not TmuxMultiplexer().window_alive("s", "s:@3")
+
+
 def test_generic_adapter_drives_only_the_mux(tmp_path, no_tmux):
     stub = StubMux()
     adapter = GenericAdapter(
