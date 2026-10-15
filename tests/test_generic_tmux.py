@@ -574,8 +574,8 @@ def test_await_result_grace_expires_fast(tmp_path):
 
 
 class _TeardownMux:
-    """Only the ops kill() drives — kill_window, window_alive (liveness),
-    window_pane_pids — with scriptable survival: the window stays alive until
+    """Only the ops kill() drives — kill_window, list_window_ids (teardown
+    verification), window_pane_pids — with scriptable survival: the window stays alive until
     ``survives_kills`` kill_window calls have landed."""
 
     def __init__(self, survives_kills=0, pids=()):
@@ -588,9 +588,9 @@ class _TeardownMux:
     def kill_window(self, target):
         self.kill_windows += 1
 
-    def window_alive(self, session, window_id):
+    def list_window_ids(self, session):
         self.liveness_probes += 1
-        return self.kill_windows <= self.survives_kills
+        return ["@w1"] if self.kill_windows <= self.survives_kills else []
 
     def window_pane_pids(self, target):
         self.pane_pid_reads += 1
@@ -667,6 +667,23 @@ def test_window_alive_asks_the_mux_not_window_membership(tmp_path):
     the session stalls instead of crashing."""
     adapter = make_adapter(tmp_path, mux=_RetainedDeadPaneMux())
     assert adapter._window_alive(_kill_handle()) is False
+
+
+def test_kill_rekills_a_listed_window_whose_pane_is_dead(tmp_path, monkeypatch):
+    """Under `remain-on-exit on` the pane reads dead while the window stays
+    listed, so teardown verifies by membership: a kill that missed the window
+    is re-killed rather than read as done. Ablation: verify with window_alive
+    and kill_window runs once."""
+    monkeypatch.setattr(generic, "KILL_POLL_S", 0)
+
+    class _Mux(_TeardownMux):
+        def window_alive(self, session, window_id):
+            return False
+
+    mux = _Mux(survives_kills=1)
+    adapter = make_adapter(tmp_path, mux=mux, teardown_grace_s=0.05)
+    adapter.kill(_kill_handle())
+    assert mux.kill_windows == 2
 
 
 def _lifecycle_lines(adapter, task_id="3-1-dev-1"):
@@ -893,7 +910,7 @@ def test_kill_escalated_flags_liveness_unknown_from_last_poll(
             raise MultiplexerError("tmux hang")
         return True
 
-    adapter._window_alive = poll
+    adapter._window_listed = poll
     adapter.kill(_kill_handle())
     assert host.force_killed == [4242]  # escalation proceeded
     (escalated,) = [e for e in _lifecycle_lines(adapter) if e["event"] == "kill-escalated"]
