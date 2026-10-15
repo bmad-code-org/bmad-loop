@@ -1270,6 +1270,10 @@ JOURNAL_KINDS = frozenset(
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
         "run-resume",
+        # The resume of a tickets run paused for a refined ticket's story-file
+        # approval records that approval (`tickets_source.approve_paused_story_file`).
+        # Its one field, `ref`, rides the by-name benign row.
+        "ticket-story-approved",
         # cli.py + runs.py
         "rearm-code-root-restamped",
         # cli.py + runs.py (resume and re-arm, `runs.reconcile_root_identities`).
@@ -1584,7 +1588,7 @@ JOURNAL_KINDS = frozenset(
         # `_JOURNAL_DROP_FIELDS`.
         "session-kill-refused",
         "run-start",
-        # stories_engine.py
+        # stories_engine.py (`plan-halt` and its proof waiver: tickets_engine.py too)
         "deferred-close-declaration-unreadable",
         "plan-halt",
         "plan-halt-proof-of-work-skipped",

@@ -25,6 +25,14 @@ breaking changes may land in a minor release.
   `bmad-loop/<run>/<epic-slug>/<ref>`. `run` refuses an initiative folder not tracked
   in the code checkout (`tickets.layout-unsupported`) and warns on `branch_per = "run"`
   (`tickets.branch-per-run`).
+- Add plan and done checkpoints in tickets mode. A refined `plan_checkpoint` ticket
+  pauses before dispatch, and resuming approves its story file. An unrefined one runs a
+  `Halt after planning.` leg, pauses for plan review, then dispatches again on the
+  uncommitted plan. `done_checkpoint` pauses after the ticket commits, except for the
+  last ticket.
+- Add the tickets dirty-initiative pause: a run pauses at `ticket-tree` before opening a
+  ticket while the initiative folder holds uncommitted changes the run does not own.
+- Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to every tickets unit commit.
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

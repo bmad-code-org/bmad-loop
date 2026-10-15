@@ -30,6 +30,18 @@ Pick-time pauses (``_halt_pick``), all raised before a ticket is recorded in
 Rows the pick passed over are journaled once per process (``ticket-skipped``,
 ``ticket-foreign-active``).
 
+Before a picked ticket is opened, a checkout-placed store whose initiative folder
+holds uncommitted changes the run does not own pauses at ``ticket-tree``
+(:meth:`TicketsEngine._gate_dirty_initiative`): the unit's commit stages the
+whole tree.
+
+Checkpoints follow upstream's contract through the checkpoint mixin. A refined
+``plan_checkpoint`` ticket's story-file approval is the resume of its pick-time
+pause (:func:`~bmad_loop.tickets_source.approve_paused_story_file`); an unrefined
+one runs the two-leg plan checkpoint (:meth:`TicketsEngine._drive_story`) with no
+interim commit; ``done_checkpoint`` is the mixin's ``_after_story``, fed by the
+binding's flags and the next pick.
+
 A picked ticket is dispatched as ``ticket <ref>`` on every leg
 (:meth:`TicketsEngine._dev_prompt`, :meth:`TicketsEngine._review_prompt`), with
 the dry-run's own invocation line (``thorough`` per ``[tickets]
@@ -38,22 +50,25 @@ checkpoint). The read-back is pinned to the plan ``find`` named from attempt 1,
 ends at ``built`` (dev) or ``built``/``done`` (review), and probes the
 initiative folder for a no-plan fallback result. The dev and review gates are
 ``verify.verify_dev_tickets`` / ``verify.verify_review_tickets``: no sprint board,
-and the orchestrator alone owns ``done``.
+and the orchestrator alone owns ``done``. The unit's commit carries
+``Bmad-Ticket:`` and ``Bmad-Plan:`` trailers.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
 from . import gates, verify
-from .adapters.base import SpecSnapshot
+from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
 from .frontmatter import frontmatter_fault, parse_frontmatter, status_of
 from .model import (
+    PAUSE_SPEC_APPROVAL,
     PAUSE_TICKET_TREE,
     Phase,
     StoryTask,
@@ -65,6 +80,7 @@ from .runs import rebase_recorded_project_path
 from .statemachine import PlanWriteReason, advance
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
+    HALT_DIRTY_INITIATIVE,
     HALT_HITL,
     HALT_PLAN_CHECKPOINT,
     HALT_REFINE,
@@ -127,6 +143,30 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except (OSError, RuntimeError):
         return False
+
+
+def _overlaps(path: str, folder: str) -> bool:
+    """Whether repo-relative ``path`` lies in ``folder`` (``"."`` is the whole
+    checkout), or contains it: an untracked nested repository is one dirty
+    entry for its whole directory."""
+    if folder == ".":
+        return True
+    return path == folder or path.startswith(folder + "/") or folder.startswith(path + "/")
+
+
+_TRAILER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: \S")
+
+
+def _with_trailers(message: str, trailers: list[str]) -> str:
+    """``message`` with ``trailers`` appended to its closing trailer block, or
+    to a new one after a blank line when its last paragraph is prose. A
+    one-paragraph message is its subject, never a trailer block."""
+    body = message.rstrip()
+    paragraphs = body.split("\n\n")
+    last = paragraphs[-1].splitlines()
+    if len(paragraphs) > 1 and last and all(_TRAILER_RE.match(line) for line in last):
+        return body + "\n" + "\n".join(trailers)
+    return body + "\n\n" + "\n".join(trailers)
 
 
 def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
@@ -198,7 +238,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _dispatch_ref(self, decision: Dispatch) -> WorkRef:
         """Resolve the picked ticket's binding before anything registers it, so a
-        ``find`` fault pauses with no task recorded and a resume re-picks."""
+        ``find`` fault pauses with no task recorded and a resume re-picks. The
+        dirty-initiative gate runs first, for the same reason."""
+        self._gate_dirty_initiative(decision)
         try:
             found = self.ticket_tree.find(decision.ref)
         except TicketsError as e:
@@ -207,6 +249,72 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             )
         self._picked[decision.ref] = ticket_binding(found)
         return TicketRef(key=decision.ref, row=decision.row)
+
+    def _gate_dirty_initiative(self, decision: Dispatch) -> None:
+        """Pause at ``ticket-tree``, before the picked ticket is opened, when the
+        checkout holds uncommitted edits under the initiative folder that this
+        run does not own. The unit's commit stages the whole tree
+        (``finalize_commit``'s ``add -A``), so a person's in-flight edit to a plan
+        or ``tickets.toml`` would ride the unit's commit, and build-auto's own
+        commit step refuses a dirty tree. The run's own writes there
+        (:meth:`_run_owned_paths`) never trip it.
+
+        Applies only to a store placed in the code checkout (the initiative
+        folder under ``repo_root``); a store elsewhere is not staged by the
+        unit's commit. A checkout whose status cannot be read pauses the same
+        way: the gate fails closed."""
+        folder = self.paths.initiative_folder
+        repo = self.paths.repo_root
+        if folder is None:
+            return
+        try:
+            prefix = folder.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return
+        try:
+            dirty = verify.dirty_paths(repo)
+        except verify.GitError as e:
+            self._pause_ticket_pick(
+                Halt(
+                    HALT_DIRTY_INITIATIVE,
+                    decision.ref,
+                    decision.row,
+                    f"cannot read the checkout's status before opening {decision.ref}: {e}",
+                )
+            )
+        owned = self._run_owned_paths()
+        touched = sorted(
+            path
+            for path in dirty
+            if _overlaps(path.rstrip("/"), prefix) and path.rstrip("/") not in owned
+        )
+        if not touched:
+            return
+        shown = ", ".join(touched[:5]) + (
+            f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+        )
+        self._pause_ticket_pick(
+            Halt(
+                HALT_DIRTY_INITIATIVE,
+                decision.ref,
+                decision.row,
+                f"the initiative folder {prefix} has uncommitted changes this run does not "
+                f"own ({shown}); commit or stash them before {decision.ref} is built, "
+                f"because the ticket's commit stages the whole tree",
+            )
+        )
+
+    def _run_owned_paths(self) -> frozenset[str]:
+        """Repo-relative paths under the initiative folder the run itself writes
+        outside a unit's commit, which the dirty-initiative gate ignores: the
+        deferred-work ledger, whose carry and defer paths can leave a tracked
+        ledger's edits uncommitted (it lives in the initiative folder on v7)."""
+        repo = self.paths.repo_root
+        try:
+            ledger = self.paths.deferred_work.resolve().relative_to(repo.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return frozenset()
+        return frozenset({ledger.as_posix()})
 
     def _run_story(self, task: StoryTask) -> None:
         # Attach the binding resolved at pick time the moment `_loop` registers
@@ -406,6 +514,66 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """Whether the next pick would end the run. A tree that cannot be read
         answers False, so a done_checkpoint still fires."""
         return isinstance(self._tickets_source.decide(self._phases()), Skip)
+
+    # ------------------------------------------------------- plan checkpoint
+
+    def _drive_story(self, task: StoryTask, dev_resume: SessionResult | None = None) -> None:
+        """The two-leg plan checkpoint of an unrefined ``plan_checkpoint`` ticket,
+        as stories mode drives it through the checkpoint mixin.
+
+        Leg 1 (``Halt after planning.``) latches ``plan_review_owed`` and
+        journals ``plan-halt`` before its session runs; the verified
+        ``ready-for-dev`` plan then pauses at ``plan-checkpoint``. The plan is
+        left uncommitted: on resume, leg 2 re-dispatches ``ticket <ref>``, which
+        build-auto routes on the plan's status before its clean-tree check, and
+        the unit's squash carries the plan with the code. A plan review still
+        owed when the code is written pauses before the commit.
+
+        A refined ticket was approved before dispatch (the pick's
+        ``plan-checkpoint`` pause), so it takes neither leg. ``dev_resume`` None
+        is a fresh drive, not a replay of a session that already ran."""
+        if dev_resume is None:
+            # the dispatch gate first, so an `environment` pause writes neither the
+            # latch nor its journal row (a passing probe is fresh for `_dev_phase`)
+            self._gate_dispatch(task, "dev")
+        if dev_resume is None and self._plan_halt_now(task):
+            # Saved before the session, so a crash after it, a retry that moved the
+            # plan on, or a session that overran the halt still owes the review.
+            task.plan_review_owed = True
+            self._save()
+            self.journal.append(
+                "plan-halt", story_key=task.story_key, spec_folder=self._initiative_rel()
+            )
+        if not self._dev_phase(task, resume_result=dev_resume):
+            return
+        if task.plan_checkpoint_pending:
+            self._pause_plan_checkpoint(task)  # always raises RunPaused
+        if task.plan_review_owed:
+            self._pause_plan_review_owed(task)  # always raises RunPaused
+        if gates.pause_after_spec(self.policy):
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"spec ready for approval: {task.story_key}",
+                f"review {self._operator_spec_path(task)}, then {self._resume_hint()}",
+            )
+            raise RunPaused(
+                f"awaiting spec approval for {task.story_key}",
+                PAUSE_SPEC_APPROVAL,
+                task.story_key,
+            )
+        self._review_and_commit(task)
+
+    def _initiative_rel(self) -> str:
+        """The initiative folder relative to the project, as the ``plan-halt``
+        row names its folder; "" when there is none."""
+        folder = self.paths.initiative_folder
+        if folder is None:
+            return ""
+        try:
+            return folder.relative_to(self.paths.project).as_posix()
+        except ValueError:
+            return str(folder)
 
     # -------------------------------------------------------------- dispatch
 
@@ -727,7 +895,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             )
         plan_halt = bool(result_mapping(result_json).get("plan_halt"))
         task.plan_checkpoint_pending = plan_halt
-        return verify.verify_dev_tickets(
+        outcome = verify.verify_dev_tickets(
             task,
             self.workspace.paths,
             result_json,
@@ -737,6 +905,29 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             plan_halt=plan_halt,
             operator_park=self._operator_park_enabled(),
             engine_written=self._harvest_gate_exclude(task),
+        )
+        # A plan-halt leg waives the proof-of-work gate (it wrote no code). The
+        # waiver leaves one row per attempt once every other gate passed, as in
+        # stories mode; `zero_diff` observes the skipped gate, never feeds it.
+        if plan_halt and outcome.ok and not self._plan_halt_waiver_recorded(task):
+            self.journal.append(
+                "plan-halt-proof-of-work-skipped",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                generation=task.generation,
+                zero_diff=outcome.plan_halt_zero_diff,
+            )
+        return outcome
+
+    def _plan_halt_waiver_recorded(self, task: StoryTask) -> bool:
+        """Whether this attempt's proof-of-work waiver is already journaled (a
+        replayed verify of the same leg)."""
+        return any(
+            entry.get("kind") == "plan-halt-proof-of-work-skipped"
+            and entry.get("story_key") == task.story_key
+            and entry.get("attempt") == task.attempt
+            and entry.get("generation", 0) == task.generation
+            for entry in self.journal.entries()
         )
 
     def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
@@ -831,6 +1022,26 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             cause=why,
         )
         raise SpecStatusWriteRefused(reason, target, why)
+
+    def _commit_message(self, task: StoryTask) -> str:
+        """The base message plus the git trailers that tie the unit's commit to
+        its ticket: ``Bmad-Ticket: <ref>`` and ``Bmad-Plan: <plan>``, the plan
+        relative to the code checkout (omitted when it lies outside it). They
+        join a trailer block the message already ends with (a template's
+        ``Signed-off-by:``), else open one. An unbound task gets the base
+        message."""
+        message = super()._commit_message(task)
+        ticket = task.ticket
+        if ticket is None:
+            return message
+        trailers = [f"Bmad-Ticket: {ticket.ref}"]
+        try:
+            plan = Path(ticket.plan).resolve().relative_to(self.paths.repo_root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            plan = None
+        if plan is not None:
+            trailers.append(f"Bmad-Plan: {plan.as_posix()}")
+        return _with_trailers(message, trailers)
 
     def _unit_branch_epic(self, task: StoryTask) -> str | None:
         """The ticket's epic slug, so a unit branch reads

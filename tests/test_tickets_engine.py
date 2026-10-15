@@ -25,6 +25,7 @@ from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
+    PAUSE_STORY_CHECKPOINT,
     PAUSE_TICKET_HITL,
     PAUSE_TICKET_REFINE,
     PAUSE_TICKET_TREE,
@@ -1499,3 +1500,270 @@ def test_tickets_unit_never_touches_sprint_status(project_v7):
 
     assert board.read_bytes() == before
     assert [e for e in engine.journal.entries() if e["kind"].startswith("board-advance")] == []
+
+
+# ------------------------------------------------ checkpoints (R12) and trailers
+#
+# Upstream's contract: a refined `plan_checkpoint` entry has its story file
+# approved before dispatch; an unrefined one dispatches `Halt after planning.`,
+# pauses for plan approval, then dispatches again — with no interim commit, because
+# build-auto routes on the uncommitted plan before its clean-tree check; a
+# `done_checkpoint` pauses after the ticket.
+
+
+def _resumed(engine: TicketsEngine, tree: FakeTicketTree, script: list):
+    """The engine `bmad-loop resume` builds from the persisted state: the resume
+    path's story-file approval, then the pause cleared."""
+    state = load_state(engine.run_dir)
+    tickets_source.approve_paused_story_file(state)
+    state.clear_pause()
+    adapter = MockAdapter(list(script))
+    resumed = TicketsEngine(
+        paths=engine.paths,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    return resumed, adapter
+
+
+def _plans_then_builds(layout: V7Layout, tree: FakeTicketTree, plan: Path, *, seen=None):
+    """A build-auto that honors `Halt after planning.`: on the plan-halt leg
+    (`BMAD_LOOP_PLAN_HALT`) it writes the plan at `ready-for-dev`, no code, and
+    marks the result `plan_halt`, as the adapter synthesizes it; any other leg
+    builds (`_builds`)."""
+    build = _builds(layout, tree, plan, seen=seen)
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        if not spec.env.get("BMAD_LOOP_PLAN_HALT"):
+            return build(spec)
+        cwd = Path(spec.cwd)
+        here = cwd / plan.relative_to(layout.project)
+        if seen is not None:
+            seen.append("")
+        _write_plan(here, "ready-for-dev", baseline=verify.rev_parse_head(cwd))
+        result = {
+            "workflow": "auto-dev",
+            "spec_file": str(here),
+            "status": "ready-for-dev",
+            "plan_halt": True,
+        }
+        return SessionResult(status="completed", result_json=result)
+
+    return effect
+
+
+def test_refined_plan_checkpoint_waits_for_approval_then_dispatches(project_v7):
+    """A refined `plan_checkpoint` ticket pauses before any session for its story
+    file's approval, unregistered; the operator's resume records the approval and
+    the resumed run dispatches the ticket once, as a plain `ticket <ref>` (no plan
+    halt: the approved story file is the checkpoint), and commits it. Ablation
+    (performed): drop the append in `tickets_source.approve_paused_story_file` and
+    the resumed run pauses at `plan-checkpoint` again — this FAILS."""
+    row = ticket_row("1.1", refined=True, plan_checkpoint=True, file="story-cart-model.md")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(project_v7, tree)
+
+    assert engine.run().paused
+    paused = load_state(engine.run_dir)
+    assert (paused.paused_stage, paused.paused_story_key) == (PAUSE_PLAN_CHECKPOINT, "1.1")
+    assert paused.tasks == {} and adapter.sessions == []
+
+    resumed, adapter = _resumed(engine, tree, [_builds(project_v7, tree, plan)])
+    resumed.run()
+
+    state = load_state(engine.run_dir)
+    assert state.ticket_story_approvals == ["1.1"]
+    assert state.paused_stage is None and state.tasks["1.1"].phase == Phase.DONE
+    [session] = adapter.sessions
+    assert session.prompt.startswith(f"/{engine._dev_skill()} ticket 1.1 — ")
+    assert "Halt after planning." not in session.prompt
+    assert "BMAD_LOOP_PLAN_HALT" not in session.env
+    assert len(_kinds(resumed, "ticket-pick-halt")) == 1
+
+
+def test_unrefined_plan_checkpoint_two_leg(project_v7):
+    """An unrefined `plan_checkpoint` ticket runs two legs: leg 1 dispatches
+    `ticket 1.1 Halt after planning.` (with `BMAD_LOOP_PLAN_HALT`), its
+    `ready-for-dev` plan is verified, and the run pauses at `plan-checkpoint` with
+    the unit registered at DEV_VERIFY; the resume re-dispatches a plain `ticket
+    1.1`, which builds and commits. The checkpoint-family rows keep the mixin's
+    shape (`plan-halt`, `checkpoint-pause`, `checkpoint-resume`), and the resume
+    approves no story file. Ablation (performed): drop the tickets `_drive_story`
+    override and leg 1 commits without pausing — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", plan_checkpoint=True),))
+    plan = Path(tree.finds["1.1"].plan)
+    effect = _plans_then_builds(project_v7, tree, plan)
+    engine, adapter = make_engine(project_v7, tree, script=[effect])
+    skill = engine._dev_skill()
+
+    assert engine.run().paused
+
+    paused = load_state(engine.run_dir)
+    task = paused.tasks["1.1"]
+    assert (paused.paused_stage, paused.paused_story_key) == (PAUSE_PLAN_CHECKPOINT, "1.1")
+    assert task.phase == Phase.DEV_VERIFY and task.plan_checkpoint_pending
+    assert not task.plan_review_owed and not task.commit_sha
+    [leg_one] = adapter.sessions
+    assert leg_one.prompt.startswith(f"/{skill} ticket 1.1 Halt after planning. ")
+    assert leg_one.env["BMAD_LOOP_PLAN_HALT"] == "1"
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "ready-for-dev"
+    assert [e["story_key"] for e in _kinds(engine, "plan-halt")] == ["1.1"]
+    [pause] = _kinds(engine, "checkpoint-pause")
+    assert (pause["story_key"], pause["checkpoint"]) == ("1.1", "plan")
+    assert [e["story_key"] for e in _kinds(engine, "plan-halt-proof-of-work-skipped")] == ["1.1"]
+
+    resumed, adapter = _resumed(engine, tree, [effect])
+    resumed.run()
+
+    state = load_state(engine.run_dir)
+    assert state.tasks["1.1"].phase == Phase.DONE and state.tasks["1.1"].commit_sha
+    assert state.ticket_story_approvals == []
+    [leg_two] = adapter.sessions
+    assert leg_two.prompt.startswith(f"/{skill} ticket 1.1 — ")
+    assert "Halt after planning." not in leg_two.prompt
+    assert "BMAD_LOOP_PLAN_HALT" not in leg_two.env
+    assert [e["checkpoint"] for e in _kinds(resumed, "checkpoint-resume")] == ["plan"]
+    assert len(_kinds(resumed, "plan-halt")) == 1
+
+
+def test_plan_checkpoint_leg2_dispatches_on_uncommitted_ready_for_dev_plan(project_v7, monkeypatch):
+    """No interim commit (R12): between the legs the `ready-for-dev` plan is an
+    uncommitted change on the baseline, leg 2 launches on it as it stands, and
+    the unit's single squash commit carries the plan — accepted `done` — with
+    the code. Ablation (performed): commit the plan in `_pause_plan_checkpoint`
+    (an interim commit) and the HEAD-at-baseline assertion FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", plan_checkpoint=True),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    seen: list[str] = []
+    effect = _plans_then_builds(project_v7, tree, plan, seen=seen)
+    engine, _ = make_engine(project_v7, tree, script=[effect])
+    baseline = verify.rev_parse_head(project_v7.project)
+    rel = plan.relative_to(project_v7.project).as_posix()
+
+    assert engine.run().paused
+
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    assert verify.rev_parse_head(project_v7.project) == baseline
+    assert git(project_v7.project, "status", "--porcelain", "--", rel).strip().endswith(rel)
+
+    resumed, _ = _resumed(engine, tree, [effect])
+    resumed.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert seen == ["", "ready-for-dev"]
+    assert task.phase == Phase.DONE and task.baseline_commit == baseline
+    assert git(project_v7.project, "rev-list", "--count", f"{baseline}..HEAD").strip() == "1"
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+    assert git(project_v7.project, "show", f"{task.commit_sha}:src.txt").strip() == "cart model"
+    assert git(project_v7.project, "status", "--porcelain") == ""
+
+
+def _builds_then_more(layout: V7Layout, tree: FakeTicketTree, plan: Path, *more: str):
+    """`_builds`, after which the tree still offers ``more`` tickets."""
+    build = _builds(layout, tree, plan)
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        result = build(spec)
+        tree.next_view = _tree(
+            layout, ready_to_start=tuple(ticket_row(ref) for ref in more)
+        ).next_view
+        return result
+
+    return effect
+
+
+def test_done_checkpoint_pauses_after_commit(project_v7):
+    """A `done_checkpoint` ticket pauses at `story-checkpoint` once its unit is
+    committed, while another ticket is still to dispatch; the pause names the
+    commit and no second session starts. Ablation (performed): answer
+    `done_checkpoint=False` from `_entry_checkpoint_flags` and the run dispatches
+    1.2 instead — this FAILS."""
+    rows = (ticket_row("1.1", done_checkpoint=True),)
+    tree = _tree(project_v7, ready_to_start=rows, others=(ticket_row("1.2"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7, tree, script=[_builds_then_more(project_v7, tree, plan, "1.2")]
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    task = state.tasks["1.1"]
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_STORY_CHECKPOINT, "1.1")
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert len(adapter.sessions) == 1 and set(state.tasks) == {"1.1"}
+    [pause] = _kinds(engine, "checkpoint-pause")
+    assert (pause["checkpoint"], pause["commit"]) == ("story", task.commit_sha)
+
+
+def test_done_checkpoint_skipped_if_last(project_v7):
+    """A `done_checkpoint` on the run's last ticket does not pause: nothing is
+    left to dispatch, so the run finishes and journals `checkpoint-skip-last`.
+    Ablation (performed): answer False from `_schedule_complete` and the run
+    pauses at `story-checkpoint` — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", done_checkpoint=True),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(project_v7, tree, script=[_builds(project_v7, tree, plan)])
+
+    summary = engine.run()
+
+    state = load_state(engine.run_dir)
+    assert not summary.paused and state.finished
+    assert state.tasks["1.1"].phase == Phase.DONE
+    assert [e["story_key"] for e in _kinds(engine, "checkpoint-skip-last")] == ["1.1"]
+    assert _kinds(engine, "checkpoint-pause") == []
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["", "feat: {story_key}\n\nBuilt by the loop.\n\nSigned-off-by: Loop <loop@example.com>"],
+    ids=["default", "template-with-trailer"],
+)
+def test_unit_commit_has_ticket_trailers(project_v7, template):
+    """The unit's commit carries `Bmad-Ticket: <ref>` and `Bmad-Plan: <plan>`
+    (repo-relative) as git trailers — joined to a template's own trailer block,
+    which git still parses as one. Ablation (performed): drop the tickets
+    `_commit_message` override and no trailer is parsed — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    pol = dataclasses.replace(_policy(), scm=ScmPolicy(commit_message_template=template))
+    engine, _ = make_engine(project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)])
+
+    engine.run()
+
+    sha = load_state(engine.run_dir).tasks["1.1"].commit_sha
+    trailers = git(project_v7.project, "log", "-1", "--format=%(trailers:only,unfold)", sha)
+    rel = plan.relative_to(project_v7.project).as_posix()
+    want = ["Bmad-Ticket: 1.1", f"Bmad-Plan: {rel}"]
+    if template:
+        want.insert(0, "Signed-off-by: Loop <loop@example.com>")
+    assert trailers.strip().splitlines() == want
+    subject = git(project_v7.project, "log", "-1", "--format=%s", sha).strip()
+    assert subject == ("feat: 1.1" if template else "story 1.1: implemented via bmad-loop")
+
+
+def test_dirty_initiative_status_unreadable_pauses(project_v7, monkeypatch):
+    """The dirty-initiative gate fails closed: a checkout whose status cannot be
+    read pauses at `ticket-tree` before the ticket is registered. Ablation
+    (performed): return early on `GitError` and a session runs — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+
+    def refuse(_repo):
+        raise verify.GitError("git status failed")
+
+    monkeypatch.setattr(verify, "dirty_paths", refuse)
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert state.tasks == {} and adapter.sessions == []
+    [halt] = _kinds(engine, "ticket-pick-halt")
+    assert halt["cause"] == tickets_source.HALT_DIRTY_INITIATIVE

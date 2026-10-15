@@ -4878,6 +4878,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # remount) is re-bound (one `root-identity-rebound`). An inode mismatch is never
     # re-recorded — its pinned writes keep refusing.
     runs.reconcile_root_identities(state, run_dir, journal, project)
+    # A tickets run paused for a refined ticket's story-file approval: this resume
+    # is that approval, recorded while the pause still names the ticket and past
+    # every refusal above, so a refused resume approves nothing.
+    approved = tickets_source.approve_paused_story_file(state)
+    if approved is not None:
+        journal.append("ticket-story-approved", ref=approved)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever

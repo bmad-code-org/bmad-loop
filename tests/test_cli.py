@@ -12841,6 +12841,52 @@ def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
     assert "stub summary" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("registered", [False, True], ids=["refined-pick-pause", "unit-pause"])
+def test_resume_records_a_refined_story_file_approval(project, capsys, monkeypatch, registered):
+    """Resuming a tickets run paused at the pick's `plan-checkpoint` (a refined
+    ticket, no task recorded) is the operator's approval of its story file: the
+    ref joins `ticket_story_approvals`, persisted before the engine starts, and
+    `ticket-story-approved` is journaled. A registered unit's `plan-checkpoint`
+    pause (the two-leg flow) approves nothing. Real spawns: the tickets resume
+    preflight's. Ablation (performed): drop the `approve_paused_story_file` call
+    from `_prepare_resume_locked` and the refined row FAILS."""
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import StoryTask
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tasks = {"1.1": StoryTask(story_key="1.1", epic=0)} if registered else {}
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-f00d",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        paused_reason="approve story file",
+        paused_stage="plan-checkpoint",
+        paused_story_key="1.1",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+        tasks=tasks,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    seen: list[list[str]] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            seen.append(list(kw["state"].ticket_story_approvals))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+
+    want = [] if registered else ["1.1"]
+    assert seen == [want]
+    assert load_state(run_dir).ticket_story_approvals == want
+    approved = [e for e in Journal(run_dir).entries() if e.get("kind") == "ticket-story-approved"]
+    assert [e["ref"] for e in approved] == want
+
+
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
     """`run`'s tickets preflight refuses a store layout tickets runs do not drive
     yet — here an initiative folder that was never committed — with a FAIL line

@@ -28,6 +28,8 @@ from bmad_loop.model import (
     PAUSE_TICKET_REFINE,
     PAUSE_TICKET_TREE,
     Phase,
+    RunState,
+    StoryTask,
 )
 from bmad_loop.platform_util import safe_segment
 from bmad_loop.ticketmodel import EpicRow, NextView, StatusView, TicketRow
@@ -422,6 +424,32 @@ def test_backlog_is_never_picked():
     decision = ts.decide_pick(next_view, status_view, {}, {}, ())
 
     assert decision == ts.Skip(ts.SKIP_EMPTY)
+
+
+@pytest.mark.parametrize(
+    ("source", "stage", "key", "registered", "approved"),
+    [
+        ("tickets", PAUSE_PLAN_CHECKPOINT, "1.1", False, "1.1"),
+        ("tickets", PAUSE_PLAN_CHECKPOINT, "1.1", True, None),
+        ("tickets", PAUSE_TICKET_HITL, "1.1", False, None),
+        ("tickets", PAUSE_PLAN_CHECKPOINT, None, False, None),
+        ("stories", PAUSE_PLAN_CHECKPOINT, "1", False, None),
+    ],
+    ids=["refined-pick-pause", "unit-pause", "other-stage", "no-key", "stories-run"],
+)
+def test_approve_paused_story_file(source, stage, key, registered, approved):
+    """Only a tickets run's unregistered `plan-checkpoint` pause is a story-file
+    approval; every other paused state approves nothing, and approving twice
+    records the ref once. Ablation (performed): drop the source test and the
+    stories row approves its key — this FAILS."""
+    state = RunState(run_id="r", project="/p", started_at="now", source=source)
+    state.paused_stage, state.paused_story_key = stage, key
+    if registered and key:
+        state.tasks[key] = StoryTask(story_key=key, epic=0)
+
+    assert ts.approve_paused_story_file(state) == approved
+    assert ts.approve_paused_story_file(state) is None
+    assert state.ticket_story_approvals == ([approved] if approved else [])
 
 
 def test_halt_stages_cover_every_cause():

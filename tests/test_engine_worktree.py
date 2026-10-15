@@ -13266,3 +13266,100 @@ def test_abandon_refuses_while_the_moved_kept_unit_is_registered_under_the_run(
     assert (moved / "extra-notes.txt").is_file()
     assert _state_bytes(replay_dir) == before
     assert all(e["kind"] != "replay-abandoned" for e in Journal(replay_dir).entries())
+
+
+# --------------------------------------------- tickets: the dirty-initiative gate
+#
+# A tickets unit's commit stages the whole checkout, so a person's uncommitted edit
+# under the initiative folder would ride it; the gate pauses before the unit opens.
+# The run's own ledger writes there never trip it. Helpers from
+# tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
+
+
+def _mount_aware(engine, tree, main):
+    """Each unit mount reads the fake through its own tree (`_MountTree`), as
+    `tickets.py --project-root <mount>` would; the main checkout reads it as is."""
+    from test_tickets_engine import _MountTree
+
+    engine._ticket_tree_factory = lambda root, pin: (
+        tree if root == main else _MountTree(tree, main, root)
+    )
+    return engine
+
+
+def _tickets_worktree_engine(layout, tree, plan):
+    from test_tickets_engine import _builds, _policy, make_engine
+
+    pol = replace(_policy(), scm=ScmPolicy(isolation="worktree", delete_branch=False))
+    engine, adapter = make_engine(layout, tree, policy=pol, script=[_builds(layout, tree, plan)])
+    return _mount_aware(engine, tree, layout.project), adapter
+
+
+def test_dirty_initiative_pauses_before_unit_open(project_v7):
+    """An uncommitted file under the initiative folder that the run does not own
+    pauses the run at `ticket-tree` before the ticket's unit opens — no task, no
+    session, no worktree or unit branch — and the reason names the path. Once
+    the edit is committed, the resume re-picks the ticket and builds it.
+    Ablation (performed): drop the `_gate_dirty_initiative` call from
+    `_dispatch_ref` and the unit opens and builds — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _builds, _resumed, _tree
+
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    note = project_v7.initiative_folder / "operator-notes.md"
+    note.write_bytes(b"draft the cart rules\n")
+    rel = note.relative_to(project_v7.project).as_posix()
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert rel in (state.paused_reason or "")
+    assert state.tasks == {} and adapter.sessions == []
+    assert git(project_v7.project, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert git(project_v7.project, "branch", "--list", "bmad-loop/*").strip() == ""
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"], e["stage"]) for e in halts] == [
+        ("1.1", "dirty-initiative", PAUSE_TICKET_TREE)
+    ]
+
+    git(project_v7.project, "add", rel)
+    git(project_v7.project, "commit", "-q", "-m", "operator notes")
+    resumed, adapter = _resumed(engine, tree, [_builds(project_v7, tree, plan)])
+    _mount_aware(resumed, tree, project_v7.project).run()
+
+    assert load_state(engine.run_dir).tasks["1.1"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1
+
+
+def test_dirty_ledger_only_does_not_pause(project_v7):
+    """The deferred-work ledger lives in the initiative folder on v7 and the run
+    writes it outside a unit's commit, so an uncommitted ledger alone never trips
+    the dirty-initiative gate: the ticket builds and lands. Ablation (performed):
+    drop the `_run_owned_paths` exclusion and the run pauses at `ticket-tree` —
+    this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    from bmad_loop.bmadconfig import load_paths
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    ledger = load_paths(project_v7.project, want_tickets=True).deferred_work
+    assert ledger.is_relative_to(project_v7.initiative_folder), "premise: R8 ledger placement"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n")
+    rel = ledger.relative_to(project_v7.project).as_posix()
+    assert git(project_v7.project, "status", "--porcelain", "--", rel).strip(), "premise: dirty"
+
+    summary = engine.run()
+
+    state = load_state(engine.run_dir)
+    assert not summary.paused, state.paused_reason
+    assert state.tasks["1.1"].phase == Phase.DONE and len(adapter.sessions) == 1
+    assert not [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]

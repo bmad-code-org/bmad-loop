@@ -164,16 +164,17 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Gates and checkpoints
 
 - **Stability:** stable
-- **Description:** Run-global gates pause an unattended run at epic boundaries or after each story's dev pass so a human can review. Per-story checkpoints in stories mode pause before implementation or after the commit. `bmad-loop resume <run-id>` continues the run.
+- **Description:** Run-global gates pause an unattended run at epic boundaries or after each story's dev pass so a human can review. Per-story checkpoints in stories and tickets mode pause before implementation or after the commit. `bmad-loop resume <run-id>` continues the run.
 - **Properties:**
   - `[gates] mode = "none"` never pauses at a gate. `per-epic` (the default) pauses at each epic boundary. Any other value fails policy load.
   - Stories mode has no epics, so `per-epic` never pauses there.
   - `per-story-spec-approval` also pauses each story after its verified dev pass and before review and commit. On resume the story goes straight to review.
   - In stories mode, a `stories.yaml` entry with `spec_checkpoint: true` pauses after planning, before any code. On resume the implementation leg runs.
   - `done_checkpoint: true` pauses after the story commits. It is skipped for the last story to dispatch, at `--max-stories`, or when a graceful stop is pending.
+  - In tickets mode, an entry's `plan_checkpoint` follows the BMAD v7 contract. A refined ticket pauses before dispatch, and resuming approves its story file. An unrefined ticket pauses after a `Halt after planning.` leg, and resuming dispatches it again on the uncommitted plan. `done_checkpoint` pauses after the ticket commits, with the same skips as stories mode.
   - `[gates] on_escalation` is reserved. It is parsed but has no effect, and CRITICAL escalations always pause whatever its value.
 - **Config:** `[gates] mode`, `[gates] on_escalation` (reserved); stories.yaml per-entry `spec_checkpoint` / `done_checkpoint`; `bmad-loop resume <run_id>`
-- **Tested by:** `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_checkpoints.py`, `tests/test_policy.py`, `tests/test_settings_schema.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_checkpoints.py`, `tests/test_tickets_engine.py`, `tests/test_policy.py`, `tests/test_settings_schema.py`
 - **Docs:** [Configuration: [gates]](reference/configuration.md#gates), [Where a pause shows up](escalations-guide.md#where-a-pause-shows-up), [Reviewing a paused run in the TUI](tui-guide.md#reviewing-a-paused-run-p), [bmad-loop resume](reference/cli.md#resume)
 
 ### Retrospective handling

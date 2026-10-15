@@ -71,6 +71,7 @@ from .model import (
     PAUSE_TICKET_REFINE,
     PAUSE_TICKET_TREE,
     Phase,
+    RunState,
     TicketBinding,
 )
 from .statemachine import PLAN_BLOCKED, PLAN_STATUS_ORDER
@@ -93,6 +94,10 @@ HALT_FOREIGN_ACTIVE: Final = "foreign-active"
 HALT_STALLED: Final = "stalled"
 HALT_TREE_FAULT: Final = "tree-fault"
 HALT_PIN_MISMATCH: Final = "pin-mismatch"
+HALT_DIRTY_INITIATIVE: Final = "dirty-initiative"
+"""Raised by the engine, not :func:`decide_pick`: the checkout holds uncommitted
+edits under the initiative folder that this run does not own, so the picked
+ticket is not opened (``TicketsEngine._gate_dirty_initiative``)."""
 
 HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_REFINE: PAUSE_TICKET_REFINE,
@@ -105,6 +110,7 @@ HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_STALLED: PAUSE_TICKET_TREE,
     HALT_TREE_FAULT: PAUSE_TICKET_TREE,
     HALT_PIN_MISMATCH: PAUSE_TICKET_TREE,
+    HALT_DIRTY_INITIATIVE: PAUSE_TICKET_TREE,
 }
 """The pause stage each :class:`Halt` cause raises."""
 
@@ -238,6 +244,30 @@ def is_plan_halt_leg(row: TicketRow) -> bool:
     ``ticket <ref> Halt after planning.``, then a pause for plan approval. A
     refined ticket's checkpoint is its story file's approval, before dispatch."""
     return row.plan_checkpoint and not row.refined and not plan_planned(row.status)
+
+
+def approve_paused_story_file(state: RunState) -> str | None:
+    """Record the operator's approval of a refined ticket's story file, which a
+    resume of the pick's ``plan-checkpoint`` pause gives: the ticket's ref joins
+    ``state.ticket_story_approvals``, so the next pick dispatches it. Called on
+    the resume path before the pause is cleared.
+
+    Only that pause qualifies: a tickets run paused at ``plan-checkpoint`` on a
+    ref with no task. A registered unit's ``plan-checkpoint`` pause (an
+    unrefined ticket's planned plan, or a plan review owed after
+    implementation) is the two-leg flow's, resumed through its task. Returns
+    the ref newly approved, else None."""
+    ref = state.paused_story_key
+    if (
+        state.source != SOURCE_TICKETS
+        or state.paused_stage != PAUSE_PLAN_CHECKPOINT
+        or not ref
+        or ref in state.tasks
+        or ref in state.ticket_story_approvals
+    ):
+        return None
+    state.ticket_story_approvals.append(ref)
+    return ref
 
 
 THOROUGH_ALWAYS: Final = "always"
