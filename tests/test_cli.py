@@ -14688,6 +14688,26 @@ def _confirm_argv(paths, *extra):
     return ["confirm", "--project", str(paths.project), *extra]
 
 
+@pytest.mark.parametrize(
+    ("policy_text", "joins_board"),
+    [
+        pytest.param(None, True, id="no-policy"),
+        pytest.param('[stories]\nsource = "sprint-status"\n', True, id="sprint"),
+        pytest.param('[stories]\nsource = "stories"\n', True, id="stories"),
+        pytest.param('[stories]\nsource = "tickets"\n', False, id="tickets"),
+        pytest.param("[stories\n", True, id="unreadable"),
+    ],
+)
+def test_confirm_joins_the_board_per_source_trait(tmp_path, policy_text, joins_board):
+    """`confirm` joins park records to the sprint board only for a source with one
+    (`SourceTraits.sprint_board`); a policy it cannot read keeps the join. Ablation
+    (performed): return True unconditionally and the tickets row FAILS."""
+    if policy_text is not None:
+        (tmp_path / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / cli.POLICY_FILE).write_text(policy_text, encoding="utf-8")
+    assert cli._confirm_sprint_board(tmp_path) is joins_board
+
+
 def test_confirm_flips_spec_board_record_and_commits(project, capsys, monkeypatch):
     """The happy path, end to end. All four records move together: the spec gains
     its audit section and reaches done, the board advances through the sole

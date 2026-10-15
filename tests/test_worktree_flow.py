@@ -139,7 +139,7 @@ def _make_flow(
         state=(
             state
             if state is not None
-            else SimpleNamespace(target_branch="", run_id="run-1", tasks={})
+            else SimpleNamespace(target_branch="", run_id="run-1", tasks={}, source="sprint-status")
         ),
         journal=journal if journal is not None else _RecordingJournal(),
         run_dir=tmp_path,
@@ -536,6 +536,31 @@ def test_board_seed_skips_a_board_outside_the_project_tree(tmp_path):
 
     assert flow.paths.rebased(worktree).sprint_status == flow.paths.sprint_status
     assert flow._board_seed(worktree) == ()
+
+
+def test_worktree_tickets_unit_never_seeds_board(tmp_path):
+    """A tickets run has no sprint board (`SourceTraits.sprint_board`), so a stray
+    gitignored board at the configured path is neither seeded into a unit worktree
+    nor named as a drop, while the ledger seed is untouched. Ablation (performed):
+    drop the trait gate from `_board_seed` and the first assertion answers the
+    board's rel; drop it from `_artifact_seed_drops` and the escaping link below is
+    named."""
+    flow = _artifact_flow(tmp_path)
+    flow.state.source = "tickets"
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow._board_seed(worktree) == ()
+    flow.state.source = "sprint-status"
+    assert flow._board_seed(worktree) != ()
+
+    flow.state.source = "tickets"
+    flow.paths.sprint_status.unlink()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("development_status: {}\n", encoding="utf-8")
+    flow.paths.sprint_status.symlink_to(outside)
+    assert flow._artifact_seed_drops(worktree) == []
 
 
 # ------------------------------------------------------- symlinked artifact seeds

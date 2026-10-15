@@ -95,6 +95,10 @@ class SourceTraits:
       verified against the sprint board.
     - ``replay``: a standalone unit replay can read this source's queue.
     - ``runnable``: ``run`` can launch from it today.
+    - ``sprint_board``: the orchestrator's v6 sprint-board bookkeeping is armed —
+      a unit worktree is seeded with a gitignored board and parked-story records
+      are joined to their board row. Stories keeps it armed as it always was (the
+      seed drops an absent board); tickets has no board.
     """
 
     name: str
@@ -107,6 +111,7 @@ class SourceTraits:
     operator_park: bool
     replay: bool
     runnable: bool
+    sprint_board: bool
 
 
 TRAITS: Final[Mapping[str, SourceTraits]] = {
@@ -121,6 +126,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         operator_park=True,
         replay=True,
         runnable=True,
+        sprint_board=True,
     ),
     SOURCE_STORIES: SourceTraits(
         name=SOURCE_STORIES,
@@ -133,6 +139,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         operator_park=False,
         replay=False,
         runnable=True,
+        sprint_board=True,
     ),
     SOURCE_TICKETS: SourceTraits(
         name=SOURCE_TICKETS,
@@ -145,6 +152,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         operator_park=True,
         replay=False,
         runnable=False,
+        sprint_board=False,
     ),
 }
 

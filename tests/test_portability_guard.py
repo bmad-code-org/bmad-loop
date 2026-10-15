@@ -357,6 +357,32 @@ ISOLATION_CONFLICT_CALLERS = {
     ("tui/app.py", "_do_rearm"): 1,
 }
 
+# Every call to a spec frontmatter-status writer in src — `set_frontmatter_status`,
+# `set_frontmatter_status_anchored`, `devcontract.reset_spec_status` — as
+# `(file, enclosing function) -> count`, with who owns its tickets-mode answer. In
+# tickets mode `TicketTree.mark` is the only write path to a plan's `status`, so a
+# writer is either the engine seam (`Engine._spec_status_write`, which TicketsEngine
+# maps to `mark` or refuses) or a non-engine site whose tickets branch is named here.
+# A new caller fails `test_spec_status_writers_are_inventoried` until it is routed
+# through the seam or given a row and a tickets-mode decision.
+SPEC_STATUS_WRITERS = {
+    # the engine seam's base arms: adoption sets, the repair family resets. Routed
+    # sites: `_salvage_review_timeout`, `_reconcile_generic_terminal_frontmatter`,
+    # `_apply_adoption`, `_reset_spec_for_repair`.
+    ("engine.py", "_spec_status_write"): 2,
+    # the writer's own callee chain: `reset_spec_for_replan` re-opens a spec for the
+    # TUI's "Request replan" (tickets mode: `mark(reason="replan")`, the TUI session).
+    ("devcontract.py", "reset_spec_for_replan"): 1,
+    # `bmad-loop confirm` (tickets mode: `mark(reason="confirm")`, the park session).
+    ("cli.py", "_apply_confirmation"): 1,
+    # the resolve re-arm transaction (tickets mode: `mark(reason="rearm")` with a
+    # `restore_preimage` rollback, the resolve session).
+    ("runs.py", "_rearm_escalation_locked"): 1,
+    # the attempt-owned spec route after a byte restore (tickets mode:
+    # `restore_preimage` plus the rollback re-arm, the park/rollback session).
+    ("recovery_flow.py", "_normalize_attempt_owned_spec"): 1,
+}
+
 # What counts as consulting liveness, matched as a substring of the callee's name
 # because the two sites legitimately spell it differently and neither spelling is more
 # correct: the CLI calls ``runs.engine_liveness`` directly, the TUI goes through
@@ -499,6 +525,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # tickets_engine.py: the pick's closed halt token (`tickets_source.HALT_*`);
     # `ref` and `stage` ride the by-name benign row, `detail` is dropped by name.
     "ticket-pick-halt": frozenset({"cause"}),
+    # tickets_engine.py `_spec_status_write`: the plan status a refused engine write
+    # targeted and the closed refusal token (`no-plan-reason` / `unbound` /
+    # `not-bound-plan`); `site` is the closed `SpecWriteReason` (by-name benign).
+    "ticket-status-write-refused": frozenset({"target", "cause"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1969,12 +1999,14 @@ JOURNAL_KINDS = frozenset(
         "triage-decision",
         # tickets_engine.py — the tickets-mode pick: rows the pick passed over
         # (once per process each), and its pick-time pauses. A blocked plan pauses
-        # through the checkpoint mixin's `stories-wedged`.
+        # through the checkpoint mixin's `stories-wedged`. Plus an engine status
+        # write the plan chokepoint has no reason for, refused unwritten.
         "ticket-foreign-active",
         "ticket-hitl-pause",
         "ticket-pick-halt",
         "ticket-refine-pause",
         "ticket-skipped",
+        "ticket-status-write-refused",
         # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
         # mark/discard call (any outcome), one `ticket-plan-restored` per
         # byte-exact restore.
@@ -5141,6 +5173,63 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
     )
+
+
+SPEC_STATUS_WRITER_NAMES = frozenset(
+    {"set_frontmatter_status", "set_frontmatter_status_anchored", "reset_spec_status"}
+)
+
+
+def _spec_status_writer_calls(rel: str, source: str) -> Counter[tuple[str, str | None]]:
+    """``(rel, innermost enclosing function) -> calls`` to a spec status writer in
+    ``source``, by bare name or attribute (``verify.set_frontmatter_status``)."""
+    tree = ast.parse(source)
+    enclosing = _enclosing_function_names(tree)
+    calls: Counter[tuple[str, str | None]] = Counter()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in SPEC_STATUS_WRITER_NAMES:
+            calls[(rel, enclosing[id(node)])] += 1
+    return calls
+
+
+def _spec_status_writer_scan() -> Counter[tuple[str, str | None]]:
+    calls: Counter[tuple[str, str | None]] = Counter()
+    for path in _py_files():
+        rel = path.relative_to(SRC).as_posix()
+        calls += _spec_status_writer_calls(rel, path.read_text(encoding="utf-8"))
+    return calls
+
+
+def test_spec_status_writers_are_inventoried():
+    """Every spec frontmatter-status writer call in src sits at a declared
+    ``(file, function)`` with its declared count (`SPEC_STATUS_WRITERS`): in tickets
+    mode a plan's `status` moves only through `TicketTree.mark`, so a new writer
+    must route through `Engine._spec_status_write` or carry its own tickets-mode
+    decision in the table.
+
+    Ablation (in-test): one dummy caller added to engine.py's source reddens the
+    comparison; deleting a row (e.g. `_apply_confirmation`'s) reddens it too."""
+    scanned = _spec_status_writer_scan()
+    declared = Counter(SPEC_STATUS_WRITERS)
+    assert scanned == declared, (
+        "spec status writer call sites moved — route an engine write through "
+        "`Engine._spec_status_write`, or add a SPEC_STATUS_WRITERS row naming the "
+        "site's tickets-mode answer:\n"
+        f"  scanned:  {sorted(scanned.items(), key=str)}\n"
+        f"  declared: {sorted(declared.items(), key=str)}"
+    )
+    dummy = "def _sneaky(spec):\n    verify.set_frontmatter_status(spec, 'done')\n"
+    engine_source = (SRC / "engine.py").read_text(encoding="utf-8") + "\n\n" + dummy
+    with_dummy = scanned - _spec_status_writer_calls(
+        "engine.py", (SRC / "engine.py").read_text(encoding="utf-8")
+    )
+    with_dummy += _spec_status_writer_calls("engine.py", engine_source)
+    assert with_dummy != declared
+    assert with_dummy[("engine.py", "_sneaky")] == 1
 
 
 def _journal_measured_splats(findings) -> Counter[tuple[str, str | None]]:

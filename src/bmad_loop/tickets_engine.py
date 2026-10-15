@@ -43,16 +43,17 @@ and the orchestrator alone owns ``done``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, NoReturn
 
 from . import gates, verify
 from .adapters.base import SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
-from .engine import Engine, RunPaused
+from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
 from .frontmatter import parse_frontmatter, status_of
 from .model import StoryTask, TicketBinding, VerifyOutcome, result_mapping
+from .statemachine import PlanWriteReason
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
     HALT_HITL,
@@ -78,6 +79,28 @@ from .worksource import WorkRef, WorkSource
 
 TicketTreeFactory = Callable[[Path, str | None], TicketTreeLike]
 """Builds the run's tree from ``(project_root, pinned_initiative)``."""
+
+PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
+    # a kept branch adopted as finished: the orchestrator's acceptance (built → done)
+    ("adoption", verify.PLAN_DONE): "accept",
+    # a repair leg re-opens the plan in place
+    ("repair", "in-progress"): "repair",
+    # ("salvage", "built") is refused (`no-plan-reason`) until the plan table gains
+    # its pending `salvage` reason ({in-progress, in-review} → built); salvage then
+    # maps here and never targets `done`.
+}
+"""The engine status writes tickets mode makes, as ``(engine reason, target) →
+plan-transition reason``; every other pair is refused
+(:meth:`TicketsEngine._spec_status_write`)."""
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two paths name the same file once resolved; False when either
+    cannot be resolved."""
+    try:
+        return a.resolve() == b.resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
@@ -625,6 +648,75 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if outcome.ok:
             self._accept_review_artifact_source(task)
         return outcome
+
+    # ------------------------------------------------- plan status and board
+
+    def _workspace_ticket_tree(self) -> TicketTreeLike:
+        """The tree that owns the active workspace's plans: the run's own in
+        place, one built for the unit worktree's project under isolation (its
+        ``find`` names the worktree's copy of the plan)."""
+        project = self.workspace.paths.project
+        if project == self.paths.project:
+            return self.ticket_tree
+        return self._ticket_tree_factory(project, self.state.initiative or None)
+
+    def _spec_status_write(
+        self,
+        task: StoryTask,
+        spec: Path,
+        target: str,
+        reason: SpecWriteReason,
+        *,
+        confine_root: Path,
+    ) -> bool:
+        """Every engine status write lands on the bound plan through
+        ``TicketTree.mark`` with its plan-transition reason
+        (:data:`PLAN_WRITE_REASONS`), or is refused: nothing else writes a plan's
+        ``status`` in tickets mode.
+
+        Refused, with ``ticket-status-write-refused`` journaled and nothing
+        written: a ``(reason, target)`` pair with no plan-transition reason — a
+        salvage reset (``in-review → built`` has none; salvage converges only on a
+        plan already at ``built``), a reconcile from the session's own prose, an
+        adoption park (the park conversion owns ``awaiting-operator``) — and a
+        write to anything but the bound plan. A mapped write that ``mark`` refuses
+        or cannot make raises its ``TicketsError``, as the base writer's faults
+        do. Returns whether the plan changed."""
+        del confine_root
+        plan_reason = PLAN_WRITE_REASONS.get((reason, target))
+        plan = self._bound_plan(task)
+        ticket = task.ticket
+        if plan_reason is None:
+            why = "no-plan-reason"
+        elif plan is None or ticket is None:
+            why = "unbound"
+        elif not _same_file(spec, plan):
+            why = "not-bound-plan"
+        else:
+            mark = self._workspace_ticket_tree().mark(
+                ticket.ref,
+                target,
+                reason=plan_reason,
+                expected_plan=plan,
+                journal=self.journal,
+            )
+            return mark.outcome == "written"
+        self.journal.append(
+            "ticket-status-write-refused",
+            story_key=task.story_key,
+            site=reason,
+            target=target,
+            cause=why,
+        )
+        raise SpecStatusWriteRefused(reason, target, why)
+
+    def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """No-op: tickets mode has no sprint board to mirror the plan onto, so no
+        ``board_advance_intended`` is ever recorded either."""
+
+    def _carry_board_advance(self, task: StoryTask) -> None:
+        """No-op: there is no sprint board to carry an advance to, whatever a
+        restored task's ``board_advance_intended`` says."""
 
     def _review_demotion_parks(self) -> bool:
         """False: a review demotion parks through the sprint board in the base

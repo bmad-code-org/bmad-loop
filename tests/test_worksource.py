@@ -71,6 +71,7 @@ def test_v6_traits_are_pinned():
         "operator_park": True,
         "replay": True,
         "runnable": True,
+        "sprint_board": True,
     }
     assert dataclasses.asdict(worksource.TRAITS["stories"]) == {
         "name": "stories",
@@ -83,13 +84,15 @@ def test_v6_traits_are_pinned():
         "operator_park": False,
         "replay": False,
         "runnable": True,
+        "sprint_board": True,
     }
 
 
 def test_tickets_traits_are_pinned():
     """The ticket-tree source is registered but not runnable yet: it has no
     numbered epics (its epics are keyed by slug), no spec folder, no stories
-    primitive, no sentinels and no replay; it parks at awaiting-operator."""
+    primitive, no sentinels, no replay and no sprint board; it parks at
+    awaiting-operator."""
     assert dataclasses.asdict(worksource.TRAITS["tickets"]) == {
         "name": "tickets",
         "label": "tickets mode — BMAD v7 ticket tree",
@@ -101,6 +104,7 @@ def test_tickets_traits_are_pinned():
         "operator_park": True,
         "replay": False,
         "runnable": False,
+        "sprint_board": False,
     }
 
 

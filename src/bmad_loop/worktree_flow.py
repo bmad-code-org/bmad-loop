@@ -2101,20 +2101,26 @@ class WorktreeFlow:
         board escapes, via the rollback's ``reset --hard``. Seeding neither
         introduces the trap nor widens it.
 
+        Nothing for a source without a sprint board (``SourceTraits.sprint_board``):
+        tickets mode never reads or writes one, so a stray board file at the
+        configured path is not seeded either.
+
         Deduped against ``scm.worktree_seed`` by the caller.
         """
+        if not worksource.resumed_traits_for(self.state.source).sprint_board:
+            return ()
         return _artifact_seed(self.paths.sprint_status, *self._mount_roots(worktree))
 
     def _artifact_seed_drops(self, worktree: Path) -> list[str]:
         """The ledger's and board's configured rels that :meth:`_ledger_seed` /
         :meth:`_board_seed` excluded as out-of-project and the worktree still lacks
         (DW-432) — project-relative, deduped, ledger first. Naming only; run after
-        provisioning. See :func:`_artifact_seed_dropped`."""
+        provisioning. See :func:`_artifact_seed_dropped`. A source without a sprint
+        board names no board drop, since it seeds none."""
         roots = self._mount_roots(worktree)
-        drops = [
-            *_artifact_seed_dropped(self.paths.deferred_work, *roots),
-            *_artifact_seed_dropped(self.paths.sprint_status, *roots),
-        ]
+        drops = [*_artifact_seed_dropped(self.paths.deferred_work, *roots)]
+        if worksource.resumed_traits_for(self.state.source).sprint_board:
+            drops.extend(_artifact_seed_dropped(self.paths.sprint_status, *roots))
         return list(dict.fromkeys(drops))
 
     def _accepted_spec_seed(

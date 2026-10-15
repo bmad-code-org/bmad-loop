@@ -289,6 +289,23 @@ class RunPaused(Exception):
         self.story_key = story_key
 
 
+SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair"]
+"""Why an engine site writes a spec's frontmatter ``status`` — the token
+:meth:`Engine._spec_status_write` receives, one per writer site."""
+
+
+class SpecStatusWriteRefused(RuntimeError):
+    """:meth:`Engine._spec_status_write` refused a write the run's mode does not
+    allow: nothing was written. A ``RuntimeError``, so a repair-write site that
+    does not catch it fails as loudly as a write that raised."""
+
+    def __init__(self, reason: SpecWriteReason, target: str, why: str):
+        super().__init__(f"{reason} write to status {target!r} refused: {why}")
+        self.reason = reason
+        self.target = target
+        self.why = why
+
+
 class RunStopped(Exception):
     """Raised to unwind the loop cleanly so the engine can mark the run `stopped`
     (a deliberate stop, distinct from a crash).
@@ -4169,20 +4186,22 @@ class Engine:
         if fm is None:
             return False
         fm_status = verify.status_of(fm)
-        if fm_status not in ("done", "in-review"):
+        success_status = self._dev_success_status()
+        if fm_status not in (success_status, "in-review"):
             return False
         reset_from: str | None = None
         if fm_status == "in-review":
             # Repair-write doctrine: these raise on an unreadable spec rather
-            # than silently proceeding stale (see _reset_spec_for_repair).
+            # than silently proceeding stale (see _reset_spec_for_repair). A mode
+            # that refuses the reset leaves salvage inapplicable, before any write.
             reset_from = fm_status
             confine_root = self.workspace.paths.project
-            devcontract.reset_spec_status(
-                spec_path,
-                "done",
-                confine_root=confine_root,
-                root_identity=self._mount_root_identity(task, confine_root),
-            )
+            try:
+                self._spec_status_write(
+                    task, spec_path, success_status, "salvage", confine_root=confine_root
+                )
+            except SpecStatusWriteRefused:
+                return False
             devcontract.strip_auto_run_result(
                 spec_path,
                 confine_root=confine_root,
@@ -5131,13 +5150,18 @@ class Engine:
             return fm_status  # no terminal prose, or blocked: leave for escalation
         # Repair-write doctrine: the False arm is "nothing to change" only. A status
         # the reader can see but no line edit can move raises instead, and that raise
-        # is deliberately left uncaught (see _reset_spec_for_repair).
-        if not devcontract.reset_spec_status(
-            spec_path,
-            success_status,
-            confine_root=self.workspace.paths.project,
-            root_identity=self._mount_root_identity(task, self.workspace.paths.project),
-        ):
+        # is deliberately left uncaught (see _reset_spec_for_repair). A mode that
+        # refuses the write leaves the status for verification, as a no-op would.
+        try:
+            if not self._spec_status_write(
+                task,
+                spec_path,
+                success_status,
+                "reconcile",
+                confine_root=self.workspace.paths.project,
+            ):
+                return fm_status
+        except SpecStatusWriteRefused:
             return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
         # the now-reconciled spec (the followup flag is only carried on a done exit).
@@ -5296,14 +5320,11 @@ class Engine:
                 if verify.status_of(fm) == verify.AWAITING_OPERATOR and actions:
                     task.operator_actions = list(actions)
             target = verify.AWAITING_OPERATOR if task.operator_actions else "done"
-            verify.set_frontmatter_status(
-                spec,
-                target,
-                confine_root=self.workspace.root,
-                root_identity=self._mount_root_identity(task, self.workspace.root),
+            self._spec_status_write(
+                task, spec, target, "adoption", confine_root=self.workspace.root
             )
             status = verify.status_of(verify.read_frontmatter(spec))
-        except (OSError, FrontmatterWriteError) as e:
+        except (OSError, FrontmatterWriteError, SpecStatusWriteRefused) as e:
             self._escalate(
                 task,
                 f"cannot adopt {task.story_key}: setting the status of {spec} failed "
@@ -8931,16 +8952,40 @@ class Engine:
         # attempt against a spec still reading `done` — step-01 would ingest it as
         # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         confine_root = self.workspace.paths.project
-        devcontract.reset_spec_status(
-            resolved,
-            "in-progress",
-            confine_root=confine_root,
-            root_identity=self._mount_root_identity(task, confine_root),
-        )
+        self._spec_status_write(task, resolved, "in-progress", "repair", confine_root=confine_root)
         devcontract.strip_auto_run_result(
             resolved,
             confine_root=confine_root,
             root_identity=self._mount_root_identity(task, confine_root),
+        )
+
+    def _spec_status_write(
+        self,
+        task: StoryTask,
+        spec: Path,
+        target: str,
+        reason: SpecWriteReason,
+        *,
+        confine_root: Path,
+    ) -> bool:
+        """The engine's one write path to a spec's frontmatter ``status``: every
+        engine writer site calls it with its own ``reason``
+        (``tests/test_portability_guard.py::SPEC_STATUS_WRITERS`` pins the sites).
+
+        The base makes each site's own write, unchanged: ``adoption`` sets an
+        existing ``status`` line (``verify.set_frontmatter_status``), and the
+        repair-family reasons fill or insert it (``devcontract.reset_spec_status``),
+        both confined to ``confine_root`` and pinned to its mount identity. Returns
+        the writer's "changed" answer; a fault raises, per the repair-write
+        doctrine. A mode whose status writes go elsewhere overrides this, and may
+        raise :class:`SpecStatusWriteRefused` for a write it does not allow."""
+        root_identity = self._mount_root_identity(task, confine_root)
+        if reason == "adoption":
+            return verify.set_frontmatter_status(
+                spec, target, confine_root=confine_root, root_identity=root_identity
+            )
+        return devcontract.reset_spec_status(
+            spec, target, confine_root=confine_root, root_identity=root_identity
         )
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:

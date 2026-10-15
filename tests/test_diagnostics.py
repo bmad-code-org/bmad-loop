@@ -303,6 +303,30 @@ def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
     assert foreign["status"] == "built"
 
 
+def test_ticket_status_write_refusal_keeps_its_closed_tokens():
+    """A refused engine status write keeps the site, the plan status it targeted
+    and the refusal token — all closed vocabularies — so a bundle shows which
+    writer tickets mode turned away."""
+    refused = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-status-write-refused",
+            "story_key": "1.1",
+            "site": "salvage",
+            "target": "built",
+            "cause": "no-plan-reason",
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert (refused["site"], refused["target"], refused["cause"]) == (
+        "salvage",
+        "built",
+        "no-plan-reason",
+    )
+
+
 def test_artifact_size_refusal_rejects_malformed_safe_fields():
     scrubbed = diagnostics._scrub_entry(
         {

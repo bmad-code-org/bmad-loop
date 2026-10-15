@@ -8,6 +8,7 @@ injected `FakeTicketTree`. Real-spawn budget: none.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from bmad_loop import tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import load_paths
-from bmad_loop.engine import Engine, RunPaused
+from bmad_loop.engine import Engine, RunPaused, SpecStatusWriteRefused
 from bmad_loop.frontmatter import parse_frontmatter, status_of
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
@@ -389,12 +390,17 @@ def test_dev_prompt_uses_ticket_ref(project_v7):
 
     plan = Path(tree.finds["1.1"].plan)
     _write_plan(plan, "built")
+    # the tree reads the plan the dev leg built, as `tickets.py find` would
+    tree.finds["1.1"] = dataclasses.replace(
+        tree.finds["1.1"], row=ticket_row("1.1", status="built")
+    )
     task.spec_file = str(plan)
     feedback = project_v7.project / "feedback.md"
     repair = engine._dev_prompt(task, feedback)
 
     assert repair.startswith(f"/{skill} ticket 1.1 — resume the autonomous dev session")
     assert repair.split("`")[-2] == str(feedback)
+    assert [(m.target, m.reason) for m in tree.marks] == [("in-progress", "repair")]
 
 
 @pytest.mark.parametrize(
@@ -604,3 +610,205 @@ def test_tickets_unit_reaches_commit_with_the_plan_at_built(project_v7):
     committed = git(project_v7.project, "show", f"{task.commit_sha}:{rel}")
     assert status_of(parse_frontmatter(committed)) == "built"
     assert tree.marks == []
+
+
+# ------------------------------------------------- plan-status writers (R19)
+#
+# Every engine status write goes through `Engine._spec_status_write`; tickets mode
+# maps it onto `TicketTree.mark` with a plan-transition reason or refuses it with
+# nothing written (`ticket-status-write-refused`). One row per engine writer site.
+
+
+def _marking_tree(tree: FakeTicketTree, plan: Path, monkeypatch) -> None:
+    """Make the fake's written marks land on the plan file too, as the real
+    `tickets.py mark` does, so a read-back after the mark sees them."""
+    real = tree.mark
+
+    def mark(ref, target, **kw):
+        result = real(ref, target, **kw)
+        if result.outcome == "written":
+            _write_plan(plan, target)
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark)
+
+
+def _refusals(engine: TicketsEngine) -> list[tuple[str, str, str]]:
+    return [
+        (e["site"], e["target"], e["cause"]) for e in _kinds(engine, "ticket-status-write-refused")
+    ]
+
+
+def test_salvage_review_timeout_marks_built_not_done(project_v7, monkeypatch):
+    """`review.on_timeout = "salvage-if-done"` converges a tickets review only on a
+    plan already at `built`: no write. A plan the dying review left `in-review`
+    needs an `in-review → built` write, which no plan-transition reason allows yet
+    (the table's `salvage` reason is pending), so the write is a typed, journaled
+    refusal before anything is written and salvage falls back to the timeout's
+    default routing — and the target it asked for is `built`, never `done`. Once
+    the `salvage` reason lands, this row flips to a `mark(reason="salvage")`.
+    Ablation (performed): drop the tickets
+    `_spec_status_write` override and the in-review plan is reset on disk to
+    `built` behind the chokepoint's back — the status assertion FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-review"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    task.spec_file = str(plan)
+    gated: list[str] = []
+
+    def gate(task, **kw):
+        gated.append(status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))))
+        return verify.VerifyOutcome.retry("stub gate")
+
+    monkeypatch.setattr(engine, "_review_verify_gate", gate)
+    timed_out = SessionResult(status="timeout")
+
+    _write_plan(plan, "in-review")
+    assert engine._salvage_review_timeout(task, timed_out) is False
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "in-review"
+    assert _refusals(engine) == [("salvage", "built", "no-plan-reason")]
+    assert gated == [] and tree.marks == []
+
+    _write_plan(plan, "built")
+    assert engine._salvage_review_timeout(task, timed_out) is False  # the stub gate
+    assert gated == ["built"]
+    assert tree.marks == [] and len(_refusals(engine)) == 1
+
+
+def test_reconcile_generic_frontmatter_refused_in_tickets_mode(project_v7):
+    """The generic reconcile promotes a spec from its own `## Auto Run Result`
+    prose. A plan's status moves only through `mark`, and no plan-transition reason
+    lets a session's prose write `built`, so tickets mode refuses it: the plan stays
+    `in-progress` for verification to judge. Ablation (performed): drop the tickets
+    override and the plan is rewritten to `built` — this FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-progress"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "in-progress")
+    plan.write_bytes(plan.read_bytes() + b"\n## Auto Run Result\n\nStatus: built\n")
+    result = {"spec_file": str(plan), "status": "in-progress"}
+
+    fm = parse_frontmatter(plan.read_text(encoding="utf-8"))
+    status = engine._reconcile_generic_terminal_frontmatter(task, result, plan, fm)
+
+    assert status == "in-progress" and result["status"] == "in-progress"
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "in-progress"
+    assert _refusals(engine) == [("reconcile", "built", "no-plan-reason")]
+    assert _kinds(engine, "spec-status-reconciled") == [] and tree.marks == []
+
+
+def test_adoption_routes_through_chokepoint(project_v7, monkeypatch):
+    """Adopting a kept unit as finished is the orchestrator's acceptance: `mark
+    <ref> done` with reason `accept`, against the bound plan, read back from disk.
+    Ablation (performed): drop the tickets override and the plan is set `done`
+    with no `mark` — `tree.marks` is empty and this FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="built"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    task.spec_file = str(plan)
+    task.phase = Phase.COMMITTING
+    _write_plan(plan, "built")
+    _marking_tree(tree, plan, monkeypatch)
+
+    engine._apply_adoption(task)
+
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "done", "accept", plan)
+    ]
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "done"
+    assert task.phase == Phase.COMMITTING and _refusals(engine) == []
+
+
+def test_adoption_park_refused_and_escalates(project_v7):
+    """An adopted unit that owes operator actions would be set `awaiting-operator`,
+    which is a session status, not one `mark` writes: refused, nothing written, and
+    the adoption escalates as any unwritable spec does. Ablation (performed): map
+    `("adoption", "awaiting-operator")` in `PLAN_WRITE_REASONS` and the fake's
+    transition table raises a different error — the refusal row FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="built"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    task.spec_file = str(plan)
+    task.phase = Phase.COMMITTING
+    task.operator_actions = ["publish the DNS record"]
+    _write_plan(plan, "built")
+
+    with pytest.raises(RunPaused):
+        engine._apply_adoption(task)
+
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
+    assert _refusals(engine) == [("adoption", "awaiting-operator", "no-plan-reason")]
+    assert tree.marks == [] and task.phase == Phase.ESCALATED
+
+
+def test_repair_reset_marks_in_progress_through_chokepoint(project_v7):
+    """A repair leg re-opens the bound plan with `mark <ref> in-progress`, reason
+    `repair`, then strips the stale terminal section. Ablation (performed): drop the
+    tickets override and the reset is a raw `reset_spec_status` — no mark."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="built"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    task.spec_file = str(plan)
+    _write_plan(plan, "built")
+    plan.write_bytes(plan.read_bytes() + b"\n## Auto Run Result\n\nStatus: built\n")
+
+    engine._reset_spec_for_repair(task)
+
+    assert [(m.ref, m.target, m.reason) for m in tree.marks] == [("1.1", "in-progress", "repair")]
+    assert "## Auto Run Result" not in plan.read_text(encoding="utf-8")
+
+
+def test_status_write_to_another_file_is_refused(project_v7):
+    """A mapped write aimed at anything but the bound plan is refused unwritten:
+    the chokepoint marks tickets, never arbitrary files. Ablation (performed): drop
+    the bound-plan check and the mark lands on the ticket instead — this FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="built"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    other = project_v7.initiative_folder / "other-plan.md"
+    _write_plan(other, "built")
+
+    with pytest.raises(SpecStatusWriteRefused):
+        engine._spec_status_write(
+            task, other, "in-progress", "repair", confine_root=project_v7.project
+        )
+
+    assert _refusals(engine) == [("repair", "in-progress", "not-bound-plan")]
+    assert tree.marks == []
+
+
+def _stray_board(engine: TicketsEngine, key: str) -> tuple[Path, bytes]:
+    """A sprint board at the configured path that nothing in tickets mode owns."""
+    board = engine.paths.sprint_status
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_bytes(f"development_status:\n  {key}: ready-for-dev\n".encode())
+    return board, board.read_bytes()
+
+
+def test_tickets_unit_never_touches_sprint_status(project_v7):
+    """Sprint bookkeeping is neutral in tickets mode: a parked plan does not mirror
+    onto a board (`_post_dev_state_sync`), and a restored task's
+    `board_advance_intended` is never carried (`_carry_board_advance`) — a stray
+    board keeps its bytes and no `board-advance-*` row is journaled. Ablation
+    (performed): drop either override and the board's row is advanced — the bytes
+    assertion FAILS."""
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-progress"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, verify.AWAITING_OPERATOR)
+    board, before = _stray_board(engine, "1.1")
+
+    engine._post_dev_state_sync(task, {"spec_file": str(plan)})
+    assert task.board_advance_intended in (None, "")
+
+    task.board_advance_intended = "done"
+    engine._carry_board_advance(task)
+
+    assert board.read_bytes() == before
+    assert [e for e in engine.journal.entries() if e["kind"].startswith("board-advance")] == []
