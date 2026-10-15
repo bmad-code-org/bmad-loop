@@ -69,6 +69,8 @@ that ticket is live. Two more errors belong to writes:
   (also a ``statemachine.PlanTransitionRefused``).
 - :class:`TicketsReadBackMismatch` — the plan read back after a write does not
   hold what was written.
+- :class:`TicketsPlanIOError` — bmad-loop's own read, write or delete of the
+  plan file raised ``OSError``.
 """
 
 from __future__ import annotations
@@ -192,6 +194,12 @@ class TicketsReadBackMismatch(TicketsError):
     """The plan read back after a write does not hold what was written."""
 
     kind = "read-back"
+
+
+class TicketsPlanIOError(TicketsError):
+    """bmad-loop's own native read, write or delete of a plan raised ``OSError``."""
+
+    kind = "plan-io"
 
 
 @dataclass(frozen=True)
@@ -535,7 +543,10 @@ class TicketTree:
                         why = f"the plan is unreadable: {e}"
                     if why:
                         raise TicketsTransitionRefused(ref, before, "", "rollback", why)
-                    plan.unlink()
+                    try:
+                        plan.unlink()
+                    except OSError as e:
+                        raise TicketsPlanIOError(f"{ref}: cannot delete {plan}: {e}") from e
                     result = PlanMark(ref, plan, before, "", "discarded")
         except TicketsError as e:
             _journal_mark(
@@ -572,12 +583,15 @@ class TicketTree:
         try:
             with self._plan_lock(plan):
                 before = _status_or_unknown(plan)
-                if data is None:
-                    plan.unlink(missing_ok=True)
-                    restored = not plan.exists()
-                else:
-                    platform_util.atomic_write_bytes(plan, data)
-                    restored = plan.read_bytes() == data
+                try:
+                    if data is None:
+                        plan.unlink(missing_ok=True)
+                        restored = not plan.exists()
+                    else:
+                        platform_util.atomic_write_bytes(plan, data)
+                        restored = plan.read_bytes() == data
+                except OSError as e:
+                    raise TicketsPlanIOError(f"cannot restore {plan}: {e}") from e
                 after = _status_or_unknown(plan)
         finally:
             journal.append(
@@ -595,13 +609,17 @@ def _plan_fields(plan: Path) -> tuple[bool, str, str]:
     """``(exists, status, blocked_reason)`` of a plan, read natively. ``status``
     is ``frontmatter.status_of``'s normalized token — states are compared that
     way, never as bytes (the script's quoting of values may change). A leading
-    UTF-8 byte-order mark is skipped, as the script keeps one it finds."""
+    UTF-8 byte-order mark is skipped, as the script keeps one it finds. A read
+    ``OSError`` raises :class:`TicketsPlanIOError`, so it reaches the callers'
+    ``ticket-mark`` failure record."""
     if not plan.is_file():
         return False, "", ""
     try:
         text = plan.read_bytes().decode("utf-8-sig")
     except UnicodeDecodeError:
         text = ""  # no readable frontmatter, as `frontmatter.read_frontmatter` degrades
+    except OSError as e:
+        raise TicketsPlanIOError(f"cannot read {plan}: {e}") from e
     fm = frontmatter.parse_frontmatter(text)
     raw = fm.get("blocked_reason", "")
     return True, frontmatter.status_of(fm), "" if raw is None else str(raw)
@@ -611,7 +629,7 @@ def _status_or_unknown(plan: Path) -> str:
     """The plan's status for a journal record; ``"?"`` when it cannot be read."""
     try:
         return _plan_fields(plan)[1]
-    except OSError:
+    except TicketsPlanIOError:
         return "?"
 
 

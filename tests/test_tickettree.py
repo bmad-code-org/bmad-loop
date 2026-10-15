@@ -43,6 +43,7 @@ from bmad_loop.tickettree import (
     TicketsLockBusy,
     TicketsNoMatch,
     TicketsPinMismatch,
+    TicketsPlanIOError,
     TicketsPlanMismatch,
     TicketsReadBackMismatch,
     TicketsSchemaError,
@@ -794,6 +795,71 @@ def test_discard_unbuilt_plan_reads_a_bom_plan_as_frontmatter_only(tmp_path, mon
     result = tree.discard_unbuilt_plan("1.1", plan, journal)
     assert (result.outcome, result.before) == ("discarded", "in-progress")
     assert not plan.exists()
+
+
+def _unreadable(monkeypatch: pytest.MonkeyPatch, plan: Path) -> None:
+    """From now on, reading ``plan``'s bytes raises ``PermissionError``."""
+    real = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self == plan:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+
+def test_mark_retypes_a_plan_read_oserror(tmp_path, monkeypatch, journal):
+    """A plan that turns unreadable — before the decision, or between the `mark`
+    child and the read-back — raises the typed `TicketsPlanIOError`, and the
+    call still journals its `failed` `ticket-mark` (status `?`).
+
+    Ablation: drop the `except OSError` arm in `_plan_fields` and this reddens —
+    the raw `PermissionError` escapes past the failure record."""
+    tree, plan, fake = _tree_with_plan(tmp_path, monkeypatch, "built")
+    fake.on_mark = lambda: _unreadable(monkeypatch, plan)
+    with pytest.raises(TicketsPlanIOError, match="cannot read"):
+        tree.mark("1.1", "done", reason="accept", expected_plan=plan, journal=journal)
+    assert fake.events == ["find", "mark"]
+
+    with pytest.raises(TicketsPlanIOError):
+        tree.mark("1.1", "done", reason="accept", expected_plan=plan, journal=journal)
+    assert fake.events == ["find", "mark", "find"]
+
+    rows = [(e["before"], e["after"], e["outcome"]) for e in _marks(journal)]
+    assert rows == [("built", "?", "failed"), ("", "?", "failed")]
+
+
+def test_discard_and_restore_retype_a_plan_oserror(tmp_path, monkeypatch, journal):
+    """A delete or write of the plan that raises `OSError` surfaces as
+    `TicketsPlanIOError`, after the `ticket-mark` / `ticket-plan-restored`
+    failure record.
+
+    Ablation: drop either `except OSError` arm (around `plan.unlink()` in
+    `discard_unbuilt_plan`, or the restore body) and this reddens."""
+    tree, plan, _ = _tree_with_plan(tmp_path, monkeypatch, "in-progress")
+    plan.write_text("---\nticket: 1\nstatus: in-progress\n---\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == plan:
+            raise PermissionError(13, "Permission denied", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(TicketsPlanIOError, match="cannot delete"):
+        tree.discard_unbuilt_plan("1.1", plan, journal)
+    assert plan.exists()
+    assert [e["outcome"] for e in _marks(journal)] == ["failed"]
+
+    def no_write(path, data, **kw):
+        raise OSError(28, "No space left on device", str(path))
+
+    monkeypatch.setattr(platform_util, "atomic_write_bytes", no_write)
+    with pytest.raises(TicketsPlanIOError, match="cannot restore"):
+        tree.restore_preimage(plan, b"---\nstatus: built\n---\n", journal)
+    restored = [e for e in journal.entries() if e["kind"] == "ticket-plan-restored"]
+    assert [e["outcome"] for e in restored] == ["failed"]
 
 
 def test_fake_ticket_tree_decides_marks_with_the_real_table(tmp_path: Path):
