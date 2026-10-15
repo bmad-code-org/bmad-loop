@@ -12326,6 +12326,10 @@ def _escalated_replay(project, tmp_path, monkeypatch):
     )
     _assert_replay_merge_refused(project, replay_dir)
     monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    # The removal guard's real `list-sessions` reports a failed query through
+    # `warn` — under a loaded xdist leg that note lands in the exact-notes
+    # assertions of the delete tests. No session is live here; answer so.
+    monkeypatch.setattr(runs, "mux_sessions", lambda *, on_fault=None: [])
     return engine, replay_dir
 
 
