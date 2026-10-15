@@ -9,9 +9,10 @@ the done spec, runs the follow-up review) plus `bmad-loop-sweep` and
 their artifacts. Installing the tool is part of setup, not
 an optional extra.
 
-There are two ways the skills land in a project. The orchestrator's wheel **bundles**
-the three skills, so the simplest path is **`uv tool install` + `bmad-loop init`**, which installs them
-itself. Alternatively the **BMAD-method installer** copies them. Either way the
+There are three ways the skills land in a project. The orchestrator's wheel **bundles**
+the skills, so the simplest path is **`uv tool install` + `bmad-loop init`**, which installs them
+itself. On BMAD v7, **`npx skills add` + `bmad setup`** installs them as a module; on
+BMAD v6, the **BMAD-method installer** copies them. Either way the
 `/bmad-loop-setup` skill installs the orchestrator tool, picks which coding CLIs to
 drive, and bootstraps the project. For the one-page summary,
 see [Installing and upgrading](../README.md#installing-and-upgrading) in the README.
@@ -59,10 +60,32 @@ see [Installing and upgrading](../README.md#installing-and-upgrading) in the REA
     `BMAD_LOOP_MUX_BACKEND` or `[mux] backend` — is reported as the reason _instead_ of the
     platform, so clear it before reading that line as a platform check.)
 
-## Installed via the BMAD-method installer? (recommended)
+## Installing on BMAD v7 (`bmad setup`)
+
+BMAD v7 installs modules from `bmod.toml` records. bmad-loop ships one: the
+`bmod-bmad-loop` skill folder is the module record (metadata, never invoked), and each
+`bmad-loop-*` skill carries a `bmod.toml` naming it. Add the record and its skills
+(`npx skills add` asks which skills to install; pick all four), then let `bmad setup`
+register the module:
+
+```bash
+npx skills add bmad-code-org/bmad-loop
+claude "/bmad setup bmad-loop"
+claude "/bmad-loop-setup accept all defaults"
+```
+
+`bmad setup` reads the record's requirements: the `bmad` skill and `bmad-build-auto`
+from the method module at 6.13.0 or newer (a `6.13.0-next` development install counts).
+It recommends `bmad-ticket` and `bmad-retrospective`, which tickets mode uses. Its update
+check compares the record's version with the one on bmad-loop's `main` branch.
+`bmad setup` installs skills only, so `/bmad-loop-setup` still installs the orchestrator
+tool, as in the v6 route below.
+
+## Installed via the BMAD-method installer? (recommended on BMAD v6)
 
 The BMAD-method installer copies the three `bmad-loop-*` skill directories
-(`bmad-loop-setup`, `bmad-loop-sweep`, `bmad-loop-resolve`) into your project. It does **not** carry the orchestrator tool — the installer copies only skill
+(`bmad-loop-setup`, `bmad-loop-sweep`, `bmad-loop-resolve`) into your project; `bmad-loop
+init` adds the `bmod-bmad-loop` record folder, which v6 ignores. It does **not** carry the orchestrator tool — the installer copies only skill
 directories, not their sibling files, so the tool can't ride along in the skill folder.
 It is installed separately from Git by the setup skill. The canonical source is
 <https://github.com/bmad-code-org/bmad-loop>. (Going the other way, the tool's wheel
@@ -109,8 +132,9 @@ claude "/bmad-loop-setup accept all defaults"                   # install the to
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
 installs all the bundled skills together: `bmad-loop-resolve` (the interactive
 `/bmad-loop-resolve <story>` escalation workflow), `bmad-loop-sweep` (automation-only
-ledger triage) and `bmad-loop-setup` (installs the tool, then runs `init` and
-`validate`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
+ledger triage), `bmad-loop-setup` (installs the tool, then runs `init` and
+`validate`) and `bmod-bmad-loop` (the BMAD v7 module record, never invoked);
+`bmad-loop-sweep` owns the canonical `deferred-work-format.md`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-build-auto`
 (spelled `bmad-dev-auto` before the 6.10.1 rename — the orchestrator resolves
 whichever name is on disk and invokes that one) is

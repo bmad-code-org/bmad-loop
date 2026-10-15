@@ -1124,7 +1124,8 @@ def module_skills_seed_undelivered(
     Informational, and NEVER an escalation gate. No ``MODULE_SKILLS`` entry has a
     worktree-resident consumer — sweep triage dispatches ``/bmad-loop-sweep`` at the
     MAIN checkout, ``bmad-loop-resolve`` runs at the main checkout too, and
-    ``bmad-loop-setup`` has no session consumer at all — so an absence here cannot
+    ``bmad-loop-setup`` and the ``bmod-bmad-loop`` module record have no session
+    consumer at all — so an absence here cannot
     prove a stall, and a CRITICAL gate would refuse healthy runs. Extension point: if
     a consumer ever becomes worktree-resident (e.g. sweep triage moving into unit
     worktrees), arm the gate by routing this predicate's result into
@@ -1483,8 +1484,9 @@ def provision_worktree(
         # caller as `worktree-module-skills-dropped`) — but journal-only, never the
         # CRITICAL gate below: no MODULE_SKILLS entry has a worktree-resident consumer
         # (sweep triage and bmad-loop-resolve dispatch at the MAIN checkout;
-        # bmad-loop-setup has no session consumer), so a partial wheel copy cannot
-        # prove a stall the way a missing upstream dev/review skill does. A future
+        # bmad-loop-setup and the bmod-bmad-loop record have no session consumer),
+        # so a partial wheel copy cannot prove a stall the way a missing upstream
+        # dev/review skill does. A future
         # worktree-resident consumer arms the gate via escalate_unit over that
         # predicate's result.
         # The orchestrator-driven upstream skills are not in the wheel; copy them

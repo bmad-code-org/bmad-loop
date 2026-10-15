@@ -136,8 +136,16 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
 - Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
   previously fixed at 30 minutes (#857).
+- Ship a `bmod.toml` module record (`bmod-bmad-loop`) so BMAD v7 `bmad setup` can
+  discover, install and update-check bmad-loop. Each bundled skill carries a `[skill]`
+  `bmod.toml`, `bmad-loop init` lays the record down, and `npx skills add
+bmad-code-org/bmad-loop` lists it.
 
 ### Changed
+
+- Refuse release versions `bmad setup` cannot order: `scripts/sync_version.py` accepts
+  SemVer `X.Y.Z` with an optional `-` pre-release only (no `.devN`, no `-dev`).
+- Make the setup greeting era-neutral: it names the BMAD v6 and v7 requirements.
 
 - Refuse to resume a story run whose recorded work source this bmad-loop does not
   know (a run started by a newer version) instead of resuming it as a sprint run.

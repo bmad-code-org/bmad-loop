@@ -64,11 +64,14 @@ ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
 # `bmad-dev-auto`) is upstream (not bundled here): the orchestrator drives it as an
 # already-installed skill. These dirs are the only skills init writes: the
-# BMAD-installed skills and `_bmad/` are read, never modified.
+# BMAD-installed skills and `_bmad/` are read, never modified. `bmod-bmad-loop` is
+# the module record BMAD v7 `bmad setup` discovers (its `bmod.toml`); it is never
+# invoked, so on v6 it is an inert skill folder.
 MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",
+    "bmod-bmad-loop",
 )
 
 # Which upstream install ships the skills the base-skill findings require, in both
