@@ -113,6 +113,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: leaf whose client prints such rows at exit 0 declares them; tmux prints
     #: none, so the tuple is empty here.
     _NON_SESSION_ROW_PREFIXES: tuple[str, ...] = ()
+    #: Prefix of the stderr line a leaf's ``list-sessions`` prints for each
+    #: server it could not read, when it then exits non-zero after printing
+    #: the rows that did answer (see :meth:`_is_partial_listing`). tmux has one
+    #: server, so its listing is never partial and the prefix is empty here.
+    _PARTIAL_LISTING_STDERR_PREFIX = ""
     #: ``-n`` name of every session's window 0, so no window bmad-loop creates is
     #: left for the multiplexer to name (psmux auto-renames unnamed windows to
     #: their foreground process). One literal for both ``new_session`` argvs.
@@ -331,6 +336,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
             # The names that did answer are kept (#919), so the listing is not
             # read as empty: only the sessions behind these rows are unknown.
             consequence = "keeping the names that answered"
+        elif self._is_partial_listing(proc):
+            # Every stderr line names a server that did not answer; the rows
+            # of the ones that did are kept, as for the exit-0 rows above.
+            outcome = f"exited {proc.returncode}"
+            detail = proc.stderr.strip()
+            consequence = "keeping the names that answered"
         else:
             if self._session_proved_gone(proc):
                 return
@@ -447,7 +458,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
         if proc.returncode != 0:
             self._warn_unproven_listing("list-sessions", proc, on_fault)
-            return []
+            if not self._is_partial_listing(proc):
+                return []
         rows = proc.stdout.splitlines()
         self._warn_non_session_rows(rows, on_fault)
         return [row for row in rows if self._is_session_row(row)]
@@ -470,10 +482,21 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return {}
         if proc.returncode != 0:  # no server / no sessions
             self._warn_unproven_listing("list-sessions", proc)
-            return {}
+            if not self._is_partial_listing(proc):
+                return {}
         rows = [line.partition("\t") for line in proc.stdout.splitlines()]
         self._warn_non_session_rows([name for name, _, _ in rows])
         return {name: value for name, _, value in rows if self._is_session_row(name)}
+
+    def _is_partial_listing(self, proc: subprocess.CompletedProcess[str]) -> bool:
+        # A non-zero list-sessions whose stdout still holds the servers that
+        # answered: every non-empty stderr line names one that did not, in the
+        # leaf's declared shape. Anything else on stderr (no server running, a
+        # transport error) or none at all is not proof of that, so the caller
+        # keeps its empty sentinel.
+        lines = [line for line in proc.stderr.splitlines() if line.strip()]
+        prefix = self._PARTIAL_LISTING_STDERR_PREFIX
+        return bool(prefix and lines) and all(line.startswith(prefix) for line in lines)
 
     def _is_session_row(self, name: str) -> bool:
         # A session name is never empty, so an empty row is the listing's own

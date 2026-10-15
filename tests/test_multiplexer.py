@@ -786,6 +786,90 @@ def test_tmux_session_listings_read_every_named_row_as_a_session(monkeypatch, ca
     assert capsys.readouterr().err == ""
 
 
+_UNREAD_BETA = "psmux: list-sessions: session beta: no response from server (timed out)"
+
+
+def _partial_listing(monkeypatch, stdout: str, stderr: str) -> None:
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 1, stdout=stdout, stderr=stderr),
+    )
+
+
+def test_psmux_partial_listing_at_exit_1_keeps_the_names_that_answered(monkeypatch, capsys):
+    """Since psmux/psmux#809 a server psmux could not read gets no row: it is
+    named on stderr and list-sessions exits 1 after printing the rows that did
+    answer. Both listings keep those rows and report the unread names through
+    the same fault channel as the exit-0 rows.
+
+    Ablation: make `_is_partial_listing` return False and both listings come
+    back empty."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    mux = PsmuxMultiplexer()
+    _partial_listing(monkeypatch, "alpha\n", f"{_UNREAD_BETA}\r\n")
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == ["alpha"]
+    assert faults == [
+        f"psmux list-sessions exited 1 without proving the session gone: {_UNREAD_BETA}"
+    ]
+    assert capsys.readouterr().err == ""
+    _partial_listing(monkeypatch, "alpha\tA\n", f"{_UNREAD_BETA}\n")
+    assert mux.session_options("@proj") == {"alpha": "A"}
+    err = capsys.readouterr().err
+    assert "keeping the names that answered" in err and _UNREAD_BETA in err
+    assert "reading it as empty" not in err
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # no per-server line at all
+        "psmux: Invalid session key\n",
+        # one per-server line beside a foreign one
+        f"{_UNREAD_BETA}\npsmux: connection timed out\n",
+        # nothing said
+        "",
+    ],
+)
+def test_psmux_exit_1_without_only_unread_server_lines_still_reads_empty(
+    monkeypatch, capsys, stderr
+):
+    """An exit 1 is a partial listing only when EVERY stderr line names an
+    unread server; a foreign line, a mixed stderr or an empty one proves no
+    such thing, so the rows on stdout are not trusted and both listings keep
+    their empty sentinel and warning.
+
+    Ablation: make `_is_partial_listing` accept any stderr and `alpha` comes
+    back in every case; swap its `all` for `any` and the mixed case fails."""
+    from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
+
+    mux = PsmuxMultiplexer()
+    _partial_listing(monkeypatch, "alpha\n", stderr)
+    faults: list[str] = []
+    assert mux.list_sessions_reporting(on_fault=faults.append) == []
+    assert len(faults) == 1 and "exited 1" in faults[0]
+    _partial_listing(monkeypatch, "alpha\tA\n", stderr)
+    assert mux.session_options("@proj") == {}
+    assert "reading it as empty" in capsys.readouterr().err
+
+
+def test_tmux_exit_1_with_psmux_unread_server_lines_still_reads_empty(monkeypatch, capsys):
+    """tmux has one server, so its listing is never partial: even stderr in
+    psmux's per-server shape leaves an exit 1 read as empty.
+
+    Ablation: give the base class psmux's `_PARTIAL_LISTING_STDERR_PREFIX` and
+    `alpha` comes back."""
+    mux = TmuxMultiplexer()
+    _partial_listing(monkeypatch, "alpha\n", f"{_UNREAD_BETA}\n")
+    assert mux.list_sessions_reporting() == []
+    _partial_listing(monkeypatch, "alpha\tA\n", f"{_UNREAD_BETA}\n")
+    assert mux.session_options("@proj") == {}
+    assert "reading it as empty" in capsys.readouterr().err
+
+
 def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
     """A byte the codec cannot decode is a transport failure like a timeout: the
     liveness probe must answer MultiplexerError ("unknowable"), not leak the raw

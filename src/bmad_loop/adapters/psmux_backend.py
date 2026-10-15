@@ -199,6 +199,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # required` as a row, so a server whose key file does not match lists as a
     # session named `ERROR: Invalid session key` (measured on 3.4.0, #919).
     _NON_SESSION_ROW_PREFIXES = ("ERROR:",)
+    # Since psmux/psmux#809 a server that does not answer gets no row: it is
+    # named on stderr as `psmux: list-sessions: session <name>: <reason>` and
+    # the command exits 1 after printing the rows that did answer.
+    _PARTIAL_LISTING_STDERR_PREFIX = "psmux: list-sessions: session "
 
     def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
         """``default_registry=True`` binds this instance to psmux's OWN registry
