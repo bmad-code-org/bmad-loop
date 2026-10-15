@@ -267,8 +267,9 @@ def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
 
 def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
     """The tickets pick's records keep the closed tokens (cause, stage, skip,
-    phase, status) and the ticket ref, and drop the halt's free-text detail — it
-    can quote a plan's `blocked_reason` or a tickets.py error naming a path."""
+    phase, status), alias the ticket ref (it can be a plan's file name), and drop
+    the halt's free-text detail — it can quote a plan's `blocked_reason` or a
+    tickets.py error naming a path."""
     secret_path = "/home/canaryuser/AcmeSecret/plan.md"
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")
     halt = diagnostics._scrub_entry(
@@ -296,7 +297,8 @@ def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
         None,
     )
 
-    assert (halt["ref"], halt["cause"], halt["stage"]) == ("1.2", "tree-fault", "ticket-tree")
+    assert (halt["cause"], halt["stage"]) == ("tree-fault", "ticket-tree")
+    assert all(e["ref"].startswith("ticket-") for e in (halt, skipped, foreign))
     assert halt["detail_present"] is True
     assert secret_path not in json.dumps(halt)
     assert (skipped["skip"], skipped["phase"]) == ("touched", "deferred")
@@ -1134,6 +1136,28 @@ def test_ticket_mark_ref_is_pseudonymized():
     assert scrubbed["ref"].startswith("ticket-")
     assert "acme" not in json.dumps(scrubbed)
     assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "ticket-foreign-active",
+        "ticket-skipped",
+        "ticket-hitl-pause",
+        "ticket-refine-pause",
+        "ticket-pick-halt",
+    ],
+)
+def test_ticket_engine_kinds_pseudonymize_their_ref(kind):
+    """The tickets engine's pick and pause records carry the same ticket key.
+
+    Ablation: remove a kind's route and its row ships the key verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "ref": "story-acme-vault-rotation"}, pseudo, {}, None
+    )
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
 
 
 def test_journal_alias_routes_accept_lone_unicode_surrogates(project):

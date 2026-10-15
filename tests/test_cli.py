@@ -12838,7 +12838,7 @@ def test_resume_unknown_source_refused(project, monkeypatch, capsys, source, sai
 @pytest.mark.parametrize("resume", ["--resume", "--no-resume"])
 @pytest.mark.parametrize(
     ("source", "said"),
-    [("bogus", "unknown to this bmad-loop"), ("tickets", "tickets mode cannot run yet")],
+    [("bogus", "unknown to this bmad-loop")],
 )
 def test_resolve_unknown_source_refused_at_entry(
     tmp_path, monkeypatch, capsys, source, said, resume

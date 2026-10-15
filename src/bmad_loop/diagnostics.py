@@ -290,6 +290,11 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     # slug, identifier-shaped, so `scrub_json` would ship it verbatim. Kind-scoped
     # because `ref` elsewhere names a git ref (`attempt-worktree-preserved`).
     "ticket-mark": {"ref": "ticket"},
+    "ticket-foreign-active": {"ref": "ticket"},
+    "ticket-skipped": {"ref": "ticket"},
+    "ticket-hitl-pause": {"ref": "ticket"},
+    "ticket-refine-pause": {"ref": "ticket"},
+    "ticket-pick-halt": {"ref": "ticket"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
