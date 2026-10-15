@@ -295,7 +295,7 @@ class TerminalMultiplexer(ABC):
         """Native ids of every window in ``session`` (empty if it is gone).
 
         SYMMETRY RULE: these must be the *same id form* :meth:`new_window`
-        returns, because :meth:`window_alive` is a membership test over this
+        returns, because :meth:`window_alive` starts from membership in this
         list. A backend that qualifies one side and not the other reads every
         live window as instantly dead. The form itself is the backend's own —
         psmux emits ``session:@N`` because its ids are minted per server (one
@@ -352,7 +352,7 @@ class TerminalMultiplexer(ABC):
 
         May raise :class:`MultiplexerError` when liveness is unknowable — a
         transport timeout / missing binary, or any other failure to take the
-        listing this membership test reads (see :meth:`list_window_ids`).
+        listing this liveness test reads (see :meth:`list_window_ids`).
         Callers must treat that as "don't know", not "dead", and must not tear
         down a possibly-working session on it. Reachable in ordinary operation,
         not only under a hung binary: a live server that refuses or drops the
