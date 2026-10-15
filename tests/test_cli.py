@@ -6187,6 +6187,49 @@ def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
     assert "were not shown" not in captured.out
 
 
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_a_resolve_whose_session_cannot_start_hands_the_record_back(
+    tmp_path, monkeypatch, capsys, restore_fails
+):
+    # #937: the resolve claimed its window, then the adapter has no interactive
+    # session, so the window exits without hosting one. The record goes back
+    # to the window it named before the claim, under the lock every claim is
+    # made in; a hand-back that did not land is printed and journaled.
+    # Ablation: drop the restore from the NotImplementedError arm and the
+    # record keeps naming @7; drop its lock and the held-lock assert fires;
+    # drop the report and the journal has no entry.
+    from bmad_loop import resolve
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+
+    def claim(project, run_id, **_kw):
+        launch._record_ctl_window(project, run_id, "@7")
+
+    real_restore = launch.restore_ctl_window
+
+    def restore(*args):
+        assert_run_state_lock_held(run_dir)
+        fault = real_restore(*args)
+        return "hand-back failed" if restore_fails else fault
+
+    monkeypatch.setattr(launch, "restore_ctl_window", restore)
+    monkeypatch.setattr(launch, "claim_ctl_window", claim)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def unsupported(*a, **k):
+        assert launch.recorded_ctl_window(tmp_path, "r1") == "@7"  # the claim landed
+        raise NotImplementedError
+
+    monkeypatch.setattr(resolve, "run_session", unsupported)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+    errors = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert errors == (["hand-back failed"] if restore_fails else [])
+    assert ("warning: hand-back failed" in capsys.readouterr().err) is restore_fails
+
+
 def _withheld_line(out: str) -> str:
     (line,) = [ln for ln in out.splitlines() if "were not shown" in ln]
     return line

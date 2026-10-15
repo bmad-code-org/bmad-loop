@@ -88,6 +88,12 @@ breaking changes may land in a minor release.
 - TUI: journal `ctl-window-claim-failed` when a TUI-launched resume or resolve cannot
   prove it runs in a control session, or exits before accepting the run, instead of
   keeping the previous launch's window record and leaving no trace (#925).
+- TUI: hand the control-window record back to the previous window when an interactive
+  resolve's session cannot start, and journal `ctl-window-claim-failed` when a finished
+  run's `--reverify` replay claims a window named for the finished run, which attach and
+  `x` cannot find (#937).
+- TUI: start a launch that lost the race to create the control session in the session the
+  other launch created, instead of refusing it as "ctl-session setup failed" (#952).
 - Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
   captured, not only after the command exits, so a chatty command's memory no longer
   grows with its runtime (DW-549).

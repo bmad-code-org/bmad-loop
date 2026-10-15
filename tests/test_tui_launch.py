@@ -335,6 +335,34 @@ def test_ensure_ctl_session_probe_failure_raises_launch_error(monkeypatch, tmp_p
         launch.start_run_detached(tmp_path, "RID")
 
 
+@pytest.mark.parametrize("rival_created", [True, False])
+def test_a_ctl_session_create_that_lost_the_race_uses_the_session(
+    fake_run, monkeypatch, tmp_path: Path, rival_created: bool
+):
+    # #952: two launches both see no control session and both create it; the
+    # loser's create is refused ("duplicate session" on tmux 3.4) by a session
+    # that now exists, so it re-probes and uses it. A create that failed while
+    # the session is still absent stays a LaunchError. Ablation: drop the
+    # re-probe and the rival_created row raises.
+    probes = iter([1, 0 if rival_created else 1])
+
+    def racing(argv, **kwargs):
+        if argv[2] == "has-session":
+            return subprocess.CompletedProcess(argv, next(probes), stdout="", stderr="")
+        if argv[2] == "new-session":
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="duplicate session: bmad-loop-ctl"
+            )
+        return fake_run(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", racing)
+    if rival_created:
+        assert launch._ensure_ctl_session(tmp_path) == launch.ctl_session(tmp_path)
+    else:
+        with pytest.raises(launch.LaunchError, match="duplicate session"):
+            launch._ensure_ctl_session(tmp_path)
+
+
 def test_session_exists(monkeypatch):
     fake = FakeRun(has_session_rc=0)
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1191,6 +1219,81 @@ def test_claim_reports_a_record_that_did_not_land(fake_run, tmp_path: Path, monk
     _in_ctl_window(monkeypatch, "@7")
     _fail_the_record(monkeypatch, OSError("read-only file system"))
     assert "could not be recorded" in (launch.claim_ctl_window(tmp_path, "RID") or "")
+
+
+def test_a_claim_from_a_window_named_for_another_run_says_so(fake_run, tmp_path: Path, monkeypatch):
+    # #937: a finished run's reverify resumes a new replay run inside the
+    # `resolve-<finished>` window, which the lookup never answers for the replay
+    # run. The record lands, but the claim reports the window unreachable
+    # rather than success. Ablation: return None once the record lands and the
+    # claim answers None.
+    _make_run(tmp_path, "REPLAY")
+    fake_run.windows = "@7\tresume-FINISHED\n"
+    _in_ctl_window(monkeypatch, "@7")
+    warning = launch.claim_ctl_window(tmp_path, "REPLAY", launched=True) or ""
+    assert "not named for run REPLAY" in warning
+    assert launch.recorded_ctl_window(tmp_path, "REPLAY") == "@7"
+
+
+def test_a_claim_whose_window_listing_failed_cannot_confirm_it(
+    fake_run, tmp_path: Path, monkeypatch
+):
+    # The name check is a listing: one that cannot be read is no confirmation.
+    # Ablation: treat a listing fault as a pass and this answers None.
+    _make_run(tmp_path)
+    _in_ctl_window(monkeypatch, "@7")
+
+    def fails(*_a, **_k):
+        raise MultiplexerError("server gone")
+
+    monkeypatch.setattr(launch, "_list_ctl_windows", fails)
+    assert "could not confirm" in (launch.claim_ctl_window(tmp_path, "RID") or "")
+
+
+@pytest.mark.parametrize(
+    ("before", "now", "after"),
+    [
+        ("@2", "@7", "@2"),  # the predecessor is the run's window again
+        (None, "@7", None),  # no predecessor: the record goes, as before the claim
+        ("@2", "@9", "@9"),  # a claim accepted since keeps its own
+    ],
+)
+def test_restore_hands_the_record_back_only_from_the_claimed_window(
+    tmp_path: Path, before: str | None, now: str, after: str | None
+):
+    # #937: an interactive resolve claimed @7 and its session could not start.
+    # Ablation: drop the still-names-@7 check and the third row reads @2; drop
+    # the forget arm and the second reads @7.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", now)
+    assert launch.restore_ctl_window(tmp_path, "RID", before, "@7") is None
+    assert launch.recorded_ctl_window(tmp_path, "RID") == after
+
+
+def test_a_restore_whose_write_failed_says_so(tmp_path: Path, monkeypatch):
+    # Both record writers swallow their faults, so the restore re-reads the
+    # record and reports when it does not name the predecessor. Ablation:
+    # answer None after the write and this reads None.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@7")
+    _fail_the_record(monkeypatch, OSError("sharing violation"))
+    assert "could not be handed back" in (
+        launch.restore_ctl_window(tmp_path, "RID", "@2", "@7") or ""
+    )
+
+
+def test_a_restore_that_could_not_drop_an_unreadable_record_says_so(tmp_path: Path, monkeypatch):
+    # No predecessor, so the record must go. A delete that did not happen
+    # beside a record that cannot be read back must not read as gone.
+    # Ablation: compare the read-back with None and this answers None.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@7")
+    reads = iter(["@7", None])
+    monkeypatch.setattr(launch, "_read_ctl_window", lambda *_a: next(reads))
+    monkeypatch.setattr(launch, "_forget_ctl_window", lambda *_a: None)
+    assert "could not be handed back" in (
+        launch.restore_ctl_window(tmp_path, "RID", None, "@7") or ""
+    )
 
 
 @pytest.mark.parametrize("second_minted", ["before", "after"])

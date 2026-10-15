@@ -4533,11 +4533,17 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
-        print(f"warning: {warning}", file=sys.stderr)
-        try:
-            Journal(run_dir).append("ctl-window-claim-failed", error=warning)
-        except OSError as exc:
-            print(f"warning: could not journal it: {exc}", file=sys.stderr)
+        _report_ctl_window_fault(run_dir, warning)
+
+
+def _report_ctl_window_fault(run_dir: Path, warning: str) -> None:
+    """Print a control-window record fault and journal it as
+    `ctl-window-claim-failed`. Never raises."""
+    print(f"warning: {warning}", file=sys.stderr)
+    try:
+        Journal(run_dir).append("ctl-window-claim-failed", error=warning)
+    except OSError as exc:
+        print(f"warning: could not journal it: {exc}", file=sys.stderr)
 
 
 def _drive_ctl_launch(args: argparse.Namespace) -> int:
@@ -5097,6 +5103,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # resume publishes its pid in, and the liveness gate above is re-taken
         # there: a resume that accepted after it keeps the record. The other paths
         # claim when they resume (`_resume_paused_run`), or drive nothing.
+        from .tui import launch  # import-safe: launch.py has no textual imports
+
         with state_lock(run_dir):
             live = runs.engine_liveness(run_dir)
             if live == "alive":
@@ -5109,7 +5117,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            # Captured around the claim, so a session that cannot start can hand
+            # the record back (#937).
+            predecessor = launch.recorded_ctl_window(project, run_dir.name)
             _claim_ctl_window(project, run_dir)
+            claimed = launch.recorded_ctl_window(project, run_dir.name)
         adapters = _make_adapters(project, run_dir, pol)
         dev_cfg = pol.adapter.resolved("dev")
         model = dev_cfg.model
@@ -5150,6 +5162,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"then: bmad-loop resolve {args.run_id} --no-interactive",
                 file=sys.stderr,
             )
+            # This window is about to exit without having hosted a session, so
+            # the window the record named before it is the run's again.
+            if claimed is not None and claimed != predecessor:
+                with state_lock(run_dir):
+                    fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
+                    if fault is not None:
+                        _report_ctl_window_fault(run_dir, fault)
             return 1
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
