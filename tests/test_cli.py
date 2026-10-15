@@ -12847,9 +12847,10 @@ def test_resume_records_a_refined_story_file_approval(project, capsys, monkeypat
     ticket, no task recorded) is the operator's approval of its story file: the
     ref joins `ticket_story_approvals`, persisted before the engine starts, and
     `ticket-story-approved` is journaled. A registered unit's `plan-checkpoint`
-    pause (the two-leg flow) approves nothing. Real spawns: the tickets resume
-    preflight's. Ablation (performed): drop the `approve_paused_story_file` call
-    from `_prepare_resume_locked` and the refined row FAILS."""
+    pause (the two-leg flow) approves nothing. No real spawn: the resume path
+    runs no `tickets.py`. Ablation (performed): drop the
+    `approve_paused_story_file` call from `_prepare_resume_locked` and the refined
+    row FAILS."""
     from bmad_loop import runs
     from bmad_loop.journal import Journal, load_state
     from bmad_loop.model import StoryTask
