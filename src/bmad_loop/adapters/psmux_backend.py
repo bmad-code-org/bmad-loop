@@ -723,6 +723,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         if window_id in panes:
             # pane_target is asked with the qualified id this returns.
             panes[qualified] = panes.pop(window_id)
+        else:
+            panes.pop(qualified, None)
         return qualified
 
     def list_window_ids(self, session: str) -> list[str]:

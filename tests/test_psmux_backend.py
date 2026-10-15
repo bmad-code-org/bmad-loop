@@ -2827,6 +2827,19 @@ def test_pane_target_uses_the_pane_read_at_create(rec, tmp_path):
     assert rec.argv[1] == "new-window"
 
 
+def test_a_create_without_a_pane_id_drops_a_stale_one(rec, tmp_path):
+    """A restarted server can reuse a window id; when that create reports no
+    pane id, pane_target lists panes instead of trusting the old window's.
+    Ablation: keep the stale entry and this answers the old %2."""
+    mux = PsmuxMultiplexer()
+    rec.stdout = "@2 %2\n"
+    mux.new_window("s", "n", tmp_path, {}, "cmd")
+    rec.stdout = "@2\n"
+    mux.new_window("s", "n", tmp_path, {}, "cmd")
+    rec.stdout = "0 %9\n"
+    assert mux.pane_target("s:@2") == "s:@2.%9"
+
+
 def test_pane_target_keeps_the_session_qualified_window(rec):
     """#948 on psmux: `session:@N.%M` — the session routes the client to the right
     per-session server, the `%M` slot names the launched pane by id."""

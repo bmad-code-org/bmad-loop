@@ -556,8 +556,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
             "#{window_id} #{pane_id}",
             *self._window_launch(env, command),
         ).partition(" ")
+        panes = self._launched_panes()
         if pane_id.startswith("%"):
-            self._launched_panes()[window_id] = pane_id
+            panes[window_id] = pane_id
+        else:
+            # A restarted server can reuse the id: no stale pane may answer for it.
+            panes.pop(window_id, None)
         return window_id
 
     def new_parked_window(
