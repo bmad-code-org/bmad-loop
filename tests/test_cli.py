@@ -6230,11 +6230,14 @@ def test_a_resolve_whose_session_cannot_start_hands_the_record_back(
     assert ("warning: hand-back failed" in capsys.readouterr().err) is restore_fails
 
 
-def test_resolve_hands_the_record_back_when_its_cli_cannot_spawn(tmp_path, monkeypatch):
-    # The dev CLI was removed: run_session raises FileNotFoundError, past the
-    # claim. The window exits all the same, so the record goes back to the
-    # window it named before, and the error still propagates. Ablation: drop
-    # the hand-back from the generic arm and the record keeps naming @7.
+@pytest.mark.parametrize("failing", ["_make_adapters", "build_context", "run_session"])
+def test_resolve_hands_the_record_back_when_it_fails_past_the_claim(tmp_path, monkeypatch, failing):
+    # Past the claim, an adapter profile that does not load, a context.json
+    # that cannot be written, or a dev CLI that was removed each end the
+    # command without a session. The window exits all the same, so the record
+    # goes back to the window it named before, and the error still
+    # propagates. Ablation: start the try at run_session and the setup rows
+    # keep naming @7.
     from bmad_loop import resolve
     from bmad_loop.tui import launch
 
@@ -6247,13 +6250,13 @@ def test_resolve_hands_the_record_back_when_its_cli_cannot_spawn(tmp_path, monke
     )
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
 
-    def missing_cli(*a, **k):
-        raise FileNotFoundError("claude")
+    def fail(*a, **k):
+        raise OSError(failing)
 
-    monkeypatch.setattr(resolve, "run_session", missing_cli)
+    monkeypatch.setattr(cli if failing == "_make_adapters" else resolve, failing, fail)
     try:
         rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
-    except FileNotFoundError:
+    except OSError:
         rc = None
     assert rc != 0
     assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"

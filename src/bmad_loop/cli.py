@@ -4889,6 +4889,20 @@ def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
         print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
+def _hand_back_ctl_window(
+    project: Path, run_dir: Path, predecessor: str | None, claimed: str | None
+) -> None:
+    """This window is about to exit without a usable session, so the window the
+    record named before its claim is the run's again (#937)."""
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if claimed is not None and claimed != predecessor:
+        with state_lock(run_dir):
+            fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
+            if fault is not None:
+                _report_ctl_window_fault(run_dir, fault)
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import PAUSE_ESCALATION, Phase
 
@@ -5126,37 +5140,29 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             predecessor = launch.recorded_ctl_window(project, run_dir.name)
             _claim_ctl_window(project, run_dir)
             claimed = launch.recorded_ctl_window(project, run_dir.name)
-        adapters = _make_adapters(project, run_dir, pol)
-        dev_cfg = pol.adapter.resolved("dev")
-        model = dev_cfg.model
-        effort = dev_cfg.effort
-        _ctx_path, withheld, unreadable = resolve.build_context(
-            state,
-            run_dir,
-            story_key,
-            isolation=pol.scm.isolation,
-            project_root=project,
-            code_root=pre_session_code_root,
-        )
-        if pre_session_code_root != project:
-            print(
-                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
-                "code fixes and commits belong in the run's code root at "
-                f"{pre_session_code_root.as_posix()!r}",
-                file=sys.stderr,
-            )
-        print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
-
-        def hand_back() -> None:
-            # This window is about to exit without a usable session, so the
-            # window the record named before it is the run's again.
-            if claimed is not None and claimed != predecessor:
-                with state_lock(run_dir):
-                    fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
-                    if fault is not None:
-                        _report_ctl_window_fault(run_dir, fault)
-
+        # From the claim on, any exit without a usable session hands the record
+        # back: adapter and context setup can fail too, not just the session.
         try:
+            adapters = _make_adapters(project, run_dir, pol)
+            dev_cfg = pol.adapter.resolved("dev")
+            model = dev_cfg.model
+            effort = dev_cfg.effort
+            _ctx_path, withheld, unreadable = resolve.build_context(
+                state,
+                run_dir,
+                story_key,
+                isolation=pol.scm.isolation,
+                project_root=project,
+                code_root=pre_session_code_root,
+            )
+            if pre_session_code_root != project:
+                print(
+                    f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                    "code fixes and commits belong in the run's code root at "
+                    f"{pre_session_code_root.as_posix()!r}",
+                    file=sys.stderr,
+                )
+            print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
             produced = resolve.run_session(
                 adapters["dev"],
                 project,
@@ -5176,12 +5182,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"then: bmad-loop resolve {args.run_id} --no-interactive",
                 file=sys.stderr,
             )
-            hand_back()
+            _hand_back_ctl_window(project, run_dir, predecessor, claimed)
             return 1
         except BaseException:
-            # The dev CLI could not be spawned, or the session died: the window
-            # exits all the same, so hand the record back before it does.
-            hand_back()
+            # Setup failed, the dev CLI could not be spawned, or the session
+            # died: the window exits all the same, so hand the record back first.
+            _hand_back_ctl_window(project, run_dir, predecessor, claimed)
             raise
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it

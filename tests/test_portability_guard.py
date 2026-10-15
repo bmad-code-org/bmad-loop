@@ -274,6 +274,7 @@ SAVE_STATE_CALLERS = {
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
     ("cli.py", "cmd_resolve"),
+    ("cli.py", "_hand_back_ctl_window"),
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
     ("cli.py", "_resolve_abandon"),
