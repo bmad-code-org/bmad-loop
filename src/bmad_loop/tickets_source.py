@@ -239,6 +239,34 @@ def is_plan_halt_leg(row: TicketRow) -> bool:
     return row.plan_checkpoint and not row.refined and not plan_planned(row.status)
 
 
+THOROUGH_ALWAYS: Final = "always"
+THOROUGH_HIGH_RISK: Final = "high-risk"
+RISK_HIGH: Final = "high"
+
+
+def wants_thorough(thorough_review: str, risk: str) -> bool:
+    """Whether a session gets the thorough review under ``[tickets]
+    thorough_review``: every ticket under ``always``, a ``high`` risk one under
+    ``high-risk``, none under ``never``. ``risk`` is the find row's for a dev
+    leg and the plan's for a review leg."""
+    if thorough_review == THOROUGH_ALWAYS:
+        return True
+    return thorough_review == THOROUGH_HIGH_RISK and risk.strip().lower() == RISK_HIGH
+
+
+def dispatch_invocation(skill: str, ref: str, *, thorough: bool, plan_halt: bool) -> str:
+    """The invocation line a ticket's dev leg dispatches, shared with the
+    dry-run so the two cannot drift: ``/<skill> ticket <ref>``, then ``thorough``
+    (build-auto's review selection) and ``Halt after planning.`` on leg 1 of an
+    unrefined ``plan_checkpoint``."""
+    line = f"/{skill} ticket {ref}"
+    if thorough:
+        line += " thorough"
+    if plan_halt:
+        line += " Halt after planning."
+    return line
+
+
 def plan_blocked(row: TicketRow) -> bool:
     """Whether ``row``'s plan is blocked (status or a ``blocked_at`` stamp)."""
     return row.status == PLAN_BLOCKED or bool(row.blocked_at)

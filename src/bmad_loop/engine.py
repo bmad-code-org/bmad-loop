@@ -3152,6 +3152,37 @@ class Engine:
         self._refresh_dispatched_spec_snapshot(task)
         task.dispatched_spec_absent = task.dispatched_spec_file is None and not task.spec_file
 
+    def _expected_spec_for(self, task: StoryTask, prompt: str, label: str | None) -> str | None:
+        """The spec a session's read-back is pinned to (``SessionSpec.expected_spec``,
+        #261), or None to let the adapter scan. Base: the recorded spec, only for a
+        primary generic-dev session whose prompt names it — see the pin's comment in
+        :meth:`_run_session`. ``TicketsEngine`` pins the bound plan from attempt 1."""
+        if (
+            label is None
+            and self._generic_dev()
+            and task.spec_file
+            and self._prompt_names_recorded_spec(task, prompt)
+        ):
+            return task.spec_file
+        return None
+
+    def _session_success_statuses(self, role: str, label: str | None) -> tuple[str, ...]:
+        """The frontmatter statuses that end a session successfully
+        (``SessionSpec.success_statuses``). Base: the v6 ``done``."""
+        del role, label
+        return (devcontract.DONE,)
+
+    def _session_fallback_dirs(self, role: str, label: str | None) -> tuple[Path, ...]:
+        """Extra directories the read-back probes for the skill's no-spec fallback
+        result (``SessionSpec.fallback_result_dirs``). Base: none."""
+        del role, label
+        return ()
+
+    def _dev_success_status(self) -> str:
+        """The status a dev session finalizes its spec to: ``done`` for a v6 spec.
+        Read by the generic reconcile and the follow-up-review routing."""
+        return devcontract.DONE
+
     @staticmethod
     def _prompt_names_recorded_spec(task: StoryTask, prompt: str) -> bool:
         """Whether the prompt contains an engine-authored explicit-spec token."""
@@ -4989,7 +5020,9 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "followup-routing")
         if fm is None:
             return False
-        return verify.status_of(fm) == "done" and bool(fm.get("followup_review_recommended", False))
+        return verify.status_of(fm) == self._dev_success_status() and bool(
+            fm.get("followup_review_recommended", False)
+        )
 
     def _reconcile_generic_terminal_status(self, task: StoryTask, result_json: dict | None) -> None:
         """Repair a generic-skill spec the session finalized in prose but not in
@@ -5048,7 +5081,7 @@ class Engine:
         faulted, without trusting result JSON or launching a replacement session
         over the first session's findings. Returns the effective status.
         """
-        success_status = "in-review" if self._dev_review_enabled() else "done"
+        success_status = "in-review" if self._dev_review_enabled() else self._dev_success_status()
         # A blank `status:` reads "" here (status_of normalizes YAML-null), so the
         # blank-status template shape reconciles like a missing key does.
         fm_status = verify.status_of(fm)
@@ -5067,7 +5100,10 @@ class Engine:
             # be clobbered to a phantom False.
             if isinstance(result_json, dict):
                 result_json["status"] = success_status
-                if success_status == "done" and "followup_review_recommended" in fm:
+                if (
+                    success_status == self._dev_success_status()
+                    and "followup_review_recommended" in fm
+                ):
                     result_json["followup_review_recommended"] = bool(
                         fm.get("followup_review_recommended")
                     )
@@ -5091,7 +5127,7 @@ class Engine:
             self._journal_spec_read_failed(spec_path, task.story_key, "reconcile-prose", e)
             return fm_status
         arr = devcontract.parse_auto_run_result(text)
-        if not arr.present or arr.status != devcontract.DONE:
+        if not arr.present or arr.status != self._dev_success_status():
             return fm_status  # no terminal prose, or blocked: leave for escalation
         # Repair-write doctrine: the False arm is "nothing to change" only. A status
         # the reader can see but no line edit can move raises instead, and that raise
@@ -5110,7 +5146,7 @@ class Engine:
         # followup flag, at the cost of a second racy read that can now fail.
         if isinstance(result_json, dict):
             result_json["status"] = success_status
-            if success_status == "done":
+            if success_status == self._dev_success_status():
                 result_json["followup_review_recommended"] = bool(
                     fm.get("followup_review_recommended", False)
                 )
@@ -5632,7 +5668,7 @@ class Engine:
         if devcontract.DEFERRED_FIELD not in fm:
             return
         status = verify.status_of(fm)
-        success_status = "in-review" if self._dev_review_enabled() else "done"
+        success_status = "in-review" if self._dev_review_enabled() else self._dev_success_status()
         parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
         if status != success_status and not parked:
             # Stories mode's explicit plan checkpoint is a verified terminal for
@@ -8296,16 +8332,11 @@ class Engine:
             # pinning it to task.spec_file would point the read-back at the wrong
             # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
             # from labeled sessions.
-            expected_spec=(
-                task.spec_file
-                if (
-                    label is None
-                    and self._generic_dev()
-                    and task.spec_file
-                    and self._prompt_names_recorded_spec(task, prompt)
-                )
-                else None
-            ),
+            expected_spec=self._expected_spec_for(task, prompt, label),
+            # The read-back's terminal vocabulary and fallback-result probe dirs:
+            # the v6 defaults (`done`, none) for every base and stories session.
+            success_statuses=self._session_success_statuses(role, label),
+            fallback_result_dirs=self._session_fallback_dirs(role, label),
         )
         self.journal.set_active_log(task_id)
         self.journal.append(
@@ -9347,8 +9378,7 @@ class Engine:
         if not task.preserve_ref:
             return ""
         recover = (
-            f'; recover with `git -C "{self.workspace.root}" '
-            f"merge --ff-only {task.preserve_ref}`"
+            f'; recover with `git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
         )
         if task.preserve_partial:
             return (

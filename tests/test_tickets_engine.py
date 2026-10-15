@@ -1,4 +1,5 @@
-"""`TicketsEngine`: the tickets-mode pick and its pick-time pauses.
+"""`TicketsEngine`: the tickets-mode pick, its pick-time pauses, and the
+dispatch, verify and review path of a picked ticket.
 
 `compose_run` still refuses tickets runs, so every test builds the engine
 directly (`make_engine`) on the `project_v7` sandbox with the mock adapter and an
@@ -10,11 +11,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import FakeTicketTree, V7Layout, ticket_row
+from conftest import FakeTicketTree, V7Layout, git, ticket_row
 
+from bmad_loop import tickets_source, verify
+from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import load_paths
 from bmad_loop.engine import Engine, RunPaused
+from bmad_loop.frontmatter import parse_frontmatter, status_of
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -26,9 +30,16 @@ from bmad_loop.model import (
     RunState,
     StoryTask,
 )
-from bmad_loop.policy import GatesPolicy, NotifyPolicy, Policy, ReviewPolicy
+from bmad_loop.policy import (
+    GatesPolicy,
+    NotifyPolicy,
+    OperatorPolicy,
+    Policy,
+    ReviewPolicy,
+    TicketsPolicy,
+)
 from bmad_loop.tickets_engine import TicketsEngine
-from bmad_loop.tickets_source import TicketRef
+from bmad_loop.tickets_source import TicketRef, ticket_binding
 from bmad_loop.tickettree import TicketsCrashed
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -38,12 +49,19 @@ def _policy() -> Policy:
     return Policy(gates=GatesPolicy(mode="none"), notify=QUIET, review=ReviewPolicy(enabled=False))
 
 
-def make_engine(layout: V7Layout, tree: FakeTicketTree, **state_fields):
+def make_engine(
+    layout: V7Layout,
+    tree: FakeTicketTree,
+    *,
+    policy: Policy | None = None,
+    script: list | None = None,
+    **state_fields,
+):
     """A TicketsEngine over ``layout`` reading ``tree``, pinned to the layout's
     initiative as `runsetup.build_run_state` pins a tickets run."""
     paths = load_paths(layout.project, want_tickets=True)
     run_dir = layout.project / ".bmad-loop" / "runs" / "test-run"
-    adapter = MockAdapter([])
+    adapter = MockAdapter(list(script or []))
     state = RunState(
         run_id="test-run",
         project=str(layout.project),
@@ -60,7 +78,7 @@ def make_engine(layout: V7Layout, tree: FakeTicketTree, **state_fields):
 
     engine = TicketsEngine(
         paths=paths,
-        policy=_policy(),
+        policy=policy or _policy(),
         adapter=adapter,
         run_dir=run_dir,
         journal=Journal(run_dir),
@@ -312,3 +330,277 @@ def test_run_behind_parked_tickets_finishes_with_a_summary(project_v7):
         ("1.2", "behind-parked")
     ]
     assert adapter.sessions == []
+
+
+# --------------------------------------------------- dispatch, verify, review
+
+
+def _bound(engine: TicketsEngine, tree: FakeTicketTree, ref: str = "1.1") -> StoryTask:
+    """A registered unit for ``ref`` carrying the binding `find` resolves, as
+    `_run_story` attaches it."""
+    task = StoryTask(ref, 0)
+    task.ticket = ticket_binding(tree.finds[ref])
+    engine.state.tasks[ref] = task
+    return task
+
+
+def _write_plan(
+    plan: Path, status: str, *, ticket: str = "1", baseline: str = "", risk: str = ""
+) -> None:
+    """A v7 build plan as build-auto leaves it. Bytes, so Windows writes LF."""
+    lines = ["---", f"ticket: {ticket}", f"status: {status}"]
+    if baseline:
+        lines.append(f"baseline_revision: '{baseline}'")
+    if risk:
+        lines.append(f"risk: {risk}")
+    lines += ["---", "", "# plan", ""]
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_bytes("\n".join(lines).encode("utf-8"))
+
+
+def _probe_session(engine: TicketsEngine, adapter: MockAdapter, task: StoryTask, **kw):
+    """The `SessionSpec` `_run_session` hands the adapter for ``task``."""
+    adapter.script.append(SessionResult(status="crashed"))
+    engine._run_session(task, prompt="probe", seq=1, **kw)
+    spec = adapter.sessions[-1]
+    assert isinstance(spec, SessionSpec)
+    return spec
+
+
+def test_dev_prompt_uses_ticket_ref(project_v7):
+    """Every dev leg dispatches `ticket <ref>`: the fresh leg is exactly the
+    dry-run's line plus the tickets clauses (park last, no backticks), and the
+    repair leg keeps the feedback file as its last backticked token. Ablation
+    (performed): fall back to the base `_dev_prompt` and the fresh prompt
+    dispatches the bare key `1.1` with the sprint-board clause — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    skill = engine._dev_skill()
+
+    fresh = engine._dev_prompt(task, None)
+
+    assert fresh == (
+        f"/{skill} ticket 1.1 — {engine._sprint_board_instruction()} "
+        f"{engine._operator_park_instruction()}"
+    )
+    assert "`" not in fresh and "sprint-status" not in fresh
+    assert "tickets.py mark" in fresh and fresh.endswith(engine._operator_park_instruction())
+
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "built")
+    task.spec_file = str(plan)
+    feedback = project_v7.project / "feedback.md"
+    repair = engine._dev_prompt(task, feedback)
+
+    assert repair.startswith(f"/{skill} ticket 1.1 — resume the autonomous dev session")
+    assert repair.split("`")[-2] == str(feedback)
+
+
+@pytest.mark.parametrize(
+    ("policy", "risk", "thorough"),
+    [
+        ("high-risk", "high", True),
+        ("high-risk", "low", False),
+        ("high-risk", "", False),
+        ("always", "low", True),
+    ],
+)
+def test_dev_prompt_thorough_on_high_risk(project_v7, policy, risk, thorough):
+    """`[tickets] thorough_review`: the dev leg reads the find row's risk; the
+    review leg reads the plan's own `risk` (here raised to high by the build).
+    Ablation (performed): drop the `thorough` token from `dispatch_invocation`
+    and the high-risk rows FAIL."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", risk=risk),))
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        tickets=TicketsPolicy(thorough_review=policy),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    skill = engine._dev_skill()
+
+    head = engine._dev_prompt(task, None).split(" — ")[0]
+
+    assert head == f"/{skill} ticket 1.1" + (" thorough" if thorough else "")
+
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "built", risk="high")
+    task.spec_file = str(plan)
+    review_head = engine._review_prompt(task).split(" — ")[0]
+    assert review_head.endswith("ticket 1.1 thorough")
+
+
+def test_dev_prompt_never_thorough_when_policy_never(project_v7):
+    """`thorough_review = "never"` keeps both legs at build-auto's own review
+    selection, whatever the ticket's or the plan's risk."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", risk="high"),))
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        tickets=TicketsPolicy(thorough_review="never"),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "built", risk="high")
+    task.spec_file = str(plan)
+
+    assert "thorough" not in engine._dev_prompt(task, None)
+    assert "thorough" not in engine._review_prompt(task)
+
+
+def test_plan_halt_leg_prompt_and_env_in_lockstep(project_v7):
+    """Leg 1 of an unrefined plan checkpoint: the prompt carries `Halt after
+    planning.` (the dry-run's exact line) exactly when the dev session's env
+    carries `BMAD_LOOP_PLAN_HALT`, and both drop together once the plan is on disk
+    at `ready-for-dev`. No other session gets the env. Ablation (performed): drop
+    the env from `_extra_session_env` and the leg-1 assertion FAILS."""
+    row = ticket_row("1.1", plan_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, adapter = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    skill = engine._dev_skill()
+    dry_run_line = tickets_source.dispatch_invocation(
+        skill, "1.1", thorough=False, plan_halt=tickets_source.is_plan_halt_leg(row)
+    )
+
+    leg_one = engine._dev_prompt(task, None)
+
+    assert dry_run_line == f"/{skill} ticket 1.1 Halt after planning."
+    assert leg_one.startswith(dry_run_line + " ")
+    assert _probe_session(engine, adapter, task, role="dev").env["BMAD_LOOP_PLAN_HALT"] == "1"
+    assert "BMAD_LOOP_PLAN_HALT" not in _probe_session(engine, adapter, task, role="review").env
+    assert "BMAD_LOOP_PLAN_HALT" not in (
+        _probe_session(engine, adapter, task, role="dev", label="tea").env
+    )
+
+    _write_plan(Path(tree.finds["1.1"].plan), "ready-for-dev")
+
+    assert "Halt after planning." not in engine._dev_prompt(task, None)
+    assert "BMAD_LOOP_PLAN_HALT" not in _probe_session(engine, adapter, task, role="dev").env
+
+
+def test_review_prompt_has_no_append_and_no_board_text(project_v7):
+    """The follow-up review re-dispatches the ticket with the ledger sentence and
+    the tickets clauses: never the banned word, never the sprint board, no
+    backticks — and no park clause, because a tickets review demotion does not
+    park yet, even under `on_review_demotion = "park"`."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        operator=OperatorPolicy(on_review_demotion="park"),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "built")
+    task.spec_file = str(plan)
+
+    prompt = engine._review_prompt(task)
+
+    assert prompt.startswith(
+        f"/{engine._dev_skill('review')} ticket 1.1 — do NOT modify, re-open, or rewrite "
+        f"existing deferred-work ledger entries"
+    )
+    assert "append" not in prompt.lower()
+    assert "board" not in prompt.lower() and "sprint-status" not in prompt
+    assert "`" not in prompt and str(plan) not in prompt
+    assert prompt.endswith(engine._board_handback_redirect())
+    assert engine._operator_park_instruction() not in prompt
+
+
+def test_expected_spec_pinned_on_attempt_one(project_v7):
+    """The read-back is pinned to the bound plan from the first dev attempt —
+    before the plan exists, with no recorded spec — and to the same plan on the
+    review leg; a ticket session ends at `built` (dev) or `built`/`done` (review)
+    and probes the initiative folder for a fallback result. A labeled workflow
+    session keeps the v6 contract. Ablation (performed): fall back to the base
+    `_expected_spec_for` and the attempt-1 pin is None — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = tree.finds["1.1"].plan
+    assert task.spec_file is None and not Path(plan).exists()
+
+    dev = _probe_session(engine, adapter, task, role="dev")
+    review = _probe_session(engine, adapter, task, role="review")
+    workflow = _probe_session(engine, adapter, task, role="dev", label="tea")
+
+    folder = engine.workspace.paths.initiative_folder
+    assert (dev.expected_spec, dev.success_statuses, dev.fallback_result_dirs) == (
+        plan,
+        ("built",),
+        (folder,),
+    )
+    assert (review.expected_spec, review.success_statuses) == (plan, ("built", "done"))
+    assert (workflow.expected_spec, workflow.success_statuses, workflow.fallback_result_dirs) == (
+        None,
+        ("done",),
+        (),
+    )
+
+
+def test_verify_rejects_done_from_dev(project_v7):
+    """A dev session that marks its own plan `done` is refused: the orchestrator
+    owns `done`, so the gate retries; the same work at `built` passes and records
+    the bound plan as the task's spec. Ablation (performed): route the tickets
+    `_verify_dev_artifacts` to the base sprint gate and the `built` plan is
+    refused instead."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    task.baseline_commit = verify.rev_parse_head(project_v7.project)
+    plan = Path(tree.finds["1.1"].plan)
+    (project_v7.project / "src.txt").write_bytes(b"changed\n")
+    result = {"workflow": "auto-dev", "spec_file": str(plan)}
+
+    _write_plan(plan, "done", baseline=task.baseline_commit)
+    refused = engine._verify_dev_artifacts(task, result)
+
+    assert not refused.ok and "built" in refused.reason
+    assert task.spec_file is None
+
+    _write_plan(plan, "built", baseline=task.baseline_commit)
+    accepted = engine._verify_dev_artifacts(task, result)
+
+    assert accepted.ok, accepted.reason
+    assert task.spec_file == str(plan)
+
+
+def test_tickets_unit_reaches_commit_with_the_plan_at_built(project_v7):
+    """A picked ticket runs end to end on the mock adapter: one dev session,
+    pointed at the bound plan, builds it; verify accepts `built`; the unit commits
+    with the plan at `built` in the commit — never `done`, which nothing marks
+    yet — and the tree is never written."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+
+    def build(spec: SessionSpec) -> SessionResult:
+        assert spec.expected_spec == str(plan)
+        cwd = Path(spec.cwd)
+        baseline = verify.rev_parse_head(cwd)
+        (cwd / "src.txt").write_bytes(b"cart model\n")
+        _write_plan(plan, "built", baseline=baseline)
+        # the ticket now reads as finished in the tree, as `tickets.py` derives it
+        tree.next_view = _tree(project_v7).next_view
+        result = {"workflow": "auto-dev", "spec_file": str(plan), "status": "built"}
+        return SessionResult(status="completed", result_json=result)
+
+    engine, adapter = make_engine(project_v7, tree, script=[build], max_stories=1)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert len(adapter.sessions) == 1
+    assert adapter.sessions[0].prompt.startswith(f"/{engine._dev_skill()} ticket 1.1")
+    rel = plan.relative_to(project_v7.project).as_posix()
+    committed = git(project_v7.project, "show", f"{task.commit_sha}:{rel}")
+    assert status_of(parse_frontmatter(committed)) == "built"
+    assert tree.marks == []

@@ -8207,6 +8207,78 @@ def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     assert _pin_probe(project, redrive, spec_file=owed) == owed
 
 
+_PIN_BOARD = (
+    "sprint-status.yaml is owned by the orchestrator: never write it, and never revert a "
+    "change to it. A row at done or awaiting-operator is the orchestrator's own bookkeeping "
+    "— not a defect to fix, and not proof that the work is verified."
+)
+_PIN_PARK = (
+    "If this story's acceptance criteria include actions only a HUMAN can perform outside "
+    "the repo (buy a domain, publish a DNS record, grant an API key, click through a vendor "
+    "console): complete every part an agent CAN do, commit it, then finalize the spec "
+    "frontmatter to status: awaiting-operator and enumerate what is owed under an "
+    "operator_actions: key — a YAML list of strings, one imperative instruction each, "
+    "non-empty. The final Auto Run Result must also report the matching status: "
+    "awaiting-operator. Never use the blocked status for this: blocked halts the whole run, "
+    "and this story is finished as far as you can take it."
+)
+
+
+def test_base_seams_preserve_sprint_prompts_byte_identical(project):
+    """Characterization pin for the tickets-mode engine seams (`_expected_spec_for`,
+    `_session_success_statuses`, `_session_fallback_dirs`, `_dev_success_status`):
+    every sprint dev leg and the review prompt keep their exact bytes (captured from
+    the pre-seam engine), and a sprint session still reaches the adapter with the
+    v6 read-back contract — the recorded spec pinned, `done` the only success,
+    no fallback-result dirs.
+
+    Ablation (performed): make the base `_session_success_statuses` answer
+    `("built",)`, or `_dev_success_status` answer `"built"`, and this test FAILS."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    owed_path = spec_path(project, "1-1-a")
+    write_spec(owed_path, "done", "abc123")
+    owed = str(owed_path)
+    engine, adapter = make_engine(project, [SessionResult(status="crashed")] * 2)
+    bound = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
+    feedback = project.project / "feedback.md"
+
+    assert engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None) == (
+        f"/bmad-dev-auto 1-1-a — {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_prompt(bound, None) == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the ready-for-dev spec at "
+        f"`{owed}`. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_prompt(dataclasses.replace(bound, restore_patch="/x.patch"), None) == (
+        f"/bmad-dev-auto Resume review of the in-review spec at `{owed}`. The attempted "
+        f"change was restored onto the working tree after an intent-gap resolution; review "
+        f"it against the amended spec. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._review_prompt(bound) == (
+        f"/bmad-dev-auto {owed} — do NOT modify, re-open, or rewrite existing deferred-work "
+        f"ledger entries; the orchestrator owns their status and resolution. {_PIN_BOARD} If "
+        f"the story cannot be finished without a human decision, finalize the spec to status: "
+        f"blocked and say why. That is the hand-back channel; the board is not."
+    )
+    repair = engine._dev_prompt(dataclasses.replace(bound), feedback)
+    assert repair == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at "
+        f"`{owed}`. The previous session's work failed deterministic verification; repair "
+        f"the working tree so verification passes without changing the spec's frozen intent "
+        f"contract. Verification evidence is in `{feedback}`. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_success_status() == "done"
+
+    for role in ("dev", "review"):
+        engine._run_session(bound, role=role, prompt=repair, seq=1)
+        spec = adapter.sessions[-1]
+        assert (spec.expected_spec, spec.success_statuses, spec.fallback_result_dirs) == (
+            owed,
+            ("done",),
+            (),
+        )
+
+
 def test_fresh_sprint_prompt_without_recorded_spec_stays_bare_and_unpinned(project):
     """T19: a fresh sprint task has no spec path to route or pin.
 

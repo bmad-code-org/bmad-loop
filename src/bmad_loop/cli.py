@@ -3836,9 +3836,12 @@ def _dry_run_tickets(
         status = row.status or "no plan"
         print(f"\n  {position}. {row.ref}  ({status}){_ticket_badge(row)}  {row.title}")
         plan_halt = tickets_source.is_plan_halt_leg(row)
-        dispatch = f"/{dev_skill} ticket {row.ref}"
-        if plan_halt:
-            dispatch += " Halt after planning."
+        dispatch = tickets_source.dispatch_invocation(
+            dev_skill,
+            tickets_source.row_label(row),
+            thorough=tickets_source.wants_thorough(pol.tickets.thorough_review, row.risk),
+            plan_halt=plan_halt,
+        )
         print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
         env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.ref}"
         if plan_halt:

@@ -29,6 +29,16 @@ Pick-time pauses (``_halt_pick``), all raised before a ticket is recorded in
 
 Rows the pick passed over are journaled once per process (``ticket-skipped``,
 ``ticket-foreign-active``).
+
+A picked ticket is dispatched as ``ticket <ref>`` on every leg
+(:meth:`TicketsEngine._dev_prompt`, :meth:`TicketsEngine._review_prompt`), with
+the dry-run's own invocation line (``thorough`` per ``[tickets]
+thorough_review``, ``Halt after planning.`` on leg 1 of an unrefined plan
+checkpoint). The read-back is pinned to the plan ``find`` named from attempt 1,
+ends at ``built`` (dev) or ``built``/``done`` (review), and probes the
+initiative folder for a no-plan fallback result. The dev and review gates are
+``verify.verify_dev_tickets`` / ``verify.verify_review_tickets``: no sprint board,
+and the orchestrator alone owns ``done``.
 """
 
 from __future__ import annotations
@@ -37,11 +47,12 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import gates
+from . import gates, verify
+from .adapters.base import SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused
 from .frontmatter import parse_frontmatter, status_of
-from .model import StoryTask, TicketBinding
+from .model import StoryTask, TicketBinding, VerifyOutcome, result_mapping
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
     HALT_HITL,
@@ -55,8 +66,10 @@ from .tickets_source import (
     Skip,
     TicketRef,
     TicketsWorkSource,
+    dispatch_invocation,
     plan_planned,
     ticket_binding,
+    wants_thorough,
 )
 from .tickettree import TicketsError, TicketTree, TicketTreeLike
 from .worksource import SOURCE_TICKETS
@@ -88,6 +101,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._noted: set[tuple[str, str, str]] = set()
         # ref -> binding resolved at pick time, attached when the task registers.
         self._picked: dict[str, TicketBinding] = {}
+        # story key -> plan status its last review launched on (`_verify_review`).
+        self._review_entered: dict[str, str] = {}
         super().__init__(*args, **kwargs)
         # pin the mode so resume/resolve rebuild a TicketsEngine without policy.
         self.state.source = SOURCE_TICKETS
@@ -297,3 +312,323 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """Whether the next pick would end the run. A tree that cannot be read
         answers False, so a done_checkpoint still fires."""
         return isinstance(self._tickets_source.decide(self._phases()), Skip)
+
+    # -------------------------------------------------------------- dispatch
+
+    def _bound_plan(self, task: StoryTask) -> Path | None:
+        """The ticket's plan as ``find`` named it at pick time, re-anchored in the
+        active workspace (the same path in place; the unit worktree's copy under
+        isolation). None for a task with no binding."""
+        ticket = task.ticket
+        if ticket is None:
+            return None
+        plan = Path(ticket.plan)
+        try:
+            rel = plan.relative_to(self.paths.project)
+        except ValueError:
+            return plan
+        return self.workspace.paths.project / rel
+
+    def _plan_halt_now(self, task: StoryTask) -> bool:
+        """Leg 1 of an unrefined ``plan_checkpoint``, read from the binding and the
+        plan on disk before the session writes it — the one predicate the prompt's
+        ``Halt after planning.`` and the env's ``BMAD_LOOP_PLAN_HALT`` share."""
+        return self._plan_halt_leg(task, self._entry_checkpoint_flags(task))
+
+    def _dev_thorough(self, task: StoryTask) -> bool:
+        """``[tickets] thorough_review`` for a dev leg: the find row's risk."""
+        ticket = task.ticket
+        risk = ticket.risk if ticket is not None else ""
+        return wants_thorough(self.policy.tickets.thorough_review, risk)
+
+    def _review_thorough(self, task: StoryTask) -> bool:
+        """``[tickets] thorough_review`` for a review leg: the plan's own ``risk``,
+        which the build settles at or above the ticket's. A plan that cannot be
+        read, or sets no risk, falls back to the find row's."""
+        ticket = task.ticket
+        risk = ticket.risk if ticket is not None else ""
+        plan = self._bound_plan(task)
+        if plan is not None:
+            try:
+                fm = parse_frontmatter(plan.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError):
+                fm = {}
+            planned = fm.get("risk")
+            if isinstance(planned, str) and planned.strip():
+                risk = planned
+        return wants_thorough(self.policy.tickets.thorough_review, risk)
+
+    def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
+        """``ticket <ref>`` on every leg: build-auto resolves the ref with
+        ``tickets.py find`` and routes an existing plan by its status, before its
+        clean-tree check, so the ref alone resumes a planned, in-review or
+        restored plan.
+
+        * fresh — :func:`~bmad_loop.tickets_source.dispatch_invocation` (the line
+          the dry-run prints): ``thorough`` per ``[tickets] thorough_review``,
+          ``Halt after planning.`` on leg 1 of an unrefined plan checkpoint, then
+          the clauses and, on a retry with parked work, its notice paragraph;
+        * restore — the restored change is reviewed against the amended plan;
+        * repair — the plan is re-opened, and the feedback file stays the last
+          backticked token.
+
+        The clauses follow the base order (board, environment claim, park last)
+        and carry no backticks."""
+        clauses = [
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._environment_claim_instruction(),
+                self._operator_park_instruction(),
+            )
+            if c
+        ]
+        tail = " ".join(clauses)
+        ticket = task.ticket
+        ref = ticket.ref if ticket is not None else task.story_key
+        skill = self._dev_skill()
+        if feedback is not None:
+            self._reset_spec_for_repair(task)
+            plan = self._bound_plan(task)
+            return (
+                f"/{skill} ticket {ref} — resume the autonomous dev session on its "
+                f"in-progress plan at `{plan or task.spec_file or ref}`. The previous "
+                f"session's work failed deterministic verification; repair the working "
+                f"tree so verification passes without changing the plan's frozen intent "
+                f"contract. Verification evidence is in `{feedback}`."
+            ) + (f" {tail}" if tail else "")
+        if task.restore_patch and task.spec_file:
+            return (
+                f"/{skill} ticket {ref} — resume review of the in-review plan: the "
+                f"attempted change was restored onto the working tree after an "
+                f"intent-gap resolution; review it against the amended plan."
+            ) + (f" {tail}" if tail else "")
+        line = dispatch_invocation(
+            skill, ref, thorough=self._dev_thorough(task), plan_halt=self._plan_halt_now(task)
+        )
+        if tail:
+            line += (" " if line.endswith(".") else " — ") + tail
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            line += f"\n\n{preserved}"
+        return line
+
+    def _review_prompt(self, task: StoryTask) -> str:
+        """The follow-up review re-dispatches the same ticket (upstream routes a
+        ``built`` or ``done`` plan to a fresh review pass), ``thorough`` per the
+        plan's risk, with the base ledger sentence and clauses. The base pins
+        ``"append"`` out of the whole prompt; nothing here spells it."""
+        park = self._operator_park_instruction() if self._review_demotion_parks() else ""
+        clauses = [
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._board_handback_redirect(),
+                self._environment_claim_instruction(),
+                park,
+            )
+            if c
+        ]
+        tail = " ".join(clauses)
+        ticket = task.ticket
+        ref = ticket.ref if ticket is not None else task.story_key
+        head = f"/{self._dev_skill('review')} ticket {ref}"
+        if self._review_thorough(task):
+            head += " thorough"
+        return (
+            f"{head} — do NOT modify, re-open, or rewrite existing deferred-work ledger "
+            f"entries; the orchestrator owns their status and resolution."
+        ) + (f" {tail}" if tail else "")
+
+    def _sprint_board_instruction(self) -> str:
+        """Tickets mode has no sprint board; the ticket plan's status is what the
+        orchestrator owns instead. Build-auto marks its own plan ``blocked`` when it
+        HALTs, so that is the one ``mark`` a session may run. Bare sentence,
+        backtick-free, never the word the review seam bans."""
+        return (
+            "The ticket plan's status belongs to the orchestrator: never mark the "
+            "ticket done, and do not run tickets.py mark except through "
+            "build-auto's own HALT. The orchestrator marks the ticket done after its "
+            "own verification."
+        )
+
+    def _board_handback_redirect(self) -> str:
+        """Where a review that cannot finish the ticket goes: build-auto's own
+        blocked HALT, which records the reason on the plan through ``mark``."""
+        return (
+            "If the ticket cannot be finished without a human decision, HALT with "
+            "status blocked and say why. That is the hand-back channel."
+        )
+
+    def _operator_park_instruction(self) -> str:
+        """The base park contract, worded for the ticket plan. "" when parking is
+        off; the callers keep it last."""
+        if not self._operator_park_enabled():
+            return ""
+        return (
+            "If this ticket's acceptance criteria include actions only a HUMAN "
+            "can perform outside the repo (buy a domain, publish a DNS record, "
+            "grant an API key, click through a vendor console): complete every "
+            "part an agent CAN do, commit it, then finalize the plan frontmatter "
+            "to status: awaiting-operator and enumerate what is owed under an "
+            "operator_actions: key — a YAML list of strings, one imperative "
+            "instruction each, non-empty. The final Auto Run Result must also "
+            "report the matching status: awaiting-operator. Never use the blocked "
+            "status for this: blocked halts the whole run, and this ticket is "
+            "finished as far as you can take it."
+        )
+
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        """Only ``BMAD_LOOP_PLAN_HALT``, on a primary dev session's plan-halt leg,
+        so the adapter reads a ``ready-for-dev`` plan as that leg's success. The
+        plan itself reaches the adapter as ``expected_spec``."""
+        if label is None and role == "dev" and self._plan_halt_now(task):
+            return {"BMAD_LOOP_PLAN_HALT": "1"}
+        return {}
+
+    def _expected_spec_for(self, task: StoryTask, prompt: str, label: str | None) -> str | None:
+        """The bound plan, from attempt 1: ``find`` named it before launch, so the
+        read-back never scans the initiative folder for another ticket's plan. A
+        labeled workflow session owes its completion marker, not the plan."""
+        del prompt
+        plan = self._bound_plan(task)
+        if label is not None or plan is None or not self._generic_dev():
+            return None
+        return str(plan)
+
+    def _session_success_statuses(self, role: str, label: str | None) -> tuple[str, ...]:
+        """A dev leg finishes its plan at ``built``; a review leaves it at
+        ``built``, or ``done`` when a human accepted it first. A labeled workflow
+        session keeps the marker contract's ``done``."""
+        if label is not None:
+            return super()._session_success_statuses(role, label)
+        if role == "review":
+            return (verify.PLAN_BUILT, verify.PLAN_DONE)
+        return (verify.PLAN_BUILT,)
+
+    def _session_fallback_dirs(self, role: str, label: str | None) -> tuple[Path, ...]:
+        """A build that cannot resolve its ticket HALTs into the initiative folder
+        (``bmad-build-auto-result-*``), never into the plan: probe it there."""
+        folder = self.workspace.paths.initiative_folder
+        if label is not None or folder is None:
+            return super()._session_fallback_dirs(role, label)
+        return (folder,)
+
+    def _dev_success_status(self) -> str:
+        return verify.PLAN_BUILT
+
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """The bound plan when it is on disk at dispatch, as the canonical regular
+        file — a fresh ticket has none yet and launches unbound."""
+        plan = self._bound_plan(task)
+        if plan is None:
+            return None
+        try:
+            if plan.is_symlink():
+                return None
+            resolved = plan.resolve(strict=True)
+            if not resolved.is_file() or not verify.spec_within_roots(
+                resolved, self.workspace.paths
+            ):
+                return None
+            return str(resolved)
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """``ticket <ref>`` routes on an existing plan, so any plan on disk is
+        input the session will mutate: it must launch with a recoverable snapshot.
+        A plan whose presence cannot be read fails closed."""
+        del prompt
+        plan = self._bound_plan(task)
+        if plan is None:
+            return False
+        try:
+            return plan.exists() or plan.is_symlink()
+        except OSError:
+            return True
+
+    def _record_dev_spec(self, task: StoryTask, result_json: dict | None) -> None:
+        """Record the bound plan — known before launch — never the session's
+        claim, and never a fallback result. No-op once set or while the plan is
+        absent (a pre-plan HALT)."""
+        del result_json
+        if task.spec_file:
+            return
+        plan = self._bound_plan(task)
+        if plan is not None and plan.is_file():
+            task.spec_file = str(plan)
+
+    def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
+        """The bound plan verification accepts, when the result names a file."""
+        if not result_mapping(result_json).get("spec_file"):
+            return None
+        return self._bound_plan(task)
+
+    # ---------------------------------------------------------------- verify
+
+    def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
+        """:func:`~bmad_loop.verify.verify_dev_tickets` against the bound plan. The
+        adapter's ``plan_halt`` marker is latched on the task, as stories mode
+        does, and switches the gate to the ``ready-for-dev`` plan."""
+        plan = self._bound_plan(task)
+        ticket = task.ticket
+        if plan is None or ticket is None:
+            return VerifyOutcome.escalate(
+                f"ticket unit {task.story_key} has no ticket binding to verify against"
+            )
+        plan_halt = bool(result_mapping(result_json).get("plan_halt"))
+        task.plan_checkpoint_pending = plan_halt
+        return verify.verify_dev_tickets(
+            task,
+            self.workspace.paths,
+            result_json,
+            plan=plan,
+            # every dispatched row has an id: backlog rows (no id) never dispatch
+            ticket_id=ticket.id or ticket.ref,
+            plan_halt=plan_halt,
+            operator_park=self._operator_park_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
+        )
+
+    def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
+        # a plan-halt leg produced only the plan: nothing to build or test yet.
+        return not bool(result_mapping(result_json).get("plan_halt"))
+
+    def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
+        """The base strip and snapshot, plus the plan status the review entered at
+        (the snapshot's), which :meth:`_verify_review` holds the review to."""
+        snapshot = super()._reset_spec_for_review(task)
+        if snapshot is not None:
+            self._review_entered[task.story_key] = snapshot.fm_status
+        else:
+            self._review_entered.pop(task.story_key, None)
+        return snapshot
+
+    def _verify_review(self, task: StoryTask):
+        """:func:`~bmad_loop.verify.verify_review_tickets`, held to the plan status
+        the review entered at. A replayed review (no launch this process) or an
+        unreadable launch snapshot assumes ``built``, the status every dev leg
+        leaves: a plan a human had already marked ``done`` then retries once,
+        visibly, and the next launch records ``done``."""
+        outcome = verify.verify_review_tickets(
+            task,
+            self.workspace.paths,
+            self.policy,
+            entered_status=self._review_entered.get(task.story_key, verify.PLAN_BUILT),
+            operator_park=self._operator_park_enabled(),
+            on_results=self._review_command_sink(task),
+            on_probes=self._review_probe_sink(task),
+        )
+        if outcome.ok:
+            self._accept_review_artifact_source(task)
+        return outcome
+
+    def _review_demotion_parks(self) -> bool:
+        """False: a review demotion parks through the sprint board in the base
+        engine, and tickets mode has none. The ticket park path (blocked with an
+        ``awaiting operator:`` reason) takes this over in Session 17 of the v7
+        program, under ``[operator] on_review_demotion = "park"``."""
+        return False
