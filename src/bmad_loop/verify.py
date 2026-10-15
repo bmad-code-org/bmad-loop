@@ -68,6 +68,7 @@ from .platform_util import (
 )
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
+from .statemachine import PLAN_STATUS_ORDER
 
 GIT_TIMEOUT_S = 120
 
@@ -9222,6 +9223,161 @@ def _stories_relpaths(root: Path, spec_folder: Path) -> tuple[str, ...]:
     return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
+# The BMAD v7 ticket-plan statuses the ticket gates name, and the skill's no-spec
+# fallback result prefixes. Mirror devcontract.BUILT / DROPPED /
+# FALLBACK_RESULT_PREFIXES, kept literal for the same import-direction reason as
+# PLAN_HALT_STATUS above (tests pin the mirrors equal).
+PLAN_BUILT = "built"
+PLAN_DONE = "done"
+PLAN_DROPPED = "dropped"
+FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
+
+
+# Upstream tickets.py's `ID_RE`: an entry id is ASCII letters and digits.
+_TICKET_ID_RE = re.compile(r"[0-9A-Za-z]+")
+
+
+def _ticket_id_key(value: object) -> int | str | None:
+    """The key a plan's ``ticket:`` binds by, as upstream ``tickets.py``'s
+    ``join_plans`` reads it: an entry id (``_id``: an int, or an ASCII
+    letters-and-digits string other than ``true``/``false``, all-digit ones being
+    the number) or else the story file's stem, matched as written. A boolean or an
+    empty value binds nothing. A plan's ``ticket:`` comes back an int or a string
+    depending on how it was quoted (upstream #3072 changes the quoting), so the
+    binding compares these keys, never raw ``str()`` spellings."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if _TICKET_ID_RE.fullmatch(text) and text.isdigit():
+        return int(text)
+    return text
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two spellings name the same file, by resolved path. A resolve
+    fault reads as "not the same", which retries rather than accepting."""
+    try:
+        return a.resolve() == b.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def verify_dev_tickets(
+    task: StoryTask,
+    paths: ProjectPaths,
+    result_json: dict[str, Any] | None,
+    *,
+    plan: Path,
+    ticket_id: str,
+    plan_halt: bool = False,
+    operator_park: bool = False,
+    engine_written: tuple[str, ...] = (),
+) -> VerifyOutcome:
+    """verify_dev for a BMAD v7 ticket: the plan ``tickets.py find`` named at
+    dispatch, and no sprint board.
+
+    Same shared gates as :func:`verify_dev_stories` — workflow tag, expected
+    frontmatter status, baseline match, proof-of-work since baseline — with the
+    plan bound deterministically instead of resolved by id:
+
+    - ``plan`` is the orchestrator's binding. A result naming any other file
+      retries, save a no-spec fallback result (``bmad-build-auto-result-*``): a
+      session that could not resolve its ticket wrote one, its block is already a
+      CRITICAL escalation, and retrying the same dispatch cannot resolve it, so
+      the gate escalates. A result naming no file is read against ``plan``.
+    - The plan's ``ticket:`` must name ``ticket_id``, compared as upstream compares
+      ids (:func:`_ticket_id_key`), so a quoted ``'7'`` and a bare ``7`` agree.
+    - The expected status is ``built``: a v7 build finishes there and the
+      orchestrator owns ``done``, so a dev session that marked its own plan
+      ``done`` retries like any other wrong status. ``ready-for-dev`` on a
+      ``plan_halt`` leg, which also demands the result's ``plan_halt`` marker and
+      skips proof-of-work as :func:`verify_dev_stories` does. ``awaiting-operator``
+      when ``operator_park`` is on and the plan declares it, held to the same
+      actions gate and park-assertion waiver as :func:`verify_dev`.
+    - A ``dropped`` plan escalates as a contradiction: a human withdrew the ticket
+      while its session ran, and no retry can build a dropped ticket.
+
+    There is no board gate: the plan's own status is the record. The plan is
+    excluded from proof-of-work as the gate's ``spec_path``, so a bare status flip
+    on it is not work. On success ``task.spec_file`` is the bound plan."""
+    rj = result_mapping(result_json)
+    claimed = rj.get("spec_file")
+    if claimed:
+        claimed_path = resolve_spec_path(str(claimed), paths)
+        if not _same_file(claimed_path, plan):
+            if claimed_path.name.startswith(FALLBACK_RESULT_PREFIXES):
+                return VerifyOutcome.escalate(
+                    f"the session halted without its ticket plan and wrote a fallback "
+                    f"result instead: {claimed_path} (expected plan {plan})"
+                )
+            return VerifyOutcome.retry(
+                f"dev result names {claimed_path}, but ticket {ticket_id!r} is bound "
+                f"to plan {plan}"
+            )
+    if not plan.is_file():
+        return VerifyOutcome.retry(f"bound ticket plan does not exist: {plan}")
+
+    fm = _gate_frontmatter(plan)
+    if isinstance(fm, VerifyOutcome):
+        return fm
+    bound = fm.get("ticket")
+    if _ticket_id_key(bound) is None or _ticket_id_key(bound) != _ticket_id_key(ticket_id):
+        return VerifyOutcome.retry(
+            f"plan {plan} names ticket {bound!r}, expected {ticket_id!r}", fixable=True
+        )
+    status = status_of(fm)
+    if status == PLAN_DROPPED:
+        return VerifyOutcome.escalate(
+            f"ticket {ticket_id!r} was dropped while its session ran: {plan}. A dropped "
+            f"ticket is not built, so there is nothing to land; decide what happens to "
+            f"the attempt's changes before re-arming.",
+            contradiction=True,
+        )
+    parked = operator_park and status == AWAITING_OPERATOR
+    if parked:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
+    skip_proof = parked and rj.get("park_asserted") is True
+
+    if plan_halt:
+        # The same synth-side cross-check verify_dev_stories makes: a
+        # died-mid-flight ready-for-dev carries no marker.
+        if rj.get("plan_halt") is not True:
+            return VerifyOutcome.retry(
+                "plan_halt verification requested but result.json carries no plan_halt marker"
+            )
+        expected = PLAN_HALT_STATUS
+    elif parked:
+        expected = AWAITING_OPERATOR
+    else:
+        expected = PLAN_BUILT
+    waived = plan_halt or skip_proof
+    gate = _verify_shared_gates(
+        plan,
+        rj,
+        task,
+        paths,
+        expected_status=expected,
+        extra_exclude=None if waived else engine_written,
+        observe_skipped_proof=engine_written if waived else None,
+        fm=fm,
+    )
+    if gate.outcome is not None:
+        return gate.outcome
+
+    task.spec_file = str(plan)
+    return VerifyOutcome.passed(
+        park_proof_skipped=skip_proof,
+        park_zero_diff=gate.skipped_proof_zero_diff if skip_proof else None,
+        plan_halt_zero_diff=gate.skipped_proof_zero_diff if plan_halt else None,
+    )
+
+
 # A hard ceiling on how much of one verifier stream is held in memory, separate
 # from and far above `[verify] stream_capture_kb` (which bounds what reaches
 # disk). Plugins are meant to see the streams essentially whole, so this is a
@@ -10191,6 +10347,84 @@ def verify_review_stories(
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
     return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+
+
+def verify_review_tickets(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    entered_status: str = PLAN_BUILT,
+    operator_park: bool = False,
+    on_results: CommandSink | None = None,
+    on_probes: ProbeSink | None = None,
+) -> VerifyOutcome:
+    """verify_review for a BMAD v7 ticket: the plan ``task.spec_file``
+    (:func:`verify_dev_tickets` recorded it) read back, then the verify commands.
+
+    A ticket review leaves the plan where a build leaves it, at ``built``: the
+    orchestrator marks ``done`` only after this gate. The one exception is a plan
+    that ENTERED the review at ``done`` (``entered_status``, read by the caller
+    before launch — a human accepted it first), which must still be ``done``.
+    ``awaiting-operator`` passes under ``operator_park`` with the same actions
+    gate :func:`verify_review` applies.
+
+    The plan is the only artifact, so the board's sign-off-regression arm becomes
+    a monotonic read-back of the plan itself: a status that sits EARLIER in
+    ``statemachine.PLAN_STATUS_ORDER`` than the one the review entered at is the
+    review walking the ticket backward. Under ``review.on_status_contradiction =
+    "escalate"`` (the default) that escalates as a contradiction, since no
+    further review cycle re-advances it; under ``"retry"`` it retries. Any other
+    mismatch retries. A ``dropped`` plan always escalates as a contradiction.
+
+    ``on_results`` / ``on_probes`` go straight to ``_verify_review_commands``,
+    as for every review gate."""
+    if not task.spec_file:
+        return VerifyOutcome.retry("no spec file recorded for task")
+    plan = Path(task.spec_file)
+    fm = _gate_frontmatter(plan)
+    if isinstance(fm, VerifyOutcome):
+        return fm
+    status = status_of(fm)
+    if status == PLAN_DROPPED:
+        return VerifyOutcome.escalate(
+            f"ticket plan was dropped during its review: {plan}. A dropped ticket is "
+            f"not accepted, so there is nothing to land.",
+            contradiction=True,
+        )
+    if operator_park and status == AWAITING_OPERATOR:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
+        return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+    expected = PLAN_DONE if entered_status == PLAN_DONE else PLAN_BUILT
+    if status != expected:
+        if _is_plan_regression(status, entered_status, policy):
+            return VerifyOutcome.escalate(
+                f"review walked ticket plan {plan} back from {entered_status!r} to "
+                f"{status!r}. The orchestrator verified it at {entered_status!r} before "
+                f"the review, and no further review cycle moves it forward again. "
+                f"Resolve by finishing the outstanding work and re-arming the "
+                f"escalation, or by accepting the ticket yourself; set "
+                f'review.on_status_contradiction = "retry" to retry instead.',
+                contradiction=True,
+            )
+        return VerifyOutcome.retry(f"plan status is {status!r}, expected {expected!r}: {plan}")
+    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+
+
+def _is_plan_regression(status: str, entered_status: str, policy: Policy) -> bool:
+    """Whether ``status`` sits strictly earlier in the plan lifecycle than the
+    status the review entered at. Conservative like :func:`_is_signoff_regression`:
+    a token outside ``PLAN_STATUS_ORDER`` (``blocked``, an unknown value), a
+    blank one (``""``: no plan status read, the shape an unreadable or torn plan
+    leaves), an unknown entry status, or the ``retry`` knob all fall through to
+    the ordinary retry."""
+    if policy.review.on_status_contradiction != "escalate" or not status:
+        return False
+    if status not in PLAN_STATUS_ORDER or entered_status not in PLAN_STATUS_ORDER:
+        return False
+    return PLAN_STATUS_ORDER.index(status) < PLAN_STATUS_ORDER.index(entered_status)
 
 
 def verify_review_bundle(
