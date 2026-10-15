@@ -6764,6 +6764,20 @@ def test_a_launched_refusal_journals_every_line_it_printed_not_only_the_hint(
     assert "still names the window of the launch before it" in error
 
 
+def test_a_refused_launch_after_a_replay_mint_journals_into_the_replay_run(tmp_path):
+    # A finished-run reverify mints a replay run and drives it in this process;
+    # a refusal after the mint is the replay run's. Ablation: ignore the
+    # switched run id and the entry lands in the finished run instead.
+    finished = _escalated_run(tmp_path, "r1")
+    replay = _escalated_run(tmp_path, "r2")
+    args = argparse.Namespace(
+        project=str(tmp_path), run_id="r1", command="resolve", ctl_launch_run_id="r2"
+    )
+    cli._journal_unaccepted_launch(args, "refused")
+    assert _ctl_launch_entries(finished) == []
+    assert len(_ctl_launch_entries(replay)) == 1
+
+
 def test_a_launched_resume_that_accepted_then_failed_journals_no_refusal(tmp_path, monkeypatch):
     # Past acceptance the run is this child's, and its failure the run's own
     # story; the claim also hears the launch marker. Ablation: drop the

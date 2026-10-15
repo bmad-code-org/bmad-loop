@@ -4579,11 +4579,15 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
     `args.run_id`), and kept only on an exact-name hit: the command normalized
     `args.run_id` to the run it resolved, and a removed run's id would otherwise
     fall back to a suffix match and journal into another run."""
+    # A finished-run reverify switches this process to the replay run it
+    # minted (`_resolve_reverify_finished`); a refusal after that is the replay
+    # run's, not the finished run's.
+    run_id = getattr(args, "ctl_launch_run_id", None) or args.run_id
     try:
-        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
+        run_dir = runs.resolve_run_dir(_project(args), run_id)
     except runs.RunRefError:
         return  # no run to record against
-    if run_dir.name != args.run_id:
+    if run_dir.name != run_id:
         return  # a partial match, not the run this command resolved
     try:
         with state_lock(run_dir):
@@ -5894,6 +5898,8 @@ def _resolve_reverify_finished(
         print(f"error: {e}", file=sys.stderr)
         return 1
     replay_id = replay_dir.name
+    # From here a refused launch is the replay run's (`_journal_unaccepted_launch`).
+    args.ctl_launch_run_id = replay_id
     print(
         f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
         "verify replays on resume"
