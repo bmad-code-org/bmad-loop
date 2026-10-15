@@ -61,6 +61,14 @@ When an escalation names a saved patch (in the spec's `## Auto Run Result`), you
 
 In-place runs only: it is refused under worktree isolation, for a task with a worktree, and for a story with no recorded spec.
 
+### Resolve in tickets mode
+
+A tickets run's frozen spec is the ticket's plan, and its intent is the plan's `<intent-contract>` block. The resolve agent's context adds a `tickets` block: the ticket's ref, the plan's status and blocked reason, and an excerpt of its `## Auto Run Result`.
+
+The re-arm moves the plan through `tickets.py mark` (reason `rearm`): to `ready-for-dev`, or `in-review` for a restore. This clears the plan's `blocked_*` fields. A move the plan transition table refuses aborts the re-arm, and the ticket stays escalated. An aborted re-arm puts the plan back byte for byte.
+
+build-auto saves an intent-gap patch beside the plan as `<plan>.patch`. The re-arm moves it to the run's `restore/` directory either way, because a patch left in the tree fails the re-drive's clean-tree check. A restore that names the patch latches the moved copy. A later `--restore-patch` naming the original path finds the copy.
+
 ### Adopt the kept branch
 
 Under worktree isolation, when the escalation was a false alarm and the kept branch is good:

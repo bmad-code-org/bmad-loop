@@ -22448,3 +22448,27 @@ def test_confirm_tickets_never_policy_marks_built(project_v7, capsys, monkeypatc
     assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 1
     assert "1.1" in operatoractions.load(project_v7.project)
     assert "NOT confirmed" in capsys.readouterr().err
+
+
+def test_resolve_restore_patch_latches_the_evacuated_copy(project_v7):
+    """A tickets re-arm moves the plan's intent-gap patch to
+    `runs.evacuated_patch_path`, so a later resolve cycle naming the original path
+    latches the moved copy, and naming the copy itself is trusted by its location.
+    Ablation (performed): drop the fallback in `_resolve_restore_patch` and the
+    original's path is refused as not a file — this FAILS."""
+    import types
+
+    from conftest import write_plan
+
+    plan = write_plan(project_v7, "epic-cart", "story-cart-model-plan", 1, "blocked")
+    run = escalated_run(project_v7.project, "r1", spec_file=str(plan), source="tickets")
+    copy = runs.evacuated_patch_path(run.run_dir, "s1")
+    copy.parent.mkdir(parents=True)
+    copy.write_text("diff\n", encoding="utf-8")
+    pol = types.SimpleNamespace(scm=types.SimpleNamespace(isolation="none"))
+
+    for raw in (str(plan.with_suffix(".patch")), str(copy)):
+        args = argparse.Namespace(restore_patch=raw, interactive=False)
+        assert cli._resolve_restore_patch(
+            project_v7.project, run.run_dir, "s1", args, pol, run.state, run.task
+        ) == (str(copy.resolve()), None)

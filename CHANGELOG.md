@@ -43,6 +43,10 @@ breaking changes may land in a minor release.
 - Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
   `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
   A plan restore is confined to the ticket store root.
+- Add `resolve` for tickets runs: the re-arm moves the ticket plan through `tickets.py
+mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm restores
+  the plan's exact bytes. An intent-gap `<plan>.patch` is moved to the run's `restore/`
+  directory, and a restore latches that copy. The resolve context gains a `tickets` block.
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

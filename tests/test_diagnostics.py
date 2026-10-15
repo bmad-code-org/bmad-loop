@@ -1444,6 +1444,12 @@ _PATCH_PATH_ROUTING_ROWS = (
         "patch",
         f"{HOME_PATH}/.bmad-loop/runs/r1/failed/{STORY_KEY}/changes.patch",
     ),
+    ("restore-patch-evacuated", "patch", f"{HOME_PATH}/artifacts/epic-x/story-x-plan.patch"),
+    (
+        "restore-patch-evacuated",
+        "stashed_to",
+        f"{HOME_PATH}/.bmad-loop/runs/r1/restore/{STORY_KEY}.patch",
+    ),
     (
         "deferred-artifacts-stashed",
         "stashed_to",

@@ -22,11 +22,11 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Any
 
-from . import worksource
+from . import devcontract, frontmatter, worksource
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
-from .journal import TASK_CYCLE_ARTIFACTS
+from .journal import TASK_CYCLE_ARTIFACTS, Journal
 from .model import RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
@@ -454,6 +454,10 @@ def build_context(
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if stories_ctx:
         context["stories"] = stories_ctx
+    # tickets mode: the ticket the escalation is about, and its plan as it reads now —
+    # the status and blocked reason build-auto's HALT left, and its result excerpt.
+    if traits.name == worksource.SOURCE_TICKETS:
+        context["tickets"] = _tickets_context(run_dir, story_key, task, plan_path=context_spec_path)
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
@@ -512,6 +516,54 @@ def _stories_context(
             "path": sentinel_path.as_posix() if sentinel_path is not None else None,
             "blocking_condition": condition,
         }
+    return ctx
+
+
+# How much of a ticket plan's `## Auto Run Result` the resolve context carries.
+TICKET_RESULT_EXCERPT_CHARS = 2000
+
+
+def _tickets_context(
+    run_dir: Path, story_key: str, task: StoryTask | None, *, plan_path: Path | None
+) -> dict[str, Any]:
+    """The tickets-mode extension of the resolve context: the ticket binding the run
+    persisted (``ref``, ``ticket_id``, ``title``, ``epic``), the plan path, and what
+    the plan reads now — ``plan_status``, ``blocked_reason`` and an excerpt of its
+    ``## Auto Run Result`` (``auto_run_result``). Read natively, never through
+    ``tickets.py``. A plan that is absent reads as nulls; one that cannot be read
+    reads as nulls too, and the fault is journaled as
+    ``resolve-ticket-context-unreadable`` so the null is never mistaken for an
+    empty plan."""
+    ticket = task.ticket if task is not None else None
+    plan = plan_path if plan_path is not None else Path(ticket.plan) if ticket else None
+    ctx: dict[str, Any] = {
+        "ref": ticket.ref if ticket else None,
+        "ticket_id": ticket.id if ticket else None,
+        "title": ticket.title if ticket else None,
+        "epic": ticket.epic_slug if ticket else None,
+        "plan": plan.as_posix() if plan is not None else None,
+        "plan_status": None,
+        "blocked_reason": None,
+        "auto_run_result": None,
+    }
+    if plan is None or not plan.exists():
+        return ctx
+    try:
+        text = plan.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        Journal(run_dir).append(
+            "resolve-ticket-context-unreadable",
+            story_key=story_key,
+            plan=str(plan),
+            error=f"{e.__class__.__name__}: {e}",
+        )
+        return ctx
+    fm = frontmatter.parse_frontmatter(text)
+    reason = fm.get("blocked_reason")
+    result = devcontract.parse_auto_run_result(text)
+    ctx["plan_status"] = frontmatter.status_of(fm)
+    ctx["blocked_reason"] = str(reason) if reason not in (None, "") else None
+    ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
     return ctx
 
 

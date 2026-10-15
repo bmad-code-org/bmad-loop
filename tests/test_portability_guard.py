@@ -441,9 +441,11 @@ JOURNAL_PATCH_KINDS = frozenset(
         # recovery_flow.py — the intent-gap restore pair.
         "attempt-restore-failed",
         "attempt-restored",
-        # runs.py — the operator-selected stale-restore pair.
+        # runs.py — the operator-selected stale-restore pair, and the tickets-mode
+        # re-arm's move of a plan's intent-gap patch to the run dir.
         "stale-restore-unparseable",
         "stale-restore-excluded",
+        "restore-patch-evacuated",
         # worktree_flow.py — the retained forensic patch of a closed unit.
         "unit-closed",
     }
@@ -525,6 +527,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # by name.
     "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
     "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
+    # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
+    # `patch` and `stashed_to` are dropped by name.
+    "restore-patch-evacuated": frozenset({"latched"}),
     # tickets_engine.py: the pick's closed halt token (`tickets_source.HALT_*`);
     # `ref` and `stage` ride the by-name benign row, `detail` is dropped by name.
     "ticket-pick-halt": frozenset({"cause"}),
@@ -1574,12 +1579,17 @@ JOURNAL_KINDS = frozenset(
         "rearm-spec-flip-skipped",
         "rearm-spec-write-unreachable",
         "rearm-upstream-write-unreachable",
+        # tickets mode: a plan's intent-gap patch moved out of the tree at re-arm.
+        "restore-patch-evacuated",
         "run-stop-undelivered",
         "sentinel-cleared",
         "stale-restore-commits",
         "stale-restore-excluded",
         "stale-restore-unparseable",
         "story-escalation-resolved",
+        # resolve.py — a tickets-mode resolve context whose plan could not be read
+        # (the context carries nulls for what it could not read).
+        "resolve-ticket-context-unreadable",
         # runsetup.py
         "composition-unwind-failed",
         # A resume that could not clear its run's same-named session from a

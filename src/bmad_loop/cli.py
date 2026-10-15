@@ -5135,10 +5135,21 @@ def _resolve_restore_patch(
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
     # is_relative_to(project) check would reject every legitimate restore there.
+    tickets = state.source == worksource.SOURCE_TICKETS
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(project, want_tickets=tickets)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot validate the restore patch path against the project config: {e}"
+    # tickets mode: an earlier re-arm moved the plan's intent-gap patch to the run dir
+    # (`runs.evacuated_patch_path`), so a later cycle naming the original latches the
+    # moved copy, and that copy is trusted by its own location.
+    evacuated = runs.evacuated_patch_path(run_dir, story_key).resolve()
+    if tickets and not patch.exists() and task.spec_file:
+        plan = runs.live_spec_path(task, state, project)
+        if patch == runs.plan_patch_path(plan).resolve() and evacuated.is_file():
+            patch = evacuated
+    if tickets and patch == evacuated and patch.is_file():
+        return str(patch), None
     if not patch.is_file() or not verify.spec_within_roots(patch, paths):
         return None, (
             f"restore patch {raw!r} is not a file under the project or its "
