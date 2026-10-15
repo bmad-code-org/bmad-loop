@@ -251,8 +251,8 @@ class TicketTreeLike(Protocol):
 _CAPABILITIES: dict[tuple[str, int, int], Capability] = {}
 
 
-def _running_version() -> tuple[int, int]:
-    return (sys.version_info[0], sys.version_info[1])
+def _running_version() -> tuple[int, int, int]:
+    return (sys.version_info[0], sys.version_info[1], sys.version_info[2])
 
 
 def _tail(text: str) -> str:

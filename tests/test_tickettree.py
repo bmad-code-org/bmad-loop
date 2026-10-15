@@ -192,7 +192,7 @@ def test_launcher_prefers_running_interpreter(tmp_path: Path):
 
 
 def test_launcher_falls_back_to_uv_when_requires_python_unmet(tmp_path, monkeypatch):
-    monkeypatch.setattr(tickettree, "_running_version", lambda: (3, 10))
+    monkeypatch.setattr(tickettree, "_running_version", lambda: (3, 10, 0))
     monkeypatch.setattr(tickettree.shutil, "which", lambda name: f"/opt/bin/{name}")
     prefix, env = tree_at(tmp_path).launcher()
     assert prefix == ["/opt/bin/uv", "run", "--no-project"]

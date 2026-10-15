@@ -376,15 +376,17 @@ def test_parse_requires_python_reads_the_pep723_block():
 @pytest.mark.parametrize(
     ("spec", "version", "expected"),
     [
-        (">=3.11", (3, 11), True),
-        (">=3.11", (3, 13), True),
-        (">=3.12", (3, 11), False),
-        (">= 3.11.2", (3, 11), True),
-        (">=4.0", (3, 13), False),
-        ("~=3.11", (3, 11), None),
-        (">=3.11,<4", (3, 11), None),
-        ("==3.11", (3, 11), None),
-        (None, (3, 11), None),
+        (">=3.11", (3, 11, 0), True),
+        (">=3.11", (3, 13, 1), True),
+        (">=3.12", (3, 11, 9), False),
+        (">= 3.11.2", (3, 11, 2), True),
+        (">= 3.11.2", (3, 11, 1), False),
+        (">=3.11.2", (3, 12, 0), True),
+        (">=4.0", (3, 13, 0), False),
+        ("~=3.11", (3, 11, 0), None),
+        (">=3.11,<4", (3, 11, 0), None),
+        ("==3.11", (3, 11, 0), None),
+        (None, (3, 11, 0), None),
     ],
 )
 def test_requires_python_only_understands_ge(spec, version, expected):

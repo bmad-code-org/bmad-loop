@@ -529,7 +529,7 @@ _PEP723_BLOCK_RE: Final = re.compile(r"^# /// script\s*$(.*?)^# ///\s*$", re.M |
 _REQUIRES_PYTHON_RE: Final = re.compile(
     r"""^#\s*requires-python\s*=\s*["']([^"']*)["']\s*$""", re.M
 )
-_GE_RE: Final = re.compile(r"^\s*>=\s*(\d+)\.(\d+)(?:\.\d+)?\s*$")
+_GE_RE: Final = re.compile(r"^\s*>=\s*(\d+)\.(\d+)(?:\.(\d+))?\s*$")
 
 
 def _usage_choices(help_text: str) -> frozenset[str]:
@@ -573,14 +573,15 @@ def capability_problems(cap: Capability) -> list[str]:
     return problems
 
 
-def requires_python_satisfied(spec: str | None, version: tuple[int, int]) -> bool | None:
-    """Whether ``version`` satisfies ``spec``. Only a single ``>=X.Y`` (or
-    ``>=X.Y.Z``, compared on X.Y) is understood; any other specifier, or none,
-    answers None — the caller then launches through ``uv``, which reads the
-    header itself."""
+def requires_python_satisfied(spec: str | None, version: tuple[int, int, int]) -> bool | None:
+    """Whether ``version`` (major, minor, micro) satisfies ``spec``. Only a single
+    ``>=X.Y`` or ``>=X.Y.Z`` is understood (a missing micro reads as 0); any other
+    specifier, or none, answers None — the caller then launches through ``uv``,
+    which reads the header itself."""
     if spec is None:
         return None
     hit = _GE_RE.match(spec)
     if hit is None:
         return None
-    return version >= (int(hit.group(1)), int(hit.group(2)))
+    floor = (int(hit.group(1)), int(hit.group(2)), int(hit.group(3) or 0))
+    return version >= floor
