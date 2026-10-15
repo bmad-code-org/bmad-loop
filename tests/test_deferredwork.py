@@ -1009,6 +1009,50 @@ def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
     assert legacy.title == "later flat finding"
 
 
+def test_flat_source_plan_append_after_canonical_stays_visible():
+    """The v7 attended `bmad-build` opens its flat block with `source_plan:`; the
+    block ends DW-1's span and reaches the legacy parser like a v6 one."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: later v7 finding\n"
+        "  evidence: must not be swallowed by DW-1\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open
+    assert "later v7 finding" not in canonical.body
+    assert legacy.title == "later v7 finding"
+    assert has_legacy(text)
+
+
+def test_flat_source_plan_status_not_absorbed_into_previous_entry():
+    """A v7 flat block after a CLOSED entry must stay an open legacy finding, not
+    become dead text inside DW-1's done span, where no reader — the strict view,
+    the legacy parser, the sweep's migrate step — would ever see it again.
+    Ablation: revert `_FLAT_SOURCE_BODY` to `source_spec:[ \\t]` and this FAILS."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: done\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: open v7 finding\n"
+        "  evidence: filed after DW-1 was closed\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+
+    assert canonical.status == "done"
+    assert "open v7 finding" not in canonical.body
+    assert has_legacy(text)
+    (legacy,) = parse_legacy(text)
+    assert legacy.title == "open v7 finding" and not legacy.done
+
+
 # The canonical-span boundary has to recognize every flat shape parse_legacy
 # does (#304): a boundary keyed on the full three-line block leaves the bug in
 # place for the partial ones — and those are not hypothetical, they are the
@@ -1028,18 +1072,21 @@ FLAT_TAIL_SHAPES = {
 }
 
 
+@pytest.mark.parametrize("key", ["source_spec", "source_plan"])
 @pytest.mark.parametrize("shape", sorted(FLAT_TAIL_SHAPES), ids=sorted(FLAT_TAIL_SHAPES))
-def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape):
+def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape, key):
+    """Both flat openers — v6 `source_spec:` and v7 `source_plan:` — in every shape."""
+    tail = FLAT_TAIL_SHAPES[shape].replace("source_spec", key).replace("SOURCE_SPEC", key.upper())
     text = (
         "# Deferred Work\n\n### DW-1: canonical\n\n"
-        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + FLAT_TAIL_SHAPES[shape]
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + tail
     )
 
     (canonical,) = parse_ledger(text)
     (legacy,) = parse_legacy(text)
 
     assert canonical.open, "the boundary must not cost DW-1 its status"
-    assert "source_spec" not in canonical.body
+    assert key not in canonical.body.lower()
     assert legacy.body.lstrip().startswith(("- ", "* ", "-\t"))
 
 

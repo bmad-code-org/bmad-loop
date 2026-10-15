@@ -5696,6 +5696,32 @@ class Engine:
         if changed:
             self._save()
 
+    def _harvest_success_statuses(self) -> frozenset[str]:
+        """The spec statuses at which a dev session's ``deferred:`` findings are
+        harvested: the status the session finalizes to — ``in-review`` when the
+        legacy dev skill hands off to review, else :meth:`_dev_success_status`."""
+        if self._dev_review_enabled():
+            return frozenset({"in-review"})
+        return frozenset({self._dev_success_status()})
+
+    def _harvest_source_name(self, spec_path: Path) -> str:
+        """The ``source_spec:`` value harvested entries carry for ``spec_path``.
+
+        On v6 it is the spec's bare file name. On v7 plan names repeat across epics
+        (``epic-auth/story-login-plan.md`` and ``epic-billing/story-login-plan.md``),
+        so it is the POSIX path relative to the initiative folder — the artifact dir
+        the ledger itself sits in — and the bare name for a plan outside it. The
+        value is half of the replay dedupe key, so it must be stable per plan."""
+        paths = self.workspace.paths
+        if paths.era == "v7":
+            try:
+                rel = spec_path.resolve().relative_to(paths.implementation_artifacts.resolve())
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                return rel.as_posix()
+        return spec_path.name
+
     def _harvest_spec_deferrals(
         self, task: StoryTask, result_json: dict | None
     ) -> VerifyOutcome | None:
@@ -5802,9 +5828,9 @@ class Engine:
         if devcontract.DEFERRED_FIELD not in fm:
             return
         status = verify.status_of(fm)
-        success_status = "in-review" if self._dev_review_enabled() else self._dev_success_status()
+        success_statuses = self._harvest_success_statuses()
         parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
-        if status != success_status and not parked:
+        if status not in success_statuses and not parked:
             # Stories mode's explicit plan checkpoint is a verified terminal for
             # that leg, not a half-finalized implementation. Its deferred notes
             # remain in the spec until the post-checkpoint implementation pass.
@@ -5821,7 +5847,7 @@ class Engine:
             # session can replace its `deferred:` list.
             status = self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
             parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
-            if status != success_status and not parked:
+            if status not in success_statuses and not parked:
                 shown_status = status or "<blank>"
                 return VerifyOutcome.retry(
                     "spec remained at reconcilable nonterminal status "
@@ -5831,7 +5857,7 @@ class Engine:
         if not findings and not malformed:
             return
 
-        spec_name = spec_path.name
+        spec_name = self._harvest_source_name(spec_path)
         # Read BEFORE building records: the seen-again match below decides which
         # findings become records at all. The durability ordering (records saved
         # before any ledger write) is preserved by the reorder — both writes,

@@ -1130,6 +1130,25 @@ def test_v7_without_initiative_falls_back_to_output_folder_with_none(tmp_path: P
     assert bmadconfig.active_initiative(root) is None
 
 
+def test_v7_ledger_path_is_initiative_folder(tmp_path: Path) -> None:
+    """On v7 the deferred-work ledger lives in the active initiative folder, beside
+    the plans whose ``deferred:`` lists the engine harvests into it."""
+    root = _v7(tmp_path, initiative="initiative-checkout")
+    paths = bmadconfig.load_paths(root)
+    folder = (root / "_bmad-output" / "initiative-checkout").resolve()
+    assert paths.deferred_work == folder / "deferred-work.md"
+
+
+def test_v7_ledger_falls_back_to_output_folder(tmp_path: Path) -> None:
+    """No active initiative: the ledger sits in ``output_folder``, the folder
+    build-auto itself writes to when ``initiative_folder == output_folder``."""
+    root = _v7(tmp_path)
+    _write_user_config(root, "# no initiative\n")
+    paths = bmadconfig.load_paths(root)
+    assert paths.initiative_folder is None
+    assert paths.deferred_work == paths.output_folder / "deferred-work.md"
+
+
 def test_v6_keys_present_keep_v6_era_even_with_tickets_py(project) -> None:
     """A complete v6 config resolves exactly as before when the v7 marker appears
     beside it: the marker alone never flips the era. Ablation: gate the v7 branch on

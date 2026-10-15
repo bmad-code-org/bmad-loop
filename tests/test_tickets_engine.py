@@ -3054,3 +3054,14 @@ def test_shared_store_adoption_latches_instead_of_marking(project_v7_store_repo,
     with pytest.raises(RunPaused):
         engine._apply_adoption(task)
     assert tree.marks == [] and task.phase == Phase.ESCALATED
+
+
+def test_tickets_harvest_accepts_built_and_done_plans(project_v7):
+    """A build leaves its plan at ``built``; a follow-up pass may find it already
+    ``done``. Both harvest, and ``source_spec:`` names the plan by its path in
+    the initiative folder."""
+    engine, _ = make_engine(project_v7, _tree(project_v7))
+    plan = project_v7.initiative_folder / "epic-auth" / "story-login-plan.md"
+
+    assert engine._harvest_success_statuses() == frozenset({"built", "done"})
+    assert engine._harvest_source_name(plan) == "epic-auth/story-login-plan.md"

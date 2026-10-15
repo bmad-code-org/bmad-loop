@@ -1,7 +1,9 @@
 # Deferred Work Format
 
-Canonical entry format for `{implementation_artifacts}/deferred-work.md`. The
-orchestrator owns this file, and two eras of dev session feed it:
+Canonical entry format for `{implementation_artifacts}/deferred-work.md` (on a
+BMAD v7 project, the active initiative folder's `deferred-work.md`, or
+`output_folder`'s when no initiative is active). The orchestrator owns this file,
+and two eras of dev session feed it:
 
 - **Current (BMAD-METHOD 6.10.1-next.33+).** The unattended primitive
   `bmad-build-auto` writes nothing here: it records defer-triaged review findings
@@ -10,7 +12,7 @@ orchestrator owns this file, and two eras of dev session feed it:
   fingerprinted `origin:` that starts with `spec-deferred`, plus `source_spec:`.
 - **Legacy and attended.** Pre-rename primitives (`bmad-dev-auto`) and the
   attended `bmad-build` append flat `- source_spec:` blocks directly into this
-  file; a `bmad-loop sweep --migrate` session normalizes them into the canonical
+  file (on v7, `- source_plan:` blocks, the same shape otherwise); a `bmad-loop sweep --migrate` session normalizes them into the canonical
   form, and rewrites freeform pre-DW-format content from older projects wholesale
   (see `./migration-mode.md`; the TUI shows such legacy items read-only until
   then).
@@ -102,27 +104,30 @@ says "no location was recorded", not "this item has none": a reader that finds
 an absent `location:` as `n/a`, never as "not yet known".
 
 Entries the orchestrator harvests from a spec carry one extra line,
-`source_spec:`, directly after `location:` — the spec the deferral came from. It
-is half the dedupe key (with `origin:`), so never edit or drop it when touching
-an entry; entries written by hand do not need it.
+`source_spec:`, directly after `location:` — the spec the deferral came from. On
+v7 the field keeps its name and holds the plan's path relative to the initiative
+folder (`epic-auth/story-login-plan.md`), because plan names repeat across epics.
+It is half the dedupe key (with `origin:`), so never edit or drop it when
+touching an entry; entries written by hand do not need it.
 
 **Every field line is exactly one line, and so is the title.** The format is
 line-oriented: readers find each field by scanning for `<name>:` at the start of
 a line, and an entry ends at whichever comes first — the next `### DW-<n>`
 entry, any other `#` .. `######` heading (indented up to three spaces, and
 followed by a space, a tab or the end of the line; four spaces or a leading tab
-makes an indented code block, which ends nothing), or a `- source_spec:`
-flat-append bullet. A value carrying a line break therefore does not wrap; it
+makes an indented code block, which ends nothing), or a `- source_spec:` or
+`- source_plan:` flat-append bullet. A value carrying a line break therefore does not wrap; it
 becomes new ledger content, and three things can follow:
 
 - a break followed by `### ` mints an entry nobody filed;
 - a break before a `status:` line leaves one entry carrying two, so the ledger
   no longer says one thing about it;
-- a break followed by `- source_spec:` cuts the entry short at that bullet, and
+- a break followed by `- source_spec:` or `- source_plan:` cuts the entry short
+  at that bullet, and
   everything after it re-surfaces as a phantom _legacy_ item.
 
 Keep breaks out of field values, along with `### ` and a leading
-`- source_spec:`. If a reason needs two sentences, write them on one line.
+`- source_spec:` or `- source_plan:`. If a reason needs two sentences, write them on one line.
 
 `severity:` is optional — entries written before this field existed have none
 and that is fine; readers must treat a missing or unrecognized value as

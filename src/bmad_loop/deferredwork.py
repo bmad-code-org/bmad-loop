@@ -1,15 +1,17 @@
 """Deterministic reading and editing of the deferred-work ledger.
 
-The ledger (`{implementation_artifacts}/deferred-work.md`) is append-only
-markdown in the canonical form documented at
+The ledger (`{implementation_artifacts}/deferred-work.md`; on a BMAD v7 project
+that is the active initiative folder, or `output_folder` when none is active) is
+append-only markdown in the canonical form documented at
 bmad-loop-sweep/deferred-work-format.md: `### DW-<seq>: <title>` headings with
 `origin:`/`location:`/`reason:`/`status:` field lines. The one sanctioned
 rewrite is :func:`archive_closed`, which moves closed entries verbatim to a
 sibling archive file and leaves id-preserving stubs. Pre-#2651 dev primitives
-and the attended `bmad-build` append flatter entries here directly, which the
-orchestrator normalizes on sweep; the current unattended primitive records its
-findings in the spec's frontmatter instead and the engine harvests them into
-canonical entries. The
+and the attended `bmad-build` append flatter entries here directly (opened by
+`- source_spec:`, or `- source_plan:` on v7), which the orchestrator normalizes
+on sweep; the current unattended primitive records its findings in the spec's
+(on v7, the plan's) frontmatter instead and the engine harvests them into
+canonical entries, whose `source_spec:` field keeps its name in every era. The
 orchestrator never trusts an LLM to have edited it — status flips and decision
 records happen here, and gates re-read the file from disk.
 
@@ -481,7 +483,11 @@ ANY_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?=[ \t]|$)", re.MULTILINE)
 # Keyed on the opening line alone, deliberately: also requiring the block's
 # `summary:`/`evidence:` lines would narrow the boundary below the parser's own
 # recognition, leaving the bug in place for every partial shape it accepts.
-_FLAT_SOURCE_BODY = r"source_spec:[ \t]"
+# Two keys open the block: v6's `source_spec:` and the v7 attended `bmad-build`'s
+# `source_plan:`. Matching only the first absorbed a v7 append into the canonical
+# entry above it, its `status:` and `gate:` lines included. The canonical field
+# stays `source_spec:` in every era; only the flat opener has two spellings.
+_FLAT_SOURCE_BODY = r"source_(?:spec|plan):[ \t]"
 FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 # The mechanical half of a hard gate. An entry could always *say* it blocked a
@@ -2883,7 +2889,8 @@ _LEAD_DONE_STRIP_RE = re.compile(
 #   - source_spec: `spec-foo.md`
 #     summary: <one sentence>
 #     evidence: <why this is real>
-# We recognize it so the `summary` becomes the title (not the source_spec path)
+# (on v7 the opener is `- source_plan: <plan>`, the same block otherwise).
+# We recognize it so the `summary` becomes the title (not the source path)
 # and the entry migrates cleanly into the canonical `### DW-<seq>` shape. The
 # opening line comes from the same `_FLAT_SOURCE_BODY` as FLAT_ENTRY_RE, which
 # bounds canonical spans on it — see that constant for why they must not drift.
@@ -2914,7 +2921,8 @@ def _clean_title(s: str) -> str:
 def _item_entry(first: str, body: str, section: str, section_done: bool) -> dict:
     """Interpret one bullet item; returns the pre-key entry fields."""
     if _FLAT_SOURCE_RE.match(first):
-        # flat appender block (legacy/attended era): title is the `summary`
+        # flat appender block (legacy/attended era, `source_spec:` or v7's
+        # `source_plan:` opener): title is the `summary`
         sm = _FLAT_SUMMARY_RE.search(body)
         summary = sm.group(1).strip() if sm else ""
         return {

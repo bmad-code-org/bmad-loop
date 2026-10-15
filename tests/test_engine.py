@@ -18778,6 +18778,78 @@ def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
     assert events[0]["deduped"] == 0 and events[0]["malformed"] == 0
 
 
+def _v7_paths(project):
+    """The sandbox project read as a v7 install: the artifact dir IS the
+    initiative folder (R8), so the ledger and plans share it."""
+    return dataclasses.replace(
+        project, era="v7", active_initiative="i", initiative_folder=project.implementation_artifacts
+    )
+
+
+def _built_plan(paths, rel: str = "epic-auth/story-login-plan.md") -> Path:
+    plan = paths.implementation_artifacts / rel
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(plan, "built", "abc123", deferred=[HARVEST_A])
+    return plan
+
+
+def test_harvest_files_built_plan_deferrals(project, monkeypatch):
+    """A mode whose builds finish at ``built`` (tickets: ``{"built", "done"}``)
+    harvests that plan's ``deferred:`` list; the base engine, whose dev success
+    status is ``done``, leaves a ``built`` spec alone.
+    Ablation: make the base ``_harvest_success_statuses`` include ``built`` and
+    the base half FAILS; drop the seam from the harvest test and the override
+    half FAILS."""
+    plan = _built_plan(project)
+    base, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert base._harvest_success_statuses() == frozenset({"done"})
+    assert base._harvest_spec_deferrals(task, {"spec_file": str(plan)}) is None
+    assert _harvest_entries(project) == []
+    assert not task.harvested_deferrals
+
+    built, _ = make_engine(project, [], policy=_harvest_policy())
+    monkeypatch.setattr(built, "_harvest_success_statuses", lambda: frozenset({"built", "done"}))
+
+    assert built._harvest_spec_deferrals(task, {"spec_file": str(plan)}) is None
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert [r["source_spec"] for r in task.harvested_deferrals] == ["story-login-plan.md"]
+
+
+def test_harvest_source_name_is_initiative_relative_on_v7(project, monkeypatch):
+    """Plan names repeat across epics, so on v7 ``source_spec:`` carries the plan's
+    path relative to the initiative folder — and the bare name for a plan outside
+    it. The persisted record carries the same value, so the isolated carry's
+    ``(origin, source_spec)`` dedupe stays stable."""
+    paths = _v7_paths(project)
+    plan = _built_plan(paths)
+    engine, _ = make_engine(paths, [], policy=_harvest_policy())
+    monkeypatch.setattr(engine, "_harvest_success_statuses", lambda: frozenset({"built", "done"}))
+    task = StoryTask(story_key="1.1", epic=0)
+
+    assert engine._harvest_source_name(plan) == "epic-auth/story-login-plan.md"
+    outside = project.project / "elsewhere" / "story-login-plan.md"
+    assert engine._harvest_source_name(outside) == "story-login-plan.md"
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(plan)})
+
+    (entry,) = _harvest_entries(paths)
+    assert "source_spec: `epic-auth/story-login-plan.md`" in entry.body
+    assert [r["source_spec"] for r in task.harvested_deferrals] == ["epic-auth/story-login-plan.md"]
+
+
+def test_harvest_source_name_unchanged_on_v6(project):
+    """v6 keeps the bare spec file name byte for byte, even for a spec nested
+    below the artifact dir."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    nested = project.implementation_artifacts / "sub" / "spec-1-1-a.md"
+
+    assert engine._harvest_source_name(nested) == "spec-1-1-a.md"
+    assert engine._harvest_source_name(spec_path(project, "1-1-a")) == "spec-1-1-a.md"
+
+
 def test_spec_deferrals_use_na_when_no_location_was_recorded(project):
     finding = {"summary": "No location", "evidence": "the report omitted it"}
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})

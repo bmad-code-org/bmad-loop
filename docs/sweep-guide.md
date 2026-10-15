@@ -2,6 +2,8 @@
 
 A sweep works through the deferred-work ledger (`deferred-work.md`), the list of follow-ups that dev and review sessions defer. A fresh triage session checks every selected open entry against the code and sorts it: already resolved, buildable bundles, blocked, skip, or a decision that needs a human. You answer the decisions. Each bundle then runs through the normal story pipeline (dev → verify → review → commit), and its review gate also requires every bundled entry to be `status: done` in the ledger.
 
+On a BMAD v7 project the ledger is `deferred-work.md` in the active initiative folder, or in `output_folder` when no initiative is active. Entries harvested from a ticket plan name it in `source_spec:` by its path inside the initiative folder, because plan file names repeat across epics.
+
 ```text
 bmad-loop sweep [--only DW-1,DW-3 | --min-severity LEVEL] [--no-prompt] [--decisions-only]
                 [--max-bundles N] [--repeat | --no-repeat] [--max-cycles N] [--dry-run]

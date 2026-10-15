@@ -83,6 +83,10 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
 - Add two ticket-plan transitions: a session-declared `awaiting-operator` park converts
   to an operator-park `blocked`, and a `salvage` write lands a timed-out review's plan at
   `built`, never `done`.
+- Harvest a v7 ticket plan's `deferred:` findings into the initiative folder's
+  `deferred-work.md` at `built` (or `done`). Entries keep the `source_spec:` field and
+  name the plan by its initiative-relative path. The ledger parser accepts the v7
+  attended `bmad-build`'s flat `- source_plan:` blocks.
 - Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
   `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,

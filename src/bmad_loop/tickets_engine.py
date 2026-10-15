@@ -1289,6 +1289,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _dev_success_status(self) -> str:
         return verify.PLAN_BUILT
 
+    def _harvest_success_statuses(self) -> frozenset[str]:
+        """A build leaves its plan at ``built``; a follow-up pass on a plan a
+        human already accepted finds it at ``done``. Both carry real findings."""
+        return frozenset({verify.PLAN_BUILT, verify.PLAN_DONE})
+
     def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
         """The bound plan when it is on disk at dispatch, as the canonical regular
         file — a fresh ticket has none yet and launches unbound."""
