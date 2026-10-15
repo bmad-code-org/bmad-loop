@@ -421,6 +421,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # A BMAD v7 ticket plan's absolute path (`ticket-mark`,
+        # `ticket-plan-restored`): a host path embedding the initiative and epic
+        # folders and the ticket's title slug. Presence-only for `path`'s reason;
+        # `ticket-mark` correlates through its `ref`.
+        "plan",
         # The kept worktree's path BEFORE the DW-525 replay moved it into the replay
         # run (`unit-replay-start`, `unit-replay-handoff`): a host path embedding the
         # finished run dir and the story slug, presence-only for `path`'s reason —

@@ -479,6 +479,12 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
     "resume-reverify": frozenset({"replay"}),
+    # tickettree.py: plan `status` tokens (`before`/`after`; `?` when unreadable),
+    # a closed outcome slug, and the script's `created` boolean. `ref` (the ticket
+    # ref) rides the by-name benign row; `plan` is dropped to presence in
+    # diagnostics; `reason` is the closed `PlanWriteReason`, dropped by name.
+    "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
+    "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1948,6 +1954,11 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-reload-failed",
         "sweep-triage-result",
         "triage-decision",
+        # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
+        # mark/discard call (any outcome), one `ticket-plan-restored` per
+        # byte-exact restore.
+        "ticket-mark",
+        "ticket-plan-restored",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",

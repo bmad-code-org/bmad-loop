@@ -48,7 +48,27 @@ token for journals and pauses:
   field (:class:`ticketmodel.TicketsSchemaError`, re-raised as a
   :class:`TicketsError` so one ``except`` catches every tickets failure).
 
-This module reads only; bmad-loop's write path to a plan is added beside it.
+Writes. :meth:`TicketTree.mark` is bmad-loop's sole write path to a plan's
+``status`` and ``blocked_*`` fields, and :meth:`TicketTree.restore_preimage`
+the sole byte-exact restore of a pre-image the same transaction captured
+(:meth:`TicketTree.discard_unbuilt_plan` deletes a plan that holds only
+frontmatter, for a rollback). All three hold the plan's advisory sidecar lock
+(``runs.lock_path_for(plan)``) for their whole read-decide-write-read-back,
+and every status write is decided by ``statemachine.check_plan_transition``
+under a :data:`~bmad_loop.statemachine.PlanWriteReason`. The lock is held across
+bounded child processes only (one ``find`` and at most one ``mark``, each under
+:data:`TICKETS_TIMEOUT_S`) and never across a session or a pause: the build
+skill writes plan status itself, so bmad-loop never marks while a session for
+that ticket is live. Two more errors belong to writes:
+
+- :class:`TicketsLockBusy` — the plan lock could not be acquired (Windows gives
+  up after about 10 s; POSIX waits).
+- :class:`TicketsPlanMismatch` — ``find`` names a different plan than the one
+  the caller expected, so the write could land on the wrong file.
+- :class:`TicketsTransitionRefused` — the transition table refused the write
+  (also a ``statemachine.PlanTransitionRefused``).
+- :class:`TicketsReadBackMismatch` — the plan read back after a write does not
+  hold what was written.
 """
 
 from __future__ import annotations
@@ -58,13 +78,19 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypeVar, runtime_checkable
 
-from . import bmadconfig, childrun, ticketmodel
+from . import bmadconfig, childrun, frontmatter, platform_util, ticketmodel
 from .process_host import ProcessHostError
+from .statemachine import PlanTransitionRefused, PlanWriteReason, check_plan_transition
 from .ticketmodel import Capability, FindResult, NextView, StatusView
+
+if TYPE_CHECKING:
+    from .journal import Journal
 
 TICKETS_TIMEOUT_S = 60.0
 _T = TypeVar("_T")
@@ -145,6 +171,45 @@ class TicketsSchemaError(TicketsError, ticketmodel.TicketsSchemaError):
     kind = "schema"
 
 
+class TicketsLockBusy(TicketsError):
+    kind = "lock-busy"
+
+
+class TicketsPlanMismatch(TicketsError):
+    """``find`` resolved the ticket to a plan other than the expected one."""
+
+    kind = "plan-mismatch"
+
+
+class TicketsTransitionRefused(TicketsError, PlanTransitionRefused):
+    """The plan transition table refused a write; nothing was written. Also an
+    instance of :class:`statemachine.PlanTransitionRefused`."""
+
+    kind = "refused"
+
+
+class TicketsReadBackMismatch(TicketsError):
+    """The plan read back after a write does not hold what was written."""
+
+    kind = "read-back"
+
+
+@dataclass(frozen=True)
+class PlanMark:
+    """What one :meth:`TicketTree.mark` or :meth:`TicketTree.discard_unbuilt_plan`
+    did. ``before``/``after`` are the plan's normalized ``status`` (``""`` when
+    unset or absent); ``outcome`` is ``written``, ``noop`` or ``discarded``;
+    ``created`` is the script's own report (always False: bmad-loop never marks a
+    ticket without a plan)."""
+
+    ref: str
+    plan: Path
+    before: str
+    after: str
+    outcome: str
+    created: bool = False
+
+
 @runtime_checkable
 class TicketTreeLike(Protocol):
     """What the engine needs from a ticket tree; :class:`TicketTree` is the real
@@ -164,6 +229,21 @@ class TicketTreeLike(Protocol):
     def status(self, folder: Path | None = None) -> StatusView: ...
 
     def find(self, ref: str) -> FindResult: ...
+
+    def mark(
+        self,
+        ref: str,
+        target: str,
+        *,
+        reason: PlanWriteReason,
+        expected_plan: Path,
+        blocked: str | None = None,
+        journal: Journal,
+    ) -> PlanMark: ...
+
+    def discard_unbuilt_plan(self, ref: str, expected_plan: Path, journal: Journal) -> PlanMark: ...
+
+    def restore_preimage(self, plan: Path, data: bytes | None, journal: Journal) -> None: ...
 
 
 # (resolved script path, st_size, st_mtime_ns) -> what the script offers. Shared
@@ -311,6 +391,253 @@ class TicketTree:
         """``find <ref>`` on the active initiative, then the backlog."""
         # `--` keeps a ref that starts with `-` from reading as an option.
         return _parsed(ticketmodel.parse_find, self._call(["find", "--", ref], verb="find"))
+
+    # ----------------------------------------------------------- writes
+
+    @contextmanager
+    def _plan_lock(self, plan: Path) -> Iterator[None]:
+        """The plan's advisory sidecar lock. Only the ACQUISITION maps to
+        :class:`TicketsLockBusy`; a fault inside the locked body is never
+        reported as contention."""
+        from . import runs  # lazy: runs imports most of the package
+
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(platform_util.file_lock(runs.lock_path_for(plan)))
+            except platform_util.LockUnavailableError as e:
+                raise TicketsLockBusy(f"the lock on {plan} is held elsewhere: {e}") from e
+            yield
+
+    def _locate(self, ref: str, expected_plan: Path) -> None:
+        """``find`` the ticket under the lock and refuse unless it names
+        ``expected_plan``: the lock and the write must be on one file."""
+        found = Path(self.find(ref).plan)
+        if platform_util.resolve_or_lexical(found) != platform_util.resolve_or_lexical(
+            expected_plan
+        ):
+            raise TicketsPlanMismatch(f"{ref}: find names plan {found}, expected {expected_plan}")
+
+    def mark(
+        self,
+        ref: str,
+        target: str,
+        *,
+        reason: PlanWriteReason,
+        expected_plan: Path,
+        blocked: str | None = None,
+        journal: Journal,
+    ) -> PlanMark:
+        """Set ``ref``'s plan ``status`` to ``target`` (``blocked`` with the park
+        reason ``blocked``) through ``tickets.py mark`` — bmad-loop's sole write
+        path to a plan's ``status``/``blocked_*``.
+
+        Under the plan lock: ``find`` and the ``expected_plan`` cross-check, the
+        plan's own fields read natively, ``check_plan_transition``, the ``mark``
+        child (skipped for a no-op), and a native read-back that must hold
+        ``target`` and the requested reason. Every call journals one
+        ``ticket-mark`` (outcome ``written``, ``noop``, ``refused`` — the table or
+        the cross-check said no — or ``failed``) and every failure raises a
+        :class:`TicketsError`."""
+        plan = Path(expected_plan)
+        before = after = ""
+        try:
+            with self._plan_lock(plan):
+                self._locate(ref, plan)
+                has_plan, before, blocked_now = _plan_fields(plan)
+                after = before
+                try:
+                    write = check_plan_transition(
+                        ref,
+                        before,
+                        target,
+                        reason,
+                        has_plan=has_plan,
+                        blocked_reason=blocked_now,
+                        blocked=blocked,
+                    )
+                except PlanTransitionRefused as e:
+                    raise TicketsTransitionRefused(
+                        e.ref, e.current, e.target, e.reason, e.why
+                    ) from e
+                if not write:
+                    result = PlanMark(ref, plan, before, before, "noop")
+                else:
+                    flags = ["--blocked", blocked] if blocked is not None else []
+                    doc = self._call(["mark", *flags, "--", ref, target], verb="mark")
+                    report = _parsed(ticketmodel.parse_mark, doc)
+                    _, after, blocked_after = _plan_fields(plan)
+                    if after != target or blocked_after != (blocked or ""):
+                        raise TicketsReadBackMismatch(
+                            f"{ref}: {plan} reads back status {after!r} (reason "
+                            f"{blocked_after!r}) after marking {target!r}"
+                        )
+                    result = PlanMark(ref, plan, before, after, "written", report.created)
+        except TicketsError as e:
+            if not isinstance(e, TicketsTransitionRefused | TicketsPlanMismatch):
+                after = _status_or_unknown(plan)
+            _journal_mark(
+                journal,
+                ref=ref,
+                reason=reason,
+                before=before,
+                after=after,
+                outcome=_failure_outcome(e),
+                plan=plan,
+            )
+            raise
+        _journal_mark(
+            journal,
+            ref=ref,
+            reason=reason,
+            before=result.before,
+            after=result.after,
+            outcome=result.outcome,
+            plan=plan,
+            created=result.created,
+        )
+        return result
+
+    def discard_unbuilt_plan(self, ref: str, expected_plan: Path, journal: Journal) -> PlanMark:
+        """Delete ``ref``'s plan when it holds only frontmatter — a rollback of a
+        ticket whose build never wrote a body. Same lock and cross-check as
+        :meth:`mark`; the plan's status must be one ``rollback`` may move. No plan
+        is a no-op; a plan with a body is refused (re-arm it with
+        ``mark(..., reason="rollback")`` instead). Journals ``ticket-mark`` with
+        outcome ``discarded``."""
+        plan = Path(expected_plan)
+        before = ""
+        try:
+            with self._plan_lock(plan):
+                self._locate(ref, plan)
+                has_plan, before, blocked_now = _plan_fields(plan)
+                if not has_plan:
+                    result = PlanMark(ref, plan, "", "", "noop")
+                else:
+                    why = ""
+                    try:
+                        check_plan_transition(
+                            ref,
+                            before,
+                            "ready-for-dev",
+                            "rollback",
+                            has_plan=True,
+                            blocked_reason=blocked_now,
+                        )
+                        if not frontmatter.is_frontmatter_only(plan.read_text(encoding="utf-8")):
+                            why = "the plan holds more than frontmatter"
+                    except PlanTransitionRefused as e:
+                        why = e.why
+                    except (OSError, UnicodeDecodeError) as e:
+                        why = f"the plan is unreadable: {e}"
+                    if why:
+                        raise TicketsTransitionRefused(ref, before, "", "rollback", why)
+                    plan.unlink()
+                    result = PlanMark(ref, plan, before, "", "discarded")
+        except TicketsError as e:
+            _journal_mark(
+                journal,
+                ref=ref,
+                reason="rollback",
+                before=before,
+                after=before,
+                outcome=_failure_outcome(e),
+                plan=plan,
+            )
+            raise
+        _journal_mark(
+            journal,
+            ref=ref,
+            reason="rollback",
+            before=result.before,
+            after=result.after,
+            outcome=result.outcome,
+            plan=plan,
+        )
+        return result
+
+    def restore_preimage(self, plan: Path, data: bytes | None, journal: Journal) -> None:
+        """Put ``plan`` back to the exact bytes a transaction captured before
+        writing it (``None``: the plan did not exist, so remove it). The sole
+        byte-exact restore of a plan, under the same lock as :meth:`mark`, for
+        undoing a write the same transaction made — never for a status change of
+        its own. No child is spawned. The bytes are read back and must match;
+        journals ``ticket-plan-restored``."""
+        plan = Path(plan)
+        before = after = "?"
+        restored = False
+        try:
+            with self._plan_lock(plan):
+                before = _status_or_unknown(plan)
+                if data is None:
+                    plan.unlink(missing_ok=True)
+                    restored = not plan.exists()
+                else:
+                    platform_util.atomic_write_bytes(plan, data)
+                    restored = plan.read_bytes() == data
+                after = _status_or_unknown(plan)
+        finally:
+            journal.append(
+                "ticket-plan-restored",
+                plan=str(plan),
+                before=before,
+                after=after,
+                outcome="restored" if restored else "failed",
+            )
+        if not restored:
+            raise TicketsReadBackMismatch(f"{plan} does not read back as the restored pre-image")
+
+
+def _plan_fields(plan: Path) -> tuple[bool, str, str]:
+    """``(exists, status, blocked_reason)`` of a plan, read natively. ``status``
+    is ``frontmatter.status_of``'s normalized token — states are compared that
+    way, never as bytes (the script's quoting of values may change). A leading
+    UTF-8 byte-order mark is skipped, as the script keeps one it finds."""
+    if not plan.is_file():
+        return False, "", ""
+    try:
+        text = plan.read_bytes().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = ""  # no readable frontmatter, as `frontmatter.read_frontmatter` degrades
+    fm = frontmatter.parse_frontmatter(text)
+    raw = fm.get("blocked_reason", "")
+    return True, frontmatter.status_of(fm), "" if raw is None else str(raw)
+
+
+def _status_or_unknown(plan: Path) -> str:
+    """The plan's status for a journal record; ``"?"`` when it cannot be read."""
+    try:
+        return _plan_fields(plan)[1]
+    except OSError:
+        return "?"
+
+
+def _failure_outcome(error: TicketsError) -> str:
+    return (
+        "refused" if isinstance(error, TicketsTransitionRefused | TicketsPlanMismatch) else "failed"
+    )
+
+
+def _journal_mark(
+    journal: Journal,
+    *,
+    ref: str,
+    reason: str,
+    before: str,
+    after: str,
+    outcome: str,
+    plan: Path,
+    created: bool = False,
+) -> None:
+    journal.append(
+        "ticket-mark",
+        ref=ref,
+        reason=reason,
+        before=before,
+        after=after,
+        outcome=outcome,
+        created=created,
+        plan=str(plan),
+    )
 
 
 def _parsed(parse: Callable[[object], _T], doc: dict[str, object] | str) -> _T:

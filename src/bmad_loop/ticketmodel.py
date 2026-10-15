@@ -40,18 +40,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from .statemachine import PLAN_BLOCKED, PLAN_DROPPED, PLAN_STATUS_ORDER
+
 # Every plan `status` upstream accepts (`tickets.py` STATUSES). The builds write
 # draft..built, build-auto writes blocked, an orchestrator writes done, and
 # bmad-ticket writes dropped. A row with no plan reads "".
+# The lifecycle order is `statemachine.PLAN_STATUS_ORDER`, beside the plan
+# transition table; `blocked` and `dropped` sit outside it.
 PLAN_STATUSES: Final[tuple[str, ...]] = (
-    "draft",
-    "ready-for-dev",
-    "in-progress",
-    "in-review",
-    "built",
-    "done",
-    "blocked",
-    "dropped",
+    *PLAN_STATUS_ORDER[1:],
+    PLAN_BLOCKED,
+    PLAN_DROPPED,
 )
 # A row's derived `state`: `planned` (no leaf file, no plan), else the tracker's
 # mirrored word, else STATE_OF[status].

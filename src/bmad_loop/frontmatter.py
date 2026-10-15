@@ -91,6 +91,16 @@ def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
     return None
 
 
+def is_frontmatter_only(text: str) -> bool:
+    """Whether ``text`` is a frontmatter block and nothing else (whitespace
+    aside) — the shape ``tickets.py mark`` gives a plan it creates, before any
+    build has written a body into it."""
+    split = _split_frontmatter(text)
+    if split is None:
+        return False
+    return "".join(split[2].splitlines(keepends=True)[1:]).strip() == ""
+
+
 def parse_frontmatter(text: str) -> dict[str, Any]:
     """The frontmatter mapping ``text`` carries, or ``{}`` when it carries none.
 

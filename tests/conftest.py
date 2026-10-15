@@ -28,19 +28,25 @@ from bmad_loop import cli, documents, envvars, platform_util, runs, ticketmodel,
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
-from bmad_loop.journal import STATE_FILE, save_state
+from bmad_loop.journal import STATE_FILE, Journal, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
 from bmad_loop.plugins.grants import GrantSet
+from bmad_loop.statemachine import PlanTransitionRefused, check_plan_transition
 from bmad_loop.ticketmodel import (
     Capability,
     EpicRow,
     FindResult,
-    MarkReport,
     NextView,
     StatusView,
     TicketRow,
 )
-from bmad_loop.tickettree import TicketsNoMatch, TicketsPinMismatch
+from bmad_loop.tickettree import (
+    PlanMark,
+    TicketsNoMatch,
+    TicketsPinMismatch,
+    TicketsPlanMismatch,
+    TicketsTransitionRefused,
+)
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
@@ -1948,13 +1954,15 @@ def ticket_row(
 
 @dataclass(frozen=True)
 class FakeMark:
-    """One `FakeTicketTree.mark` call, as recorded."""
+    """One `FakeTicketTree.mark` call the transition table let through, as
+    recorded (``outcome`` is ``written`` or ``noop``)."""
 
     ref: str
     target: str
     reason: str
     expected_plan: Path | None
     blocked: str | None
+    outcome: str = "written"
 
 
 class FakeTicketTree:
@@ -1966,7 +1974,10 @@ class FakeTicketTree:
     every row; `find` answers each row's ref with a plan path under
     ``project_root/_bmad-output/<initiative>/<epic>/``), or pass views directly.
     ``faults[verb]`` (``"next"``, ``"status"``, ``"find"``, ``"capability"``,
-    ``"mark"``) is raised on every call of that verb until removed. With a
+    ``"mark"``, ``"discard"``, ``"restore"``) is raised on every call of that
+    verb until removed. Writes run the real `statemachine.check_plan_transition`
+    on the row's status (a row with status ``""`` has no plan), so an engine test
+    sees the same refusals and no-ops as the real chokepoint. With a
     ``pinned_initiative``, set ``live_initiative`` to simulate the operator
     switching initiatives: every tree read then raises `TicketsPinMismatch`
     before recording a call, as the real tree refuses before spawning."""
@@ -1995,6 +2006,8 @@ class FakeTicketTree:
         self.faults: dict[str, Exception] = {}
         self.calls: list[tuple[str, ...]] = []
         self.marks: list[FakeMark] = []
+        self.discards: list[str] = []
+        self.restores: list[tuple[Path, bytes | None]] = []
 
     @classmethod
     def from_rows(
@@ -2067,6 +2080,15 @@ class FakeTicketTree:
         except KeyError:
             raise TicketsNoMatch(f"no ticket matches {ref!r}") from None
 
+    def _write_target(self, ref: str, expected_plan: Path | None) -> FindResult:
+        found = self.find(ref)
+        self.calls.pop()  # the inner find is not a call of its own
+        if expected_plan is not None and Path(found.plan) != Path(expected_plan):
+            raise TicketsPlanMismatch(
+                f"{ref}: find names plan {found.plan}, expected {expected_plan}"
+            )
+        return found
+
     def mark(
         self,
         ref: str,
@@ -2075,30 +2097,82 @@ class FakeTicketTree:
         reason: str,
         expected_plan: Path | None = None,
         blocked: str | None = None,
-        journal: object = None,
-    ) -> MarkReport:
-        """Record the mark and reflect it in `find` (status, blocked fields).
-        Transition legality is not modelled: that lives in the real chokepoint."""
+        journal: Journal | None = None,
+    ) -> PlanMark:
+        """Decide the mark with the real transition table, record it, and reflect
+        a write in `find` (status, blocked fields). ``expected_plan`` None skips
+        the cross-check; a ``journal`` gets the real chokepoint's ``ticket-mark``."""
         self._enter("mark", ref, target)
-        found = self.find(ref)
-        self.calls.pop()  # the inner find is not a call of its own
-        self.marks.append(FakeMark(ref, target, reason, expected_plan, blocked))
-        row = dataclasses.replace(
-            found.row,
-            status=target,
-            state=_FAKE_STATE_OF[target],
-            blocked_at="2026-01-01" if blocked is not None else "",
-            blocked_reason=blocked or "",
-        )
+        found = self._write_target(ref, expected_plan)
+        row = found.row
+        try:
+            write = check_plan_transition(
+                ref,
+                row.status,
+                target,
+                reason,  # type: ignore[arg-type]
+                has_plan=row.status != "",
+                blocked_reason=row.blocked_reason,
+                blocked=blocked,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, e.target, e.reason, e.why) from e
+        outcome = "written" if write else "noop"
+        self.marks.append(FakeMark(ref, target, reason, expected_plan, blocked, outcome))
+        if write:
+            row = dataclasses.replace(
+                row,
+                status=target,
+                state=_FAKE_STATE_OF[target],
+                blocked_at="2026-01-01" if blocked is not None else "",
+                blocked_reason=blocked or "",
+            )
+            self.finds[ref] = dataclasses.replace(found, row=row)
+        if journal is not None:
+            journal.append(
+                "ticket-mark",
+                ref=ref,
+                reason=reason,
+                before=found.row.status,
+                after=row.status,
+                outcome=outcome,
+                created=False,
+                plan=found.plan,
+            )
+        return PlanMark(ref, Path(found.plan), found.row.status, row.status, outcome)
+
+    def discard_unbuilt_plan(
+        self, ref: str, expected_plan: Path | None = None, journal: Journal | None = None
+    ) -> PlanMark:
+        """Record the discard and reset the row to "no plan" (the fake has no
+        plan bodies, so every plan counts as frontmatter-only)."""
+        self._enter("discard", ref)
+        found = self._write_target(ref, expected_plan)
+        before = found.row.status
+        if before == "":
+            return PlanMark(ref, Path(found.plan), "", "", "noop")
+        try:
+            check_plan_transition(
+                ref,
+                before,
+                "ready-for-dev",
+                "rollback",
+                has_plan=True,
+                blocked_reason=found.row.blocked_reason,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, "", e.reason, e.why) from e
+        self.discards.append(ref)
+        row = dataclasses.replace(found.row, status="", state="planned")
         self.finds[ref] = dataclasses.replace(found, row=row)
-        return MarkReport(
-            plan=found.plan,
-            created=not Path(found.plan).is_file(),
-            status=target,
-            assignee=row.assignee,
-            blocked_at=row.blocked_at,
-            blocked_reason=row.blocked_reason,
-        )
+        return PlanMark(ref, Path(found.plan), before, "", "discarded")
+
+    def restore_preimage(
+        self, plan: Path, data: bytes | None, journal: Journal | None = None
+    ) -> None:
+        """Record the restore; the fake does not touch disk."""
+        self._enter("restore", str(plan), tree=False)
+        self.restores.append((Path(plan), data))
 
 
 def fake_next_view(
