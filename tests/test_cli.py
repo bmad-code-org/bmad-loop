@@ -6696,6 +6696,31 @@ def test_a_launched_resume_refused_before_accepting_is_journaled(
         assert errors == []
 
 
+def test_a_launched_refusal_journals_every_line_it_printed_not_only_the_hint(
+    tmp_path, monkeypatch, capsys
+):
+    # A skills gate prints its FAIL lines and then a generic hint; the entry
+    # keeps them all, so the cause survives the window. Ablation: keep only the
+    # last line and the FAIL lines are missing.
+    run_dir = _escalated_run(tmp_path, "r1")
+
+    def refuse(_args):
+        print("FAIL: .claude/skills/bmad-build-auto not found", file=sys.stderr)
+        print("run `bmad-loop validate` for details", file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(cli, "cmd_resume", refuse)
+    args = argparse.Namespace(
+        func=refuse, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+    )
+    assert cli._drive_ctl_launch(args) == 1
+    capsys.readouterr()
+    [error] = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert "FAIL: .claude/skills/bmad-build-auto not found" in error
+    assert "bmad-loop validate" in error
+    assert "still names the window of the launch before it" in error
+
+
 def test_a_launched_resume_that_accepted_then_failed_journals_no_refusal(tmp_path, monkeypatch):
     # Past acceptance the run is this child's, and its failure the run's own
     # story; the claim also hears the launch marker. Ablation: drop the

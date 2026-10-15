@@ -4481,18 +4481,21 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
 
 class _CtlLaunch:
     """A TUI-launched resume/resolve in flight (`--ctl-launch`, see
-    `_drive_ctl_launch`): whether it has accepted its run yet, and the last line
-    it wrote to stderr — the refusal, when it exits before accepting. A
-    pass-through for every other stream attribute."""
+    `_drive_ctl_launch`): whether it has accepted its run yet, and the lines it
+    wrote to stderr before that — the refusal, when it exits before accepting.
+    Every line, not the last: a gate prints its `FAIL:` lines and then a generic
+    hint. A pass-through for every other stream attribute."""
 
     def __init__(self, stream: Any) -> None:
         self._stream = stream
         self.accepted = False
-        self.last_line = ""
+        self.lines: list[str] = []
 
     def write(self, text: str) -> int:
-        if text.strip():
-            self.last_line = text.strip().splitlines()[-1]
+        if not self.accepted:
+            # ponytail: capped so a chatty refusal cannot bloat the journal entry.
+            self.lines.extend(line.strip() for line in text.splitlines() if line.strip())
+            del self.lines[:-20]
         return self._stream.write(text)
 
     def flush(self) -> None:
@@ -4551,12 +4554,12 @@ def _drive_ctl_launch(args: argparse.Namespace) -> int:
         with contextlib.redirect_stderr(ctl):
             rc = args.func(args)
     except BaseException as e:
-        ctl.last_line = str(e) or type(e).__name__
+        ctl.lines.append(str(e) or type(e).__name__)
         raise
     finally:
         _ctl_launch = None
         if rc != ExitCode.OK and not ctl.accepted:
-            _journal_unaccepted_launch(args, ctl.last_line or f"exit {rc}")
+            _journal_unaccepted_launch(args, "; ".join(ctl.lines) or f"exit {rc}")
     return rc
 
 
@@ -4582,8 +4585,8 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
                 Journal(run_dir).append(
                     "ctl-window-claim-failed",
                     error=f"a TUI-launched {args.command} exited before driving the run: "
-                    f"{reason} — attach and stop from the TUI may target an older window "
-                    "for this run",
+                    f"{reason} — the run's control-window record still names the window "
+                    "of the launch before it",
                 )
     except Exception as e:
         print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)
