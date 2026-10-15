@@ -11949,3 +11949,95 @@ def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_back
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert get_multiplexer().capture_pane("@7") == BYPASS_FOOTER
     assert calls == [["tmux", "-u", "capture-pane", "-p", "-t", "@7"]]
+
+
+def _scripted_tmux(monkeypatch, stdout):
+    """Fake the tmux subprocess seam: every call answers `stdout`; returns the argv log."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    monkeypatch.setattr(tmux_base.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_pane_target_pins_the_launched_pane_by_id(monkeypatch, force_tmux_backend):
+    """#948: the window's pane id, composed under the window id, so a later
+    operator split (the new ACTIVE pane) is not what a nudge addresses."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "%9\n")
+    assert get_multiplexer().pane_target("@7") == "@7.%9"
+    assert calls == [["tmux", "-u", "display-message", "-p", "-t", "@7", "#{pane_id}"]]
+
+
+def test_pane_target_of_a_dead_window_raises(monkeypatch, force_tmux_backend):
+    """display-message on a dead window exits 0 with empty output: no pin."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    _scripted_tmux(monkeypatch, "")
+    with pytest.raises(tmux_base.TmuxError, match="no pane id"):
+        get_multiplexer().pane_target("@7")
+
+
+def test_send_text_refuses_a_pane_in_mode(monkeypatch, force_tmux_backend):
+    """#949: copy/clock mode would swallow the keys, so nothing is typed and the
+    send raises — every nudge site counts that as not delivered."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "1\n")
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        get_multiplexer().send_text("@7.%9", "go on")
+    assert [c for c in calls if "send-keys" in c] == []
+
+
+def test_send_text_types_into_a_pane_not_in_mode(monkeypatch, force_tmux_backend):
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "0\n")
+    get_multiplexer().send_text("@7.%9", "go on")
+    assert calls == [
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_in_mode}"],
+        ["tmux", "-u", "send-keys", "-t", "@7.%9", "-l", "go on"],
+        ["tmux", "-u", "send-keys", "-t", "@7.%9", "Enter"],
+    ]
+
+
+class _PinningMux(_LaunchingUnitMux):
+    def __init__(self, pin):
+        super().__init__()
+        self.pin = pin
+
+    def pane_target(self, window_id):
+        if isinstance(self.pin, Exception):
+            raise self.pin
+        return f"{window_id}.{self.pin}"
+
+
+def test_start_session_pins_the_launched_pane(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path, mux=_PinningMux("%9"))
+    handle = adapter.start_session(_dev_spec(tmp_path))
+    assert (handle.native_id, handle.pane_target) == ("@1", "@1.%9")
+    assert _lifecycle_events(adapter, "pane-pin-failed") == []
+
+
+def test_a_failed_pin_falls_back_to_the_window_and_says_so(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path, mux=_PinningMux(MultiplexerError("gone")))
+    handle = adapter.start_session(_dev_spec(tmp_path))
+    assert handle.pane_target is None
+    crumbs = _lifecycle_events(adapter, "pane-pin-failed")
+    assert [(c["window"], c["error"]) for c in crumbs] == [("@1", "MultiplexerError: gone")]
+
+
+def test_stall_nudge_and_screen_read_address_the_pinned_pane(tmp_path, monkeypatch):
+    """#948 end to end through the wait loop: both the parked-prompt screen read
+    and the nudge go to the pinned pane, not the window's active pane."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], nudges=1)
+    handle = dataclasses.replace(_dev_handle(), pane_target="@1.%9")
+    result = adapter.wait_for_completion(handle, _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert mux.sent == [("@1.%9", generic.STALL_NUDGE_TEXT)]
+    assert set(mux.captures) == {"@1.%9"}

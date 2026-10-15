@@ -236,6 +236,9 @@ class SessionHandle:
     # no such flag, so attribution learns the id from the first SessionStart.
     # Never persisted. Kept LAST so positional constructions stay valid.
     pinned_session_id: str | None = None
+    # The launched pane as a mux `pane_target` (#948): nudges and the screen read
+    # go here, not to `native_id`'s active pane. None = not pinned; use native_id.
+    pane_target: str | None = None
 
 
 @dataclass(frozen=True)

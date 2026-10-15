@@ -2813,3 +2813,21 @@ def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatc
     while the real registry was unreachable would read as "nothing to clean"."""
     monkeypatch.setenv("PSMUX_DATA_DIR", bad)
     assert PsmuxMultiplexer().legacy_registries() == []
+
+
+def test_pane_target_keeps_the_session_qualified_window(rec):
+    """#948 on psmux: `session:@N.%M` — the session routes the client to the right
+    per-session server, the `%M` slot names the launched pane by id."""
+    rec.stdout = "%2\n"
+    assert PsmuxMultiplexer().pane_target("s:@2") == "s:@2.%2"
+    assert rec.argv[-5:] == ["display-message", "-p", "-t", "s:@2", "#{pane_id}"]
+
+
+def test_send_text_refuses_while_a_mode_is_open(rec):
+    """#949 on psmux: a mode takes the text as mode keys and passes only Enter, so
+    nothing is typed while `#{pane_in_mode}` is set (server-wide on psmux 3.4.0,
+    psmux/psmux#828)."""
+    rec.stdout = "1\n"
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        PsmuxMultiplexer().send_text("s:@2.%2", "go on")
+    assert [argv for argv, _ in rec.calls if "send-keys" in argv] == []

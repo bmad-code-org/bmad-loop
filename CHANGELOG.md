@@ -173,6 +173,11 @@ breaking changes may land in a minor release.
   has no `os.pidfd_open`, and spawn `sys.executable` instead of a bare `python` (#883).
 - Count Claude subagent and workflow-agent transcript writes as session activity, so a
   session waiting on a foreground subagent no longer journals `session-idle` (#858).
+- Send nudges to the agent's own pane, pinned by pane id at launch, instead of the
+  window's active pane, so an operator split or floating pane no longer receives them;
+  a failed pin falls back to the window and is crumbed `pane-pin-failed` (#948).
+- Refuse to type a nudge into a pane in copy or clock mode, which swallowed it while
+  it counted as sent; the nudge is now recorded as not delivered (#949).
 
 ### Security
 

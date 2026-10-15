@@ -1149,11 +1149,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
         self.mux.pipe_pane(window_id, log_file)
+        # Pin the launched pane now, while it is the window's only one: an
+        # operator split later becomes the ACTIVE pane, and a window target
+        # would type every nudge into it (#948). A failed pin degrades to the
+        # window target, crumbed; a window already dead fails here too, and the
+        # wait loop reports that crash. A duck-typed backend predating the
+        # method keeps the window target, as for capture_pane.
+        pin = getattr(self.mux, "pane_target", None)
+        try:
+            pane_target = pin(window_id) if pin is not None else None
+        except MultiplexerError as e:
+            pane_target = None
+            self._note_lifecycle(
+                spec.task_id, "pane-pin-failed", window=window_id, error=f"{type(e).__name__}: {e}"
+            )
         return SessionHandle(
             task_id=spec.task_id,
             native_id=window_id,
             launched_ns=launched_ns,
             pinned_session_id=pinned_session_id,
+            pane_target=pane_target,
         )
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
@@ -2344,7 +2359,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if capture is None:
             return None
         try:
-            screen = capture(handle.native_id)
+            screen = capture(handle.pane_target or handle.native_id)
         except MultiplexerError as e:
             self._note_lifecycle(
                 handle.task_id,
@@ -2424,7 +2439,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         )
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
-        self.mux.send_text(handle.native_id, text)
+        self.mux.send_text(handle.pane_target or handle.native_id, text)
 
     def kill(self, handle: SessionHandle) -> None:
         grace = float(self.policy.limits.teardown_grace_s)

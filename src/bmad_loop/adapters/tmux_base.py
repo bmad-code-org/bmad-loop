@@ -637,7 +637,26 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # caller reads as "no match" (DW-350).
         return self._tmux("capture-pane", "-p", "-t", window_id)
 
+    def pane_target(self, window_id: str) -> str:
+        # `<window>.%N` rather than a bare `%N`: psmux runs one server per session
+        # and only reaches the right one through the session the window id
+        # carries, and both backends resolve a `%N` pane slot by id (psmux 3.4.0
+        # and tmux 3.4 measured). A pane index would drift with swap-pane.
+        # display-message on a dead window exits 0 with empty output, so empty
+        # is a failure too.
+        pane = self._tmux("display-message", "-p", "-t", window_id, "#{pane_id}")
+        if not pane.startswith("%"):
+            raise TmuxError(f"no pane id for {window_id}: {pane!r}")
+        return f"{window_id}.{pane}"
+
     def send_text(self, window_id: str, text: str) -> None:
+        # A pane in copy or clock mode eats the keys: tmux swallows the text, and
+        # psmux takes it as mode keys and leaves only the Enter (#949). Refuse
+        # rather than leave the mode — that would yank an operator reading
+        # scrollback. On psmux the flag is server-wide (psmux/psmux#828), which
+        # still matches what it swallows.
+        if self._tmux("display-message", "-p", "-t", window_id, "#{pane_in_mode}") == "1":
+            raise TmuxError(f"{window_id} is in a pane mode; not typing into it")
         self._tmux("send-keys", "-t", window_id, "-l", text)
         time.sleep(0.3)  # let the TUI ingest the paste before submitting
         self._tmux("send-keys", "-t", window_id, "Enter")
