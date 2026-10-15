@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from . import bmadconfig, childrun, ticketmodel, tickettree
 from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
@@ -747,7 +748,8 @@ def _ticket_store(project: Path) -> tuple[str | None, str]:
     could not be read (then the store is None)."""
     path = project / TICKETS_STORE_CONFIG_REL
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: upstream's `read_text` strips a byte-order mark before parsing
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return "repo", ""
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
@@ -755,6 +757,32 @@ def _ticket_store(project: Path) -> tuple[str | None, str]:
     table = data.get("tickets", {})
     store = table.get("store", "repo") if isinstance(table, dict) else "repo"
     return (store if isinstance(store, str) and store else "repo"), ""
+
+
+def _probe_fault(path: Path, kind: Literal["file", "dir"]) -> tuple[bool, str]:
+    """Whether ``path`` is a ``kind`` entry, and "" or the stat fault that kept the
+    probe from finding out. Absence (ENOENT/ENOTDIR and kin) is a plain false; any
+    other OSError is reported, never raised and never folded into absence:
+    ``Path.is_file``/``is_dir`` raise it on 3.11–3.13 and answer false on 3.14."""
+    try:
+        mode = path.stat().st_mode
+    except OSError as e:
+        if e.errno in _ABSENCE_ERRNOS or getattr(e, "winerror", None) in _ABSENCE_WINERRORS:
+            return False, ""
+        return False, f"{type(e).__name__}: {e}"
+    except ValueError:
+        return False, ""
+    return (stat.S_ISREG(mode) if kind == "file" else stat.S_ISDIR(mode)), ""
+
+
+def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
+    return Finding(
+        check,
+        "problem",
+        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem "
+        "and re-run",
+        {"path": rel, "error": fault},
+    )
 
 
 def tickets_preflight(
@@ -777,9 +805,12 @@ def tickets_preflight(
     it ``tickets.capability-not-run`` says so."""
     project = paths.project
     findings: list[Finding] = []
-    script = project / TICKETS_SCRIPT_REL
-    script_ok = script.is_file()
-    if not script_ok:
+    script_ok, script_fault = _probe_fault(project / TICKETS_SCRIPT_REL, "file")
+    if script_fault:
+        findings.append(
+            _probe_unreadable("tickets.script-missing", TICKETS_SCRIPT_REL, script_fault)
+        )
+    elif not script_ok:
         findings.append(
             Finding(
                 "tickets.script-missing",
@@ -790,7 +821,14 @@ def tickets_preflight(
                 {"path": TICKETS_SCRIPT_REL},
             )
         )
-    if not (project / RENDERER_CONFIG_UTILS_REL).is_file():
+    utils_ok, utils_fault = _probe_fault(project / RENDERER_CONFIG_UTILS_REL, "file")
+    if utils_fault:
+        findings.append(
+            _probe_unreadable(
+                "tickets.config-utils-missing", RENDERER_CONFIG_UTILS_REL, utils_fault
+            )
+        )
+    elif not utils_ok:
         findings.append(
             Finding(
                 "tickets.config-utils-missing",
@@ -824,20 +862,29 @@ def tickets_preflight(
                     {"output_folder": str(paths.output_folder)},
                 )
             )
-        elif paths.initiative_folder is None or not paths.initiative_folder.is_dir():
-            findings.append(
-                Finding(
-                    "tickets.initiative-missing",
-                    "problem",
-                    f"active initiative {paths.active_initiative!r} has no folder at "
-                    f"{paths.initiative_folder} — create it with the `bmad-ticket` "
-                    "skill, or switch `[core] active_initiative`",
-                    {
-                        "initiative": paths.active_initiative,
-                        "path": str(paths.initiative_folder),
-                    },
-                )
+        else:
+            folder = paths.initiative_folder
+            folder_ok, folder_fault = (
+                _probe_fault(folder, "dir") if folder is not None else (False, "")
             )
+            if folder_fault:
+                findings.append(
+                    _probe_unreadable("tickets.initiative-missing", str(folder), folder_fault)
+                )
+            elif not folder_ok:
+                findings.append(
+                    Finding(
+                        "tickets.initiative-missing",
+                        "problem",
+                        f"active initiative {paths.active_initiative!r} has no folder at "
+                        f"{paths.initiative_folder} — create it with the `bmad-ticket` "
+                        "skill, or switch `[core] active_initiative`",
+                        {
+                            "initiative": paths.active_initiative,
+                            "path": str(paths.initiative_folder),
+                        },
+                    )
+                )
     store, store_error = _ticket_store(project)
     if store != "repo":
         findings.append(

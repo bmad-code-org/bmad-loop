@@ -1233,10 +1233,16 @@ def test_v7_relative_output_folder_resolves_against_project(tmp_path: Path, monk
     assert paths.initiative_folder == (root / "out" / "docs" / "initiative-demo").resolve()
 
 
-def test_v7_unset_output_folder_defaults_like_v6(tmp_path: Path) -> None:
+def test_v7_unset_output_folder_defaults_to_project_root_like_tickets_py(tmp_path: Path) -> None:
+    """`tickets_root` joins an unset `output_folder` ("") onto the project root, so
+    the initiative folder bmad-loop checks must be the one the script reads."""
     root = _v7(tmp_path)
-    (root / "_bmad" / "config.toml").write_text('[core]\nproject_name = "x"\n', encoding="utf-8")
-    assert bmadconfig.load_paths(root).output_folder == (root / "_bmad-output").resolve()
+    (root / "_bmad" / "config.toml").write_text(
+        '[core]\nproject_name = "x"\nactive_initiative = "initiative-demo"\n', encoding="utf-8"
+    )
+    paths = bmadconfig.load_paths(root)
+    assert paths.output_folder == root.resolve()
+    assert paths.initiative_folder == (root / "initiative-demo").resolve()
 
 
 def test_v7_missing_base_layer_refuses(tmp_path: Path) -> None:

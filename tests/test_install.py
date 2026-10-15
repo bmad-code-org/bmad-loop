@@ -12151,6 +12151,56 @@ def test_tickets_preflight_repo_store_defaults_like_upstream(project_v7, monkeyp
     assert "tickets.store-not-repo" not in _ids(_tickets_findings(project_v7, monkeypatch))
 
 
+@pytest.mark.parametrize(("config", "store"), [("repo", None), ("jira", "jira")])
+def test_tickets_preflight_store_config_reads_through_a_bom(project_v7, monkeypatch, config, store):
+    """Upstream's `store_config` decodes with utf-8-sig, so a BOM-saved store config
+    is the store it names, not an unreadable file. Ablation: read with plain utf-8
+    and the repo row FAILS (`tickets.store-not-repo`, TOMLDecodeError)."""
+    (project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL).write_bytes(
+        b"\xef\xbb\xbf" + f'[tickets]\nstore = "{config}"\n'.encode()
+    )
+    problems = [f for f in _tickets_findings(project_v7, monkeypatch) if f.severity == "problem"]
+    assert [(f.check, f.detail["store"]) for f in problems] == (
+        [("tickets.store-not-repo", store)] if store else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "check"),
+    [
+        ("script", "tickets.script-missing"),
+        ("config-utils", "tickets.config-utils-missing"),
+        ("initiative", "tickets.initiative-missing"),
+    ],
+)
+def test_tickets_preflight_stat_fault_is_a_named_problem(project_v7, monkeypatch, target, check):
+    """A stat fault other than absence on a probed path (an unsearchable parent, a
+    failing share) neither raises out of the preflight — `validate --json` must
+    still emit its document — nor reads as a missing path: it is a problem naming
+    the error. Ablation: probe with `Path.is_file`/`is_dir` and every row FAILS
+    (raises on 3.11–3.13, reads as absent on 3.14)."""
+    paths = _tickets_paths(project_v7)
+    victim = {
+        "script": project_v7.project / install_mod.TICKETS_SCRIPT_REL,
+        "config-utils": project_v7.project / install_mod.RENDERER_CONFIG_UTILS_REL,
+        "initiative": paths.initiative_folder,
+    }[target]
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == victim:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == check
+    assert problem.detail["error"].startswith("PermissionError:")
+    assert "could not be checked" in problem.message
+
+
 def test_tickets_preflight_capability_ok_on_project_v7(project_v7, monkeypatch):
     """Under `probe_capability` the vendored script's `--help` offers every verb and
     `mark` status bmad-loop needs (2 real spawns, this file's whole budget)."""

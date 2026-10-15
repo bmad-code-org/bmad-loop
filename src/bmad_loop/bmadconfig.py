@@ -669,7 +669,9 @@ def _assemble_v7(
             f"configured path {out_hit[0]!r} ({out_hit[1]})",
         )
         if out_hit
-        else _canonical(project / "_bmad-output", "default output folder")
+        # unset, `tickets.py` joins "" onto the project root: the tree lives there,
+        # not under v6's `_bmad-output` default
+        else _canonical(project, "default output folder")
     )
     name_hit = _core_value(central, "active_initiative")
     initiative = name_hit[0].strip() if name_hit else ""
