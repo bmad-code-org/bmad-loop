@@ -138,9 +138,19 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "tickets.uv-missing",
         "tickets.initiative-unset",
         "tickets.initiative-missing",
-        # the initiative folder is not tracked inside the code checkout (other store
-        # layouts land with the store-topology layer)
-        "tickets.layout-unsupported",
+        # the ticket-store topology (ticketstore.classify_store): the classified
+        # layout, or a store tickets runs refuse (incl. layouts marked outside the
+        # commit window, which land with a later release layer)
+        "tickets.store-topology",
+        # the initiative folder only partly tracked, or untracked but not gitignored
+        "tickets.tree-untracked",
+        # worktree isolation cannot redirect a shared store: config.user.toml is
+        # tracked or not gitignored
+        "tickets.own-repo-isolation",
+        # the project is not a git repository (a BMAD workspace): deferred
+        "tickets.workspace-unsupported",
+        # a shared store written outside the session cwd while a role sets extra_args
+        "tickets.store-sandbox",
         # `[scm] branch_per = "run"`: build-auto's branch-fit check may HALT a ticket
         "tickets.branch-per-run",
         # a tracker store (or an unreadable store config): bmad-loop drives repo stores only

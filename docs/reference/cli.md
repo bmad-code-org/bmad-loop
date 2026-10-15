@@ -161,7 +161,7 @@ bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] 
 
 - Sprint mode selects stories at `backlog` or `ready-for-dev`. A `--story` that matches nothing, matches several stories, or is not actionable exits 1.
 - Refused with exit 1 before anything is created on: git below the supported floor, a dirty worktree, a worktree-isolation conflict, missing base skills, or a failing plugin-trust verdict.
-- `[stories] source = "tickets"` runs the active initiative's ticket tree. Before anything is created, `run` executes the `tickets.*` preflight (capability probe included) and refuses with exit 1 on a problem, including an initiative folder that is not tracked inside the code checkout (`tickets.layout-unsupported`); `branch_per = "run"` prints the `tickets.branch-per-run` warning. Each picked ticket is dispatched as `ticket <ref>` and, once verified at `built`, marked `done` inside its unit's commit under `[tickets] mark_done = "auto"` (left at `built` under `"never"`). Under worktree isolation a unit's branch is `bmad-loop/<run>/<epic-slug>/<ref>`.
+- `[stories] source = "tickets"` runs the active initiative's ticket tree. Before anything is created, `run` executes the `tickets.*` preflight (capability probe included) and refuses with exit 1 on a problem, including a ticket store tickets runs cannot drive yet: anything but an initiative folder tracked inside the code checkout (layout T1, `tickets.store-topology` and the refusals below). The classified topology is recorded on the run, and `resume`, `resolve` and the TUI refuse a store that changed since; `branch_per = "run"` prints the `tickets.branch-per-run` warning. Each picked ticket is dispatched as `ticket <ref>` and, once verified at `built`, marked `done` inside its unit's commit under `[tickets] mark_done = "auto"` (left at `built` under `"never"`). Under worktree isolation a unit's branch is `bmad-loop/<run>/<epic-slug>/<ref>`.
 - `--dry-run` in tickets mode reads the active initiative through its `tickets.py` and marks nothing. It prints the startable tickets in build order (initiative epic table, then entry order), each with its badges, its `ticket <ref>` dispatch (`thorough` when `[tickets] thorough_review` selects it, `Halt after planning.` on an unrefined plan-checkpoint ticket) and its env, then the first pause a run would reach (`predicted:`), the `next` group counts and the tree's problems. A `tickets.py` failure exits 1.
 - Prints `run <id> starting (attach: bmad-loop attach)`, then the run summary; exits 0 once the engine has run.
 
@@ -457,15 +457,16 @@ bmad-loop relay [event]
 
 ### `validate --json`
 
-| Field         | Type   | Meaning                                                                                        |
-| ------------- | ------ | ---------------------------------------------------------------------------------------------- |
-| `ok`          | bool   | no finding has severity `problem`; matches the exit code                                       |
-| `mode`        | str    | the work source: `sprint`, `stories` or `tickets` — an open enum                               |
-| `spec_folder` | str    | stories spec folder; `""` in the other modes                                                   |
-| `initiative`  | str    | the BMAD v7 active initiative tickets mode drives; `""` in the other modes                     |
-| `era`         | str    | the BMAD config shape the project resolved as: `v6` or `v7`; `""` when the config did not load |
-| `counts`      | object | `{ok, warning, problem}` counts                                                                |
-| `findings`    | array  | one entry per finding, in the order the checks ran                                             |
+| Field          | Type           | Meaning                                                                                                                                                            |
+| -------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ok`           | bool           | no finding has severity `problem`; matches the exit code                                                                                                           |
+| `mode`         | str            | the work source: `sprint`, `stories` or `tickets` — an open enum                                                                                                   |
+| `spec_folder`  | str            | stories spec folder; `""` in the other modes                                                                                                                       |
+| `initiative`   | str            | the BMAD v7 active initiative tickets mode drives; `""` in the other modes                                                                                         |
+| `era`          | str            | the BMAD config shape the project resolved as: `v6` or `v7`; `""` when the config did not load                                                                     |
+| `ticket_store` | object \| null | tickets mode: the classified ticket store (`layout` T1–T4/T6, `placement`, `versioning`, `store_root`, `store_repo`); null when unclassified or in the other modes |
+| `counts`       | object         | `{ok, warning, problem}` counts                                                                                                                                    |
+| `findings`     | array          | one entry per finding, in the order the checks ran                                                                                                                 |
 
 `mode` is an open enum: a new work source adds a value without a `schema_version` bump, and an existing value never changes meaning. Treat an unknown value as "another mode", never as sprint.
 
@@ -589,100 +590,104 @@ Codes 3–129 and 131 and above are unallocated.
 
 Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `problem`; only `problem` fails `validate`.
 
-| Check id                               | Severity               | What it checks                                                                                                                      |
-| -------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `bmad-config`                          | ok / problem           | BMAD config loads and artifact paths resolve; on BMAD v7 the ok line names the era and the active initiative                        |
-| `bmad-config.initiative-unset`         | warning                | BMAD v7 with no `[core] active_initiative`: artifacts resolve to the output folder                                                  |
-| `bmad-config.v6-keys-ignored`          | warning                | a mixed install resolved as BMAD v7 for tickets mode, ignoring leftover v6 artifact keys                                            |
-| `policy`                               | ok / problem           | `.bmad-loop/policy.toml` loads                                                                                                      |
-| `policy.isolation-repo-root`           | problem                | `isolation = "worktree"` with the project outside the code root                                                                     |
-| `policy.isolation-shared-artifact-dir` | warning                | under worktree isolation, an artifact dir shared with the main checkout                                                             |
-| `policy.model-qualified`               | warning                | an opencode-http role model that is not `provider/model`                                                                            |
-| `policy.extra-args-unservable`         | warning                | an opencode-http role's `extra_args` repeats an adapter-owned serve flag                                                            |
-| `policy.effort-unsupported`            | warning                | `effort` set on a profile whose adapter ignores it                                                                                  |
-| `policy.bypass-dropped`                | warning                | an explicit `extra_args` drops the profile's `bypass_args`                                                                          |
-| `adapter.profile`                      | problem                | a role's adapter name does not resolve to a loadable profile                                                                        |
-| `adapter.binary`                       | ok / problem           | the profile binary is on `PATH`                                                                                                     |
-| `adapter.binary-unrunnable`            | warning                | a packaged profile's binary is on `PATH` but `--version` fails                                                                      |
-| `adapter.httpx`                        | ok / problem           | `httpx` is importable for an opencode-http profile                                                                                  |
-| `adapter.launch-args-unservable`       | warning                | an opencode-http profile's `launch_args` cannot form a valid serve command                                                          |
-| `adapter.opencode-version`             | ok / warning           | the OpenCode server API an opencode-http binary's `--version` reports is supported                                                  |
-| `adapter.hookless`                     | ok                     | the profile is hookless, so hook checks are skipped                                                                                 |
-| `adapter.kind`                         | ok / problem           | the profile's `adapter` kind is registered                                                                                          |
-| `adapter.external`                     | warning                | a third-party adapter entry point failed to load                                                                                    |
-| `adapter.external-profile`             | warning                | a third-party profile entry point failed to load                                                                                    |
-| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON or has malformed handlers                                                                    |
-| `hooks.registered`                     | ok / problem           | relay hooks are registered for the profile's events                                                                                 |
-| `hooks.trust`                          | ok / problem           | Codex project hook trust is current                                                                                                 |
-| `hooks.relay-path-unsafe`              | warning                | a registered relay path has shell metacharacters the host's quoting leaves unsafe                                                   |
-| `hooks.relay-present`                  | ok / problem           | each registered relay executable exists and is usable                                                                               |
-| `hooks.relay-stale`                    | warning                | a registered relay path differs from this installation's relay                                                                      |
-| `queue.sprint-status`                  | ok / problem           | sprint mode: `sprint-status.yaml` loads; counts actionable stories                                                                  |
-| `queue.sprint-status-unknown-keys`     | warning                | sprint mode: unknown keys in `sprint-status.yaml` were ignored                                                                      |
-| `queue.nested-specs`                   | warning                | sprint mode: spec-like files in artifact subdirectories, or unreadable subdirectories                                               |
-| `queue.stories-manifest`               | ok / problem           | stories mode: `stories.yaml` and `SPEC.md` are valid                                                                                |
-| `git.worktree-clean`                   | ok / problem           | the code root's worktree is clean                                                                                                   |
-| `git.probe`                            | problem                | the git check itself failed (spawn, timeout, error)                                                                                 |
-| `git.version`                          | ok / problem           | host git meets the supported floor                                                                                                  |
-| `git.render-tracked`                   | warning                | the rendered-skill output dir is tracked by git                                                                                     |
-| `deferred.ledger-unreadable`           | problem                | the deferred-work ledger cannot be read                                                                                             |
-| `deferred.ledger-untracked`            | warning                | the ledger is neither committed nor gitignored                                                                                      |
-| `deferred.ledger-ignored-isolated`     | warning                | the ledger is gitignored under worktree isolation, so session writes are lost                                                       |
-| `deferred.hard-gate`                   | ok / problem           | an actionable story is gated (`gate:`) by a ledger entry not marked `done`                                                          |
-| `deferred.hard-gate-unstructured`      | warning                | a not-done entry declares a gate `validate` cannot enforce (malformed, empty or misspelled `gate:`, or a prose-only `HARD GATE:`)   |
-| `deferred.closes-malformed`            | warning                | a spec's `closes_deferred` has an unreadable shape                                                                                  |
-| `deferred.closes-entry-unreadable`     | warning                | `closes_deferred` names entries that are neither open nor done                                                                      |
-| `deferred.closes-unknown`              | warning                | `closes_deferred` names ids not in the ledger                                                                                       |
-| `operator.actions-malformed`           | warning                | sprint mode: a parked story's `operator_actions` declares nothing readable                                                          |
-| `operator.confirm-interrupted`         | warning                | sprint mode: a confirmation signed the spec but never advanced the board                                                            |
-| `operator.registry-stale`              | warning                | sprint mode: a park record disagrees with the spec or board, so `confirm` will refuse it                                            |
-| `operator.park-record-missing`         | warning                | sprint mode: the board parks a story that no park record claims                                                                     |
-| `plugins.manifests`                    | ok / warning / problem | every `plugin.toml` parses (problem); unsupported manifests are skipped (warning)                                                   |
-| `plugins.trust`                        | ok / problem           | project plugins are granted and unchanged, and the grant store is readable                                                          |
-| `mux.backend`                          | ok / problem           | the selected multiplexer backend is available                                                                                       |
-| `mux.preflight`                        | problem                | multiplexer selection or readiness raised an error                                                                                  |
-| `mux.backends-detected`                | ok / warning           | inventory of detected backends when more than one is registered; detection failure (warning)                                        |
-| `mux.backend-probe`                    | warning                | a registered backend's platform or availability probe raised an error                                                               |
-| `mux.selection`                        | ok / warning           | why the backend was selected; `fallback` is a warning                                                                               |
-| `mux.external-backend`                 | warning                | a third-party multiplexer backend entry point failed to load                                                                        |
-| `host.process`                         | ok / problem           | the process host resolves; an unknown `BMAD_LOOP_PROCESS_HOST` is a problem                                                         |
-| `host.win32-on-wsl-path`               | warning                | a Windows interpreter is working on a WSL UNC project path                                                                          |
-| `notify.desktop-unavailable`           | warning                | `[notify] desktop` is on but the platform has no desktop notifier                                                                   |
-| `environment.probes-not-run`           | ok                     | probes are configured but `--probes` was not passed                                                                                 |
-| `environment.probes-none`              | ok                     | `--probes` was passed with no probes configured                                                                                     |
-| `environment.probe`                    | ok / problem           | one per probe under `--probes`; `detail.status` is `pass`, `fail`, `timeout` or `interrupted`                                       |
-| `skills.base`                          | ok                     | the dev primitive and review layers are present                                                                                     |
-| `skills.base-missing`                  | problem                | the dev primitive or a review-layer skill is not installed                                                                          |
-| `skills.base-incomplete`               | problem                | the dev primitive is missing marker files                                                                                           |
-| `skills.base-shim`                     | problem                | the legacy dev primitive is unusable and the new one is absent                                                                      |
-| `skills.dev-renderer`                  | problem                | a renderer-stub primitive lacks its renderer script                                                                                 |
-| `skills.dev-renderer-sources`          | problem                | a renderer stub's render sources are unresolved                                                                                     |
-| `skills.dev-renderer-config`           | problem                | a renderer stub's central config layer is missing                                                                                   |
-| `skills.dev-render-probe`              | ok / problem           | `--render-probe` only: the stub's render command succeeds in a temp copy                                                            |
-| `skills.customize-legacy`              | warning                | customize overrides named for the legacy dev primitive no longer apply                                                              |
-| `skills.customize-unreadable`          | warning                | a customize override is not valid TOML                                                                                              |
-| `skills.review-layers-empty`           | problem                | the dev primitive has no enabled review layer                                                                                       |
-| `skills.review-layer-missing`          | problem                | a referenced review-layer skill is not installed                                                                                    |
-| `skills.review-layer-unresolved`       | warning                | a conditionally referenced review-layer skill is not installed                                                                      |
-| `skills.stories-dispatch`              | ok                     | stories mode: the dev primitive supports folder+id dispatch                                                                         |
-| `skills.stories-dispatch-missing`      | problem                | stories mode: the dispatch probe file is missing                                                                                    |
-| `skills.stories-dispatch-stale`        | problem                | stories mode: the dev primitive lacks folder+id dispatch                                                                            |
-| `skills.tickets-dispatch`              | ok                     | tickets mode: the dev primitive resolves a ticket from the ticket tree                                                              |
-| `skills.tickets-dispatch-missing`      | problem                | tickets mode: the dispatch probe file is missing                                                                                    |
-| `skills.tickets-dispatch-stale`        | problem                | tickets mode: the dev primitive predates the ticket tree                                                                            |
-| `skills.sweep`                         | ok                     | the `bmad-loop-sweep` skill is present in the triage skill trees                                                                    |
-| `skills.sweep-missing`                 | problem                | `bmad-loop-sweep` is not installed in a triage skill tree                                                                           |
-| `skills.sweep-incomplete`              | problem                | `bmad-loop-sweep` is missing files                                                                                                  |
-| `tickets.era`                          | ok                     | tickets mode: names the ticket-tree script, the method module version and the active initiative                                     |
-| `tickets.script-missing`               | problem                | tickets mode: `_bmad/method/scripts/tickets.py` is not installed                                                                    |
-| `tickets.config-utils-missing`         | problem                | tickets mode: `_bmad/scripts/config_utils.py`, which `tickets.py` reads the config through, is missing                              |
-| `tickets.uv-missing`                   | problem                | tickets mode: `uv` is not on PATH (`bmad-build-auto` runs `tickets.py` with `uv run`)                                               |
-| `tickets.initiative-unset`             | problem                | tickets mode: no `[core] active_initiative` is set                                                                                  |
-| `tickets.initiative-missing`           | problem                | tickets mode: the active initiative's folder does not exist                                                                         |
-| `tickets.store-not-repo`               | problem                | tickets mode: the ticket store is a tracker, or its config cannot be read; bmad-loop drives repo stores only                        |
-| `tickets.layout-unsupported`           | problem                | tickets mode: the initiative folder is not tracked inside the code checkout (gitignored, uncommitted, outside it, or a nested repo) |
-| `tickets.branch-per-run`               | warning                | tickets mode: `[scm] branch_per = "run"` builds every ticket on one branch, which build-auto's branch-fit check may HALT            |
-| `tickets.capability`                   | ok / problem           | `--probes` in tickets mode: `tickets.py --help` offers every command and `mark` status bmad-loop needs                              |
-| `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                   |
+| Check id                               | Severity               | What it checks                                                                                                                                  |
+| -------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bmad-config`                          | ok / problem           | BMAD config loads and artifact paths resolve; on BMAD v7 the ok line names the era and the active initiative                                    |
+| `bmad-config.initiative-unset`         | warning                | BMAD v7 with no `[core] active_initiative`: artifacts resolve to the output folder                                                              |
+| `bmad-config.v6-keys-ignored`          | warning                | a mixed install resolved as BMAD v7 for tickets mode, ignoring leftover v6 artifact keys                                                        |
+| `policy`                               | ok / problem           | `.bmad-loop/policy.toml` loads                                                                                                                  |
+| `policy.isolation-repo-root`           | problem                | `isolation = "worktree"` with the project outside the code root                                                                                 |
+| `policy.isolation-shared-artifact-dir` | warning                | under worktree isolation, an artifact dir shared with the main checkout                                                                         |
+| `policy.model-qualified`               | warning                | an opencode-http role model that is not `provider/model`                                                                                        |
+| `policy.extra-args-unservable`         | warning                | an opencode-http role's `extra_args` repeats an adapter-owned serve flag                                                                        |
+| `policy.effort-unsupported`            | warning                | `effort` set on a profile whose adapter ignores it                                                                                              |
+| `policy.bypass-dropped`                | warning                | an explicit `extra_args` drops the profile's `bypass_args`                                                                                      |
+| `adapter.profile`                      | problem                | a role's adapter name does not resolve to a loadable profile                                                                                    |
+| `adapter.binary`                       | ok / problem           | the profile binary is on `PATH`                                                                                                                 |
+| `adapter.binary-unrunnable`            | warning                | a packaged profile's binary is on `PATH` but `--version` fails                                                                                  |
+| `adapter.httpx`                        | ok / problem           | `httpx` is importable for an opencode-http profile                                                                                              |
+| `adapter.launch-args-unservable`       | warning                | an opencode-http profile's `launch_args` cannot form a valid serve command                                                                      |
+| `adapter.opencode-version`             | ok / warning           | the OpenCode server API an opencode-http binary's `--version` reports is supported                                                              |
+| `adapter.hookless`                     | ok                     | the profile is hookless, so hook checks are skipped                                                                                             |
+| `adapter.kind`                         | ok / problem           | the profile's `adapter` kind is registered                                                                                                      |
+| `adapter.external`                     | warning                | a third-party adapter entry point failed to load                                                                                                |
+| `adapter.external-profile`             | warning                | a third-party profile entry point failed to load                                                                                                |
+| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON or has malformed handlers                                                                                |
+| `hooks.registered`                     | ok / problem           | relay hooks are registered for the profile's events                                                                                             |
+| `hooks.trust`                          | ok / problem           | Codex project hook trust is current                                                                                                             |
+| `hooks.relay-path-unsafe`              | warning                | a registered relay path has shell metacharacters the host's quoting leaves unsafe                                                               |
+| `hooks.relay-present`                  | ok / problem           | each registered relay executable exists and is usable                                                                                           |
+| `hooks.relay-stale`                    | warning                | a registered relay path differs from this installation's relay                                                                                  |
+| `queue.sprint-status`                  | ok / problem           | sprint mode: `sprint-status.yaml` loads; counts actionable stories                                                                              |
+| `queue.sprint-status-unknown-keys`     | warning                | sprint mode: unknown keys in `sprint-status.yaml` were ignored                                                                                  |
+| `queue.nested-specs`                   | warning                | sprint mode: spec-like files in artifact subdirectories, or unreadable subdirectories                                                           |
+| `queue.stories-manifest`               | ok / problem           | stories mode: `stories.yaml` and `SPEC.md` are valid                                                                                            |
+| `git.worktree-clean`                   | ok / problem           | the code root's worktree is clean                                                                                                               |
+| `git.probe`                            | problem                | the git check itself failed (spawn, timeout, error)                                                                                             |
+| `git.version`                          | ok / problem           | host git meets the supported floor                                                                                                              |
+| `git.render-tracked`                   | warning                | the rendered-skill output dir is tracked by git                                                                                                 |
+| `deferred.ledger-unreadable`           | problem                | the deferred-work ledger cannot be read                                                                                                         |
+| `deferred.ledger-untracked`            | warning                | the ledger is neither committed nor gitignored                                                                                                  |
+| `deferred.ledger-ignored-isolated`     | warning                | the ledger is gitignored under worktree isolation, so session writes are lost                                                                   |
+| `deferred.hard-gate`                   | ok / problem           | an actionable story is gated (`gate:`) by a ledger entry not marked `done`                                                                      |
+| `deferred.hard-gate-unstructured`      | warning                | a not-done entry declares a gate `validate` cannot enforce (malformed, empty or misspelled `gate:`, or a prose-only `HARD GATE:`)               |
+| `deferred.closes-malformed`            | warning                | a spec's `closes_deferred` has an unreadable shape                                                                                              |
+| `deferred.closes-entry-unreadable`     | warning                | `closes_deferred` names entries that are neither open nor done                                                                                  |
+| `deferred.closes-unknown`              | warning                | `closes_deferred` names ids not in the ledger                                                                                                   |
+| `operator.actions-malformed`           | warning                | sprint mode: a parked story's `operator_actions` declares nothing readable                                                                      |
+| `operator.confirm-interrupted`         | warning                | sprint mode: a confirmation signed the spec but never advanced the board                                                                        |
+| `operator.registry-stale`              | warning                | sprint mode: a park record disagrees with the spec or board, so `confirm` will refuse it                                                        |
+| `operator.park-record-missing`         | warning                | sprint mode: the board parks a story that no park record claims                                                                                 |
+| `plugins.manifests`                    | ok / warning / problem | every `plugin.toml` parses (problem); unsupported manifests are skipped (warning)                                                               |
+| `plugins.trust`                        | ok / problem           | project plugins are granted and unchanged, and the grant store is readable                                                                      |
+| `mux.backend`                          | ok / problem           | the selected multiplexer backend is available                                                                                                   |
+| `mux.preflight`                        | problem                | multiplexer selection or readiness raised an error                                                                                              |
+| `mux.backends-detected`                | ok / warning           | inventory of detected backends when more than one is registered; detection failure (warning)                                                    |
+| `mux.backend-probe`                    | warning                | a registered backend's platform or availability probe raised an error                                                                           |
+| `mux.selection`                        | ok / warning           | why the backend was selected; `fallback` is a warning                                                                                           |
+| `mux.external-backend`                 | warning                | a third-party multiplexer backend entry point failed to load                                                                                    |
+| `host.process`                         | ok / problem           | the process host resolves; an unknown `BMAD_LOOP_PROCESS_HOST` is a problem                                                                     |
+| `host.win32-on-wsl-path`               | warning                | a Windows interpreter is working on a WSL UNC project path                                                                                      |
+| `notify.desktop-unavailable`           | warning                | `[notify] desktop` is on but the platform has no desktop notifier                                                                               |
+| `environment.probes-not-run`           | ok                     | probes are configured but `--probes` was not passed                                                                                             |
+| `environment.probes-none`              | ok                     | `--probes` was passed with no probes configured                                                                                                 |
+| `environment.probe`                    | ok / problem           | one per probe under `--probes`; `detail.status` is `pass`, `fail`, `timeout` or `interrupted`                                                   |
+| `skills.base`                          | ok                     | the dev primitive and review layers are present                                                                                                 |
+| `skills.base-missing`                  | problem                | the dev primitive or a review-layer skill is not installed                                                                                      |
+| `skills.base-incomplete`               | problem                | the dev primitive is missing marker files                                                                                                       |
+| `skills.base-shim`                     | problem                | the legacy dev primitive is unusable and the new one is absent                                                                                  |
+| `skills.dev-renderer`                  | problem                | a renderer-stub primitive lacks its renderer script                                                                                             |
+| `skills.dev-renderer-sources`          | problem                | a renderer stub's render sources are unresolved                                                                                                 |
+| `skills.dev-renderer-config`           | problem                | a renderer stub's central config layer is missing                                                                                               |
+| `skills.dev-render-probe`              | ok / problem           | `--render-probe` only: the stub's render command succeeds in a temp copy                                                                        |
+| `skills.customize-legacy`              | warning                | customize overrides named for the legacy dev primitive no longer apply                                                                          |
+| `skills.customize-unreadable`          | warning                | a customize override is not valid TOML                                                                                                          |
+| `skills.review-layers-empty`           | problem                | the dev primitive has no enabled review layer                                                                                                   |
+| `skills.review-layer-missing`          | problem                | a referenced review-layer skill is not installed                                                                                                |
+| `skills.review-layer-unresolved`       | warning                | a conditionally referenced review-layer skill is not installed                                                                                  |
+| `skills.stories-dispatch`              | ok                     | stories mode: the dev primitive supports folder+id dispatch                                                                                     |
+| `skills.stories-dispatch-missing`      | problem                | stories mode: the dispatch probe file is missing                                                                                                |
+| `skills.stories-dispatch-stale`        | problem                | stories mode: the dev primitive lacks folder+id dispatch                                                                                        |
+| `skills.tickets-dispatch`              | ok                     | tickets mode: the dev primitive resolves a ticket from the ticket tree                                                                          |
+| `skills.tickets-dispatch-missing`      | problem                | tickets mode: the dispatch probe file is missing                                                                                                |
+| `skills.tickets-dispatch-stale`        | problem                | tickets mode: the dev primitive predates the ticket tree                                                                                        |
+| `skills.sweep`                         | ok                     | the `bmad-loop-sweep` skill is present in the triage skill trees                                                                                |
+| `skills.sweep-missing`                 | problem                | `bmad-loop-sweep` is not installed in a triage skill tree                                                                                       |
+| `skills.sweep-incomplete`              | problem                | `bmad-loop-sweep` is missing files                                                                                                              |
+| `tickets.era`                          | ok                     | tickets mode: names the ticket-tree script, the method module version and the active initiative                                                 |
+| `tickets.script-missing`               | problem                | tickets mode: `_bmad/method/scripts/tickets.py` is not installed                                                                                |
+| `tickets.config-utils-missing`         | problem                | tickets mode: `_bmad/scripts/config_utils.py`, which `tickets.py` reads the config through, is missing                                          |
+| `tickets.uv-missing`                   | problem                | tickets mode: `uv` is not on PATH (`bmad-build-auto` runs `tickets.py` with `uv run`)                                                           |
+| `tickets.initiative-unset`             | problem                | tickets mode: no `[core] active_initiative` is set                                                                                              |
+| `tickets.initiative-missing`           | problem                | tickets mode: the active initiative's folder does not exist                                                                                     |
+| `tickets.store-not-repo`               | problem                | tickets mode: the ticket store is a tracker, or its config cannot be read; bmad-loop drives repo stores only                                    |
+| `tickets.store-topology`               | ok / problem           | tickets mode: the classified ticket-store layout; a problem for a layout runs do not drive yet (anything but T1) or a store git cannot classify |
+| `tickets.tree-untracked`               | problem                | tickets mode: the initiative folder is only partly tracked, or neither tracked nor gitignored inside the code checkout                          |
+| `tickets.own-repo-isolation`           | problem                | tickets mode, worktree isolation: a shared store needs the mount redirect, but `_bmad/custom/config.user.toml` is tracked or not gitignored     |
+| `tickets.workspace-unsupported`        | problem                | tickets mode: the project is not a git repository (a BMAD workspace); not supported yet                                                         |
+| `tickets.store-sandbox`                | warning                | tickets mode: sessions write a shared store outside their cwd while a role's `extra_args` replace the profile's bypass flags                    |
+| `tickets.branch-per-run`               | warning                | tickets mode: `[scm] branch_per = "run"` builds every ticket on one branch, which build-auto's branch-fit check may HALT                        |
+| `tickets.capability`                   | ok / problem           | `--probes` in tickets mode: `tickets.py --help` offers every command and `mark` status bmad-loop needs                                          |
+| `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                               |
 
 The set is closed (`checks.VALIDATE_CHECKS`); plugins cannot add check ids.

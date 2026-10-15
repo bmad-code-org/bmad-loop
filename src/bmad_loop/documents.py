@@ -62,6 +62,7 @@ def validate_document(
     *,
     initiative: str = "",
     era: str = "",
+    ticket_store: dict[str, str | None] | None = None,
 ) -> dict[str, object]:
     """The `validate --json` document: the verdict plus every check that produced it.
 
@@ -71,7 +72,9 @@ def validate_document(
     ``initiative`` is the BMAD v7 active initiative a tickets run would drive
     ("" in the other modes, as ``spec_folder`` is outside stories mode); ``era``
     is the BMAD config shape the project resolved as (``v6``/``v7``, "" when the
-    config failed to load).
+    config failed to load). ``ticket_store`` is the classified ticket-store topology
+    (``ticketstore.StoreTopology.to_dict``) in tickets mode, null when the store was
+    not classified (refused, no initiative) and outside tickets mode.
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
     anything breaking bumps VALIDATE_SCHEMA_VERSION). ``ok`` is true when no
@@ -118,6 +121,7 @@ def validate_document(
         "spec_folder": spec_folder if mode == "stories" else "",
         "initiative": initiative if mode == "tickets" else "",
         "era": era,
+        "ticket_store": dict(ticket_store) if ticket_store and mode == "tickets" else None,
         "counts": report.counts(),
         "findings": [
             {

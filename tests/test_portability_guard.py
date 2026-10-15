@@ -310,6 +310,8 @@ REFUSAL_HELPER_DEFS = {
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
     ("cli.py", "_reject_isolation_conflict"),
+    # the ticket-store topology wrapper (tickets mode); test_cli.py
+    ("cli.py", "_reject_store_topology"),
     # #496/#497: the launch plugin-trust preflight; test_cli.py
     # test_run_refuses_an_enabled_ungranted_project_plugin and
     # test_resume_refuses_a_mismatched_plugin_before_any_side_effect
@@ -354,6 +356,31 @@ ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "_warn_preflight_would_abort"): 1,  # the dry-run honesty banner
     ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises — no rc channel
     ("tui/app.py", "_guarded"): 1,  # the pre-launch toast guard
+    ("tui/app.py", "_do_rearm"): 1,
+}
+
+# Every call site of the ticket-store topology refusal — the pure text producer
+# `ticketstore.store_topology_conflict`, the probe-level predicate
+# `ticketstore.store_conflict` that wraps it, and the rc-returning CLI wrapper
+# `_reject_store_topology` — as `(file, enclosing function) -> count`. The
+# `ISOLATION_CONFLICT_CALLERS` idiom and rows: the store refusal stands beside the
+# #414 one on every run-arming surface, so resume, resolve, the dry-run banner, the
+# auto-sweep factory and the TUI guards cannot skip it. `validate` reports it as
+# findings through `install._tickets_store_findings` (its tickets queue validator),
+# and `cmd_run` refuses through the wrapper ahead of that same preflight. A new
+# caller lands with a row and the test that it refuses.
+STORE_TOPOLOGY_CALLERS = {
+    ("ticketstore.py", "store_conflict"): 1,  # the predicate's own text call
+    ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
+    ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
+    ("cli.py", "cmd_run"): 1,
+    ("cli.py", "cmd_sweep"): 1,
+    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm, as the #414 pair
+    ("cli.py", "_resolve_reverify_finished"): 1,
+    ("cli.py", "_prepare_resume_locked"): 1,  # re-validates the recorded topology
+    ("cli.py", "_warn_preflight_would_abort"): 1,
+    ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises
+    ("tui/app.py", "_guarded"): 1,
     ("tui/app.py", "_do_rearm"): 1,
 }
 
@@ -3265,6 +3292,24 @@ def _names_isolation_refusal(
     ) or _names_guarded_verify_call(func, "_reject_isolation_conflict", wrapper_aliases)
 
 
+def _names_store_topology_refusal(
+    func: ast.expr, aliases: dict[str, frozenset[str]] | None = None
+) -> bool:
+    """True when ``func`` spells a ticket-store topology refusal entry point: the
+    pure ``ticketstore.store_topology_conflict``, the predicate
+    ``ticketstore.store_conflict``, or the CLI wrapper ``_reject_store_topology``,
+    each through its own alias set. Same reach and trade as
+    :func:`_names_isolation_refusal`."""
+    aliases = aliases or {}
+    return any(
+        _names_guarded_verify_call(func, name, aliases.get(name, frozenset()))
+        for name in STORE_TOPOLOGY_NAMES
+    )
+
+
+STORE_TOPOLOGY_NAMES = ("store_topology_conflict", "store_conflict", "_reject_store_topology")
+
+
 def _block_exits(body: list[ast.stmt]) -> bool:
     """Whether this simple guard body cannot fall through to the re-arm below it."""
     return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
@@ -3514,6 +3559,7 @@ def _scan_source(src: str, rel: str):
     rearm_aliases = _call_aliases(tree, "rearm_escalation")
     isolation_aliases = _call_aliases(tree, "worktree_isolation_conflict")
     isolation_wrapper_aliases = _call_aliases(tree, "_reject_isolation_conflict")
+    store_aliases = {name: _call_aliases(tree, name) for name in STORE_TOPOLOGY_NAMES}
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -4331,6 +4377,16 @@ def _scan_source(src: str, rel: str):
             findings.append(
                 (
                     "isolationcall",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    enclosing_names.get(id(node)),
+                )
+            )
+        if isinstance(node, ast.Call) and _names_store_topology_refusal(node.func, store_aliases):
+            findings.append(
+                (
+                    "storetopologycall",
                     rel,
                     node.lineno,
                     line_at(node.lineno),
@@ -5204,6 +5260,85 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
     )
+
+
+def test_store_topology_refusal_sites_are_enumerated():
+    """The ticket-store topology refusal is reached from exactly the declared call
+    sites, counted WITH multiplicity — `store_topology_conflict`, `store_conflict`
+    and `_reject_store_topology` alike — so a run-arming surface that skips it, or a
+    new one that reaches it, reddens a row.
+
+    Ablation: delete the `storetopologycall` emit and this reddens (every row
+    declared, none scanned); delete the `_reject_store_topology` call in
+    `_prepare_resume_locked` and the count comparison reddens naming the site."""
+    findings = _of("storetopologycall")
+    sites = Counter((rel, fn) for _, rel, _, _, fn in findings)
+    declared = Counter(STORE_TOPOLOGY_CALLERS)
+    changed = {key for key in set(sites) | set(declared) if sites[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: in {fn or '<module>'} — {txt.strip()}"
+        for _, rel, ln, txt, fn in findings
+        if (rel, fn) in changed
+    ]
+    assert sites == declared, (
+        "the ticket-store topology refusal call sites moved (store_topology_conflict / "
+        "store_conflict / _reject_store_topology). A new surface lands WITH its refusal "
+        "test; a removed one deletes its row — update STORE_TOPOLOGY_CALLERS only "
+        "alongside that decision:\n"
+        f"  scanned:  {sorted(sites.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "fn"),
+    [
+        (
+            "qualified-predicate-call",
+            "def f(args):\n    ticketstore.store_conflict(project, source, iso)\n",
+            "f",
+        ),
+        (
+            "bare-wrapper-call",
+            "def cmd_run(args):\n"
+            "    if (rc := _reject_store_topology(project, pol, source)) is not None:\n"
+            "        return rc\n",
+            "cmd_run",
+        ),
+        (
+            "renamed-text-import",
+            "from .ticketstore import store_topology_conflict as why\n"
+            "def g(result):\n    why(result)\n",
+            "g",
+        ),
+    ],
+    ids=["qualified-predicate-call", "bare-wrapper-call", "renamed-text-import"],
+)
+def test_store_topology_call_detector_reports_the_site(label, source, fn):
+    """Each spelling is found and attributed to its enclosing function.
+
+    Ablation: delete the `storetopologycall` emit and every row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "storetopologycall"]
+    assert len(found) == 1, f"the {label!r} shape produced {len(found)} findings:\n{source}"
+    assert found[0][4] == fn
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def store_conflict(project, source, isolation):\n    return None\n",
+        "def f():\n    store_conflicts(paths)\n",
+        "def f():\n    handler = ticketstore.store_conflict\n",
+    ],
+    ids=["definition", "similar-name", "reference-not-a-call"],
+)
+def test_store_topology_call_detector_stays_silent_on_non_calls(source):
+    """A definition, a similar name and a bare reference are not call sites.
+
+    Ablation: relax `_names_guarded_verify_call`'s name equality to a substring
+    match and the similar-name row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "storetopologycall"]
+    assert not found
 
 
 SPEC_STATUS_WRITER_NAMES = frozenset(

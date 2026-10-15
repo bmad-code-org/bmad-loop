@@ -111,6 +111,11 @@ class ProjectPaths:
     # v7 only: the origin of each v6 artifact key that is configured but ignored
     # because tickets mode resolved the project as v7 (a mixed install)
     ignored_v6_keys: tuple[str, ...] = ()
+    # v7 tickets runs only: the ticket store (``output_folder``) when no checkout
+    # carries its own copy — an ignored folder, its own repository, or a folder
+    # outside the project (``ticketstore``). Every artifact dir under it is shared:
+    # :meth:`rebased` leaves it unmoved, and a worktree mount is redirected to it.
+    shared_store: Path | None = None
 
     def __post_init__(self) -> None:
         if self.output_folder is None:
@@ -139,7 +144,8 @@ class ProjectPaths:
         :func:`worktree_isolation_conflict`). Artifact dirs move with the project:
         each is re-joined onto the new project at its offset inside the old one, and
         one configured outside the project tree is shared, not per-checkout, so it
-        doesn't move (DW-379)."""
+        doesn't move (DW-379); nor does one under the shared ticket store
+        (:attr:`shared_store`), which carries over as is."""
         new_root = new_root.resolve()
         new_project = rebased_project(self.project, self.repo_root, new_root)
         return ProjectPaths(
@@ -156,7 +162,13 @@ class ProjectPaths:
                 else self.artifact_at(self.initiative_folder, new_project)
             ),
             ignored_v6_keys=self.ignored_v6_keys,
+            shared_store=self.shared_store,
         )
+
+    def in_shared_store(self, path: Path) -> bool:
+        """True when ``path`` is the shared ticket store or lies under it."""
+        store = self.shared_store
+        return store is not None and (path == store or path.is_relative_to(store))
 
     def artifact_at(self, artifact: Path, mount_project: Path) -> Path:
         """Where `artifact` (one of this config's dirs) sits for the project mounted
@@ -164,7 +176,11 @@ class ProjectPaths:
         unmoved when configured outside the project tree, which is shared rather
         than per-checkout (DW-379). The rule :meth:`rebased` applies to every
         artifact dir, exposed for callers that hold the mount PROJECT rather than
-        the checkout root — the session cwd (DW-484)."""
+        the checkout root — the session cwd (DW-484). A dir under the shared
+        ticket store (:attr:`shared_store`) is unmoved for the same reason: every
+        checkout reads and writes that one store."""
+        if self.in_shared_store(artifact):
+            return artifact
         try:
             rel = artifact.relative_to(self.project)
         except ValueError:

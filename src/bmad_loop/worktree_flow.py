@@ -39,6 +39,7 @@ from . import (
     deferredwork,
     gates,
     sprintstatus,
+    ticketstore,
     verify,
     worksource,
     workspace_trust,
@@ -116,7 +117,18 @@ def _crlf_normalized(data: bytes) -> bytes:
     return data.replace(b"\r\n", b"\n")
 
 
-def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+def _in_store(artifact: Path, shared_store: Path | None) -> bool:
+    """True when ``artifact`` lies in the shared ticket store
+    (``ProjectPaths.shared_store``), which a worktree mount reads in place through
+    its redirect — nothing there is seeded, named as dropped, or carried."""
+    return shared_store is not None and (
+        artifact == shared_store or artifact.is_relative_to(shared_store)
+    )
+
+
+def _artifact_seed(
+    artifact: Path, repo: Path, worktree: Path, *, shared_store: Path | None = None
+) -> tuple[str, ...]:
     """The seed rel for one orchestrator-owned artifact (ledger or board), or ``()``.
 
     The shared body of ``WorktreeFlow._ledger_seed`` and ``_board_seed``. The rel
@@ -141,9 +153,13 @@ def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...
 
     ``()`` on any resolve/relative fault; for an artifact absent from the main
     checkout (dropped silently by the seed loop, so naming it would be invisible
-    rather than inert); for one the checkout already delivers; and behind a
-    worktree link whose target is already in the worktree. Every probe is total.
+    rather than inert); for one the checkout already delivers; behind a
+    worktree link whose target is already in the worktree; and for one in the shared
+    ticket store ``shared_store``, which ``rebased`` leaves unmoved and the mount is
+    redirected to. Every probe is total.
     """
+    if _in_store(artifact, shared_store):
+        return ()
     try:
         repo_resolved = repo.resolve()
         rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
@@ -162,7 +178,9 @@ def _artifact_seed(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...
     return (rel,)
 
 
-def _artifact_seed_dropped(artifact: Path, repo: Path, worktree: Path) -> tuple[str, ...]:
+def _artifact_seed_dropped(
+    artifact: Path, repo: Path, worktree: Path, *, shared_store: Path | None = None
+) -> tuple[str, ...]:
     """The configured rel :func:`_artifact_seed` excluded as out-of-project, when the
     worktree ends up without it — or ``()`` (DW-432).
 
@@ -181,8 +199,11 @@ def _artifact_seed_dropped(artifact: Path, repo: Path, worktree: Path) -> tuple[
     and ``worktree`` are the :func:`provision_roots` pair, so the rel is
     project-relative like every other ``worktree-seed-dropped`` entry. Meant to run
     after provisioning, on the post-provisioning worktree. Total: a resolve fault is
-    "not dropped".
+    "not dropped", and so is an artifact in the shared ticket store, which the mount
+    reads in place.
     """
+    if _in_store(artifact, shared_store):
+        return ()
     try:
         repo_resolved = repo.resolve()
         rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
@@ -2046,7 +2067,11 @@ class WorktreeFlow:
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        return _artifact_seed(self.paths.deferred_work, *self._mount_roots(worktree))
+        return _artifact_seed(
+            self.paths.deferred_work,
+            *self._mount_roots(worktree),
+            shared_store=self.paths.shared_store,
+        )
 
     def _board_seed(self, worktree: Path) -> tuple[str, ...]:
         """The sprint board, when a worktree checkout cannot deliver it (#350).
@@ -2113,7 +2138,11 @@ class WorktreeFlow:
         """
         if not worksource.resumed_traits_for(self.state.source).sprint_board:
             return ()
-        return _artifact_seed(self.paths.sprint_status, *self._mount_roots(worktree))
+        return _artifact_seed(
+            self.paths.sprint_status,
+            *self._mount_roots(worktree),
+            shared_store=self.paths.shared_store,
+        )
 
     def _artifact_seed_drops(self, worktree: Path) -> list[str]:
         """The ledger's and board's configured rels that :meth:`_ledger_seed` /
@@ -2121,10 +2150,12 @@ class WorktreeFlow:
         (DW-432) — project-relative, deduped, ledger first. Naming only; run after
         provisioning. See :func:`_artifact_seed_dropped`. A source without a sprint
         board names no board drop, since it seeds none."""
-        roots = self._mount_roots(worktree)
-        drops = [*_artifact_seed_dropped(self.paths.deferred_work, *roots)]
+        roots, store = self._mount_roots(worktree), self.paths.shared_store
+        drops = [*_artifact_seed_dropped(self.paths.deferred_work, *roots, shared_store=store)]
         if worksource.resumed_traits_for(self.state.source).sprint_board:
-            drops.extend(_artifact_seed_dropped(self.paths.sprint_status, *roots))
+            drops.extend(
+                _artifact_seed_dropped(self.paths.sprint_status, *roots, shared_store=store)
+            )
         return list(dict.fromkeys(drops))
 
     def _accepted_spec_seed(
@@ -2611,6 +2642,21 @@ class WorktreeFlow:
             # "why" to the inner message rather than asserting one of the three.
             reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
+        # A shared ticket store (no checkout carries its own copy) is read and
+        # written in place: point the mount's `tickets.py` and renderer at it before
+        # anything inside the mount resolves `output_folder`, and before the
+        # escalating gates below, so a failed redirect never reaches a session.
+        if self.paths.shared_store is not None:
+            try:
+                ticketstore.redirect_mount_store(
+                    unit.workspace.paths.project, self.paths.shared_store
+                )
+            except ticketstore.TicketStoreError as e:
+                reason = (
+                    f"cannot point the worktree for {task.story_key} at the shared ticket "
+                    f"store: {e}"
+                )
+                self.escalate_unit(task, reason)  # always raises RunPaused
         # Before any session launches in the worktree: a CLI that gates sessions
         # on a home-level exact-path allowlist would otherwise block on its trust
         # dialog in this fresh path until the session timeout (DW-390).
@@ -3016,6 +3062,8 @@ class WorktreeFlow:
             artifacts.append(self.paths.deferred_work)
         rels: list[str] = []
         for artifact in artifacts:
+            if _in_store(artifact, self.paths.shared_store):
+                continue  # the shared ticket store: the unit wrote the one copy in place
             try:
                 rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
             except (OSError, RuntimeError, ValueError):
@@ -4585,7 +4633,11 @@ class WorktreeFlow:
             )
 
     def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
-        """Persist accepted bytes before merge can consume the unit."""
+        """Persist accepted bytes before merge can consume the unit. Nothing to
+        persist when the artifacts dir is in the shared ticket store: the mount
+        wrote the main checkout's one copy in place."""
+        if source.in_shared_store(source.implementation_artifacts):
+            return
         try:
             limits = self.policy.limits
             try:
@@ -4681,7 +4733,10 @@ class WorktreeFlow:
             self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
 
     def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
-        """Validate final staged Git deliverables or retain the unit mount."""
+        """Validate final staged Git deliverables or retain the unit mount. An
+        artifacts dir in the shared ticket store stages nothing: ``{}``."""
+        if source.in_shared_store(source.implementation_artifacts):
+            return {}
         try:
             try:
                 return artifact_publication.validate_staged(task, source)

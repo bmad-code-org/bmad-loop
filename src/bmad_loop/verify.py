@@ -7004,6 +7004,26 @@ def worktree_list(repo: Path) -> list[Path]:
     return paths
 
 
+def git_toplevel(path: Path) -> Path | None:
+    """The working-tree root of the repository holding ``path`` (canonical), or None
+    when ``path`` lies in no repository — or does not exist, which git answers the
+    same way. A ticket store's own repository (``ticketstore``) and the code repo
+    are told apart by comparing these.
+
+    Git refusing reads as None; a spawn or timeout fault is raised typed
+    (:class:`GitSpawnError` / :class:`GitTimeoutError`), never folded into "not a
+    repository"."""
+    proc = _run_git(["git", "-C", str(path), "rev-parse", "--show-toplevel"], path)
+    if proc.returncode != 0:
+        return None
+    # Git terminates this scalar with one newline; the path may itself hold others.
+    top = proc.stdout.removesuffix("\n")
+    try:
+        return Path(top).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+
 def worktree_is_registered(repo: Path, path: Path) -> bool:
     """Whether ``path`` is this repository's exact live linked worktree.
 
@@ -8354,7 +8374,8 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
     reconcile) must refuse a session-reported ``spec_file`` that resolves outside
     these roots, so a surprising path can never be silently rewritten. Artifact
     dirs configured outside ``project`` are roots too, so a legitimately
-    out-of-project spec is still allowed."""
+    out-of-project spec is still allowed — as is the shared ticket store a worktree
+    mount is redirected to (``ProjectPaths.shared_store``)."""
     try:
         sp = spec_path.resolve()
         roots = (
@@ -8362,6 +8383,7 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
             paths.output_folder,
             paths.implementation_artifacts,
             paths.planning_artifacts,
+            *(() if paths.shared_store is None else (paths.shared_store,)),
         )
         return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
     except (OSError, RuntimeError, ValueError):

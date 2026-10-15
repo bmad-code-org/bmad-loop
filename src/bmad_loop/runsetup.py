@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
-from . import runs, worksource
+from . import runs, ticketstore, worksource
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
@@ -831,6 +831,7 @@ def build_run_state(
     run_dir_identity: tuple[int, int] | None,
     initiative: str = "",
     initiative_folder: str = "",
+    store_topology: dict[str, str | None] | None = None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -857,7 +858,8 @@ def build_run_state(
     ``initiative`` / ``initiative_folder`` are the v7 active initiative and its
     folder (``ProjectPaths.active_initiative`` / ``initiative_folder``), pinned only
     for a tickets run, whose tree reads refuse once the live initiative differs;
-    every other source records them empty."""
+    every other source records them empty. ``store_topology`` is the classified
+    ticket store (``ticketstore.StoreTopology.to_dict``), likewise tickets only."""
     tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
@@ -873,8 +875,31 @@ def build_run_state(
         spec_folder=spec_folder if worksource.traits_for(source).has_spec_folder else "",
         initiative=initiative if tickets else "",
         initiative_folder=initiative_folder if tickets else "",
+        store_topology=dict(store_topology or {}) if tickets else {},
         trusted_config_digest=trusted_config_digest,
     )
+
+
+def _run_store_topology(
+    paths: bmadconfig.ProjectPaths, policy: Policy, source: str
+) -> dict[str, str | None]:
+    """The ticket-store topology a tickets run records at its start (``{}`` for any
+    other source, and when there is no initiative folder to classify — the
+    preflight's ``tickets.initiative-*`` checks own that refusal). The run preflight
+    refused every unrunnable store already, so a store refused here changed in
+    between; that raises :class:`ticketstore.TicketStoreError` rather than starting
+    unrecorded."""
+    if source != worksource.SOURCE_TICKETS:
+        return {}
+    result = ticketstore.assess_store(paths, policy.scm.isolation)
+    if result is None:
+        return {}
+    if isinstance(result, ticketstore.StoreRefusal):
+        raise ticketstore.TicketStoreError(
+            "the ticket store no longer classifies at run start (it changed after the "
+            "preflight) — run `bmad-loop validate` and start the run again"
+        )
+    return result.to_dict()
 
 
 def _engine_cls_for(
@@ -1280,6 +1305,8 @@ def compose_run(
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # Before the claim: a store that changed since the preflight leaves nothing behind.
+    store_topology = _run_store_topology(paths, policy, source)
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     composer_claim = _claim_run_dir(run_dir)
@@ -1312,6 +1339,7 @@ def compose_run(
             initiative_folder=(
                 str(paths.initiative_folder) if paths.initiative_folder is not None else ""
             ),
+            store_topology=store_topology,
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering

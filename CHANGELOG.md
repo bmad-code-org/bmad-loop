@@ -22,8 +22,7 @@ breaking changes may land in a minor release.
   tree (tracked in-repo store). The run picks in initiative build order, pauses on hitl
   and unrefined tickets, verifies each plan at `built`, and marks it `done` inside the
   unit's own commit (`[tickets] mark_done = "auto"`). A worktree unit's branch is
-  `bmad-loop/<run>/<epic-slug>/<ref>`. `run` refuses an initiative folder not tracked
-  in the code checkout (`tickets.layout-unsupported`) and warns on `branch_per = "run"`
+  `bmad-loop/<run>/<epic-slug>/<ref>`. `run` warns on `branch_per = "run"`
   (`tickets.branch-per-run`).
 - Add plan and done checkpoints in tickets mode. A refined `plan_checkpoint` ticket
   pauses before dispatch, and resuming approves its story file. An unrefined one runs a
@@ -40,6 +39,15 @@ breaking changes may land in a minor release.
 - Add `bmad-loop confirm <ref>` for a tickets park: it marks the plan `done` (`built`
   under `[tickets] mark_done = "never"`) through `tickets.py mark`, clearing its
   `blocked_*` fields.
+- Classify the ticket-store topology in tickets mode: a store tracked in the code
+  checkout (T1), an ignored folder (T2), its own nested or external repository (T3/T4)
+  or an outside folder. `validate` reports it (`tickets.store-topology`, the additive
+  `ticket_store` field) and refuses partial tracking, an untracked unignored store and a
+  workspace project (`tickets.tree-untracked`, `tickets.workspace-unsupported`). Runs
+  record it; resume, resolve and the TUI refuse a store that changed. Runs still need
+  T1. Under worktree isolation a shared store is read in place: the mount's
+  `config.user.toml` is redirected to it (`tickets.own-repo-isolation` when it cannot
+  be), and no seed, carry or publication touches it.
 - Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
   `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
   A plan restore is confined to the ticket store root.

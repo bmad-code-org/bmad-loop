@@ -12041,7 +12041,9 @@ def test_tickets_preflight_passes_on_project_v7(project_v7, monkeypatch):
     from bmad_loop.checks import VALIDATE_CHECKS
 
     findings = _tickets_findings(project_v7, monkeypatch)
-    assert _ids(findings) == ["tickets.era", "tickets.capability-not-run"]
+    assert _ids(findings) == ["tickets.era", "tickets.store-topology", "tickets.capability-not-run"]
+    assert findings[1].severity == "ok"
+    assert findings[1].detail["topology"]["layout"] == "T1"
     era = findings[0]
     assert era.severity == "ok"
     assert era.detail == {
@@ -12120,14 +12122,24 @@ def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
     assert problem.detail["initiative"] == project_v7.initiative
 
 
-@pytest.mark.parametrize("layout", ["ignored", "uncommitted", "outside"])
-def test_untracked_store_refused_until_topology_layer(project_v7, monkeypatch, tmp_path, layout):
-    """Tickets runs drive a ticket tree tracked inside the code checkout, so a
-    plan marked `done` rides its unit's own commit. An initiative folder that is
-    gitignored, never committed, or outside `repo_root` is a store layout a later
-    release layer supports: one `tickets.layout-unsupported` problem naming why.
-    Ablation (performed): drop the layout check in `tickets_preflight` and every
-    row FAILS."""
+@pytest.mark.parametrize(
+    ("layout", "check", "text"),
+    [
+        ("ignored", "tickets.store-topology", "layout T2"),
+        ("uncommitted", "tickets.tree-untracked", "neither tracks nor ignores"),
+        ("outside", "tickets.store-topology", "layout T4"),
+    ],
+)
+def test_tickets_preflight_classifies_store_layouts(
+    project_v7, monkeypatch, tmp_path, layout, check, text
+):
+    """The store-topology classifier stands where the tracked-in-checkout gate
+    stood: an ignored initiative folder classifies as T2 and a code repo elsewhere
+    makes the store its own repository (T4) — both still refused for a run until
+    marking outside the commit window lands — while a folder neither tracked nor
+    ignored is untracked dirt (`tickets.tree-untracked`). One problem each, carrying
+    the refusal or the classified topology. Ablation (performed): drop the
+    `_tickets_store_findings` call in `tickets_preflight` and every row FAILS."""
     import dataclasses
 
     rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
@@ -12135,7 +12147,8 @@ def test_untracked_store_refused_until_topology_layer(project_v7, monkeypatch, t
     if layout in ("ignored", "uncommitted"):
         git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
         if layout == "ignored":
-            (project_v7.project / ".gitignore").write_text(f"/{rel}/\n", encoding="utf-8")
+            with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+                f.write(f"/{rel}/\n")
             git(project_v7.project, "add", ".gitignore")
         git(project_v7.project, "commit", "-q", "-m", "untrack the initiative")
     else:
@@ -12148,41 +12161,52 @@ def test_untracked_store_refused_until_topology_layer(project_v7, monkeypatch, t
     findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
 
     (problem,) = [f for f in findings if f.severity == "problem"]
-    assert problem.check == "tickets.layout-unsupported"
-    assert problem.detail == {
-        "path": str(paths.initiative_folder),
-        "repo_root": str(paths.repo_root),
-    }
-    why = {"ignored": "no tracked files", "uncommitted": "no tracked files", "outside": "outside"}
-    assert why[layout] in problem.message and "later release layer" in problem.message
+    assert problem.check == check
+    assert text in problem.message
+    assert problem.detail["path"] == str(paths.initiative_folder)
+    if layout == "uncommitted":
+        assert problem.detail["refusal"] == "store-not-ignored"
+    else:
+        assert problem.detail["topology"]["layout"] == text.split()[-1]
+        assert "later release layer" in problem.message
 
 
-@pytest.mark.parametrize(("isolation", "refused"), [("worktree", True), ("none", False)])
-def test_tracked_sibling_store_refused_under_worktree_isolation(
-    project_v7, monkeypatch, isolation, refused
+@pytest.mark.parametrize(
+    ("isolation", "roles", "warned"),
+    [
+        ("worktree", ("dev",), True),
+        ("worktree", (), False),
+        ("none", ("dev",), False),
+    ],
+)
+def test_tickets_preflight_warns_shared_store_extra_args(
+    project_v7, monkeypatch, isolation, roles, warned
 ):
-    """A nested project (`<repo>/app`) whose initiative folder is a tracked sibling
-    (`output_folder = ../tickets`): a unit worktree re-anchors only what the
-    project holds, so its session would read and mark the main checkout's plan.
-    Refused under worktree isolation, accepted in place. Ablation (performed):
-    drop the isolation clause in `_tickets_layout_problem` and the `worktree` row
-    FAILS."""
-    import dataclasses
-
-    paths = dataclasses.replace(
-        _tickets_paths(project_v7), project=project_v7.project.resolve() / "app"
-    )
+    """A shared store written outside the session cwd (an ignored store under worktree
+    isolation) while a role sets `extra_args`: the `tickets.store-sandbox` warning —
+    stage `extra_args` replace the profile's sandbox-bypass flags. Silent without
+    such a role, and under isolation "none", where the store is inside the cwd.
+    Ablation (performed): drop the warning branch and the warned row FAILS."""
+    rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "untrack the initiative")
     monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
 
     findings = install_mod.tickets_preflight(
-        paths, [".claude/skills"], probe_capability=False, isolation=isolation
+        _tickets_paths(project_v7),
+        [".claude/skills"],
+        probe_capability=False,
+        isolation=isolation,
+        extra_args_roles=roles,
     )
 
-    layout = [f for f in findings if f.check == "tickets.layout-unsupported"]
-    assert [f.severity for f in layout] == (["problem"] if refused else [])
-    if refused:
-        assert 'isolation = "worktree"' in layout[0].message
-        assert str(paths.project) in layout[0].message
+    sandbox = [f for f in findings if f.check == "tickets.store-sandbox"]
+    assert len(sandbox) == (1 if warned else 0)
+    if warned:
+        assert sandbox[0].severity == "warning" and sandbox[0].detail["roles"] == ["dev"]
 
 
 @pytest.mark.parametrize(("branch_per", "warned"), [("run", True), ("story", False), (None, False)])

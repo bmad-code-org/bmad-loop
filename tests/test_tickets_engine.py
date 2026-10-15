@@ -117,6 +117,26 @@ def test_engine_pins_source_and_builds_the_tree_from_the_pin(project_v7):
     assert engine.tree_builds == [(project_v7.project, project_v7.initiative)]
 
 
+@pytest.mark.parametrize(("layout", "shared"), [("T1", False), ("T3", True)])
+def test_engine_shares_the_store_the_run_recorded(project_v7, layout, shared):
+    """A run that recorded a shared store (here T3, its own nested repository)
+    builds its engine with `ProjectPaths.shared_store` set, so worktree mounts are
+    redirected and every store-derived path stays put; a T1 store is per-checkout
+    and sets nothing. Ablation (performed): drop the `with_shared_store` call in
+    `TicketsEngine.__init__` and the T3 row FAILS."""
+    store = str(project_v7.output_folder.resolve())
+    topology = {
+        "T1": {"placement": "checkout", "versioning": "code-repo", "store_repo": None},
+        "T3": {"placement": "shared-in-project", "versioning": "store-repo", "store_repo": store},
+    }[layout]
+    tree = _tree(project_v7)
+    engine, _ = make_engine(
+        project_v7, tree, store_topology={"layout": layout, "store_root": store, **topology}
+    )
+    assert engine.paths.shared_store == (Path(store) if shared else None)
+    assert engine.workspace.paths.shared_store == engine.paths.shared_store
+
+
 def test_hitl_ticket_pauses_without_registering(project_v7):
     """A hitl ticket at the head of the build order pauses at `ticket-hitl` before
     anything is recorded, so a resume re-reads the tree; no session runs and

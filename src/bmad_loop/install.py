@@ -35,7 +35,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, NamedTuple
 
-from . import bmadconfig, childrun, ticketmodel, tickettree
+from . import bmadconfig, childrun, ticketmodel, ticketstore, tickettree
 from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
@@ -47,7 +47,6 @@ from .verify import (
     git_bytes,
     git_floor_text,
     git_version_at_least,
-    path_tracked_kind,
 )
 
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
@@ -792,43 +791,49 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     )
 
 
-def _tickets_layout_problem(
-    paths: bmadconfig.ProjectPaths, folder: Path, isolation: str = "none"
-) -> str:
-    """Why the initiative folder is not a store tickets runs drive today — a
-    folder tracked inside the code checkout (``repo_root``), so a plan marked
-    ``done`` rides its unit's own commit — or "" when it is one. Outside the
-    checkout, untracked or gitignored, or a nested repo (a gitlink, not a tree)
-    is a store layout a later release layer of bmad-loop supports. Under
-    ``isolation = "worktree"`` the folder must also lie inside the project: the
-    unit worktree's paths re-anchor only what the project holds, so a tracked
-    sibling (an ``output_folder`` of ``../tickets``) would be read and marked in
-    the main checkout, not the unit's own copy."""
-    repo_root = paths.repo_root
-    try:
-        rel = folder.resolve().relative_to(repo_root.resolve()).as_posix()
-    except (OSError, RuntimeError, ValueError):
-        return f"it lies outside the code checkout {repo_root}"
-    try:
-        kind = path_tracked_kind(repo_root, rel)
-    except GitError as e:
-        return f"git cannot say whether it is tracked in {repo_root}: {e}"
-    if kind == "file":
-        return f"{rel} is a nested repository (a gitlink in {repo_root}), not a tracked folder"
-    if kind == "untracked":
-        return (
-            f"{rel} has no tracked files in {repo_root} (gitignored, or never "
-            "committed) — commit the initiative folder"
+def _tickets_store_findings(
+    paths: bmadconfig.ProjectPaths, isolation: str, extra_args_roles: Sequence[str]
+) -> list[Finding]:
+    """The store-topology findings for the active initiative's folder (it exists):
+    the classified layout (``tickets.store-topology``), or the refusal under the
+    check :attr:`ticketstore.StoreRefusal.check` names, plus the
+    ``tickets.store-sandbox`` warning when sessions write a shared store outside
+    their cwd while a role's ``extra_args`` replace the profile's bypass flags."""
+    result = ticketstore.assess_store(paths, isolation)
+    if result is None:
+        return []
+    conflict = ticketstore.store_topology_conflict(result)
+    detail: dict[str, object] = {
+        "path": str(paths.initiative_folder),
+        "repo_root": str(paths.repo_root),
+        "isolation": isolation,
+    }
+    if isinstance(result, ticketstore.StoreRefusal):
+        assert conflict is not None
+        return [Finding(result.check, "problem", conflict, {**detail, "refusal": result.code})]
+    findings = [
+        Finding(
+            "tickets.store-topology",
+            "ok" if conflict is None else "problem",
+            conflict or f"ticket store {ticketstore.describe_topology(result)}",
+            {**detail, "topology": result.to_dict()},
         )
-    # `folder` resolved above; `paths.project` is canonical off `load_paths`
-    if isolation == "worktree" and not folder.resolve().is_relative_to(paths.project):
-        return (
-            f'isolation = "worktree" needs it inside the project {paths.project}, so '
-            "a unit worktree marks its own copy, not the main checkout's — move it "
-            'under the project, or set `isolation = "none"` under [scm] in '
-            ".bmad-loop/policy.toml"
+    ]
+    outside_cwd = result.needs_redirect(isolation) or result.placement == "shared-outside"
+    if outside_cwd and extra_args_roles:
+        roles = ", ".join(extra_args_roles)
+        findings.append(
+            Finding(
+                "tickets.store-sandbox",
+                "warning",
+                f"sessions write the shared ticket store {result.store_root} outside their "
+                f"working directory, and `extra_args` for {roles} replace the profile's "
+                "sandbox-bypass flags — a sandboxed CLI may refuse those writes; keep the "
+                "bypass flags in `extra_args`",
+                {"store_root": str(result.store_root), "roles": list(extra_args_roles)},
+            )
         )
-    return ""
+    return findings
 
 
 def tickets_preflight(
@@ -838,19 +843,23 @@ def tickets_preflight(
     probe_capability: bool,
     branch_per: str | None = None,
     isolation: str = "none",
+    extra_args_roles: Sequence[str] = (),
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
     paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
     the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
-    policy's ``[scm] isolation``).
+    policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
+    resolved adapter sets ``extra_args``).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
     (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
     bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
-    / ``tickets.initiative-missing``), the store layout
-    (``tickets.layout-unsupported``: the initiative folder must be tracked inside
-    the code checkout), a repo store (``tickets.store-not-repo``: tracker stores
+    / ``tickets.initiative-missing``), the store topology
+    (:func:`_tickets_store_findings`: ``tickets.store-topology``,
+    ``tickets.tree-untracked``, ``tickets.own-repo-isolation``,
+    ``tickets.workspace-unsupported``, and the ``tickets.store-sandbox`` warning),
+    a repo store (``tickets.store-not-repo``: tracker stores
     are refused), and a warning for ``branch_per = "run"``
     (``tickets.branch-per-run``: build-auto checks that the checked-out branch
     fits the ticket, and one branch for the whole run may not). ``tickets.era`` is
@@ -942,18 +951,8 @@ def tickets_preflight(
                         },
                     )
                 )
-            elif folder is not None and (why := _tickets_layout_problem(paths, folder, isolation)):
-                findings.append(
-                    Finding(
-                        "tickets.layout-unsupported",
-                        "problem",
-                        f"the initiative folder {paths.initiative_folder} is not a store "
-                        f"tickets runs support yet: {why}. bmad-loop drives a ticket tree "
-                        "tracked inside the code checkout; other store layouts land in a "
-                        "later release layer",
-                        {"path": str(paths.initiative_folder), "repo_root": str(paths.repo_root)},
-                    )
-                )
+            else:
+                findings.extend(_tickets_store_findings(paths, isolation, extra_args_roles))
     store, store_error = _ticket_store(project)
     if store != "repo":
         findings.append(

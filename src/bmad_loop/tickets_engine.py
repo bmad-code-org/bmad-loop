@@ -82,7 +82,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import gates, verify
+from . import gates, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
@@ -289,6 +289,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._picked: dict[str, TicketBinding] = {}
         # story key -> plan status its last review launched on (`_verify_review`).
         self._review_entered: dict[str, str] = {}
+        # A store no checkout carries is shared: every artifact dir under it stays
+        # at the main checkout (`ProjectPaths.rebased`), and worktree mounts are
+        # redirected to it. Read from the topology the run recorded at its start.
+        state, paths = kwargs.get("state"), kwargs.get("paths")
+        if state is not None and paths is not None and state.store_topology:
+            kwargs["paths"] = ticketstore.with_shared_store(paths, state.store_topology)
         super().__init__(*args, **kwargs)
         # pin the mode so resume/resolve rebuild a TicketsEngine without policy.
         self.state.source = SOURCE_TICKETS

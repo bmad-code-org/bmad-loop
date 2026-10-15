@@ -40,6 +40,7 @@ from . import stories as stories_mod
 from . import (
     ticketmodel,
     tickets_source,
+    ticketstore,
     tickettree,
     verify,
     worksource,
@@ -341,6 +342,31 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
         return None
     print(conflict, file=sys.stderr)
     return 1
+
+
+def _reject_store_topology(
+    project: Path, pol, source: str, *, recorded: dict[str, str | None] | None = None
+) -> int | None:
+    """Refuse a tickets run whose ticket store tickets runs cannot drive
+    (:func:`ticketstore.store_conflict`: a refused layout, a store other than T1
+    until marking outside the commit window lands, or — given the run's
+    ``recorded`` ``RunState.store_topology`` — a store that changed since the run
+    started). Returns 1 to abort, None to proceed — the
+    :func:`_reject_isolation_conflict` sibling, called beside it from every
+    run-arming surface that returns an rc to a human; the surfaces without an rc
+    channel call the predicate itself. Outside tickets mode it is a no-op."""
+    conflict = ticketstore.store_conflict(project, source, pol.scm.isolation, recorded=recorded)
+    if conflict is None:
+        return None
+    print(f"error: {conflict}", file=sys.stderr)
+    return 1
+
+
+def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches whose resolved adapter sets
+    ``extra_args`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).extra_args)
 
 
 def _reject_under_floor_git(project: Path) -> int | None:
@@ -1427,11 +1453,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 spec_folder,
                 initiative=paths.active_initiative if paths is not None else "",
                 era=paths.era if paths is not None else "",
+                ticket_store=_reported_ticket_store(report),
             )
         )
     else:
         report.render()
     return 0 if report.passed else 1
+
+
+def _reported_ticket_store(report: ValidationReport) -> dict[str, str | None] | None:
+    """The topology the ``tickets.store-topology`` ok finding classified, for
+    ``validate --json``'s ``ticket_store``; None when no store was classified."""
+    for finding in report.findings:
+        if finding.check == "tickets.store-topology" and finding.severity == "ok":
+            topology = (finding.detail or {}).get("topology")
+            if isinstance(topology, dict):
+                return {str(k): None if v is None else str(v) for k, v in topology.items()}
+    return None
 
 
 def cmd_mux(args: argparse.Namespace) -> int:
@@ -2221,6 +2259,12 @@ def _warn_preflight_would_abort(
         )
         if p.severity == "problem"
     ]
+    if require_tickets and (
+        store := ticketstore.store_conflict(
+            paths.project, worksource.SOURCE_TICKETS, pol.scm.isolation
+        )
+    ):
+        problems.insert(0, store)
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
@@ -2772,6 +2816,9 @@ def _validate_tickets_mode_queue(
             probe_capability=probes,
             branch_per=pol.scm.branch_per if pol is not None else None,
             isolation=pol.scm.isolation if pol is not None else "none",
+            extra_args_roles=(
+                _store_extra_args_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
         )
     )
     tickets_probs = install.missing_tickets_support(project, dev_trees)
@@ -3499,6 +3546,7 @@ def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
         probe_capability=True,
         branch_per=pol.scm.branch_per,
         isolation=pol.scm.isolation,
+        extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
     )
     for warning in (f for f in findings if f.severity == "warning"):
         print(f"warning: {warning.message}", file=sys.stderr)
@@ -3561,6 +3609,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # operator clear a dirty tree or fix a story key first would only delay the
     # same abort.
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (rc := _reject_store_topology(project, pol, source)) is not None:
         return rc
 
     if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
@@ -4119,6 +4169,9 @@ def _sweep_factory(
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
+        store = ticketstore.store_conflict(project, pol.stories.source, pol.scm.isolation)
+        if store is not None:
+            raise RuntimeError(store)
         # Same refusal as the three rc-returning sites, same raise-not-return reason
         # as the two above it. A `GitError` here needs no arm of its own: it is
         # already an exception, and this factory's contract is that any raise before
@@ -4207,6 +4260,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return rc
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    # a sweep works the configured source's store (its ledger lives there on v7)
+    if (rc := _reject_store_topology(project, pol, pol.stories.source)) is not None:
         return rc
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
@@ -4584,6 +4640,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (
+        rc := _reject_store_topology(
+            project, pol, state.source, recorded=state.store_topology or None
+        )
+    ) is not None:
         return rc
     # A tickets run re-reads the tree it dispatches from, so the tree's own
     # refusals (script, layout, store, capability) apply on resume as at launch.
@@ -5436,6 +5498,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # same predicate, so an operator who declines still gets no config lecture.
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
                 return rc
+            if (
+                rc := _reject_store_topology(
+                    project, pol, state.source, recorded=state.store_topology or None
+                )
+            ) is not None:
+                return rc
         adapters = _make_adapters(project, run_dir, pol)
         dev_cfg = pol.adapter.resolved("dev")
         model = dev_cfg.model
@@ -5621,6 +5689,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # resolve still writes nothing, and an operator who declines is not owed a
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+            return rc
+        if (
+            rc := _reject_store_topology(
+                project, pol, state.source, recorded=state.store_topology or None
+            )
+        ) is not None:
             return rc
         # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
         # for the same reason — a refusal after it has already spent the escalation.
@@ -6131,6 +6205,12 @@ def _resolve_reverify_finished(
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (
+        rc := _reject_store_topology(
+            project, pol, state.source, recorded=state.store_topology or None
+        )
+    ) is not None:
         return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
     if not _require_base_skills(

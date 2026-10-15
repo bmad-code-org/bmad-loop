@@ -2277,3 +2277,191 @@ def test_nested_ledger_board_and_accepted_spec_seeds_land_under_the_mount_projec
     for rel in seeds:
         assert (wt / "app" / rel).is_file(), rel
         assert not (wt / rel).exists(), rel
+
+
+# ------------------------------------------------------- shared ticket store
+#
+# A ticket store no checkout carries (`ProjectPaths.shared_store`, set from the
+# run's recorded topology) is read and written in place by every worktree mount
+# through the redirect, so no seed, drop, carry or publication acts on it. One
+# test per site; each ablation is "stop passing / checking `shared_store` there".
+
+
+def _shared_store_flow(tmp_path, *, source: str = "sprint-status") -> WorktreeFlow:
+    """`_artifact_flow`'s BMAD shape with its artifacts dir inside the shared store,
+    the ledger and the board both present in the main checkout."""
+    import dataclasses
+
+    flow = _artifact_flow(tmp_path)
+    store = flow.paths.project / "_bmad-output"
+    flow.paths = dataclasses.replace(flow.paths, shared_store=store)
+    flow.state = SimpleNamespace(target_branch="", run_id="run-1", tasks={}, source=source)
+    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    flow.paths.sprint_status.write_text("development_status: {}\n", encoding="utf-8")
+    return flow
+
+
+def test_artifact_seed_skips_the_shared_store(tmp_path):
+    """Ablation (performed): drop the `_in_store` check in `_artifact_seed` and the
+    shared row FAILS (it seeds the main copy into the mount)."""
+    from bmad_loop.worktree_flow import _artifact_seed
+
+    flow = _shared_store_flow(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    ledger, project = flow.paths.deferred_work, flow.paths.project
+    rel = ledger.relative_to(project).as_posix()
+    assert _artifact_seed(ledger, project, worktree) == (rel,)
+    assert _artifact_seed(ledger, project, worktree, shared_store=flow.paths.shared_store) == ()
+    assert (
+        _artifact_seed_dropped(ledger, project, worktree, shared_store=flow.paths.shared_store)
+        == ()
+    )
+
+
+def test_ledger_seed_skips_a_redirected_store_ledger(tmp_path):
+    """Ablation (performed): stop passing `shared_store` from `_ledger_seed` and
+    this FAILS."""
+    flow = _shared_store_flow(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    assert flow.paths.rebased(worktree).deferred_work == flow.paths.deferred_work
+    assert flow._ledger_seed(worktree) == ()
+
+
+def test_board_seed_skips_the_shared_store(tmp_path):
+    """A sprint-board source, so the trait gate does not answer first. Ablation
+    (performed): stop passing `shared_store` from `_board_seed` and this FAILS."""
+    flow = _shared_store_flow(tmp_path, source="sprint-status")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    assert flow._board_seed(worktree) == ()
+    assert flow._artifact_seed_drops(worktree) == []
+
+
+def test_carried_artifact_rels_skips_the_shared_store(tmp_path):
+    """A tracked ledger the task wrote is a protected carry rel — unless it is in
+    the shared store, which the unit wrote in place. Ablation (performed): drop the
+    `_in_store` skip in `_carried_artifact_rels` and the shared row FAILS."""
+    import dataclasses
+
+    flow = _shared_store_flow(tmp_path)
+    repo = flow.paths.project
+    git(repo, "init", "-q")
+    git(repo, "add", "-A")
+    git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "seed")
+    task = StoryTask(story_key="1-1", epic=1)
+    task.harvested_deferrals = [{"id": "DW-1"}]
+    assert flow._carried_artifact_rels(repo, task) == ()
+    flow.paths = dataclasses.replace(flow.paths, shared_store=None)
+    assert flow._carried_artifact_rels(repo, task) == (
+        flow.paths.deferred_work.relative_to(repo).as_posix(),
+    )
+
+
+def test_publication_skips_the_shared_store(tmp_path, monkeypatch):
+    """A worktree source whose artifacts dir is in the shared store prepares and
+    stages nothing — the mount wrote the main copy. Ablation (performed): drop
+    either early return and its half FAILS on the `pytest.fail` stub."""
+    flow = _shared_store_flow(tmp_path)
+    source = flow.paths.rebased(tmp_path / "wt")
+    assert source.in_shared_store(source.implementation_artifacts)
+    for name in ("prepare", "validate_staged"):
+        monkeypatch.setattr(
+            artifact_publication, name, lambda *_a, _n=name, **_k: pytest.fail(f"{_n} ran")
+        )
+    task = StoryTask(story_key="1-1", epic=1)
+    flow.prepare_publication(task, source)
+    assert flow.validate_staged_publication(task, source) == {}
+
+
+class _AfterRedirect(Exception):
+    """Raised by the first result probe after the redirect, to stop `run_isolated`
+    there without a session."""
+
+
+def _isolated_v7_flow(tmp_path, monkeypatch, layout):
+    """`run_isolated` over a REAL git worktree of ``layout``'s code repo with the
+    store shared, provisioning stubbed (it copies only the personal config layer,
+    as `_seed_bmad_tree` does) and the first result probe raising
+    :class:`_AfterRedirect`. Returns ``(flow, unit, task)``."""
+    import dataclasses
+
+    import bmad_loop.worktree_flow as worktree_flow
+    from bmad_loop import bmadconfig, ticketstore
+
+    paths = bmadconfig.load_paths(layout.project, want_tickets=True)
+    paths = dataclasses.replace(paths, shared_store=paths.output_folder)
+    wt = tmp_path / "mount"
+    git(layout.project, "worktree", "add", "-q", "-b", "bmad-loop/run-1/1.1", str(wt))
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=paths.repo_root,
+        branch="bmad-loop/run-1/1.1",
+        path=wt,
+        baseline=git(layout.project, "rev-parse", "HEAD"),
+    )
+
+    def provision(worktree, *_a, **_k):
+        src = layout.project / ticketstore.USER_CONFIG_REL
+        shutil.copyfile(src, worktree / ticketstore.USER_CONFIG_REL)
+        return []
+
+    def stop(*_a, **_k):
+        raise _AfterRedirect
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
+    monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="tickets", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        policy=_policy(isolation="worktree"),
+        open_unit_workspace=lambda *_a, **_k: unit,
+    )
+    return flow, unit, StoryTask(story_key="1.1", epic=0)
+
+
+def test_run_isolated_redirects_ignored_store(tmp_path, monkeypatch, project_v7_store_repo):
+    """A nested, ignored store repository (T3) under worktree isolation: once the
+    worktree is provisioned the mount's personal config points `output_folder` at
+    the main store — so `tickets.py` there reads the one shared tree — and the
+    mount stays `git status`-clean. Ablation (performed): delete the redirect call
+    in `run_isolated` and this FAILS."""
+    from bmad_loop import bmadconfig
+
+    flow, unit, task = _isolated_v7_flow(tmp_path, monkeypatch, project_v7_store_repo)
+
+    with pytest.raises(_AfterRedirect):
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    store = flow.paths.shared_store
+    assert bmadconfig.read_core_value(unit.path, "output_folder")[0] == str(store)
+    mounted = bmadconfig.load_paths(unit.path, want_tickets=True)
+    assert mounted.initiative_folder == flow.paths.initiative_folder
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert task.phase != Phase.ESCALATED
+
+
+def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store_repo):
+    """A redirect that cannot be written escalates the unit before any result probe
+    or session. Ablation (performed): drop the `TicketStoreError` catch in
+    `run_isolated` and this FAILS (the error escapes un-escalated)."""
+    from bmad_loop import ticketstore
+
+    flow, unit, task = _isolated_v7_flow(tmp_path, monkeypatch, project_v7_store_repo)
+
+    def refuse(*_a, **_k):
+        raise ticketstore.TicketStoreError("config.user.toml cannot take the redirect")
+
+    monkeypatch.setattr(ticketstore, "redirect_mount_store", refuse)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    assert task.phase == Phase.ESCALATED
+    assert "shared ticket store" in excinfo.value.reason
+    assert "cannot take the redirect" in excinfo.value.reason
+    assert flow.journal.events() == ["worktree-opened", "story-escalated"]
+    assert flow.calls.pauses == [(excinfo.value.reason, "1.1")]

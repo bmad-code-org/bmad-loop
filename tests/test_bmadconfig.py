@@ -1388,6 +1388,47 @@ def test_rebased_moves_initiative_folder(tmp_path: Path) -> None:
     assert moved.implementation_artifacts == moved.initiative_folder
 
 
+def test_rebased_keeps_shared_store_unmoved(tmp_path: Path) -> None:
+    """With the ticket store shared (`shared_store`), every artifact dir under it —
+    the store itself, the initiative folder and the v7 artifact dirs, so the ledger
+    too — stays at the main checkout while the project moves; the field carries
+    over. Ablation (performed): drop the `in_shared_store` arm of `artifact_at` and
+    this FAILS."""
+    import dataclasses
+
+    paths = bmadconfig.load_paths(_v7(tmp_path))
+    shared = dataclasses.replace(paths, shared_store=paths.output_folder)
+    checkout = tmp_path / "wt"
+    checkout.mkdir()
+    moved = shared.rebased(checkout)
+    assert moved.project == checkout.resolve()
+    assert moved.shared_store == paths.output_folder
+    assert moved.output_folder == paths.output_folder
+    assert moved.initiative_folder == paths.initiative_folder
+    assert moved.implementation_artifacts == paths.implementation_artifacts
+    assert moved.deferred_work == paths.deferred_work
+    assert shared.artifact_at(paths.initiative_folder, checkout) == paths.initiative_folder
+
+
+def test_spec_within_roots_accepts_shared_store(tmp_path: Path) -> None:
+    """A mount's plan lives in the shared store, outside every rebased root: the
+    store is a root too. Ablation (performed): drop `shared_store` from the roots
+    and this FAILS."""
+    import dataclasses
+
+    from bmad_loop import verify
+
+    store = (tmp_path / "store").resolve()
+    plan = store / "initiative-demo" / "epic-cart" / "story-a-plan.md"
+    mount = ProjectPaths(
+        project=tmp_path / "wt",
+        implementation_artifacts=tmp_path / "wt" / "a",
+        planning_artifacts=tmp_path / "wt" / "a",
+    )
+    assert not verify.spec_within_roots(plan, mount)
+    assert verify.spec_within_roots(plan, dataclasses.replace(mount, shared_store=store))
+
+
 def test_rebased_keeps_v6_defaults(tmp_path: Path) -> None:
     paths = ProjectPaths(
         project=tmp_path / "p",

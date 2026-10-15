@@ -36,6 +36,7 @@ from .. import (
     resolve,
     runs,
     stories,
+    ticketstore,
     verify,
     worksource,
 )
@@ -294,13 +295,15 @@ class BmadLoopApp(App[None]):
         except (bmadconfig.BmadConfigError, OSError):
             loaded = None
         try:
-            conflict = (
-                None
-                if loaded is None
-                else bmadconfig.worktree_isolation_conflict(
-                    loaded, policy.load(self.project / POLICY_FILE).scm.isolation
-                )
-            )
+            conflict = None
+            if loaded is not None:
+                pol = policy.load(self.project / POLICY_FILE)
+                conflict = bmadconfig.worktree_isolation_conflict(loaded, pol.scm.isolation)
+                if conflict is None:
+                    # the ticket-store topology `cmd_run` refuses next (tickets mode)
+                    conflict = ticketstore.store_conflict(
+                        self.project, pol.stories.source, pol.scm.isolation
+                    )
         except (policy.PolicyError, OSError):
             conflict = None
         if conflict is not None:
@@ -1352,6 +1355,20 @@ class BmadLoopApp(App[None]):
             # time: two reads of one file in one gesture can disagree under a concurrent
             # edit, and the refusal must be about the same mode the re-arm is told.
             conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
+            if conflict is None:
+                # the ticket-store refusal `_prepare_resume_locked` makes next, with
+                # the topology the run recorded (tickets mode only)
+                try:
+                    recorded = load_state(run_dir)
+                except (OSError, KeyError, ValueError):
+                    recorded = None  # the locked re-read below names an unreadable state
+                if recorded is not None:
+                    conflict = ticketstore.store_conflict(
+                        self.project,
+                        recorded.source,
+                        isolation,
+                        recorded=recorded.store_topology or None,
+                    )
             if conflict is not None:
                 self.notify(conflict, severity="error")
                 return

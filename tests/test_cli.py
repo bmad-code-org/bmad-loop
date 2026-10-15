@@ -12636,6 +12636,10 @@ def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):
     assert by_check["skills.tickets-dispatch"]["severity"] == "ok"
     assert "queue.sprint-status" not in by_check
     assert not any(f["check"].startswith("deferred.") for f in doc["findings"])
+    # the classified store, additively: the tracked in-checkout default (T1)
+    assert by_check["tickets.store-topology"]["severity"] == "ok"
+    assert doc["ticket_store"]["layout"] == "T1"
+    assert doc["ticket_store"] == by_check["tickets.store-topology"]["detail"]["topology"]
 
 
 def test_validate_probes_runs_the_tickets_capability_probe(project, capsys, monkeypatch):
@@ -12838,6 +12842,9 @@ def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
     assert len(built) == 1
     state = load_state(project.project / ".bmad-loop" / "runs" / run_id)
     assert (state.source, state.initiative) == ("tickets", V7_DEFAULT_INITIATIVE)
+    # the store topology recorded at run start, for resume to re-validate
+    assert state.store_topology["layout"] == "T1"
+    assert built[0]["state"].store_topology == state.store_topology
     assert "stub summary" in capsys.readouterr().out
 
 
@@ -12926,12 +12933,58 @@ def test_resume_records_an_answered_epic_closure_pause(project, capsys, monkeypa
     assert load_state(run_dir).ticket_epic_closure_resumed == ["epic-cart"]
 
 
+@pytest.mark.parametrize("recorded", ["moved", "unreadable"])
+def test_resume_tickets_refuses_a_changed_store_topology(project, capsys, monkeypatch, recorded):
+    """Resume re-classifies the ticket store and refuses when it differs from the
+    topology the run recorded at its start — a store that moved under a paused
+    run, or a recorded topology a hand edit mangled — before any engine is built.
+    No real spawn. Ablation (performed): drop the `_reject_store_topology` call in
+    `_prepare_resume_locked` and both rows FAIL (the engine is built)."""
+    from bmad_loop import bmadconfig, runs
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    store = bmadconfig.load_paths(project.project, want_tickets=True).output_folder
+    topology = {
+        "layout": "T1",
+        "placement": "checkout",
+        "versioning": "code-repo",
+        "store_root": str(store.parent / "elsewhere") if recorded == "moved" else str(store),
+        "store_repo": None,
+    }
+    if recorded == "unreadable":
+        topology = {"unreadable": "list"}
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5707",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology=topology,
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "the ticket store changed since this run started" in capsys.readouterr().err
+    assert built == []
+
+
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
-    """`run`'s tickets preflight refuses a store layout tickets runs do not drive
-    yet — here an initiative folder that was never committed — with a FAIL line
-    and no run left behind. Ablation (performed): point the tickets
-    `_RUN_PREFLIGHTS` row at the stories preflight and the run starts — this
-    FAILS."""
+    """`run` refuses a store layout tickets runs do not drive yet — here an
+    ignored initiative folder (T2) — through `_reject_store_topology`, ahead of the
+    queue preflight, with no run left behind. Ablation (performed): delete the
+    `_reject_store_topology` call in `cmd_run` and only the preflight's FAIL line
+    refuses — this FAILS."""
     from conftest import git
 
     from bmad_loop import bmadconfig, runs
@@ -12948,7 +13001,8 @@ def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
     assert cli.main(["run", "--project", str(project.project)]) == 1
 
     err = capsys.readouterr().err
-    assert "FAIL: the initiative folder" in err and "later release layer" in err
+    assert "error: the ticket store" in err and "layout T2" in err
+    assert "FAIL:" not in err
     runs_dir = project.project / runs.RUNS_DIR
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 

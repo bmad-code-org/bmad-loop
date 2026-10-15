@@ -223,6 +223,34 @@ def test_old_state_json_defaults_ticket_fields_empty():
     assert back.ticket_epic_closures == {}
 
 
+def test_run_state_store_topology_round_trips_exactly():
+    topology = {
+        "layout": "T3",
+        "placement": "shared-in-project",
+        "versioning": "store-repo",
+        "store_root": "/p/_bmad-output",
+        "store_repo": "/p/_bmad-output",
+    }
+    assert _state().store_topology == {}
+    back = RunState.from_dict(json.loads(json.dumps(_state(store_topology=topology).to_dict())))
+    assert back.store_topology == topology
+    old = _state().to_dict()
+    del old["store_topology"]
+    assert RunState.from_dict(old).store_topology == {}
+
+
+@pytest.mark.parametrize("mangled", [["T1"], {"layout": 1}, "T1", {"layout": ["T1"]}])
+def test_run_state_mangled_store_topology_reads_as_unreadable(mangled):
+    """A hand-mangled topology never raises out of `from_dict` and never reads as
+    "nothing recorded" (which would skip resume's comparison): it becomes a
+    marker no classified topology equals. Ablation (performed): return `{}` for a
+    mangled shape and this FAILS."""
+    d = _state().to_dict()
+    d["store_topology"] = mangled
+    back = RunState.from_dict(d)
+    assert back.store_topology and "unreadable" in back.store_topology
+
+
 def test_story_task_ticket_binding_round_trips():
     task = StoryTask(story_key="2.1", epic=0)
     task.ticket = _binding()

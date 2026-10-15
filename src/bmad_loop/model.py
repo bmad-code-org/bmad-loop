@@ -300,6 +300,26 @@ def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     return out
 
 
+def _store_topology_from(raw: object) -> dict[str, str | None]:
+    """Rehydrate `RunState.store_topology`: string keys to string-or-null values,
+    copied exactly. Absent or null reads as `{}` (nothing recorded). Any other shape
+    never raises out of `from_dict`, and never reads as "nothing recorded" either:
+    it becomes ``{"unreadable": <type>}``, which no classified topology equals, so
+    resume refuses it as a changed store instead of skipping the check."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        items = cast("dict[object, object]", raw)
+        out: dict[str, str | None] = {}
+        for key, value in items.items():
+            if not isinstance(key, str) or not (value is None or isinstance(value, str)):
+                break
+            out[key] = value
+        else:
+            return out
+    return {"unreadable": type(raw).__name__}
+
+
 def _identity_record_from(raw: object) -> tuple[int, int] | None:
     """Rehydrate a mint-time root identity record (DW-446) from state.json: a
     two-int ``[st_dev, st_ino]`` list. A pre-upgrade absent key, ``null``, or any
@@ -1361,6 +1381,12 @@ class RunState:
     ticket_epic_closures: dict[str, str] = field(default_factory=dict)
     ticket_epic_closure_resumed: list[str] = field(default_factory=list)
     ticket_epic_closure_acked: list[str] = field(default_factory=list)
+    # tickets mode only: the ticket-store topology classified at run start
+    # (`ticketstore.StoreTopology.to_dict`: layout, placement, versioning,
+    # store_root, store_repo). Resume re-classifies the store and refuses on any
+    # difference; a shared store sets `ProjectPaths.shared_store` for the engine.
+    # Empty on other runs and on state written before it existed.
+    store_topology: dict[str, str | None] = field(default_factory=dict)
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -1544,6 +1570,7 @@ class RunState:
             "ticket_epic_closures": dict(self.ticket_epic_closures),
             "ticket_epic_closure_resumed": list(self.ticket_epic_closure_resumed),
             "ticket_epic_closure_acked": list(self.ticket_epic_closure_acked),
+            "store_topology": dict(self.store_topology),
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
@@ -1595,6 +1622,7 @@ class RunState:
             },
             ticket_epic_closure_resumed=[str(s) for s in d.get("ticket_epic_closure_resumed", [])],
             ticket_epic_closure_acked=[str(s) for s in d.get("ticket_epic_closure_acked", [])],
+            store_topology=_store_topology_from(d.get("store_topology")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],

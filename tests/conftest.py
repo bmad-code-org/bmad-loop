@@ -1200,6 +1200,54 @@ def project_v7(tmp_path: Path, _project_template_v7: Path) -> V7Layout:
     return v7_layout(root)
 
 
+def _store_repo(store: Path) -> None:
+    """Make ``store`` its own git repository with its contents committed."""
+    git(store, "init", "-q", "-b", "main")
+    git(store, "config", "user.email", "store@example.invalid")
+    git(store, "config", "user.name", "store")
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "store")
+
+
+@pytest.fixture
+def project_v7_store_repo(project_v7: V7Layout) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store (`_bmad-output`) turned into its own git
+    repository NESTED in the code checkout and gitignored by it — layout T3. The
+    code repo stops tracking the store (one commit), the store repo commits it."""
+    root, rel = project_v7.project, project_v7.output_folder.relative_to(project_v7.project)
+    git(root, "rm", "-r", "-q", "--cached", rel.as_posix())
+    with (root / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel.as_posix()}/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "the store is its own repository")
+    _store_repo(project_v7.output_folder)
+    yield project_v7
+    remove_tree(project_v7.output_folder / ".git")
+
+
+@pytest.fixture
+def project_v7_external_store(project_v7: V7Layout, tmp_path: Path) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store moved OUTSIDE the project into its own git
+    repository and `output_folder` set to its absolute path — layout T4."""
+    root = project_v7.project
+    rel = project_v7.output_folder.relative_to(root).as_posix()
+    store = tmp_path / "store"
+    shutil.move(str(project_v7.output_folder), str(store))
+    config = root / "_bmad" / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            '"{project-root}/_bmad-output"', json.dumps(str(store))
+        ),
+        encoding="utf-8",
+    )
+    git(root, "rm", "-r", "-q", "--cached", rel)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "the store moved out")
+    _store_repo(store)
+    yield v7_layout(root, initiative=project_v7.initiative, output_folder=str(store))
+    remove_tree(store / ".git")
+
+
 @pytest.fixture
 def project_tree(tmp_path: Path) -> ProjectPaths:
     """The `project` file tree at the same `tmp_path / "sandbox"` spot, with NO Git.
