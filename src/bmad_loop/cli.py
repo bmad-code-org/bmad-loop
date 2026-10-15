@@ -4384,13 +4384,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # registered source whose runs land later is refused the way `run` refuses it.
     # Ahead of every side effect below. A sweep's `source` is its launch default and
     # never selects its engine.
-    if state.run_type != "sweep":
-        try:
-            if not worksource.resumable_traits_for(state.source).runnable:
-                worksource.refuse_unrunnable(state.source)
-        except (worksource.UnknownSource, worksource.SourceNotRunnable) as e:
-            print(f"cannot resume {run_dir.name}: {e}", file=sys.stderr)
-            return 1
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
+        return 1
     paths = bmadconfig.load_paths(project, want_tickets=state.source == worksource.SOURCE_TICKETS)
     sweep_options = None
     if state.run_type == "sweep":
@@ -4721,6 +4717,20 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
+def _unresumable_source(state: RunState) -> str | None:
+    """Why this version cannot drive a story run's persisted source, or None: one a
+    newer bmad-loop persisted, or a registered source whose runs land later. A
+    sweep's `source` is its launch default and never selects its engine."""
+    if state.run_type == "sweep":
+        return None
+    try:
+        if not worksource.resumable_traits_for(state.source).runnable:
+            worksource.refuse_unrunnable(state.source)
+    except (worksource.UnknownSource, worksource.SourceNotRunnable) as e:
+        return str(e)
+    return None
+
+
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
     """Resume a paused/interrupted run without holding its lock across execution.
 
@@ -5047,6 +5057,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
+    # Ahead of every side effect, for `_resume_paused_run`'s source gate: re-arming
+    # (or even `--no-resume`) a run this version cannot drive mutates it, and the
+    # resolve session would be spent before the resume refused.
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resolve {run_dir.name}: {refusal}", file=sys.stderr)
+        return 1
     # DW-525: a FINISHED run has no resume to replay on, so `--reverify` there mints a
     # replay run for the named kept worktree unit instead. Routed ahead of the pause
     # gate (a finished run is not paused); every paused-run branch below is untouched.

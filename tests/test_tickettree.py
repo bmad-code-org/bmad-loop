@@ -784,6 +784,18 @@ def test_discard_unbuilt_plan_removes_only_a_frontmatter_plan(tmp_path, monkeypa
     assert [e["outcome"] for e in _marks(journal)] == ["refused", "refused", "discarded", "noop"]
 
 
+def test_discard_unbuilt_plan_reads_a_bom_plan_as_frontmatter_only(tmp_path, monkeypatch, journal):
+    """A BOM ahead of `---` is not a body: the plan is discarded, as `_plan_fields`
+    already reads its status through the BOM.
+
+    Ablation: read the plan with plain `utf-8` and the discard is refused."""
+    tree, plan, _ = _tree_with_plan(tmp_path, monkeypatch, "in-progress")
+    plan.write_bytes(b"\xef\xbb\xbf---\r\nticket: 1\r\nstatus: in-progress\r\n---\r\n")
+    result = tree.discard_unbuilt_plan("1.1", plan, journal)
+    assert (result.outcome, result.before) == ("discarded", "in-progress")
+    assert not plan.exists()
+
+
 def test_fake_ticket_tree_decides_marks_with_the_real_table(tmp_path: Path):
     """The fake runs `check_plan_transition`, so an engine test sees the real
     chokepoint's refusals and no-ops; discards and restores are recorded."""

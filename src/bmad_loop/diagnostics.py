@@ -286,6 +286,10 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     },
     "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
+    # A BMAD v7 ticket key (`story-acme-vault-rotation`, `1.3`): the plan's title
+    # slug, identifier-shaped, so `scrub_json` would ship it verbatim. Kind-scoped
+    # because `ref` elsewhere names a git ref (`attempt-worktree-preserved`).
+    "ticket-mark": {"ref": "ticket"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's

@@ -1055,6 +1055,25 @@ def test_non_string_sentinel_is_safely_pseudonymized():
     assert pseudo.entries() == [("spec", str(raw), scrubbed["sentinel"])]
 
 
+def test_ticket_mark_ref_is_pseudonymized():
+    """A ticket key is the plan's title slug and identifier-shaped.
+
+    Ablation: remove the `ticket-mark` kind route and `scrub_json` ships the key
+    verbatim.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "ticket-mark", "ref": "story-acme-vault-rotation", "outcome": "marked"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
+    assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
+
+
 def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
     run_dir = _seed_run(project.project)
     sentinel_value = chr(0xDC80)

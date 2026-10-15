@@ -12698,6 +12698,29 @@ def test_resume_unknown_source_refused(project, monkeypatch, capsys, source, sai
     assert load_state(run_dir).paused_reason == "escalation"
 
 
+@pytest.mark.parametrize("resume", ["--resume", "--no-resume"])
+@pytest.mark.parametrize(
+    ("source", "said"),
+    [("bogus", "unknown to this bmad-loop"), ("tickets", "tickets mode cannot run yet")],
+)
+def test_resolve_unknown_source_refused_at_entry(
+    tmp_path, monkeypatch, capsys, source, said, resume
+):
+    """`resolve` refuses a run whose persisted source this version cannot drive
+    before the interactive session or the re-arm — `--no-resume` never reaches the
+    resume's own gate. Ablation: drop the entry check in `cmd_resolve` and the
+    re-arm stub fails the test."""
+    from bmad_loop import runs
+
+    escalated_run(tmp_path, "r1", source=source)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("launched a session"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed"))
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", resume, "--no-interactive"]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resolve r1:" in err and said in err
+
+
 def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):
     """The renderer's refusal, surfaced where validate reports config faults: the
     same short key under two tables is a `bmad-config` problem naming both, not a

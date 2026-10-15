@@ -523,7 +523,11 @@ class TicketTree:
                             has_plan=True,
                             blocked_reason=blocked_now,
                         )
-                        if not frontmatter.is_frontmatter_only(plan.read_text(encoding="utf-8")):
+                        # `utf-8-sig`, as `_plan_fields` reads it: a BOM ahead of
+                        # `---` would otherwise read as a body.
+                        if not frontmatter.is_frontmatter_only(
+                            plan.read_bytes().decode("utf-8-sig")
+                        ):
                             why = "the plan holds more than frontmatter"
                     except PlanTransitionRefused as e:
                         why = e.why

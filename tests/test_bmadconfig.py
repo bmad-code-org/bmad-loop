@@ -1239,6 +1239,17 @@ def test_v7_unset_output_folder_defaults_like_v6(tmp_path: Path) -> None:
     assert bmadconfig.load_paths(root).output_folder == (root / "_bmad-output").resolve()
 
 
+def test_v7_missing_base_layer_refuses(tmp_path: Path) -> None:
+    """`tickets.py` loads `_bmad/config.toml` as required, so a v7 project with only
+    the custom layers left must not resolve as a healthy v7 snapshot.
+
+    Ablation: drop the base-layer check and the custom layer resolves cleanly."""
+    root = _v7(tmp_path, initiative="initiative-checkout")
+    (root / "_bmad" / "config.toml").unlink()
+    with pytest.raises(bmadconfig.BmadConfigError, match=r"config\.toml is missing.*bmad setup"):
+        bmadconfig.load_paths(root)
+
+
 def test_core_reader_ignores_modules_bmm_active_initiative(tmp_path: Path) -> None:
     """The pre-v7 home `[modules.bmm] active_initiative` is not `[core]`'s key: the
     short-key lookup would find it, `tickets.py` would not."""

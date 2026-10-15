@@ -643,7 +643,17 @@ def _assemble_v7(
 ) -> ProjectPaths:
     """The v7 snapshot: `output_folder` and `active_initiative` from the strict
     ``[core]`` reader, both artifact dirs on the initiative folder (or on
-    `output_folder` when none is active), `repo_root` from the short-key lookup."""
+    `output_folder` when none is active), `repo_root` from the short-key lookup.
+    The base layer is required, as upstream's `config_utils` loads it: without it
+    every `tickets.py` command fails, so the snapshot must not read healthy."""
+    base = project / V7_CENTRAL_LAYERS_REL[0]
+    if not _is_file(base):
+        raise BmadConfigError(
+            _diagnostic_text(
+                f"{base} is missing — BMAD v7's tickets.py requires it; "
+                "run `bmad setup` to finish the install"
+            )
+        )
     central = _load_central(project, V7_CENTRAL_LAYERS_REL) or {}
     out_hit = _core_value(central, "output_folder")
     output_folder = (

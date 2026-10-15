@@ -479,10 +479,21 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
     "resume-reverify": frozenset({"replay"}),
+    # A git recovery ref NAME (`refs/...`), never a story key on its own — the
+    # `/` fails `_IDENTIFIER_RE`, so `scrub_json` redacts it. Declared per kind, not
+    # by name: on `ticket-mark` the same name carries an identifier-shaped ticket
+    # key and is aliased.
+    "attempt-commits-preserved": frozenset({"ref"}),
+    "attempt-worktree-preserved": frozenset({"ref"}),
+    "replay-abandon-snapshot": frozenset({"ref"}),
+    "replay-abandoned": frozenset({"ref"}),
+    "merge-target-preserved": frozenset({"ref"}),
+    "isolation-flip-orphan-preserved": frozenset({"ref"}),
     # tickettree.py: plan `status` tokens (`before`/`after`; `?` when unreadable),
     # a closed outcome slug, and the script's `created` boolean. `ref` (the ticket
-    # ref) rides the by-name benign row; `plan` is dropped to presence in
-    # diagnostics; `reason` is the closed `PlanWriteReason`, dropped by name.
+    # key) is aliased by `diagnostics._JOURNAL_KIND_ALIAS_FIELDS`; `plan` is dropped
+    # to presence in diagnostics; `reason` is the closed `PlanWriteReason`, dropped
+    # by name.
     "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
     "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
 }
@@ -795,7 +806,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "rearmed",
         "record",
         "redrive",
-        "ref",
         # DW-535: `replay-abandoned`'s flag that a retry's recovered `-abandon` ref
         # was pruned since the earlier attempt parked it (a bare boolean).
         "ref_pruned",
