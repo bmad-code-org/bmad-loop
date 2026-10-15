@@ -647,7 +647,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # Launched pane per window id, as new_window read it at create time;
         # per instance, created on first use (subclasses need not call
         # an __init__ for it).
-        return self.__dict__.setdefault("_launched_pane_ids", {})
+        return vars(self).setdefault("_launched_pane_ids", {})
 
     def pane_target(self, window_id: str) -> str:
         # `<window>.%N` rather than a bare `%N`: psmux runs one server per session
