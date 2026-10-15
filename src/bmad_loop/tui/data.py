@@ -21,7 +21,9 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import os
 import re
+import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -33,7 +35,16 @@ from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, policy, sprintstatus, stories, worksource
+from .. import (
+    bmadconfig,
+    deferredwork,
+    policy,
+    sprintstatus,
+    stories,
+    ticketmodel,
+    tickettree,
+    worksource,
+)
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
@@ -1005,19 +1016,138 @@ def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | N
     return stories_overview(project, state.spec_folder)
 
 
-BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | None"]
+@dataclass(frozen=True)
+class TicketsBoard:
+    """The tickets-mode board for one initiative: ``tickets.py status``'s rows in
+    the script's order, or why the tree could not be read. A read that failed
+    carries ``fault`` (and no rows), never an empty board that would read as "no
+    tickets". ``initiative`` is the one the board was read for (``""`` when there
+    was none to read)."""
+
+    rows: tuple[ticketmodel.TicketRow, ...]
+    fault: str | None
+    initiative: str
+
+
+# A board read that failed is retried after this long even when no file changed:
+# a timeout or a busy store lock clears on its own, so a fault kept until the
+# next edit could outlive its cause. An answer is kept until a file changes.
+TICKETS_FAULT_RETRY_S = 30.0
+
+# (project, initiative, initiative folder) -> (tree signature, board, monotonic
+# time of the read)
+_tickets_cache: dict[tuple[Path, str, Path], tuple[object, TicketsBoard, float]] = {}
+
+
+def _tickets_tree_sig(project: Path, folder: Path) -> object:
+    """What a ``tickets.py status`` answer depends on, as one comparable value:
+    the ``(path, mtime_ns, size)`` of ``tickets.toml`` and every ``*.md`` in the
+    initiative folder and its subfolders (two levels — epic folders hold their
+    leaves and plans flat), plus the config layers ``active_initiative`` is read
+    from and the script itself. Read with ``scandir``; a folder that cannot be
+    listed or a file that cannot be stat'ed is part of the signature too."""
+    files: list[tuple[str, object, object]] = []
+    pending: list[tuple[Path, int]] = [(folder, 1)]
+    while pending:
+        here, depth = pending.pop()
+        try:
+            with os.scandir(here) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            if depth < 2:
+                                pending.append((Path(entry.path), depth + 1))
+                            continue
+                        if entry.name != "tickets.toml" and not entry.name.endswith(".md"):
+                            continue
+                        st = entry.stat()
+                    except OSError as e:
+                        files.append((entry.path, "error", e.errno))
+                        continue
+                    files.append((entry.path, st.st_mtime_ns, st.st_size))
+        except OSError as e:
+            files.append((str(here), "unlistable", e.errno))
+    sources = (*bmadconfig.V7_CENTRAL_LAYERS_REL, bmadconfig.V7_MARKER_REL)
+    return (
+        tuple(sorted(files, key=lambda f: f[0])),
+        tuple(_config_source_sig(project / rel) for rel in sources),
+    )
+
+
+def _board_ticket_tree(project: Path, initiative: str) -> tickettree.TicketTreeLike:
+    """The tree the board reads: the project's installed ``tickets.py``, pinned
+    to ``initiative`` so a switched ``active_initiative`` reads as a fault, not
+    as another initiative's board. A seam: tests swap in a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project, pinned_initiative=initiative)
+
+
+def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoard:
+    """``initiative``'s board, stat-gated on :func:`_tickets_tree_sig`: the
+    script is spawned only when that signature changes (or a cached fault is
+    older than :data:`TICKETS_FAULT_RETRY_S`). ``tickets.py`` is project code (it
+    imports the project's ``config_utils``) and may run for seconds, so call this
+    from a worker thread, never the UI thread."""
+    key = (project, initiative, folder)
+    sig = _tickets_tree_sig(project, folder)  # before the read: an edit mid-read re-reads
+    cached = _tickets_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        board = cached[1]
+        if board.fault is None or time.monotonic() - cached[2] < TICKETS_FAULT_RETRY_S:
+            return board
+    try:
+        view = _board_ticket_tree(project, initiative).status()
+    except tickettree.TicketsError as e:
+        board = TicketsBoard((), f"tickets.py {e.kind}: {e}", initiative)
+    else:
+        board = TicketsBoard(view.tickets, None, initiative)
+    _tickets_cache[key] = (sig, board, time.monotonic())
+    return board
+
+
+def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
+    """The tickets-mode board for a run: the tree of the initiative it pinned
+    (``RunState.initiative`` and ``initiative_folder``), read as
+    :func:`initiative_board` reads it — off the UI thread. A run with no pinned
+    initiative has no tree to read and says so in ``fault``."""
+    if not state.initiative or not state.initiative_folder:
+        return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    folder = Path(state.initiative_folder)
+    if not folder.is_absolute():
+        folder = project / folder
+    return initiative_board(project, state.initiative, folder)
+
+
+def project_tickets_overview(project: Path) -> TicketsBoard:
+    """The board a new tickets run would start from: the project's live ``[core]
+    active_initiative``. A project that is not v7, or names no initiative, says
+    so in ``fault``. Spawns like :func:`initiative_board` — off the UI thread."""
+    paths = _project_paths(project)
+    if paths is None:
+        why = _paths_fault.get(project, "the project is not initialized")
+        return TicketsBoard((), f"BMAD config unreadable: {why}", "")
+    if paths.era != "v7" or paths.initiative_folder is None or not paths.active_initiative:
+        return TicketsBoard((), "no v7 active initiative ([core] active_initiative)", "")
+    return initiative_board(project, paths.active_initiative, paths.initiative_folder)
+
+
+def _tickets_board(project: Path, state: RunState) -> TicketsBoard:
+    return tickets_overview(project, state)
+
+
+BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | TicketsBoard | None"]
 
 
 BOARD_LOADERS: Mapping[str, BoardLoader | None] = {
     worksource.SOURCE_SPRINT: None,
     worksource.SOURCE_STORIES: _stories_board,
-    worksource.SOURCE_TICKETS: None,
+    worksource.SOURCE_TICKETS: _tickets_board,
 }
 """The per-run board each work source shows in the dashboard's board slot, keyed
 by ``RunState.source``. ``None`` means the source has no per-run board: the slot
 shows the project-level sprint tree (:func:`sprint_overview`, painted on rescan).
 A source this table does not carry is shown as sprint, as before the registry.
-Tickets has no per-run board yet; the run's task rows carry each ticket.
+A loader returns stories rows (the stories board) or a :class:`TicketsBoard`
+(the tickets board); the dashboard picks the widget by that type.
 One row per ``worksource.SOURCES`` (``tests/test_worksource.py`` holds it
 exhaustive)."""
 

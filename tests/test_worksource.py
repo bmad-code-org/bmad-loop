@@ -216,7 +216,7 @@ def test_tickets_run_side_rows_are_live(tmp_path, capsys):
         from bmad_loop.tui import data
     except ImportError:  # pragma: no cover - the tui extra is installed in CI
         return
-    assert data.BOARD_LOADERS["tickets"] is None
+    assert data.BOARD_LOADERS["tickets"] is data._tickets_board
 
 
 async def test_modal_select_options_match_runnable_traits(tmp_path, monkeypatch):

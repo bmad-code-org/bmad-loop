@@ -181,7 +181,7 @@ class BmadLoopApp(App[None]):
         border-title-color: $text;
         border-title-style: bold;
     }
-    #sprint-tree, #stories-table {
+    #sprint-tree, #stories-table, #tickets-table {
         /* the dividers above these panes are the draggable splitter bars, which
            also carry the section title that used to ride the border-top */
         height: 3fr;

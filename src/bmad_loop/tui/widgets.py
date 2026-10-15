@@ -43,6 +43,8 @@ from ..model import (
 )
 from ..sprintstatus import SprintStatus, Story
 from ..stories import StoryRow
+from ..ticketmodel import TicketRow
+from ..tickets_source import needs_refine, row_label
 from ..worksource import SOURCE_TICKETS
 from . import data
 
@@ -915,6 +917,145 @@ class StoriesTable(DataTable):
                 r.id, "chk", story_checkpoint_cell(r.spec_checkpoint, r.done_checkpoint)
             )
             self.update_cell(r.id, "title", _short(r.title, 48))
+
+
+# ------------------------------------------------------------- tickets table
+
+# A ticket's board state -> glyph + style. Keyed on the plan's status when the
+# ticket has a plan, else on the row's derived state (`planned`, `backlog`, or a
+# tracker's mirrored word), plus `refine` for a plan-less ticket that must be
+# refined before a build can start.
+TICKET_GLYPHS = {
+    "planned": "·",
+    "backlog": "·",
+    "refine": "✎",
+    "draft": "◦",
+    "ready-for-dev": "○",
+    "in-progress": "▶",
+    "in-review": "◆",
+    "review": "◆",
+    "built": "●",
+    "done": "✓",
+    "blocked": "✖",
+    "dropped": "–",
+}
+
+TICKET_STYLES = {
+    "planned": "dim",
+    "backlog": "dim",
+    "refine": "yellow",
+    "draft": "dim",
+    "ready-for-dev": "cyan",
+    "in-progress": "cyan",
+    "in-review": "magenta",
+    "review": "magenta",
+    "built": "green",
+    "done": "green",
+    "blocked": "bold red",
+    "dropped": "dim strike",
+}
+
+
+def ticket_state_cell(status: str, state: str) -> Text:
+    """A ticket's board state: its plan ``status`` when it has a plan, else the
+    row's derived ``state``."""
+    key = status or state
+    return Text(f"{TICKET_GLYPHS.get(key, '?')} {key}", style=TICKET_STYLES.get(key, "dim"))
+
+
+def ticket_flags_cell(hitl: bool, plan_cp: bool, done_cp: bool) -> Text:
+    """The flags a tickets run pauses on, positionally like
+    :func:`story_checkpoint_cell`: `H` (hitl — built with a person, yellow), `P`
+    (plan checkpoint, magenta), `D` (done checkpoint, cyan), dim `·` when unset."""
+    text = Text()
+    for mark, on, style in (
+        ("H", hitl, "yellow"),
+        ("P", plan_cp, "magenta"),
+        ("D", done_cp, "cyan"),
+    ):
+        text.append(mark if on else "·", style=style if on else "dim")
+    return text
+
+
+def _ticket_cells(row: TicketRow) -> tuple[Text, Text]:
+    state = "refine" if not row.status and needs_refine(row) else row.state
+    return (
+        ticket_state_cell(row.status, state),
+        ticket_flags_cell(row.hitl, row.plan_checkpoint, row.done_checkpoint),
+    )
+
+
+def _ticket_keys(rows: tuple[TicketRow, ...]) -> list[str]:
+    """One unique row key per ticket: its operator label, suffixed on a repeat
+    so two rows the tree prints alike still get rows of their own."""
+    keys: list[str] = []
+    seen: dict[str, int] = {}
+    for row in rows:
+        label = row_label(row)
+        n = seen.get(label, 0)
+        seen[label] = n + 1
+        keys.append(label if n == 0 else f"{label}#{n + 1}")
+    return keys
+
+
+class TicketsTable(DataTable):
+    """The tickets-mode board — one row per ticket of the run's initiative, as
+    ``tickets.py status`` prints it (build order within each epic), replacing the
+    sprint tree when a tickets-mode run is selected.
+
+    Reconciles in place like :class:`StoriesTable` (row key = the ticket's ref):
+    an unchanged ref list only updates cells, keeping the cursor. A board that
+    could not be read shows its fault, never an empty table."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+        self._row_keys: list[str] | None = None  # None: placeholder/empty shown
+
+    def on_mount(self) -> None:
+        self.add_column("state", key="state", width=15)
+        self.add_column("ref", key="ref", width=8)
+        self.add_column("epic", key="epic", width=14)
+        self.add_column("⚑", key="flags", width=3)
+        self.add_column("title", key="title")
+
+    def _placeholder(self, label: str, style: str = "dim") -> None:
+        self.clear()
+        self.add_row(Text(label, style=style), "", "", "", "")
+        self._row_keys = None
+
+    def update_tickets(self, board: data.TicketsBoard | None) -> None:
+        if board is None:
+            self._placeholder("tickets board loading…")
+            return
+        if board.fault is not None:
+            self._placeholder(f"tickets board unavailable: {board.fault}", "red")
+            return
+        if not board.rows:
+            self._placeholder("no tickets")
+            return
+        keys = _ticket_keys(board.rows)
+        if self._row_keys != keys:
+            self.clear()
+            for key, row in zip(keys, board.rows):
+                state, flags = _ticket_cells(row)
+                self.add_row(
+                    state,
+                    row_label(row),
+                    _short(row.epic, 14),
+                    flags,
+                    _short(row.title, 48),
+                    key=key,
+                )
+            self._row_keys = keys
+            return
+        for key, row in zip(keys, board.rows):
+            state, flags = _ticket_cells(row)
+            self.update_cell(key, "state", state)
+            self.update_cell(key, "epic", _short(row.epic, 14))
+            self.update_cell(key, "flags", flags)
+            self.update_cell(key, "title", _short(row.title, 48))
 
 
 # ------------------------------------------------------------ deferred work

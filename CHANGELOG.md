@@ -151,6 +151,11 @@ bmad-code-org/bmad-loop` lists it.
   pause-reason viewer for those stages, and an epic-closure viewer that shows the
   retrospective verdict and path. **Request replan** on a ticket plan marks it `draft`
   through `tickets.py mark` instead of editing its frontmatter.
+- Add the tickets board to the TUI: a tickets run's initiative, one row per ticket with
+  its plan state and hitl/plan/done flags, read off the UI thread and only when the
+  initiative's files change. A tree it cannot read shows why.
+- Add tickets mode to the TUI start-run modal: a preview of the active initiative, and
+  an epic field that takes an epic id or slug in tickets mode.
 
 ### Changed
 

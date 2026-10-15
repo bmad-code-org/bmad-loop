@@ -29,6 +29,7 @@ from conftest import (
     make_validate_document,
     nested_repo_root_paths,
     refuse_to_resolve,
+    ticket_row,
     write_sprint,
 )
 from rich.console import Console
@@ -98,6 +99,7 @@ from bmad_loop.tui.widgets import (
     Splitter,
     SprintTree,
     StoriesTable,
+    TicketsTable,
     agent_label,
     journal_line,
     pause_label,
@@ -2817,6 +2819,89 @@ async def test_start_run_modal_refuses_tickets_against_the_policy_source(project
         assert not calls
 
 
+async def test_start_run_modal_tickets_option(project, monkeypatch):
+    """With `[stories] source = "tickets"` the modal opens on tickets mode, its
+    preview is the active initiative's board read off the UI thread, and start
+    launches a run with no `--spec` and the epic as text. Canned board: nothing
+    here runs tickets.py.
+
+    Ablation (performed): route tickets to the sprint preview in
+    `_refresh_preview` and the initiative never shows — this FAILS."""
+    calls: dict = {}
+    threads: list[threading.Thread] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(BmadLoopApp, "_stories_defaults", lambda self: ("tickets", ""))
+
+    def preview(proj):
+        threads.append(threading.current_thread())
+        return data.TicketsBoard(
+            (ticket_row("1.1", status="done"), ticket_row("1.2", plan_checkpoint=True)),
+            None,
+            "init-a",
+        )
+
+    def fake_start(proj, run_id, *, spec=None, epic, story, max_stories):
+        calls.update(spec=spec, epic=epic, story=story)
+
+    monkeypatch.setattr(data, "project_tickets_overview", preview)
+    monkeypatch.setattr(launch, "start_run_detached", fake_start)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        modal = app.screen
+        assert modal.query_one("#source", Select).value == "tickets"
+        body = modal.query_one("#preview-body", Static)
+        await until(pilot, lambda: "initiative init-a" in str(body.render()))
+        rendered = str(body.render())
+        assert "2 tickets" in rendered
+        assert "plan checkpoint: 1.2" in rendered
+        assert threads and threading.main_thread() not in threads
+        modal.query_one("#epic", Input).value = "cart"
+        modal.query_one("#story", Input).value = "1.2"
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        assert calls == {"spec": None, "epic": "cart", "story": "1.2"}
+
+
+async def test_start_run_modal_epic_text_validation_per_mode(project, monkeypatch):
+    """The epic input is text: outside tickets mode it must still be a number
+    (`run --epic` exits 2 on anything else there), so a slug keeps the modal open
+    and launches nothing; a number launches as an int.
+
+    Ablation (performed): return the text in every mode from `epic_selector` and
+    the sprint-mode slug launches — this FAILS."""
+    from bmad_loop.tui.screens.modals import epic_selector
+
+    assert epic_selector("tickets", " epic-cart ") == "epic-cart"
+    assert epic_selector("tickets", "2") == "2"  # run resolves an id against the tree
+    assert epic_selector("sprint-status", "2") == 2
+    assert epic_selector("stories", "") is None
+    with pytest.raises(ValueError):
+        epic_selector("stories", "cart")
+
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(kw))
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#epic", Input).value = "cart"
+        await pilot.click("#ok")
+        await until(pilot, lambda: any("epic must be a number" in m for m in notifications(app)))
+        assert isinstance(app.screen, StartRunModal)
+        app.screen.query_one("#epic", Input).value = "2"
+        # the error toast can sit over the docked button row: press it directly
+        app.screen.query_one("#ok", Button).press()
+        await until(pilot, lambda: bool(calls))
+        assert calls[0]["epic"] == 2
+
+
 async def test_dirty_worktree_blocks_launch(project, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -4964,6 +5049,62 @@ def _tickets_paused_run(
     state.ticket_epic_closures = dict(closures or {})
     save_state(run_dir, state)
     return run_dir, plan
+
+
+async def test_tickets_mode_run_shows_tickets_board(project_tree, monkeypatch):
+    """A tickets-mode run swaps the sprint tree for the tickets board, titled
+    "Tickets", one row per ticket with its plan state and pause flags; a board
+    that cannot be read shows its fault. The board is loaded on the poll worker,
+    never the UI thread, because the real loader may spawn tickets.py. Canned
+    boards: nothing here runs tickets.py.
+
+    Ablation (performed): drop the `TicketsBoard` branch in `_poll` and the board
+    lands in the stories slot — this FAILS."""
+    root = project_tree.project
+    _tickets_paused_run(root, stage="ticket-hitl", key="1.2")
+    canned = {
+        "board": data.TicketsBoard(
+            (
+                ticket_row("1.1", status="done"),
+                ticket_row("1.2", hitl=True, done_checkpoint=True),
+                ticket_row("2.1", epic="epic-pay", refine=True),
+            ),
+            None,
+            "init-a",
+        )
+    }
+    threads: list[threading.Thread] = []
+
+    def board(project, state):
+        threads.append(threading.current_thread())
+        assert state.initiative == "init-a"
+        return canned["board"]
+
+    monkeypatch.setattr(data, "tickets_overview", board)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        tickets_table = screen.query_one("#tickets-table", TicketsTable)
+        await until(pilot, lambda: tickets_table.display and tickets_table.row_count == 3)
+        assert not screen.query_one("#sprint-tree", SprintTree).display
+        assert not screen.query_one("#stories-table", StoriesTable).display
+        assert screen.query_one("#split-runs", Splitter)._label == "Tickets"
+        assert tickets_table.get_cell("1.1", "state").plain == "✓ done"
+        assert tickets_table.get_cell("1.2", "state").plain == "· planned"
+        assert tickets_table.get_cell("1.2", "flags").plain == "H·D"
+        assert tickets_table.get_cell("2.1", "state").plain == "✎ refine"
+        assert tickets_table.get_cell("2.1", "epic") == "epic-pay"
+        assert threads and threading.main_thread() not in threads
+
+        canned["board"] = data.TicketsBoard((), "tickets.py timeout: took too long", "init-a")
+        await until(
+            pilot,
+            lambda: tickets_table.row_count == 1
+            and "tickets.py timeout" in tickets_table.get_row_at(0)[0].plain,
+        )
+        assert tickets_table.get_row_at(0)[0].plain.startswith("tickets board unavailable")
 
 
 @pytest.mark.parametrize(

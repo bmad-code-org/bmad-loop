@@ -155,6 +155,34 @@ dim `·` when unset), and the title. The board re-derives on each poll.
 | `✖`   | blocked                                  | bold red |
 | `⚠`   | ambiguous / sentinel (`sentinel:<kind>`) | bold red |
 
+#### Tickets board (middle, tickets mode)
+
+When the selected run is in tickets mode, the slot shows the run's pinned
+initiative as `tickets.py status` prints it, titled `Tickets`. One row per
+ticket: state glyph and label, the ref, the epic folder, a three-slot flags cell
+(`H` = hitl, `P` = plan checkpoint, `D` = done checkpoint, dim `·` when unset),
+and the title. The state is the plan's status when the ticket has a plan, else
+`planned` (or `refine` when it must be refined first).
+
+`tickets.py` is the project's own code, so the board reads it on the poll worker,
+never the UI thread. It runs again only when `tickets.toml`, a `.md` file in the
+initiative or one of its epic folders, the config, or the script changes. A tree
+that cannot be read shows `tickets board unavailable:` and the reason, and is
+retried after 30 seconds.
+
+| Glyph | State                       | Color    |
+| ----- | --------------------------- | -------- |
+| `✓`   | done                        | green    |
+| `●`   | built                       | green    |
+| `▶`   | in-progress                 | cyan     |
+| `◆`   | in-review / review          | magenta  |
+| `○`   | ready-for-dev               | cyan     |
+| `◦`   | draft                       | dim      |
+| `✎`   | refine (no plan yet)        | yellow   |
+| `·`   | planned / backlog (no plan) | dim      |
+| `✖`   | blocked                     | bold red |
+| `–`   | dropped                     | dim      |
+
 #### Deferred work (bottom)
 
 Every entry in the `deferred-work.md` ledger, in file order: its id and title.
@@ -347,14 +375,19 @@ To return to the default proportions, delete the `[tui]` size keys from
 
 `r` opens the **start run** modal. Every field is optional:
 
-- **source**: `sprint mode` (walks `sprint-status.yaml`) or `stories mode`
-  (folder-and-id dispatch), prefilled from `[stories]`.
+- **source**: `sprint mode` (walks `sprint-status.yaml`), `stories mode`
+  (folder-and-id dispatch) or `tickets mode` (the BMAD v7 ticket tree),
+  prefilled from `[stories]`. Tickets mode previews the active initiative: its
+  ticket counts and the refs that pause on hitl or a checkpoint. A tickets pick
+  launches only while `[stories] source = "tickets"`.
 - **spec folder**: stories mode only. The epic spec folder holding
   `stories.yaml` and `SPEC.md`; it drives a live schedule preview that validates
   the manifest and lists the schedule with `[spec/done]` checkpoint markers and
   each story's state. Stories mode with an empty spec folder is refused.
-- **epic**: restrict to one epic (sprint mode).
-- **story key**: restrict to one story (a story id in stories mode).
+- **epic**: restrict to one epic: a number, or in tickets mode an epic id or
+  slug. Any other text outside tickets mode keeps the modal open.
+- **story key**: restrict to one story (a story id in stories mode, a ticket ref
+  in tickets mode).
 - **max stories**: stop after N stories.
 - **dry run**: print the plan without spawning anything; output shows in a modal.
 
@@ -487,9 +520,10 @@ act on it. Every action that resumes refuses a still-live engine.
 
 ### Tickets mode
 
-A tickets run (the BMAD v7 ticket tree) reuses most viewers. The views read
-`state.json` and plan frontmatter only; the TUI never runs `tickets.py` on the
-UI thread.
+A tickets run (the BMAD v7 ticket tree) reuses most viewers. The pause viewers
+read `state.json` and plan frontmatter only. The
+[tickets board](#tickets-board-middle-tickets-mode) and the start-run preview
+run `tickets.py`, always off the UI thread.
 
 | Stage             | Badge    | What `p` shows                                                                                                                                                                                                 |
 | ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
