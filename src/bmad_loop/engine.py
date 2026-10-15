@@ -1741,6 +1741,10 @@ class Engine:
         ``sessions`` is written only after one returns, and ``rearmed`` covers a
         stories-mode wedge (``StoriesEngine._pause_wedged``) that reaches ESCALATED
         with no session at all. The arm's own unwinding is the stronger guarantee.
+
+        Which tokens gate which key is :meth:`_gate_hits`; tokens in a grammar the
+        queue no longer reads (:meth:`_legacy_gate_tokens`) pause every pick, since
+        no key can be shown free of them.
         """
         ledger = self.paths.deferred_work
         # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
@@ -1773,40 +1777,64 @@ class Engine:
             )
             gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
             raise RunPaused(reason, PAUSE_STORY_GATE, story_key) from e
-        blocking = [
-            (entry.id, hits)
-            for entry, hits in (
-                (
-                    entry,
-                    [
-                        token
-                        for token in deferredwork.gates(entry).tokens
-                        if deferredwork.gates_story(token, story_key)
-                    ],
-                )
-                # `done`, not `not open`: an entry whose status the format cannot
-                # read is not evidence the work landed, and reading it as closed
-                # would let a one-character typo disable the gate.
-                for entry in deferredwork.parse_ledger(text)
-                if not entry.done
-            )
-            if hits
-        ]
-        if not blocking:
+        blocking: list[tuple[str, list[str]]] = []
+        legacy: list[tuple[str, tuple[str, ...]]] = []
+        # `done`, not `not open`: an entry whose status the format cannot read is
+        # not evidence the work landed, and reading it as closed would let a
+        # one-character typo disable the gate.
+        for entry in deferredwork.parse_ledger(text):
+            if entry.done:
+                continue
+            hits = self._gate_hits(entry, story_key)
+            if hits:
+                blocking.append((entry.id, hits))
+            stale = self._legacy_gate_tokens(entry)
+            if stale:
+                legacy.append((entry.id, stale))
+        if not blocking and not legacy:
             return
-        named = ", ".join(f"{dw_id} (gate: {', '.join(hits)})" for dw_id, hits in blocking)
-        reason = (
-            f"{story_key} is gated by unlanded deferred work: {named} — close the "
-            f"entry in {ledger.name} (`status: done <date>`) or run `bmad-loop sweep`, "
-            f"then `bmad-loop resume {self.state.run_id}`"
-        )
-        self.journal.append(
-            "story-gated",
-            story_key=story_key,
-            dw_ids=[dw_id for dw_id, _ in blocking],
-        )
+        clauses: list[str] = []
+        if blocking:
+            named = ", ".join(f"{dw_id} (gate: {', '.join(hits)})" for dw_id, hits in blocking)
+            clauses.append(
+                f"{story_key} is gated by unlanded deferred work: {named} — close the "
+                f"entry in {ledger.name} (`status: done <date>`) or run `bmad-loop sweep`"
+            )
+        if legacy:
+            clauses.append(self._legacy_gate_clause(story_key, legacy, ledger.name))
+        reason = "; ".join(clauses) + f", then `bmad-loop resume {self.state.run_id}`"
+        dw_ids = [dw_id for dw_id, _ in blocking]
+        dw_ids += [dw_id for dw_id, _ in legacy if dw_id not in dw_ids]
+        self.journal.append("story-gated", story_key=story_key, dw_ids=dw_ids)
         gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
         raise RunPaused(reason, PAUSE_STORY_GATE, story_key)
+
+    def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
+        """The ``gate:`` tokens of ``entry`` that gate ``story_key``, in entry order.
+
+        The predicate half of :meth:`_refuse_gated_story`, split out so a queue
+        with its own key grammar reads the same ledger the same way: the base
+        engine matches story keys (sprint and stories queues), and
+        ``TicketsEngine`` matches ticket refs."""
+        return [
+            token
+            for token in deferredwork.gates(entry).tokens
+            if deferredwork.gates_story(token, story_key)
+        ]
+
+    def _legacy_gate_tokens(self, entry: deferredwork.DWEntry) -> tuple[str, ...]:
+        """``entry``'s ``gate:`` tokens written in a key grammar this queue no
+        longer reads, which pause every pick until rewritten. None for the base
+        engine: its queue reads the story grammar the tokens were written in."""
+        return ()
+
+    def _legacy_gate_clause(
+        self, story_key: str, legacy: list[tuple[str, tuple[str, ...]]], ledger_name: str
+    ) -> str:
+        """The pause-reason clause for :meth:`_legacy_gate_tokens` hits. Only an
+        engine that overrides that seam ever reaches it."""
+        named = ", ".join(f"{dw_id} (gate: {', '.join(tokens)})" for dw_id, tokens in legacy)
+        return f"{named} declare gate tokens {story_key}'s queue cannot read ({ledger_name})"
 
     def _make_work_source(self) -> WorkSource:
         """The work source this engine picks from. The base engine reads the

@@ -12812,6 +12812,127 @@ def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, m
     assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
 
 
+def _validate_ticket_gates(project, monkeypatch, capsys, gate_line, *, rc, rows=None):
+    """Validate a tickets project whose initiative ledger holds one open entry,
+    DW-1, carrying ``gate_line``, against a FakeTicketTree whose `next` lists
+    ``rows`` as ready to start; returns the parsed findings."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    if rows is None:
+        rows = (ticket_row("1.1"), ticket_row("2.1", epic="epic-checkout"))
+    tree = FakeTicketTree(project.project, next_view=fake_next_view(ready_to_start=rows))
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    # committed, so `git.worktree-clean` stays green and the exit code is the gate's
+    write_gated_ledger(paths, {"DW-1": ("open", [gate_line])})
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=rc)
+    return doc["findings"]
+
+
+def _gate_findings(findings, check="deferred.hard-gate"):
+    return [f for f in findings if f["check"] == check]
+
+
+@pytest.mark.parametrize(
+    ("gate_line", "gated"),
+    [
+        ("gate: 1.1", ["1.1"]),  # the ticket by ref
+        ("gate: epic-checkout", ["2.1"]),  # an epic by its folder
+        ("gate: 1", ["1.1"]),  # an epic by its initiative id
+        ("gate: 1.2", []),  # a ref no startable ticket carries
+    ],
+)
+def test_validate_hard_gate_ticket_mode(project, capsys, monkeypatch, gate_line, gated):
+    """In tickets mode `validate` reads the initiative's ledger and matches `gate:`
+    tokens as ticket refs against `next`'s startable tickets: a gated ticket fails
+    `deferred.hard-gate` with its ref in `story_key`, an ungated queue reports the
+    `ok`, and no ref token reads as malformed. Ablation (performed): read the
+    ledger under the story grammar and the refs land in `malformed`, so every
+    gated row FAILS."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, gate_line, rc=1 if gated else 0)
+
+    hard = _gate_findings(findings)
+    failed = [f["detail"]["story_key"] for f in hard if f["severity"] == "problem"]
+    assert failed == gated
+    if not gated:
+        assert [f["severity"] for f in hard] == ["ok"]
+        assert hard[0]["detail"]["actionable"] == ["1.1", "2.1"]
+        assert "no actionable ticket is gated" in hard[0]["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_fails_a_v6_token(project, capsys, monkeypatch):
+    """A migrated ledger's v6 `gate: 3-2` names no ticket, and the run pauses
+    before every ticket while it stands, so `validate` fails it as a hard gate
+    (naming the `v6_key` the migration left) rather than warning it as
+    unstructured: preflight and dispatch agree. Ablation (performed): drop the
+    `legacy` arm in `_validate_hard_gates` and the problem vanishes — this
+    FAILS."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, "gate: 3-2", rc=1)
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "1.1",
+        "tokens": ["3-2"],
+    }
+    assert "`v6_key`" in hard["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_warns_an_unmatchable_token(project, capsys, monkeypatch):
+    """A token neither grammar reads (`1.2.3`) is the field's silent no-op, warned
+    `deferred.hard-gate-unstructured` in ticket wording."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, "gate: 1.2.3", rc=0)
+
+    (warn,) = _gate_findings(findings, "deferred.hard-gate-unstructured")
+    assert warn["detail"]["malformed"] == ["1.2.3"]
+    assert "cannot name a ticket ref (`E.M`): 1.2.3" in warn["message"]
+    assert "name the blocked ticket refs" in warn["message"]
+
+
+def test_validate_hard_gate_ticket_mode_landed_gates_read_no_queue(project, capsys, monkeypatch):
+    """Plain `validate` executes no project code, and the one exception — running
+    `tickets.py next` to compare a gate — applies only while an unlanded entry
+    declares one. A ledger whose gates have all landed still reports its `ok`,
+    without the spawn. Ablation (performed): drop the tickets-mode unlanded guard
+    in `_validate_hard_gates` and `next` is called — this FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = FakeTicketTree(
+        project.project, next_view=fake_next_view(ready_to_start=(ticket_row("1.1"),))
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    write_gated_ledger(paths, {"DW-1": ("done 2026-10-02", ["gate: 1.1", "gate: 3-2"])})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    (hard,) = _gate_findings(doc["findings"])
+    assert hard["severity"] == "ok" and hard["detail"] == {"gating_ids": []}
+    assert [c for c in tree.calls if c[0] == "next"] == []
+
+
+def test_validate_hard_gate_ticket_mode_reports_an_unreadable_tree(project, capsys, monkeypatch):
+    """No `queue.*` check runs `tickets.py next` in plain validate, so a gated
+    ledger whose tree cannot be read fails `deferred.hard-gate` with the fault
+    instead of saying nothing about gates it never compared."""
+    from bmad_loop import tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = FakeTicketTree(project.project)
+    tree.faults["next"] = tickettree.TicketsTimeout("slow")
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    write_gated_ledger(paths, {"DW-1": ("open", ["gate: 1.1"])}, commit=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    (hard,) = _gate_findings(doc["findings"])
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["kind"] == "timeout"
+
+
 # Tickets dry-run. Real-spawn budget: 4 vendored `tickets.py` spawns (two tests
 # x `next` + `status`); every other tickets dry-run test injects a FakeTicketTree.
 

@@ -868,7 +868,9 @@ def tickets_preflight(
     ``probe_capability`` runs the script's ``--help`` and checks every verb and
     ``mark`` status bmad-loop needs (``tickets.capability``). It executes the
     project's script, so ``validate`` passes it only under ``--probes``; without
-    it ``tickets.capability-not-run`` says so."""
+    it ``tickets.capability-not-run`` says so. (``validate``'s ledger gate check,
+    not this preflight, runs ``tickets.py next`` without ``--probes``, and only
+    when an unlanded ledger entry declares a gate: ``cli._validate_hard_gates``.)"""
     project = paths.project
     findings: list[Finding] = []
     script_ok, script_fault = _probe_fault(project / TICKETS_SCRIPT_REL, "file")

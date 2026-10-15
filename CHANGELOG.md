@@ -87,6 +87,10 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   `deferred-work.md` at `built` (or `done`). Entries keep the `source_spec:` field and
   name the plan by its initiative-relative path. The ledger parser accepts the v7
   attended `bmad-build`'s flat `- source_plan:` blocks.
+- Add ticket-ref gates in tickets mode: a ledger `gate:` names a ticket (`1.2`), an epic
+  by id (`1`) or folder (`epic-cart`), or a backlog file name. `validate` and the run
+  refuse the gated ticket. A v6 story-key token fails `deferred.hard-gate` and pauses the
+  run at `story-gate` until it is rewritten.
 - Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
   `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,

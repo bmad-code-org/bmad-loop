@@ -187,10 +187,10 @@ def test_validate_document_mode_per_source(source):
 def test_tickets_run_side_rows_are_live(tmp_path, capsys):
     """Tickets runs are enabled, so its run-side rows are real: the engine map
     builds `TicketsEngine`, the run preflight is the tickets one, the status
-    footer names the pinned initiative, and the TUI shows no per-run board. The
-    actionable-keys row stays a refusal: tickets validate reads no ledger gate
-    yet, so nothing reaches it. Ablation (performed): point the tickets
-    `_RUN_PREFLIGHTS` row at `_preflight_sprint_queue` and this FAILS."""
+    footer names the pinned initiative, the actionable-keys row reads the ticket
+    tree (validate's ledger gate compares ticket refs), and the TUI shows no
+    per-run board. Ablation (performed): point the tickets `_RUN_PREFLIGHTS` row at
+    `_preflight_sprint_queue` and this FAILS."""
     from bmad_loop.model import RunState
     from bmad_loop.tickets_engine import TicketsEngine
 
@@ -208,8 +208,7 @@ def test_tickets_run_side_rows_are_live(tmp_path, capsys):
     )
     cli._STATUS_PRINTERS["tickets"](state, tmp_path)
     assert capsys.readouterr().out == f"tickets: initiative shop  ({tmp_path / 'shop'})\n"
-    with pytest.raises(worksource.SourceNotRunnable):
-        cli._ACTIONABLE_KEY_READERS["tickets"](None, "")
+    assert cli._ACTIONABLE_KEY_READERS["tickets"] is cli._actionable_ticket_keys
     try:
         from bmad_loop.tui import data
     except ImportError:  # pragma: no cover - the tui extra is installed in CI

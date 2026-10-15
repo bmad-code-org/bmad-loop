@@ -92,7 +92,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import gates, ticketstore, verify
+from . import deferredwork, gates, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
@@ -1293,6 +1293,43 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """A build leaves its plan at ``built``; a follow-up pass on a plan a
         human already accepted finds it at ``done``. Both carry real findings."""
         return frozenset({verify.PLAN_BUILT, verify.PLAN_DONE})
+
+    # ------------------------------------------------------------ ledger gates
+
+    def _gate_binding(self, story_key: str) -> TicketBinding | None:
+        """The binding a gate check reads the ticket's epic from: resolved at pick
+        time (the gate runs before ``_loop`` registers the task), or the task's own
+        on the restart arm."""
+        task = self.state.tasks.get(story_key)
+        return self._picked.get(story_key) or (task.ticket if task is not None else None)
+
+    def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
+        """Ticket-grammar tokens that gate ``story_key``: its ref, its epic's id or
+        its epic's folder (:func:`deferredwork.gates_ticket`). With no binding only
+        the ref arm can match."""
+        binding = self._gate_binding(story_key)
+        epic_id = binding.epic_id if binding is not None else ""
+        epic_slug = binding.epic_slug if binding is not None else ""
+        return [
+            token
+            for token in deferredwork.gates(entry, grammar="ticket").tokens
+            if deferredwork.gates_ticket(token, story_key, epic_id=epic_id, epic_slug=epic_slug)
+        ]
+
+    def _legacy_gate_tokens(self, entry: deferredwork.DWEntry) -> tuple[str, ...]:
+        return deferredwork.legacy_story_tokens(entry)
+
+    def _legacy_gate_clause(
+        self, story_key: str, legacy: list[tuple[str, tuple[str, ...]]], ledger_name: str
+    ) -> str:
+        named = ", ".join(f"{dw_id} (gate: {', '.join(tokens)})" for dw_id, tokens in legacy)
+        return (
+            f"{named} in {ledger_name} declare v6 story-key gate tokens, which no ticket "
+            f"ref can match, so {story_key} cannot be shown free of them — the v7 "
+            f"migration keeps each story's old key as `v6_key` in its ticket file; "
+            f"rewrite the tokens as ticket refs (`E.M`, an epic id, `epic-<slug>` or a "
+            f"backlog file name) or close the entry"
+        )
 
     def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
         """The bound plan when it is on disk at dispatch, as the canonical regular

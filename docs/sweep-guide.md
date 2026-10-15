@@ -98,6 +98,8 @@ A ledger entry can block stories until it is done.
 2. `bmad-loop validate` fails `deferred.hard-gate` for each actionable story a gate matches, and warns `deferred.hard-gate-unstructured` for a malformed or misspelled gate line (`Gate:`, an indented line, or prose `HARD GATE:` with no `gate:` line).
 3. If a run pauses at stage `story-gate` with `<story> is gated by unlanded deferred work`, either set the entry to `status: done <date>`, drop the token, or run `bmad-loop sweep`. Then `bmad-loop resume <run-id>`.
 
+In tickets mode a token names a ticket instead: its ref (`1.2`), its epic's id (`1`) or folder (`epic-cart`), or a backlog file name, with no prefix matching. A v6 story key such as `3-2` names no ticket, so validate fails it and a run pauses at `story-gate` until you rewrite it; the v7 migration keeps each story's old key as `v6_key` in its ticket file. To compare a gate against the queue, validate runs the project's `tickets.py next`, but only while an unlanded entry declares one. See [the format doc](../src/bmad_loop/data/skills/bmad-loop-sweep/deferred-work-format.md).
+
 Only an explicit `status: done` releases a gate; a missing or misspelled status still gates. Sweep runs are never gated. If the ledger cannot be read, validate fails `deferred.ledger-unreadable` and a run pauses at stage `story-gate` with `<ledger> cannot be read (…)` (journaled `story-gate-unreadable`): fix the file, then resume.
 
 ## Answering decisions

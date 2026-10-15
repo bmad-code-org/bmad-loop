@@ -62,7 +62,7 @@ bmad-loop validate [--project PROJECT] [--spec FOLDER] [--render-probe] [--probe
 | `--json`         | Print the findings as one JSON document.                                                                                                                                                               |
 
 - Exit 0 when no finding has severity `problem`, else 1. Warnings do not change the exit code.
-- Runs no project-controlled commands unless `--render-probe` or `--probes` is given.
+- Runs no project-controlled commands unless `--render-probe` or `--probes` is given. One exception: in tickets mode, when an unlanded deferred-work entry declares a `gate:` token, it runs the project's `tickets.py next` to compare the gate against the startable tickets.
 - Checks are chained: when an earlier gate fails (for example the policy does not load), the checks that depend on it emit nothing. A missing check id means the check did not run, not that it passed. Every id is listed under [validate checks](#validate-checks).
 
 JSON: [`validate --json`](#validate---json).
@@ -629,7 +629,7 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `deferred.ledger-unreadable`           | problem                | the deferred-work ledger cannot be read                                                                                                                 |
 | `deferred.ledger-untracked`            | warning                | the ledger is neither committed nor gitignored                                                                                                          |
 | `deferred.ledger-ignored-isolated`     | warning                | the ledger is gitignored under worktree isolation, so session writes are lost                                                                           |
-| `deferred.hard-gate`                   | ok / problem           | an actionable story is gated (`gate:`) by a ledger entry not marked `done`                                                                              |
+| `deferred.hard-gate`                   | ok / problem           | an actionable story or ticket is gated by a not-`done` ledger entry; tickets mode also fails a v6 story-key token or an unreadable `tickets.py next`    |
 | `deferred.hard-gate-unstructured`      | warning                | a not-done entry declares a gate `validate` cannot enforce (malformed, empty or misspelled `gate:`, or a prose-only `HARD GATE:`)                       |
 | `deferred.closes-malformed`            | warning                | a spec's `closes_deferred` has an unreadable shape                                                                                                      |
 | `deferred.closes-entry-unreadable`     | warning                | `closes_deferred` names entries that are neither open nor done                                                                                          |

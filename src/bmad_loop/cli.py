@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from stat import S_ISREG
@@ -2810,11 +2811,12 @@ def _validate_tickets_mode_queue(
     probes: bool,
     pol,
 ) -> None:
-    """``validate``'s queue checks for a tickets run: the v7 ticket tree's
-    preflight (:func:`install.tickets_preflight`; the script's capability probe
-    only under ``--probes``, since it executes the project's script) and the dev
-    primitive's ticket route. The deferred-work ledger is not read here: the v7
-    ledger lands with a later release layer."""
+    """``validate``'s queue checks for a tickets run: the initiative's
+    deferred-work ledger (its ``gate:`` lines read as ticket refs), the v7 ticket
+    tree's preflight (:func:`install.tickets_preflight`; the script's capability
+    probe only under ``--probes``, since it executes the project's script) and the
+    dev primitive's ticket route."""
+    _validate_deferred_ledger(paths, report, source=worksource.SOURCE_TICKETS)
     report.extend(
         install.tickets_preflight(
             paths,
@@ -3161,27 +3163,75 @@ def _validate_hard_gates(
     Once a gate exists the passing case reports itself — a gate that only ever
     speaks when it fires is indistinguishable, on the day it matters, from one
     nobody remembered to write.
+
+    Tickets mode reads ``gate:`` tokens as ticket refs and its queue through the
+    project's ``tickets.py next``. That spawn is the one exception to plain
+    ``validate`` executing no project code, and it happens only when an unlanded
+    entry carries a ticket-grammar or v6 story-key token; a ledger whose gates
+    have all landed reports its ``ok`` without it.
     """
-    declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
+    grammar: deferredwork.GateGrammar = "ticket" if source == worksource.SOURCE_TICKETS else "story"
+    noun = "ticket" if grammar == "ticket" else "story"
+    declared = [
+        (entry, deferredwork.gates(entry, grammar=grammar))
+        for entry in deferredwork.parse_ledger(text)
+    ]
+    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them): no
+    # ticket carries one, and the run pauses before every ticket while one stands
+    # (`TicketsEngine._legacy_gate_tokens`), so they fail here rather than warn.
+    legacy = {
+        entry.id: stale
+        for entry, _ in declared
+        if grammar == "ticket" and not entry.done
+        for stale in (deferredwork.legacy_story_tokens(entry),)
+        if stale
+    }
     for entry, entry_gates in declared:
         if entry.done:
             continue  # a landed entry gates nothing; that is what closing it means
-        _report_unstructured_gate(entry, entry_gates, report)
+        _report_unstructured_gate(
+            entry, entry_gates, report, grammar=grammar, legacy=legacy.get(entry.id, ())
+        )
     # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
     # malformed enforced nothing, and an `ok` there would be the same false all-clear
     # the warning above exists to break. Closed entries still count, deliberately —
     # the passing case has to keep speaking after the gate lands, or `ok` and "nobody
     # ever wrote a gate" become the same silence. Reading the queue sits behind this
     # test so a project that gates nothing pays neither the walk nor its failure modes.
-    if not any(entry_gates.tokens for _, entry_gates in declared):
+    if not any(entry_gates.tokens for _, entry_gates in declared) and not legacy:
         return
-    story_keys = _actionable_story_keys(paths, source, spec_folder or "")
-    if story_keys is None:
+    # Tickets mode reads its queue by executing the project's `tickets.py next`, and
+    # plain `validate` otherwise executes no project code. So only an UNLANDED gate
+    # pays for that spawn; landed ones still get their `ok`, from the ledger alone.
+    if grammar == "ticket" and not any(
+        not e.done and (g.tokens or e.id in legacy) for e, g in declared
+    ):
+        report.ok(
+            "deferred.hard-gate",
+            "deferred-work gates OK: no unlanded entry declares a gate, so the ticket "
+            "queue was not read",
+            {"gating_ids": []},
+        )
+        return
+    try:
+        targets = _actionable_story_keys(paths, source, spec_folder or "")
+    except tickettree.TicketsError as e:
+        # No `queue.*` check runs `tickets.py next`, so this one owns the outage:
+        # the gates were declared and never compared, which is no all-clear.
+        report.fail(
+            "deferred.hard-gate",
+            f"tickets.py next could not be read ({e.kind}: {e}), so the `gate:` lines in "
+            f"{paths.deferred_work.name} were not compared against the startable tickets "
+            f"— fix the ticket tree, then re-run `bmad-loop validate`",
+            {"error": str(e), "kind": e.kind},
+        )
+        return
+    if targets is None:
         # The queue could not be read, so nothing was compared. `queue.sprint-status`
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
-    gating = [e.id for e, g in declared if not e.done and g.tokens]
+    gating = [e.id for e, g in declared if not e.done and (g.tokens or e.id in legacy)]
     gated = False
     for entry, entry_gates in declared:
         # `done`, not `not open` — the tri-state is the whole point. An entry whose
@@ -3191,15 +3241,35 @@ def _validate_hard_gates(
         # retires a gate; everything else holds until someone writes that word.
         if entry.done:
             continue
-        for story_key in story_keys:
-            hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
+        stale = legacy.get(entry.id, ())
+        if stale and targets:
+            gated = True
+            report.fail(
+                "deferred.hard-gate",
+                f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and declares v6 "
+                f"story-key gate tokens no ticket ref can match ({', '.join(stale)}) — a "
+                f"tickets run pauses before every ticket while it stands, starting with "
+                f"{targets[0].key}. The v7 migration keeps each story's old key as "
+                f"`v6_key` in its ticket file: rewrite the tokens as ticket refs (`E.M`, "
+                f"an epic id, `epic-<slug>` or a backlog file name), or close the entry in "
+                f"{paths.deferred_work.name} (`status: done <date>`)",
+                {
+                    "dw_id": entry.id,
+                    "title": entry.title,
+                    "story_key": targets[0].key,
+                    "tokens": list(stale),
+                },
+            )
+        for target in targets:
+            story_key = target.key
+            hits = [t for t in entry_gates.tokens if _gate_matches(t, target, grammar)]
             if not hits:
                 continue
             gated = True
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
-                f"{story_key} (gate: {', '.join(hits)}) — that story must not run until "
+                f"{story_key} (gate: {', '.join(hits)}) — that {noun} must not run until "
                 f"the entry lands. Close it in {paths.deferred_work.name} "
                 f"(`status: done <date>`), or drop the token from its `gate:` line if it "
                 f"no longer blocks this work",
@@ -3213,10 +3283,31 @@ def _validate_hard_gates(
     if not gated:
         report.ok(
             "deferred.hard-gate",
-            f"deferred-work gates OK: no actionable story is gated by an unlanded entry "
+            f"deferred-work gates OK: no actionable {noun} is gated by an unlanded entry "
             f"({', '.join(gating) if gating else 'no unlanded gated entries'})",
-            {"gating_ids": gating, "actionable": list(story_keys)},
+            {"gating_ids": gating, "actionable": [t.key for t in targets]},
         )
+
+
+@dataclass(frozen=True)
+class _GateTarget:
+    """One key a queue could dispatch, as :func:`_validate_hard_gates` matches
+    ``gate:`` tokens against it: the key, plus a ticket's epic (its initiative id,
+    ``""`` when unlisted, and its folder) for the ticket grammar's epic arms."""
+
+    key: str
+    epic_id: str = ""
+    epic_slug: str = ""
+
+
+def _gate_matches(token: str, target: _GateTarget, grammar: deferredwork.GateGrammar) -> bool:
+    """The dispatch-side predicate for ``grammar`` (``Engine._gate_hits`` and its
+    ``TicketsEngine`` override), so preflight and dispatch refuse the same keys."""
+    if grammar == "ticket":
+        return deferredwork.gates_ticket(
+            token, target.key, epic_id=target.epic_id, epic_slug=target.epic_slug
+        )
+    return deferredwork.gates_story(token, target.key)
 
 
 def _gate_status_clause(entry: deferredwork.DWEntry) -> str:
@@ -3239,6 +3330,9 @@ def _report_unstructured_gate(
     entry: deferredwork.DWEntry,
     entry_gates: deferredwork.EntryGates,
     report: ValidationReport,
+    *,
+    grammar: deferredwork.GateGrammar = "story",
+    legacy: tuple[str, ...] = (),
 ) -> None:
     """Warn about a hard gate the mechanical check cannot enforce.
 
@@ -3263,22 +3357,27 @@ def _report_unstructured_gate(
     Runs for every entry that is not ``done``, which is the same set the refusal
     holds against. Keying it on ``open`` instead would have left an entry with an
     unreadable status silent about a malformed token as well as about its gate.
+
+    Under the ticket ``grammar`` the wording names ticket refs, and ``legacy`` (the
+    entry's v6 story-key tokens) is left out of ``malformed``: those fail
+    ``deferred.hard-gate`` instead, because the run pauses on them.
     """
+    ticket = grammar == "ticket"
+    noun, shape = ("ticket", "a ticket ref (`E.M`)") if ticket else ("story", "a story")
+    malformed = [t for t in entry_gates.malformed if t not in legacy]
     reasons: list[str] = []
-    if entry_gates.malformed:
-        reasons.append(
-            f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
-        )
+    if malformed:
+        reasons.append(f"declares `gate:` tokens that cannot name {shape}: {', '.join(malformed)}")
     if entry_gates.empty == 1:
-        reasons.append("declares an empty `gate:` line, which names no story")
+        reasons.append(f"declares an empty `gate:` line, which names no {noun}")
     elif entry_gates.empty:
-        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no {noun}")
     if entry_gates.near_miss:
         reasons.append(
             f"spells {entry_gates.near_miss} `gate:` line(s) in a form the field does not "
             f"read (the field is a lowercase `gate:` at the very start of a line)"
         )
-    prose_only = not entry_gates.tokens and not reasons
+    prose_only = not entry_gates.tokens and not legacy and not reasons
     if prose_only and deferredwork.declares_prose_gate(entry):
         reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
     if not reasons:
@@ -3286,11 +3385,12 @@ def _report_unstructured_gate(
     report.warn(
         "deferred.hard-gate-unstructured",
         f"{entry.id} ({entry.title}) {' and '.join(reasons)} — so `validate` cannot refuse "
-        f"the gated story and nothing holds it back; name the blocked stories on a `gate:` "
-        f"line (comma-separated) to make the gate enforceable",
+        f"the gated {noun} and nothing holds it back; name the blocked "
+        f"{'ticket refs' if ticket else 'stories'} on a `gate:` line (comma-separated) to "
+        f"make the gate enforceable",
         {
             "dw_id": entry.id,
-            "malformed": list(entry_gates.malformed),
+            "malformed": malformed,
             "empty": entry_gates.empty,
             "near_miss": entry_gates.near_miss,
         },
@@ -3299,7 +3399,7 @@ def _report_unstructured_gate(
 
 def _actionable_story_keys(
     paths: bmadconfig.ProjectPaths, source: str, spec_folder: str
-) -> list[str] | None:
+) -> list[_GateTarget] | None:
     """The story keys ``source``'s queue could dispatch, in queue order — one
     reader per work source in ``_ACTIONABLE_KEY_READERS``.
 
@@ -3339,39 +3439,62 @@ def _actionable_story_keys(
     return _ACTIONABLE_KEY_READERS[source](paths, spec_folder)
 
 
-def _actionable_sprint_keys(paths: bmadconfig.ProjectPaths, spec_folder: str) -> list[str] | None:
+def _actionable_sprint_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
     """Sprint half of :func:`_actionable_story_keys`: the board's actionable keys."""
     try:
         ss = sprintstatus.load(paths.sprint_status)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return None
-    return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+    return [_GateTarget(s.key) for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
 
 
-def _actionable_stories_keys(paths: bmadconfig.ProjectPaths, spec_folder: str) -> list[str] | None:
+def _actionable_stories_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
     """Stories half of :func:`_actionable_story_keys`: the manifest entries the
     scheduler's per-entry predicate calls actionable."""
-    keys: list[str] = []
+    keys: list[_GateTarget] = []
     try:
         folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
         for entry in stories_mod.load_stories(folder).entries:
             state = stories_mod.resolve_story_spec(folder, entry.id)
             if stories_mod._classify(state) != "actionable":
                 continue
-            keys.append(entry.id)
+            keys.append(_GateTarget(entry.id))
     except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
         return None
     return keys
 
 
-_ACTIONABLE_KEY_READERS: dict[str, Callable[[bmadconfig.ProjectPaths, str], list[str] | None]] = {
+def _actionable_ticket_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Tickets half of :func:`_actionable_story_keys`: the refs of the active
+    initiative's ``ready_to_start`` and ``in_progress`` rows, in ``next`` order,
+    each with its epic. ``ready_to_refine`` and hitl-free checks are the pick's
+    business; backlog rows are never dispatched. Runs the project's ``tickets.py
+    next`` (unpinned: ``validate`` reads the live initiative), so it is reached
+    only when the ledger declares a gate; a fault raises
+    :class:`~bmad_loop.tickettree.TicketsError` for the caller to report, since no
+    ``queue.*`` check reads ``next``."""
+    view = tickettree.TicketTree(paths.project).next()
+    targets: list[_GateTarget] = []
+    for row in (*view.ready_to_start, *view.in_progress):
+        if not row.ref:
+            continue
+        epic_id, dot, _ = row.ref.partition(".")
+        targets.append(_GateTarget(row.ref, epic_id if dot else "", row.epic))
+    return targets
+
+
+_ACTIONABLE_KEY_READERS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, str], list[_GateTarget] | None]
+] = {
     worksource.SOURCE_SPRINT: _actionable_sprint_keys,
     worksource.SOURCE_STORIES: _actionable_stories_keys,
-    # Tickets validate runs no ledger gate yet (the v7 ledger lands later), so this
-    # row is unreachable; it refuses rather than answer for a queue it never read.
-    worksource.SOURCE_TICKETS: lambda _paths, _folder: worksource.refuse_unrunnable(
-        worksource.SOURCE_TICKETS
-    ),
+    worksource.SOURCE_TICKETS: _actionable_ticket_keys,
 }
 
 

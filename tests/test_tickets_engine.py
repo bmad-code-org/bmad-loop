@@ -27,6 +27,7 @@ from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_STORY_CHECKPOINT,
+    PAUSE_STORY_GATE,
     PAUSE_TICKET_HITL,
     PAUSE_TICKET_REFINE,
     PAUSE_TICKET_TREE,
@@ -398,6 +399,97 @@ def test_find_fault_on_rebind_pauses_at_ticket_tree(project_v7, monkeypatch):
 
     assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
     assert task.ticket is None and driven == [] and adapter.sessions == []
+
+
+def _gate_ledger(engine: TicketsEngine, layout: V7Layout, *gate_lines: str) -> None:
+    """One open ledger entry, DW-1, in the run's v7 ledger, carrying ``gate_lines``;
+    committed so the checkout stays clean."""
+    ledger = engine.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(
+        "# Deferred Work\n\n### DW-1: item\n\norigin: test, 2026-10-01\n"
+        "location: src.txt:1\nreason: test entry.\nstatus: open\n"
+        + "".join(f"{line}\n" for line in gate_lines),
+        encoding="utf-8",
+    )
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "ledger")
+
+
+@pytest.mark.parametrize("token", ["2.1", "02.1", "2", "epic-checkout"])
+def test_tickets_gate_refuses_ref(project_v7, token):
+    """A `gate:` token in the ticket grammar refuses the ticket it names, by ref,
+    by its epic's id, or by its epic's folder: the run pauses at `story-gate`
+    before the ticket is registered or any session runs. Ablation (performed):
+    route `TicketsEngine._gate_hits` back to the base story grammar and every row
+    FAILS (`2.1` and `epic-checkout` are no story key)."""
+    row = ticket_row("2.1", epic="epic-checkout")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, f"gate: {token}")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "2.1")
+    assert saved.tasks == {} and adapter.sessions == [] and tree.marks == []
+    assert f"DW-1 (gate: {token})" in saved.paused_reason
+    assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+@pytest.mark.parametrize("token", ["2.2", "1", "epic-cart", "2.1a", "story-2-1.md"])
+def test_tickets_gate_passes_a_ticket_no_token_names(project_v7, token):
+    """A ticket-grammar token for another ticket or epic gates nothing here — no
+    prefix or split arm reaches `2.1` — so the gate check returns."""
+    row = ticket_row("2.1", epic="epic-checkout")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, f"gate: {token}")
+
+    picked = engine._pick_next()
+    assert picked is not None
+    engine._refuse_gated_story(picked.key)  # must not raise
+    assert _kinds(engine, "story-gated") == []
+
+
+def test_tickets_gate_pauses_on_v6_token(project_v7):
+    """A migrated ledger keeps its v6 `gate: 3-2` verbatim, and no ticket carries a
+    story key, so read under the ticket grammar alone it would gate nothing in
+    silence. The run pauses at `story-gate` instead, naming the entry, the token
+    and the `v6_key` the migration left in the ticket file. Ablation (performed):
+    return `()` from `TicketsEngine._legacy_gate_tokens` and the run dispatches
+    1.1 — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2-invite-link, 1.9")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert saved.tasks == {} and adapter.sessions == []
+    assert "DW-1 (gate: 3-2-invite-link)" in saved.paused_reason
+    assert "`v6_key`" in saved.paused_reason
+    assert saved.paused_reason.endswith(f"`bmad-loop resume {engine.state.run_id}`")
+    assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+def test_tickets_gate_closed_v6_entry_gates_nothing(project_v7):
+    """A `done` entry retires its gate, v6 tokens included: the legacy pause holds
+    only while the entry is unlanded."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+    ledger = engine.paths.deferred_work
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace("status: open", "status: done 2026-10-02"),
+        encoding="utf-8",
+    )
+
+    engine._refuse_gated_story("1.1")  # must not raise
+    assert _kinds(engine, "story-gated") == []
 
 
 def test_passed_over_rows_journal_once(project_v7):
