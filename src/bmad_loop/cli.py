@@ -4009,10 +4009,22 @@ def _print_stories_status(state: RunState, project: Path) -> None:
 def _print_tickets_status(state: RunState, project: Path) -> None:
     """``status``'s queue footer for a tickets run: the initiative the run is
     pinned to and its folder, read from run state alone — the per-run task rows
-    above already carry each ticket's phase; no ticket tree is read here."""
+    above already carry each ticket's phase; no ticket tree is read here. Then
+    every shared-store write still owed after its code landed: a latched mark,
+    or a store-repository commit that failed (the latch is kept until it lands)."""
     del project
     folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
     print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
+    owed = [
+        f"{key} ({'blocked' if task.ticket_park_pending else 'done'})"
+        for key, task in state.tasks.items()
+        if task.ticket_park_pending or task.ticket_done_pending
+    ]
+    if owed:
+        print(
+            f"tickets: mark or store commit owed after landing: {', '.join(owed)} "
+            "— see the journal's store-commit-* rows; a resume retries"
+        )
 
 
 # `status`'s queue footer, one entry per work source (held exhaustive over

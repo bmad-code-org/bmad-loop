@@ -12980,11 +12980,11 @@ def test_resume_tickets_refuses_a_changed_store_topology(project, capsys, monkey
 
 
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
-    """`run` refuses a store layout tickets runs do not drive yet — here an
-    ignored initiative folder (T2) — through `_reject_store_topology`, ahead of the
-    queue preflight, with no run left behind. Ablation (performed): delete the
-    `_reject_store_topology` call in `cmd_run` and only the preflight's FAIL line
-    refuses — this FAILS."""
+    """`run` refuses a store layout tickets runs cannot drive — here an initiative
+    folder the code repository neither tracks nor ignores — through
+    `_reject_store_topology`, ahead of the queue preflight, with no run left
+    behind. Ablation (performed): delete the `_reject_store_topology` call in
+    `cmd_run` and only the preflight's FAIL line refuses — this FAILS."""
     from conftest import git
 
     from bmad_loop import bmadconfig, runs
@@ -12993,18 +12993,39 @@ def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
     folder = bmadconfig.load_paths(project.project, want_tickets=True).initiative_folder
     rel = folder.relative_to(project.project).as_posix()
     git(project.project, "rm", "-r", "-q", "--cached", rel)
-    (project.project / ".gitignore").write_text(f"/{rel}/\n", encoding="utf-8")
-    git(project.project, "add", ".gitignore")
     git(project.project, "commit", "-q", "-m", "untrack the initiative")
     monkeypatch.setattr(cli, "TicketsEngine", _StubEngine)
 
     assert cli.main(["run", "--project", str(project.project)]) == 1
 
     err = capsys.readouterr().err
-    assert "error: the ticket store" in err and "layout T2" in err
+    assert "error: the initiative folder" in err and "neither tracks nor ignores" in err
     assert "FAIL:" not in err
     runs_dir = project.project / runs.RUNS_DIR
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_tickets_status_lists_owed_post_landing_writes(tmp_path, capsys):
+    """A shared-store mark or store commit still owed after its code landed (the
+    latch kept) is listed under the tickets footer, so a failed store commit is
+    visible without reading the journal. Ablation (performed): drop the owed
+    line and this FAILS."""
+    from bmad_loop.model import RunState, StoryTask
+
+    state = RunState(run_id="r", project=str(tmp_path), started_at="now", source="tickets")
+    state.tasks["1.1"] = StoryTask(story_key="1.1", epic=0, ticket_done_pending=True)
+    state.tasks["1.2"] = StoryTask(
+        story_key="1.2", epic=0, ticket_park_pending="awaiting operator: x"
+    )
+    state.tasks["1.3"] = StoryTask(story_key="1.3", epic=0)
+
+    cli._print_tickets_status(state, tmp_path)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "tickets: initiative (none)"
+    assert lines[1].startswith(
+        "tickets: mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)"
+    )
 
 
 @pytest.mark.parametrize(

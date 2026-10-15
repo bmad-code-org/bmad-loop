@@ -298,6 +298,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._picked: dict[str, TicketBinding] = {}
         # story key -> plan status its last review launched on (`_verify_review`).
         self._review_entered: dict[str, str] = {}
+        # Whether this run has journaled `store-unversioned`; None until the
+        # journal is first read for it (`_note_store_unversioned`).
+        self._unversioned_noted: bool | None = None
         # A store no checkout carries is shared: every artifact dir under it stays
         # at the main checkout (`ProjectPaths.rebased`), and worktree mounts are
         # redirected to it. Read from the topology the run recorded at its start.
@@ -309,6 +312,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self.state.source = SOURCE_TICKETS
 
     # ------------------------------------------------------------------ tree
+
+    @property
+    def store_topology(self) -> ticketstore.StoreTopology | None:
+        """The ticket store the run recorded at its start; None when it recorded
+        none (no initiative to classify, or a run older than the record)."""
+        recorded = self.state.store_topology
+        return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
 
     @property
     def ticket_tree(self) -> TicketTreeLike:
@@ -1584,9 +1594,107 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 )
         except TicketsError as e:
             self._pause_post_landing_mark(task, target, f"tickets.py {e.kind}: {e}")
+        if not self._commit_marked_plan(task, target):
+            return  # latch kept: a resume marks (a no-op) and commits again
         task.ticket_done_pending = False
         task.ticket_park_pending = ""
         self._save()
+
+    def _commit_marked_plan(self, task: StoryTask, target: str) -> bool:
+        """Commit the plan just marked ``target`` in a store with its own
+        repository (T3/T4) — with the deferred-work ledger when the task wrote to
+        it — through :class:`~bmad_loop.ticketstore.StoreCommitter`, as ``chore(
+        tickets): <ref> <target> [bmad-loop <run>]`` with the code trailers. An
+        unversioned store (T2/T6) has nothing to commit and journals
+        ``store-unversioned`` once per run.
+
+        Bookkeeping, never a pause: the mark on disk is what ``next`` reads. A
+        failed commit journals ``store-commit-failed``, a staged foreign version
+        of a path ``store-commit-foreign-dirt``; both return False so the caller
+        keeps the latch and a resume commits again."""
+        topology = self.store_topology
+        ticket = task.ticket
+        if topology is None or topology.per_worktree() or ticket is None:
+            return True
+        if topology.store_repo is None:
+            self._note_store_unversioned(topology)
+            return True
+        paths = [Path(ticket.plan)]
+        if task.harvested_deferrals or task.story_closes_intended:
+            paths.append(self.paths.deferred_work)
+        return self._store_commit(
+            topology.store_repo,
+            task.story_key,
+            paths,
+            f"chore(tickets): {ticket.ref} {target} [bmad-loop {self.state.run_id}]",
+            code_commit=task.commit_sha,
+            code_baseline=task.baseline_commit,
+        )
+
+    def _store_commit(
+        self,
+        store_repo: Path,
+        key: str,
+        paths: list[Path],
+        message: str,
+        *,
+        code_commit: str | None,
+        code_baseline: str | None = None,
+    ) -> bool:
+        """One :class:`~bmad_loop.ticketstore.StoreCommitter` commit, journaled
+        under ``key`` (``store-committed``, ``store-commit-foreign-dirt`` or
+        ``store-commit-failed``); True when nothing is left owed."""
+        committer = ticketstore.StoreCommitter(store_repo, self.paths.repo_root)
+        try:
+            result = committer.commit(
+                key, paths, message, code_commit=code_commit, code_baseline=code_baseline
+            )
+        except ticketstore.StoreCommitError as e:
+            self.journal.append("store-commit-failed", story_key=key, error=str(e))
+            return False
+        if result.foreign:
+            self.journal.append(
+                "store-commit-foreign-dirt", story_key=key, count=len(result.foreign)
+            )
+            return False
+        self.journal.append("store-committed", story_key=key, commit=result.sha)
+        return True
+
+    def _note_store_unversioned(self, topology: ticketstore.StoreTopology) -> None:
+        """Journal ``store-unversioned`` once per run: an unversioned store's marks
+        live on disk only, with no history to recover them from."""
+        if self._unversioned_noted is None:
+            self._unversioned_noted = any(
+                e.get("kind") == "store-unversioned" for e in self.journal.entries()
+            )
+        if not self._unversioned_noted:
+            self.journal.append("store-unversioned", layout=topology.layout)
+            self._unversioned_noted = True
+
+    def _settle_retro_tree(
+        self, epic: int, ok: bool, docs: list[Path], *, epic_ref: str | None = None
+    ) -> None:
+        """A store with its own repository (T3/T4) commits the retro document
+        there first (``chore(retro): <slug> retrospective``, best effort like a
+        plan's store commit). The code checkout is then settled as the base does;
+        the store repository's own dirt never pauses the run — humans edit
+        planning beside it. Journaled under the retro session's key,
+        ``<slug>-retrospective``."""
+        topology = self.store_topology
+        if ok and docs and topology is not None and topology.store_repo is not None:
+            label = epic_ref or f"epic {epic}"
+            try:
+                head: str | None = verify.rev_parse_head(self.paths.repo_root)
+            except verify.GitError:
+                head = None  # the trailer is provenance; the commit still lands
+            self._store_commit(
+                topology.store_repo,
+                f"{label}-retrospective",
+                list(docs),
+                f"chore(retro): {label} retrospective [bmad-loop {self.state.run_id}]",
+                code_commit=head,
+            )
+        super()._settle_retro_tree(epic, ok, docs, epic_ref=epic_ref)
 
     def _replay_post_landing_writes(self) -> None:
         """On resume, make every latched mark whose code had landed when the host

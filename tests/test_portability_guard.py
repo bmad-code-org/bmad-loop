@@ -574,6 +574,8 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # (`done` / `blocked`), latched and replayed.
     "ticket-mark-latched": frozenset({"target"}),
     "resume-ticket-mark": frozenset({"target"}),
+    # tickets_engine.py: the unversioned store's closed layout token (`T2`/`T6`).
+    "store-unversioned": frozenset({"layout"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -2060,9 +2062,14 @@ JOURNAL_KINDS = frozenset(
         # the epic boundary: the closure it recorded, and a resume past an epic
         # still open (its `retro-auto-*` rows reuse the base kinds with `epic_ref`).
         # And a shared store's mark latched for after the code lands, and its
-        # replay on resume.
+        # replay on resume; its store-repository commit (made, failed, or skipped
+        # over a foreign staged version) and an unversioned store, once a run.
         "epic-closure-not-recorded",
         "resume-ticket-mark",
+        "store-commit-failed",
+        "store-commit-foreign-dirt",
+        "store-committed",
+        "store-unversioned",
         "ticket-epic-closure",
         "ticket-foreign-active",
         "ticket-hitl-pause",

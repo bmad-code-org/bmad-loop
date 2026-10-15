@@ -44,8 +44,8 @@ breaking changes may land in a minor release.
   or an outside folder. `validate` reports it (`tickets.store-topology`, the additive
   `ticket_store` field) and refuses partial tracking, an untracked unignored store and a
   workspace project (`tickets.tree-untracked`, `tickets.workspace-unsupported`). Runs
-  record it; resume, resolve and the TUI refuse a store that changed. Runs still need
-  T1. Under worktree isolation a shared store is read in place: the mount's
+  record it; resume, resolve and the TUI refuse a store that changed. Under worktree
+  isolation a shared store is read in place: the mount's
   `config.user.toml` is redirected to it (`tickets.own-repo-isolation` when it cannot
   be), and no seed, carry or publication touches it.
 - Mark a shared ticket store's plan after the code lands: a store no code checkout
@@ -53,6 +53,11 @@ breaking changes may land in a minor release.
   place, or after the merge-back under worktree isolation, never inside the unit's
   commit. The mark is latched in the commit's first save and replayed on resume; a
   failed mark pauses at `ticket-tree`.
+- Support a ticket store in its own git repository, nested in the code checkout or
+  outside it: each marked plan (and the ledger the unit wrote) gets a plan-only commit
+  there with `Bmad-Code-*` trailers, and so does an epic's retrospective document. A
+  failed store commit is journaled and retried on resume, never pauses the run, and
+  shows in `status`. Tickets runs now drive every classified store layout.
 - Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
   `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
   A plan restore is confined to the ticket store root.

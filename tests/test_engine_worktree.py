@@ -13363,3 +13363,131 @@ def test_dirty_ledger_only_does_not_pause(project_v7):
     assert not summary.paused, state.paused_reason
     assert state.tasks["1.1"].phase == Phase.DONE and len(adapter.sessions) == 1
     assert not [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+
+
+# ----------------------------------------- tickets: commits in a store repository
+#
+# A ticket store with its own repository (T3 nested, T4 external) gets a plan-only
+# commit there once the unit's code has merged back and the plan is marked; an
+# unversioned store (T2) has nothing to commit and says so once per run. Helpers
+# from tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
+
+
+def _store_engine(layout, tree, expect, **kw):
+    """`make_engine` under worktree isolation, the run's topology recorded from the
+    real probe as `runsetup` stamps it (asserted to be layout ``expect``)."""
+    from test_tickets_engine import _policy, make_engine
+
+    from bmad_loop import ticketstore
+    from bmad_loop.bmadconfig import load_paths
+
+    paths = load_paths(layout.project, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "worktree")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == expect
+    pol = replace(_policy(), scm=ScmPolicy(isolation="worktree", delete_branch=False))
+    return make_engine(layout, tree, policy=pol, store_topology=topology.to_dict(), **kw)
+
+
+def _store_tree(layout, *refs):
+    """The fake tree offering ``refs``, every `find` plan under the layout's own
+    initiative folder (the fake spells it under the project's `_bmad-output`)."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    tree = _tree(layout, ready_to_start=tuple(ticket_row(ref) for ref in refs))
+    default = layout.project / "_bmad-output" / layout.initiative
+    for ref, found in tree.finds.items():
+        rel = Path(found.plan).relative_to(default)
+        tree.finds[ref] = replace(found, plan=str(layout.initiative_folder / rel))
+    return tree
+
+
+def _store_run(layout, expect, monkeypatch):
+    """One ticket built and merged back over a shared store of layout ``expect``."""
+    from test_tickets_engine import _builds_shared, _marking_tree
+
+    tree = _store_tree(layout, "1.1")
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, _ = _store_engine(
+        layout, tree, expect, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+    engine.run()
+    return engine, tree, plan
+
+
+def _assert_plan_committed(engine, store, plan):
+    from test_tickets_engine import _kinds, _plan_status
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.worktree_path and task.commit_sha
+    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert _plan_status(plan) == "done"
+    body = git(store, "log", "-1", "--format=%B")
+    assert body.splitlines()[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
+    assert f"Bmad-Code-Repo: {engine.paths.repo_root.as_posix()}" in body
+    assert f"Bmad-Code-Commit: {task.commit_sha}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in body
+    rel = plan.resolve().relative_to(store.resolve()).as_posix()
+    assert git(store, "show", "--name-only", "--format=", "HEAD").split() == [rel]
+    assert git(store, "status", "--porcelain") == ""
+    assert [e["commit"] for e in _kinds(engine, "store-committed")] == [
+        verify.rev_parse_head(store)
+    ]
+    assert git(engine.paths.project, "status", "--porcelain") == ""
+
+
+def test_t3_mark_done_commits_in_store_repo(project_v7_store_repo, monkeypatch):
+    """T3 (the store is its own repository nested in the code checkout): once the
+    unit's code has merged back and the plan is marked `done`, the store repository
+    gets one `chore(tickets)` commit holding the plan alone, its trailers naming
+    the code repository, the unit's commit and its range. Ablation (performed):
+    drop the `_commit_marked_plan` call in `_land_post_landing_writes` and the
+    plan stays uncommitted in the store — this FAILS."""
+    layout = project_v7_store_repo
+    engine, tree, plan = _store_run(layout, "T3", monkeypatch)
+
+    _assert_plan_committed(engine, layout.output_folder, plan)
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
+
+
+def test_t4_external_store_commit(project_v7_external_store, monkeypatch):
+    """T4 (the store is its own repository outside the code checkout): the same
+    plan-only commit lands in the external store repository, the code checkout
+    untouched by it."""
+    layout = project_v7_external_store
+    engine, _, plan = _store_run(layout, "T4", monkeypatch)
+
+    _assert_plan_committed(engine, layout.output_folder, plan)
+
+
+def test_t2_unversioned_journals_once(project_v7, monkeypatch):
+    """T2 (an ignored plain folder): the plan is marked after the merge-back with
+    nothing to commit, and `store-unversioned` is journaled once per run — not
+    again for a later landing, nor by a resumed process over the same journal.
+    Ablation (performed): drop the journal read in `_note_store_unversioned` and
+    the resumed process journals it again — this FAILS."""
+    from test_tickets_engine import _kinds, _plan_status, _resume
+
+    rel = project_v7.output_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "the store is ignored")
+    engine, tree, plan = _store_run(project_v7, "T2", monkeypatch)
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and not task.ticket_done_pending
+    assert _plan_status(plan) == "done"
+    assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]
+    assert not _kinds(engine, "store-committed")
+
+    for again in (engine, _resume(engine, tree)):
+        landed = load_state(engine.run_dir).tasks["1.1"]
+        landed.ticket_done_pending = True
+        again.state.tasks["1.1"] = landed
+        again._land_post_landing_writes(landed)
+
+    assert len(_kinds(engine, "store-unversioned")) == 1
+    assert [m.outcome for m in tree.marks] == ["written", "noop", "noop"]

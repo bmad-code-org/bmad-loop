@@ -181,15 +181,16 @@ def test_tracked_user_config_refuses_redirect(over, code):
 
 
 @pytest.mark.parametrize("layout", ["T2", "T3", "T4", "T6"])
-def test_shared_layouts_refused_for_a_run_until_marked_after_landing(layout):
-    """Marking `done` outside the commit window lands in a later release layer, so
-    every layout but T1 still refuses a run. Ablation (performed): drop the
+def test_shared_layouts_run(layout):
+    """Every classified shared layout runs: its plans are marked after the code
+    lands (and committed in a store repository of its own), so no layout but a
+    refusal or a changed store refuses a run. Ablation (performed): restore the
     non-T1 arm of `store_topology_conflict` and every row FAILS."""
     versioning = {"T2": "none", "T3": "store-repo", "T4": "store-repo", "T6": "none"}[layout]
     repo = STORE if versioning == "store-repo" else None
     topology = StoreTopology(layout, "shared-in-project", versioning, STORE, repo)  # type: ignore[arg-type]
-    text = store_topology_conflict(topology) or ""
-    assert f"layout {layout}" in text and "later release layer" in text
+    assert store_topology_conflict(topology) is None
+    assert store_topology_conflict(topology, recorded=topology.to_dict()) is None
 
 
 def test_changed_topology_refused_against_the_recorded_one():

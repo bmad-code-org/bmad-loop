@@ -12125,9 +12125,9 @@ def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
 @pytest.mark.parametrize(
     ("layout", "check", "text"),
     [
-        ("ignored", "tickets.store-topology", "layout T2"),
+        ("ignored", "tickets.store-topology", "T2: "),
         ("uncommitted", "tickets.tree-untracked", "neither tracks nor ignores"),
-        ("outside", "tickets.store-topology", "layout T4"),
+        ("outside", "tickets.store-topology", "T4: "),
     ],
 )
 def test_tickets_preflight_classifies_store_layouts(
@@ -12135,11 +12135,11 @@ def test_tickets_preflight_classifies_store_layouts(
 ):
     """The store-topology classifier stands where the tracked-in-checkout gate
     stood: an ignored initiative folder classifies as T2 and a code repo elsewhere
-    makes the store its own repository (T4) — both still refused for a run until
-    marking outside the commit window lands — while a folder neither tracked nor
-    ignored is untracked dirt (`tickets.tree-untracked`). One problem each, carrying
-    the refusal or the classified topology. Ablation (performed): drop the
-    `_tickets_store_findings` call in `tickets_preflight` and every row FAILS."""
+    makes the store its own repository (T4) — both an ok finding carrying the
+    topology, since shared stores run — while a folder neither tracked nor ignored
+    is untracked dirt (`tickets.tree-untracked`), the one problem. Ablation
+    (performed): drop the `_tickets_store_findings` call in `tickets_preflight` and
+    every row FAILS."""
     import dataclasses
 
     rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
@@ -12160,15 +12160,16 @@ def test_tickets_preflight_classifies_store_layouts(
 
     findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
 
-    (problem,) = [f for f in findings if f.severity == "problem"]
-    assert problem.check == check
-    assert text in problem.message
-    assert problem.detail["path"] == str(paths.initiative_folder)
+    (found,) = [f for f in findings if f.check == check]
+    assert text in found.message
+    assert found.detail["path"] == str(paths.initiative_folder)
     if layout == "uncommitted":
-        assert problem.detail["refusal"] == "store-not-ignored"
+        assert found.severity == "problem"
+        assert found.detail["refusal"] == "store-not-ignored"
     else:
-        assert problem.detail["topology"]["layout"] == text.split()[-1]
-        assert "later release layer" in problem.message
+        assert found.severity == "ok"
+        assert found.detail["topology"]["layout"] == text[:2]
+        assert not [f for f in findings if f.severity == "problem"]
 
 
 @pytest.mark.parametrize(

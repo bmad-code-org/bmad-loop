@@ -89,9 +89,18 @@ def test_probe_git_fault_is_a_refusal_not_a_guess(project_v7, monkeypatch):
 
 
 def test_store_conflict_is_silent_outside_tickets_mode(project_v7_store_repo):
+    """Only a tickets run classifies the store: a recorded topology the live T3
+    store contradicts refuses a tickets run and nothing else, and the T3 store
+    itself runs."""
     project = project_v7_store_repo.project
-    assert ticketstore.store_conflict(project, "sprint-status", "worktree") is None
-    assert "layout T3" in (ticketstore.store_conflict(project, "tickets", "worktree") or "")
+    recorded = StoreTopology(
+        "T1", "checkout", "code-repo", project_v7_store_repo.output_folder.resolve()
+    ).to_dict()
+    assert (
+        ticketstore.store_conflict(project, "sprint-status", "worktree", recorded=recorded) is None
+    )
+    assert ticketstore.store_conflict(project, "tickets", "worktree", recorded=recorded)
+    assert ticketstore.store_conflict(project, "tickets", "worktree") is None
 
 
 def test_store_conflict_refuses_a_store_that_changed_since_the_run_started(

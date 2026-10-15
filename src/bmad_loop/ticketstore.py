@@ -34,9 +34,9 @@ config rewrite :func:`redirected_user_config_text`. The PROBE part reads git and
 the disk: :func:`probe_store_facts` (every git call through ``verify``'s
 ``_run_git`` chokepoint), :func:`assess_store` and :func:`redirect_mount_store`.
 
-Marking ``done`` outside the commit window — every layout but T1 — lands in a later
-release layer, so :func:`store_topology_conflict` still refuses those layouts for a
-run."""
+A store with its own repository (T3/T4) is committed by :class:`StoreCommitter`:
+the marked plan (and the ledger or retro document the run wrote there) alone, by
+pathspec, never the planning edits a human has in flight beside it."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast, get_args
 
-from . import bmadconfig, verify
+from . import bmadconfig, platform_util, verify
 from .platform_util import atomic_write_bytes
 
 Layout = Literal["T1", "T2", "T3", "T4", "T6"]
@@ -90,6 +90,11 @@ _REFUSAL_CHECKS: dict[RefusalCode, str] = {
 
 class TicketStoreError(Exception):
     """The worktree redirect could not be written or did not take."""
+
+
+class StoreCommitError(Exception):
+    """A store-repository commit could not be made: git, the disk or the store
+    lock failed. Bookkeeping, never a repair write — the caller journals it."""
 
 
 @dataclass(frozen=True)
@@ -266,10 +271,11 @@ def store_topology_conflict(
 ) -> str | None:
     """The refusal message for a store tickets runs cannot drive, or None.
 
-    Refused: every :class:`StoreRefusal`; a topology that differs from the one a
-    run ``recorded`` at its start (resume re-validates — a store that moved under a
-    running ticket tree would mark plans the run never read); and, until marking
-    outside the commit window lands, every layout but T1.
+    Refused: every :class:`StoreRefusal`, and a topology that differs from the one
+    a run ``recorded`` at its start (resume re-validates — a store that moved under
+    a running ticket tree would mark plans the run never read). Every classified
+    layout runs: T1 is marked inside the commit window, the shared layouts after the
+    code lands.
 
     Sole producer of the text, shared by validate, the run/sweep/resume/resolve
     preflights, the dry-run banner, the auto-sweep factory and the TUI guards."""
@@ -282,14 +288,6 @@ def store_topology_conflict(
             f"({recorded.get('store_root')}) and is now {result.layout} "
             f"({result.store_root}) — a run marks plans only in the store it started "
             "on. Restore the store layout, or start a new run."
-        )
-    if result.layout != "T1":
-        return (
-            f"the ticket store {result.store_root} is layout {result.layout} "
-            f"({_describe(result)}): tickets runs mark plans `done` only in a store "
-            "tracked inside the code checkout (T1) for now — marking a shared store "
-            "after its code lands comes in a later release layer. Track the "
-            "initiative folder in the code repository to run it today."
         )
     return None
 
@@ -537,3 +535,97 @@ def with_shared_store(
     if topology.per_worktree():
         return paths
     return replace(paths, shared_store=topology.store_root)
+
+
+# --- store-repository commits ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoreCommit:
+    """What :meth:`StoreCommitter.commit` did. ``sha`` is the new store commit,
+    None when nothing was committed: the paths held no change, or (``foreign``
+    non-empty) the store's index holds a staged version of one of them that the
+    commit would have destroyed — those repo-relative paths, and nothing was
+    staged."""
+
+    sha: str | None
+    foreign: tuple[str, ...] = ()
+
+
+def code_trailers(code_repo: Path, commit: str | None, baseline: str | None = None) -> list[str]:
+    """The trailers tying a store commit to the code it describes:
+    ``Bmad-Code-Repo`` always, ``Bmad-Code-Commit`` with a commit, and
+    ``Bmad-Code-Range: <baseline>..<commit>`` with both — the range survives a
+    later squash of the code repository."""
+    trailers = [f"Bmad-Code-Repo: {code_repo.as_posix()}"]
+    if commit:
+        trailers.append(f"Bmad-Code-Commit: {commit}")
+        if baseline:
+            trailers.append(f"Bmad-Code-Range: {baseline}..{commit}")
+    return trailers
+
+
+class StoreCommitter:
+    """Commits a tickets run's own writes in a store repository (T3/T4).
+
+    ``store_repo`` is the store's own repository (``StoreTopology.store_repo``),
+    ``code_repo`` the code checkout the run builds in."""
+
+    def __init__(self, store_repo: Path, code_repo: Path) -> None:
+        self.store_repo = store_repo
+        self.code_repo = code_repo
+
+    def commit(
+        self,
+        story_key: str,
+        paths: list[Path],
+        message: str,
+        *,
+        code_commit: str | None = None,
+        code_baseline: str | None = None,
+    ) -> StoreCommit:
+        """Commit exactly ``paths`` in the store repository (``verify.commit_paths``:
+        pathspec only, every other change in the store left as it is) under
+        ``message`` plus the :func:`code_trailers`, holding the store's lock
+        (``runs.lock_path_for(<store_repo>/.git)``) so two runs over one store
+        never interleave a stage and a commit.
+
+        Before anything is staged, each path's index entry is checked with
+        ``verify.index_holds_no_foreign_content`` against the bytes on disk: a
+        staged version distinct from both HEAD and the file (a human's ``git add``
+        in progress) would be overwritten by the stage, so the commit is skipped
+        and those paths are returned in :attr:`StoreCommit.foreign`. Raises
+        :class:`StoreCommitError` naming ``story_key`` on any git, disk or lock
+        fault."""
+        from . import runs  # lazy: runs imports most of the package
+
+        repo = self.store_repo
+        body = (
+            message.rstrip()
+            + "\n\n"
+            + "\n".join(code_trailers(self.code_repo, code_commit, code_baseline))
+        )
+        try:
+            with platform_util.file_lock(runs.lock_path_for(repo / ".git")):
+                foreign = self._foreign(paths)
+                if foreign:
+                    return StoreCommit(None, foreign)
+                return StoreCommit(verify.commit_paths(repo, body, paths))
+        except (verify.GitError, OSError, RuntimeError, ValueError, runs.StateRootError) as e:
+            raise StoreCommitError(f"store commit for {story_key} in {repo} failed: {e}") from e
+
+    def _foreign(self, paths: list[Path]) -> tuple[str, ...]:
+        root = self.store_repo.resolve()
+        foreign: list[str] = []
+        for path in paths:
+            try:
+                rel = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue  # outside the store: `commit_paths` ignores it too
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue  # a deletion to stage, or a path git never saw
+            if not verify.index_holds_no_foreign_content(self.store_repo, rel, data):
+                foreign.append(rel)
+        return tuple(foreign)
