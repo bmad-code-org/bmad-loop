@@ -11969,9 +11969,19 @@ def test_pane_target_pins_the_launched_pane_by_id(monkeypatch, force_tmux_backen
     operator split (the new ACTIVE pane) is not what a nudge addresses."""
     from bmad_loop.adapters.multiplexer import get_multiplexer
 
-    calls = _scripted_tmux(monkeypatch, "%9\n")
+    calls = _scripted_tmux(monkeypatch, "0 %9\n")
     assert get_multiplexer().pane_target("@7") == "@7.%9"
-    assert calls == [["tmux", "-u", "display-message", "-p", "-t", "@7", "#{pane_id}"]]
+    assert calls == [["tmux", "-u", "list-panes", "-t", "@7", "-F", "#{pane_index} #{pane_id}"]]
+
+
+def test_pane_target_pins_the_first_pane_not_an_operator_split(monkeypatch, force_tmux_backend):
+    """#948: an operator who splits the window before the pin makes the split
+    the active pane; the launched pane keeps the lowest index, so that is the
+    one pinned. Ablation: pin the active (or last listed) pane and this fails."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    _scripted_tmux(monkeypatch, "1 %10\n0 %9\n")
+    assert get_multiplexer().pane_target("@7") == "@7.%9"
 
 
 def test_pane_target_of_a_dead_window_raises(monkeypatch, force_tmux_backend):

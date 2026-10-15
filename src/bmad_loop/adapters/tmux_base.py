@@ -641,13 +641,21 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # `<window>.%N` rather than a bare `%N`: psmux runs one server per session
         # and only reaches the right one through the session the window id
         # carries, and both backends resolve a `%N` pane slot by id (psmux 3.4.0
-        # and tmux 3.4 measured). A pane index would drift with swap-pane.
-        # display-message on a dead window exits 0 with empty output, so empty
-        # is a failure too.
-        pane = self._tmux("display-message", "-p", "-t", window_id, "#{pane_id}")
-        if not pane.startswith("%"):
-            raise TmuxError(f"no pane id for {window_id}: {pane!r}")
-        return f"{window_id}.{pane}"
+        # and tmux 3.4 measured). A pane index would drift with swap-pane, so
+        # the id is what is kept. The launched pane is the window's FIRST pane, not its active one: an
+        # operator who splits the window before this runs makes the split active
+        # (display-message would answer it), while a split never takes the
+        # lowest index (psmux 3.4.0 and tmux 3.4 list panes by index). A dead
+        # window lists nothing, so no pane id is a failure too.
+        rows = self._tmux("list-panes", "-t", window_id, "-F", "#{pane_index} #{pane_id}")
+        panes = []
+        for row in rows.splitlines():
+            index, _, pane = row.partition(" ")
+            if index.isdigit() and pane.startswith("%"):
+                panes.append((int(index), pane))
+        if not panes:
+            raise TmuxError(f"no pane id for {window_id}: {rows!r}")
+        return f"{window_id}.{min(panes)[1]}"
 
     def send_text(self, window_id: str, text: str) -> None:
         # A pane in copy or clock mode eats the keys: tmux swallows the text, and

@@ -2818,9 +2818,9 @@ def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatc
 def test_pane_target_keeps_the_session_qualified_window(rec):
     """#948 on psmux: `session:@N.%M` — the session routes the client to the right
     per-session server, the `%M` slot names the launched pane by id."""
-    rec.stdout = "%2\n"
+    rec.stdout = "0 %2\n1 %3\n"
     assert PsmuxMultiplexer().pane_target("s:@2") == "s:@2.%2"
-    assert rec.argv[-5:] == ["display-message", "-p", "-t", "s:@2", "#{pane_id}"]
+    assert rec.argv[-5:] == ["list-panes", "-t", "s:@2", "-F", "#{pane_index} #{pane_id}"]
 
 
 def test_send_text_refuses_while_a_mode_is_open(rec):
