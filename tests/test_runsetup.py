@@ -29,7 +29,7 @@ import pytest
 from bmad_loop import bmadconfig
 from bmad_loop import journal as journal_mod
 from bmad_loop import policy as policy_mod
-from bmad_loop import runs, runsetup
+from bmad_loop import runs, runsetup, worksource
 from bmad_loop.adapters.profile import ProfileError
 from bmad_loop.journal import Journal, load_state, state_lock
 from bmad_loop.model import RunState
@@ -1437,43 +1437,51 @@ def test_compose_run_engine_class_per_source(
     assert (state.source, state.spec_folder) == (source, persisted_folder)
 
 
-def test_compose_resume_unknown_source_falls_back_to_sprint_engine(tmp_path, monkeypatch, capsys):
-    """Characterization pin for the WorkSource refactor: `compose_resume`
-    builds the stories engine only for `source == "stories"`, so a persisted run whose `source`
-    is any other string — here an unknown "bogus" — silently rebuilds the sprint
-    `engine_cls`: no stories class, no journal row, no output."""
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [("bogus", worksource.UnknownSource), ("tickets", worksource.SourceNotRunnable)],
+)
+def test_compose_resume_refuses_a_source_it_cannot_drive(tmp_path, monkeypatch, source, error):
+    """`compose_resume` refuses a persisted story run whose source this version
+    cannot drive — unknown to the registry (a newer bmad-loop wrote it), or
+    registered but not runnable yet — before any side effect: no session kill,
+    no adapters, no journal row. It used to rebuild an unknown source as a sprint
+    run.
+
+    Ablation (performed): restoring the sprint fallback in `_engine_cls_for` turns
+    the `bogus` row red; moving the engine selection back below the session kills
+    and the adapter build turns both rows red (the build is reached)."""
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
-    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
     monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
     journal = Journal(run_dir)
     state = RunState(
         run_id=RUN_ID,
         project=str(tmp_path),
         started_at="now",
-        source="bogus",
+        source=source,
         spec_folder="epic-1",
     )
 
-    composed = runsetup.compose_resume(
-        project=tmp_path,
-        paths=_fake_paths(tmp_path),
-        run_dir=run_dir,
-        state=state,
-        policy=policy_mod.loads(""),
-        journal=journal,
-        sweep_factory=lambda _trigger, *, started: None,
-        make_adapters=_accepting_adapters,
-        engine_cls=_SprintCapturingEngine,
-        stories_engine_cls=_StoriesCapturingEngine,
-        sweep_engine_cls=_NeverBuilt,
-    )
+    with pytest.raises(error, match=repr(source) if source == "bogus" else "cannot run yet"):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=journal,
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_NeverBuilt,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            sweep_engine_cls=_NeverBuilt,
+        )
 
-    assert type(composed.engine) is _SprintCapturingEngine
-    assert set(composed.engine.kwargs) == _STORY_ENGINE_KWARGS  # no spec_folder
-    assert composed.engine.kwargs["state"].source == "bogus"  # left as persisted
+    assert killed == []
     assert journal.entries() == []
-    assert capsys.readouterr() == ("", "")
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])

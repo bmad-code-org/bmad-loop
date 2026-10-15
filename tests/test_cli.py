@@ -18,6 +18,7 @@ import yaml
 from conftest import (
     _OK,
     _REVERIFY_KEY,
+    DEFAULT_TREE,
     MISSING_TOOL_CMD,
     NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
@@ -25,6 +26,7 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
+    V7_DEFAULT_INITIATIVE,
     _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
@@ -36,6 +38,7 @@ from conftest import (
     install_bmad_config,
     install_bmad_v7,
     install_build_auto_skill,
+    install_build_auto_v7_skill,
     install_dev_base_skills,
     install_dev_shim,
     install_render_probe_fixture,
@@ -52,6 +55,7 @@ from conftest import (
     write_script_launcher,
     write_spec,
     write_sprint,
+    write_ticket_tree,
 )
 
 from bmad_loop import bmadconfig
@@ -12496,11 +12500,11 @@ def test_validate_passes_bmad_config_on_a_toml_only_project(project, capsys, mon
     assert doc["ok"] is True
 
 
-def _validate_v7_findings(project, capsys) -> dict[str, dict]:
+def _validate_v7_findings(project, capsys, *, policy=CLAUDE_ONLY_POLICY) -> dict[str, dict]:
     """`validate --json` findings keyed by check id (first of each), on the `project`
     sandbox after the test laid down its BMAD v7 install. rc 1: the sprint queue gate
-    has no board on a v7 config."""
-    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    has no board on a v7 config (and nothing else is set up to pass)."""
+    _write_policy(project.project, policy)
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     findings: dict[str, dict] = {}
     for f in doc["findings"]:
@@ -12540,10 +12544,10 @@ def test_validate_warns_v7_initiative_unset(project, capsys):
     assert "active_initiative" in finding["message"]
 
 
-def test_validate_warns_v6_keys_ignored_on_a_mixed_install(project, capsys, monkeypatch):
-    """Decision 8: a mixed install resolved as v7 for tickets mode names each leftover
-    v6 key. `validate` learns the source in a later layer; until then the tickets-mode
-    load is pinned here. Ablation: drop the warn and this FAILS."""
+def test_validate_warns_v6_keys_ignored_on_a_mixed_install(project, capsys):
+    """Decision 8: a mixed install resolved as v7 for tickets mode (the policy's
+    source, nothing pinned) names each leftover v6 key. Ablation: drop the warn and
+    this FAILS; load the config without `want_tickets` and it resolves as v6."""
     install_bmad_v7(project.project)
     (project.project / "_bmad" / "custom" / "config.toml").write_text(
         "[modules.bmm]\n"
@@ -12551,16 +12555,147 @@ def test_validate_warns_v6_keys_ignored_on_a_mixed_install(project, capsys, monk
         'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
         encoding="utf-8",
     )
-    real = bmadconfig.load_paths
-    monkeypatch.setattr(
-        bmadconfig, "load_paths", lambda project, **kw: real(project, want_tickets=True)
-    )
-    by_check = _validate_v7_findings(project, capsys)
+    by_check = _validate_v7_findings(project, capsys, policy=TICKETS_POLICY)
     assert by_check["bmad-config"]["detail"]["era"] == "v7"
     finding = by_check["bmad-config.v6-keys-ignored"]
     assert finding["severity"] == "warning"
     assert len(finding["detail"]["keys"]) == 2
     assert "modules.bmm.implementation_artifacts" in finding["message"]
+
+
+TICKETS_POLICY = CLAUDE_ONLY_POLICY + '[stories]\nsource = "tickets"\n'
+
+
+def _make_tickets_validate_pass(project, monkeypatch, capsys):
+    """`_make_validate_pass` for tickets mode: a BMAD v7 install with the default
+    ticket tree, the v7 build-auto, and `[stories] source = "tickets"`."""
+
+    def v7_config(sandbox):
+        write_ticket_tree(install_bmad_v7(sandbox.project), DEFAULT_TREE)
+
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=TICKETS_POLICY,
+        skills=install_build_auto_v7_skill,
+        bmad_config=v7_config,
+    )
+
+
+def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):
+    """A tickets project bmad-loop can drive validates ok: `mode` is `tickets`, the
+    document names the active initiative and the v7 era, and the tickets checks ran
+    (the script's capability probe only as a not-run note — plain validate executes
+    no project script). Ablation: route tickets to the sprint queue validator and
+    the tickets findings vanish (and the missing board fails it)."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["ok"] is True
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("tickets", V7_DEFAULT_INITIATIVE, "v7")
+    assert doc["spec_folder"] == ""
+    by_check = {f["check"]: f for f in doc["findings"]}
+    assert by_check["tickets.era"]["severity"] == "ok"
+    assert by_check["tickets.capability-not-run"]["detail"] == {"run": False}
+    assert by_check["skills.tickets-dispatch"]["severity"] == "ok"
+    assert "queue.sprint-status" not in by_check
+    assert not any(f["check"].startswith("deferred.") for f in doc["findings"])
+
+
+def test_validate_probes_runs_the_tickets_capability_probe(project, capsys, monkeypatch):
+    """`--probes` is the opt-in that executes project-controlled commands, so it is
+    what runs the script's capability probe (stubbed here: the real probe's contract
+    is tests/test_install.py's)."""
+    from bmad_loop import ticketmodel, tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    calls: list[str] = []
+
+    def capability(self):
+        calls.append("probed")
+        return ticketmodel.Capability(
+            verbs=frozenset(ticketmodel.REQUIRED_VERBS),
+            statuses=frozenset(ticketmodel.REQUIRED_STATUSES),
+        )
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", capability)
+    doc = machine_json(
+        ["validate", "--project", str(project.project), "--probes", "--json"], capsys
+    )
+    assert calls == ["probed"]
+    by_check = {f["check"]: f for f in doc["findings"]}
+    assert by_check["tickets.capability"]["severity"] == "ok"
+    assert "tickets.capability-not-run" not in by_check
+
+
+def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, monkeypatch):
+    """`initiative` is a tickets-mode field: a sprint-mode validate reports "" even on
+    a v7 project whose config names an active initiative (as `spec_folder` is ""
+    outside stories mode), while `era` still says which config shape resolved."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v6")
+
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "bmm" / "config.yaml").unlink()  # v7 only: no v6 keys
+    by_check = _validate_v7_findings(project, capsys)
+    assert by_check["bmad-config"]["detail"]["initiative"] == V7_DEFAULT_INITIATIVE
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["run", "dry-run"])
+def test_run_tickets_refused_until_runnable(project, capsys, monkeypatch, dry_run):
+    """Tickets mode is registered (validate checks it) but its runs land in a later
+    release layer: `run` and `run --dry-run` refuse with one clear line at exit 1 and
+    leave no run behind. Ablation (performed): point the tickets `_RUN_PREFLIGHTS`
+    row at the sprint preflight and the `run` row FAILS."""
+    from bmad_loop import runs
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    argv = ["run", "--project", str(project.project)] + (["--dry-run"] if dry_run else [])
+
+    assert cli.main(argv) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.strip() == (
+        "error: tickets mode cannot run yet: it lands in a later release layer of "
+        "bmad-loop — `bmad-loop validate` checks a tickets project today"
+    )
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("source", "said"),
+    [("bogus", "unknown to this bmad-loop"), ("tickets", "tickets mode cannot run yet")],
+)
+def test_resume_unknown_source_refused(project, monkeypatch, capsys, source, said):
+    """R16: a paused story run whose persisted source this version cannot drive is
+    refused before any side effect — no engine, no `run-resume` row, the pause left
+    standing — instead of being resumed as a sprint run. Ablation (performed): drop
+    the source check in `_prepare_resume_locked` and the `bogus` row FAILS (the stub
+    engine runs it as sprint)."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, source=source)
+    built: list[str] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, *a, **kw):
+            built.append("built")
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert f"cannot resume {run_dir.name}:" in err and said in err
+    assert built == []
+    assert _resume_entries(run_dir) == []
+    assert load_state(run_dir).paused_reason == "escalation"
 
 
 def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):
@@ -12831,6 +12966,34 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     failing = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted, "the run emitted findings"
+    assert emitted <= VALIDATE_CHECKS
+
+
+def test_validate_json_every_emitted_tickets_check_is_registered(project, capsys, monkeypatch):
+    """The registry test's tickets-mode legs: a passing tickets project, then one
+    with every static tickets check failing (no initiative folder, a tracker store,
+    no uv, a pre-v7 build-auto). Exercised paths only, as above."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    passing = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    shutil.rmtree(project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE)
+    (project.project / "_bmad" / "custom" / "ticketing-store-config.toml").write_text(
+        '[tickets]\nstore = "jira"\n', encoding="utf-8"
+    )
+    install_build_auto_v7_skill(project.project, tickets_route=False)
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda tool: None if tool == "uv" else f"/usr/bin/{tool}"
+    )
+    failing = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    failed = {f["check"] for f in failing["findings"] if f["severity"] == "problem"}
+    assert {
+        "tickets.initiative-missing",
+        "tickets.store-not-repo",
+        "tickets.uv-missing",
+        "skills.tickets-dispatch-stale",
+    } <= failed
+    emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted <= VALIDATE_CHECKS
 
 

@@ -1007,14 +1007,21 @@ def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | N
 
 BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | None"]
 
+
+def _tickets_board(project: Path, state: RunState) -> list[stories.StoryRow] | None:
+    worksource.refuse_unrunnable(worksource.SOURCE_TICKETS)
+
+
 BOARD_LOADERS: Mapping[str, BoardLoader | None] = {
     worksource.SOURCE_SPRINT: None,
     worksource.SOURCE_STORIES: _stories_board,
+    worksource.SOURCE_TICKETS: _tickets_board,
 }
 """The per-run board each work source shows in the dashboard's board slot, keyed
 by ``RunState.source``. ``None`` means the source has no per-run board: the slot
 shows the project-level sprint tree (:func:`sprint_overview`, painted on rescan).
 A source this table does not carry is shown as sprint, as before the registry.
+The tickets row refuses: no tickets run can exist until its engine lands.
 One row per ``worksource.SOURCES`` (``tests/test_worksource.py`` holds it
 exhaustive)."""
 

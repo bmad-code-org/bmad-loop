@@ -874,11 +874,13 @@ def _engine_cls_for(
     """The engine class a story run from ``source`` is built with, and the extra
     constructor kwargs that class takes beyond the shared ones.
 
-    Keyed on the source name rather than :func:`worksource.traits_for`: an
-    unrecognised source (a run state persisted by another version) builds the
-    sprint ``engine_cls``, which is how resume has always treated it. The classes
-    are injected so ``cli``'s module-level names — and the tests' monkeypatches of
-    them — stay the ones built."""
+    A source the registry does not carry (a run state persisted by a newer
+    version) raises :class:`worksource.UnknownSource`, and a registered source
+    that cannot run yet raises :class:`worksource.SourceNotRunnable` — neither is
+    rebuilt as a sprint run. The classes are injected so ``cli``'s module-level
+    names — and the tests' monkeypatches of them — stay the ones built."""
+    if not worksource.resumable_traits_for(source).runnable:
+        worksource.refuse_unrunnable(source)
     if source == worksource.SOURCE_STORIES:
         return stories_engine_cls, {"spec_folder": spec_folder}
     return engine_cls, {}
@@ -1542,9 +1544,24 @@ def compose_resume(
     ``plugin_grants`` is the resume's frozen grant set, as in :func:`compose_run`.
     Unlike the two launches this has no unwind, so the caller preflights the
     grants before its first side effect (``cli._prepare_resume_locked``); the
-    engine build stays the gate."""
+    engine build stays the gate.
+
+    A story run whose persisted ``source`` this version cannot drive — unknown to
+    the registry, or registered but not runnable yet — raises before any side
+    effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
+        story_engine = None
+    else:
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag. An unrecognised persisted
+        # source is refused here, ahead of the session kills below.
+        story_engine = _engine_cls_for(
+            state.source,
+            state.spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+        )
     resolved_sweep_options = (
         sweep_options
         if sweep_options is not None
@@ -1622,15 +1639,8 @@ def compose_resume(
             sweep_factory=sweep_factory,
             plugin_grants=plugin_grants,
         )
-        # stories mode is pinned in run state at launch, so resume rebuilds the
-        # same picker (StoriesEngine) without any flag. An unrecognised persisted
-        # source resumes as a sprint run (see `_engine_cls_for`).
-        cls, extra = _engine_cls_for(
-            state.source,
-            state.spec_folder,
-            engine_cls=engine_cls,
-            stories_engine_cls=stories_engine_cls,
-        )
+        assert story_engine is not None
+        cls, extra = story_engine
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
         engine = cls(**story_common, **extra)  # pyright: ignore[reportArgumentType]
     return ComposedRun(

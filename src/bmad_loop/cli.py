@@ -699,25 +699,37 @@ def cmd_validate(args: argparse.Namespace) -> int:
     project = _project(args)
     report = ValidationReport()
 
+    # Policy is READ first — its [stories].source (or a --spec override) selects
+    # which story-queue gate runs below (the sprint-status file, the stories.yaml
+    # manifest, or the v7 ticket tree), and tickets mode resolves a mixed install
+    # as BMAD v7 — but REPORTED after the BMAD config, as it always was. Loaded
+    # before the queue gate so a stories-only project is not failed on a missing
+    # sprint-status.yaml.
+    loaded_pol = None
+    policy_error: policy_mod.PolicyError | None = None
     try:
-        paths = bmadconfig.load_paths(project)
+        loaded_pol = policy_mod.load(_policy_path(project))
+    except policy_mod.PolicyError as e:
+        policy_error = e
+    source, spec_folder = _resolve_source(args, loaded_pol)
+
+    try:
+        paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
         _report_bmad_config(report, paths)
     except bmadconfig.BmadConfigError as e:
         report.fail("bmad-config", str(e))
         paths = None
 
-    # Policy first — its [stories].source (or a --spec override) selects which
-    # story-queue gate runs below: the sprint-status file (sprint mode) or the
-    # stories.yaml manifest (stories mode). Loaded before the queue gate so a
-    # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters import registry as adapter_registry
     from .adapters.profile import ProfileError, external_profile_errors, get_profile
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
     pol = None
-    try:
-        pol = policy_mod.load(_policy_path(project))
+    if policy_error is not None:
+        report.fail("policy", str(policy_error))
+    elif loaded_pol is not None:
+        pol = loaded_pol
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
         report.ok(
             "policy",
@@ -733,8 +745,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 profile_by_name[name] = profile
             except ProfileError as e:
                 report.fail("adapter.profile", str(e), {"profile": name})
-    except policy_mod.PolicyError as e:
-        report.fail("policy", str(e))
 
     # #414: the one configuration where every gate below reports on a surface the
     # isolated run will never see — worktree isolation beside a `repo_root` the
@@ -792,9 +802,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else []
     )
 
-    source, spec_folder = _resolve_source(args, pol)
     if paths:
-        _QUEUE_VALIDATORS[source](project, paths, spec_folder, dev_trees, report)
+        _QUEUE_VALIDATORS[source](
+            project, paths, spec_folder, dev_trees, report, bool(getattr(args, "probes", False))
+        )
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
     # whether the tree was clean, but whether the binary answered at all. A
@@ -1399,7 +1410,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
         # anything holding a hand-built Namespace) that predate the flag.
-        machine.emit(validate_document(report, worksource.validate_mode(source), spec_folder))
+        machine.emit(
+            validate_document(
+                report,
+                worksource.validate_mode(source),
+                spec_folder,
+                initiative=paths.active_initiative if paths is not None else "",
+                era=paths.era if paths is not None else "",
+            )
+        )
     else:
         report.render()
     return 0 if report.passed else 1
@@ -2275,6 +2294,7 @@ def _require_base_skills(
     grants: GrantSet,
     *,
     require_stories: bool = False,
+    require_tickets: bool = False,
     review_owed: bool = False,
 ) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
@@ -2291,11 +2311,15 @@ def _require_base_skills(
     ``require_stories`` additionally content-probes the resolved primitive for
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
-    dispatch time. ``review_owed`` keeps the review tree gated (`_skill_trees`)."""
+    dispatch time. ``require_tickets`` likewise probes it for the ticket-tree
+    route tickets mode dispatches through. ``review_owed`` keeps the review tree
+    gated (`_skill_trees`)."""
     skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
         findings += install.missing_stories_support(project, skill_trees)
+    if require_tickets:
+        findings += install.missing_tickets_support(project, skill_trees)
     # Severity decides. A review layer we can't statically resolve (a `when` gate,
     # an unrecognized handoff phrasing, an unparseable override) is reported and
     # then stepped over: aborting on it would be the false FAIL of #260, only now
@@ -2671,6 +2695,7 @@ def _validate_sprint_mode_queue(
     spec_folder: str,
     dev_trees: list[str],
     report: ValidationReport,
+    probes: bool,
 ) -> None:
     """``validate``'s queue checks for a sprint-status run: the ledger, the park
     records, and the sprint board itself."""
@@ -2701,6 +2726,7 @@ def _validate_stories_mode_queue(
     spec_folder: str,
     dev_trees: list[str],
     report: ValidationReport,
+    probes: bool,
 ) -> None:
     """``validate``'s queue checks for a stories run: the manifest and the
     ledger, read against the spec folder."""
@@ -2710,13 +2736,44 @@ def _validate_stories_mode_queue(
     )
 
 
+def _validate_tickets_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+    probes: bool,
+) -> None:
+    """``validate``'s queue checks for a tickets run: the v7 ticket tree's
+    preflight (:func:`install.tickets_preflight`; the script's capability probe
+    only under ``--probes``, since it executes the project's script) and the dev
+    primitive's ticket route. The deferred-work ledger is not read here: the v7
+    ledger lands with a later release layer."""
+    report.extend(install.tickets_preflight(paths, dev_trees, probe_capability=probes))
+    tickets_probs = install.missing_tickets_support(project, dev_trees)
+    if dev_trees and not tickets_probs:
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree) for tree in dict.fromkeys(dev_trees)
+            )
+        )
+        report.ok(
+            "skills.tickets-dispatch",
+            f"{' + '.join(probed)} dispatches from the ticket tree (tickets mode)",
+            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": probed},
+        )
+    report.extend(tickets_probs)
+
+
 # `validate`'s queue checks, one entry per work source (held exhaustive over
-# `worksource.SOURCES` by tests/test_worksource.py).
+# `worksource.SOURCES` by tests/test_worksource.py). The last argument is
+# `validate --probes`.
 _QUEUE_VALIDATORS: dict[
-    str, Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport], None]
+    str, Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport, bool], None]
 ] = {
     worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
     worksource.SOURCE_STORIES: _validate_stories_mode_queue,
+    worksource.SOURCE_TICKETS: _validate_tickets_mode_queue,
 }
 
 
@@ -3232,6 +3289,11 @@ def _actionable_stories_keys(paths: bmadconfig.ProjectPaths, spec_folder: str) -
 _ACTIONABLE_KEY_READERS: dict[str, Callable[[bmadconfig.ProjectPaths, str], list[str] | None]] = {
     worksource.SOURCE_SPRINT: _actionable_sprint_keys,
     worksource.SOURCE_STORIES: _actionable_stories_keys,
+    # Tickets validate runs no ledger gate yet (the v7 ledger lands later), so this
+    # row is unreachable; it refuses rather than answer for a queue it never read.
+    worksource.SOURCE_TICKETS: lambda _paths, _folder: worksource.refuse_unrunnable(
+        worksource.SOURCE_TICKETS
+    ),
 }
 
 
@@ -3400,6 +3462,9 @@ _RUN_PREFLIGHTS: dict[
 ] = {
     worksource.SOURCE_SPRINT: _preflight_sprint_queue,
     worksource.SOURCE_STORIES: _preflight_stories_queue,
+    worksource.SOURCE_TICKETS: lambda _paths, _args, _folder: worksource.refuse_unrunnable(
+        worksource.SOURCE_TICKETS
+    ),
 }
 
 
@@ -3407,10 +3472,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_bad_run_id(args.run_id)) is not None:
         return rc
     project = _project(args)
-    paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
     source, spec_folder = _resolve_source(args, pol)
     traits = worksource.traits_for(source)
+    paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
 
     if not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
@@ -3689,6 +3754,9 @@ def _dry_run_stories(
 _DRY_RUNNERS: dict[str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int]] = {
     worksource.SOURCE_SPRINT: _dry_run_sprint,
     worksource.SOURCE_STORIES: _dry_run_stories,
+    worksource.SOURCE_TICKETS: lambda _paths, _pol, _args, _folder: worksource.refuse_unrunnable(
+        worksource.SOURCE_TICKETS
+    ),
 }
 
 
@@ -3729,6 +3797,9 @@ def _print_stories_status(state: RunState, project: Path) -> None:
 _STATUS_PRINTERS: dict[str, Callable[[RunState, Path], None]] = {
     worksource.SOURCE_SPRINT: _print_sprint_status,
     worksource.SOURCE_STORIES: _print_stories_status,
+    worksource.SOURCE_TICKETS: lambda _state, _project: worksource.refuse_unrunnable(
+        worksource.SOURCE_TICKETS
+    ),
 }
 
 
@@ -4304,11 +4375,23 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
             file=sys.stderr,
         )
         return 1
-    paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    # A story run resumes only from a source this version can drive: one a newer
+    # bmad-loop persisted is refused rather than rebuilt as a sprint run, and a
+    # registered source whose runs land later is refused the way `run` refuses it.
+    # Ahead of every side effect below. A sweep's `source` is its launch default and
+    # never selects its engine.
+    if state.run_type != "sweep":
+        try:
+            if not worksource.resumable_traits_for(state.source).runnable:
+                worksource.refuse_unrunnable(state.source)
+        except (worksource.UnknownSource, worksource.SourceNotRunnable) as e:
+            print(f"cannot resume {run_dir.name}: {e}", file=sys.stderr)
+            return 1
+    paths = bmadconfig.load_paths(project, want_tickets=state.source == worksource.SOURCE_TICKETS)
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -7914,7 +7997,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
         "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
-        "that fails, times out or cannot be started fails validate",
+        "that fails, times out or cannot be started fails validate. In tickets mode, "
+        "also probe the project's tickets.py for the commands bmad-loop needs",
     )
     machine.add_json_flag(validate_p, "check findings")
 
@@ -8390,6 +8474,8 @@ def main(argv: list[str] | None = None) -> int:
         sprintstatus.SprintStatusError,
         policy_mod.PolicyError,
         verify.GitError,
+        worksource.SourceNotRunnable,
+        worksource.UnknownSource,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE

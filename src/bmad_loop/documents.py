@@ -65,9 +65,13 @@ def validate_document(
 ) -> dict[str, object]:
     """The `validate --json` document: the verdict plus every check that produced it.
 
-    ``mode`` is the source's ``validate_mode`` trait (``worksource``).
-    ``initiative`` and ``era`` are accepted but not yet emitted: they are reserved
-    for the ticket-tree source, which adds them to the document additively.
+    ``mode`` is the source's ``validate_mode`` trait (``worksource``) — an open
+    enum (``sprint``, ``stories``, ``tickets`` today) that a new source extends
+    additively, without a schema bump: an existing value never changes meaning.
+    ``initiative`` is the BMAD v7 active initiative a tickets run would drive
+    ("" in the other modes, as ``spec_folder`` is outside stories mode); ``era``
+    is the BMAD config shape the project resolved as (``v6``/``v7``, "" when the
+    config failed to load).
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
     anything breaking bumps VALIDATE_SCHEMA_VERSION). ``ok`` is true when no
@@ -112,6 +116,8 @@ def validate_document(
         # "" rather than null in sprint mode, where a spec folder is inapplicable —
         # the same convention as list_document's paused_stage.
         "spec_folder": spec_folder if mode == "stories" else "",
+        "initiative": initiative if mode == "tickets" else "",
+        "era": era,
         "counts": report.counts(),
         "findings": [
             {

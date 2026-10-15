@@ -80,6 +80,8 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 - **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start`. Written by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
 - **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts.
 
+`state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
+
 ## Task directory
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.

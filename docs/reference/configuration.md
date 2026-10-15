@@ -65,8 +65,17 @@ Story-queue source: classic sprint board vs. folder+id dispatch.
 
 | Key | Type | Default | Allowed | Description |
 | --- | --- | --- | --- | --- |
-| `source` | string | `"sprint-status"` | `sprint-status` / `stories` | sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder) |
+| `source` | string | `"sprint-status"` | `sprint-status` / `stories` / `tickets` | sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder) · tickets: the BMAD v7 ticket tree of core.active_initiative, via _bmad/method/scripts/tickets.py (validate only; runs land in a later release) |
 | `spec_folder` | string | `""` |  | stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md) |
+
+### `[tickets]`
+
+BMAD v7 ticket-tree runs (stories.source = tickets).
+
+| Key | Type | Default | Allowed | Description |
+| --- | --- | --- | --- | --- |
+| `mark_done` | string | `"auto"` | `auto` / `never` | auto: bmad-loop marks a ticket done once its build passes verify and review · never: leave the plan at built for a human |
+| `thorough_review` | string | `"high-risk"` | `always` / `high-risk` / `never` | when a ticket gets the thorough review: high-risk (its risk is high), always, or never |
 
 ### `[limits]`
 

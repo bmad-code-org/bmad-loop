@@ -90,6 +90,46 @@ def test_stories_source_invalid():
         policy.loads('[stories]\nsource = "manifest"\n')
 
 
+def test_stories_source_accepts_tickets():
+    """The ticket-tree source is a known source (its runs land later, but policy
+    must load it so `validate` can check the project). It needs no spec folder."""
+    pol = policy.loads('[stories]\nsource = " tickets "\n')
+    assert pol.stories.source == "tickets"
+    assert pol.stories.spec_folder == ""
+    assert "tickets" in policy.STORIES_SOURCES
+
+
+def test_tickets_policy_defaults_parse_and_template():
+    """`[tickets]` defaults to marking done automatically and thorough-reviewing only
+    high-risk tickets; every mode parses (stripped), and the template ships both
+    keys at their defaults."""
+    assert policy.loads("").tickets == policy.TicketsPolicy("auto", "high-risk")
+    for mode in sorted(policy.TICKETS_MARK_DONE_MODES):
+        assert policy.loads(f'[tickets]\nmark_done = " {mode} "\n').tickets.mark_done == mode
+    for mode in sorted(policy.TICKETS_THOROUGH_REVIEW_MODES):
+        loaded = policy.loads(f'[tickets]\nthorough_review = " {mode} "\n')
+        assert loaded.tickets.thorough_review == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).tickets == policy.TicketsPolicy()
+    assert 'mark_done = "auto"' in policy.POLICY_TEMPLATE
+    assert 'thorough_review = "high-risk"' in policy.POLICY_TEMPLATE
+    assert policy.loads("").to_dict()["tickets"] == {
+        "mark_done": "auto",
+        "thorough_review": "high-risk",
+    }
+
+
+def test_tickets_mark_done_rejects_unknown():
+    """Ablation: drop the `TICKETS_MARK_DONE_MODES` check and this FAILS."""
+    with pytest.raises(policy.PolicyError, match=r"tickets\.mark_done"):
+        policy.loads('[tickets]\nmark_done = "always"\n')
+
+
+def test_tickets_thorough_review_rejects_unknown():
+    """Ablation: drop the `TICKETS_THOROUGH_REVIEW_MODES` check and this FAILS."""
+    with pytest.raises(policy.PolicyError, match=r"tickets\.thorough_review"):
+        policy.loads('[tickets]\nthorough_review = "low-risk"\n')
+
+
 def test_stories_mode_requires_spec_folder():
     with pytest.raises(policy.PolicyError, match="requires stories.spec_folder"):
         policy.loads('[stories]\nsource = "stories"\n')

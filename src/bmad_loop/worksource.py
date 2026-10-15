@@ -2,13 +2,24 @@
 each one supports.
 
 A *work source* is where a run's queue comes from — ``"sprint-status"`` (the
-sprint board written by bmad-sprint-planning) or ``"stories"`` (a stories.yaml
-manifest beside SPEC.md). The CLI, runsetup and the read models have no Engine
+sprint board written by bmad-sprint-planning), ``"stories"`` (a stories.yaml
+manifest beside SPEC.md) or ``"tickets"`` (the BMAD v7 ticket tree of the active
+initiative, read through the project's ``tickets.py``). The CLI, runsetup and the read models have no Engine
 instance to ask, so the per-source differences they branch on live here as plain
 data: :class:`SourceTraits`, one entry per source in :data:`TRAITS`. A site that
 used to test ``source == "stories"`` reads the trait that names *why* it
 branches, and a site that dispatches whole functions per source keys a table on
 :data:`SOURCES` (``tests/test_worksource.py`` holds every such table exhaustive).
+
+A registered source that cannot run yet (``SourceTraits.runnable`` false: tickets,
+until its engine lands) still has a row in every table. Its rows for the run-side
+sites — dry-run, run preflight, the engine map, the status footer and the TUI
+board — raise :class:`SourceNotRunnable`, which the CLI reports as a one-line
+error at exit 1; ``validate`` checks such a source fully.
+
+A *persisted* source this registry does not carry (a run state written by a newer
+bmad-loop) is refused at resume (:func:`resumable_traits_for`), never rebuilt as
+some other source.
 
 ``SOURCES`` must equal ``policy.STORIES_SOURCES`` (a sync test enforces it).
 policy.py deliberately does not import this module: the settings sync test
@@ -31,21 +42,41 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol, TypeAlias
+from typing import Final, Literal, NoReturn, Protocol, TypeAlias
 
 from .model import Phase
 
 SOURCE_SPRINT: Final = "sprint-status"
 SOURCE_STORIES: Final = "stories"
-SOURCES: Final[tuple[str, ...]] = (SOURCE_SPRINT, SOURCE_STORIES)
+SOURCE_TICKETS: Final = "tickets"
+SOURCES: Final[tuple[str, ...]] = (SOURCE_SPRINT, SOURCE_STORIES, SOURCE_TICKETS)
 
-QueueMode = Literal["sprint", "stories"]
+QueueMode = Literal["sprint", "stories", "tickets"]
 """The ``mode`` values ``validate --json`` reports — one per source, through
-:attr:`SourceTraits.validate_mode`."""
+:attr:`SourceTraits.validate_mode`. An open enum: a new source adds a value."""
 
 
 class UnknownSource(ValueError):
     """A source name no registry entry carries."""
+
+
+class SourceNotRunnable(Exception):
+    """A registered source whose runs land in a later release: raised by its row
+    in every run-side dispatch table (module docstring). ``str()`` is the
+    operator-facing line."""
+
+    def __init__(self, source: str) -> None:
+        super().__init__(
+            f"{source} mode cannot run yet: it lands in a later release layer of "
+            f"bmad-loop — `bmad-loop validate` checks a {source} project today"
+        )
+        self.source = source
+
+
+def refuse_unrunnable(source: str) -> NoReturn:
+    """Raise :class:`SourceNotRunnable` for ``source`` — the body of a
+    not-yet-runnable source's row in a run-side dispatch table."""
+    raise SourceNotRunnable(source)
 
 
 @dataclass(frozen=True)
@@ -103,6 +134,18 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         replay=False,
         runnable=True,
     ),
+    SOURCE_TICKETS: SourceTraits(
+        name=SOURCE_TICKETS,
+        label="tickets mode — BMAD v7 ticket tree",
+        validate_mode="tickets",
+        has_epics=False,
+        has_spec_folder=False,
+        stories_primitive=False,
+        sentinels=False,
+        operator_park=True,
+        replay=False,
+        runnable=False,
+    ),
 }
 
 
@@ -116,14 +159,30 @@ def traits_for(source: str) -> SourceTraits:
 
 
 def resumed_traits_for(source: str) -> SourceTraits:
-    """The traits of a *persisted* run's ``source``, falling back to the sprint
-    source for a name the registry does not carry.
+    """The traits of a *persisted* run's ``source`` for the read-side sites
+    (status, the TUI, rollback and resolve bookkeeping), falling back to the
+    sprint source for a name the registry does not carry, so an observer never
+    crashes on a run state written by another version.
 
-    This is the legacy resume behavior, kept on purpose: a run state written with
-    an unrecognised ``source`` has always been resumed, reported and replayed as a
-    sprint run. Only sites reading ``RunState.source`` use it; a launch-time
-    source goes through :func:`traits_for`."""
+    Resuming such a run is refused instead: the resume path asks
+    :func:`resumable_traits_for`. A launch-time source goes through
+    :func:`traits_for`."""
     return TRAITS.get(source, TRAITS[SOURCE_SPRINT])
+
+
+def resumable_traits_for(source: str) -> SourceTraits:
+    """The traits of a persisted run's ``source`` for resuming it; raises
+    :class:`UnknownSource` for a name the registry does not carry. A run state
+    written by a newer bmad-loop must not be driven on as a sprint run, so the
+    resume path refuses it loudly (do not downgrade bmad-loop mid-run)."""
+    try:
+        return TRAITS[source]
+    except KeyError:
+        raise UnknownSource(
+            f"this run's work source {source!r} is unknown to this bmad-loop — it was "
+            "started by a newer version; resume it with that version (do not downgrade "
+            "bmad-loop mid-run)"
+        ) from None
 
 
 def launch_roles(source: str, retrospective: str) -> tuple[str, ...]:

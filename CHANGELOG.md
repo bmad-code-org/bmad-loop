@@ -13,6 +13,15 @@ breaking changes may land in a minor release.
   `_bmad/method/scripts/tickets.py` and no v6 artifact keys validates and resolves its
   artifacts to the active initiative folder. New `bmad-config.initiative-unset` and
   `bmad-config.v6-keys-ignored` validate warnings.
+- Register the `tickets` work source (`[stories] source = "tickets"`, the BMAD v7 ticket
+  tree). `validate` checks a tickets project: the `tickets.*` preflight (script, config
+  reader, uv, active initiative, repo store; tracker stores are refused) and the dev
+  primitive's ticket route (`skills.tickets-dispatch*`). `validate --probes` also probes
+  the project's `tickets.py`. `run` and `resume` refuse tickets mode until its engine lands.
+- Add the `[tickets]` policy section: `mark_done` (`auto` | `never`) and
+  `thorough_review` (`never` | `high-risk` | `always`).
+- Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
+  `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 - Add `bmad-loop plugins [list|enable|accept|revoke] [name]`: list plugins with origin,
@@ -50,6 +59,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Refuse to resume a story run whose recorded work source this bmad-loop does not
+  know (a run started by a newer version) instead of resuming it as a sprint run.
 - Start bmad-loop's psmux servers with `PSMUX_NO_WARM=1`: their warm pool and hidden
   `__warm__` standby were never used, and dropping them cuts an idle project from 16 psmux
   processes and about 935 MiB of summed working sets to 4 and about 175 MiB. The operator's

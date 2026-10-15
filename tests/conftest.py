@@ -2394,6 +2394,31 @@ def install_build_auto_skill(
     return skills
 
 
+def install_build_auto_v7_skill(
+    root: Path, tree: str = ".claude/skills", *, tickets_route: bool = True
+) -> Path:
+    """The BMAD v7 `bmad-build-auto`: :func:`install_build_auto_skill` (so the base
+    and stories probes pass too) with a step-01 that also resolves a ticket from the
+    tree, carrying the marker `install.missing_tickets_support` content-probes for.
+    ``tickets_route=False`` leaves the pre-v7 step-01, the stale install."""
+    from bmad_loop.install import (
+        DEV_PRIMITIVE_NEW,
+        STORIES_PROBE_TEXT,
+        TICKETS_PROBE_FILE,
+        TICKETS_PROBE_TEXT,
+    )
+
+    skills = install_build_auto_skill(root, tree, folder_id=True)
+    if tickets_route:
+        (skills / DEV_PRIMITIVE_NEW / TICKETS_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n"
+            f"Resolve a ticket with `uv run {{project-root}}/_bmad/{TICKETS_PROBE_TEXT} "
+            "--project-root {project-root} find <ref>`.\n",
+            encoding="utf-8",
+        )
+    return skills
+
+
 def install_dev_shim(root: Path, tree: str = ".claude/skills", *, with_review: bool = True) -> Path:
     """Lay down ONLY the post-rename forwarding shim: a lone `bmad-dev-auto/SKILL.md`
     with no marker files and no new-name skill beside it.

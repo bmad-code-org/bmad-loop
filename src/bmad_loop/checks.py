@@ -127,6 +127,23 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        # tickets mode: the dev primitive's step-01 routes a ticket from the v7 tree
+        "skills.tickets-dispatch",
+        "skills.tickets-dispatch-missing",
+        "skills.tickets-dispatch-stale",
+        # tickets mode preflight (install.tickets_preflight)
+        "tickets.era",
+        "tickets.script-missing",
+        "tickets.config-utils-missing",
+        "tickets.uv-missing",
+        "tickets.initiative-unset",
+        "tickets.initiative-missing",
+        # a tracker store (or an unreadable store config): bmad-loop drives repo stores only
+        "tickets.store-not-repo",
+        # `validate --probes`: the script's `--help` offers every verb and mark status
+        "tickets.capability",
+        # tickets.py present but validate ran without --probes: nothing executed
+        "tickets.capability-not-run",
         "skills.sweep",
         "skills.sweep-missing",
         "skills.sweep-incomplete",

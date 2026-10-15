@@ -54,12 +54,12 @@ Runs the preflight checks.
 bmad-loop validate [--project PROJECT] [--spec FOLDER] [--render-probe] [--probes] [--json]
 ```
 
-| Option           | Description                                                                                                                     |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `--spec FOLDER`  | Validate stories mode against `FOLDER/stories.yaml`. Overrides `[stories] source` and skips the sprint-status gate.             |
-| `--render-probe` | Also run each dev skill's render command in a throwaway copy of `_bmad/` (needs network access).                                |
-| `--probes`       | Also run every `[environment]` probe on this host. All probes run, each bounded by `probe_timeout_s`; any failure is a problem. |
-| `--json`         | Print the findings as one JSON document.                                                                                        |
+| Option           | Description                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--spec FOLDER`  | Validate stories mode against `FOLDER/stories.yaml`. Overrides `[stories] source` and skips the sprint-status gate.                                                                                    |
+| `--render-probe` | Also run each dev skill's render command in a throwaway copy of `_bmad/` (needs network access).                                                                                                       |
+| `--probes`       | Also run every `[environment]` probe on this host. All probes run, each bounded by `probe_timeout_s`; any failure is a problem. In tickets mode, also run the project's `tickets.py` capability probe. |
+| `--json`         | Print the findings as one JSON document.                                                                                                                                                               |
 
 - Exit 0 when no finding has severity `problem`, else 1. Warnings do not change the exit code.
 - Runs no project-controlled commands unless `--render-probe` or `--probes` is given.
@@ -161,6 +161,7 @@ bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] 
 
 - Sprint mode selects stories at `backlog` or `ready-for-dev`. A `--story` that matches nothing, matches several stories, or is not actionable exits 1.
 - Refused with exit 1 before anything is created on: git below the supported floor, a dirty worktree, a worktree-isolation conflict, missing base skills, or a failing plugin-trust verdict.
+- `[stories] source = "tickets"` is refused with exit 1, `--dry-run` included: tickets runs are not available yet. `validate` checks a tickets project.
 - Prints `run <id> starting (attach: bmad-loop attach)`, then the run summary; exits 0 once the engine has run.
 
 ### `sweep`
@@ -203,6 +204,7 @@ bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
 | `--accept-baseline` | For this resume only, adopt the current HEAD as the baseline of every restarted in-place story instead of preserving commits above the old baseline. |
 
 - Refused with exit 1 for a live engine, a finished run, a sweep whose ledger cannot be read, and the same git-floor, isolation, skill and plugin-trust gates as `run`. Does not require a clean worktree.
+- Refused with exit 1, before any side effect, for a story run whose work source this version does not know (the run was started by a newer bmad-loop) or cannot run yet. Do not downgrade bmad-loop while a run is in progress.
 - Discards any pending stop request and re-reads the policy and config before continuing.
 
 ### `resolve`
@@ -453,13 +455,17 @@ bmad-loop relay [event]
 
 ### `validate --json`
 
-| Field         | Type   | Meaning                                                  |
-| ------------- | ------ | -------------------------------------------------------- |
-| `ok`          | bool   | no finding has severity `problem`; matches the exit code |
-| `mode`        | str    | `sprint` or `stories`                                    |
-| `spec_folder` | str    | stories spec folder; `""` in sprint mode                 |
-| `counts`      | object | `{ok, warning, problem}` counts                          |
-| `findings`    | array  | one entry per finding, in the order the checks ran       |
+| Field         | Type   | Meaning                                                                                        |
+| ------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| `ok`          | bool   | no finding has severity `problem`; matches the exit code                                       |
+| `mode`        | str    | the work source: `sprint`, `stories` or `tickets` — an open enum                               |
+| `spec_folder` | str    | stories spec folder; `""` in the other modes                                                   |
+| `initiative`  | str    | the BMAD v7 active initiative tickets mode drives; `""` in the other modes                     |
+| `era`         | str    | the BMAD config shape the project resolved as: `v6` or `v7`; `""` when the config did not load |
+| `counts`      | object | `{ok, warning, problem}` counts                                                                |
+| `findings`    | array  | one entry per finding, in the order the checks ran                                             |
+
+`mode` is an open enum: a new work source adds a value without a `schema_version` bump, and an existing value never changes meaning. Treat an unknown value as "another mode", never as sprint.
 
 Each finding has `check` (the stable [check id](#validate-checks) — the only field safe to match on), `severity` (`ok` / `warning` / `problem`), `message` (free text), and `detail` (check-specific object, or null).
 
@@ -659,8 +665,20 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `skills.stories-dispatch`              | ok                     | stories mode: the dev primitive supports folder+id dispatch                                                                       |
 | `skills.stories-dispatch-missing`      | problem                | stories mode: the dispatch probe file is missing                                                                                  |
 | `skills.stories-dispatch-stale`        | problem                | stories mode: the dev primitive lacks folder+id dispatch                                                                          |
+| `skills.tickets-dispatch`              | ok                     | tickets mode: the dev primitive resolves a ticket from the ticket tree                                                            |
+| `skills.tickets-dispatch-missing`      | problem                | tickets mode: the dispatch probe file is missing                                                                                  |
+| `skills.tickets-dispatch-stale`        | problem                | tickets mode: the dev primitive predates the ticket tree                                                                          |
 | `skills.sweep`                         | ok                     | the `bmad-loop-sweep` skill is present in the triage skill trees                                                                  |
 | `skills.sweep-missing`                 | problem                | `bmad-loop-sweep` is not installed in a triage skill tree                                                                         |
 | `skills.sweep-incomplete`              | problem                | `bmad-loop-sweep` is missing files                                                                                                |
+| `tickets.era`                          | ok                     | tickets mode: names the ticket-tree script, the method module version and the active initiative                                   |
+| `tickets.script-missing`               | problem                | tickets mode: `_bmad/method/scripts/tickets.py` is not installed                                                                  |
+| `tickets.config-utils-missing`         | problem                | tickets mode: `_bmad/scripts/config_utils.py`, which `tickets.py` reads the config through, is missing                            |
+| `tickets.uv-missing`                   | problem                | tickets mode: `uv` is not on PATH (`bmad-build-auto` runs `tickets.py` with `uv run`)                                             |
+| `tickets.initiative-unset`             | problem                | tickets mode: no `[core] active_initiative` is set                                                                                |
+| `tickets.initiative-missing`           | problem                | tickets mode: the active initiative's folder does not exist                                                                       |
+| `tickets.store-not-repo`               | problem                | tickets mode: the ticket store is a tracker, or its config cannot be read; bmad-loop drives repo stores only                      |
+| `tickets.capability`                   | ok / problem           | `--probes` in tickets mode: `tickets.py --help` offers every command and `mark` status bmad-loop needs                            |
+| `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                 |
 
 The set is closed (`checks.VALIDATE_CHECKS`); plugins cannot add check ids.

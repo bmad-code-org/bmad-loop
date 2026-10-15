@@ -23,6 +23,7 @@ from conftest import (
     RENDERER_STUB_SKILL_MD,
     git,
     install_build_auto_skill,
+    install_build_auto_v7_skill,
     install_dev_shim,
     install_render_probe_fixture,
     nested_repo_root_paths,
@@ -12004,3 +12005,256 @@ def test_module_skills_unreadable_source_dir_is_reported(tmp_path):
     assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
         f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
     ]
+
+
+# --- tickets mode (BMAD v7 ticket tree): preflight findings, one test per id ---
+#
+# Real-spawn budget: one capability probe of the vendored tickets.py (2 spawns:
+# `--help` and `mark --help`) in test_tickets_preflight_capability_ok_on_project_v7;
+# every other capability row stubs `TicketTree.capability`.
+
+
+def _tickets_paths(layout):
+    from bmad_loop import bmadconfig
+
+    return bmadconfig.load_paths(layout.project, want_tickets=True)
+
+
+def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv"):
+    """`tickets_preflight` on ``layout`` with uv pinned present (or absent with
+    ``uv=None``) — the host's PATH must not decide a project check."""
+    monkeypatch.setattr(
+        install_mod.shutil, "which", lambda tool: uv if tool == "uv" else f"/usr/bin/{tool}"
+    )
+    return install_mod.tickets_preflight(
+        _tickets_paths(layout), [".claude/skills"], probe_capability=probe
+    )
+
+
+def _ids(findings):
+    return [f.check for f in findings]
+
+
+def test_tickets_preflight_passes_on_project_v7(project_v7, monkeypatch):
+    """The v7 sandbox is a tickets project bmad-loop can drive: no problem, and the
+    `tickets.era` ok line names the script, the method module and the initiative."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    findings = _tickets_findings(project_v7, monkeypatch)
+    assert _ids(findings) == ["tickets.era", "tickets.capability-not-run"]
+    era = findings[0]
+    assert era.severity == "ok"
+    assert era.detail == {
+        "era": "v7",
+        "script": "_bmad/method/scripts/tickets.py",
+        "bmod_method_version": "7.0.0",
+        "initiative": project_v7.initiative,
+    }
+    assert "7.0.0" in era.message and project_v7.initiative in era.message
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_script_missing(project_v7, monkeypatch):
+    """Tickets mode on a v6 install (no `_bmad/method/scripts/tickets.py`, so the
+    config resolved as v6 — without the v6 keys `load_paths` itself refuses): a
+    problem, and no `tickets.era` ok line or capability note about a script that is
+    not there. Ablation: drop the is_file gate and this FAILS."""
+    from bmad_loop import bmadconfig
+
+    project_v7.tickets_script.unlink()
+    paths = bmadconfig.ProjectPaths(
+        project=project_v7.project,
+        implementation_artifacts=project_v7.output_folder,
+        planning_artifacts=project_v7.output_folder,
+    )
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=True)
+    assert _ids(findings) == ["tickets.script-missing"]
+    assert findings[0].severity == "problem"
+    assert "bmad setup" in findings[0].message
+
+
+def test_tickets_preflight_config_utils_missing(project_v7, monkeypatch):
+    """`tickets.py` imports the project's `_bmad/scripts/config_utils.py`; without it
+    every call exits `cannot read the BMad config`. Ablation: drop the check and this
+    FAILS."""
+    (project_v7.project / install_mod.RENDERER_CONFIG_UTILS_REL).unlink()
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.config-utils-missing"
+    assert problem.detail == {"path": install_mod.RENDERER_CONFIG_UTILS_REL}
+
+
+def test_tickets_preflight_uv_missing(project_v7, monkeypatch):
+    """bmad-build-auto runs tickets.py with `uv run`, so uv is required even though
+    bmad-loop itself runs the script directly. Ablation: drop the check and this
+    FAILS."""
+    findings = _tickets_findings(project_v7, monkeypatch, uv=None)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.uv-missing"
+    assert "uv run" in problem.message
+
+
+def test_tickets_preflight_initiative_unset(project_v7, monkeypatch):
+    """No `[core] active_initiative`: validate's `bmad-config.initiative-unset` is a
+    warning, but tickets mode has no tree to run, so here it is a problem.
+    Ablation: drop the check and this FAILS."""
+    (project_v7.project / "_bmad" / "custom" / "config.user.toml").write_text(
+        "# no initiative\n", encoding="utf-8"
+    )
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-unset"
+    assert "config.user.toml" in problem.message
+    assert "tickets.initiative-missing" not in _ids(findings)
+
+
+def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
+    """The active initiative names a folder that does not exist (tickets.py would
+    exit `active initiative folder not found`). Ablation: drop the check and this
+    FAILS."""
+    shutil.rmtree(project_v7.initiative_folder)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-missing"
+    assert problem.detail["initiative"] == project_v7.initiative
+
+
+@pytest.mark.parametrize(
+    ("config", "store"),
+    [('[tickets]\nstore = "jira"\n', "jira"), ("[tickets\nstore = ", None)],
+    ids=["tracker", "unreadable"],
+)
+def test_tickets_preflight_store_not_repo(project_v7, monkeypatch, config, store):
+    """Tracker stores are refused (decision 9): bmad-loop drives a repo store only,
+    and a store config it cannot read is not assumed to be one. Ablation: drop the
+    store check and both rows FAIL."""
+    (project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL).write_text(config, encoding="utf-8")
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.store-not-repo"
+    assert problem.detail["store"] == store
+    assert ("tracker stores are not supported" in problem.message) == (store is not None)
+
+
+@pytest.mark.parametrize(
+    "config", [None, "# no table\n", '[tickets]\nstore = ""\n', '[tickets]\nstore = "repo"\n']
+)
+def test_tickets_preflight_repo_store_defaults_like_upstream(project_v7, monkeypatch, config):
+    """Upstream reads an absent file, table or blank value as the repo store — so
+    must the preflight, or it would refuse a stock install."""
+    store_cfg = project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL
+    if config is None:
+        store_cfg.unlink()
+    else:
+        store_cfg.write_text(config, encoding="utf-8")
+    assert "tickets.store-not-repo" not in _ids(_tickets_findings(project_v7, monkeypatch))
+
+
+def test_tickets_preflight_capability_ok_on_project_v7(project_v7, monkeypatch):
+    """Under `probe_capability` the vendored script's `--help` offers every verb and
+    `mark` status bmad-loop needs (2 real spawns, this file's whole budget)."""
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert cap.severity == "ok"
+    assert {"next", "status", "find", "mark"} <= set(cap.detail["verbs"])
+    assert "tickets.capability-not-run" not in _ids(findings)
+
+
+def test_tickets_preflight_capability_problem_names_the_gap(project_v7, monkeypatch):
+    """A script missing a verb or a `mark` status cannot drive a run. Ablation: drop
+    the `capability_problems` check and this FAILS."""
+    from bmad_loop import ticketmodel, tickettree
+
+    monkeypatch.setattr(
+        tickettree.TicketTree,
+        "capability",
+        lambda self: ticketmodel.Capability(
+            verbs=frozenset({"next", "status", "find"}), statuses=frozenset({"done"})
+        ),
+    )
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert cap.severity == "problem"
+    assert "no `mark` command" in cap.message
+    assert any("blocked" in line for line in cap.detail["problems"])
+
+
+def test_tickets_preflight_capability_fault_is_a_problem(project_v7, monkeypatch):
+    """A probe that cannot run (here: timed out) is a problem carrying the error's
+    `kind`, never a silent pass."""
+    from bmad_loop import tickettree
+
+    def boom(self):
+        raise tickettree.TicketsTimeout("tickets.py --help timed out")
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", boom)
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert (cap.severity, cap.detail) == ("problem", {"kind": "timeout"})
+
+
+def test_tickets_preflight_capability_not_run_executes_nothing(project_v7, monkeypatch):
+    """Without `probe_capability` the project's script is never executed (plain
+    validate runs no project-controlled command); a note says so. Ablation: probe
+    unconditionally and the stub below raises."""
+    from bmad_loop import tickettree
+
+    def never(self):
+        raise AssertionError("capability probed without probe_capability")
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", never)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    note = next(f for f in findings if f.check == "tickets.capability-not-run")
+    assert (note.severity, note.detail) == ("ok", {"run": False})
+    assert "--probes" in note.message
+
+
+def test_tickets_script_rel_is_the_v7_marker():
+    """The script tickets mode runs IS the era marker bmadconfig probes."""
+    from bmad_loop import bmadconfig
+
+    assert install_mod.TICKETS_SCRIPT_REL == bmadconfig.V7_MARKER_REL.as_posix()
+
+
+def test_bmod_method_version_reads_the_first_tree_with_one(tmp_path):
+    """Display only: the first tree carrying a `[bmod] version`, None when none does."""
+    assert install_mod.bmod_method_version(tmp_path, [".claude/skills"]) is None
+    manifest = tmp_path / ".agents/skills" / install_mod.BMOD_METHOD_MANIFEST
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('[bmod]\ncode = "method"\nversion = "6.13.0"\n', encoding="utf-8")
+    assert (
+        install_mod.bmod_method_version(tmp_path, [".claude/skills", ".agents/skills"]) == "6.13.0"
+    )
+
+
+def test_missing_tickets_support_findings_split_absent_from_stale(tmp_path):
+    """Tickets mode needs a dev primitive whose step-01 resolves a ticket from the
+    tree: a half install (`-missing`) and a pre-v7 one (`-stale`) are separate ids,
+    and the v7 build-auto clears both. Ablation: drop the marker check and the
+    stale leg FAILS."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import (
+        DEV_PRIMITIVE_NEW,
+        TICKETS_PROBE_FILE,
+        TICKETS_PROBE_TEXT,
+        missing_tickets_support,
+    )
+
+    tree = ".claude/skills"
+    absent = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in absent] == ["skills.tickets-dispatch-missing"]
+
+    install_build_auto_v7_skill(tmp_path, tree, tickets_route=False)
+    stale = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in stale] == ["skills.tickets-dispatch-stale"]
+    assert stale[0].detail == {
+        "tree": tree,
+        "skill": DEV_PRIMITIVE_NEW,
+        "file": TICKETS_PROBE_FILE,
+        "marker": TICKETS_PROBE_TEXT,
+    }
+    assert all(f.check in VALIDATE_CHECKS for f in (*absent, *stale))
+
+    install_build_auto_v7_skill(tmp_path, tree)
+    assert missing_tickets_support(tmp_path, [tree]) == []
