@@ -12020,6 +12020,10 @@ class _PinningMux(_LaunchingUnitMux):
     def __init__(self, pin):
         super().__init__()
         self.pin = pin
+        self.piped: list[str] = []
+
+    def pipe_pane(self, window_id, log_file):
+        self.piped.append(window_id)
 
     def pane_target(self, window_id):
         if isinstance(self.pin, Exception):
@@ -12028,16 +12032,23 @@ class _PinningMux(_LaunchingUnitMux):
 
 
 def test_start_session_pins_the_launched_pane(tmp_path):
-    adapter, _ = make_dev_adapter(tmp_path, mux=_PinningMux("%9"))
+    # The log tee follows the pin too: a window target is the active pane,
+    # which a hook's split would be. Ablation: pipe before pinning, or pipe the
+    # window id, and the tee lands on the window.
+    mux = _PinningMux("%9")
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
     handle = adapter.start_session(_dev_spec(tmp_path))
     assert (handle.native_id, handle.pane_target) == ("@1", "@1.%9")
+    assert mux.piped == ["@1.%9"]
     assert _lifecycle_events(adapter, "pane-pin-failed") == []
 
 
 def test_a_failed_pin_falls_back_to_the_window_and_says_so(tmp_path):
-    adapter, _ = make_dev_adapter(tmp_path, mux=_PinningMux(MultiplexerError("gone")))
+    mux = _PinningMux(MultiplexerError("gone"))
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
     handle = adapter.start_session(_dev_spec(tmp_path))
     assert handle.pane_target is None
+    assert mux.piped == ["@1"]
     crumbs = _lifecycle_events(adapter, "pane-pin-failed")
     assert [(c["window"], c["error"]) for c in crumbs] == [("@1", "MultiplexerError: gone")]
 
