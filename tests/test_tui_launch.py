@@ -3173,16 +3173,21 @@ def test_an_underivable_launcher_root_is_reported_by_the_check(monkeypatch, tmp_
 def test_a_ctl_session_setup_warning_reaches_the_sink(monkeypatch, tmp_path: Path):
     """Textual captures stderr for the whole TUI run, so a step the backend
     could not finish at create (psmux turning a user's destroy-unattached off)
-    is routed to the sink, not printed. Ablation: drop the catch around
-    new_session and the sink is empty."""
-    import warnings
+    is routed to the sink as well. Ablation: drop the take_setup_notes read
+    and the sink is empty."""
 
     class _Mux:
+        notes: list[str] = []
+
         def has_session(self, name):
             return False
 
         def new_session(self, name, project):
-            warnings.warn(f"could not set destroy-unattached off on {name}", RuntimeWarning)
+            self.notes = [f"could not set destroy-unattached off on {name}"]
+
+        def take_setup_notes(self):
+            notes, self.notes = self.notes, []
+            return notes
 
     warned: list[str] = []
     monkeypatch.setattr(launch, "get_multiplexer", lambda: _Mux())

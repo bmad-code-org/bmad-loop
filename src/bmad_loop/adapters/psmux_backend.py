@@ -80,7 +80,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -696,16 +695,19 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # exists, and raising here would leave it untagged (the caller's tag
         # write never runs), which a shared registry's cleanup refuses to own.
         # psmux reaps only on a last-client detach, so a failed write is said,
-        # not fatal. Said as a warning, so a caller whose stderr reaches nobody
-        # (the TUI) can route it to the operator.
+        # not fatal. Printed unconditionally, and kept for take_setup_notes so
+        # a caller whose stderr reaches nobody (the TUI) can show it too.
         try:
             self.set_session_option(name, "destroy-unattached", "off")
         except TmuxError as exc:
-            warnings.warn(
-                f"could not set destroy-unattached off on {name}: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            note = f"could not set destroy-unattached off on {name}: {exc}"
+            print(f"warning: {note}", file=sys.stderr)
+            vars(self).setdefault("_setup_notes", []).append(note)
+
+    def take_setup_notes(self) -> list[str]:
+        """The setup degradations new_session said since the last call, oldest
+        first; the instance is process-wide, so each is handed out once."""
+        return vars(self).pop("_setup_notes", [])
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:

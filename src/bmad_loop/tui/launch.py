@@ -18,7 +18,6 @@ import re
 import stat
 import subprocess
 import sys
-import warnings
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
@@ -1055,13 +1054,12 @@ def _ensure_ctl_session(project: Path) -> str:
     # catch — otherwise the raw MultiplexerError slips past them and crashes the app.
     try:
         if not mux.has_session(name):
-            # A setup step the backend could not finish is a warning, not an
-            # error; Textual swallows stderr, so it goes through the sink.
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                mux.new_session(name, project)
-            for w in caught:
-                _warn_once(f"ctl-session-setup:{name}:{w.message}", str(w.message))
+            mux.new_session(name, project)
+            # A setup step the backend could not finish is printed, not raised,
+            # and Textual swallows stderr, so it goes through the sink too.
+            take = getattr(mux, "take_setup_notes", None)
+            for note in take() if take is not None else []:
+                _warn_once(f"ctl-session-setup:{name}:{note}", note)
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
     # After both arms: a session created just now on a stale server inherits

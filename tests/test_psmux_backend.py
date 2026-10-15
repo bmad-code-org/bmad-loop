@@ -414,7 +414,7 @@ def test_new_session_exit_zero_noop_raises(monkeypatch, tmp_path):
         PsmuxMultiplexer().new_session("s", tmp_path)
 
 
-def test_new_session_survives_a_failed_destroy_unattached_write(monkeypatch, tmp_path):
+def test_new_session_survives_a_failed_destroy_unattached_write(monkeypatch, tmp_path, capsys):
     # #951: the session exists once has-session answers; raising on the option
     # write would leave it untagged (the caller's tag write never runs), so the
     # failure is said instead. Ablation: let the TmuxError through and this raises.
@@ -423,8 +423,13 @@ def test_new_session_survives_a_failed_destroy_unattached_write(monkeypatch, tmp
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="timed out")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    with pytest.warns(RuntimeWarning, match="could not set destroy-unattached off on s"):
-        PsmuxMultiplexer().new_session("s", tmp_path)
+    mux = PsmuxMultiplexer()
+    mux.new_session("s", tmp_path)
+    assert "could not set destroy-unattached off on s" in capsys.readouterr().err
+    # Kept for a caller whose stderr reaches nobody, and handed out once.
+    (note,) = mux.take_setup_notes()
+    assert note.startswith("could not set destroy-unattached off on s")
+    assert mux.take_setup_notes() == []
 
 
 def test_new_session_failure_raises_multiplexer_error(monkeypatch, tmp_path):
