@@ -8478,6 +8478,34 @@ def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
 
 
+def test_sweep_resume_refuses_an_initiative_change_before_any_write(project, monkeypatch, capsys):
+    """A v7 sweep resumed under another active initiative is refused with the
+    pin's fix text before the journal row, the pin re-stamp and the engine arm.
+    `compose_resume` raises the same text, but only after those side effects; the
+    gate here is what keeps them from happening. The judgment itself is pinned
+    in tests/test_runsetup.py; here it is stubbed to a refusal.
+
+    ABLATION (performed): delete the `sweep_initiative_conflict` gate in
+    `_prepare_resume_locked` and the resume journals `run-resume` and re-stamps
+    the pin before `compose_resume` refuses."""
+    import contextlib
+
+    from bmad_loop import runs, runsetup
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    monkeypatch.setattr(
+        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+    )
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    with contextlib.suppress(runsetup.SweepPinError):
+        assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert f"cannot resume {run_dir.name}: initiative switched" in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
+
+
 def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
     """A story run never dispatches `/bmad-loop-sweep`, so its resume ignores the
     skill. Ablation: drop the `run_type` guard on the resume gate and this reddens."""

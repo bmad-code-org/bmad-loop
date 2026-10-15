@@ -245,7 +245,7 @@ bmad-loop decisions [--project PROJECT] [--list] [--json]
 | `--list` | List pending decisions with their options and the recommended one. |
 | `--json` | Emit the pending decisions as one JSON document. Implies `--list`. |
 
-- Prompts once per decision. `close` marks the ledger entry done immediately; `build` and `keep-open` are saved to `.bmad-loop/decisions.json` for the next sweep.
+- Prompts once per decision. `close` marks the ledger entry done immediately; `build` and `keep-open` are saved to `.bmad-loop/decisions.json` (on BMAD v7, the active initiative's `decisions-<initiative>.json`) for the next sweep.
 - Exits 1 if an answer fails to record. Unreadable ledger or run directories produce a `note:` on stderr and exit 0.
 
 JSON: [`decisions --json`](#decisions---json).

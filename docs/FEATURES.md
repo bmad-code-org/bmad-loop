@@ -215,7 +215,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** A sweep's triage can raise questions only a human can answer. You answer them during an attended sweep, or afterwards with `bmad-loop decisions` or `d` in the TUI; each answer builds, closes, or keeps the entry open.
 - **Properties:**
   - `bmad-loop decisions` offers only ids still open, surfaced by a past triage, and without a usable stored answer.
-  - An out-of-band `close` marks the ledger entry done immediately; `build` and `keep-open` are saved to `.bmad-loop/decisions.json` for the next sweep.
+  - An out-of-band `close` marks the ledger entry done immediately; `build` and `keep-open` are saved to `.bmad-loop/decisions.json` (on BMAD v7, the active initiative's `decisions-<initiative>.json`) for the next sweep.
   - A sweep reads its run store first and uses a project-store answer only for an id this triage asks that the run store has not answered.
   - A keep-open answer whose option is gone or re-authored is dropped as `stale-option`, notified, and removed from the project store.
   - An unattended sweep (`--no-prompt`) asks nothing, builds only decision-free bundles, and notifies `N deferred-work decisions pending`.

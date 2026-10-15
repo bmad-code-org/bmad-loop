@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
-from . import deferredwork, gates, sprintstatus, verify
+from . import deferredwork, gates, sprintstatus, ticketstore, verify
 from .adapters.generic import load_result_document
 from .engine import (
     Engine,
@@ -1483,6 +1483,16 @@ class SweepEngine(Engine):
         prompter: DecisionPrompter | None = None,
         **kwargs: Any,
     ):
+        # v7: a ticket store no checkout carries is shared, as in a tickets run
+        # (`TicketsEngine.__init__`) — the ledger and bundle plans under it stay at
+        # the main checkout and worktree mounts are redirected to it. Read from the
+        # topology the sweep recorded at its start (`runsetup.compose_sweep`).
+        state, paths = kwargs.get("state"), kwargs.get("paths")
+        if state is not None and paths is not None and state.store_topology:
+            kwargs["paths"] = ticketstore.with_shared_store(paths, state.store_topology)
+        # Whether `store-unversioned` is already journaled for this run (None until
+        # the journal is first read for it, `_note_store_unversioned`).
+        self._unversioned_noted: bool | None = None
         super().__init__(*args, **kwargs)
         self.adapters["triage"] = (
             triage_adapter if triage_adapter is not None else self.adapters["dev"]
@@ -2939,7 +2949,10 @@ class SweepEngine(Engine):
         # `deferred_work` hangs off `implementation_artifacts`, which stays
         # project-rooted under the override.
         project = _project_of_run_dir(self.run_dir)
-        dropped = decisions_store.prune_pre_answers(project, deferredwork.open_ids(text))
+        scope = decisions_store.store_scope(self.paths)
+        dropped = decisions_store.prune_pre_answers(
+            project, deferredwork.open_ids(text), scope=scope
+        )
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             # The STORE FILE, not the workspace root: the same divergence that
@@ -2954,7 +2967,7 @@ class SweepEngine(Engine):
             # nothing wrote nothing and spawns no git.
             self._commit_ledger(
                 "chore(sweep): drop consumed deferred-work pre-answers",
-                path=decisions_store.store_path(project),
+                path=decisions_store.store_path(project, scope),
                 family="store",
             )
 
@@ -3019,7 +3032,8 @@ class SweepEngine(Engine):
         # way). The nested/monorepo shape is unaffected — `repo_root` is an
         # ancestor there, so the store sits inside it.
         project = _project_of_run_dir(self.run_dir)
-        if not decisions_store.drop_pre_answer(project, dw_id, answer=answer):
+        scope = decisions_store.store_scope(self.paths)
+        if not decisions_store.drop_pre_answer(project, dw_id, answer=answer, scope=scope):
             # Either no store entry (a run-local-only answer) or an entry that is
             # no longer the value dropped (a human's later replacement): no write,
             # no row — the store's bytes are untouched either way.
@@ -3039,7 +3053,7 @@ class SweepEngine(Engine):
         # Guarded on `drop_pre_answer` above: no store entry, no write, no git.
         self._commit_ledger(
             "chore(sweep): drop stale deferred-work pre-answer",
-            path=decisions_store.store_path(project),
+            path=decisions_store.store_path(project, scope),
             family="store",
         )
 
@@ -5991,7 +6005,10 @@ class SweepEngine(Engine):
         # unattended/abandoned sweep left). The ledger edits were already applied
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
-        pre = decisions_store.load_pre_answers(project_root)
+        # The store that answers THIS sweep's ledger: on v7 the pinned initiative's.
+        pre = decisions_store.load_pre_answers(
+            project_root, decisions_store.store_scope(self.paths)
+        )
         # The ids adopted from the project store THIS cycle, not every id in
         # `answers`: the write-back rows below name exactly what this phase tried
         # to persist, not the answers the run store already held.
@@ -6969,10 +6986,10 @@ class SweepEngine(Engine):
           no repository at all, and git resolves the enclosing repository in all
           three. The WORKSPACE's copy, never `self.paths.deferred_work`, which is
           a different file in a different tree under worktree isolation.
-        * the two pre-answer PRUNES pass `decisions.store_path(project)`. The
-          pre-answer store is a bare join off the project root
-          (`decisions.STORE_REL`) that no config knob can move, and the run dir is
-          the anchor no workspace swap relocates.
+        * the two pre-answer PRUNES pass `decisions.store_path(project, scope)`.
+          The pre-answer store is a bare join off the project root
+          (`decisions.STORE_REL`, per initiative on v7) that no config knob can
+          move, and the run dir is the anchor no workspace swap relocates.
 
         `self.workspace.root` is refused at every site. Where `repo_root` names a
         tree DISJOINT from the project it is the separate CODE repo, so a
@@ -8735,6 +8752,79 @@ class SweepEngine(Engine):
         if self._v7_sweep():
             return self._bundle_success_statuses("dev")
         return super()._harvest_success_statuses()
+
+    # ------------------------------------------- v7: bundle plan in a store repo
+
+    @property
+    def store_topology(self) -> ticketstore.StoreTopology | None:
+        """The ticket store a v7 sweep recorded at its start; None on v6, and when
+        it recorded none (no store to classify, or a sweep older than the record)."""
+        recorded = self.state.store_topology
+        return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
+
+    def _land_post_landing_writes(self, task: StoryTask) -> None:
+        """Once a bundle's code has landed, publish its accepted plan when the plan
+        lives in a ticket store with its own repository (T3/T4): the code commit
+        cannot carry a file in another repository. See
+        :meth:`_publish_bundle_plan`."""
+        super()._land_post_landing_writes(task)
+        self._publish_bundle_plan(task)
+
+    def _publish_bundle_plan(self, task: StoryTask) -> None:
+        """Commit ``task``'s accepted bundle plan in the store's repository through
+        :class:`~bmad_loop.ticketstore.StoreCommitter`, as ``chore(sweep): <bundle>
+        plan [bmad-loop <run>]`` with the ``Bmad-Code-*`` trailers. The ledger is
+        not part of it: the sweep's ledger publishers already commit it in the
+        ledger's own repository. An unversioned store (T2/T6) journals
+        ``store-unversioned`` once per run.
+
+        Best effort, like a tickets run's retro commit, and never a pause: the plan
+        on disk is the record, and the code has already landed. A failed commit
+        journals ``store-commit-failed``, a staged foreign version of the plan
+        ``store-commit-foreign-dirt``; the plan then stays uncommitted in the store
+        for a human (no latch replays it)."""
+        topology = self.store_topology
+        if topology is None or topology.per_worktree() or not task.spec_file:
+            return
+        if topology.store_repo is None:
+            self._note_store_unversioned(topology)
+            return
+        plan = verify.resolve_spec_path(task.spec_file, self.paths)
+        try:
+            inside = plan.resolve().is_relative_to(topology.store_repo.resolve())
+        except (OSError, RuntimeError, ValueError):
+            inside = False
+        if not inside or not plan.is_file():
+            return  # not a store-repo plan: the code commit carried it, or nothing
+        committer = ticketstore.StoreCommitter(topology.store_repo, self.paths.repo_root)
+        try:
+            result = committer.commit(
+                task.story_key,
+                [plan],
+                f"chore(sweep): {task.story_key} plan [bmad-loop {self.state.run_id}]",
+                code_commit=task.commit_sha,
+                code_baseline=task.baseline_commit,
+            )
+        except ticketstore.StoreCommitError as e:
+            self.journal.append("store-commit-failed", story_key=task.story_key, error=str(e))
+            return
+        if result.foreign:
+            self.journal.append(
+                "store-commit-foreign-dirt", story_key=task.story_key, count=len(result.foreign)
+            )
+            return
+        self.journal.append("store-committed", story_key=task.story_key, commit=result.sha)
+
+    def _note_store_unversioned(self, topology: ticketstore.StoreTopology) -> None:
+        """Journal ``store-unversioned`` once per run: a bundle plan in an
+        unversioned store lives on disk only, with no history to recover it from."""
+        if self._unversioned_noted is None:
+            self._unversioned_noted = any(
+                e.get("kind") == "store-unversioned" for e in self.journal.entries()
+            )
+        if not self._unversioned_noted:
+            self.journal.append("store-unversioned", layout=topology.layout)
+            self._unversioned_noted = True
 
     def _bundle_artifact_home_wording(self) -> tuple[str, str]:
         """How the bundle prompt names the artifact home: the phrase after "in"

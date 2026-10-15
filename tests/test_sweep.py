@@ -50,7 +50,7 @@ from conftest import (
 
 from bmad_loop import artifact_publication, deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
-from bmad_loop import verify
+from bmad_loop import ticketstore, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
@@ -121,14 +121,27 @@ def triage_result(open_ids, **sections):
 
 
 def make_sweep(
-    project, script, policy=None, answers=(), prompting=False, run_id="sweep-run", **kwargs
+    project,
+    script,
+    policy=None,
+    answers=(),
+    prompting=False,
+    run_id="sweep-run",
+    store_topology=None,
+    **kwargs,
 ):
     # `run_id` names a DISTINCT run: its own run_dir, state.json and journal.
     # Overridden only where a test needs a second run rather than a resume of the
-    # first (run-scoped state, e.g. the DW-124 quarantine).
+    # first (run-scoped state, e.g. the DW-124 quarantine). `store_topology` is the
+    # v7 store record `runsetup.compose_sweep` stamps (`StoreTopology.to_dict`).
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
-    state = RunState(run_id=run_id, project=str(project.project), started_at="now")
+    state = RunState(
+        run_id=run_id,
+        project=str(project.project),
+        started_at="now",
+        store_topology=dict(store_topology or {}),
+    )
     journal = Journal(run_dir)
     # the run dir's mint-time identity, as `runsetup.compose_sweep` records it (DW-446)
     state.run_dir_identity = platform_util.root_identity_record(run_dir)
@@ -12099,7 +12112,7 @@ def test_an_inherited_commit_debt_survives_a_replay_that_closes_nothing(project,
 # a different path in a different tree under worktree isolation — so a publisher
 # added in that scope would have satisfied a text match while naming the wrong file.
 _LEDGER_PUBLISHED = frozenset({"self.workspace.paths.deferred_work"})
-_STORE_PUBLISHED = frozenset({"decisions_store.store_path(project)"})
+_STORE_PUBLISHED = frozenset({"decisions_store.store_path(project, scope)"})
 
 
 def test_every_sweep_ledger_commit_names_its_own_tree():
@@ -38060,6 +38073,96 @@ def test_v7_bundle_closes_on_built(project_v7):
     folder = paths.initiative_folder.relative_to(paths.project).as_posix()
     assert f"the initiative folder `{folder}`" in dev_prompt
     assert "implementation_artifacts" not in dev_prompt
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_v7_bundle_plan_committed_in_store_repo(request, fixture, layout):
+    """When the initiative folder is in a ticket store with its own repository
+    (T3 nested, T4 external), the code commit cannot carry the bundle's plan.
+    Once the code has landed, the accepted plan gets its own commit in the store
+    repository, holding the plan alone, with the `Bmad-Code-*` trailers naming
+    the bundle's code commit and range.
+
+    ABLATION (performed): drop the `_publish_bundle_plan` call in
+    `SweepEngine._land_post_landing_writes` and the plan stays uncommitted in the
+    store (no `store-committed` row, no commit touching it)."""
+    v7 = request.getfixturevalue(fixture)
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)  # the store's, not the code's
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    plan = _v7_plan(paths, "fix-things")
+    rel = plan.resolve().relative_to(store.resolve()).as_posix()
+    commits = git(store, "log", "--format=%H", "--", rel).split()
+    assert len(commits) == 1
+    assert [e["commit"] for e in _records(engine, "store-committed")] == commits
+    body = git(store, "log", "-1", "--format=%B", commits[0])
+    assert body.splitlines()[0] == "chore(sweep): dw-fix-things plan [bmad-loop sweep-run]"
+    assert f"Bmad-Code-Repo: {paths.repo_root.as_posix()}" in body
+    assert f"Bmad-Code-Commit: {task.commit_sha}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in body
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [rel]
+    assert git(store, "status", "--porcelain", "--", rel) == ""
+    assert verify.status_of(verify.read_frontmatter(plan)) == "built"
+
+
+def test_v7_bundle_plan_in_a_checkout_store_rides_the_code_commit(project_v7):
+    """T1 (the store is tracked inside the code checkout): the code commit
+    already carries the plan, so the sweep makes no store-repository commit and
+    journals no store row.
+
+    ABLATION (performed): drop the `per_worktree()` early return in
+    `_publish_bundle_plan` and the T1 run journals `store-unversioned` (its
+    topology has no store repository)."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T1"
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    rel = _v7_plan(paths, "fix-things").relative_to(paths.project).as_posix()
+    assert rel in git(paths.project, "show", "--name-only", "--format=", task.commit_sha).split()
+    for kind in ("store-committed", "store-commit-failed", "store-unversioned"):
+        assert _records(engine, kind) == []
 
 
 def test_v7_bundle_review_accepts_built(project_v7):

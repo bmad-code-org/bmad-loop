@@ -34,16 +34,16 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 
 ## Project `.bmad-loop/` directory
 
-| Path                                 | Contents                                                                                               | Gitignored by `init` |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------------- |
-| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                                                                 | yes                  |
-| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                                                                | yes                  |
-| `.bmad-loop/cache/`                  | plugin caches                                                                                          | yes                  |
-| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                                                                | no                   |
-| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep                                                            | no                   |
-| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed; a tickets park also records `source` and `ref`) | no                   |
-| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                                                                       | no                   |
-| `.bmad-loop/plugins/`                | project-local plugins                                                                                  | no                   |
+| Path                                 | Contents                                                                                                | Gitignored by `init` |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------- | -------------------- |
+| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                                                                  | yes                  |
+| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                                                                 | yes                  |
+| `.bmad-loop/cache/`                  | plugin caches                                                                                           | yes                  |
+| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                                                                 | no                   |
+| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep (BMAD v7: one `decisions-<initiative>.json` per initiative) | no                   |
+| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed; a tickets park also records `source` and `ref`)  | no                   |
+| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                                                                        | no                   |
+| `.bmad-loop/plugins/`                | project-local plugins                                                                                   | no                   |
 
 ## Run directory
 
@@ -85,7 +85,9 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 
 A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals`, `ticket_epic_closures`, `ticket_epic_closure_resumed` and `ticket_epic_closure_acked` hold the epic selector, the refs whose story file an operator approved (resuming the pick's `plan-checkpoint` pause records the ref), each finished epic's closure (its retrospective `verdict`, or `unknown`), the epics whose closure pause a resume answered (a closure recorded without one pauses again), and the epics whose one closure pause was resumed past. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree`.
 
-`store_topology` is the ticket store classified at run start: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
+A v7 sweep records `initiative` and `initiative_folder` too, and its resume refuses while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on.
+
+`store_topology` is the ticket store classified at the start of a tickets run or a v7 sweep: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
 
 For such a shared store, the unit's commit cannot carry its plan, so the ticket's terminal mark waits until the code has landed on the target: after the commit in place, or after the merge-back under worktree isolation. The task latches it in the save that records `COMMITTING`. `ticket_done_pending` stands for `mark <ref> done`, and `ticket_park_pending` holds a park's `blocked_reason`. Under `mark_done = "never"` there is no mark, but a store that is its own git repository still owes the commit of the `built` plan the session wrote there: `ticket_commit_pending`. A resume makes any latched mark whose code had landed before it picks (`resume-ticket-mark`), and replays a lost merge-back first. A mark already made is a no-op. The latch is cleared once the mark is made. A mark that fails pauses the run at `ticket-tree` and keeps the latch.
 

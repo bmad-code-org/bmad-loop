@@ -4788,6 +4788,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
             return 1
+        # v7: a sweep resumes only on the initiative it started on. Ahead of every
+        # side effect below; `compose_resume` raises the same text as a backstop.
+        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+            print(f"cannot resume {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -4798,9 +4803,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
-    # A sweep persists no source; its store is judged under the configured source,
-    # as at launch, against the topology it recorded.
-    store_source = runs.judged_store_source(state, pol.stories.source)
+    # A sweep persists no source; on v7 its store is judged as a tickets run's,
+    # as at launch (`_sweep_store_source`), against the topology it recorded.
+    store_source = runs.judged_store_source(state, _sweep_store_source(paths, pol))
     if (
         rc := _reject_store_topology(
             project, pol, store_source, recorded=runs.live_store_topology(state, project) or None

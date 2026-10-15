@@ -1382,8 +1382,10 @@ class RunState:
     # BMAD v7 only: the `[core] active_initiative` the run picked from, and its
     # canonical folder, pinned at run start (bmadconfig.ProjectPaths). The live
     # value can change under a paused run; tickets mode compares the two so a
-    # resume never builds another initiative's ticket. Empty on v6 runs and on
-    # state written before the pin existed.
+    # resume never builds another initiative's ticket, and a v7 sweep's resume
+    # refuses a change (`runsetup.sweep_initiative_conflict`) so it never sweeps
+    # another initiative's ledger. Empty on v6 runs and on state written before
+    # the pin existed.
     initiative: str = ""
     initiative_folder: str = ""
     # tickets mode only. `ticket_epic_filter`: the `--epic` selector as an epic
@@ -1402,7 +1404,7 @@ class RunState:
     ticket_epic_closures: dict[str, str] = field(default_factory=dict)
     ticket_epic_closure_resumed: list[str] = field(default_factory=list)
     ticket_epic_closure_acked: list[str] = field(default_factory=list)
-    # tickets mode only: the ticket-store topology classified at run start
+    # tickets mode and v7 sweeps: the ticket-store topology classified at run start
     # (`ticketstore.StoreTopology.to_dict`: layout, placement, versioning,
     # store_root, store_repo). Resume re-classifies the store and refuses on any
     # difference; a shared store sets `ProjectPaths.shared_store` for the engine.

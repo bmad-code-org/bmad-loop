@@ -1131,7 +1131,7 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
         return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
         _stat_sig(paths.deferred_work),
-        _stat_sig(decisions.store_path(project)),
+        _stat_sig(decisions.store_path(project, decisions.store_scope(paths))),
         tuple(d.name for d in run_dirs),
     )
     cached = _missed_cache.get(project)

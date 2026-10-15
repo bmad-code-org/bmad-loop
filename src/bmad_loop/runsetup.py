@@ -953,6 +953,43 @@ class SweepOptionsError(ValueError):
     """Persisted selector-bearing sweep options are unsafe to resume."""
 
 
+class SweepPinError(ValueError):
+    """A sweep would resume under another BMAD v7 initiative than it started on."""
+
+
+def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -> str | None:
+    """The refusal text when a sweep would resume on another initiative than the
+    one it pinned at launch (``RunState.initiative``), else None. Every story run
+    is None here: a tickets run checks its pin on each tree read instead.
+
+    On v7 the ledger and the pre-answer store both belong to one initiative
+    (``ProjectPaths.deferred_work``, ``decisions.store_scope``), and a sweep's
+    triage, bundles and run-local decisions name that ledger's DW ids, so a
+    resume under a switched initiative would apply them to a different ledger
+    whose ids mean other entries. The live side is ``paths.active_initiative``
+    (``""`` off v7). A sweep that started with no initiative active pins
+    ``""``; one written before the pin existed reads the same, which on a v7
+    project with an initiative active is refused rather than guessed."""
+    if state.run_type != "sweep":
+        return None
+    pinned = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    if pinned == live:
+        return None
+    started = f"initiative {pinned!r}" if pinned else "no active initiative"
+    now = repr(live) if live else "unset"
+    fix = (
+        f"set `[core] active_initiative` back to {pinned!r}"
+        if pinned
+        else "unset `[core] active_initiative`"
+    )
+    return (
+        f"sweep {state.run_id} started on {started}, but the active initiative is now "
+        f"{now}; its ledger and pre-answers belong to the initiative it started on. "
+        f"To resume it, {fix} (_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
+
+
 @dataclass(frozen=True)
 class SweepResumeOptions:
     values: dict[str, Any]
@@ -1480,6 +1517,7 @@ def compose_sweep(
     from .sweep import select_entries
 
     select_entries((), only_ids=only_ids, min_severity=min_severity)
+    v7 = paths.era == "v7"
     options = {
         "prompting": prompting,
         "decisions_only": decisions_only,
@@ -1498,6 +1536,11 @@ def compose_sweep(
 
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # v7: the ledger and the bundle plans live in the ticket store, so a sweep
+    # records its topology as a tickets run does (before the claim, for the same
+    # reason): `SweepEngine` shares a store no checkout carries and publishes an
+    # accepted plan in a store's own repository, and a resume refuses a changed one.
+    store_topology = _run_store_topology(paths, policy, worksource.SOURCE_TICKETS) if v7 else {}
     # Same claim, same reason, same placement outside the try as in `compose_run`.
     composer_claim = _claim_run_dir(run_dir)
     # Atomic from the first published artifact onward, exactly as in `compose_run`
@@ -1517,6 +1560,13 @@ def compose_sweep(
             sweep_options_version=SWEEP_OPTIONS_VERSION,
             sweep_options_digest=options_digest,
             trusted_config_digest=trusted_config_digest,
+            # v7: the initiative whose ledger this sweep works, which a resume
+            # must find unchanged (`sweep_initiative_conflict`).
+            initiative=paths.active_initiative if v7 else "",
+            initiative_folder=(
+                str(paths.initiative_folder) if v7 and paths.initiative_folder is not None else ""
+            ),
+            store_topology=store_topology,
         )
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
@@ -1610,6 +1660,8 @@ def compose_resume(
     effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
+        if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+            raise SweepPinError(conflict)
         story_engine = None
     else:
         # stories mode is pinned in run state at launch, so resume rebuilds the

@@ -86,7 +86,10 @@ A sweep runs on a v7 project the same way, with these differences:
 - **Bundle plans.** Each bundle hands `bmad-build-auto` its free-form intent. The skill writes `plan-<slug>.md` in the initiative folder (or `output_folder`) and is asked to lead the slug with the bundle key, such as `dw-fix-things`. The orchestrator still finds the plan by scanning that folder; the ledger there never counts as a result.
 - **`built` closes a bundle.** build-auto finishes a plan at `built`. The dev gate, the ledger close, the review gate and the review reclose all accept `built` or `done`. A bundle is not a ticket, so nothing marks its plan `done`: it stays `built`.
 - **No retro ingest.** v7 retrospective action items are prose in the epic retrospective, not records. A fresh sweep files none and journals `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
-- **Store layout.** The store-topology check judges a v7 sweep as a tickets run, because its ledger lives in the ticket store.
+- **Store layout.** The store-topology check judges a v7 sweep as a tickets run, because its ledger lives in the ticket store. The sweep records the store's topology at its start, and a resume refuses a store that changed since.
+- **Pinned initiative.** A sweep records the active initiative it started on. A resume refuses while `[core] active_initiative` names another: set it back, or start a new sweep.
+- **Decisions per initiative.** Each initiative has its own ledger and DW numbering, so pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`. `bmad-loop decisions` and the TUI answer the active initiative's decisions and offer only those its own sweeps raised. With no initiative active, the project store stays `.bmad-loop/decisions.json`.
+- **Plans in a store repository.** When the ticket store is its own git repository (nested or outside the checkout), the bundle's code commit cannot carry its plan. Once the code has landed, the accepted plan gets its own commit there, `chore(sweep): <bundle> plan [bmad-loop <run>]`, with `Bmad-Code-*` trailers naming the code. This is best effort, like a tickets run's store commit: a failure is journaled (`store-commit-failed` or `store-commit-foreign-dirt`) and the plan stays uncommitted for a human.
 
 ## Story-declared closure (`closes_deferred`)
 
@@ -137,10 +140,10 @@ Each decision offers options, and each option has one effect:
 
 ### Project store and run store
 
-| Store         | Path                                      | Written by                     | Holds                                  |
-| ------------- | ----------------------------------------- | ------------------------------ | -------------------------------------- |
-| Project store | `.bmad-loop/decisions.json`               | `bmad-loop decisions`, TUI `d` | `build` and `keep-open` answers        |
-| Run store     | `.bmad-loop/runs/<run-id>/decisions.json` | answers given during a sweep   | every in-run answer, including `close` |
+| Store         | Path                                                            | Written by                     | Holds                                  |
+| ------------- | --------------------------------------------------------------- | ------------------------------ | -------------------------------------- |
+| Project store | `.bmad-loop/decisions.json` (v7: `decisions-<initiative>.json`) | `bmad-loop decisions`, TUI `d` | `build` and `keep-open` answers        |
+| Run store     | `.bmad-loop/runs/<run-id>/decisions.json`                       | answers given during a sweep   | every in-run answer, including `close` |
 
 An out-of-band `close` goes straight to the ledger and is not stored. A sweep reads its run store first. It uses a project-store answer only for an id that this triage asks and the run store has not answered (journaled `decision-preanswered`). `bmad-loop decisions` offers only ids that are still open, appear in a past triage, and have no usable project-store answer.
 

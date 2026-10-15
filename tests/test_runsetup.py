@@ -2254,3 +2254,91 @@ def test_compose_defaults_to_no_grants_and_never_reads_the_store(tmp_path, monke
     composed = _compose(composer, tmp_path, monkeypatch)
     grants = composed.engine.kwargs["plugin_grants"]
     assert grants.records == () and grants.fault is None and grants.snapshot_root is None
+
+
+# ------------------------------------------------- v7: the sweep's initiative pin
+
+
+def test_sweep_resume_refuses_initiative_change(project_v7, monkeypatch):
+    """A v7 sweep pins the initiative whose ledger it works. Resumed after the
+    operator switched `[core] active_initiative`, it would apply its triage and
+    bundles to another ledger whose DW ids name other entries, so the resume is
+    refused with the fix (switch back, or start a new sweep) before it touches
+    any session. The unchanged initiative resumes.
+
+    ABLATION (performed): drop the `sweep_initiative_conflict` raise in
+    `compose_resume` and the switched resume composes an engine (and kills the
+    run's session first)."""
+    from conftest import V7_USER_CONFIG_REL
+
+    project = project_v7.project
+    paths = bmadconfig.load_paths(project)
+    composed = runsetup.compose_sweep(
+        project=project,
+        paths=paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+    state = load_state(composed.run_dir)
+    assert state.initiative == project_v7.initiative
+    assert state.initiative_folder == str(paths.initiative_folder)
+    assert state.store_topology["layout"] == "T1"
+    assert runsetup.sweep_initiative_conflict(state, paths) is None
+
+    (project_v7.output_folder / "other").mkdir()
+    (project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "other"\n', encoding="utf-8"
+    )
+    switched = bmadconfig.load_paths(project)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+
+    def resume(live_paths):
+        return runsetup.compose_resume(
+            project=project,
+            paths=live_paths,
+            run_dir=composed.run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(composed.run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    with pytest.raises(runsetup.SweepPinError) as refused:
+        resume(switched)
+    message = str(refused.value)
+    assert f"started on initiative {project_v7.initiative!r}" in message
+    assert "now 'other'" in message
+    assert f"set `[core] active_initiative` back to {project_v7.initiative!r}" in message
+    assert "start a new sweep" in message
+    assert killed == []
+
+    assert resume(paths).engine.kwargs["state"] is state
+
+
+def test_sweep_initiative_conflict_ignores_story_runs_and_v6():
+    """Only a sweep is judged here (a tickets run checks its pin on every tree
+    read), and a v6 sweep pins nothing."""
+    v6 = _fake_paths(Path("/p"))
+    sweep = RunState(run_id=RUN_ID, project="/p", started_at="now", run_type="sweep")
+    assert runsetup.sweep_initiative_conflict(sweep, v6) is None
+    story = RunState(run_id=RUN_ID, project="/p", started_at="now", initiative="a")
+    assert runsetup.sweep_initiative_conflict(story, v6) is None
+    pinned = dataclasses.replace(sweep, initiative="a")
+    assert "unset `[core] active_initiative`" not in (
+        runsetup.sweep_initiative_conflict(pinned, v6) or ""
+    )
+    assert "now unset" in (runsetup.sweep_initiative_conflict(pinned, v6) or "")
