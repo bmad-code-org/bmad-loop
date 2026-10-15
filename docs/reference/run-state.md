@@ -34,16 +34,16 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 
 ## Project `.bmad-loop/` directory
 
-| Path                                 | Contents                                               | Gitignored by `init` |
-| ------------------------------------ | ------------------------------------------------------ | -------------------- |
-| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                 | yes                  |
-| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                | yes                  |
-| `.bmad-loop/cache/`                  | plugin caches                                          | yes                  |
-| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                | no                   |
-| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep            | no                   |
-| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed) | no                   |
-| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                       | no                   |
-| `.bmad-loop/plugins/`                | project-local plugins                                  | no                   |
+| Path                                 | Contents                                                                                               | Gitignored by `init` |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------------- |
+| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                                                                 | yes                  |
+| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                                                                | yes                  |
+| `.bmad-loop/cache/`                  | plugin caches                                                                                          | yes                  |
+| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                                                                | no                   |
+| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep                                                            | no                   |
+| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed; a tickets park also records `source` and `ref`) | no                   |
+| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                                                                       | no                   |
+| `.bmad-loop/plugins/`                | project-local plugins                                                                                  | no                   |
 
 ## Run directory
 

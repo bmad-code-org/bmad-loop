@@ -6279,6 +6279,33 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     return None
 
 
+def _confirm_policy(project: Path) -> policy_mod.Policy | None:
+    """The project's policy for ``confirm``, None when it cannot be read."""
+    try:
+        return policy_mod.load(_policy_path(project))
+    except (policy_mod.PolicyError, OSError):
+        return None
+
+
+def _confirm_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``confirm`` marks a ticket park's plan through: the project's
+    installed ``tickets.py``, unpinned — ``confirm`` runs outside any run, and the
+    park record's plan path is the cross-check ``mark`` holds the write to."""
+    return tickettree.TicketTree(project)
+
+
+class _ConfirmMarkLog(Journal):
+    """Where the ticket chokepoint's ``ticket-mark`` row goes during ``confirm``,
+    which runs outside any run and so has no run journal: kept in memory (nothing
+    is written), while the outcome itself is printed."""
+
+    def __init__(self) -> None:  # no run dir: `confirm` writes no journal
+        self.rows: list[dict[str, object]] = []
+
+    def append(self, kind: str, **fields: Any) -> None:
+        self.rows.append({"kind": kind, **fields})
+
+
 def cmd_confirm(args: argparse.Namespace) -> int:
     """Complete a story parked at `awaiting-operator` once the human has carried
     out the external actions it owes (#335).
@@ -6292,8 +6319,12 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     stayed outside the repo. `--reverify` is there for the case that matters —
     the external action may have changed what the tests see."""
     project = _project(args)
+    pol = _confirm_policy(project)
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(
+            project,
+            want_tickets=pol is not None and pol.stories.source == worksource.SOURCE_TICKETS,
+        )
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -6390,9 +6421,13 @@ def _resume_confirmation(
     advanced", since the confirmation itself already happened."""
     spec = story.spec_path
     assert spec is not None  # resumable requires a spec that read back as done
+    left = (
+        f"its plan is signed off and reads {story.spec_status}, but the park entry was"
+        if story.ticket
+        else "its spec is signed off and reads done, but the board and the park entry were"
+    )
     print(
-        f"{story.story_key} was already confirmed — its spec is signed off and reads "
-        f"done, but the board and the park entry were left behind. Finishing that; "
+        f"{story.story_key} was already confirmed — {left} left behind. Finishing that; "
         f"you will not be asked to acknowledge anything again.\n"
     )
     if args.reverify:
@@ -6461,6 +6496,10 @@ def _apply_confirmation(
             file=sys.stderr,
         )
         return 1
+    if story.ticket:
+        # A ticket plan's status is written only by the ticket chokepoint: the
+        # `confirm` mark is the landing half's, which a resume re-enters too.
+        return _land_confirmation(project, paths, story, spec, today)
     try:
         frontmatter.set_frontmatter_status(spec, "done", confine_root=project)
     except frontmatter.FrontmatterWriteError as e:
@@ -6506,7 +6545,16 @@ def _land_confirmation(
 
     A board row the writer refuses (``SprintStatusWriteRefused``) and one that
     otherwise did not reach ``done`` both exit 1 with the park entry kept, so a
-    re-run after the operator repairs the board resumes here."""
+    re-run after the operator repairs the board resumes here.
+
+    A ticket park has no board: its plan is marked instead
+    (:func:`_mark_ticket_confirmed`), and the commit carries the plan and the
+    record's deletion."""
+    if story.ticket:
+        target = _mark_ticket_confirmed(project, story, spec)
+        if target is None:
+            return 1
+        return _commit_confirmation(project, paths, story, [spec], f"plan is {target}")
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
     # confirming needs no exception to never-regress. Idempotent at `done`, which
@@ -6535,13 +6583,6 @@ def _land_confirmation(
             file=sys.stderr,
         )
         return 1
-    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
-    # a committed record's deletion must ride the confirm commit (#356) — the
-    # record arrived in the park's commit, so leaving its removal uncommitted
-    # would dirty the tree the next run's preflight refuses. `commit_paths`
-    # skips the path when no record was ever committed (a legacy-index park).
-    record = operatoractions.record_path(project, story.story_key)
-    operatoractions.drop(project, story.story_key)
     # A GITIGNORED board is left OUT of the list rather than handed over and
     # forgiven (#577). `commit_paths` forces every operand literal, so `git add`
     # refuses an ignored one with rc 1 — and refuses the whole operand list with
@@ -6549,12 +6590,69 @@ def _land_confirmation(
     # of the other two. That is right for the board (a file git will not track has
     # no commit to ride; the status on disk is the value) and wrong for the spec
     # and the record, whose deletion in particular MUST land per the #356 note
-    # above. #350's board carry makes a gitignored board an ordinary shape, so
-    # this is the common park's exit and not an exotic one.
+    # in `_commit_confirmation`. #350's board carry makes a gitignored board an
+    # ordinary shape, so this is the common park's exit and not an exotic one.
     try:
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
+    files = [spec] if board_ignored else [spec, paths.sprint_status]
+    return _commit_confirmation(project, paths, story, files, "spec and board are done")
+
+
+def _mark_ticket_confirmed(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> str | None:
+    """Mark a confirmed ticket park's plan through the ticket chokepoint: reason
+    ``confirm``, to ``done`` under ``[tickets] mark_done = "auto"``, else to
+    ``built`` for a person to accept. ``mark`` clears the plan's ``blocked_*``
+    fields, holds the write to the record's plan, and reads it back; a plan
+    already at the target (an interrupted confirmation) is a no-op. Returns the
+    target, or None after printing why nothing was marked — the park entry stays,
+    so a re-run finishes the job."""
+    pol = _confirm_policy(project)
+    if pol is None:
+        print(
+            f"error: cannot read {_policy_path(project)}, so whether {story.story_key} "
+            f"lands done or built (`[tickets] mark_done`) is unknown — its plan was NOT "
+            f"marked and the park entry has been left in place. Repair the policy, then "
+            f"re-run `bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    target = "done" if pol.tickets.mark_done == "auto" else "built"
+    try:
+        _confirm_ticket_tree(project).mark(
+            story.ref, target, reason="confirm", expected_plan=spec, journal=_ConfirmMarkLog()
+        )
+    except tickettree.TicketsError as e:
+        print(
+            f"error: marking ticket {story.ref} {target} failed (tickets.py {e.kind}: {e}), so "
+            f"{story.story_key} was NOT confirmed. The audit section was appended to {spec}; "
+            f"the plan and the park entry are untouched. Fix the ticket tree, then re-run "
+            f"`bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    return target
+
+
+def _commit_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    story: operatoractions.ParkedStory,
+    files: list[Path],
+    landed: str,
+) -> int:
+    """Drop the park record and commit ``files`` with the record's deletion: the
+    shared tail of a board and a ticket confirmation."""
+    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
+    # a committed record's deletion must ride the confirm commit (#356) — the
+    # record arrived in the park's commit, so leaving its removal uncommitted
+    # would dirty the tree the next run's preflight refuses. `commit_paths`
+    # skips the path when no record was ever committed (a legacy-index park).
+    record = operatoractions.record_path(project, story.story_key)
+    operatoractions.drop(project, story.story_key)
     # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
     # `commit_paths` forces every operand LITERAL, so an operand replaced by a
     # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
@@ -6565,7 +6663,7 @@ def _land_confirmation(
     # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
     # not sink its siblings, which is the whole point of the `board_ignored` drop
     # this joins.
-    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    operands: list[Path] = [*files, record]
     survivors: list[Path] = []
     for path in operands:
         # The SAME resolve-then-guard the four carries take, imported rather than
@@ -6602,7 +6700,7 @@ def _land_confirmation(
             )
         except verify.GitError:
             pass  # files are written; git history is best effort (as `decisions`)
-    print(f"✓ {story.story_key} confirmed — spec and board are done")
+    print(f"✓ {story.story_key} confirmed — {landed}")
     return 0
 
 

@@ -26074,3 +26074,96 @@ def test_defer_pause_notice_names_resolve_reverify(project, tmp_path):
     deferred_note = attention[attention.index("story deferred: 1-1-a") :]
     assert "bmad-loop resolve test-run --reverify" in deferred_note
     assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+
+
+# ---- tickets mode: a code rollback re-arms the bound plan through the chokepoint
+
+
+def _tickets_rollback_unit(project_v7, *, body: bool = True):
+    """A TicketsEngine (auto-rollback on) with ticket 1.1 bound and a failed
+    attempt's leftovers: code beside the baseline, and the plan the attempt
+    created and carried to `in-progress` (with a body, or frontmatter only)."""
+    from conftest import ticket_row
+    from test_tickets_engine import _bound, _policy, _tree, _write_plan, make_engine
+
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-progress"),))
+    pol = dataclasses.replace(_policy(), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    task.baseline_commit = rev_parse_head(project_v7.project)
+    task.baseline_untracked = sorted(verify.untracked_files(project_v7.project))
+    task.attempt = 1
+    plan = Path(tree.finds["1.1"].plan)
+    (project_v7.project / "src.txt").write_bytes(b"half a cart model\n")
+    if body:
+        _write_plan(plan, "in-progress")
+    else:
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_bytes(b"---\nticket: 1\nstatus: in-progress\n---\n")
+    return engine, tree, task, plan
+
+
+def test_store_never_reset_on_rollback(project_v7):
+    """The rollback resets the code, never the ticket store: the attempt's plan
+    survives the reset byte for byte (the store's folder is kept from the
+    untracked sweep), nothing is stashed, and the plan's only change is the
+    chokepoint's own re-arm — the fake's `mark` writes nothing to disk, so the
+    bytes prove no git reset, clean or stash reached it. Ablation (performed):
+    drop the protected artifact folders from `RecoveryFlow.safe_reset`'s `keep`
+    and the plan is swept with the attempt's residue — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7)
+    before = plan.read_bytes()
+
+    engine._rollback_or_pause(task)
+
+    # the code is back at the baseline's bytes (src.txt is tracked there)
+    assert git(project_v7.project, "status", "--porcelain", "--", "src.txt") == ""
+    assert plan.read_bytes() == before
+    assert git(project_v7.project, "stash", "list") == ""
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rollback")]
+
+
+def test_rollback_rearms_plan_to_ready_for_dev(project_v7):
+    """After the code rollback, a plan the attempt carried past `ready-for-dev`
+    is re-armed through the chokepoint — `mark 1.1 ready-for-dev` (reason
+    `rollback`) on the bound plan — so the next dispatch builds against the reset
+    code instead of resuming or reviewing work that is gone. A plan already at
+    `ready-for-dev` is left alone. Ablation (performed): drop the
+    `_after_code_rollback` call from `Engine._rollback_or_pause` and no mark is
+    made — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7)
+
+    engine._rollback_or_pause(task)
+
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "ready-for-dev", "rollback", plan)
+    ]
+    assert tree.discards == []
+    assert [e["outcome"] for e in engine.journal.entries() if e["kind"] == "ticket-mark"] == [
+        "written"
+    ]
+    # the row now reads ready-for-dev: a second rollback re-arms nothing
+    _write_plan_status(plan, "ready-for-dev")
+    engine._rollback_or_pause(task)
+    assert len(tree.marks) == 1
+
+
+def _write_plan_status(plan: Path, status: str) -> None:
+    from test_tickets_engine import _write_plan
+
+    _write_plan(plan, status)
+
+
+def test_rollback_discards_frontmatter_only_plan(project_v7):
+    """A plan that holds only frontmatter — the attempt never wrote its body — is
+    deleted through `discard_unbuilt_plan` instead of re-armed, per upstream's
+    unattended-builds contract, so the next dispatch plans the ticket afresh.
+    Ablation (performed): always take the `mark(..., reason="rollback")` arm in
+    `TicketsEngine._after_code_rollback` and the plan is re-armed, not discarded
+    — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7, body=False)
+
+    engine._rollback_or_pause(task)
+
+    assert tree.discards == ["1.1"]
+    assert tree.marks == []

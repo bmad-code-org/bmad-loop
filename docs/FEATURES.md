@@ -122,12 +122,13 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** A story whose acceptance criteria need an action no agent can take, such as buying a domain, commits the agent's work, parks at `awaiting-operator`, and waits for `bmad-loop confirm`.
 - **Properties:**
   - In sprint mode with `[operator] enabled` (default on), a story owing human-only actions commits its agent work, parks at `awaiting-operator`, and the run continues.
+  - In tickets mode the park commits with the ticket's plan marked `blocked` (reason `awaiting operator: <actions>`), never `done`; `confirm <ref>` marks it `done`, or `built` under `[tickets] mark_done = "never"`, through `tickets.py mark`.
   - `bmad-loop confirm --list` shows each parked story and what it owes; `--json` emits it as a machine-readable document.
   - A confirmation adds an `## Operator Confirmation` section, moves spec and board to `done`, and commits.
   - `confirm --reverify` runs the environment probes and `[verify]` commands first; a failure blocks the confirmation.
-  - `[operator] on_review_demotion = "park"` lets a review demote a `done` story to `awaiting-operator` (sprint mode only); the default `escalate` rejects the demotion.
+  - `[operator] on_review_demotion = "park"` lets a review demote a `done` story to `awaiting-operator` (sprint and tickets mode); the default `escalate` rejects the demotion.
 - **Config:** `[operator] enabled`, `[operator] on_review_demotion`, `bmad-loop confirm --list`, `bmad-loop confirm --yes`, `bmad-loop confirm --reverify`, `bmad-loop confirm --json`
-- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_operatoractions.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_operatoractions.py`, `tests/test_tickets_engine.py`
 - **Docs:** [Human-only actions](escalations-guide.md#human-only-actions), [confirm CLI reference](reference/cli.md#confirm), [[operator] reference](reference/configuration.md#operator)
 
 ### Environment-fault pause

@@ -1911,6 +1911,11 @@ _FAKE_STATE_OF = {
     "built": "review",
     "done": "done",
     "dropped": "dropped",
+    # a build session's own park token: upstream reads it as an unknown status (a
+    # `problems` row) and forces the ticket to blocked, which `state` derives as
+    # in-progress. The fake's `mark` still decides on it natively, as the real
+    # chokepoint reads the plan's own `status`.
+    "awaiting-operator": "in-progress",
 }
 
 

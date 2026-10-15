@@ -33,6 +33,16 @@ breaking changes may land in a minor release.
 - Add the tickets dirty-initiative pause: a run pauses at `ticket-tree` before opening a
   ticket while the initiative folder holds uncommitted changes the run does not own.
 - Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to every tickets unit commit.
+- Add parking in tickets mode: a session's `awaiting-operator` park commits with its
+  plan marked `blocked` ("awaiting operator: <actions>"), never `done`. A review
+  demotion parks the same way under `[operator] on_review_demotion = "park"`. The park
+  record carries `source` and `ref`.
+- Add `bmad-loop confirm <ref>` for a tickets park: it marks the plan `done` (`built`
+  under `[tickets] mark_done = "never"`) through `tickets.py mark`, clearing its
+  `blocked_*` fields.
+- Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
+  `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
+  A plan restore is confined to the ticket store root.
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

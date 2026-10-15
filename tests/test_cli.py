@@ -22331,3 +22331,120 @@ def test_validate_trust_reads_the_configured_repo_root(project, capsys, monkeypa
     cli.main(argv)
     [finding] = _trust_findings(json.loads(capsys.readouterr().out))
     assert (finding["severity"], finding["detail"]) == ("ok", {"plugins": ["hooky"]})
+
+
+# ---- `confirm` in tickets mode: the plan is the park's whole committed truth.
+# Real-spawn budget: 2 vendored `tickets.py` spawns (`find` + `mark`, the
+# done/clears-blocked test); the `mark_done = "never"` test injects a FakeTicketTree.
+
+TICKET_PARK_ACTIONS = ["buy example.com at the registrar", "publish the acme TXT record"]
+
+
+def _park_ticket(layout, *, policy_text: str):
+    """Leave ticket 1.1 as a tickets run's park commits it: the plan `blocked`
+    with an operator-park reason and its owed actions, and a park record naming
+    source and ref — all committed, under a tickets policy."""
+    from conftest import write_plan
+
+    from bmad_loop import operatoractions
+
+    policy = layout.project / cli.POLICY_FILE
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(policy_text, encoding="utf-8")
+    plan = write_plan(
+        layout,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        # double-quoted, as upstream `mark --blocked` writes them
+        blocked_at='"2026-10-15"',
+        blocked_reason='"awaiting operator: ' + "; ".join(TICKET_PARK_ACTIONS) + '"',
+        operator_actions=TICKET_PARK_ACTIONS,
+    )
+    operatoractions.record_park(
+        layout.project,
+        "1.1",
+        actions=list(TICKET_PARK_ACTIONS),
+        spec_file=plan.relative_to(layout.project).as_posix(),
+        run_id="run-1",
+        parked_at="2026-10-15",
+        source="tickets",
+        ref="1.1",
+    )
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "park 1.1")
+    return plan
+
+
+def test_confirm_tickets_marks_done_and_clears_blocked(project_v7, capsys, monkeypatch):
+    """A ticket park has no board: `confirm 1.1` appends the audit section, then
+    marks the plan through the ticket chokepoint — the real `tickets.py mark`,
+    reason `confirm`, to `done` under `mark_done = "auto"` — which clears the
+    plan's `blocked_*` fields; the record is dropped and the plan and the
+    record's deletion are committed together, leaving a clean tree. Ablation
+    (performed): drop the tickets branch from `_land_confirmation` and the board
+    advance answers nothing for a v7 project, so `confirm` exits 1 with the plan
+    still blocked — this FAILS."""
+    from bmad_loop import devcontract, frontmatter, operatoractions, verify
+
+    plan = _park_ticket(project_v7, policy_text='[stories]\nsource = "tickets"\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 0
+
+    fm = frontmatter.read_frontmatter(plan)
+    assert frontmatter.status_of(fm) == "done"
+    assert not fm.get("blocked_reason") and not fm.get("blocked_at")
+    text = plan.read_text(encoding="utf-8")
+    assert "## Operator Confirmation" in text and devcontract.OPERATOR_CONFIRM_NOTE in text
+    assert operatoractions.load(project_v7.project) == {}
+    assert "confirm 1.1" in git(project_v7.project, "log", "-1", "--format=%s")
+    changed = git(project_v7.project, "show", "--name-only", "--format=", "HEAD")
+    assert ".bmad-loop/operator/1.1.json" in changed
+    assert plan.relative_to(project_v7.project).as_posix() in changed
+    assert verify.worktree_clean(project_v7.project)
+    assert "✓ 1.1 confirmed — plan is done" in capsys.readouterr().out
+
+
+def test_confirm_tickets_never_policy_marks_built(project_v7, capsys, monkeypatch):
+    """Under `[tickets] mark_done = "never"` a confirmed park lands `built`, for a
+    person to accept, through the same chokepoint (reason `confirm`, the
+    record's plan as the cross-check). A refused mark keeps the park entry so a
+    re-run can finish. Ablation (performed): always target `done` in
+    `_mark_ticket_confirmed` and the mark is `done` — this FAILS."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop import operatoractions, tickettree
+
+    plan = _park_ticket(
+        project_v7,
+        policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
+    )
+    reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
+    row = ticket_row("1.1", status="blocked", blocked_reason=reason)
+    tree = FakeTicketTree(project_v7.project, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(cli, "_confirm_ticket_tree", lambda _project: tree)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 0
+
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "built", "confirm", plan)
+    ]
+    assert operatoractions.load(project_v7.project) == {}
+    assert "✓ 1.1 confirmed — plan is built" in capsys.readouterr().out
+
+    # a mark the chokepoint refuses changes nothing and keeps the entry
+    plan = _park_ticket(
+        project_v7,
+        policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], row=row)
+    tree.faults["mark"] = tickettree.TicketsCrashed("boom")
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 1
+    assert "1.1" in operatoractions.load(project_v7.project)
+    assert "NOT confirmed" in capsys.readouterr().err

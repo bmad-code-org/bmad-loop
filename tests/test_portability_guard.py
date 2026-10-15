@@ -373,13 +373,16 @@ SPEC_STATUS_WRITERS = {
     # the writer's own callee chain: `reset_spec_for_replan` re-opens a spec for the
     # TUI's "Request replan" (tickets mode: `mark(reason="replan")`, the TUI session).
     ("devcontract.py", "reset_spec_for_replan"): 1,
-    # `bmad-loop confirm` (tickets mode: `mark(reason="confirm")`, the park session).
+    # `bmad-loop confirm`'s v6 spec flip. A ticket park never reaches it: its
+    # plan is marked `mark(reason="confirm")` in `_mark_ticket_confirmed`.
     ("cli.py", "_apply_confirmation"): 1,
     # the resolve re-arm transaction (tickets mode: `mark(reason="rearm")` with a
     # `restore_preimage` rollback, the resolve session).
     ("runs.py", "_rearm_escalation_locked"): 1,
-    # the attempt-owned spec route after a byte restore (tickets mode:
-    # `restore_preimage` plus the rollback re-arm, the park/rollback session).
+    # the attempt-owned spec route after a byte restore. A ticket plan never
+    # reaches it: `RecoveryFlow._route_owned_plan` hands it to the engine's
+    # `OwnedPlanWriter` (`restore_preimage`, then `mark` with reason `rollback` or
+    # `rearm`), and `TicketsEngine._after_code_rollback` re-arms it after a reset.
     ("recovery_flow.py", "_normalize_attempt_owned_spec"): 1,
 }
 

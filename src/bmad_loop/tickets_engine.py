@@ -52,6 +52,14 @@ initiative folder for a no-plan fallback result. The dev and review gates are
 ``verify.verify_dev_tickets`` / ``verify.verify_review_tickets``: no sprint board,
 and the orchestrator alone owns ``done``. The unit's commit carries
 ``Bmad-Ticket:`` and ``Bmad-Plan:`` trailers.
+
+A session (or, under ``[operator] on_review_demotion = "park"``, a review) that
+parks the ticket at ``awaiting-operator`` keeps the base park verification; the
+commit window then marks the plan ``blocked`` with an ``awaiting operator: ``
+reason instead of ``done``, and ``bmad-loop confirm`` later marks it through the
+same chokepoint. A code rollback re-arms the bound plan (``ready-for-dev``, or a
+frontmatter-only plan deleted), and the recovery flow restores and re-routes a
+plan only through the ticket tree, confined to the store root.
 """
 
 from __future__ import annotations
@@ -66,7 +74,7 @@ from . import gates, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
-from .frontmatter import frontmatter_fault, parse_frontmatter, status_of
+from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatter, status_of
 from .model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_TICKET_TREE,
@@ -76,8 +84,9 @@ from .model import (
     VerifyOutcome,
     result_mapping,
 )
+from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
 from .runs import rebase_recorded_project_path
-from .statemachine import PlanWriteReason, advance
+from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
     HALT_DIRTY_INITIATIVE,
@@ -154,6 +163,35 @@ def _overlaps(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder + "/") or folder.startswith(path + "/")
 
 
+# A rolled-back attempt's plan re-routed to `ready-for-dev` (the recovery flow's
+# plain route) or to a re-drive's resume status; nothing else moves it there.
+_ROLLBACK_ROUTE_REASONS: Mapping[str, PlanWriteReason] = {
+    "ready-for-dev": "rollback",
+    "in-progress": "rearm",
+    "in-review": "rearm",
+}
+# What a code rollback re-arms: a plan the attempt carried past `ready-for-dev`.
+_REARMED_AFTER_ROLLBACK = frozenset({"in-progress", "in-review", "built"})
+
+
+def _plan_state(plan: Path) -> tuple[str, str, str] | None:
+    """``(status, blocked_reason, text)`` of the plan on disk, None when it is
+    absent. Raises ``OSError``/``UnicodeDecodeError`` for one that cannot be
+    read."""
+    if not plan.exists():
+        return None
+    text = plan.read_text(encoding="utf-8-sig")
+    fm = parse_frontmatter(text)
+    reason = fm.get("blocked_reason")
+    return status_of(fm), reason.strip() if isinstance(reason, str) else "", text
+
+
+def operator_park_reason(actions: Iterable[str]) -> str:
+    """The ``blocked_reason`` a ticket park carries: the operator-park prefix,
+    then what the human owes, one action after another."""
+    return OPERATOR_PARK_PREFIX + "; ".join(a.strip() for a in actions if a.strip())
+
+
 _TRAILER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: \S")
 
 
@@ -172,6 +210,32 @@ def _with_trailers(message: str, trailers: list[str]) -> str:
 def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
     """The project's installed ``tickets.py``, pinned to ``pinned_initiative``."""
     return TicketTree(project_root, pinned_initiative=pinned_initiative)
+
+
+class _TicketPlanWriter:
+    """The recovery flow's writer for a bound ticket plan
+    (:class:`~bmad_loop.recovery_flow.OwnedPlanWriter`): the byte restore is
+    ``TicketTree.restore_preimage`` and the lifecycle route is ``mark``, so a
+    rolled-back plan never meets the recovery flow's own frontmatter writer."""
+
+    def __init__(self, engine: TicketsEngine) -> None:
+        self._engine = engine
+
+    def owns(self, task: StoryTask, spec_path: Path) -> bool:
+        plan = self._engine._bound_plan(task)
+        return plan is not None and _same_file(spec_path, plan)
+
+    def restore(self, task: StoryTask, spec_path: Path, data: bytes) -> None:
+        del task
+        engine = self._engine
+        try:
+            engine._workspace_ticket_tree().restore_preimage(spec_path, data, engine.journal)
+        except (TicketsError, OSError) as e:
+            raise OwnedPlanRefused(str(e)) from e
+
+    def normalize(self, task: StoryTask, spec_path: Path, target_status: str) -> None:
+        del spec_path
+        self._engine._route_plan(task, target_status)
 
 
 class TicketsEngine(CheckpointFlowMixin, Engine):
@@ -1052,38 +1116,58 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         return ticket.epic_slug
 
     def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | None:
-        """The orchestrator's acceptance: ``mark <ref> done`` (reason ``accept``)
-        on the bound plan, inside the commit window, under ``[tickets] mark_done =
-        "auto"``. The store is tracked inside the code checkout (preflight refuses
+        """The ticket's terminal write on the bound plan, inside the commit
+        window. The store is tracked inside the code checkout (preflight refuses
         every other layout for now), so the marked plan rides the unit's own
         squash and reaches the target branch only with the code it describes —
         never before: ``next`` unblocks a done ticket's dependents.
 
-        Nothing is written under ``"never"`` (the plan stays ``built`` for a
-        person to accept), for an unbound task, or for a plan already ``done``
-        (a no-op mark). A failed mark puts back whatever it may have written,
-        then pauses at ``ticket-tree`` with the task still COMMITTING, so a
-        resume re-drives the window and marks again. Returns the pre-image for
-        :meth:`_undo_terminal_plan_write`."""
+        * A park (``task.operator_actions`` latched): the session's
+          ``awaiting-operator`` plan becomes ``mark <ref> blocked --blocked
+          "awaiting operator: <actions>"`` (reason ``park``), whatever
+          ``mark_done`` says — never ``done``: the human still owes the actions.
+        * Otherwise the orchestrator's acceptance, under ``[tickets] mark_done =
+          "auto"``: ``mark <ref> done`` (reason ``accept``). Nothing is written
+          under ``"never"`` (the plan stays ``built`` for a person to accept).
+
+        Nothing is written for an unbound task, or for a plan already at the
+        target (a no-op mark, e.g. a re-driven window). A failed mark puts back
+        whatever it may have written, then pauses at ``ticket-tree`` with the
+        task still COMMITTING, so a resume re-drives the window and marks again.
+        Returns the pre-image for :meth:`_undo_terminal_plan_write`."""
         plan = self._bound_plan(task)
         ticket = task.ticket
-        if self.policy.tickets.mark_done != "auto" or plan is None or ticket is None:
+        if plan is None or ticket is None:
+            return None
+        parked = bool(task.operator_actions)
+        if not parked and self.policy.tickets.mark_done != "auto":
             return None
         try:
             preimage = plan.read_bytes() if plan.is_file() else None
         except OSError as e:
-            self._pause_mark_done(task, f"cannot read {plan}: {e}")
+            self._pause_mark_done(task, f"cannot read {plan}: {e}", parked=parked)
         undo = _PlanUndo(plan, preimage)
+        tree = self._workspace_ticket_tree()
         try:
-            mark = self._workspace_ticket_tree().mark(
-                ticket.ref, "done", reason="accept", expected_plan=plan, journal=self.journal
-            )
+            if parked:
+                mark = tree.mark(
+                    ticket.ref,
+                    "blocked",
+                    reason="park",
+                    expected_plan=plan,
+                    blocked=operator_park_reason(task.operator_actions),
+                    journal=self.journal,
+                )
+            else:
+                mark = tree.mark(
+                    ticket.ref, "done", reason="accept", expected_plan=plan, journal=self.journal
+                )
         except TicketsError as e:
             detail = f"tickets.py {e.kind}: {e}"
             if _bytes_or_none(plan) != preimage:
                 if unrestored := self._undo_terminal_plan_write(task, undo):
                     detail = f"{detail}; {unrestored}"
-            self._pause_mark_done(task, detail)
+            self._pause_mark_done(task, detail, parked=parked)
         return undo if mark.outcome == "written" else None
 
     def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
@@ -1101,25 +1185,35 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         except (TicketsError, OSError) as e:
             return (
                 f"{undo.plan} could not be put back to its pre-mark bytes ({e}) and may "
-                "still read done; restore it before resuming"
+                "still carry the mark; restore it before resuming"
             )
         return None
 
-    def _pause_mark_done(self, task: StoryTask, detail: str) -> NoReturn:
+    def _pause_mark_done(self, task: StoryTask, detail: str, *, parked: bool = False) -> NoReturn:
+        what = "parking" if parked else "marking"
+        target = "blocked" if parked else "done"
         reason = (
-            f"marking {task.story_key} done failed ({detail}) — the unit is verified "
+            f"{what} {task.story_key} {target} failed ({detail}) — the unit is verified "
             f"but not committed; fix the ticket tree, then {self._resume_hint()}"
         )
-        gates.notify(self.policy, self.run_dir, f"mark done failed: {task.story_key}", reason)
+        gates.notify(self.policy, self.run_dir, f"mark {target} failed: {task.story_key}", reason)
         raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
 
-    def _operator_park_enabled(self) -> bool:
-        """False: a session-declared ``awaiting-operator`` plan has no ticket-tree
-        meaning (``tickets.py`` reads it as a problems row), and its conversion to
-        a ``blocked`` park through ``mark`` lands with the ticket lifecycle — so,
-        like stories and sweep, no tickets prompt offers the park and both gates
-        refuse the status."""
-        return False
+    def _park_record_fields(self, task: StoryTask) -> dict[str, str]:
+        """A ticket park's record names its source and ref, so ``bmad-loop
+        confirm`` marks the plan through the ticket chokepoint instead of reading a
+        sprint board."""
+        ticket = task.ticket
+        return {"source": SOURCE_TICKETS, "ref": ticket.ref if ticket else task.story_key}
+
+    def _park_review_demotion(self, task: StoryTask, result: SessionResult) -> VerifyOutcome:
+        """A review that demoted the ticket to ``awaiting-operator`` (``[operator]
+        on_review_demotion = "park"``): there is no sprint board to regress, so
+        this is the base gate and latch alone — ``verify_review_tickets`` holds
+        the park to its pair and a non-empty action list — and the latched
+        actions turn the commit window's plan write into the same ``blocked``
+        park a dev park gets (:meth:`_terminal_plan_write`)."""
+        return self._gate_review_demotion(task, result)
 
     def _reset_spec_for_repair(self, task: StoryTask) -> None:
         """Re-open the bound plan before a repair leg: ``mark <ref> in-progress``
@@ -1144,9 +1238,95 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """No-op: there is no sprint board to carry an advance to, whatever a
         restored task's ``board_advance_intended`` says."""
 
-    def _review_demotion_parks(self) -> bool:
-        """False: a review demotion parks through the sprint board in the base
-        engine, and tickets mode has none. The ticket park path (blocked with an
-        ``awaiting operator:`` reason) takes this over in Session 17 of the v7
-        program, under ``[operator] on_review_demotion = "park"``."""
-        return False
+    # ------------------------------------------------------------- rollback
+
+    def _spec_confine_root(self, task: StoryTask) -> Path:
+        """A bound ticket's plan is restored only inside the store root (the
+        active workspace's ``output_folder``, where ``tickets.py`` keeps every
+        initiative); an unbound task keeps the base root."""
+        if task.ticket is None:
+            return super()._spec_confine_root(task)
+        return self.workspace.paths.output_folder
+
+    def _owned_plan_writer(self) -> OwnedPlanWriter | None:
+        return _TicketPlanWriter(self)
+
+    def _route_plan(self, task: StoryTask, target: str) -> None:
+        """Re-route a rolled-back plan to ``target`` through ``mark``: reason
+        ``rollback`` to ``ready-for-dev``, ``rearm`` to a re-drive's
+        ``in-progress``/``in-review``. A plan already there is left alone; any
+        other target, an absent or unreadable plan, or a refused mark raises
+        :class:`~bmad_loop.recovery_flow.OwnedPlanRefused`."""
+        plan = self._bound_plan(task)
+        ticket = task.ticket
+        if plan is None or ticket is None:
+            raise OwnedPlanRefused(f"{task.story_key} has no ticket binding")
+        try:
+            state = _plan_state(plan)
+        except (OSError, UnicodeDecodeError) as e:
+            raise OwnedPlanRefused(f"cannot read {plan}: {e}") from e
+        if state is None:
+            raise OwnedPlanRefused(f"{plan} is absent")
+        status, blocked_reason, _ = state
+        if status == target and not blocked_reason:
+            return
+        reason = _ROLLBACK_ROUTE_REASONS.get(target)
+        if reason is None:
+            raise OwnedPlanRefused(f"no plan-transition reason routes a plan to {target!r}")
+        try:
+            self._workspace_ticket_tree().mark(
+                ticket.ref, target, reason=reason, expected_plan=plan, journal=self.journal
+            )
+        except TicketsError as e:
+            raise OwnedPlanRefused(f"tickets.py {e.kind}: {e}") from e
+
+    def _after_code_rollback(self, task: StoryTask) -> None:
+        """Re-arm the bound plan once a rollback returned. The reset keeps the
+        artifact folders' untracked files, so a plan the attempt created and
+        carried to ``in-progress``, ``in-review`` or ``built`` survives it (a
+        tracked plan goes back to its baseline bytes, or its pre-launch snapshot
+        through the recovery flow), and would otherwise send the next dispatch to
+        resume or review against code that is gone. A plan holding only
+        frontmatter is deleted (``discard_unbuilt_plan``), as upstream's
+        unattended-builds contract asks; any other is marked ``ready-for-dev``
+        (reason ``rollback``). Either way the plan moves only through the ticket
+        chokepoint — never by a reset, a stash or a preserve ref of its own.
+
+        Nothing is done for an unbound task, an absent plan, a plan still at or
+        before ``ready-for-dev`` (or parked, done, dropped), or a re-drive that
+        restores its change (``restore_patch``: the recovery flow routes that
+        plan to ``in-review`` itself). A plan that cannot be read or re-armed
+        pauses at ``ticket-tree``; a resume rolls back and re-arms again."""
+        plan = self._bound_plan(task)
+        ticket = task.ticket
+        if plan is None or ticket is None or task.restore_patch:
+            return
+        try:
+            state = _plan_state(plan)
+        except (OSError, UnicodeDecodeError) as e:
+            self._pause_rearm(task, f"cannot read {plan}: {e}")
+        if state is None or state[0] not in _REARMED_AFTER_ROLLBACK:
+            return
+        tree = self._workspace_ticket_tree()
+        try:
+            if is_frontmatter_only(state[2]):
+                tree.discard_unbuilt_plan(ticket.ref, plan, self.journal)
+            else:
+                tree.mark(
+                    ticket.ref,
+                    "ready-for-dev",
+                    reason="rollback",
+                    expected_plan=plan,
+                    journal=self.journal,
+                )
+        except TicketsError as e:
+            self._pause_rearm(task, f"tickets.py {e.kind}: {e}")
+
+    def _pause_rearm(self, task: StoryTask, detail: str) -> NoReturn:
+        reason = (
+            f"re-arming {task.story_key}'s plan after its rollback failed ({detail}) — "
+            f"the code is back at the attempt baseline but the plan is not; fix the "
+            f"ticket tree, then {self._resume_hint()}"
+        )
+        gates.notify(self.policy, self.run_dir, f"plan re-arm failed: {task.story_key}", reason)
+        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)

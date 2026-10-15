@@ -459,14 +459,15 @@ def _probe_session(engine: TicketsEngine, adapter: MockAdapter, task: StoryTask,
 
 def test_dev_prompt_uses_ticket_ref(project_v7):
     """Every dev leg dispatches `ticket <ref>`: the fresh leg is exactly the
-    dry-run's line plus the tickets clauses (no backticks; no park clause, which
-    tickets mode does not offer yet — and which stays last when it is on), and
-    the repair leg keeps the feedback file as its last backticked token.
+    dry-run's line plus the tickets clauses (no backticks; the park clause last,
+    and absent under `[operator] enabled = false`), and the repair leg keeps the
+    feedback file as its last backticked token.
     Ablation (performed): fall back to the base `_dev_prompt` and the fresh
     prompt dispatches the bare key `1.1` with the sprint-board clause — this
     FAILS."""
     tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
-    engine, _ = make_engine(project_v7, tree)
+    off = dataclasses.replace(_policy(), operator=OperatorPolicy(enabled=False))
+    engine, _ = make_engine(project_v7, tree, policy=off)
     task = _bound(engine, tree)
     skill = engine._dev_skill()
 
@@ -476,11 +477,10 @@ def test_dev_prompt_uses_ticket_ref(project_v7):
     assert fresh == f"/{skill} ticket 1.1 — {engine._sprint_board_instruction()}"
     assert "`" not in fresh and "sprint-status" not in fresh
     assert "tickets.py mark" in fresh and "awaiting-operator" not in fresh
-    engine._operator_park_enabled = lambda: True  # type: ignore[method-assign]
-    park = engine._operator_park_instruction()
-    assert park and "`" not in park
-    assert engine._dev_prompt(task, None) == f"{fresh} {park}"
-    del engine._operator_park_enabled
+    parking, _ = make_engine(project_v7, tree)
+    park = parking._operator_park_instruction()
+    assert park and "`" not in park and "awaiting-operator" in park
+    assert parking._dev_prompt(task, None) == f"{fresh} {park}"
 
     plan = Path(tree.finds["1.1"].plan)
     _write_plan(plan, "built")
@@ -781,8 +781,8 @@ def test_resume_moves_in_place_spec_paths_with_a_renamed_project(project_v7, tmp
 def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     """The follow-up review re-dispatches the ticket with the ledger sentence and
     the tickets clauses: never the banned word, never the sprint board, no
-    backticks — and no park clause, because a tickets review demotion does not
-    park yet, even under `on_review_demotion = "park"`."""
+    backticks — and the park clause last only under `on_review_demotion =
+    "park"`, the one setting a tickets review demotion parks under."""
     tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
     pol = Policy(
         gates=GatesPolicy(mode="none"),
@@ -805,8 +805,13 @@ def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     assert "append" not in prompt.lower()
     assert "board" not in prompt.lower() and "sprint-status" not in prompt
     assert "`" not in prompt and str(plan) not in prompt
-    assert prompt.endswith(engine._board_handback_redirect())
-    assert "awaiting-operator" not in prompt
+    assert prompt.endswith(
+        f"{engine._board_handback_redirect()} {engine._operator_park_instruction()}"
+    )
+    escalating, _ = make_engine(project_v7, tree)
+    plain = escalating._review_prompt(task)
+    assert plain.endswith(escalating._board_handback_redirect())
+    assert "awaiting-operator" not in plain
 
 
 def test_expected_spec_pinned_on_attempt_one(project_v7):
@@ -1767,3 +1772,251 @@ def test_dirty_initiative_status_unreadable_pauses(project_v7, monkeypatch):
     assert state.tasks == {} and adapter.sessions == []
     [halt] = _kinds(engine, "ticket-pick-halt")
     assert halt["cause"] == tickets_source.HALT_DIRTY_INITIATIVE
+
+
+# ---- parking: a session-declared `awaiting-operator` plan becomes a `blocked` park
+
+PARK_ACTIONS = ["buy example.com at the registrar", "publish the _acme TXT record"]
+
+
+def _write_parked_plan(
+    plan: Path,
+    status: str,
+    *,
+    actions=PARK_ACTIONS,
+    blocked_reason: str = "",
+    baseline: str = "",
+) -> None:
+    """A plan as a parking build leaves it: the park status and its owed
+    `operator_actions` (and, once marked, the operator-park `blocked_reason`)."""
+    lines = ["---", "ticket: 1", f"status: {status}"]
+    if baseline:
+        lines.append(f"baseline_revision: '{baseline}'")
+    if blocked_reason:
+        lines.append(f"blocked_reason: '{blocked_reason}'")
+    lines.append("operator_actions:")
+    lines += [f"  - '{a}'" for a in actions]
+    lines += ["---", "", "# plan", "", "the agent-doable half is built", ""]
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_bytes("\n".join(lines).encode("utf-8"))
+
+
+def _parks(layout: V7Layout, tree: FakeTicketTree, plan: Path):
+    """A dev session that builds what it can and parks the ticket: code in the
+    tree, the plan at `awaiting-operator` with its actions, and the fake's row
+    reading the session's own token as `tickets.py` would hand it back."""
+
+    def park(spec: SessionSpec) -> SessionResult:
+        cwd = Path(spec.cwd)
+        here = cwd / plan.relative_to(layout.project)
+        baseline = verify.rev_parse_head(cwd)
+        (cwd / "src.txt").write_bytes(b"dns client\n")
+        _write_parked_plan(here, "awaiting-operator", baseline=baseline)
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="awaiting-operator")
+        )
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "awaiting-operator"}
+        return SessionResult(status="completed", result_json=result)
+
+    return park
+
+
+def _park_marking_tree(tree: FakeTicketTree, plan: Path, monkeypatch) -> None:
+    """Make the fake's written marks land on the plan as `tickets.py mark` does:
+    status and `blocked_reason` rewritten, the plan's other keys (the owed
+    actions) kept."""
+    real = tree.mark
+
+    def mark(ref, target, **kw):
+        result = real(ref, target, **kw)
+        if result.outcome == "written":
+            _write_parked_plan(plan, target, blocked_reason=kw.get("blocked") or "")
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark)
+
+
+def _park_record(layout: V7Layout, key: str = "1.1") -> dict:
+    from bmad_loop import operatoractions
+
+    return operatoractions.load(layout.project)[key]
+
+
+def test_park_converted_to_blocked_at_commit(project_v7, monkeypatch):
+    """A session that parks the ticket at `awaiting-operator` keeps the v6 park
+    verification (both gates hold it to its action list), and the commit window
+    converts it: `mark 1.1 blocked --blocked "awaiting operator: <actions>"`
+    (reason `park`) on the bound plan, riding the unit's squash with the code and
+    the park record — which names its source and ref, for `confirm`. The unit
+    ends AWAITING_OPERATOR with a clean tree, so the next pick's dirty-initiative
+    gate does not trip. Ablation (performed): drop the park branch from
+    `_terminal_plan_write` and the plan is marked `done` from `awaiting-operator`,
+    which the transition table refuses and the run pauses — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    engine, adapter = make_engine(project_v7, tree, script=[_parks(project_v7, tree, plan)])
+    engine.state.max_stories = 1
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert task.operator_actions == PARK_ACTIONS
+    reason = "awaiting operator: " + "; ".join(PARK_ACTIONS)
+    assert [(m.ref, m.target, m.reason, m.expected_plan, m.blocked) for m in tree.marks] == [
+        ("1.1", "blocked", "park", plan, reason)
+    ]
+    committed = parse_frontmatter(
+        git(
+            project_v7.project,
+            "show",
+            f"{task.commit_sha}:{plan.relative_to(project_v7.project).as_posix()}",
+        )
+    )
+    assert status_of(committed) == "blocked"
+    assert committed["blocked_reason"] == reason
+    assert committed["operator_actions"] == PARK_ACTIONS
+    record = _park_record(project_v7)
+    assert (record["source"], record["ref"]) == ("tickets", "1.1")
+    assert git(project_v7.project, "show", f"{task.commit_sha}:src.txt").strip() == "dns client"
+    assert git(project_v7.project, "status", "--porcelain") == ""
+    assert [e["kind"] for e in engine.journal.entries()].count(
+        "review-skipped-awaiting-operator"
+    ) == 1
+
+
+@pytest.mark.parametrize("mark_done", ["auto", "never"])
+def test_park_not_marked_done(project_v7, monkeypatch, mark_done):
+    """A parked ticket is never accepted: whatever `[tickets] mark_done` says, the
+    one mark the commit window makes is the `blocked` park — `done` would unblock
+    dependents of a ticket a human still owes work on, and `"never"` must not
+    leave the session's `awaiting-operator` (a problems row upstream) behind.
+    Ablation (performed): gate the park branch on `mark_done == "auto"` and the
+    `never` row writes nothing, committing the plan at `awaiting-operator` — this
+    FAILS; drop the branch and the `auto` row tries `done` — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    pol = dataclasses.replace(_policy(), tickets=TicketsPolicy(mark_done=mark_done))
+    engine, _ = make_engine(
+        project_v7, tree, policy=pol, script=[_parks(project_v7, tree, plan)], max_stories=1
+    )
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR
+    assert [(m.target, m.reason) for m in tree.marks] == [("blocked", "park")]
+    rel = plan.relative_to(project_v7.project).as_posix()
+    assert (
+        status_of(parse_frontmatter(git(project_v7.project, "show", f"{task.commit_sha}:{rel}")))
+        == "blocked"
+    )
+
+
+def _demotes(layout: V7Layout, tree: FakeTicketTree, plan: Path):
+    """A review pass that concludes the built ticket still owes human-only
+    actions: the plan finalized at `awaiting-operator` with its actions."""
+
+    def review(spec: SessionSpec) -> SessionResult:
+        here = Path(spec.cwd) / plan.relative_to(layout.project)
+        _write_parked_plan(here, "awaiting-operator")
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="awaiting-operator")
+        )
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "awaiting-operator"}
+        return SessionResult(status="completed", result_json=result)
+
+    return review
+
+
+def _builds_asking_review(layout: V7Layout, tree: FakeTicketTree, plan: Path):
+    """`_builds`, with the dev result recommending the follow-up review pass."""
+    build = _builds(layout, tree, plan)
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        result = build(spec)
+        rj = {**(result.result_json or {}), "followup_review_recommended": True}
+        return dataclasses.replace(result, result_json=rj)
+
+    return effect
+
+
+def test_review_demotion_parks_to_blocked(project_v7, monkeypatch):
+    """`[operator] on_review_demotion = "park"`: a review that demotes the built
+    ticket to `awaiting-operator` is gated (actions owed) and committed as the
+    same `blocked` park a dev park gets — no sprint board is touched or recorded
+    as intended — and the review prompt offered the park. Ablation (performed):
+    drop the `_park_review_demotion` override and the base regresses the sprint
+    board and records `board_advance_intended` — this FAILS; restore the False
+    `_review_demotion_parks` and the demotion is not taken (no park mark) — this
+    FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True),
+        operator=OperatorPolicy(on_review_demotion="park"),
+    )
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=pol,
+        script=[_builds_asking_review(project_v7, tree, plan), _demotes(project_v7, tree, plan)],
+        max_stories=1,
+    )
+    # committed, so the dirty-initiative gate (the board path is in the initiative
+    # folder on v7) lets the ticket through
+    board, before = _stray_board(engine, "1.1")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "stray board")
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert len(adapter.sessions) == 2
+    assert "awaiting-operator" in adapter.sessions[1].prompt
+    reason = "awaiting operator: " + "; ".join(PARK_ACTIONS)
+    assert [(m.target, m.reason, m.blocked) for m in tree.marks] == [("blocked", "park", reason)]
+    rel = plan.relative_to(project_v7.project).as_posix()
+    assert (
+        status_of(parse_frontmatter(git(project_v7.project, "show", f"{task.commit_sha}:{rel}")))
+        == "blocked"
+    )
+    assert board.read_bytes() == before
+    assert task.board_advance_intended in (None, "")
+
+
+def test_rollback_restores_plan_preimage_through_chokepoint(project_v7, monkeypatch):
+    """A plan that was on disk at dispatch is attempt-owned input: when the
+    attempt is rolled back, its pre-launch bytes go back through
+    `TicketTree.restore_preimage` — the recovery flow's own anchored writer never
+    touches a ticket plan — and the plan is confined to the store root
+    (`output_folder`). Ablation (performed): return None from
+    `TicketsEngine._owned_plan_writer` and the anchored writer restores it
+    instead, with no `restore_preimage` call — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", status="ready-for-dev"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "ready-for-dev")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "plan")
+    _disk_restores(tree, monkeypatch)
+    pol = dataclasses.replace(_policy(), scm=ScmPolicy(rollback_on_failure=False))
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    task.baseline_commit = verify.rev_parse_head(project_v7.project)
+    task.baseline_untracked = []
+    operator = plan.read_bytes().replace(b"# plan", b"# plan, amended before launch")
+    task.dispatched_spec_file = str(plan.resolve())
+    task.dispatched_spec_snapshot = operator
+    # the failed child put the plan back at HEAD, discarding the pre-launch edit
+
+    engine._rollback_or_pause(task)
+
+    assert tree.restores == [(plan.resolve(), operator)]
+    assert plan.read_bytes() == operator
+    assert engine._spec_confine_root(task) == engine.workspace.paths.output_folder

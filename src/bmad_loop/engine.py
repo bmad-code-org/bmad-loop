@@ -90,7 +90,7 @@ from .platform_util import (
 )
 from .plugins import GrantSet, HookBus, HookContext, PluginRegistry, PluginTrustError, Refusal
 from .policy import Policy
-from .recovery_flow import RecoveryFlow
+from .recovery_flow import OwnedPlanWriter, RecoveryFlow
 from .runs import (
     StateRootError,
     clear_graceful_stop,
@@ -1044,7 +1044,9 @@ class Engine:
         # the engine's escalation; `escalation_pause` raises RunPaused for it
         # (injected so recovery_flow need not import engine — that would reintroduce
         # a runtime<->engine cycle); `dev_attempt_dispatched` is the preserve-ref
-        # provenance probe (#777).
+        # provenance probe (#777); `spec_confine_root` and `owned_plan` are the
+        # work source's say over where an attempt-owned spec may be restored, and
+        # who restores it (`_spec_confine_root`, `_owned_plan_writer`).
         self._recovery_flow = RecoveryFlow(
             paths=self.paths,
             policy=self.policy,
@@ -1057,6 +1059,8 @@ class Engine:
             escalate=self._escalate,
             escalation_pause=self._escalation_pause,
             dev_attempt_dispatched=self._dev_attempt_dispatched,
+            spec_confine_root=lambda task: self._spec_confine_root(task),
+            owned_plan=self._owned_plan_writer(),
         )
 
     def _escalation_pause(
@@ -1851,6 +1855,28 @@ class Engine:
         # so the next dispatch re-probes the restored tree (DW-523).
         self._env_probes_fresh_root = None
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
+        self._after_code_rollback(task)
+
+    def _after_code_rollback(self, task: StoryTask) -> None:
+        """The work source's follow-up once a rollback (or its clean no-op)
+        returned: ``TicketsEngine`` re-arms the unit's plan, which the reset keeps
+        when the attempt created it (the artifact folders are kept from the
+        untracked sweep). Base: nothing — the spec route is the recovery flow's
+        own."""
+        del task
+
+    def _spec_confine_root(self, task: StoryTask) -> Path:
+        """The root an attempt-owned spec write for ``task`` is confined to
+        (``RecoveryFlow``'s restore and normalization sites). Base: the active
+        workspace's project, where every v6 spec lives."""
+        del task
+        return self.workspace.paths.project
+
+    def _owned_plan_writer(self) -> OwnedPlanWriter | None:
+        """Who restores and re-routes an attempt-owned spec instead of the recovery
+        flow's own anchored writers: ``TicketsEngine``'s ticket chokepoint for a
+        bound plan. Base: None — the recovery flow writes v6 specs itself."""
+        return None
 
     def _accept_current_baseline(self, task: StoryTask) -> None:
         self._recovery_flow.accept_current_baseline(task)
@@ -4823,11 +4849,19 @@ class Engine:
                 run_id=self.state.run_id,
                 parked_at=self._today(),
                 root_identity=self._mount_root_identity(task, self.workspace.paths.project),
+                **self._park_record_fields(task),
             )
         except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
             return None
         return (path, prior)
+
+    def _park_record_fields(self, task: StoryTask) -> dict[str, str]:
+        """The work source's extra park-record keys (``source``, ``ref``) for
+        ``operatoractions.record_park``. Base: none, so a v6 record keeps its
+        shape."""
+        del task
+        return {}
 
     def _restore_park_record(self, task: StoryTask, record: tuple[Path, str | None] | None) -> None:
         """Put the park record back the way `_write_park_record` found it, for

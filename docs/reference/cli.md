@@ -267,6 +267,7 @@ bmad-loop confirm [--project PROJECT] [--list] [--yes] [--reverify] [--json] [st
 | `--json`     | Emit the parked set as one JSON document. Implies `--list`.                                                                                                                |
 
 - After each action is acknowledged, appends an `## Operator Confirmation` section to the spec, sets the spec and board to `done`, removes the park record, and commits the result (best-effort). Declining any action changes nothing and exits 0.
+- Tickets mode: `story_key` is the ticket ref, and there is no board. The plan is marked through `tickets.py mark` (`done` under `[tickets] mark_done = "auto"`, else `built`), which clears its `blocked_*` fields. A failed mark exits 1 and keeps the park record.
 - Exits 2 without a `story_key`, `--list` or `--json`. Exits 1 when the story is not parked in this checkout or its park record disagrees with the committed state.
 
 JSON: [`confirm --json`](#confirm---json).
