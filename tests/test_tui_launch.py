@@ -3170,6 +3170,29 @@ def test_an_underivable_launcher_root_is_reported_by_the_check(monkeypatch, tmp_
     assert len(warned) == 1 and envvars.STATE_DIR in warned[0]
 
 
+def test_a_ctl_session_setup_warning_reaches_the_sink(monkeypatch, tmp_path: Path):
+    """Textual captures stderr for the whole TUI run, so a step the backend
+    could not finish at create (psmux turning a user's destroy-unattached off)
+    is routed to the sink, not printed. Ablation: drop the catch around
+    new_session and the sink is empty."""
+    import warnings
+
+    class _Mux:
+        def has_session(self, name):
+            return False
+
+        def new_session(self, name, project):
+            warnings.warn(f"could not set destroy-unattached off on {name}", RuntimeWarning)
+
+    warned: list[str] = []
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _Mux())
+    monkeypatch.setattr(launch.runs, "ctl_session_for", lambda project, mux: "ctl")
+    monkeypatch.setattr(launch, "_warn_if_stale_state_root", lambda mux, name: None)
+    monkeypatch.setattr(launch, "warn_sink", warned.append)
+    assert launch._ensure_ctl_session(tmp_path) == "ctl"
+    assert warned == ["could not set destroy-unattached off on ctl"]
+
+
 def test_an_underivable_launcher_root_refuses_the_launch(monkeypatch, tmp_path: Path):
     """A launcher that cannot name a state root cannot hand the window one, and
     omitting `--state-root` would let the engine inherit whatever root the

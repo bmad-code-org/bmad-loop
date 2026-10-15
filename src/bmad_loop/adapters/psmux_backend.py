@@ -80,6 +80,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -695,13 +696,15 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # exists, and raising here would leave it untagged (the caller's tag
         # write never runs), which a shared registry's cleanup refuses to own.
         # psmux reaps only on a last-client detach, so a failed write is said,
-        # not fatal.
+        # not fatal. Said as a warning, so a caller whose stderr reaches nobody
+        # (the TUI) can route it to the operator.
         try:
             self.set_session_option(name, "destroy-unattached", "off")
         except TmuxError as exc:
-            print(
-                f"warning: could not set destroy-unattached off on {name}: {exc}",
-                file=sys.stderr,
+            warnings.warn(
+                f"could not set destroy-unattached off on {name}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
             )
 
     @staticmethod
