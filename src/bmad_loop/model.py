@@ -1350,10 +1350,13 @@ class RunState:
     # `plan_checkpoint` story file an operator approved this run, so the pick
     # dispatches them instead of pausing again. `ticket_epic_closures`: epic slug ->
     # the closure disposition this run recorded at its epic boundary (a retro
-    # verdict, e.g. "rejected", holds every later epic until the epic is closed).
+    # verdict, e.g. "rejected", holds every later epic until the epic is closed;
+    # "unknown" when no verdict was read). `ticket_epic_closure_acked`: epic slugs
+    # whose non-rejected closure pause an operator resumed past, so it pauses once.
     ticket_epic_filter: str = ""
     ticket_story_approvals: list[str] = field(default_factory=list)
     ticket_epic_closures: dict[str, str] = field(default_factory=dict)
+    ticket_epic_closure_acked: list[str] = field(default_factory=list)
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -1535,6 +1538,7 @@ class RunState:
             "ticket_epic_filter": self.ticket_epic_filter,
             "ticket_story_approvals": list(self.ticket_story_approvals),
             "ticket_epic_closures": dict(self.ticket_epic_closures),
+            "ticket_epic_closure_acked": list(self.ticket_epic_closure_acked),
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
@@ -1584,6 +1588,7 @@ class RunState:
             ticket_epic_closures={
                 str(k): str(v) for k, v in d.get("ticket_epic_closures", {}).items()
             },
+            ticket_epic_closure_acked=[str(s) for s in d.get("ticket_epic_closure_acked", [])],
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],

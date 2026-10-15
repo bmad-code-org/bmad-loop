@@ -11004,17 +11004,24 @@ class Engine:
             latch()
             self.journal.append("sweep-auto-finished", trigger=trigger)
 
-    def _skip_auto_retro(self, epic: int, reason: str, error: str | None = None) -> None:
+    def _skip_auto_retro(
+        self, epic: int, reason: str, error: str | None = None, *, epic_ref: str | None = None
+    ) -> None:
         """Journal a pre-dispatch refusal of the auto retrospective and, unless the
-        retro is simply already done, tell the operator to run it by hand."""
-        extra = {} if error is None else {"error": error}
+        retro is simply already done, tell the operator to run it by hand.
+        ``epic_ref`` names a slug-keyed epic (tickets mode, ``epic`` 0): it rides
+        the row and the notice names it."""
+        extra: dict[str, str] = {} if error is None else {"error": error}
+        if epic_ref is not None:
+            extra["epic_ref"] = epic_ref
         self.journal.append("retro-auto-skipped", epic=epic, reason=reason, **extra)
+        label = f"epic {epic}" if epic_ref is None else epic_ref
         if reason != "already-done":
             gates.notify(
                 self.policy,
                 self.run_dir,
-                f"auto retrospective skipped for epic {epic}",
-                f"{reason}: run /bmad-retrospective for epic {epic} by hand",
+                f"auto retrospective skipped for {label}",
+                f"{reason}: run /bmad-retrospective for {label} by hand",
             )
 
     def _retro_docs(self, epic: int) -> list[Path]:
@@ -11078,7 +11085,9 @@ class Engine:
         except (OSError, RuntimeError, ValueError):
             return None
 
-    def _settle_retro_tree(self, epic: int, ok: bool, docs: list[Path]) -> None:
+    def _settle_retro_tree(
+        self, epic: int, ok: bool, docs: list[Path], *, epic_ref: str | None = None
+    ) -> None:
         """Leave the tree clean after an auto-retro session, or pause.
 
         On success, commit exactly the dirty members of {sprint-status, the retro
@@ -11090,8 +11099,11 @@ class Engine:
         baseline, so an uncommitted retro doc would be destroyed or swept into that
         story's commit, and an LLM session's stray write must not enter history
         silently. Resume re-enters this boundary; ``already-done`` keeps a
-        succeeded retro from running twice."""
+        succeeded retro from running twice. ``epic_ref`` names a slug-keyed epic
+        (tickets mode, ``epic`` 0) on every row, the commit and the pause."""
         repo = self.paths.repo_root
+        label = f"epic {epic}" if epic_ref is None else epic_ref
+        ref: dict[str, str] = {} if epic_ref is None else {"epic_ref": epic_ref}
         try:
             dirty = verify.dirty_paths(repo)
             if ok:
@@ -11102,29 +11114,33 @@ class Engine:
                     try:
                         verify.commit_paths(
                             repo,
-                            f"chore(retro): epic {epic} retrospective",
+                            f"chore(retro): {label} retrospective",
                             [repo / rel for rel in to_commit],
                         )
                     except verify.GitError as e:
-                        self.journal.append("retro-auto-uncommitted", epic=epic, error=str(e))
+                        self.journal.append(
+                            "retro-auto-uncommitted", epic=epic, error=str(e), **ref
+                        )
                     dirty = verify.dirty_paths(repo)
         except verify.GitError as e:
-            self.journal.append("retro-auto-dirty", epic=epic, paths=[], error=str(e))
+            self.journal.append("retro-auto-dirty", epic=epic, paths=[], error=str(e), **ref)
             raise RunPaused(
-                f"epic {epic} boundary — could not read the worktree after the auto "
+                f"{label} boundary — could not read the worktree after the auto "
                 f"retrospective ({e}); check it, then `bmad-loop resume {self.state.run_id}`",
                 PAUSE_EPIC_BOUNDARY,
             ) from e
         if not dirty:
             return
         leftover = sorted(dirty)
-        self.journal.append("retro-auto-dirty", epic=epic, paths=leftover, count=len(leftover))
+        self.journal.append(
+            "retro-auto-dirty", epic=epic, paths=leftover, count=len(leftover), **ref
+        )
         shown = ", ".join(leftover[:_RETRO_DIRTY_REASON_PATHS])
         more = len(leftover) - _RETRO_DIRTY_REASON_PATHS
         if more > 0:
             shown += f" (+{more} more)"
         raise RunPaused(
-            f"epic {epic} boundary — the auto retrospective left uncommitted changes: "
+            f"{label} boundary — the auto retrospective left uncommitted changes: "
             f"{shown}; commit or clean them, then `bmad-loop resume {self.state.run_id}`",
             PAUSE_EPIC_BOUNDARY,
         )

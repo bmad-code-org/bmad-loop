@@ -65,6 +65,7 @@ def test_v6_traits_are_pinned():
         "label": "sprint mode — sprint-status.yaml",
         "validate_mode": "sprint",
         "has_epics": True,
+        "epic_retro": True,
         "has_spec_folder": False,
         "stories_primitive": False,
         "sentinels": False,
@@ -78,6 +79,7 @@ def test_v6_traits_are_pinned():
         "label": "stories mode — folder+id dispatch",
         "validate_mode": "stories",
         "has_epics": False,
+        "epic_retro": False,
         "has_spec_folder": True,
         "stories_primitive": True,
         "sentinels": True,
@@ -91,12 +93,14 @@ def test_v6_traits_are_pinned():
 def test_tickets_traits_are_pinned():
     """The ticket-tree source runs: it has no numbered epics (its epics are keyed
     by slug), no spec folder, no stories primitive, no sentinels, no replay and
-    no sprint board; it parks at awaiting-operator."""
+    no sprint board; it parks at awaiting-operator, and a finished epic fires the
+    retrospective gate by slug."""
     assert dataclasses.asdict(worksource.TRAITS["tickets"]) == {
         "name": "tickets",
         "label": "tickets mode — BMAD v7 ticket tree",
         "validate_mode": "tickets",
         "has_epics": False,
+        "epic_retro": True,
         "has_spec_folder": False,
         "stories_primitive": False,
         "sentinels": False,
@@ -115,12 +119,14 @@ def test_tickets_traits_are_pinned():
         ("sprint-status", "off", ("dev", "review")),
         ("stories", "auto", ("dev", "review")),
         ("stories", "off", ("dev", "review")),
-        ("tickets", "auto", ("dev", "review")),
+        ("tickets", "auto", ("dev", "review", "retro")),
+        ("tickets", "notify", ("dev", "review")),
     ],
 )
 def test_launch_roles(source, retrospective, roles):
-    """Only a source with epics launches the auto retrospective's `retro` role —
-    the same roles `cmd_run` / resume warned about before the registry."""
+    """Only a source whose finished epics fire the retrospective gate launches the
+    auto retrospective's `retro` role — sprint's numbered epics and tickets' epic
+    slugs, never stories."""
     assert worksource.launch_roles(source, retrospective) == roles
 
 

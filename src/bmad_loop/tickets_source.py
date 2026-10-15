@@ -50,6 +50,13 @@ noted ``foreign-active``.
    ``stalled``, so the run cannot finish past an unclosed epic;
 7. otherwise :class:`Skip` ``empty``: the run finishes.
 
+**Epic boundaries** (:func:`epic_boundary`) are read before the pick, from the
+same ``status`` view, so they survive a pause and a resume: an open epic whose
+every ticket is ``built``, ``done`` or ``dropped``, and of which this run committed
+at least one, owes its retrospective and closure pause; a recorded ``rejected``
+closure re-pauses while that epic stays open and finished; any other recorded
+closure pauses once and is acknowledged on the next pick.
+
 The unit key is the ticket ref (``E.M``), which is a legal path segment and
 branch component as it stands. A flat key space has no epic numbers:
 :attr:`TicketsWorkSource.has_epics` is false and every unit's epic is 0; the
@@ -88,6 +95,10 @@ HALT_REFINE: Final = "refine"
 HALT_HITL: Final = "hitl"
 HALT_PLAN_CHECKPOINT: Final = "plan-checkpoint"
 HALT_AWAITING_CLOSURE: Final = "awaiting-closure"
+HALT_EPIC_CLOSURE: Final = "epic-closure"
+"""Raised by the engine, not :func:`decide_pick`: an epic this run finished has
+its closure recorded (a retrospective verdict) and waits for a person to close it
+with bmad-ticket (``TicketsEngine._ticket_epic_boundary_check``)."""
 HALT_EPIC_REJECTED: Final = "epic-rejected"
 HALT_BLOCKED_PLAN: Final = "blocked-plan"
 HALT_FOREIGN_ACTIVE: Final = "foreign-active"
@@ -104,6 +115,7 @@ HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_HITL: PAUSE_TICKET_HITL,
     HALT_PLAN_CHECKPOINT: PAUSE_PLAN_CHECKPOINT,
     HALT_AWAITING_CLOSURE: PAUSE_EPIC_BOUNDARY,
+    HALT_EPIC_CLOSURE: PAUSE_EPIC_BOUNDARY,
     HALT_EPIC_REJECTED: PAUSE_EPIC_BOUNDARY,
     HALT_BLOCKED_PLAN: PAUSE_ESCALATION,
     HALT_FOREIGN_ACTIVE: PAUSE_TICKET_TREE,
@@ -123,8 +135,12 @@ NOTE_FOREIGN_ACTIVE: Final = "foreign-active"
 # The closure verdict that holds every later epic until the epic is closed.
 CLOSURE_REJECTED: Final = "rejected"
 # An epic container status that no longer holds anything back.
-_EPIC_CLOSED: Final = frozenset({"done", "dropped"})
+EPIC_CLOSED: Final = frozenset({"done", "dropped"})
 _TICKET_FINISHED: Final = frozenset({"done", "dropped"})
+
+BOUNDARY_RETRO: Final = "retro"
+BOUNDARY_REJECTED: Final = "rejected"
+BOUNDARY_ACK: Final = "ack"
 
 
 @dataclass(frozen=True)
@@ -216,6 +232,62 @@ def ticket_binding(found: FindResult) -> TicketBinding:
         done_checkpoint=row.done_checkpoint,
         hitl=row.hitl,
     )
+
+
+@dataclass(frozen=True)
+class EpicBoundary:
+    """One epic-boundary action, in build order (:func:`epic_boundary`):
+
+    * :data:`BOUNDARY_RETRO` — ``slug`` is finished, this run committed one of
+      its tickets, and no closure is recorded: run the retrospective gate,
+      record the closure, pause for the human's close;
+    * :data:`BOUNDARY_REJECTED` — the recorded closure (``verdict``) is
+      ``rejected`` and the epic is still open and finished: pause again;
+    * :data:`BOUNDARY_ACK` — a non-rejected closure (``verdict``) whose one
+      pause the operator resumed past: acknowledge it and go on."""
+
+    action: str
+    slug: str
+    verdict: str = ""
+
+
+def epic_finished(status_view: StatusView, slug: str) -> bool:
+    """Whether epic ``slug`` has tickets and every one is ``built`` or reads
+    ``done``/``dropped`` — the retrospective skill's own rule for an epic ready to
+    retro (a ``built`` ticket awaits only the orchestrator's or a person's
+    acceptance)."""
+    rows = [t for t in status_view.tickets if t.epic == slug]
+    return bool(rows) and all(t.status == "built" or t.state in _TICKET_FINISHED for t in rows)
+
+
+def epic_boundary(
+    status_view: StatusView,
+    closures: Mapping[str, str],
+    acked: Sequence[str] | frozenset[str],
+    committed: frozenset[str],
+) -> list[EpicBoundary]:
+    """The epic-boundary actions owed before the next pick, in build order, over
+    the open epics only (a closed epic owes nothing: its closure is recorded in
+    the tree). ``committed`` holds the epic slugs this run committed a ticket
+    of. The caller stops at the first :data:`BOUNDARY_RETRO` or
+    :data:`BOUNDARY_REJECTED`; acknowledgements before it are carried out."""
+    out: list[EpicBoundary] = []
+    for epic in status_view.epics:
+        if epic.status in EPIC_CLOSED:
+            continue
+        slug = epic.slug
+        verdict = closures.get(slug)
+        if verdict is None:
+            if slug in committed and epic_finished(status_view, slug):
+                out.append(EpicBoundary(BOUNDARY_RETRO, slug))
+        elif verdict == CLOSURE_REJECTED:
+            # Fix-up tickets added to the epic reopen it: they are built first
+            # (`decide_pick` holds only the later epics), then it pauses again.
+            if epic_finished(status_view, slug):
+                out.append(EpicBoundary(BOUNDARY_REJECTED, slug, verdict))
+        elif slug not in acked:
+            out.append(EpicBoundary(BOUNDARY_ACK, slug, verdict))
+    return out
 
 
 # ------------------------------------------------------------------- the pick
@@ -321,7 +393,7 @@ def _awaiting_closure(status_view: StatusView) -> list[str]:
     human closes them (bmad-ticket), never bmad-loop."""
     out: list[str] = []
     for epic in status_view.epics:
-        if epic.status in _EPIC_CLOSED:
+        if epic.status in EPIC_CLOSED:
             continue
         states = [t.state for t in status_view.tickets if t.epic == epic.slug]
         if states and all(s in _TICKET_FINISHED for s in states):
@@ -335,7 +407,7 @@ def _unbroken_epics(status_view: StatusView) -> list[str]:
     return [
         e.slug
         for e in status_view.epics
-        if e.status not in _EPIC_CLOSED and e.slug not in with_tickets
+        if e.status not in EPIC_CLOSED and e.slug not in with_tickets
     ]
 
 
@@ -376,7 +448,7 @@ def _rejected_gate(
     for epic in status_view.epics:
         if epic.slug == row.epic:
             return None
-        if epic_closures.get(epic.slug) == CLOSURE_REJECTED and epic.status not in _EPIC_CLOSED:
+        if epic_closures.get(epic.slug) == CLOSURE_REJECTED and epic.status not in EPIC_CLOSED:
             return epic.slug
     return None
 
@@ -557,14 +629,22 @@ class TicketsWorkSource:
         tree = self._tree_get()
         return tree.next(), tree.status()
 
-    def decide(self, phases: Mapping[str, Phase]) -> PickDecision:
+    def decide(
+        self,
+        phases: Mapping[str, Phase],
+        gate: Callable[[StatusView], None] | None = None,
+    ) -> PickDecision:
         """:func:`decide_pick` over a fresh read. A tree that cannot be read halts
-        ``pin-mismatch`` or ``tree-fault``, the error's ``kind`` in the detail."""
+        ``pin-mismatch`` or ``tree-fault``, the error's ``kind`` in the detail.
+        ``gate`` sees the fresh ``status`` view before the pick (the engine's
+        epic boundary, which may pause), so one read serves both."""
         try:
             next_view, status_view = self.read()
         except TicketsError as e:
             cause = HALT_PIN_MISMATCH if e.kind == "pin-mismatch" else HALT_TREE_FAULT
             return Halt(cause, "", None, f"tickets.py {e.kind}: {e}")
+        if gate is not None:
+            gate(status_view)
         return decide_pick(
             next_view,
             status_view,

@@ -305,6 +305,41 @@ def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
     assert foreign["status"] == "built"
 
 
+def test_ticket_epic_retro_journals_alias_the_epic_slug():
+    """Tickets mode's epic-boundary rows carry the epic slug in `epic_ref`, which
+    names the customer's epic: it is aliased in its own `epic` namespace (one
+    alias across the retro and its closure), while `epic` 0 and the closed
+    verdict token stay readable."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    finished = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 0,
+            "epic_ref": "epic-acme-vault",
+            "docs": ["epic-acme-vault-retrospective.md"],
+            "verdict": "rejected",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    closure = diagnostics._scrub_entry(
+        {"kind": "ticket-epic-closure", "epic_ref": "epic-acme-vault", "verdict": "rejected"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert "acme" not in json.dumps([finished, closure])
+    assert finished["epic_ref"] == closure["epic_ref"]
+    assert str(finished["epic_ref"]).startswith("epic-")
+    assert (finished["epic"], finished["verdict"], closure["verdict"]) == (
+        0,
+        "rejected",
+        "rejected",
+    )
+
+
 def test_ticket_status_write_refusal_keeps_its_closed_tokens():
     """A refused engine status write keeps the site, the plan status it targeted
     and the refusal token — all closed vocabularies — so a bundle shows which

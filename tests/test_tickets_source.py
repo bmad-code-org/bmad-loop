@@ -569,3 +569,106 @@ def test_source_remaining_estimate(tmp_path: Path):
         others=(ticket_row("1.4", status="done"),),
     )
     assert _source(tree).remaining_estimate({"1.1": Phase.DEFERRED}) == 1
+
+
+def _boundary(views, closures=None, acked=(), committed=(CART,)):
+    _, status_view = views
+    return [
+        (b.action, b.slug, b.verdict)
+        for b in ts.epic_boundary(
+            status_view, closures or {}, frozenset(acked), frozenset(committed)
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("views", "closures", "acked", "committed", "expected"),
+    [
+        pytest.param(
+            _views(others=(_done("1.1"), ticket_row("1.2", status="built"))),
+            None,
+            (),
+            (CART,),
+            [("retro", CART, "")],
+            id="finished-and-committed-owes-a-retro",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"),)),
+            None,
+            (),
+            (),
+            [],
+            id="finished-by-someone-else-owes-nothing",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"), ticket_row("1.2", status="in-review"))),
+            None,
+            (),
+            (CART,),
+            [],
+            id="unfinished-owes-nothing",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"),), epics=(_epic(CART, "1", status="done"),)),
+            {CART: "rejected"},
+            (),
+            (CART,),
+            [],
+            id="closed-epic-owes-nothing",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"),)),
+            {CART: "rejected"},
+            (),
+            (CART,),
+            [("rejected", CART, "rejected")],
+            id="rejected-open-and-finished-pauses-again",
+        ),
+        pytest.param(
+            _views(start=(ticket_row("1.3"),), others=(_done("1.1"),)),
+            {CART: "rejected"},
+            (),
+            (CART,),
+            [],
+            id="rejected-with-a-fix-up-ticket-builds-it-first",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"), _done("2.1", epic=CHECKOUT))),
+            {CART: "accepted"},
+            (),
+            (CART, CHECKOUT),
+            [("ack", CART, "accepted"), ("retro", CHECKOUT, "")],
+            id="unacked-closure-then-the-next-epic-in-build-order",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"),)),
+            {CART: "unknown"},
+            (CART,),
+            (CART,),
+            [],
+            id="acked-closure-owes-nothing",
+        ),
+    ],
+)
+def test_epic_boundary(views, closures, acked, committed, expected):
+    """The epic-boundary actions, in build order, over the open epics: a retro
+    for a finished epic this run committed to, a re-pause for a rejected one
+    still finished, an acknowledgement for any other unacknowledged closure."""
+    assert _boundary(views, closures, acked, committed) == expected
+
+
+def test_source_decide_gates_on_the_pick_status_view(tmp_path: Path):
+    """`decide`'s gate sees the very `status` view the pick reads, before the
+    pick, and a gate that raises stops the pick."""
+    tree = FakeTicketTree.from_rows(tmp_path, ready_to_start=(ticket_row("1.1"),))
+    seen = []
+
+    def gate(status_view):
+        seen.append(status_view)
+        raise RuntimeError("paused")
+
+    with pytest.raises(RuntimeError):
+        _source(tree).decide({}, gate=gate)
+
+    assert seen == [tree.status_view]
+    assert [c[0] for c in tree.calls] == ["next", "status"]

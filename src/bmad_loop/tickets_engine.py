@@ -60,11 +60,23 @@ reason instead of ``done``, and ``bmad-loop confirm`` later marks it through the
 same chokepoint. A code rollback re-arms the bound plan (``ready-for-dev``, or a
 frontmatter-only plan deleted), and the recovery flow restores and re-routes a
 plan only through the ticket tree, confined to the store root.
+
+The epic boundary is checked before every pick and at run end
+(:meth:`TicketsEngine._ticket_epic_boundary_check`), keyed by slug: an open epic
+whose tickets are all ``built``/``done``/``dropped`` and of which this run
+committed one gets its retrospective (``gates.retrospective = "auto"``:
+``/bmad-retrospective -H <slug>``, verified on disk and committed alone), its
+closure recorded in ``RunState.ticket_epic_closures`` and a pause at
+``epic-boundary`` for a person to close it with bmad-ticket — bmad-loop never
+writes the epic file. A ``rejected`` verdict pauses every later pick while the
+epic stays open; any other pauses once.
 """
 
 from __future__ import annotations
 
 import re
+import stat
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,7 +85,17 @@ from typing import Any, NoReturn
 from . import gates, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
-from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
+from .engine import (
+    RETRO_SKILL,
+    RETRO_VERDICT_UNKNOWN,
+    RETRO_VERDICTS,
+    Engine,
+    RunPaused,
+    RunStopped,
+    SpecStatusWriteRefused,
+    SpecWriteReason,
+    _retro_auto_prompt,
+)
 from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatter, status_of
 from .model import (
     PAUSE_SPEC_APPROVAL,
@@ -85,11 +107,17 @@ from .model import (
     result_mapping,
 )
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
-from .runs import rebase_recorded_project_path
+from .runs import graceful_stop_requested, rebase_recorded_project_path
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
+from .ticketmodel import StatusView
 from .tickets_source import (
+    BOUNDARY_ACK,
+    BOUNDARY_RETRO,
+    CLOSURE_REJECTED,
     HALT_BLOCKED_PLAN,
     HALT_DIRTY_INITIATIVE,
+    HALT_EPIC_CLOSURE,
+    HALT_EPIC_REJECTED,
     HALT_HITL,
     HALT_PLAN_CHECKPOINT,
     HALT_REFINE,
@@ -97,12 +125,14 @@ from .tickets_source import (
     RISK_HIGH,
     SKIP_PARKED,
     Dispatch,
+    EpicBoundary,
     Halt,
     PickNote,
     Skip,
     TicketRef,
     TicketsWorkSource,
     dispatch_invocation,
+    epic_boundary,
     plan_planned,
     ticket_binding,
     wants_thorough,
@@ -290,7 +320,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _pick_next(self) -> WorkRef | None:
         self._repause_inrun_escalation()  # raises when one is live
-        decision = self._tickets_source.decide(self._phases())
+        decision = self._tickets_source.decide(
+            self._phases(), gate=self._ticket_epic_boundary_check
+        )
         self._journal_pick_notes(decision.notes)
         if isinstance(decision, Halt):
             self._halt_pick(WorkHalt(key=decision.key, cause=decision.cause, payload=decision))
@@ -428,6 +460,235 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"{', '.join(decision.waiting)} wait behind {', '.join(decision.held)}, which "
             f"this run did not finish — resolve those, then start a new run",
         )
+
+    # ---------------------------------------------------------- epic boundary
+
+    def _committed_epics(self) -> frozenset[str]:
+        """Epic slugs this run committed at least one ticket of."""
+        return frozenset(
+            task.ticket.epic_slug
+            for task in self.state.tasks.values()
+            if task.ticket is not None
+            and task.ticket.epic_slug
+            and task.phase == Phase.DONE
+            and task.commit_sha
+        )
+
+    def _ticket_epic_boundary_check(self, status_view: StatusView) -> None:
+        """The epic boundary, run before every pick (on the pick's own ``status``
+        view) and at run end, so it survives a pause and a resume
+        (:func:`~bmad_loop.tickets_source.epic_boundary` decides, in build order):
+
+        * a finished epic this run committed a ticket of, with no closure
+          recorded: run the retrospective gate (:meth:`_ticket_epic_retro`),
+          record its verdict in ``state.ticket_epic_closures``, journal
+          ``ticket-epic-closure`` and pause at ``epic-boundary`` for a person to
+          close the epic with bmad-ticket;
+        * a recorded ``rejected`` verdict on an epic still open and finished:
+          pause again — closing the epic is the human override;
+        * any other recorded verdict the operator resumed past: acknowledge it
+          (``ticket_epic_closure_acked``), journal ``epic-closure-not-recorded``
+          (the epic is still open) and go on.
+
+        bmad-loop never writes the epic's file: its status is read, never set."""
+        steps = epic_boundary(
+            status_view,
+            self.state.ticket_epic_closures,
+            frozenset(self.state.ticket_epic_closure_acked),
+            self._committed_epics(),
+        )
+        for step in steps:
+            if step.action == BOUNDARY_ACK:
+                self._ack_epic_closure(step)
+                continue
+            if step.action == BOUNDARY_RETRO:
+                verdict = self._ticket_epic_retro(step.slug)
+                self.state.ticket_epic_closures[step.slug] = verdict
+                self._save()
+                self.journal.append("ticket-epic-closure", epic_ref=step.slug, verdict=verdict)
+                self._pause_epic_closure(step.slug, verdict)
+            self._pause_ticket_pick(
+                Halt(
+                    HALT_EPIC_REJECTED,
+                    step.slug,
+                    None,
+                    f"{step.slug}'s retrospective verdict is rejected; close {step.slug} "
+                    f"with bmad-ticket before the run goes on",
+                )
+            )
+
+    def _ack_epic_closure(self, step: EpicBoundary) -> None:
+        """The operator resumed past an epic's one closure pause without closing
+        it: acknowledge it so it never pauses again, and say so once."""
+        self.state.ticket_epic_closure_acked.append(step.slug)
+        self._save()
+        self.journal.append("epic-closure-not-recorded", epic_ref=step.slug, verdict=step.verdict)
+
+    def _pause_epic_closure(self, slug: str, verdict: str) -> NoReturn:
+        detail = f"close {slug} with bmad-ticket (closure check; retrospective verdict: {verdict})"
+        if verdict == CLOSURE_REJECTED:
+            detail += f"; the rejected verdict holds the run until {slug} is closed"
+        self._pause_ticket_pick(Halt(HALT_EPIC_CLOSURE, slug, None, detail))
+
+    def _run_end_retrospective(self) -> None:
+        """The epic boundary at run end (an exhausted tree or ``--max-stories``):
+        the same check as the pick's, on a fresh ``status`` read, so the run's
+        last finished epic gets its retrospective and closure pause too. A tree
+        that cannot be read journals ``retro-run-end-skipped``
+        (``board-unreadable``)."""
+        try:
+            status_view = self.ticket_tree.status()
+        except TicketsError as e:
+            self.journal.append(
+                "retro-run-end-skipped", epic=0, reason="board-unreadable", error=str(e)
+            )
+            return
+        self._ticket_epic_boundary_check(status_view)
+
+    def _retro_doc(self, slug: str) -> Path:
+        """Where the retrospective skill writes epic ``slug``'s document:
+        ``<epic folder>/<slug>-retrospective.md``, the epic folder named by its
+        slug inside the initiative folder."""
+        folder = self.paths.initiative_folder or self.paths.output_folder
+        return folder / slug / f"{slug}-retrospective.md"
+
+    def _read_retro_doc(self, slug: str) -> tuple[list[str], str, int]:
+        """Read epic ``slug``'s retrospective document as ``(errors, verdict,
+        mtime_ns)``: it must be a regular file (``lstat``, never followed) whose
+        frontmatter names ``epic: <slug>`` and a ``verdict`` in
+        :data:`~bmad_loop.engine.RETRO_VERDICTS`. ``verdict`` is "" unless every
+        check passed; ``mtime_ns`` is -1 when the file cannot be stat'd."""
+        doc = self._retro_doc(slug)
+        name = doc.name
+        try:
+            st = doc.lstat()
+        except FileNotFoundError:
+            return [f"no retrospective document {name}"], "", -1
+        except OSError as e:
+            return [f"cannot stat {name}: {e}"], "", -1
+        if not stat.S_ISREG(st.st_mode):
+            return [f"{name} is not a regular file"], "", st.st_mtime_ns
+        try:
+            fm = verify.read_frontmatter(doc)
+        except OSError as e:
+            return [f"cannot read {name}: {e}"], "", st.st_mtime_ns
+        errors: list[str] = []
+        epic = fm.get("epic")
+        if not isinstance(epic, str) or epic.strip() != slug:
+            errors.append(f"{name} frontmatter epic is not {slug}")
+        raw = fm.get("verdict")
+        verdict = raw.strip().lower() if isinstance(raw, str) else ""
+        if verdict not in RETRO_VERDICTS:
+            errors.append(f"{name} frontmatter verdict is not one of {sorted(RETRO_VERDICTS)}")
+        return errors, ("" if errors else verdict), st.st_mtime_ns
+
+    def _verify_retro_ticket(
+        self, slug: str, result: SessionResult | None, launched_ns: int
+    ) -> tuple[list[str], str]:
+        """Deterministic success checks for epic ``slug``'s auto-retro session,
+        as ``(errors, verdict)``: a completed session whose ``result.json`` says
+        ``done``, and a retrospective document (:meth:`_read_retro_doc`) written
+        at or after the launch. Nothing the session said is taken on trust.
+        ``result`` is None when the session raised."""
+        errors: list[str] = []
+        if result is not None:
+            if result.status != "completed":
+                errors.append(f"session status {result.status}, not completed")
+            elif result_mapping(result.result_json).get("status") != "done":
+                errors.append("result.json status is not done")
+        doc_errors, verdict, mtime_ns = self._read_retro_doc(slug)
+        errors.extend(doc_errors)
+        if 0 <= mtime_ns < launched_ns:
+            errors.append(f"{self._retro_doc(slug).name} predates the session")
+        return errors, ("" if errors else verdict)
+
+    def _ticket_epic_retro(self, slug: str) -> str:
+        """The retrospective gate for finished epic ``slug``; returns the closure
+        to record: the document's verdict, or ``unknown`` when none was read.
+
+        A valid document already on disk is the retro already done (journaled
+        ``retro-auto-skipped`` ``already-done`` under ``auto``), whatever the mode.
+        ``notify`` sends the nudge and ``never`` does nothing; both still pause
+        for closure. ``auto`` runs ``/bmad-retrospective -H <slug>`` on the retro
+        adapter, after the base pre-dispatch refusals (``stop-requested``,
+        ``dirty``/``git-error``, ``skill-missing``), verifies it
+        (:meth:`_verify_retro_ticket`), and settles the tree: the document alone
+        (``TicketsWorkSource.retro_commit_paths``) is committed, and anything else
+        left dirty pauses before a closure is recorded, so a resume re-enters
+        here. The ``retro-auto-*`` rows keep ``epic`` 0 and name the slug in
+        ``epic_ref``."""
+        mode = self.policy.gates.retrospective
+        doc_errors, existing, _ = self._read_retro_doc(slug)
+        if not doc_errors:
+            if mode == "auto":
+                self._skip_auto_retro(0, "already-done", epic_ref=slug)
+            return existing
+        if mode == "notify":
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"{slug} tickets complete",
+                f"retrospective suggested: run /bmad-retrospective -H {slug} before closing it",
+            )
+        if mode != "auto":
+            return RETRO_VERDICT_UNKNOWN
+        if graceful_stop_requested(self.run_dir):
+            self._skip_auto_retro(0, "stop-requested", epic_ref=slug)
+            return RETRO_VERDICT_UNKNOWN
+        try:
+            clean = verify.worktree_clean(self.workspace.root, project=self.workspace.paths.project)
+        except verify.GitError as e:
+            self._skip_auto_retro(0, "git-error", str(e), epic_ref=slug)
+            return RETRO_VERDICT_UNKNOWN
+        if not clean:
+            self._skip_auto_retro(0, "dirty", epic_ref=slug)
+            return RETRO_VERDICT_UNKNOWN
+        adapter = self.adapters["retro"]
+        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        if tree and not (self.workspace.paths.project / tree / RETRO_SKILL / "SKILL.md").is_file():
+            self._skip_auto_retro(0, "skill-missing", epic_ref=slug)
+            return RETRO_VERDICT_UNKNOWN
+
+        task = StoryTask(story_key=f"{slug}-retrospective", epic=0)
+        self.journal.append("retro-auto-start", epic=0, epic_ref=slug)
+        # whole seconds: a filesystem with coarse timestamps still dates the doc
+        # at or after the launch
+        launched_ns = time.time_ns() // 1_000_000_000 * 1_000_000_000
+        result: SessionResult | None = None
+        raised: Exception | None = None
+        try:
+            result = self._run_session(task, role="retro", prompt=_retro_auto_prompt(slug), seq=1)
+        except (RunStopped, RunPaused):
+            raise
+        except Exception as e:  # a failed retro, never a failed run
+            raised = e
+        errors, verdict = self._verify_retro_ticket(slug, result, launched_ns)
+        if raised is not None:
+            errors.insert(0, f"session raised {type(raised).__name__}")
+        ok = not errors
+        doc = self._retro_doc(slug)
+        if ok:
+            self.journal.append(
+                "retro-auto-finished", epic=0, epic_ref=slug, docs=[doc.name], verdict=verdict
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"{slug} retrospective done",
+                f"retrospective written: {doc.name}; verdict: {verdict}",
+            )
+        else:
+            verdict = RETRO_VERDICT_UNKNOWN
+            extra = {} if raised is None else {"error": str(raised)}
+            self.journal.append("retro-auto-failed", epic=0, epic_ref=slug, errors=errors, **extra)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                "auto retrospective failed",
+                f"{slug}: {'; '.join(errors)} — run /bmad-retrospective -H {slug} by hand",
+            )
+        self._settle_retro_tree(0, ok, [doc] if ok else [], epic_ref=slug)
+        return verdict
 
     # ---------------------------------------------------------------- pauses
 
@@ -872,8 +1133,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _session_success_statuses(self, role: str, label: str | None) -> tuple[str, ...]:
         """A dev leg finishes its plan at ``built``; a review leaves it at
         ``built``, or ``done`` when a human accepted it first. A labeled workflow
-        session keeps the marker contract's ``done``."""
-        if label is not None:
+        session, and the epic retrospective, keep the base contract."""
+        if label is not None or role not in ("dev", "review"):
             return super()._session_success_statuses(role, label)
         if role == "review":
             return (verify.PLAN_BUILT, verify.PLAN_DONE)
@@ -888,9 +1149,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _session_fallback_dirs(self, role: str, label: str | None) -> tuple[Path, ...]:
         """A build that cannot resolve its ticket HALTs into the initiative folder
-        (``bmad-build-auto-result-*``), never into the plan: probe it there."""
+        (``bmad-build-auto-result-*``), never into the plan: probe it there. The
+        epic retrospective is not a build."""
         folder = self.workspace.paths.initiative_folder
-        if label is not None or folder is None:
+        if label is not None or folder is None or role not in ("dev", "review"):
             return super()._session_fallback_dirs(role, label)
         return (folder,)
 

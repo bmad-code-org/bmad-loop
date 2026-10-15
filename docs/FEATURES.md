@@ -181,16 +181,17 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Retrospective handling
 
 - **Stability:** in-progress
-- **Description:** When an epic finishes, bmad-loop can stay silent, suggest a retrospective, or run a headless `/bmad-retrospective` session and commit its output. The retro's verdict is reported to you but never gates the run.
+- **Description:** When an epic finishes, bmad-loop can stay silent, suggest a retrospective, or run a headless `/bmad-retrospective` session and commit its output. In sprint mode the retro's verdict is reported to you but never gates the run; in tickets mode the run pauses for you to close the epic.
 - **Properties:**
   - `[gates] retrospective = "notify"` (the default) sends one "retrospective suggested" notice per finished epic. `never` sends nothing.
   - `auto` runs `/bmad-retrospective -H <epic>` on the `[adapter.retro]` role (falling back to the base `[adapter]` when that is unset), before the per-epic auto-sweep.
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
+  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-ticket. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
-- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`
-- **Docs:** [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
+- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`
+- **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
 
 ## Deferred work
 

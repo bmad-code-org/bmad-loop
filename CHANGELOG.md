@@ -47,6 +47,11 @@ breaking changes may land in a minor release.
 mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm restores
   the plan's exact bytes. An intent-gap `<plan>.patch` is moved to the run's `restore/`
   directory, and a restore latches that copy. The resolve context gains a `tickets` block.
+- Add the epic retrospective and closure pause in tickets mode. When this run finishes an
+  epic, `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>` and
+  commits only its document. The run then records the verdict and pauses at
+  `epic-boundary` until a person closes the epic with bmad-ticket. A `rejected` verdict
+  pauses every later pick while the epic stays open; any other pauses once.
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

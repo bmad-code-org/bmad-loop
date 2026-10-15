@@ -88,6 +88,9 @@ class SourceTraits:
     - ``validate_mode``: the ``mode`` value ``validate --json`` reports.
     - ``has_epics``: the queue is grouped into numbered epics, so a run crosses
       epic boundaries (retrospective, ``--epic``, the auto-retro ``retro`` role).
+    - ``epic_retro``: a finished epic fires the retrospective gate, so
+      ``gates.retrospective = "auto"`` launches the ``retro`` role. The numbered
+      epics do; tickets mode fires it per epic slug (``TicketsEngine``).
     - ``has_spec_folder``: the run pins a spec folder (``RunState.spec_folder``).
     - ``stories_primitive``: the dev skill must support folder+id dispatch
       (``install.missing_stories_support``).
@@ -106,6 +109,7 @@ class SourceTraits:
     label: str
     validate_mode: QueueMode
     has_epics: bool
+    epic_retro: bool
     has_spec_folder: bool
     stories_primitive: bool
     sentinels: bool
@@ -121,6 +125,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         label="sprint mode — sprint-status.yaml",
         validate_mode="sprint",
         has_epics=True,
+        epic_retro=True,
         has_spec_folder=False,
         stories_primitive=False,
         sentinels=False,
@@ -134,6 +139,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         label="stories mode — folder+id dispatch",
         validate_mode="stories",
         has_epics=False,
+        epic_retro=False,
         has_spec_folder=True,
         stories_primitive=True,
         sentinels=True,
@@ -147,6 +153,7 @@ TRAITS: Final[Mapping[str, SourceTraits]] = {
         label="tickets mode — BMAD v7 ticket tree",
         validate_mode="tickets",
         has_epics=False,
+        epic_retro=True,
         has_spec_folder=False,
         stories_primitive=False,
         sentinels=False,
@@ -196,10 +203,10 @@ def resumable_traits_for(source: str) -> SourceTraits:
 
 def launch_roles(source: str, retrospective: str) -> tuple[str, ...]:
     """The session roles a story run from ``source`` launches: dev + review, plus
-    the auto retrospective's ``retro`` when the source has epics and
-    ``gates.retrospective`` is ``"auto"``. A source without epics never crosses an
-    epic boundary, so it never launches a retro."""
-    if traits_for(source).has_epics and retrospective == "auto":
+    the auto retrospective's ``retro`` when the source fires an epic retrospective
+    (``epic_retro``) and ``gates.retrospective`` is ``"auto"``. Stories mode never
+    crosses an epic boundary, so it never launches a retro."""
+    if traits_for(source).epic_retro and retrospective == "auto":
         return ("dev", "review", "retro")
     return ("dev", "review")
 

@@ -506,6 +506,12 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `accepted-with-open-items` / `rejected` / `unknown`) — never the doc's raw
     # text. Kind-scoped because `verdict` is generic.
     "retro-auto-finished": frozenset({"verdict"}),
+    # tickets_engine.py: the closure an epic boundary recorded (the same closed
+    # verdict token, or `unknown` when no retrospective verdict was read), and its
+    # acknowledgement when a resume passed an epic still open. `epic_ref` is
+    # aliased by name.
+    "ticket-epic-closure": frozenset({"verdict"}),
+    "epic-closure-not-recorded": frozenset({"verdict"}),
     # DW-527: the literal `post-proceed`, marking the row `_finish_inflight`'s
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
@@ -2019,7 +2025,11 @@ JOURNAL_KINDS = frozenset(
         # through the checkpoint mixin's `stories-wedged`. Plus an engine status
         # write the plan chokepoint has no reason for, refused unwritten, and a
         # registered task whose binding a resume re-resolved from the tree, and a
-        # review leg whose plan risk could not be read (reviewed as high risk).
+        # review leg whose plan risk could not be read (reviewed as high risk). And
+        # the epic boundary: the closure it recorded, and a resume past an epic
+        # still open (its `retro-auto-*` rows reuse the base kinds with `epic_ref`).
+        "epic-closure-not-recorded",
+        "ticket-epic-closure",
         "ticket-foreign-active",
         "ticket-hitl-pause",
         "ticket-pick-halt",

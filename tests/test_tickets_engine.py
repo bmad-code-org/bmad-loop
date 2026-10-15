@@ -23,6 +23,7 @@ from bmad_loop.engine import Engine, RunPaused, SpecStatusWriteRefused
 from bmad_loop.frontmatter import parse_frontmatter, status_of
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
+    PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_STORY_CHECKPOINT,
@@ -42,6 +43,7 @@ from bmad_loop.policy import (
     ScmPolicy,
     TicketsPolicy,
 )
+from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
 from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy, TicketsPlanIOError
@@ -2020,3 +2022,387 @@ def test_rollback_restores_plan_preimage_through_chokepoint(project_v7, monkeypa
     assert tree.restores == [(plan.resolve(), operator)]
     assert plan.read_bytes() == operator
     assert engine._spec_confine_root(task) == engine.workspace.paths.output_folder
+
+
+# ------------------------------------------------------------- epic boundary
+#
+# A finished epic this run committed a ticket of gets its retrospective (under
+# `gates.retrospective = "auto"`), its closure recorded and a pause for a person to
+# close it with bmad-ticket. The fake's `status` view is the epic table: each test
+# lists the epics and moves the built ticket to `built` there, as tickets.py
+# derives it.
+
+
+def _epic(slug: str = "epic-cart", status: str = "in-progress", epic_id: str = "1") -> EpicRow:
+    return EpicRow(
+        slug=slug, id=epic_id, status=status, after=(), gated_by=(), blocks=(), next_id=1
+    )
+
+
+def _retro_policy(mode: str = "auto", **kw) -> Policy:
+    return dataclasses.replace(_policy(), gates=GatesPolicy(mode="none", retrospective=mode), **kw)
+
+
+def _epic_tree(
+    layout: V7Layout,
+    *,
+    ready: tuple = (),
+    others: tuple = (),
+    epics: tuple[EpicRow, ...] | None = None,
+) -> FakeTicketTree:
+    """1.1 in epic-cart, ready, plus ``ready``/``others``, with the epic table."""
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"), *ready), others=others)
+    tree.status_view = dataclasses.replace(tree.status_view, epics=epics or (_epic(),))
+    return tree
+
+
+def _close_epic(tree: FakeTicketTree, slug: str, status: str = "done") -> None:
+    """A person closes the epic with bmad-ticket: its file's status in `status`."""
+    epics = tuple(
+        dataclasses.replace(e, status=status) if e.slug == slug else e
+        for e in tree.status_view.epics
+    )
+    tree.status_view = dataclasses.replace(tree.status_view, epics=epics)
+
+
+def _builds_finishing(layout: V7Layout, tree: FakeTicketTree, plan: Path, *more: str):
+    """`_builds`, after which 1.1 reads `built` in `status` (its epic finished)
+    and the tree offers ``more`` tickets."""
+    build = _builds(layout, tree, plan)
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        result = build(spec)
+        tickets = tuple(
+            dataclasses.replace(t, status="built", state="review") if t.ref == "1.1" else t
+            for t in tree.status_view.tickets
+        )
+        tree.status_view = dataclasses.replace(tree.status_view, tickets=tickets)
+        tree.next_view = _tree(
+            layout, ready_to_start=tuple(ticket_row(ref, epic="epic-checkout") for ref in more)
+        ).next_view
+        return result
+
+    return effect
+
+
+def _retro_doc(layout: V7Layout, slug: str = "epic-cart") -> Path:
+    return layout.initiative_folder / slug / f"{slug}-retrospective.md"
+
+
+def _write_retro_doc(layout: V7Layout, verdict: str, *, epic: str = "epic-cart") -> Path:
+    """The retrospective document as bmad-retrospective finalizes it."""
+    doc = _retro_doc(layout)
+    lines = [
+        "---",
+        f"epic: {epic}",
+        "date: 2026-10-15",
+        f"verdict: {verdict}",
+        "criteria: profiled",
+        "headless: true",
+        "---",
+        "",
+        "# Retrospective",
+        "",
+    ]
+    doc.write_bytes("\n".join(lines).encode("utf-8"))
+    return doc
+
+
+def _retro_writes(layout: V7Layout, verdict: str = "accepted", *, epic: str = "epic-cart"):
+    """A `/bmad-retrospective -H` session: it writes the document and reports
+    done through result.json."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        _write_retro_doc(layout, verdict, epic=epic)
+        result = {"workflow": "bmad-retrospective", "status": "done"}
+        return SessionResult(status="completed", result_json=result)
+
+    return effect
+
+
+def _files_of(layout: V7Layout, subject: str) -> list[str]:
+    log = git(layout.project, "log", "--format=%H %s").splitlines()
+    shas = [line.split(" ", 1)[0] for line in log if line.split(" ", 1)[1] == subject]
+    assert len(shas) == 1, (subject, log)
+    return git(layout.project, "show", "--name-only", "--format=", shas[0]).split()
+
+
+def test_ticket_retro_happy_path_commits_doc_only(project_v7):
+    """The run's last ticket finishes epic-cart: under `auto` one retro session
+    runs `/bmad-retrospective -H epic-cart`, its document lands alone in a
+    `chore(retro)` commit, the verdict is recorded as the epic's closure, and the
+    run pauses at `epic-boundary` naming bmad-ticket. The `retro-auto-*` rows
+    keep `epic` 0 and carry the slug in `epic_ref`. Ablation (performed): drop
+    the `_settle_retro_tree` call in `_ticket_epic_retro` and the document is
+    left uncommitted — this FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan), _retro_writes(project_v7)],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert "close epic-cart with bmad-ticket" in (state.paused_reason or "")
+    assert state.ticket_epic_closures == {"epic-cart": "accepted"}
+    assert state.tasks["1.1"].phase == Phase.DONE and "epic-cart-retrospective" not in state.tasks
+    retro = adapter.sessions[1]
+    assert retro.role == "retro"
+    assert retro.prompt.startswith("/bmad-retrospective -H epic-cart\n")
+    doc = _retro_doc(project_v7).relative_to(project_v7.project).as_posix()
+    assert _files_of(project_v7, "chore(retro): epic-cart retrospective") == [doc]
+    assert git(project_v7.project, "status", "--porcelain") == ""
+    [start] = _kinds(engine, "retro-auto-start")
+    [finished] = _kinds(engine, "retro-auto-finished")
+    assert (start["epic"], start["epic_ref"]) == (0, "epic-cart")
+    assert (finished["epic"], finished["epic_ref"], finished["verdict"]) == (
+        0,
+        "epic-cart",
+        "accepted",
+    )
+    assert finished["docs"] == ["epic-cart-retrospective.md"]
+    [closure] = _kinds(engine, "ticket-epic-closure")
+    assert (closure["epic_ref"], closure["verdict"]) == ("epic-cart", "accepted")
+    [halt] = _kinds(engine, "ticket-pick-halt")
+    assert (halt["ref"], halt["cause"], halt["stage"]) == (
+        "epic-cart",
+        "epic-closure",
+        PAUSE_EPIC_BOUNDARY,
+    )
+
+
+def test_ticket_retro_verdict_rejected_hard_gates_until_epic_done(project_v7):
+    """A `rejected` verdict pauses again on every later pick while epic-cart stays
+    open — with nothing else queued, and with epic-checkout's 2.1 ready — and
+    only closing the epic (bmad-ticket sets its file to `done`) lets 2.1 start.
+    Ablation (performed): drop the `BOUNDARY_REJECTED` arm in
+    `tickets_source.epic_boundary` and the first resumed run finishes instead of
+    pausing — this FAILS; drop the closure record
+    (`state.ticket_epic_closures[slug] = verdict`) and the resumed runs never
+    re-pause — this FAILS."""
+    tree = _epic_tree(
+        project_v7,
+        others=(ticket_row("2.1", epic="epic-checkout"),),
+        epics=(_epic(), _epic("epic-checkout", epic_id="2")),
+    )
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan), _retro_writes(project_v7, "rejected")],
+    )
+
+    assert engine.run().paused
+    first = load_state(engine.run_dir)
+    assert first.ticket_epic_closures == {"epic-cart": "rejected"}
+    assert "holds the run until epic-cart is closed" in (first.paused_reason or "")
+
+    # nothing else queued: the rejected epic itself holds the run
+    resumed, adapter = _resumed(engine, tree, [])
+    assert resumed.run().paused
+    again = load_state(engine.run_dir)
+    assert (again.paused_stage, again.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert adapter.sessions == []
+
+    # the next epic is ready: still held
+    tree.next_view = _tree(
+        project_v7, ready_to_start=(ticket_row("2.1", epic="epic-checkout"),)
+    ).next_view
+    resumed, adapter = _resumed(engine, tree, [])
+    assert resumed.run().paused
+    assert adapter.sessions == [] and "2.1" not in load_state(engine.run_dir).tasks
+    causes = [h["cause"] for h in _kinds(resumed, "ticket-pick-halt")]
+    assert causes == ["epic-closure", "epic-rejected", "epic-rejected"]
+
+    _close_epic(tree, "epic-cart")
+    resumed, _ = _resumed(engine, tree, [])
+    picked = resumed._pick_next()
+    assert isinstance(picked, TicketRef) and picked.key == "2.1"
+
+
+def test_ticket_retro_accepted_one_shot_closure_pause(project_v7):
+    """A non-rejected verdict pauses once: the resumed run acknowledges it,
+    journals `epic-closure-not-recorded` (the epic is still open) and finishes
+    without pausing again. Ablation (performed): pause on the `BOUNDARY_ACK` step
+    instead of acknowledging it and the resumed run pauses again — this
+    FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[
+            _builds_finishing(project_v7, tree, plan),
+            _retro_writes(project_v7, "accepted-with-open-items"),
+        ],
+    )
+    assert engine.run().paused
+
+    resumed, adapter = _resumed(engine, tree, [])
+    summary = resumed.run()
+
+    state = load_state(engine.run_dir)
+    assert not summary.paused and state.finished
+    assert state.ticket_epic_closures == {"epic-cart": "accepted-with-open-items"}
+    assert state.ticket_epic_closure_acked == ["epic-cart"]
+    [note] = _kinds(resumed, "epic-closure-not-recorded")
+    assert (note["epic_ref"], note["verdict"]) == ("epic-cart", "accepted-with-open-items")
+    assert len(_kinds(resumed, "ticket-pick-halt")) == 1 and adapter.sessions == []
+
+
+def test_ticket_retro_existing_doc_already_done(project_v7):
+    """A valid retrospective document already in the epic folder is the retro
+    already done: no retro session runs, `retro-auto-skipped` says
+    `already-done`, and its verdict is the closure the run pauses on. Ablation
+    (performed): skip the existing-document read in `_ticket_epic_retro` and a
+    second session is dispatched — this FAILS."""
+    _write_retro_doc(project_v7, "accepted-with-open-items")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "retro by hand")
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan)],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert state.paused_stage == PAUSE_EPIC_BOUNDARY
+    assert state.ticket_epic_closures == {"epic-cart": "accepted-with-open-items"}
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    [skipped] = _kinds(engine, "retro-auto-skipped")
+    assert (skipped["epic"], skipped["epic_ref"], skipped["reason"]) == (
+        0,
+        "epic-cart",
+        "already-done",
+    )
+
+
+def test_ticket_epic_boundary_fires_at_pick_after_resume(project_v7):
+    """The epic finishes behind a pause (1.1's done_checkpoint, with 2.1 ready):
+    the boundary is read from the tree at the resumed run's first pick, so the
+    retro runs and the run pauses for closure before 2.1 is dispatched.
+    Ablation (performed): drop the `gate=` from `_pick_next`'s decide and the
+    resumed run dispatches 2.1 — this FAILS."""
+    tree = _epic_tree(
+        project_v7,
+        others=(ticket_row("2.1", epic="epic-checkout"),),
+        epics=(_epic(), _epic("epic-checkout", epic_id="2")),
+    )
+    tree.next_view = _tree(
+        project_v7, ready_to_start=(ticket_row("1.1", done_checkpoint=True),)
+    ).next_view
+    tree.finds["1.1"] = dataclasses.replace(
+        tree.finds["1.1"], row=ticket_row("1.1", done_checkpoint=True)
+    )
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan, "2.1")],
+    )
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_STORY_CHECKPOINT
+    assert _kinds(engine, "retro-auto-start") == []
+
+    resumed, adapter = _resumed(engine, tree, [_retro_writes(project_v7)])
+    assert resumed.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert [s.role for s in adapter.sessions] == ["retro"]
+    assert "2.1" not in state.tasks
+    assert state.ticket_epic_closures == {"epic-cart": "accepted"}
+
+
+@pytest.mark.parametrize("mode", ["never", "notify"])
+def test_retro_never_still_pauses_for_closure(project_v7, mode):
+    """`gates.retrospective` `never` or `notify` runs no retro session, but the
+    finished epic still pauses for its closure, recorded as `unknown`. Ablation
+    (performed): return from `_ticket_epic_boundary_check` when the gate is not
+    `auto` and the run finishes — this FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(mode),
+        script=[_builds_finishing(project_v7, tree, plan)],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert state.ticket_epic_closures == {"epic-cart": "unknown"}
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert _kinds(engine, "retro-auto-start") == []
+
+
+def test_ticket_retro_wrong_epic_fails_and_pauses_on_its_output(project_v7):
+    """A document whose frontmatter names another epic is no retrospective of
+    this one: `retro-auto-failed`, nothing committed, and the uncommitted
+    output pauses at `epic-boundary` before a closure is recorded, so a resume
+    re-enters the boundary. Ablation (performed): drop the `epic` check in
+    `_read_retro_doc` and the retro succeeds — this FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[
+            _builds_finishing(project_v7, tree, plan),
+            _retro_writes(project_v7, epic="epic-checkout"),
+        ],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert state.paused_stage == PAUSE_EPIC_BOUNDARY
+    assert state.ticket_epic_closures == {}
+    [failed] = _kinds(engine, "retro-auto-failed")
+    assert failed["epic_ref"] == "epic-cart"
+    assert any("frontmatter epic is not epic-cart" in e for e in failed["errors"])
+    [dirty] = _kinds(engine, "retro-auto-dirty")
+    assert dirty["epic_ref"] == "epic-cart"
+
+
+def test_epic_file_never_written(project_v7):
+    """bmad-loop never writes the epic's own file: across the retro, the closure
+    pause, a rejected re-pause and the human's close, `epic-cart.md` keeps its
+    bytes and its one commit, and no mark targets anything but the ticket."""
+    epic_file = project_v7.initiative_folder / "epic-cart" / "epic-cart.md"
+    before = epic_file.read_bytes()
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan), _retro_writes(project_v7, "rejected")],
+    )
+    assert engine.run().paused
+    resumed, _ = _resumed(engine, tree, [])
+    assert resumed.run().paused
+    _close_epic(tree, "epic-cart")
+    resumed, _ = _resumed(engine, tree, [])
+    assert not resumed.run().paused
+
+    rel = epic_file.relative_to(project_v7.project).as_posix()
+    assert len(git(project_v7.project, "log", "--format=%H", "--", rel).split()) == 1
+    assert epic_file.read_bytes() == before
+    assert {m.ref for m in tree.marks} == {"1.1"}

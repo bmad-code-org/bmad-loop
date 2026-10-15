@@ -128,6 +128,11 @@ _JOURNAL_ALIAS_FIELDS = {
     "log_task": "story",
     "task_id": "story",
     "bundle": "bundle",
+    # A tickets-mode epic slug (`epic-<name>`, the epic folder's name) on the
+    # `retro-auto-*` rows and the epic-closure rows, beside `epic` 0. The slug is
+    # the customer's epic name, so it is aliased in its own namespace: one epic,
+    # one alias across the retro and its closure.
+    "epic_ref": "epic",
     "branch": "branch",
     "target_branch": "branch",
     # The branch the main checkout had instead of the target, when a merge paused
