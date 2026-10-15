@@ -78,6 +78,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
@@ -451,7 +452,7 @@ class TicketTree:
         try:
             with self._plan_lock(plan):
                 self._locate(ref, plan)
-                has_plan, before, blocked_now = _plan_fields(plan)
+                has_plan, before, blocked_now, blocked_at = _plan_fields(plan)
                 after = before
                 try:
                     write = check_plan_transition(
@@ -462,6 +463,7 @@ class TicketTree:
                         has_plan=has_plan,
                         blocked_reason=blocked_now,
                         blocked=blocked,
+                        blocked_at=blocked_at,
                     )
                 except PlanTransitionRefused as e:
                     raise TicketsTransitionRefused(
@@ -473,11 +475,16 @@ class TicketTree:
                     flags = ["--blocked", blocked] if blocked is not None else []
                     doc = self._call(["mark", *flags, "--", ref, target], verb="mark")
                     report = _parsed(ticketmodel.parse_mark, doc)
-                    _, after, blocked_after = _plan_fields(plan)
-                    if after != target or blocked_after != (blocked or ""):
+                    _, after, blocked_after, blocked_at_after = _plan_fields(plan)
+                    if (
+                        after != target
+                        or blocked_after != (blocked or "")
+                        or (blocked is None and blocked_at_after)
+                    ):
                         raise TicketsReadBackMismatch(
                             f"{ref}: {plan} reads back status {after!r} (reason "
-                            f"{blocked_after!r}) after marking {target!r}"
+                            f"{blocked_after!r}, blocked_at {blocked_at_after!r}) "
+                            f"after marking {target!r}"
                         )
                     result = PlanMark(ref, plan, before, after, "written", report.created)
         except TicketsError as e:
@@ -517,7 +524,7 @@ class TicketTree:
         try:
             with self._plan_lock(plan):
                 self._locate(ref, plan)
-                has_plan, before, blocked_now = _plan_fields(plan)
+                has_plan, before, blocked_now, _ = _plan_fields(plan)
                 if not has_plan:
                     result = PlanMark(ref, plan, "", "", "noop")
                 else:
@@ -605,15 +612,23 @@ class TicketTree:
             raise TicketsReadBackMismatch(f"{plan} does not read back as the restored pre-image")
 
 
-def _plan_fields(plan: Path) -> tuple[bool, str, str]:
-    """``(exists, status, blocked_reason)`` of a plan, read natively. ``status``
-    is ``frontmatter.status_of``'s normalized token — states are compared that
-    way, never as bytes (the script's quoting of values may change). A leading
-    UTF-8 byte-order mark is skipped, as the script keeps one it finds. A read
-    ``OSError`` raises :class:`TicketsPlanIOError`, so it reaches the callers'
-    ``ticket-mark`` failure record."""
-    if not plan.is_file():
-        return False, "", ""
+def _plan_fields(plan: Path) -> tuple[bool, str, str, str]:
+    """``(exists, status, blocked_reason, blocked_at)`` of a plan, read natively.
+    ``status`` is ``frontmatter.status_of``'s normalized token — states are
+    compared that way, never as bytes (the script's quoting of values may
+    change). A leading UTF-8 byte-order mark is skipped, as the script keeps one
+    it finds. An ``OSError`` from the existence probe or the read (other than
+    the plan, or a parent, not existing) raises :class:`TicketsPlanIOError`, so
+    it reaches the callers' ``ticket-mark`` failure record — ``Path.is_file``
+    would raise it raw before 3.14 and answer "no plan" from 3.14 on."""
+    try:
+        is_file = stat.S_ISREG(plan.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        is_file = False
+    except OSError as e:
+        raise TicketsPlanIOError(f"cannot stat {plan}: {e}") from e
+    if not is_file:
+        return False, "", "", ""
     try:
         text = plan.read_bytes().decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -621,8 +636,13 @@ def _plan_fields(plan: Path) -> tuple[bool, str, str]:
     except OSError as e:
         raise TicketsPlanIOError(f"cannot read {plan}: {e}") from e
     fm = frontmatter.parse_frontmatter(text)
-    raw = fm.get("blocked_reason", "")
-    return True, frontmatter.status_of(fm), "" if raw is None else str(raw)
+    raw, at = fm.get("blocked_reason", ""), fm.get("blocked_at", "")
+    return (
+        True,
+        frontmatter.status_of(fm),
+        "" if raw is None else str(raw),
+        "" if at is None else str(at),
+    )
 
 
 def _status_or_unknown(plan: Path) -> str:

@@ -348,6 +348,40 @@ def test_leftover_blocked_reason_is_not_a_noop():
     )
 
 
+@pytest.mark.parametrize(
+    ("reason", "status", "blocked", "expected"),
+    [
+        ("rearm", "in-progress", None, True),
+        ("rearm", "ready-for-dev", None, True),  # outside rearm's sources: a cleanup, not a move
+        ("repair", "in-progress", None, True),
+        ("accept", "done", None, False),  # a done plan is never picked again
+        ("park", "blocked", PARK, False),  # same park: `blocked_at` is the park's own stamp
+    ],
+)
+def test_stale_blocked_at_is_not_a_noop(reason, status, blocked, expected):
+    """A same-status write onto a plan carrying a stale `blocked_at` with no
+    reason is written, so the script's mark clears it; the script reads any
+    `blocked_at` as blocked. With no `blocked_at` every row is a no-op.
+
+    Ablation: drop the `blocked_at` term from the no-op test in
+    `check_plan_transition` and the True rows redden."""
+
+    def decide(blocked_at: str) -> bool:
+        return check_plan_transition(
+            "1.1",
+            status,
+            status,
+            reason,  # type: ignore[arg-type]
+            has_plan=True,
+            blocked_reason=blocked or "",
+            blocked=blocked,
+            blocked_at=blocked_at,
+        )
+
+    assert decide("2026-10-14") is expected
+    assert decide("") is False
+
+
 def test_session_declared_park_converts_to_blocked():
     """A build session parks by writing `awaiting-operator` itself; the
     commit-time conversion to an operator-park `blocked` is a legal `park` write,

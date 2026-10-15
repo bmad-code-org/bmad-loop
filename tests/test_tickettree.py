@@ -830,6 +830,67 @@ def test_mark_retypes_a_plan_read_oserror(tmp_path, monkeypatch, journal):
     assert rows == [("built", "?", "failed"), ("", "?", "failed")]
 
 
+def test_mark_retypes_a_plan_stat_oserror(tmp_path, monkeypatch, journal):
+    """A plan whose existence probe fails (a stat error other than "not there")
+    raises the typed `TicketsPlanIOError` and journals its `failed`
+    `ticket-mark`, rather than escaping raw (`Path.is_file` before 3.14) or
+    reading as "no plan" (3.14 on).
+
+    Ablation: put `plan.is_file()` back in `_plan_fields` and this reddens on
+    every supported Python."""
+    tree, plan, fake = _tree_with_plan(tmp_path, monkeypatch, "built")
+    real = Path.stat
+
+    def stat(self: Path, *, follow_symlinks: bool = True):
+        if self == plan:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    with pytest.raises(TicketsPlanIOError, match="cannot stat"):
+        tree.mark("1.1", "done", reason="accept", expected_plan=plan, journal=journal)
+    assert fake.events == ["find"]
+    assert [(e["after"], e["outcome"]) for e in _marks(journal)] == [("?", "failed")]
+
+
+def test_mark_clears_a_stale_blocked_at(tmp_path, monkeypatch, journal):
+    """A plan already at the re-arm target but still stamped `blocked_at` (no
+    reason) is written — the script reads it as blocked — and the read-back
+    requires the stamp gone.
+
+    Ablation: drop `blocked_at=` from the `check_plan_transition` call in
+    `TicketTree.mark` and this reddens (a no-op, no `mark` child)."""
+    tree, plan, fake = _tree_with_plan(tmp_path, monkeypatch, "in-progress")
+    plan.write_text(
+        "---\nticket: 1\nstatus: in-progress\nblocked_at: 2026-10-14\n---\n\n# plan\n",
+        encoding="utf-8",
+    )
+    result = tree.mark("1.1", "in-progress", reason="rearm", expected_plan=plan, journal=journal)
+    assert (result.before, result.after, result.outcome) == (
+        "in-progress",
+        "in-progress",
+        "written",
+    )
+    assert fake.events == ["find", "mark"]
+    assert "blocked_at" not in frontmatter.read_frontmatter(plan)
+
+    plan.write_text(
+        "---\nticket: 1\nstatus: in-progress\nblocked_at: 2026-10-14\n---\n\n# plan\n",
+        encoding="utf-8",
+    )
+    real_call = tree._call
+
+    def mark_keeping_the_stamp(tail, *, verb, json_out=True):
+        doc = real_call(tail, verb=verb, json_out=json_out)
+        text = plan.read_text(encoding="utf-8")
+        plan.write_text(text.replace("---\n\n", "blocked_at: 2026-10-14\n---\n\n", 1), "utf-8")
+        return doc
+
+    monkeypatch.setattr(tree, "_call", mark_keeping_the_stamp)
+    with pytest.raises(TicketsReadBackMismatch, match="blocked_at"):
+        tree.mark("1.1", "in-progress", reason="rearm", expected_plan=plan, journal=journal)
+
+
 def test_discard_and_restore_retype_a_plan_oserror(tmp_path, monkeypatch, journal):
     """A delete or write of the plan that raises `OSError` surfaces as
     `TicketsPlanIOError`, after the `ticket-mark` / `ticket-plan-restored`

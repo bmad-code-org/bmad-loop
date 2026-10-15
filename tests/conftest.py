@@ -2114,6 +2114,7 @@ class FakeTicketTree:
                 has_plan=row.status != "",
                 blocked_reason=row.blocked_reason,
                 blocked=blocked,
+                blocked_at=row.blocked_at,
             )
         except PlanTransitionRefused as e:
             raise TicketsTransitionRefused(e.ref, e.current, e.target, e.reason, e.why) from e

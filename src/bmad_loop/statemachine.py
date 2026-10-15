@@ -207,19 +207,24 @@ def check_plan_transition(
     has_plan: bool,
     blocked_reason: str,
     blocked: str | None = None,
+    blocked_at: str = "",
 ) -> bool:
     """Decide one plan write: True to write, False for a no-op, else raise
     :class:`PlanTransitionRefused`.
 
-    ``current`` and ``blocked_reason`` are the plan's own fields as read back
-    (normalized ``status``; ``""`` when unset). ``blocked`` is the reason the write
-    would set — a park's — and None otherwise. bmad-loop never creates a plan, so
-    ``has_plan=False`` refuses every reason.
+    ``current``, ``blocked_reason`` and ``blocked_at`` are the plan's own fields
+    as read back (normalized ``status``; ``""`` when unset). ``blocked`` is the
+    reason the write would set — a park's — and None otherwise. bmad-loop never
+    creates a plan, so ``has_plan=False`` refuses every reason.
 
     A no-op is a write that would change nothing: the plan already has ``target``
     (and, for ``blocked``, the same reason; for anything else, no reason left
     over). It is answered before the sinks are checked, so a replayed accept of a
-    ``done`` plan is a no-op rather than a refusal."""
+    ``done`` plan is a no-op rather than a refusal. A same-status write onto a
+    stale ``blocked_at`` with no reason (a hand edit: the script's own writes set
+    or clear both) is no no-op — the script reads any ``blocked_at`` as blocked,
+    so the write is the cleanup that clears it. A ``done`` plan is never picked
+    again, so there it stays a no-op."""
     rule = PLAN_TRANSITIONS.get(reason)
 
     def refuse(why: str) -> PlanTransitionRefused:
@@ -238,7 +243,7 @@ def check_plan_transition(
     if blocked is not None and (reason != "park" or not blocked.startswith(OPERATOR_PARK_PREFIX)):
         raise refuse(f"a park reason must start {OPERATOR_PARK_PREFIX!r}")
     if current == target and blocked_reason == (blocked or ""):
-        return False
+        return blocked is None and bool(blocked_at) and current != PLAN_STATUS_ORDER[-1]
     if current in (PLAN_STATUS_ORDER[-1], PLAN_DROPPED):
         raise refuse(f"{current} is final")
     if current in rule.sources:
