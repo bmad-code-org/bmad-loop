@@ -8360,6 +8360,35 @@ def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_tickets_resume_runs_the_tickets_preflight_and_skill_probe(project, monkeypatch, source):
+    """A resumed tickets run re-reads the tree it dispatches from, so resume
+    applies `run`'s tickets refusals — the tree preflight and the skill's
+    ticket-route probe — ahead of every side effect; other sources get neither.
+    Ablation (performed): drop either the `_check_tickets_preflight` call or
+    `require_tickets=` in `_prepare_resume_locked` and the tickets row FAILS."""
+    run_dir = _paused_run_for_resume(project, monkeypatch, source=source)
+    preflights: list[str] = []
+    skill_kwargs: list[dict] = []
+
+    def preflight(paths, pol):
+        preflights.append(str(paths.project))
+        return None
+
+    def skills(*a, **kw):
+        skill_kwargs.append(kw)
+        return False
+
+    monkeypatch.setattr(cli, "_check_tickets_preflight", preflight)
+    monkeypatch.setattr(cli, "_require_base_skills", skills)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    tickets = source == "tickets"
+    assert preflights == ([str(project.project)] if tickets else [])
+    assert [kw["require_tickets"] for kw in skill_kwargs] == [tickets]
+    assert _resume_entries(run_dir) == []
+
+
 # ------------------------------------------- resume re-stamps the code root
 
 # `repo_root:` is the one ProjectPaths member that decides which git TREE the run

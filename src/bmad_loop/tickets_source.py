@@ -42,8 +42,9 @@ noted ``foreign-active``.
    closed → halt ``awaiting-closure``;
 4. foreign active rows → halt ``foreign-active``;
 5. rows that wait only behind tickets this run retired without finishing
-   (deferred, parked) → :class:`Skip` ``parked``; rows waiting on nothing this
-   run can explain → halt ``stalled``;
+   (deferred, parked) — directly, through another such row, or through such a
+   ticket's epic → :class:`Skip` ``parked``; any row with a wait none of those
+   explains → halt ``stalled`` on it;
 6. an epic still open with every ticket done (an empty ``next`` included) →
    halt ``awaiting-closure``, and an open epic with no tickets at all → halt
    ``stalled``, so the run cannot finish past an unclosed epic;
@@ -308,6 +309,33 @@ def _unbroken_epics(status_view: StatusView) -> list[str]:
     ]
 
 
+def _behind_held(
+    rows: Sequence[TicketRow], every: Sequence[TicketRow], held: Sequence[str]
+) -> set[str]:
+    """The labels of ``rows`` whose every wait is ``held`` work: a held ticket, a
+    row already behind one, or the epic of either (a ``gated_by`` slug). A
+    sibling's wait is its bare id, resolved within the row's epic through
+    ``every``; another epic's is its ``E.M`` ref."""
+    by_id = {(r.epic, r.id): row_label(r) for r in every if r.id is not None}
+    epic_of = {row_label(r): r.epic for r in every}
+    behind: set[str] = set(held)
+    grew = True
+    while grew:
+        grew = False
+        epics = {epic_of[key] for key in behind if key in epic_of}
+        for row in rows:
+            label = row_label(row)
+            if label in behind or not row.waiting_on:
+                continue
+            if all(
+                by_id.get((row.epic, wait), wait) in behind or wait in epics
+                for wait in row.waiting_on
+            ):
+                behind.add(label)
+                grew = True
+    return behind
+
+
 def _rejected_gate(
     row: TicketRow, status_view: StatusView, epic_closures: Mapping[str, str]
 ) -> str | None:
@@ -424,9 +452,23 @@ def decide_pick(
             row_label(r) for r in blocked if not waiting_rows
         ]
         if own_held:
-            last = len(rank)
-            held = tuple(sorted(own_held, key=lambda k: (rank.get(k, last), k)))
-            return Skip(SKIP_PARKED, held, waiting, held_notes)
+            every = (
+                *status_view.tickets,
+                *next_view.ready_to_refine,
+                *next_view.ready_to_start,
+                *next_view.in_progress,
+                *blocked,
+            )
+            behind = _behind_held(waiting_rows, every, own_held)
+            stalled = [r for r in waiting_rows if row_label(r) not in behind]
+            if not stalled:
+                last = len(rank)
+                held = tuple(sorted(own_held, key=lambda k: (rank.get(k, last), k)))
+                return Skip(SKIP_PARKED, held, waiting, held_notes)
+            # a row also waiting on something no held ticket explains stalls the
+            # tree whatever this run finishes
+            waiting_rows = stalled
+            waiting = tuple(row_label(r) for r in stalled)
         return Halt(
             HALT_STALLED,
             waiting[0],

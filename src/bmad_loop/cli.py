@@ -3482,7 +3482,13 @@ def _preflight_stories_queue(
 def _preflight_tickets_queue(
     paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
 ) -> int | None:
-    """``run``'s queue preflight for a tickets run: the v7 tree's checks
+    """``run``'s queue preflight for a tickets run: :func:`_check_tickets_preflight`."""
+    del args, spec_folder
+    return _check_tickets_preflight(paths, pol)
+
+
+def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
+    """The v7 tree's checks for a tickets run, at launch and on resume
     (:func:`install.tickets_preflight`, the script's capability probe included —
     the run executes the script anyway). Warnings print; a problem refuses the
     run."""
@@ -4572,6 +4578,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    # A tickets run re-reads the tree it dispatches from, so the tree's own
+    # refusals (script, layout, store, capability) apply on resume as at launch.
+    tickets = state.run_type != "sweep" and state.source == worksource.SOURCE_TICKETS
+    if tickets and (rc := _check_tickets_preflight(paths, pol)) is not None:
+        return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE; see the trust gate below
     if not _require_base_skills(
         project,
@@ -4579,6 +4590,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         paths.repo_root,
         plugin_grants,
         require_stories=worksource.resumed_traits_for(state.source).stories_primitive,
+        require_tickets=tickets,
         review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
     ):
         return 1

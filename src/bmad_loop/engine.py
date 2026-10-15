@@ -4692,8 +4692,8 @@ class Engine:
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
-            self._undo_terminal_plan_write(task, plan_undo)
-            self._escalate(task, f"commit failed: {e}")
+            unrestored = self._undo_terminal_plan_write(task, plan_undo)
+            self._escalate(task, f"commit failed: {e}" + (f"; {unrestored}" if unrestored else ""))
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
             # handler `_run` installed raises RunStopped from wherever the main
@@ -4704,6 +4704,8 @@ class Engine:
             # does not exist. Restore, then re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
+            # A failed put-back is journaled by the work source; the task stays
+            # COMMITTING, so a resume re-drives this window over the written plan.
             self._undo_terminal_plan_write(task, plan_undo)
             raise
         if task.dw_ids and task.worktree_path:
@@ -4748,12 +4750,15 @@ class Engine:
         del task
         return None
 
-    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> None:
+    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
         """Put back what :meth:`_terminal_plan_write` wrote, for the commit
         window's failure arms: a plan marked finished for a commit that does not
         exist would unblock work on code that is not there. Never raises, like
-        :meth:`_restore_park_record`. Base: nothing to undo."""
+        :meth:`_restore_park_record`; a put-back that failed is returned as the
+        operator-facing detail the escalation carries, None when there was
+        nothing to undo or it was undone. Base: nothing to undo."""
         del task, undo
+        return None
 
     def _park_spec_relpath(self, task: StoryTask) -> str:
         """The parked story's spec as a path relative to the WORKSPACE root, so

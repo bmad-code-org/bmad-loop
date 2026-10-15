@@ -230,6 +230,40 @@ CASES = [
         id="blocked-behind-own-deferred",
     ),
     pytest.param(
+        _views(
+            start=(ticket_row("1.1", status="ready-for-dev"),),
+            blocked=(_waits("1.2", "1"), _waits("1.3", "2"), _waits("2.1", CART, epic=CHECKOUT)),
+            epics=(_epic(CART, "1"), _epic(CHECKOUT, "2")),
+        ),
+        {"1.1": Phase.DEFERRED},
+        {},
+        (),
+        ("skip", ts.SKIP_PARKED, ("1.1",), ("1.2", "1.3", "2.1")),
+        id="blocked-transitively-behind-own-deferred",
+    ),
+    pytest.param(
+        _views(
+            start=(ticket_row("1.1", status="ready-for-dev"),),
+            blocked=(_waits("1.2", "1"), _waits("1.3", "9")),
+        ),
+        {"1.1": Phase.DEFERRED},
+        {},
+        (),
+        ("halt", ts.HALT_STALLED, "1.3", PAUSE_TICKET_TREE),
+        id="unrelated-wait-stalls-despite-own-deferred",
+    ),
+    pytest.param(
+        _views(
+            start=(ticket_row("1.1", status="ready-for-dev"),),
+            blocked=(_waits("1.2", "1", "9"),),
+        ),
+        {"1.1": Phase.DEFERRED},
+        {},
+        (),
+        ("halt", ts.HALT_STALLED, "1.2", PAUSE_TICKET_TREE),
+        id="partly-unexplained-wait-stalls",
+    ),
+    pytest.param(
         _views(blocked=(ticket_row("1.1", status="blocked", blocked_reason="tests red"),)),
         {},
         {},

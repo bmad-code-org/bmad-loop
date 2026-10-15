@@ -43,7 +43,8 @@ from bmad_loop.policy import (
 )
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
-from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy
+from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy, TicketsPlanIOError
+from bmad_loop.workspace import Workspace
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -497,6 +498,30 @@ def test_plan_halt_leg_prompt_and_env_in_lockstep(project_v7):
     assert "BMAD_LOOP_PLAN_HALT" not in _probe_session(engine, adapter, task, role="dev").env
 
 
+def test_plan_produced_reads_the_active_workspace(project_v7, tmp_path):
+    """Under worktree isolation leg 1 writes the plan into the retained unit
+    worktree only, so the plan-produced check reads the workspace's copy: the
+    resume after a plan checkpoint dispatches the implement leg, not another
+    `Halt after planning.` leg. Ablation (performed): read `ticket.plan` (the main
+    checkout's path) in `_plan_produced` and the halt leg repeats — this FAILS."""
+    row = ticket_row("1.1", plan_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    mount = tmp_path / "mount"
+    engine.workspace = Workspace(root=mount, paths=engine.paths.rebased(mount))
+    mounted = mount / plan.relative_to(project_v7.project)
+    assert engine._plan_halt_now(task)
+
+    _write_plan(mounted, "ready-for-dev")
+
+    assert not plan.exists()  # only the worktree's copy is planned
+    assert engine._bound_plan(task) == mounted
+    assert not engine._plan_halt_now(task)
+    assert "Halt after planning." not in engine._dev_prompt(task, None)
+
+
 def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     """The follow-up review re-dispatches the ticket with the ledger sentence and
     the tickets clauses: never the banned word, never the sprint board, no
@@ -794,6 +819,36 @@ def test_mark_done_undone_on_commit_failure(project_v7, monkeypatch):
     assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
 
 
+def test_failed_mark_done_undo_is_named_in_the_escalation(project_v7, monkeypatch):
+    """A commit failure whose put-back of the pre-mark plan also fails (a held
+    lock, an FS fault) leaves the plan reading `done` for a commit that does not
+    exist. The undo still never raises out of the failure arm, but the
+    escalation names the plan instead of reading as a plain commit failure.
+    Ablation (performed): return None from `_undo_terminal_plan_write`'s
+    failure arm and the reason no longer names the plan — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+
+    def restore(plan, data, journal=None):
+        raise TicketsPlanIOError(f"cannot restore {plan}: disk full")
+
+    monkeypatch.setattr(tree, "restore_preimage", restore)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    _reject_commits(project_v7)
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["1.1"].phase == Phase.ESCALATED
+    [escalated] = _kinds(engine, "story-escalated")
+    assert escalated["reason"].startswith("commit failed: ")
+    assert f"{plan} could not be put back" in escalated["reason"]
+    assert "disk full" in escalated["reason"]
+
+
 def test_mark_done_undone_when_the_window_is_interrupted(project_v7, monkeypatch):
     """The window's other failure arm: anything else raised out of
     `finalize_commit` (an FS fault here, or a stop signal) also puts the plan
@@ -919,7 +974,8 @@ def test_worktree_unit_marks_the_mounts_plan_on_an_epic_branch(project_v7):
     assert [(m.target, m.reason, m.expected_plan) for m in tree.marks] == [("done", "accept", plan)]
     assert _committed_status(project_v7, task.commit_sha, plan) == "done"
     assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "done"
-    assert (main / "src.txt").read_bytes() == b"cart model\n"
+    # text, not bytes: the merge-back checks the file out under autocrlf on Windows
+    assert (main / "src.txt").read_text(encoding="utf-8") == "cart model\n"
 
 
 def test_never_mark_before_code_lands(project_v7, monkeypatch):

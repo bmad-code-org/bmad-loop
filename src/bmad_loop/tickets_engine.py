@@ -337,13 +337,14 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         )
 
     def _plan_produced(self, task: StoryTask) -> bool:
-        """Whether the bound plan is on disk at ``ready-for-dev`` or later. A
-        missing or unreadable plan is not produced."""
-        ticket = task.ticket
-        if ticket is None:
+        """Whether the bound plan is on disk at ``ready-for-dev`` or later, read in
+        the active workspace (:meth:`_bound_plan`): under isolation leg 1 wrote it
+        into the unit worktree only. A missing or unreadable plan is not produced."""
+        plan = self._bound_plan(task)
+        if plan is None:
             return False
         try:
-            text = Path(ticket.plan).read_text(encoding="utf-8-sig")
+            text = plan.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             return False
         return plan_planned(status_of(parse_frontmatter(text)))
@@ -769,23 +770,31 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 ticket.ref, "done", reason="accept", expected_plan=plan, journal=self.journal
             )
         except TicketsError as e:
+            detail = f"tickets.py {e.kind}: {e}"
             if _bytes_or_none(plan) != preimage:
-                self._undo_terminal_plan_write(task, undo)
-            self._pause_mark_done(task, f"tickets.py {e.kind}: {e}")
+                if unrestored := self._undo_terminal_plan_write(task, undo):
+                    detail = f"{detail}; {unrestored}"
+            self._pause_mark_done(task, detail)
         return undo if mark.outcome == "written" else None
 
-    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> None:
+    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
         """Put the plan back to its pre-mark bytes through
         :meth:`~bmad_loop.tickettree.TicketTree.restore_preimage`, which journals
-        ``ticket-plan-restored`` with its outcome either way; a failed restore is
-        that row, never a raise out of the commit window's failure arm."""
+        ``ticket-plan-restored`` with its outcome either way. A failed restore is
+        never a raise out of the commit window's failure arm: it is returned, so
+        the escalation (or pause) names the plan left marked for a commit that
+        does not exist instead of reading as a plain commit failure."""
         del task
         if not isinstance(undo, _PlanUndo):
-            return
+            return None
         try:
             self._workspace_ticket_tree().restore_preimage(undo.plan, undo.data, self.journal)
-        except (TicketsError, OSError):
-            pass
+        except (TicketsError, OSError) as e:
+            return (
+                f"{undo.plan} could not be put back to its pre-mark bytes ({e}) and may "
+                "still read done; restore it before resuming"
+            )
+        return None
 
     def _pause_mark_done(self, task: StoryTask, detail: str) -> NoReturn:
         reason = (
