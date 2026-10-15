@@ -580,13 +580,27 @@ def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
         raise BmadConfigError(_diagnostic_text(message)) from e
     config_path = project / LEGACY_CONFIG_REL
     marker = project / V7_MARKER_REL
-    central = _load_central(project)
+    # v7's `config_utils` never reads the v6-only `_bmad/config.user.toml`, so a v7
+    # resolution must not fail on it either. A tickets caller on a v7 install skips it
+    # up front. An auto-detecting caller retries without it when the marker is present,
+    # and its fault (`v6_fault`) still raises unless the project then resolves as v7.
+    v7_layers = want_tickets and _is_file(marker)
+    v6_fault: BmadConfigError | None = None
+    try:
+        central = _load_central(project, V7_CENTRAL_LAYERS_REL if v7_layers else CENTRAL_LAYERS_REL)
+    except BmadConfigError as e:
+        if v7_layers or not _is_file(marker):
+            raise
+        v6_fault = e
+        central = _load_central(project, V7_CENTRAL_LAYERS_REL)
     if central is None:
         # No TOML layer at all, so v7's required base layer is absent too: a v7
         # install (the marker, under tickets mode or with no legacy YAML to fall back
         # on) gets `_assemble_v7`'s refusal, never a healthy-looking v6 snapshot.
         if (want_tickets or not _is_file(config_path)) and _is_file(marker):
             return _assemble_v7(project, None, ())
+        if v6_fault is not None:
+            raise v6_fault
         if not _is_file(config_path):
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
@@ -615,6 +629,8 @@ def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
     # outside tickets mode resolves exactly as it always did.
     if (want_tickets or not v6_hits) and _is_file(marker):
         return _assemble_v7(project, lookup("repo_root"), tuple(origin for _, origin in v6_hits))
+    if v6_fault is not None:
+        raise v6_fault
     found = {**v6, "repo_root": lookup("repo_root"), "output_folder": lookup("output_folder")}
     for key in _REQUIRED_KEYS:
         if found[key] is None:

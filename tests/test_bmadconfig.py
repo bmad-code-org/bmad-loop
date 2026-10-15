@@ -1321,6 +1321,32 @@ def test_core_reader_ignores_legacy_config_user_toml_layer(tmp_path: Path) -> No
     assert bmadconfig.active_initiative(root) is None
 
 
+@pytest.mark.parametrize("want_tickets", [True, False])
+def test_v7_resolution_ignores_a_broken_v6_user_layer(tmp_path: Path, want_tickets: bool) -> None:
+    """A leftover `_bmad/config.user.toml` that does not parse must not refuse a v7
+    project: upstream's three-layer merge never reads it, so `tickets.py` runs.
+
+    Ablation: load the four v6 layers unconditionally and both rows raise."""
+    root = _v7(tmp_path, initiative="initiative-checkout")
+    (root / "_bmad" / "config.user.toml").write_text("not = [toml\n", encoding="utf-8")
+    paths = bmadconfig.load_paths(root, want_tickets=want_tickets)
+    assert paths.era == "v7"
+    assert paths.initiative_folder == (root / "_bmad-output" / "initiative-checkout").resolve()
+
+
+def test_broken_v6_user_layer_still_refuses_a_project_that_stays_v6(tmp_path: Path) -> None:
+    """Outside tickets mode the v6 keys keep the project on v6, which reads the user
+    layer, so its parse fault still raises even with the v7 marker present.
+
+    Ablation: drop the re-raise before the v6 resolution and this resolves cleanly."""
+    root = _v7(tmp_path)
+    with (root / "_bmad" / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + V6_KEYS_TOML)
+    (root / "_bmad" / "config.user.toml").write_text("not = [toml\n", encoding="utf-8")
+    with pytest.raises(bmadconfig.BmadConfigError, match=r"config\.user\.toml"):
+        bmadconfig.load_paths(root)
+
+
 def test_core_reader_layers_and_strips(tmp_path: Path) -> None:
     root = _v7(tmp_path)
     (root / "_bmad" / "custom" / "config.toml").write_text(
