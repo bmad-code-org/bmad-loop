@@ -394,7 +394,7 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         """Tee the window's pane output to ``log_file`` (tolerant of the window
-        having already died)."""
+        having already died). ``window_id`` may also be a :meth:`pane_target`."""
 
     @abstractmethod
     def send_text(self, window_id: str, text: str) -> None:
@@ -410,7 +410,7 @@ class TerminalMultiplexer(ABC):
         in, even after an operator splits the window and another pane becomes
         active (#948). Resolve it right after :meth:`new_window`, while the
         launched pane is the only one. Opaque like the window id; accepted by
-        :meth:`send_text` and :meth:`capture_pane`.
+        :meth:`pipe_pane`, :meth:`send_text` and :meth:`capture_pane`.
 
         NON-abstract so released out-of-tree backends keep working unchanged:
         the default answers the window id itself, i.e. the window's active pane
