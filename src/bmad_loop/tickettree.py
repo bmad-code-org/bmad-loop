@@ -313,6 +313,18 @@ class TicketTree:
 
     # ----------------------------------------------------------- launch
 
+    def _script_stat(self) -> os.stat_result:
+        """The script's stat, every failure typed :class:`TicketsUnavailable` —
+        ``Path.is_file`` would raise a non-"not there" ``OSError`` raw before 3.14
+        and past callers that catch only :class:`TicketsError`."""
+        try:
+            st = self.script.stat()
+        except OSError as e:
+            raise TicketsUnavailable(f"{self.script} is missing: {e}") from e
+        if not stat.S_ISREG(st.st_mode):
+            raise TicketsUnavailable(f"{self.script} is missing")
+        return st
+
     def _script_text(self) -> str:
         try:
             return self.script.read_text(encoding="utf-8")
@@ -352,8 +364,7 @@ class TicketTree:
         Tree reads (``json_out``) check the initiative pin first."""
         if json_out:
             self._check_pin()
-        if not self.script.is_file():
-            raise TicketsUnavailable(f"{self.script} is missing")
+        self._script_stat()
         prefix, env = self.launcher()
         argv = [*prefix, str(self.script), "--project-root", str(self._project_root), *tail]
         try:
@@ -370,10 +381,7 @@ class TicketTree:
         """The verbs and ``mark`` statuses the installed script offers, from its
         ``--help`` output. Cached on the script's (path, size, mtime), so a
         reinstalled script is probed again and an unchanged one costs no spawn."""
-        try:
-            st = self.script.stat()
-        except OSError as e:
-            raise TicketsUnavailable(f"{self.script} is missing: {e}") from e
+        st = self._script_stat()
         key = (str(self.script.resolve()), st.st_size, st.st_mtime_ns)
         cached = _CAPABILITIES.get(key)
         if cached is not None:

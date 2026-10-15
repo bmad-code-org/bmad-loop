@@ -217,6 +217,31 @@ def test_missing_script_is_unavailable_and_spawns_nothing(tmp_path, monkeypatch)
     assert seen == []
 
 
+def test_script_stat_oserror_is_unavailable_and_spawns_nothing(tmp_path, monkeypatch):
+    """A script whose existence probe fails (a stat error other than "not
+    there") raises the typed `TicketsUnavailable` from every verb, so callers
+    catching only `TicketsError` (`install.tickets_preflight`) still see it.
+
+    Ablation: put `self.script.is_file()` back in `_call` and `next` reddens
+    with a raw `PermissionError` before 3.14."""
+    script = tmp_path / "tickets.py"
+    script.write_text("print('{}')\n", encoding="utf-8")
+    seen = canned(monkeypatch, ChildRun(0, "{}", ""))
+    real = Path.stat
+
+    def stat(self: Path, *, follow_symlinks: bool = True):
+        if self == script:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    tree = TicketTree(tmp_path, script)
+    for call in (tree.next, tree.capability):
+        with pytest.raises(TicketsUnavailable, match="Permission denied"):
+            call()
+    assert seen == []
+
+
 # ---------------------------------------------------------------- pin
 
 
