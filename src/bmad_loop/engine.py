@@ -1031,6 +1031,7 @@ class Engine:
             save=self._save,
             gate_unit=self._gate_unit,
             carry_isolated_ledger_writes=lambda task: self._carry_isolated_ledger_writes(task),
+            land_post_landing_writes=lambda task: self._land_post_landing_writes(task),
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
@@ -1198,6 +1199,7 @@ class Engine:
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
                 self._replay_unlatched_ledger_carries()
+                self._replay_post_landing_writes()
                 self._loop()
                 # A hard request that landed after `_loop`'s head check reaches none
                 # of the raise sites on an exhausted-queue return: sites A and B live
@@ -2099,12 +2101,16 @@ class Engine:
             # the ordinary case of exactly that: nearly every generic story records
             # one and nothing else, so leaving it out here would strand the write
             # that keeps `_pick_next` from re-picking the finished story.
+            # A shared ticket store's latched mark (tickets mode) is such a write
+            # too: it is made only once the code has merged back.
             if not task.worktree_path or not (
                 task.harvested_deferrals
                 or task.bundle_closes_intended
                 or task.story_closes_intended
                 or task.board_advance_intended
                 or publication_pending
+                or task.ticket_done_pending
+                or task.ticket_park_pending
             ):
                 continue
             merged = merged_key in merged_units
@@ -2222,6 +2228,7 @@ class Engine:
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
             self._save()
+            self._land_post_landing_writes(task)
             # The failed integration unwound before _run_story returned, so the
             # loop never reached its normal post-integration continuation.
             self._after_story(task)
@@ -4606,6 +4613,9 @@ class Engine:
             return
         advance(task, Phase.COMMITTING)
         task.salvage_refile_pending = False
+        # Latched in the COMMITTING save itself, so no crash window between here
+        # and the mark after landing can lose it.
+        self._latch_post_landing_writes(task)
         self._save()
         self._finalize_commit_phase(task)
 
@@ -4758,6 +4768,30 @@ class Engine:
             self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
+        # In place the code is on the target now; under isolation it lands with
+        # the merge-back (`WorktreeFlow.integrate_unit`), which makes this call.
+        if not task.worktree_path:
+            self._land_post_landing_writes(task)
+
+    def _latch_post_landing_writes(self, task: StoryTask) -> None:
+        """Record on ``task``, before ``_commit``'s COMMITTING save, the work
+        source's writes owed once the unit's code has landed on the target (tickets
+        mode with a shared ticket store marks the plan then:
+        ``StoryTask.ticket_done_pending`` / ``ticket_park_pending``). Base: none."""
+        del task
+
+    def _land_post_landing_writes(self, task: StoryTask) -> None:
+        """Make the writes :meth:`_latch_post_landing_writes` latched, now that
+        ``task``'s code is on the target: after ``finalize_commit`` in place, after
+        the merge-back under isolation, or on resume. Clears the latch once made; a
+        write that fails raises ``RunPaused`` with the latch kept. Base: none."""
+        del task
+
+    def _replay_post_landing_writes(self) -> None:
+        """Make, on resume, every latched post-landing write whose code had
+        already landed when the host stopped. Called from ``run()`` after
+        :meth:`_replay_unlatched_ledger_carries` (which replays a terminal unit's
+        lost merge-back first) and before ``_loop`` picks. Base: none."""
 
     def _unit_branch_epic(self, task: StoryTask) -> str | None:
         """The epic segment of ``task``'s unit branch under worktree isolation

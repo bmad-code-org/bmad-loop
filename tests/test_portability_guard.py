@@ -570,6 +570,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # targeted and the closed refusal token (`no-plan-reason` / `unbound` /
     # `not-bound-plan`); `site` is the closed `SpecWriteReason` (by-name benign).
     "ticket-status-write-refused": frozenset({"target", "cause"}),
+    # tickets_engine.py: the plan status a shared store's post-landing mark owes
+    # (`done` / `blocked`), latched and replayed.
+    "ticket-mark-latched": frozenset({"target"}),
+    "resume-ticket-mark": frozenset({"target"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -2055,10 +2059,14 @@ JOURNAL_KINDS = frozenset(
         # review leg whose plan risk could not be read (reviewed as high risk). And
         # the epic boundary: the closure it recorded, and a resume past an epic
         # still open (its `retro-auto-*` rows reuse the base kinds with `epic_ref`).
+        # And a shared store's mark latched for after the code lands, and its
+        # replay on resume.
         "epic-closure-not-recorded",
+        "resume-ticket-mark",
         "ticket-epic-closure",
         "ticket-foreign-active",
         "ticket-hitl-pause",
+        "ticket-mark-latched",
         "ticket-pick-halt",
         "ticket-plan-risk-unread",
         "ticket-rebound",

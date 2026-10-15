@@ -53,6 +53,15 @@ initiative folder for a no-plan fallback result. The dev and review gates are
 and the orchestrator alone owns ``done``. The unit's commit carries
 ``Bmad-Ticket:`` and ``Bmad-Plan:`` trailers.
 
+Where the ticket's terminal mark lands depends on the run's store topology. A
+store tracked in the code checkout (T1) is marked inside the commit window, so the
+plan rides the unit's commit. A shared store (T2–T4: ``ProjectPaths.shared_store``)
+cannot ride it, so the mark is latched on the task in the COMMITTING save
+(``ticket_done_pending`` / ``ticket_park_pending``) and made once the code has
+landed: after ``finalize_commit`` in place, after the merge-back under worktree
+isolation, or replayed on resume before any pick. A failed mark pauses at
+``ticket-tree``, latch kept.
+
 A session (or, under ``[operator] on_review_demotion = "park"``, a review) that
 parks the ticket at ``awaiting-operator`` keeps the base park verification; the
 commit window then marks the plan ``blocked`` with an ``awaiting operator: ``
@@ -963,15 +972,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _bound_plan(self, task: StoryTask) -> Path | None:
         """The ticket's plan as ``find`` named it at pick time (moved with the
         project, :meth:`_recorded_plan`), re-anchored in the active workspace
-        (the same path in place; the unit worktree's copy under isolation).
-        A plan outside the project is left as recorded: under isolation the
-        preflight refuses an initiative folder outside the project
-        (``tickets.layout-unsupported``), since the mount re-anchors only what
-        the project holds. None for a task with no binding."""
+        (the same path in place; the unit worktree's copy under isolation, but
+        the one shared plan when the store is shared). A plan outside the
+        project is left as recorded: under isolation the preflight refuses a
+        tracked initiative folder outside the project
+        (``tickets.store-topology``), since the mount re-anchors only what the
+        project holds. None for a task with no binding."""
         ticket = task.ticket
         if ticket is None:
             return None
         plan = self._recorded_plan(ticket)
+        if self.paths.in_shared_store(plan):
+            return plan
         try:
             rel = plan.relative_to(self.paths.project)
         except ValueError:
@@ -1429,10 +1441,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | None:
         """The ticket's terminal write on the bound plan, inside the commit
-        window. The store is tracked inside the code checkout (preflight refuses
-        every other layout for now), so the marked plan rides the unit's own
-        squash and reaches the target branch only with the code it describes —
-        never before: ``next`` unblocks a done ticket's dependents.
+        window, for a store tracked inside the code checkout (T1): the marked plan
+        rides the unit's own squash and reaches the target branch only with the
+        code it describes — never before: ``next`` unblocks a done ticket's
+        dependents. A shared store (T2–T4) is written after the code lands
+        instead (:meth:`_latch_post_landing_writes`), so nothing is written here.
 
         * A park (``task.operator_actions`` latched): the session's
           ``awaiting-operator`` plan becomes ``mark <ref> blocked --blocked
@@ -1449,7 +1462,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         Returns the pre-image for :meth:`_undo_terminal_plan_write`."""
         plan = self._bound_plan(task)
         ticket = task.ticket
-        if plan is None or ticket is None:
+        if plan is None or ticket is None or self.paths.shared_store is not None:
             return None
         parked = bool(task.operator_actions)
         if not parked and self.policy.tickets.mark_done != "auto":
@@ -1510,6 +1523,118 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         )
         gates.notify(self.policy, self.run_dir, f"mark {target} failed: {task.story_key}", reason)
         raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+
+    # ------------------------------------------- shared store: after landing
+
+    def _latch_post_landing_writes(self, task: StoryTask) -> None:
+        """For a shared store (T2–T4: no code checkout carries the plan, so the
+        unit's commit cannot), latch the ticket's terminal mark on ``task`` in the
+        COMMITTING save — the same choice :meth:`_terminal_plan_write` makes for
+        T1: a park's ``blocked`` reason (``ticket_park_pending``), else ``done``
+        under ``mark_done = "auto"`` (``ticket_done_pending``), else nothing. Both
+        fields are assigned every time, so a re-armed unit never carries a stale
+        latch into its next commit. Journals ``ticket-mark-latched``."""
+        if self.paths.shared_store is None or task.ticket is None:
+            return
+        parked = bool(task.operator_actions)
+        task.ticket_park_pending = operator_park_reason(task.operator_actions) if parked else ""
+        task.ticket_done_pending = not parked and self.policy.tickets.mark_done == "auto"
+        self._journal_latch(task)
+
+    def _journal_latch(self, task: StoryTask) -> None:
+        target = self._post_landing_target(task)
+        if target:
+            self.journal.append("ticket-mark-latched", story_key=task.story_key, target=target)
+
+    @staticmethod
+    def _post_landing_target(task: StoryTask) -> str:
+        if task.ticket_park_pending:
+            return "blocked"
+        return verify.PLAN_DONE if task.ticket_done_pending else ""
+
+    def _land_post_landing_writes(self, task: StoryTask) -> None:
+        """Make the latched mark now that the unit's code is on the target: on the
+        run's own tree (the main checkout's view of the shared store) and the plan
+        ``find`` named at pick time — ``mark <ref> blocked --blocked <reason>``
+        (reason ``park``) or ``mark <ref> done`` (reason ``accept``) — then clear
+        the latch and save. A replay after a crash past the mark is the
+        chokepoint's no-op. A mark that fails is a repair write: it raises
+        ``RunPaused`` at ``ticket-tree`` with the latch kept, so the resume marks
+        again (:meth:`_replay_post_landing_writes`)."""
+        target = self._post_landing_target(task)
+        if not target:
+            return
+        ticket = task.ticket
+        if ticket is None:
+            self._pause_post_landing_mark(task, target, "the unit has no ticket binding")
+        plan = Path(ticket.plan)
+        try:
+            if task.ticket_park_pending:
+                self.ticket_tree.mark(
+                    ticket.ref,
+                    "blocked",
+                    reason="park",
+                    expected_plan=plan,
+                    blocked=task.ticket_park_pending,
+                    journal=self.journal,
+                )
+            else:
+                self.ticket_tree.mark(
+                    ticket.ref, "done", reason="accept", expected_plan=plan, journal=self.journal
+                )
+        except TicketsError as e:
+            self._pause_post_landing_mark(task, target, f"tickets.py {e.kind}: {e}")
+        task.ticket_done_pending = False
+        task.ticket_park_pending = ""
+        self._save()
+
+    def _replay_post_landing_writes(self) -> None:
+        """On resume, make every latched mark whose code had landed when the host
+        stopped: a DONE or AWAITING_OPERATOR unit, in place (its commit is on the
+        target) or merged back (``isolated_ledger_carried``: the merge-back
+        returned; a terminal unit whose merge-back was lost has just been merged by
+        :meth:`~bmad_loop.engine.Engine._replay_unlatched_ledger_carries`, which
+        marks it there). A unit still in flight marks after its own landing.
+        Journals ``resume-ticket-mark`` per replayed mark."""
+        for task in list(self.state.tasks.values()):
+            target = self._post_landing_target(task)
+            if not target or task.phase not in (Phase.DONE, Phase.AWAITING_OPERATOR):
+                continue
+            if task.worktree_path and not task.isolated_ledger_carried:
+                continue
+            self.journal.append("resume-ticket-mark", story_key=task.story_key, target=target)
+            self._land_post_landing_writes(task)
+
+    def _pause_post_landing_mark(self, task: StoryTask, target: str, detail: str) -> NoReturn:
+        what = "parking" if target == "blocked" else "marking"
+        reason = (
+            f"{what} {task.story_key} {target} failed after its code landed ({detail}) — "
+            f"the mark is still owed; fix the ticket tree, then {self._resume_hint()}"
+        )
+        gates.notify(self.policy, self.run_dir, f"mark {target} failed: {task.story_key}", reason)
+        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+
+    def _apply_adoption(self, task: StoryTask) -> None:
+        """An adopted kept branch (``resolve --adopt-branch``) is the orchestrator's
+        acceptance. For a shared store the plan is never written before the code
+        lands, so the acceptance is latched (``ticket_done_pending``) and made after
+        the merge-back like a commit's; an adoption that owes operator actions is
+        refused as it is for T1 (the park conversion owns those). A per-checkout
+        store keeps the base adoption, which marks the mount's plan in the window."""
+        if self.paths.shared_store is None or task.ticket is None:
+            super()._apply_adoption(task)
+            return
+        if task.operator_actions:
+            self._escalate(
+                task,
+                f"cannot adopt {task.story_key}: it owes operator actions, and an "
+                "adoption only accepts a ticket",
+            )
+            return
+        task.ticket_park_pending = ""
+        task.ticket_done_pending = True
+        self._journal_latch(task)
+        self._save()
 
     def _park_record_fields(self, task: StoryTask) -> dict[str, str]:
         """A ticket park's record names its source and ref, so ``bmad-loop

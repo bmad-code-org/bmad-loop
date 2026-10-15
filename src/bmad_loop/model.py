@@ -792,6 +792,17 @@ class StoryTask:
     # right after registration). None for sprint, stories and sweep units.
     # Deliberately absent from `documents.py`'s `--json` projection (schema 1).
     ticket: TicketBinding | None = None
+    # tickets mode, shared ticket store only (T2–T4: a store no code checkout
+    # carries): the ticket's terminal mark, owed once the unit's code has LANDED on
+    # the target — after `finalize_commit` in place, after the merge-back under
+    # worktree isolation — because a plan the unit's commit does not carry would
+    # otherwise unblock `next`'s dependents of code that is not there yet. Set in
+    # `_commit` before the COMMITTING save, so every crash window past it replays
+    # the mark on resume; cleared (and saved) only once the mark is made.
+    # `ticket_done_pending`: accept (`mark <ref> done`); `ticket_park_pending`: the
+    # park's `blocked_reason` (`mark <ref> blocked --blocked <reason>`), "" for none.
+    ticket_done_pending: bool = False
+    ticket_park_pending: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -904,6 +915,8 @@ class StoryTask:
             "tokens": self.tokens.to_dict(),
             "token_budget_warned": self.token_budget_warned,
             "ticket": self.ticket.to_dict() if self.ticket is not None else None,
+            "ticket_done_pending": self.ticket_done_pending,
+            "ticket_park_pending": self.ticket_park_pending,
         }
 
     def _serialized_worktree_path(
@@ -1189,6 +1202,8 @@ class StoryTask:
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
             ticket=_ticket_binding_from(d.get("ticket")),
+            ticket_done_pending=bool(d.get("ticket_done_pending", False)),
+            ticket_park_pending=str(d.get("ticket_park_pending", "") or ""),
         )
 
 

@@ -1781,7 +1781,8 @@ class WorktreeFlow:
     callables: ``emit`` fires a plugin hook (late-bound so a monkeypatched
     ``Engine._emit`` still wins), ``save`` persists run state, ``gate_unit`` runs
     the per-unit ready gate, ``carry_isolated_ledger_writes`` applies Engine-owned
-    ledger bookkeeping after a successful merge, ``workspace_get``/``workspace_set``
+    ledger bookkeeping after a successful merge, ``land_post_landing_writes`` makes
+    the writes the engine latched for after landing, ``workspace_get``/``workspace_set``
     read and swap the engine's active workspace, and ``escalation_pause`` raises the
     engine's ``RunPaused`` (injected so this module need not import ``engine`` — that
     would reintroduce a runtime<->engine import cycle)."""
@@ -1802,6 +1803,7 @@ class WorktreeFlow:
         gate_unit: Callable[[StoryTask], bool],
         carry_isolated_ledger_writes: Callable[[StoryTask], None],
         escalation_pause: Callable[..., NoReturn],
+        land_post_landing_writes: Callable[[StoryTask], None] = lambda task: None,
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
         unit_branch_epic: Callable[[StoryTask], str | None] = lambda task: None,
@@ -1822,6 +1824,7 @@ class WorktreeFlow:
         self._save = save
         self._gate_unit = gate_unit
         self._carry_isolated_ledger_writes = carry_isolated_ledger_writes
+        self._land_post_landing_writes = land_post_landing_writes
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
@@ -2925,6 +2928,9 @@ class WorktreeFlow:
             # after a crash in the merge-to-carry window.
             task.isolated_ledger_carried = True
             self._save()
+            # The unit's code is on the target now: make the writes the engine
+            # latched for after landing (a shared ticket store's mark).
+            self._land_post_landing_writes(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,

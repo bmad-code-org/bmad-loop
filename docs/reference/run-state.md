@@ -87,6 +87,8 @@ A tickets run's `state.json` also records `initiative` and `initiative_folder`, 
 
 `store_topology` is the ticket store classified at run start: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
 
+For such a shared store, the unit's commit cannot carry its plan, so the ticket's terminal mark waits until the code has landed on the target: after the commit in place, or after the merge-back under worktree isolation. The task latches it in the save that records `COMMITTING`. `ticket_done_pending` stands for `mark <ref> done`, and `ticket_park_pending` holds a park's `blocked_reason`. A resume makes any latched mark whose code had landed before it picks (`resume-ticket-mark`), and replays a lost merge-back first. A mark already made is a no-op. The latch is cleared once the mark is made. A mark that fails pauses the run at `ticket-tree` and keeps the latch.
+
 ## Task directory
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.

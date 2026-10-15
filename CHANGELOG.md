@@ -48,6 +48,11 @@ breaking changes may land in a minor release.
   T1. Under worktree isolation a shared store is read in place: the mount's
   `config.user.toml` is redirected to it (`tickets.own-repo-isolation` when it cannot
   be), and no seed, carry or publication touches it.
+- Mark a shared ticket store's plan after the code lands: a store no code checkout
+  carries (T2–T4) gets its `done` or park `blocked` mark after `finalize_commit` in
+  place, or after the merge-back under worktree isolation, never inside the unit's
+  commit. The mark is latched in the commit's first save and replayed on resume; a
+  failed mark pauses at `ticket-tree`.
 - Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
   `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
   A plan restore is confined to the ticket store root.

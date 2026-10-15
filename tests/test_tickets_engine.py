@@ -2613,3 +2613,371 @@ def test_epic_file_never_written(project_v7):
     assert len(git(project_v7.project, "log", "--format=%H", "--", rel).split()) == 1
     assert epic_file.read_bytes() == before
     assert {m.ref for m in tree.marks} == {"1.1"}
+
+
+# ---------------------------------------------- shared store: after landing
+
+
+def _shared_engine(layout: V7Layout, tree: FakeTicketTree, *, isolation: str = "none", **kw):
+    """`make_engine` over a shared store, the run's topology recorded from the
+    real probe as `runsetup` stamps it (here T3: the nested, ignored store
+    repository of `project_v7_store_repo`)."""
+    from bmad_loop import ticketstore
+
+    topology = ticketstore.assess_store(load_paths(layout.project, want_tickets=True), isolation)
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T3"
+    pol = kw.pop("policy", None) or _policy()
+    if isolation != "none":
+        pol = dataclasses.replace(pol, scm=ScmPolicy(isolation=isolation, delete_branch=False))
+    return make_engine(layout, tree, policy=pol, store_topology=topology.to_dict(), **kw)
+
+
+def _builds_shared(layout: V7Layout, tree: FakeTicketTree, plan: Path, *, park: bool = False):
+    """A dev session over a shared store: the code in the session's own checkout,
+    the plan at `built` (or parked at `awaiting-operator`) in the ONE store every
+    checkout shares, the fake's row following."""
+
+    def build(spec: SessionSpec) -> SessionResult:
+        cwd = Path(spec.cwd)
+        assert spec.expected_spec == str(plan)
+        baseline = verify.rev_parse_head(cwd)
+        (cwd / "src.txt").write_bytes(b"cart model\n")
+        status = "awaiting-operator" if park else "built"
+        if park:
+            _write_parked_plan(plan, status, baseline=baseline)
+        else:
+            _write_plan(plan, status, baseline=baseline)
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status=status)
+        )
+        tree.next_view = _tree(layout).next_view
+        result = {"workflow": "auto-dev", "spec_file": str(plan), "status": status}
+        return SessionResult(status="completed", result_json=result)
+
+    return build
+
+
+def _has_unit_code(checkout: Path) -> bool:
+    """Whether the unit's change (`_builds_shared`) is in ``checkout``'s tree; the
+    template commits its own `src.txt`."""
+    return (checkout / "src.txt").read_bytes() == b"cart model\n"
+
+
+def _landed_marks(tree: FakeTicketTree, main: Path, monkeypatch) -> list[tuple[str, bool]]:
+    """Record, at every mark, the main checkout's HEAD and whether the unit's
+    code is in it."""
+    seen: list[tuple[str, bool]] = []
+    marking = tree.mark
+
+    def mark(ref, target, **kw):
+        seen.append((verify.rev_parse_head(main), _has_unit_code(main)))
+        return marking(ref, target, **kw)
+
+    monkeypatch.setattr(tree, "mark", mark)
+    return seen
+
+
+def _resume(engine: TicketsEngine, tree: FakeTicketTree) -> TicketsEngine:
+    """A fresh process over the run as its state file left it."""
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    return TicketsEngine(
+        paths=load_paths(engine.paths.project, want_tickets=True),
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+
+
+def _plan_status(plan: Path) -> str:
+    return status_of(parse_frontmatter(plan.read_text(encoding="utf-8")))
+
+
+def test_shared_store_marks_done_only_after_merge(project_v7_store_repo, monkeypatch):
+    """A shared store (T3) under worktree isolation: the unit's commit cannot carry
+    the plan, so the acceptance is latched in the COMMITTING save and made only
+    once the merge-back has put the code on the target — `mark 1.1 done` (reason
+    `accept`) on the main store's plan, the main checkout already holding the
+    code — then the latch is cleared. Ablation (performed): let
+    `_terminal_plan_write` mark a shared store in the window and the mark runs in
+    the mount before the merge, the main checkout without the code — this
+    FAILS."""
+    layout = project_v7_store_repo
+    main = layout.project
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    at_mark = _landed_marks(tree, main, monkeypatch)
+    engine, _ = _shared_engine(
+        layout,
+        tree,
+        isolation="worktree",
+        script=[_builds_shared(layout, tree, plan)],
+        max_stories=1,
+    )
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha and task.worktree_path
+    assert [(m.target, m.reason, m.expected_plan, m.outcome) for m in tree.marks] == [
+        ("done", "accept", plan, "written")
+    ]
+    assert at_mark == [(verify.rev_parse_head(main), True)]
+    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert [e["target"] for e in _kinds(engine, "ticket-mark-latched")] == ["done"]
+    assert _plan_status(plan) == "done"
+    assert git(main, "status", "--porcelain") == ""
+
+
+def test_shared_store_park_after_landing(project_v7_store_repo, monkeypatch):
+    """A park in a shared store follows the same placement: the commit window
+    writes nothing, the park's `blocked` reason is latched, and `mark 1.1 blocked
+    --blocked "awaiting operator: …"` (reason `park`) runs once the unit's commit
+    is on the target — never `done`. Ablation (performed): latch the park as
+    `ticket_done_pending` and the post-landing mark is an `accept` the table
+    refuses from `awaiting-operator` — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    at_mark = _landed_marks(tree, layout.project, monkeypatch)
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan, park=True)], max_stories=1
+    )
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    reason = "awaiting operator: " + "; ".join(PARK_ACTIONS)
+    assert [(m.target, m.reason, m.blocked) for m in tree.marks] == [("blocked", "park", reason)]
+    assert at_mark == [(task.commit_sha, True)]
+    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert _plan_status(plan) == "blocked"
+
+
+class _HostDied(BaseException):
+    """The host process vanishing: nothing after it runs, nothing after it is saved."""
+
+
+def test_crash_before_committing_save_has_no_latch(project_v7_store_repo, monkeypatch):
+    """The latch rides the COMMITTING save itself: it is set before that save is
+    made, so a host lost at the save leaves the unit pre-COMMITTING on disk with
+    no latch and no mark — nothing claims a mark for code that never committed.
+    Ablation (performed): latch after `_commit`'s save instead of before it and
+    the COMMITTING save carries no latch — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+    latched_at_save: list[bool] = []
+    real_save = engine._save
+
+    def save():
+        if latched_at_save:
+            return  # the host is gone: no later save reaches the disk
+        task = engine.state.tasks.get("1.1")
+        if task is not None and task.phase == Phase.COMMITTING:
+            latched_at_save.append(task.ticket_done_pending)
+            raise _HostDied
+        real_save()
+
+    monkeypatch.setattr(engine, "_save", save)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    assert latched_at_save == [True]
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase in (Phase.DEV_VERIFY, Phase.REVIEW_VERIFY) and not task.commit_sha
+    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert tree.marks == []
+    assert _plan_status(plan) == "built"
+
+
+def test_crash_after_landing_replays_done_on_resume(project_v7_store_repo, monkeypatch):
+    """A host lost after the unit's commit landed but before the mark leaves a
+    DONE unit with its latch on disk; the resume makes the mark before any pick
+    (`resume-ticket-mark`) and clears the latch. Ablation (performed): drop the
+    `_replay_post_landing_writes` call from `run()` and the resumed run finishes
+    with no mark — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+    marking = tree.mark
+
+    def host_dies(*a, **kw):
+        raise _HostDied
+
+    monkeypatch.setattr(tree, "mark", host_dies)
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert verify.rev_parse_head(layout.project) == task.commit_sha
+    assert task.ticket_done_pending is True
+    assert tree.marks == [] and _plan_status(plan) == "built"
+
+    monkeypatch.setattr(tree, "mark", marking)
+    resumed = _resume(engine, tree)
+    resumed.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert [(m.target, m.reason, m.outcome) for m in tree.marks] == [("done", "accept", "written")]
+    assert [e["target"] for e in _kinds(resumed, "resume-ticket-mark")] == ["done"]
+    assert task.ticket_done_pending is False
+    assert _plan_status(plan) == "done"
+
+
+def test_crash_after_mark_before_clear_is_idempotent(project_v7_store_repo, monkeypatch):
+    """A host lost after the mark was written but before the latch was cleared
+    replays the mark on resume, which the chokepoint answers as a no-op (`done`
+    is already there), and then clears the latch: one write, never a refusal.
+    Ablation (performed): drop the `done → done` no-op from
+    `check_plan_transition` and the replay is refused (`done` is final) — the
+    resume pauses and this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+    marking = tree.mark
+
+    def mark_then_host_dies(ref, target, **kw):
+        marking(ref, target, **kw)
+        raise _HostDied
+
+    monkeypatch.setattr(tree, "mark", mark_then_host_dies)
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.ticket_done_pending is True
+    assert _plan_status(plan) == "done"
+
+    monkeypatch.setattr(tree, "mark", marking)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert [m.outcome for m in tree.marks] == ["written", "noop"]
+    assert load_state(engine.run_dir).tasks["1.1"].ticket_done_pending is False
+    assert _plan_status(plan) == "done"
+
+
+def test_failed_post_landing_mark_pauses_ticket_tree(project_v7_store_repo, monkeypatch):
+    """A post-landing mark the chokepoint cannot make is a repair write, so it
+    raises rather than degrades: the run pauses at `ticket-tree` with the unit
+    committed, the latch kept on disk and the reason naming the owed mark; a
+    resume once the tree is fixed marks and clears it. Ablation (performed):
+    swallow the `TicketsError` in `_land_post_landing_writes` and the run
+    finishes with the plan unmarked — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    tree.faults["mark"] = TicketsLockBusy("the lock on the plan is held elsewhere")
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+
+    summary = engine.run()
+
+    state = load_state(engine.run_dir)
+    task = state.tasks["1.1"]
+    assert summary.paused and state.paused_stage == PAUSE_TICKET_TREE
+    assert state.paused_story_key == "1.1"
+    assert "marking 1.1 done failed after its code landed" in state.paused_reason
+    assert task.phase == Phase.DONE and task.commit_sha and task.ticket_done_pending
+    assert tree.marks == [] and _plan_status(plan) == "built"
+
+    del tree.faults["mark"]
+    _resume(engine, tree).run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
+    assert task.ticket_done_pending is False and _plan_status(plan) == "done"
+
+
+def test_crash_before_merge_back_replays_merge_then_marks(project_v7_store_repo, monkeypatch):
+    """Under worktree isolation a host lost after the unit committed in its mount
+    but before the merge-back leaves a DONE unit whose code is NOT on the target:
+    no mark may run until it is. The resume replays the merge-back first (the
+    latch is a write owed after landing, like a ledger carry), then marks.
+    Ablation (performed): drop the latch from `_replay_unlatched_ledger_carries`'
+    payload test and the unit is never merged or marked — this FAILS."""
+    layout = project_v7_store_repo
+    main = layout.project
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    at_mark = _landed_marks(tree, main, monkeypatch)
+    engine, _ = _shared_engine(
+        layout,
+        tree,
+        isolation="worktree",
+        script=[_builds_shared(layout, tree, plan)],
+        max_stories=1,
+    )
+    flow = engine._worktree_flow
+
+    def host_dies(*a, **kw):
+        raise _HostDied
+
+    monkeypatch.setattr(flow, "merge_local", host_dies)
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.ticket_done_pending is True
+    assert not _has_unit_code(main) and tree.marks == []
+
+    monkeypatch.undo()
+    _marking_tree(tree, plan, monkeypatch)
+    at_mark = _landed_marks(tree, main, monkeypatch)
+    _resume(engine, tree).run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
+    assert at_mark == [(verify.rev_parse_head(main), True)]
+    assert task.ticket_done_pending is False and _plan_status(plan) == "done"
+
+
+def test_shared_store_adoption_latches_instead_of_marking(project_v7_store_repo, monkeypatch):
+    """An adopted kept branch in a shared store is accepted after its merge-back,
+    like any commit: `_apply_adoption` latches `ticket_done_pending` and writes
+    nothing, and an adoption owing operator actions escalates unwritten. Ablation
+    (performed): drop the shared-store arm of the tickets `_apply_adoption` and
+    the base adoption marks `done` before the code lands — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, in_progress=(ticket_row("1.1", status="built"),))
+    engine, _ = _shared_engine(layout, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    task.spec_file = str(plan)
+    task.phase = Phase.COMMITTING
+    _write_plan(plan, "built")
+    _marking_tree(tree, plan, monkeypatch)
+
+    engine._apply_adoption(task)
+
+    assert tree.marks == [] and _plan_status(plan) == "built"
+    assert load_state(engine.run_dir).tasks["1.1"].ticket_done_pending is True
+
+    task.operator_actions = ["publish the DNS record"]
+    with pytest.raises(RunPaused):
+        engine._apply_adoption(task)
+    assert tree.marks == [] and task.phase == Phase.ESCALATED
