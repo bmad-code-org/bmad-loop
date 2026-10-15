@@ -375,7 +375,7 @@ def test_new_session_bypasses_nesting_guard(rec, monkeypatch, tmp_path):
         "24",
     ]
     # the no-op belt: create is verified by a has-session probe afterwards, then
-    # a user's `destroy-unattached on` is turned off on this session alone, or
+    # a user's `destroy-unattached on` is turned off for this session, or
     # its last client detaching would reap it (#951)
     assert [argv for argv, _ in rec.calls[1:]] == [
         ["psmux", "has-session", "-t", "=s"],

@@ -690,8 +690,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         # A user config with `destroy-unattached on` would tear this session
         # down when its last client detaches (psmux reaps only on that edge, not
-        # at a detached create as tmux does), so turn it off on the session
-        # itself; the user's global stays (#951). Best-effort: the session
+        # at a detached create as tmux does), so turn it off for this session
+        # (#951). psmux 3.4.0 keeps session options in the server's one store
+        # (psmux/psmux#803, fixed only on master), so there the write lands in
+        # the server-wide value: harmless while this server holds only this
+        # session, but a later runtime `set -g destroy-unattached on` (a config
+        # reload) re-arms the reap. A release with that fix keeps the session's
+        # own value and leaves the user's global alone. Best-effort: the session
         # exists, and raising here would leave it untagged (the caller's tag
         # write never runs), which a shared registry's cleanup refuses to own.
         # psmux reaps only on a last-client detach, so a failed write is said,
