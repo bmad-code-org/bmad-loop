@@ -640,16 +640,17 @@ def _refusals(engine: TicketsEngine) -> list[tuple[str, str, str]]:
 
 
 def test_salvage_review_timeout_marks_built_not_done(project_v7, monkeypatch):
-    """`review.on_timeout = "salvage-if-done"` converges a tickets review only on a
-    plan already at `built`: no write. A plan the dying review left `in-review`
-    needs an `in-review → built` write, which no plan-transition reason allows yet
-    (the table's `salvage` reason is pending), so the write is a typed, journaled
-    refusal before anything is written and salvage falls back to the timeout's
-    default routing — and the target it asked for is `built`, never `done`. Once
-    the `salvage` reason lands, this row flips to a `mark(reason="salvage")`.
-    Ablation (performed): drop the tickets
-    `_spec_status_write` override and the in-review plan is reset on disk to
-    `built` behind the chokepoint's back — the status assertion FAILS."""
+    """`review.on_timeout = "salvage-if-done"` converges a tickets review through
+    the chokepoint. A plan the dying review left `in-review` is marked `built` with
+    reason `salvage` against the bound plan, then gated; a plan already at `built`
+    salvages with no write; and salvage never writes `done` — that pair has no
+    plan-transition reason, so it is a typed, journaled refusal with nothing
+    written. Ablations (performed): drop the `("salvage", "built")` mapping and
+    the in-review arm is refused instead of marked — the marks assertion FAILS;
+    map `("salvage", "done")` too and the fake's transition table raises instead
+    of the journaled refusal — the `done` row FAILS; drop the tickets
+    `_spec_status_write` override and the plan is reset on disk with no `mark` —
+    the marks assertion FAILS."""
     tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-review"),))
     engine, _ = make_engine(project_v7, tree)
     task = _bound(engine, tree)
@@ -662,18 +663,28 @@ def test_salvage_review_timeout_marks_built_not_done(project_v7, monkeypatch):
         return verify.VerifyOutcome.retry("stub gate")
 
     monkeypatch.setattr(engine, "_review_verify_gate", gate)
+    _marking_tree(tree, plan, monkeypatch)
     timed_out = SessionResult(status="timeout")
 
     _write_plan(plan, "in-review")
-    assert engine._salvage_review_timeout(task, timed_out) is False
-    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "in-review"
-    assert _refusals(engine) == [("salvage", "built", "no-plan-reason")]
-    assert gated == [] and tree.marks == []
+    assert engine._salvage_review_timeout(task, timed_out) is False  # the stub gate
+    assert [(m.ref, m.target, m.reason, m.expected_plan, m.outcome) for m in tree.marks] == [
+        ("1.1", "built", "salvage", plan, "written")
+    ]
+    assert gated == ["built"] and _refusals(engine) == []
 
     _write_plan(plan, "built")
-    assert engine._salvage_review_timeout(task, timed_out) is False  # the stub gate
-    assert gated == ["built"]
-    assert tree.marks == [] and len(_refusals(engine)) == 1
+    assert engine._salvage_review_timeout(task, timed_out) is False
+    assert gated == ["built", "built"]
+    assert len(tree.marks) == 1 and _refusals(engine) == []
+
+    with pytest.raises(SpecStatusWriteRefused):
+        engine._spec_status_write(
+            task, plan, "done", "salvage", confine_root=engine.workspace.paths.project
+        )
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
+    assert _refusals(engine) == [("salvage", "done", "no-plan-reason")]
+    assert len(tree.marks) == 1
 
 
 def test_reconcile_generic_frontmatter_refused_in_tickets_mode(project_v7):

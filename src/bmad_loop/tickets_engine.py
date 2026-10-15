@@ -85,9 +85,9 @@ PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
     ("adoption", verify.PLAN_DONE): "accept",
     # a repair leg re-opens the plan in place
     ("repair", "in-progress"): "repair",
-    # ("salvage", "built") is refused (`no-plan-reason`) until the plan table gains
-    # its pending `salvage` reason ({in-progress, in-review} → built); salvage then
-    # maps here and never targets `done`.
+    # a timed-out review's verified work lands at `built` ({in-progress, in-review}
+    # → built); salvage never targets `done`, which stays the acceptance's
+    ("salvage", verify.PLAN_BUILT): "salvage",
 }
 """The engine status writes tickets mode makes, as ``(engine reason, target) →
 plan-transition reason``; every other pair is refused
@@ -676,10 +676,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
         Refused, with ``ticket-status-write-refused`` journaled and nothing
         written: a ``(reason, target)`` pair with no plan-transition reason — a
-        salvage reset (``in-review → built`` has none; salvage converges only on a
-        plan already at ``built``), a reconcile from the session's own prose, an
-        adoption park (the park conversion owns ``awaiting-operator``) — and a
-        write to anything but the bound plan. A mapped write that ``mark`` refuses
+        salvage to ``done`` (salvage lands a plan at ``built`` only), a reconcile
+        from the session's own prose, an adoption park (the park conversion owns
+        ``awaiting-operator``) — and a write to anything but the bound plan. A mapped write that ``mark`` refuses
         or cannot make raises its ``TicketsError``, as the base writer's faults
         do. Returns whether the plan changed."""
         del confine_root
