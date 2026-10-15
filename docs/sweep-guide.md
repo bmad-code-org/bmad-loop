@@ -84,6 +84,7 @@ A sweep runs on a v7 project the same way, with these differences:
 
 - **No sprint board.** A v7 sweep never reads `sprint-status.yaml`, never seeds one into a unit worktree, and its review prompts say nothing about one. A stray board at the old path is ignored.
 - **Bundle plans.** Each bundle hands `bmad-build-auto` its free-form intent. The skill writes `plan-<slug>.md` in the initiative folder (or `output_folder`) and is asked to lead the slug with the bundle key, such as `dw-fix-things`. The orchestrator still finds the plan by scanning that folder; the ledger there never counts as a result.
+- **Ledger appends.** Attended `bmad-build` on v7 appends flat `- source_plan: <plan>` blocks; the ledger reads them like `- source_spec:` blocks. A tickets run also harvests a plan's `deferred:` findings when the plan reaches `built`.
 - **`built` closes a bundle.** build-auto finishes a plan at `built`. The dev gate, the ledger close, the review gate and the review reclose all accept `built` or `done`. A bundle is not a ticket, so nothing marks its plan `done`: it stays `built`.
 - **No retro ingest.** v7 retrospective action items are prose in the epic retrospective, not records. A fresh sweep files none and journals `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
 - **Store layout.** The store-topology check judges a v7 sweep as a tickets run, because its ledger lives in the ticket store. The sweep records the store's topology at its start, and a resume refuses a store that changed since, or whose initiative folder is gone.

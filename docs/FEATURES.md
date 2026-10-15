@@ -25,8 +25,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Board writes never move a row backward. The only exception is done → awaiting-operator, and only when the caller explicitly opts in.
   - Board updates are serialized across processes, so two concurrent bmad-loop processes cannot interleave an advance.
   - A session completes only on a hook Stop event or on window death, never because of what the model writes in its reply.
+  - In tickets mode there is no board: bmad-loop is the only writer of a ticket plan's status during a run, through `tickets.py mark`, and the plan reaches `done` only after verify and review.
 - **Config:** `bmad-loop run --epic N`, `bmad-loop run --story KEY`, `bmad-loop run --max-stories N`, `bmad-loop run --dry-run`; `[limits] max_dev_attempts`
-- **Tested by:** `tests/test_engine.py`, `tests/test_statemachine.py`, `tests/test_sprintstatus_advance.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_statemachine.py`, `tests/test_sprintstatus_advance.py`, `tests/test_tickets_engine.py`
 - **Docs:** [CLI reference: run](reference/cli.md#run), [Configuration: [limits]](reference/configuration.md#limits), [Run state reference](reference/run-state.md)
 
 ### Stories mode
@@ -42,6 +43,22 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Config:** `[stories] source`, `[stories] spec_folder`; `bmad-loop run --spec FOLDER`, `bmad-loop run --dry-run --spec FOLDER`
 - **Tested by:** `tests/test_stories.py`, `tests/test_stories_engine.py`, `tests/test_stories_e2e.py`, `tests/test_install.py`
 - **Docs:** [Configuration: [stories]](reference/configuration.md#stories), [CLI reference: run](reference/cli.md#run), [Recovering paused runs](escalations-guide.md#resolving-an-escalation)
+
+### Ticket-tree mode
+
+- **Stability:** experimental
+- **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and marks a verified ticket `done` itself.
+- **Properties:**
+  - A run is pinned to `[core] active_initiative` at start; a changed initiative pauses the run at `ticket-tree` instead of building another initiative's ticket.
+  - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
+  - bmad-loop writes a plan's `status` and `blocked_*` only through `tickets.py mark`, under a lock, read back afterwards and checked against one plan transition table; it never writes `dropped` or an epic file.
+  - Tickets this run did not start are never dispatched or marked.
+  - A store tracked in the checkout is marked inside the unit's commit; a shared store's mark is latched and made after the code lands, and a store with its own repository gets a plan-only commit.
+  - `run` refuses a tracker store and the multi-repo workspace layout before creating a run directory; resume and resolve refuse a store whose layout changed.
+  - When the run finishes an epic, it runs the retrospective and pauses at `epic-boundary` until a person closes the epic; a `rejected` verdict blocks later epics.
+- **Config:** `[stories] source = "tickets"`, `[core] active_initiative`, `[tickets] mark_done`, `[tickets] thorough_review`, `[gates] retrospective`; `bmad-loop run --epic ID|SLUG`, `--story REF`, `--dry-run`; `bmad-loop confirm <ref>`
+- **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_tickets_e2e.py`
+- **Docs:** [Ticket-tree mode guide](tickets-guide.md), [Setup: BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup), [Configuration: [tickets]](reference/configuration.md#tickets), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [TUI: tickets mode](tui-guide.md#tickets-mode)
 
 ### Trust-nothing verification
 
@@ -112,9 +129,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `--abandon` (in-progress) closes an escalated replay run unmerged, keeping its branch and parking dirty work on a preserve ref.
   - Re-arming resets the story to `pending` with fresh dev-attempt and review-cycle budgets.
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
+  - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields; a refused move puts the plan back byte for byte.
 - **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`
-- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [resolve CLI reference](reference/cli.md#resolve)
+- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
 ### Human-only actions
 
@@ -174,9 +192,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `done_checkpoint: true` pauses after the story commits. It is skipped for the last story to dispatch, at `--max-stories`, or when a graceful stop is pending.
   - In tickets mode, an entry's `plan_checkpoint` follows the BMAD v7 contract. A refined ticket pauses before dispatch, and resuming approves its story file. An unrefined ticket pauses after a `Halt after planning.` leg, and resuming dispatches it again on the uncommitted plan. `done_checkpoint` pauses after the ticket commits, with the same skips as stories mode.
   - `[gates] on_escalation` is reserved. It is parsed but has no effect, and CRITICAL escalations always pause whatever its value.
-- **Config:** `[gates] mode`, `[gates] on_escalation` (reserved); stories.yaml per-entry `spec_checkpoint` / `done_checkpoint`; `bmad-loop resume <run_id>`
+- **Config:** `[gates] mode`, `[gates] on_escalation` (reserved); stories.yaml per-entry `spec_checkpoint` / `done_checkpoint`; ticket-entry `plan_checkpoint` / `done_checkpoint`; `bmad-loop resume <run_id>`
 - **Tested by:** `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_checkpoints.py`, `tests/test_tickets_engine.py`, `tests/test_policy.py`, `tests/test_settings_schema.py`
-- **Docs:** [Configuration: [gates]](reference/configuration.md#gates), [Where a pause shows up](escalations-guide.md#where-a-pause-shows-up), [Reviewing a paused run in the TUI](tui-guide.md#reviewing-a-paused-run-p), [bmad-loop resume](reference/cli.md#resume)
+- **Docs:** [Configuration: [gates]](reference/configuration.md#gates), [Where a pause shows up](escalations-guide.md#where-a-pause-shows-up), [Reviewing a paused run in the TUI](tui-guide.md#reviewing-a-paused-run-p), [Tickets checkpoints](tickets-guide.md#checkpoints), [bmad-loop resume](reference/cli.md#resume)
 
 ### Retrospective handling
 
@@ -190,8 +208,8 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
   - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-ticket. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
-- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`
-- **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
+- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`
+- **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Tickets guide: retrospective and closure](tickets-guide.md#epic-retrospective-and-closure), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
 
 ## Deferred work
 
@@ -205,9 +223,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `--archive` moves dated closed entries to `deferred-work-archive.md`, leaves an id-preserving `status: done` stub, and refuses while any run may be live.
   - Legacy (non-`DW-<n>`) entries are migrated automatically at a sweep's start; a rewrite that drops a `gate:` token or changes a status fails validation.
   - `[sweep] auto` starts a child sweep per epic or at run end, at most once per trigger; a failed child never fails the parent run.
+  - On BMAD v7 a sweep reads no sprint board, keeps its ledger and bundle plans in the initiative folder, closes bundles at `built`, and is pinned to the initiative it started on.
 - **Config:** `[sweep] auto`, `[sweep] max_bundles`, `[sweep] repeat`, `[sweep] max_cycles`, `[sweep] max_triage_attempts`; `bmad-loop sweep --dry-run`, `--only DW-ID,...`, `--min-severity`, `--max-bundles`, `--repeat`/`--no-repeat`, `--max-cycles`, `--no-prompt`, `--decisions-only`, `--archive`, `--before DATE`
 - **Tested by:** `tests/test_sweep.py`, `tests/test_cli.py`, `tests/test_deferredwork.py`, `tests/test_engine.py`
-- **Docs:** [Sweep guide](sweep-guide.md), [Repeat mode](sweep-guide.md#repeat-mode), [Legacy-ledger migration](sweep-guide.md#legacy-ledger-migration), [CLI: sweep](reference/cli.md#sweep), [Configuration: [sweep]](reference/configuration.md#sweep)
+- **Docs:** [Sweep guide](sweep-guide.md), [Repeat mode](sweep-guide.md#repeat-mode), [Legacy-ledger migration](sweep-guide.md#legacy-ledger-migration), [Sweeps on BMAD v7](sweep-guide.md#sweeps-on-bmad-v7), [CLI: sweep](reference/cli.md#sweep), [Configuration: [sweep]](reference/configuration.md#sweep)
 
 ### Deferred-work decisions
 
@@ -262,6 +281,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Off by default: with `isolation = "none"` work happens in place on the checked-out branch; only `none` and `worktree` are accepted.
   - Each unit gets a `bmad-loop/<run-id>/<story>` branch (`bmad-loop/<run-id>` with `branch_per = "run"`), mounted under `.bmad-loop/runs/<run-id>/worktrees/`.
   - A gitignored sprint board is seeded into the unit, and only the story's own status advance is carried back to the main board.
+  - A ticket store the code checkout does not track is shared: the unit reads and marks the project's store in place, never a copy.
   - A finished unit merges into the target branch with `ff`, `merge` or `squash`; on success the worktree is removed and, by default, the branch deleted.
   - A deferred unit's diff is saved to `.bmad-loop/runs/<run-id>/failed/<unit>/changes.patch`; its worktree and branch stay with `keep_failed`. An escalated unit's worktree stays mounted.
   - A failed merge-back keeps the unit's branch and worktree and escalates; if the main checkout is off the target branch, the run pauses (`merge-target-not-checked-out`).
@@ -420,9 +440,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - The dashboard has no private channel to the engine. It reads the files a run writes, so runs started from a shell show up exactly like TUI-started runs.
   - The settings editor checks edits with the same policy parser a run uses, and will not save an invalid value.
   - Resized pane sizes are saved per project under `[tui]` in policy.toml and restored on the next launch.
+  - In tickets mode the middle pane is a tickets board, read off the UI thread only when the initiative's files change, and **Request replan** goes through `tickets.py mark`.
 - **Config:** `bmad-loop tui --low-frame-rate`, `[tui] low_frame_rate`
 - **Tested by:** `tests/test_tui_app.py`, `tests/test_tui_launch.py`, `tests/test_tui_settings.py`, `tests/test_tui_data.py`
-- **Docs:** [TUI guide](tui-guide.md), [Observer/launcher architecture](tui-guide.md#architecture-observerlauncher-never-the-engine), [CLI: tui](reference/cli.md#tui)
+- **Docs:** [TUI guide](tui-guide.md), [Observer/launcher architecture](tui-guide.md#architecture-observerlauncher-never-the-engine), [TUI: tickets mode](tui-guide.md#tickets-mode), [CLI: tui](reference/cli.md#tui)
 
 ### Session and disk cleanup
 
@@ -447,10 +468,11 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `init` appends only the `.gitignore` lines that are missing, so running it again changes nothing.
   - `validate` exits 1 only when a finding has severity `problem`. Warnings never change the exit code.
   - Every finding carries a stable check id taken from a fixed, documented registry.
-  - `validate` runs no project-controlled commands unless `--render-probe` or `--probes` is given.
+  - `validate` runs no project-controlled commands unless `--render-probe` or `--probes` is given. The one exception is tickets mode, which runs `tickets.py next` while an unlanded ledger entry declares a `gate:`.
+  - On a BMAD v7 project `validate` reports the era, the active initiative, the ticket-store layout and the `tickets.*` preflight.
 - **Config:** `bmad-loop init --cli PROFILE --no-skills --force-skills`; `bmad-loop validate --spec FOLDER --render-probe --probes --json`
 - **Tested by:** `tests/test_cli.py`, `tests/test_install.py`
-- **Docs:** [Setup guide](setup-guide.md), [CLI: init](reference/cli.md#init), [CLI: validate](reference/cli.md#validate), [validate check ids](reference/cli.md#validate-checks)
+- **Docs:** [Setup guide](setup-guide.md), [Ticket-tree prerequisites](tickets-guide.md#prerequisites), [CLI: init](reference/cli.md#init), [CLI: validate](reference/cli.md#validate), [validate check ids](reference/cli.md#validate-checks)
 
 ### Diagnostics and JSON output
 
@@ -459,6 +481,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Properties:**
   - In `--json` mode stdout holds exactly one JSON object, or nothing when `--out` redirects it. On an error stdout stays empty and the exit code is nonzero.
   - Every document carries an integer `schema_version` owned by its command. Breaking changes bump it; new fields are only ever added.
+  - Tickets mode added fields without a bump: `validate --json` gains `era`, `initiative` and `ticket_store`, and `status --json` gains a run-level `tickets` and a per-task `ticket` object, null outside tickets runs.
   - Exit codes are limited to 0 (OK), 1 (FAILURE), 2 (USAGE) and 130 (INTERRUPTED).
   - `diagnose` defaults to the latest run. Its dump contains no code, specs, prompts, paths or PII; story keys and branches are pseudonymized.
   - If the final leak check finds PII or a secret, `diagnose` emits no dump and exits 1.

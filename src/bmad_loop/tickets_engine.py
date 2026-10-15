@@ -55,7 +55,7 @@ and the orchestrator alone owns ``done``. The unit's commit carries
 
 Where the ticket's terminal mark lands depends on the run's store topology. A
 store tracked in the code checkout (T1) is marked inside the commit window, so the
-plan rides the unit's commit. A shared store (T2–T4: ``ProjectPaths.shared_store``)
+plan rides the unit's commit. A shared store (T2–T4, T6: ``ProjectPaths.shared_store``)
 cannot ride it, so the mark is latched on the task in the COMMITTING save
 (``ticket_done_pending`` / ``ticket_park_pending``; ``ticket_commit_pending``
 when ``mark_done = "never"`` leaves only the ``built`` plan to commit in a store
@@ -1588,7 +1588,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         window, for a store tracked inside the code checkout (T1): the marked plan
         rides the unit's own squash and reaches the target branch only with the
         code it describes — never before: ``next`` unblocks a done ticket's
-        dependents. A shared store (T2–T4) is written after the code lands
+        dependents. A shared store (T2–T4, T6) is written after the code lands
         instead (:meth:`_latch_post_landing_writes`), so nothing is written here.
 
         * A park (``task.operator_actions`` latched): the session's
@@ -1671,7 +1671,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     # ------------------------------------------- shared store: after landing
 
     def _latch_post_landing_writes(self, task: StoryTask) -> None:
-        """For a shared store (T2–T4: no code checkout carries the plan, so the
+        """For a shared store (T2–T4, T6: no code checkout carries the plan, so the
         unit's commit cannot), latch the ticket's terminal mark on ``task`` in the
         COMMITTING save — the same choice :meth:`_terminal_plan_write` makes for
         T1: a park's ``blocked`` reason (``ticket_park_pending``), else ``done``

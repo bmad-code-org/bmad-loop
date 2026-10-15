@@ -9,101 +9,62 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Resolve BMAD v7 `[core] output_folder` / `active_initiative` config. A project with
-  `_bmad/method/scripts/tickets.py` and no v6 artifact keys validates and resolves its
-  artifacts to the active initiative folder. New `bmad-config.initiative-unset` and
-  `bmad-config.v6-keys-ignored` validate warnings.
-- Register the `tickets` work source (`[stories] source = "tickets"`, the BMAD v7 ticket
-  tree). `validate` checks a tickets project: the `tickets.*` preflight (script, config
-  reader, uv, active initiative, repo store; tracker stores are refused) and the dev
-  primitive's ticket route (`skills.tickets-dispatch*`). `validate --probes` also probes
-  the project's `tickets.py`.
+- Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
+  (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
+  build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
+  (`[tickets] mark_done`, `thorough_review`). See `docs/tickets-guide.md`.
 - Support BMAD-METHOD v7 as of upstream main `8f0d50e1` (`6.13.0-next`; v7 is not yet
-  tagged). The tickets contract tests run against `tickets.py` vendored at that commit.
-- Add the tickets work source: dispatch `bmad-build-auto ticket <ref>` from the v7 ticket
-  tree (tracked in-repo store). The run picks in initiative build order, pauses on hitl
-  and unrefined tickets, verifies each plan at `built`, and marks it `done` inside the
-  unit's own commit (`[tickets] mark_done = "auto"`). A worktree unit's branch is
-  `bmad-loop/<run>/<epic-slug>/<ref>`. `run` warns on `branch_per = "run"`
-  (`tickets.branch-per-run`).
-- Add plan and done checkpoints in tickets mode. A refined `plan_checkpoint` ticket
-  pauses before dispatch, and resuming approves its story file. An unrefined one runs a
-  `Halt after planning.` leg, pauses for plan review, then dispatches again on the
-  uncommitted plan. `done_checkpoint` pauses after the ticket commits, except for the
-  last ticket.
-- Add the tickets dirty-initiative pause: a run pauses at `ticket-tree` before opening a
-  ticket while the initiative folder holds uncommitted changes the run does not own.
-- Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to every tickets unit commit.
-- Add parking in tickets mode: a session's `awaiting-operator` park commits with its
-  plan marked `blocked` ("awaiting operator: <actions>"), never `done`. A review
-  demotion parks the same way under `[operator] on_review_demotion = "park"`. The park
-  record carries `source` and `ref`.
-- Add `bmad-loop confirm <ref>` for a tickets park: it marks the plan `done` (`built`
-  under `[tickets] mark_done = "never"`) through `tickets.py mark`, clearing its
-  `blocked_*` fields.
-- Classify the ticket-store topology in tickets mode: a store tracked in the code
-  checkout (T1), an ignored folder (T2), its own nested or external repository (T3/T4)
-  or an outside folder. `validate` reports it (`tickets.store-topology`, the additive
-  `ticket_store` field) and refuses partial tracking, a tracked store outside `repo_root`,
-  an untracked unignored store and a workspace project (`tickets.tree-untracked`,
-  `tickets.workspace-unsupported`). Runs record it; resume, resolve and the TUI refuse a store that changed. Under worktree
-  isolation a shared store is read in place: the mount's
-  `config.user.toml` is redirected to it (`tickets.own-repo-isolation` when it cannot
-  be), and no seed, carry or publication touches it.
-- Mark a shared ticket store's plan after the code lands: a store no code checkout
-  carries (T2–T4) gets its `done` or park `blocked` mark after `finalize_commit` in
-  place, or after the merge-back under worktree isolation, never inside the unit's
-  commit. The mark is latched in the commit's first save and replayed on resume; a
-  failed mark pauses at `ticket-tree`.
-- Support a ticket store in its own git repository, nested in the code checkout or
-  outside it: each marked plan (and the ledger the unit wrote) gets a plan-only commit
-  there with `Bmad-Code-*` trailers, and so does an epic's retrospective document. A
-  failed store commit is journaled and shows in `status`; the run goes on, retries it
-  before finishing and pauses at `ticket-tree` if it is still owed. A failed
-  retrospective commit pauses at the epic boundary before the closure is recorded, and
-  the resume commits it. A store inside a renamed project moves with it. Tickets runs
-  now drive every classified store layout.
-- Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
-  `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
-  A plan restore is confined to the ticket store root.
-- Add `resolve` for tickets runs: the re-arm moves the ticket plan through `tickets.py
-mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm restores
-  the plan's exact bytes. An intent-gap `<plan>.patch` is moved to the run's `restore/`
-  directory, and a restore latches that copy. The resolve context gains a `tickets` block.
-- Add the epic retrospective and closure pause in tickets mode. When this run finishes an
-  epic, `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>` and
-  commits only its document. The run then records the verdict and pauses at
-  `epic-boundary` until a person closes the epic with bmad-ticket. A `rejected` verdict
-  pauses every later pick while the epic stays open; any other pauses once. A
-  retrospective refused for a dirty tree, a git fault or a stop request records no
-  closure, so the resume runs it.
-- Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
-  each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
-  the first pause a run would reach, group counts and tree problems. Marks nothing.
-- Add the `[tickets]` policy section: `mark_done` (`auto` | `never`) and
-  `thorough_review` (`never` | `high-risk` | `always`).
-- Add two ticket-plan transitions: a session-declared `awaiting-operator` park converts
-  to an operator-park `blocked`, and a `salvage` write lands a timed-out review's plan at
-  `built`, never `done`.
-- Harvest a v7 ticket plan's `deferred:` findings into the initiative folder's
-  `deferred-work.md` at `built` (or `done`). Entries keep the `source_spec:` field and
-  name the plan by its initiative-relative path. The ledger parser accepts the v7
-  attended `bmad-build`'s flat `- source_plan:` blocks.
-- Add ticket-ref gates in tickets mode: a ledger `gate:` names a ticket (`1.2`), an epic
-  by id (`1`) or folder (`epic-cart`). `validate` and the run
-  refuse the gated ticket. A v6 story-key token fails `deferred.hard-gate` and pauses the
-  run at `story-gate` until it is rewritten.
-- Run deferred-work sweeps on BMAD v7 initiatives. A v7 sweep never reads a sprint board,
-  its bundles write a `plan-<slug>.md` in the initiative folder and close their entries
-  at `built` (or `done`), and retro action-item ingest journals
-  `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
-- Pin a v7 sweep to its initiative: a resume refuses a switched `active_initiative`, and
-  pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`.
-  `decisions` and the TUI refuse an answer once another initiative is active than the
-  one its decision was listed from. A bundle plan in a ticket store with its own
-  repository is committed there once the code lands.
-- Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
-  `tickets`); `schema_version` stays 1.
+  tagged). The contract tests run against `tickets.py` vendored at that commit.
+- Resolve BMAD v7 config (`[core] output_folder`, `active_initiative`): a project with
+  `_bmad/method/scripts/tickets.py` resolves its artifacts to the active initiative
+  folder. New validate warnings `bmad-config.initiative-unset` and
+  `bmad-config.v6-keys-ignored`.
+- Validate tickets projects: the `tickets.*` preflight (script, config reader, uv, active
+  initiative, repo store, store topology; tracker stores and the multi-repo workspace
+  layout are refused), the dev skill's ticket route (`skills.tickets-dispatch*`), and
+  `tickets.py` under `--probes`. `validate --json` gains `initiative`, `era` and
+  `ticket_store`; `mode` gains `tickets`.
+- Pause tickets runs for a person: hitl tickets (`ticket-hitl`), tickets needing
+  refinement (`ticket-refine`), tree faults, foreign in-progress rows and a dirty
+  initiative folder (`ticket-tree`), plan and done checkpoints, and epic closure.
+- Follow upstream checkpoints: a refined `plan_checkpoint` waits for story-file approval
+  before dispatch, an unrefined one runs a `Halt after planning.` leg and pauses for plan
+  review, and `done_checkpoint` pauses after the ticket commits.
+- Run the epic retrospective (`/bmad-retrospective -H <epic-slug>`) when a run finishes
+  an epic, record its verdict, and pause at `epic-boundary` until a person closes the
+  epic with bmad-ticket. A `rejected` verdict blocks every later pick while the epic
+  stays open. A retrospective refused for a dirty tree, a git fault or a stop request
+  records no closure, so the resume runs it.
+- Park a ticket as `blocked` ("awaiting operator: …"), never `done`. `bmad-loop confirm
+  <ref>` and `resolve` re-arm it through `tickets.py mark`; a code rollback re-arms its
+  plan, and a timed-out review lands it at `built`.
+- Drive every repo-store layout: a store tracked in the code checkout is marked inside
+  the unit's commit; an ignored folder or a store in its own repository is marked after
+  the code lands (latched and replayed on resume), and a store repository gets plan-only
+  commits with `Bmad-Code-*` trailers. A failed store commit is retried before the run
+  finishes and pauses at `ticket-tree` if still owed; a failed retrospective commit
+  pauses at the epic boundary before its closure, and the resume commits it. A store
+  inside a renamed project moves with it.
+- Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to tickets unit commits, and name worktree
+  unit branches `bmad-loop/<run>/<epic-slug>/<ref>`.
+- Add tickets mode to `run --dry-run` (build order, dispatches, the first pause) and the
+  `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
+- Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,
+  accept v7 `source_plan:` ledger blocks, and gate tickets by ledger `gate:` refs (a
+  ticket, an epic id or folder). A v6 story-key gate pauses at
+  `story-gate` until it is rewritten.
+- Run deferred-work sweeps on v7 initiatives: no sprint board, bundle plans in the
+  initiative folder closed at `built`, the sweep pinned to its initiative, and
+  pre-answers kept per initiative in `.bmad-loop/decisions-<initiative>.json`. An answer
+  is refused once another initiative is active than the one its decision was listed
+  from.
+- Show tickets in `status` (a board grouped by epic) and `status --json` (`ticket` and
+  `tickets` objects; schema 1), and in the TUI: a tickets board, `hitl`/`refine`/`tree`
+  badges, pause-reason and epic-closure viewers, a start-run preview, and **Request
+  replan** through `tickets.py mark`.
+- Ship a `bmod.toml` module record (`bmod-bmad-loop`) so BMAD v7 `bmad setup` can
+  discover, install and update-check bmad-loop; each bundled skill carries its own
+  `[skill]` record.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 - Add `bmad-loop plugins [list|enable|accept|revoke] [name]`: list plugins with origin,
@@ -138,33 +99,12 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
 - Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
   previously fixed at 30 minutes (#857).
-- Ship a `bmod.toml` module record (`bmod-bmad-loop`) so BMAD v7 `bmad setup` can
-  discover, install and update-check bmad-loop. Each bundled skill carries a `[skill]`
-  `bmod.toml`, `bmad-loop init` lays the record down, and `npx skills add
-bmad-code-org/bmad-loop` lists it.
-- Add `run --epic` / `--story` selectors in tickets mode: `--epic` takes an epic id,
-  slug or `epic-<slug>`, and `--story` a ticket ref resolved through `tickets.py find`.
-  An unknown, ambiguous or unstartable selection exits 1.
-- Add the tickets board to `status`: the initiative's tickets grouped by epic in build
-  order, with plan status, flags and the run's phase. A tree it cannot read is printed.
-- Add `ticket` (per task) and `tickets` (run) objects to `status --json`, null outside
-  tickets runs. Additive: the schema version stays 1.
-- Add tickets-mode pause review to the TUI: `hitl`, `refine` and `tree` badges, a
-  pause-reason viewer for those stages, and an epic-closure viewer that shows the
-  retrospective verdict and path. **Request replan** on a ticket plan marks it `draft`
-  through `tickets.py mark` instead of editing its frontmatter.
-- Add the tickets board to the TUI: a tickets run's initiative, one row per ticket with
-  its plan state and hitl/plan/done flags, read off the UI thread and only when the
-  initiative's files change. A tree it cannot read shows why.
-- Add tickets mode to the TUI start-run modal: a preview of the active initiative, and
-  an epic field that takes an epic id or slug in tickets mode.
 
 ### Changed
 
 - Refuse release versions `bmad setup` cannot order: `scripts/sync_version.py` accepts
   SemVer `X.Y.Z` with an optional `-` pre-release only (no `.devN`, no `-dev`).
 - Make the setup greeting era-neutral: it names the BMAD v6 and v7 requirements.
-
 - Refuse to resume a story run whose recorded work source this bmad-loop does not
   know (a run started by a newer version) instead of resuming it as a sprint run.
 - Start bmad-loop's psmux servers with `PSMUX_NO_WARM=1`: their warm pool and hidden

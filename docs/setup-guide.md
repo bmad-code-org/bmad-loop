@@ -81,6 +81,9 @@ check compares the record's version with the one on bmad-loop's `main` branch.
 `bmad setup` installs skills only, so `/bmad-loop-setup` still installs the orchestrator
 tool, as in the v6 route below.
 
+To drive the initiative's ticket tree, set `[stories] source = "tickets"` and follow the
+[ticket-tree mode guide](tickets-guide.md#prerequisites).
+
 ## Installed via the BMAD-method installer? (recommended on BMAD v6)
 
 The BMAD-method installer copies the three `bmad-loop-*` skill directories

@@ -139,8 +139,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "tickets.initiative-unset",
         "tickets.initiative-missing",
         # the ticket-store topology (ticketstore.classify_store): the classified
-        # layout, or a store tickets runs refuse (incl. layouts marked outside the
-        # commit window, which land with a later release layer)
+        # layout, or a store tickets runs refuse (a T1 store outside the project
+        # under worktree isolation)
         "tickets.store-topology",
         # the initiative folder only partly tracked, or untracked but not gitignored
         "tickets.tree-untracked",

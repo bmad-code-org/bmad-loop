@@ -41,27 +41,27 @@ Two orthogonal seams:
 - **Which CLI** (adapter axis): `adapters/base.py` `CodingCLIAdapter`, TOML profiles in `src/bmad_loop/data/profiles/`, user overlay `.bmad-loop/profiles/*.toml`. A new coding CLI is a TOML profile plus `bmad-loop probe-adapter`, not Python. A CLI needing its own adapter **class** registers one in `adapters/registry.py` (`register_adapter`, `bmad_loop.adapters` entry point), selected by the profile's `adapter` field.
 - **Which transport** (mux axis): `adapters/multiplexer.py` `TerminalMultiplexer` registry. Selection: `BMAD_LOOP_MUX_BACKEND` env > policy `[mux] backend` > platform default > first available match > fallback — full 5-step precedence in [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
-| Module                                     | Role                                                                                        |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `cli.py`                                   | argparse CLI, all `cmd_*` handlers; injectable `engine_cls`/`make_adapters` seams           |
-| `engine.py`                                | `Engine` — the deterministic control loop                                                   |
-| `worktree_flow.py`, `recovery_flow.py`     | engine collaborators: worktree isolation/merge; rollback + recovery-ref preservation        |
-| `sweep.py`, `stories_engine.py`            | deferred-work sweep run type; stories.yaml mode                                             |
-| `statemachine.py`, `model.py`, `policy.py` | pure typed core (pyright-strict): transitions, data model, policy.toml → frozen dataclasses |
-| `verify.py`                                | deterministic post-session verification; `_run_git` chokepoint                              |
-| `machine.py`, `documents.py`               | `--json` contract; read-model projections                                                   |
-| `adapters/`                                | coding-CLI adapters + mux backends (see seams above)                                        |
-| `tui/`                                     | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
-| `plugins/`                                 | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
+| Module                                               | Role                                                                                        |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `cli.py`                                             | argparse CLI, all `cmd_*` handlers; injectable `engine_cls`/`make_adapters` seams           |
+| `engine.py`                                          | `Engine` — the deterministic control loop                                                   |
+| `worktree_flow.py`, `recovery_flow.py`               | engine collaborators: worktree isolation/merge; rollback + recovery-ref preservation        |
+| `sweep.py`, `stories_engine.py`, `tickets_engine.py` | deferred-work sweep run type; stories.yaml mode; BMAD v7 ticket-tree mode                   |
+| `statemachine.py`, `model.py`, `policy.py`           | pure typed core (pyright-strict): transitions, data model, policy.toml → frozen dataclasses |
+| `verify.py`                                          | deterministic post-session verification; `_run_git` chokepoint                              |
+| `machine.py`, `documents.py`                         | `--json` contract; read-model projections                                                   |
+| `adapters/`                                          | coding-CLI adapters + mux backends (see seams above)                                        |
+| `tui/`                                               | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
+| `plugins/`                                           | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
 
-29 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
+43 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
 ## Testing
 
 - Flat `tests/` mirrors src modules by name; `asyncio_mode=auto`; no custom markers.
 - Use the conftest sandbox fixtures (`project` copies a session-scoped template repo per test — never hand-roll temp repos or touch the template). Mock adapter drives engine tests without tmux or an LLM; caveat: it exercises the generic adapter path only.
 - Pin the backend with the `force_tmux_backend` fixture when asserting tmux argv through the mux seam.
-- E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), and `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens). Never "fix" these to call real CLIs.
+- E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens), and `tests/test_tickets_e2e.py` (real tmux on Linux, the vendored v7 `tickets.py` + a scripted fake build-auto, zero tokens). Never "fix" these to call real CLIs.
 - Ablation rule: for any test asserting "X is refused/absent", delete the gating code and confirm the test FAILS before trusting it — negative assertions pass for every reason a value could be absent.
 - New behavior lands with a test at the lowest layer that can catch its regression: pure-core unit > seam > sandbox E2E.
 - Windows CI shards each leg with `--ci-shard I/N` (digest-assigned function families and xdist groups; `tests/perf_report.py`) and its `test (windows, …)` aggregator fails on any test run in no shard or two. Never select CI tests by hand-kept lists; the psmux gate stays a separate serial job.
@@ -96,6 +96,7 @@ These rules apply to code you are already touching — do not initiate refactors
 | [docs/reference/cli.md](docs/reference/cli.md)                     | a subcommand, flag, `--json` shape, or exit code        |
 | [docs/reference/run-state.md](docs/reference/run-state.md)         | run/task dir layout, sessions, stop, cleanup scope      |
 | [docs/sweep-guide.md](docs/sweep-guide.md)                         | running sweeps, answering decisions, ledger recovery    |
+| [docs/tickets-guide.md](docs/tickets-guide.md)                     | BMAD v7 tickets mode: pauses, store layouts, marks      |
 | [docs/escalations-guide.md](docs/escalations-guide.md)             | recovering a paused or escalated run (`resolve`)        |
 | [docs/tui-guide.md](docs/tui-guide.md)                             | TUI work                                                |
 | [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md) | adding/finalizing a coding-CLI profile or adapter class |

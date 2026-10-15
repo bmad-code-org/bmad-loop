@@ -83,9 +83,20 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
 
-A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals`, `ticket_epic_closures`, `ticket_epic_closure_resumed` and `ticket_epic_closure_acked` hold the epic selector, the refs whose story file an operator approved (resuming the pick's `plan-checkpoint` pause records the ref), each finished epic's closure (its retrospective `verdict`, or `unknown`), the epics whose closure pause a resume answered (a closure recorded without one pauses again), and the epics whose one closure pause was resumed past. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree`. `run` resolves a tickets run's selectors before it starts: `ticket_epic_filter` holds the `--epic` epic slug, `story_filter` the `--story` ticket ref, and `epic_filter` stays null.
+A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals`, `ticket_epic_closures`, `ticket_epic_closure_resumed` and `ticket_epic_closure_acked` hold the epic selector, the refs whose story file an operator approved (resuming the pick's `plan-checkpoint` pause records the ref), each finished epic's closure (its retrospective `verdict`, or `unknown`), the epics whose closure pause a resume answered (a closure recorded without one pauses again), and the epics whose one closure pause was resumed past. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree` (causes below). `run` resolves a tickets run's selectors before it starts: `ticket_epic_filter` holds the `--epic` epic slug, `story_filter` the `--story` ticket ref, and `epic_filter` stays null.
 
 A v7 sweep records `initiative` and `initiative_folder` too, and its resume, `resolve` and the dashboard's re-arm refuse while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on.
+
+A pick pause journals `ticket-pick-halt` with its `cause` and `stage`:
+
+| `cause`                                                                       | `paused_stage`    |
+| ----------------------------------------------------------------------------- | ----------------- |
+| `hitl`                                                                        | `ticket-hitl`     |
+| `refine`                                                                      | `ticket-refine`   |
+| `plan-checkpoint`                                                             | `plan-checkpoint` |
+| `awaiting-closure`, `epic-closure`, `epic-rejected`                           | `epic-boundary`   |
+| `blocked-plan`                                                                | `escalation`      |
+| `foreign-active`, `stalled`, `tree-fault`, `pin-mismatch`, `dirty-initiative` | `ticket-tree`     |
 
 `store_topology` is the ticket store classified at the start of a tickets run or a v7 sweep: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs, or when the initiative folder is gone. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
 

@@ -192,6 +192,7 @@ bmad-loop sweep [--project PROJECT] [--no-prompt] [--decisions-only] [--max-bund
 
 - `--archive` starts no sessions and combines only with `--dry-run` and `--before`. It is refused while any run of the project may be live.
 - A normal sweep has the same launch refusals as `run`, plus a missing `bmad-loop-sweep` skill.
+- On BMAD v7 a sweep is pinned to the active initiative; a resume refuses with exit 1 while `[core] active_initiative` names another, or when the ticket store's layout changed. See [Sweeps on BMAD v7](../sweep-guide.md#sweeps-on-bmad-v7).
 - Prints `sweep <id> starting (attach: bmad-loop attach)`, then the summary. Exits 0, except 1 when the engine crashed on an `--only` sweep.
 
 ### `resume`
@@ -231,6 +232,7 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--force`                  | Proceed when engine liveness cannot be verified. A provably live engine still blocks.                                                        |
 
 - `--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
+- Tickets mode: `--story` takes a ticket ref. The re-arm moves the plan through `tickets.py mark` to `ready-for-dev`, or `in-review` for a restore, and a refused move aborts it. Refused with exit 1 when the ticket store's layout changed since the run started. See the [tickets guide](../tickets-guide.md#parking-and-resolve).
 - `--reverify --story KEY` on a finished sprint run creates a new replay run for a kept DEFERRED worktree unit; the finished run is not modified.
 - Refuses with exit 1, leaving the run unchanged, when the run is not paused at an escalation (`--reverify --story` accepts any pause), the engine is live, there is no escalated story, or a DEFERRED story is targeted without `--reverify`. Declining the confirm prompt exits 0 and leaves the run paused.
 
@@ -546,7 +548,7 @@ Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`i
 
 `ticket` (per task): `ref`, `id`, `epic_slug`, `epic_id`, `title`, `plan` (the absolute plan path recorded at the pick), `done_pending` (bool: a shared-store `done` mark is still owed), `park_pending` (the owed park's reason, or null) and `commit_pending` (bool: under `mark_done = "never"`, the store-repository commit of the `built` plan is still owed). It is null for a task with no ticket. A plan's live status is not part of the document, because it is not in `state.json`; the text board reads it.
 
-Both objects are additive, so the schema version stays 1. Tickets pause stages (`ticket-hitl`, `ticket-refine`, `ticket-tree`) are new values of `paused_stage`, an open string.
+Both objects are additive, so the schema version stays 1. Tickets pause stages (`ticket-hitl`, `ticket-refine`, `ticket-tree`) are new values of `paused_stage`, an open string; tickets runs also pause at `plan-checkpoint`, `story-checkpoint`, `epic-boundary`, `escalation` and `story-gate`.
 
 ### `diagnose --json`
 
