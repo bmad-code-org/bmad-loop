@@ -4,6 +4,7 @@ from bmad_loop.model import TERMINAL_PHASES, Phase, StoryTask
 from bmad_loop.sprintstatus import STATUS_ORDER
 from bmad_loop.statemachine import (
     BOARD_REGRESSIONS,
+    PLAN_AWAITING_OPERATOR,
     PLAN_STATUS_ORDER,
     PLAN_TRANSITIONS,
     TRANSITIONS,
@@ -169,6 +170,8 @@ PLAN_STATES = {
     **{s: (s, "") for s in PLAN_STATUSES if s != "blocked"},
     "blocked(escalation)": ("blocked", ESCALATION),
     "blocked(park)": ("blocked", PARK),
+    # a session-declared park, outside upstream's statuses until `park` converts it
+    "awaiting-operator": ("awaiting-operator", ""),
 }
 _BUILT_SET = ("draft", "ready-for-dev", "in-progress", "in-review", "built")
 _STARTED = ("ready-for-dev", "in-progress", "in-review", "built")
@@ -179,6 +182,7 @@ EXPECTED: dict[str, dict[tuple[str, str], str]] = {
     "accept": {("built", "done"): "write", ("done", "done"): "noop"},
     "park": {
         **{(c, "blocked"): "write" for c in _BUILT_SET},
+        ("awaiting-operator", "blocked"): "write",
         ("blocked(park)", "blocked"): "noop",
     },
     "confirm": {
@@ -207,6 +211,11 @@ EXPECTED: dict[str, dict[tuple[str, str], str]] = {
     "replan": {
         **{(c, "draft"): "write" for c in (*_STARTED, *_BLOCKED)},
         ("draft", "draft"): "noop",
+    },
+    "salvage": {
+        ("in-progress", "built"): "write",
+        ("in-review", "built"): "write",
+        ("built", "built"): "noop",
     },
 }
 
@@ -337,6 +346,38 @@ def test_leftover_blocked_reason_is_not_a_noop():
         )
         is True
     )
+
+
+def test_session_declared_park_converts_to_blocked():
+    """A build session parks by writing `awaiting-operator` itself; the
+    commit-time conversion to an operator-park `blocked` is a legal `park` write,
+    and no other reason may move an `awaiting-operator` plan.
+
+    Ablation: drop `PLAN_AWAITING_OPERATOR` from the park rule's sources and the
+    first assertion reddens (the park is refused)."""
+    assert PLAN_AWAITING_OPERATOR == "awaiting-operator"
+    assert _decide("park", "awaiting-operator", "blocked") == "write"
+    assert _decide("park", "awaiting-operator", "blocked", blocked=ESCALATION) == "refuse"
+    for reason in sorted(set(EXPECTED) - {"park"}):
+        for target in PLAN_STATUSES:
+            assert _decide(reason, "awaiting-operator", target) == "refuse", (reason, target)
+
+
+def test_salvage_writes_built_and_never_done():
+    """A timed-out review's salvage lands the plan at `built` from in-progress or
+    in-review; it never writes `done` and never starts from a plan the build has
+    not started.
+
+    Ablation: widen the salvage rule's targets to include `done` and the `done`
+    refusal reddens; widen its sources to every build status and the
+    draft/ready-for-dev refusals redden; remove the rule and the writes redden."""
+    assert _decide("salvage", "in-review", "built") == "write"
+    assert _decide("salvage", "in-progress", "built") == "write"
+    assert _decide("salvage", "built", "built") == "noop"
+    for state in ("in-progress", "in-review", "built"):
+        assert _decide("salvage", state, "done") == "refuse", state
+    for state in ("", "draft", "ready-for-dev", *_BLOCKED, "awaiting-operator"):
+        assert _decide("salvage", state, "built") == "refuse", state
 
 
 def test_plan_transition_refused_is_an_illegal_transition():

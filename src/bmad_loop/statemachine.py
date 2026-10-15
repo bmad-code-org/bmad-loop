@@ -105,8 +105,10 @@ def check_board_regression(story_key: str, current: str, target: str) -> None:
 # every such write carries a reason this table decides. "Never regress" means the
 # accept path is strictly forward (built -> done); every backward move needs an
 # explicit reason, and those reasons exist so park/confirm, repair, re-arm,
-# rollback and replan keep working in tickets mode. `done` and `dropped` are
-# final, and bmad-loop never writes `dropped` (bmad-ticket owns it).
+# rollback and replan keep working in tickets mode. `salvage` is the one other
+# forward write: a timed-out review's verified work lands at `built`, never
+# `done`. `done` and `dropped` are final, and bmad-loop never writes `dropped`
+# (bmad-ticket owns it).
 
 # The lifecycle order of a plan `status`; "" is a row with no plan. `blocked` and
 # `dropped` sit outside it (`ticketmodel.PLAN_STATUSES` adds them).
@@ -124,8 +126,14 @@ PLAN_DROPPED: Final = "dropped"
 # The `blocked_reason` prefix that marks a park: a ticket waiting on the operator,
 # as opposed to one a build blocked on its own.
 OPERATOR_PARK_PREFIX: Final = "awaiting operator: "
+# The status a build session itself writes to declare a park. Upstream reads it
+# as an unknown status (a `problems` row), so bmad-loop converts it to an
+# operator-park `blocked` under the `park` reason.
+PLAN_AWAITING_OPERATOR: Final = "awaiting-operator"
 
-PlanWriteReason = Literal["accept", "park", "confirm", "repair", "rearm", "rollback", "replan"]
+PlanWriteReason = Literal[
+    "accept", "park", "confirm", "repair", "rearm", "rollback", "replan", "salvage"
+]
 
 _BUILD_STATUSES: Final = frozenset(PLAN_STATUS_ORDER[1:6])  # draft..built
 _STARTED: Final = frozenset(PLAN_STATUS_ORDER[2:6])  # ready-for-dev..built
@@ -147,7 +155,10 @@ PLAN_TRANSITIONS: Final[dict[PlanWriteReason, PlanRule]] = {
     "accept": PlanRule(frozenset({"built"}), frozenset({"done"})),
     # A ticket owing the operator something, parked as `blocked` with a reason
     # starting OPERATOR_PARK_PREFIX; re-parking a parked plan updates its reason.
-    "park": PlanRule(_BUILD_STATUSES, frozenset({PLAN_BLOCKED}), parked=True),
+    # PLAN_AWAITING_OPERATOR is the session-declared park this write converts.
+    "park": PlanRule(
+        _BUILD_STATUSES | {PLAN_AWAITING_OPERATOR}, frozenset({PLAN_BLOCKED}), parked=True
+    ),
     # `bmad-loop confirm` on a park: done under `mark_done = "auto"`, else built.
     "confirm": PlanRule(frozenset(), frozenset({"done", "built"}), parked=True),
     "repair": PlanRule(
@@ -161,6 +172,9 @@ PLAN_TRANSITIONS: Final[dict[PlanWriteReason, PlanRule]] = {
     # (`TicketTree.discard_unbuilt_plan`).
     "rollback": PlanRule(_STARTED, frozenset({"ready-for-dev"})),
     "replan": PlanRule(_STARTED | {PLAN_BLOCKED}, frozenset({"draft"})),
+    # A review that timed out after its work verified: the plan lands at `built`,
+    # never `done` — acceptance stays with `accept`, after the orchestrator's gates.
+    "salvage": PlanRule(frozenset({"in-progress", "in-review"}), frozenset({"built"})),
 }
 
 

@@ -20,6 +20,9 @@ breaking changes may land in a minor release.
   the project's `tickets.py`. `run` and `resume` refuse tickets mode until its engine lands.
 - Add the `[tickets]` policy section: `mark_done` (`auto` | `never`) and
   `thorough_review` (`never` | `high-risk` | `always`).
+- Add two ticket-plan transitions: a session-declared `awaiting-operator` park converts
+  to an operator-park `blocked`, and a `salvage` write lands a timed-out review's plan at
+  `built`, never `done`.
 - Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
   `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
