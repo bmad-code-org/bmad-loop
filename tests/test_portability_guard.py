@@ -496,6 +496,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # by name.
     "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
     "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
+    # tickets_engine.py: the pick's closed halt token (`tickets_source.HALT_*`);
+    # `ref` and `stage` ride the by-name benign row, `detail` is dropped by name.
+    "ticket-pick-halt": frozenset({"cause"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -1964,6 +1967,14 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-reload-failed",
         "sweep-triage-result",
         "triage-decision",
+        # tickets_engine.py — the tickets-mode pick: rows the pick passed over
+        # (once per process each), and its pick-time pauses. A blocked plan pauses
+        # through the checkpoint mixin's `stories-wedged`.
+        "ticket-foreign-active",
+        "ticket-hitl-pause",
+        "ticket-pick-halt",
+        "ticket-refine-pause",
+        "ticket-skipped",
         # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
         # mark/discard call (any outcome), one `ticket-plan-restored` per
         # byte-exact restore.

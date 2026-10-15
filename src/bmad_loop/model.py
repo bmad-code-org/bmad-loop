@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .mountpaths import project_offset, rebased_project
 
@@ -69,6 +69,17 @@ PAUSE_STORY_CHECKPOINT = "story-checkpoint"
 # environment, not the story, blocks the run, so nothing was charged or rolled
 # back and resume re-probes before dispatching. Reserved for the dispatch gate.
 PAUSE_ENVIRONMENT = "environment"
+# tickets-mode pick-time pauses (BMAD v7 ticket tree). HITL: the next ticket in
+# build order is a human-in-the-loop ticket; REFINE: it needs refining (a bug, an
+# unrefined backlog leaf, or an open `unknown`) before a build can start; TREE: the
+# tree itself blocks the run — the pinned initiative changed, `tickets.py` faulted,
+# or only tickets this run did not start stand in the way. All three are raised
+# before the ticket is recorded in state.tasks, so a resume re-picks and re-reads
+# the tree. A refined `plan_checkpoint`, an epic awaiting closure and a blocked
+# plan reuse PLAN_CHECKPOINT, EPIC_BOUNDARY and ESCALATION.
+PAUSE_TICKET_HITL = "ticket-hitl"
+PAUSE_TICKET_REFINE = "ticket-refine"
+PAUSE_TICKET_TREE = "ticket-tree"
 
 # Where an environment fault was detected (DW-523), as recorded in
 # `StoryTask.env_fault_site`. A CLOSED vocabulary: `verify:<role>` — a verify
@@ -306,6 +317,72 @@ def _identity_record_from(raw: object) -> tuple[int, int] | None:
 
 def _identity_record_to(record: tuple[int, int] | None) -> list[int] | None:
     return None if record is None else [record[0], record[1]]
+
+
+@dataclass(frozen=True)
+class TicketBinding:
+    """tickets mode only: the ticket-tree identity a unit was dispatched for,
+    captured from ``tickets.py find`` when the ticket is picked and persisted on
+    its :class:`StoryTask` so a resume never re-resolves it.
+
+    ``ref`` is the unit key (``E.M``); ``id`` the entry id as text; ``epic_slug``
+    the epic folder (``epic-<x>``) and ``epic_id`` its id in the initiative table
+    (``""`` when the initiative does not list it). ``plan`` is the absolute plan
+    path ``find`` names, which may not exist before the first build. The
+    checkpoint flags and ``hitl`` are the entry's, as picked."""
+
+    ref: str
+    id: str
+    epic_slug: str
+    epic_id: str
+    title: str
+    plan: str
+    risk: str
+    refined: bool
+    plan_checkpoint: bool
+    done_checkpoint: bool
+    hitl: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "id": self.id,
+            "epic_slug": self.epic_slug,
+            "epic_id": self.epic_id,
+            "title": self.title,
+            "plan": self.plan,
+            "risk": self.risk,
+            "refined": self.refined,
+            "plan_checkpoint": self.plan_checkpoint,
+            "done_checkpoint": self.done_checkpoint,
+            "hitl": self.hitl,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TicketBinding":
+        return cls(
+            ref=str(d["ref"]),
+            id=str(d.get("id", "")),
+            epic_slug=str(d.get("epic_slug", "")),
+            epic_id=str(d.get("epic_id", "")),
+            title=str(d.get("title", "")),
+            plan=str(d.get("plan", "")),
+            risk=str(d.get("risk", "")),
+            refined=bool(d.get("refined", False)),
+            plan_checkpoint=bool(d.get("plan_checkpoint", False)),
+            done_checkpoint=bool(d.get("done_checkpoint", False)),
+            hitl=bool(d.get("hitl", False)),
+        )
+
+
+def _ticket_binding_from(raw: object) -> TicketBinding | None:
+    """A persisted binding, or None for an absent one. A present value that is not
+    a mapping is a corrupt state file: refuse it rather than drop the binding."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"ticket binding must be an object, got {type(raw).__name__}")
+    return TicketBinding.from_dict(cast("dict[str, Any]", raw))
 
 
 @dataclass
@@ -691,6 +768,10 @@ class StoryTask:
     # counts it was computed from stay in `tokens`. Persisted precisely so a
     # resumed run does not re-notify what the pre-pause process already did.
     token_budget_warned: bool = False
+    # tickets mode only: the ticket this unit was picked for (TicketsEngine binds it
+    # right after registration). None for sprint, stories and sweep units.
+    # Deliberately absent from `documents.py`'s `--json` projection (schema 1).
+    ticket: TicketBinding | None = None
 
     @property
     def terminal(self) -> bool:
@@ -802,6 +883,7 @@ class StoryTask:
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
             "token_budget_warned": self.token_budget_warned,
+            "ticket": self.ticket.to_dict() if self.ticket is not None else None,
         }
 
     def _serialized_worktree_path(
@@ -1086,6 +1168,7 @@ class StoryTask:
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
+            ticket=_ticket_binding_from(d.get("ticket")),
         )
 
 
@@ -1262,6 +1345,15 @@ class RunState:
     # state written before the pin existed.
     initiative: str = ""
     initiative_folder: str = ""
+    # tickets mode only. `ticket_epic_filter`: the `--epic` selector as an epic
+    # slug ("" = every epic). `ticket_story_approvals`: refs whose refined
+    # `plan_checkpoint` story file an operator approved this run, so the pick
+    # dispatches them instead of pausing again. `ticket_epic_closures`: epic slug ->
+    # the closure disposition this run recorded at its epic boundary (a retro
+    # verdict, e.g. "rejected", holds every later epic until the epic is closed).
+    ticket_epic_filter: str = ""
+    ticket_story_approvals: list[str] = field(default_factory=list)
+    ticket_epic_closures: dict[str, str] = field(default_factory=dict)
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -1440,6 +1532,9 @@ class RunState:
             "spec_folder": self.spec_folder,
             "initiative": self.initiative,
             "initiative_folder": self.initiative_folder,
+            "ticket_epic_filter": self.ticket_epic_filter,
+            "ticket_story_approvals": list(self.ticket_story_approvals),
+            "ticket_epic_closures": dict(self.ticket_epic_closures),
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
@@ -1484,6 +1579,11 @@ class RunState:
             spec_folder=str(d.get("spec_folder", "")),
             initiative=str(d.get("initiative", "")),
             initiative_folder=str(d.get("initiative_folder", "")),
+            ticket_epic_filter=str(d.get("ticket_epic_filter", "")),
+            ticket_story_approvals=[str(r) for r in d.get("ticket_story_approvals", [])],
+            ticket_epic_closures={
+                str(k): str(v) for k, v in d.get("ticket_epic_closures", {}).items()
+            },
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],

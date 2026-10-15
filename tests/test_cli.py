@@ -27,9 +27,13 @@ from conftest import (
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
     V7_DEFAULT_INITIATIVE,
+    FakeTicketTree,
     _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
+    fake_find,
+    fake_next_view,
+    fake_status_view,
     fault_metadata_probe,
     fault_read_text,
     git,
@@ -49,6 +53,7 @@ from conftest import (
     plant_root_markers,
     refuse_to_resolve,
     spec_path,
+    ticket_row,
     write_gated_ledger,
     write_ledger,
     write_repo_root_override,
@@ -12646,16 +12651,114 @@ def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, m
     assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
 
 
-@pytest.mark.parametrize("dry_run", [False, True], ids=["run", "dry-run"])
-def test_run_tickets_refused_until_runnable(project, capsys, monkeypatch, dry_run):
-    """Tickets mode is registered (validate checks it) but its runs land in a later
-    release layer: `run` and `run --dry-run` refuse with one clear line at exit 1 and
-    leave no run behind. Ablation (performed): point the tickets `_RUN_PREFLIGHTS`
-    row at the sprint preflight and the `run` row FAILS."""
+# Tickets dry-run. Real-spawn budget: 4 vendored `tickets.py` spawns (two tests
+# x `next` + `status`); every other tickets dry-run test injects a FakeTicketTree.
+
+
+def _fake_dry_run_tree(monkeypatch, tree):
+    """Point the dry-run's `TicketTree(project)` at ``tree``."""
+    from bmad_loop import tickettree
+
+    monkeypatch.setattr(tickettree, "TicketTree", lambda *_a, **_k: tree)
+
+
+def test_dry_run_tickets_prints_dispatch_and_predicted_pause(project, capsys, monkeypatch):
+    """The dry-run lists the startable tickets in build order — the `status` order,
+    not `next`'s — each with its badges and the `/bmad-build-auto ticket <ref>`
+    dispatch, then the pause a fresh run would reach first (here: before the hitl
+    ticket that leads the build order) and the group counts. Ablation (performed):
+    drop the build-order sort and the order assertion FAILS; predict from the
+    second ticket instead of `decide_pick` and the predicted line FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    first = ticket_row("1.1", hitl=True, done_checkpoint=True, title="Cart model")
+    second = ticket_row("1.2", title="Cart rules")
+    folder = project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE / "epic-cart"
+    tree = FakeTicketTree(
+        project.project,
+        next_view=fake_next_view(ready_to_start=(second, first)),
+        status_view=fake_status_view((first, second)),
+        finds={r.ref: fake_find(r, folder) for r in (first, second)},
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, _ = capsys.readouterr()
+    assert rc == 0
+    assert out.index("1. 1.1  (no plan) [hitl, done-checkpoint]  Cart model") < out.index(
+        "2. 1.2  (no plan)  Cart rules"
+    )
+    assert '"/bmad-build-auto ticket 1.1"' in out
+    assert '"/bmad-build-auto ticket 1.2"' in out
+    assert "env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1.2\n" in out
+    assert "Halt after planning." not in out
+    assert "predicted: run would pause before 1.1 (ticket-hitl): 1.1 is a hitl ticket\n" in out
+    assert "groups: ready_to_refine=0 ready_to_start=2 in_progress=0 blocked=0 backlog=0\n" in out
+    assert tree.marks == [] and [c[0] for c in tree.calls] == ["next", "status"]
+
+
+def test_dry_run_tickets_unrefined_plan_checkpoint_adds_halt_marker(project, capsys, monkeypatch):
+    """On the default tree (real `tickets.py`, 2 spawns) the only startable ticket,
+    1.1, is an unrefined `plan_checkpoint`: its dispatch is leg 1 —
+    `ticket 1.1 Halt after planning.` with `BMAD_LOOP_PLAN_HALT=1` — and the run
+    would pause after planning it. Ablation (performed): drop the dry-run's
+    `Halt after planning.` branch and this test FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "1. 1.1  (no plan) [plan-checkpoint, done-checkpoint]  Cart model" in out
+    assert '"/bmad-build-auto ticket 1.1 Halt after planning."' in out
+    assert "env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1.1 BMAD_LOOP_PLAN_HALT=1\n" in out
+    assert "predicted: run would pause after planning 1.1 (plan-checkpoint)" in out
+    assert "ready_to_start=1" in out and "blocked=3" in out
+
+
+def test_dry_run_tickets_never_writes(project, capsys, monkeypatch):
+    """A dry-run reads the tree and writes nothing: every byte of the sandbox is
+    unchanged, no run directory appears, and no write verb of the tree is ever
+    reached (real `tickets.py`, 2 spawns). Ablation (performed): mark the first
+    ticket `built` from the dry-run and this test FAILS on the write guard."""
+    from bmad_loop import tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    def refuse(*_a, **_k):
+        raise AssertionError("dry-run reached a tree write")
+
+    for verb in ("mark", "discard_unbuilt_plan", "restore_preimage"):
+        monkeypatch.setattr(tickettree.TicketTree, verb, refuse)
+
+    def snapshot():
+        return {
+            p.relative_to(project.project).as_posix(): p.read_bytes()
+            for p in sorted(project.project.rglob("*"))
+            if p.is_file() and ".git" not in p.relative_to(project.project).parts
+        }
+
+    before = snapshot()
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "ticket 1.1" in out
+    assert snapshot() == before
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_run_tickets_refused_until_runnable(project, capsys, monkeypatch):
+    """Tickets mode is registered (validate checks it, `run --dry-run` previews it)
+    but its runs land in a later release layer: `run` refuses with one clear line
+    at exit 1 and leaves no run behind. Ablation (performed): point the tickets
+    `_RUN_PREFLIGHTS` row at the sprint preflight and this test FAILS."""
     from bmad_loop import runs
 
     _make_tickets_validate_pass(project, monkeypatch, capsys)
-    argv = ["run", "--project", str(project.project)] + (["--dry-run"] if dry_run else [])
+    argv = ["run", "--project", str(project.project)]
 
     assert cli.main(argv) == 1
     out, err = capsys.readouterr()

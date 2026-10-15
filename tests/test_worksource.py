@@ -179,7 +179,6 @@ def _run_side_tickets_rows():
     """Every run-side dispatch row of the tickets source, called with dummy
     arguments: each must refuse before it reads any of them."""
     rows = {
-        "cli._DRY_RUNNERS": lambda: cli._DRY_RUNNERS["tickets"](None, None, None, ""),
         "cli._STATUS_PRINTERS": lambda: cli._STATUS_PRINTERS["tickets"](None, None),
         "cli._RUN_PREFLIGHTS": lambda: cli._RUN_PREFLIGHTS["tickets"](None, None, ""),
         "cli._ACTIONABLE_KEY_READERS": lambda: cli._ACTIONABLE_KEY_READERS["tickets"](None, ""),

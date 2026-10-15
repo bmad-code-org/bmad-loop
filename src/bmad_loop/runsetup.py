@@ -826,6 +826,8 @@ def build_run_state(
     spec_folder: str,
     trusted_config_digest: str,
     run_dir_identity: tuple[int, int] | None,
+    initiative: str = "",
+    initiative_folder: str = "",
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -847,7 +849,13 @@ def build_run_state(
 
     ``run_dir_identity`` is the run dir's mint-time identity
     (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
-    stream's pin compares the run dir it opens against."""
+    stream's pin compares the run dir it opens against.
+
+    ``initiative`` / ``initiative_folder`` are the v7 active initiative and its
+    folder (``ProjectPaths.active_initiative`` / ``initiative_folder``), pinned only
+    for a tickets run, whose tree reads refuse once the live initiative differs;
+    every other source records them empty."""
+    tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
         project=str(project),
@@ -860,6 +868,8 @@ def build_run_state(
         max_stories=max_stories,
         source=source,
         spec_folder=spec_folder if worksource.traits_for(source).has_spec_folder else "",
+        initiative=initiative if tickets else "",
+        initiative_folder=initiative_folder if tickets else "",
         trusted_config_digest=trusted_config_digest,
     )
 
@@ -1286,6 +1296,10 @@ def compose_run(
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
             run_dir_identity=_claim_identity(composer_claim),
+            initiative=paths.active_initiative,
+            initiative_folder=(
+                str(paths.initiative_folder) if paths.initiative_folder is not None else ""
+            ),
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering

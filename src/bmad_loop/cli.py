@@ -38,6 +38,9 @@ from . import (
 )
 from . import stories as stories_mod
 from . import (
+    ticketmodel,
+    tickets_source,
+    tickettree,
     verify,
     worksource,
 )
@@ -2147,6 +2150,7 @@ def _warn_preflight_would_abort(
     pol,
     *,
     require_stories: bool = False,
+    require_tickets: bool = False,
     require_sweep: bool = False,
 ) -> None:
     """Dry-run honesty banner: say so when the real command would refuse to run.
@@ -2189,7 +2193,8 @@ def _warn_preflight_would_abort(
 
     ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
-    preview must not promise an abort over it.
+    preview must not promise an abort over it. ``require_tickets`` (the tickets
+    dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set.
 
     The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
     fatal verdicts only: an inert never-granted plugin does not abort the launch.
@@ -2201,6 +2206,7 @@ def _warn_preflight_would_abort(
         p.message
         for p in install.missing_base_skills(paths.project, trees)
         + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+        + (install.missing_tickets_support(paths.project, trees) if require_tickets else [])
         + (
             install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
             if require_sweep
@@ -3477,7 +3483,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     traits = worksource.traits_for(source)
     paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
 
-    if not traits.has_epics and args.epic is not None:
+    if source == worksource.SOURCE_TICKETS and (args.epic is not None or args.story):
+        # tickets mode picks the initiative's build order whole; TicketsEngine
+        # nulls both selectors, so warn rather than silently run unfiltered.
+        print("note: --epic and --story are ignored in tickets mode", file=sys.stderr)
+    elif not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
         # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
         # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
@@ -3749,14 +3759,109 @@ def _dry_run_stories(
     return 0
 
 
+def _ticket_badge(row: ticketmodel.TicketRow) -> str:
+    """`` [hitl, refine, plan-checkpoint, done-checkpoint]`` for the flags a tickets
+    run pauses on, or ``""`` when it sets none. Shared spelling for the dry-run
+    schedule and status."""
+    marks = []
+    if row.hitl:
+        marks.append("hitl")
+    if tickets_source.needs_refine(row):
+        marks.append("refine")
+    if row.plan_checkpoint:
+        marks.append("plan-checkpoint")
+    if row.done_checkpoint:
+        marks.append("done-checkpoint")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
+def _predicted_pause(decision: tickets_source.PickDecision) -> str:
+    """The first pause a fresh tickets run would reach, as one line."""
+    if isinstance(decision, tickets_source.Halt):
+        where = f" before {decision.key}" if decision.key else ""
+        return f"run would pause{where} ({decision.stage}): {decision.detail}"
+    if isinstance(decision, tickets_source.Skip):
+        if decision.reason == tickets_source.SKIP_PARKED:
+            return f"run would end: {', '.join(decision.waiting)} wait behind parked tickets"
+        return "run would finish: no ticket is ready to start"
+    row = decision.row
+    if tickets_source.is_plan_halt_leg(row):
+        return (
+            f"run would pause after planning {decision.ref} (plan-checkpoint): "
+            "approve the plan, then resume"
+        )
+    if row.done_checkpoint:
+        return f"run would pause after {decision.ref} (story-checkpoint): done checkpoint"
+    return f"no pause predicted before {decision.ref} finishes"
+
+
+def _dry_run_tickets(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print what a tickets run would dispatch from the active initiative: the
+    startable tickets in build order with their dispatch lines, the pause a fresh
+    run would reach first, the group counts and the tree's problems. Reads the
+    tree with ``tickets.py next``/``status`` only — it never marks a ticket."""
+    _warn_preflight_would_abort(paths, pol, require_tickets=True)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
+    tree = tickettree.TicketTree(paths.project)
+    try:
+        next_view = tree.next()
+        status_view = tree.status()
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    decision = tickets_source.decide_pick(next_view, status_view, {}, {}, ())
+    rank = tickets_source.build_order(status_view)
+    last = len(rank)
+    ready = sorted(
+        (
+            row
+            for row in (*next_view.ready_to_refine, *next_view.ready_to_start)
+            if row.ref is not None
+        ),
+        key=lambda row: rank.get(tickets_source.row_label(row), last),
+    )
+    if args.max_stories is not None:
+        ready = ready[: args.max_stories]
+    print(
+        f"tickets mode: initiative {paths.active_initiative or next_view.folder} — "
+        f"{len(ready)} ready of {len(status_view.tickets)} tickets (gates={pol.gates.mode})"
+    )
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
+    print("build order (initiative epic table, then entry order):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
+    for position, row in enumerate(ready, 1):
+        status = row.status or "no plan"
+        print(f"\n  {position}. {row.ref}  ({status}){_ticket_badge(row)}  {row.title}")
+        plan_halt = tickets_source.is_plan_halt_leg(row)
+        dispatch = f"/{dev_skill} ticket {row.ref}"
+        if plan_halt:
+            dispatch += " Halt after planning."
+        print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
+        env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.ref}"
+        if plan_halt:
+            env += " BMAD_LOOP_PLAN_HALT=1"
+        print(f"    env:    {env}")
+    print(f"\npredicted: {_predicted_pause(decision)}")
+    if next_view.backlog is not None:
+        backlog = str(sum(len(next_view.backlog.group(g)) for g in ticketmodel.NEXT_GROUPS))
+    else:
+        backlog = "unreadable" if next_view.backlog_error is not None else "0"
+    counts = " ".join(f"{g}={len(next_view.group(g))}" for g in ticketmodel.NEXT_GROUPS)
+    print(f"groups: {counts} backlog={backlog}")
+    for problem in dict.fromkeys((*next_view.problems, *status_view.problems)):
+        print(f"problem: {problem}")
+    return 0
+
+
 # `run --dry-run`'s queue printer, one entry per work source (held exhaustive over
 # `worksource.SOURCES` by tests/test_worksource.py).
 _DRY_RUNNERS: dict[str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int]] = {
     worksource.SOURCE_SPRINT: _dry_run_sprint,
     worksource.SOURCE_STORIES: _dry_run_stories,
-    worksource.SOURCE_TICKETS: lambda _paths, _pol, _args, _folder: worksource.refuse_unrunnable(
-        worksource.SOURCE_TICKETS
-    ),
+    worksource.SOURCE_TICKETS: _dry_run_tickets,
 }
 
 

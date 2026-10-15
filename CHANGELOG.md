@@ -18,6 +18,9 @@ breaking changes may land in a minor release.
   reader, uv, active initiative, repo store; tracker stores are refused) and the dev
   primitive's ticket route (`skills.tickets-dispatch*`). `validate --probes` also probes
   the project's `tickets.py`. `run` and `resume` refuse tickets mode until its engine lands.
+- Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
+  each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
+  the first pause a run would reach, group counts and tree problems. Marks nothing.
 - Add the `[tickets]` policy section: `mark_done` (`auto` | `never`) and
   `thorough_review` (`never` | `high-risk` | `always`).
 - Add two ticket-plan transitions: a session-declared `awaiting-operator` park converts

@@ -8,13 +8,15 @@ A run pauses when it needs a human: an escalation, an environment fault, a merge
 - **`bmad-loop status <run-id>`** shows the pause stage, the paused story and the reason. A parked attempt's recovery ref appears as `[ref]` (`preserve_ref` in `status --json`).
 - **The TUI** shows the same, and its keys launch the commands below: `R` resolve, `V` re-verify, `e` resume, `p` review the paused run.
 
-| Pause stage                           | Cause                                                        | Clear it with                                                                 |
-| ------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `escalation`                          | a CRITICAL escalation, or a story still escalated at run end | [`bmad-loop resolve`](#resolving-an-escalation)                               |
-| `environment`                         | an environment probe failed before a session launched        | fix the environment, then `bmad-loop resume` ([details](#environment-faults)) |
-| `story-gate`                          | a ledger `gate:`, or a ledger that cannot be read            | see the [sweep guide](sweep-guide.md#hard-gates)                              |
-| `spec-approval`, `epic-boundary`      | a configured gate or a retrospective                         | `bmad-loop resume`                                                            |
-| `plan-checkpoint`, `story-checkpoint` | a stories-mode checkpoint                                    | `bmad-loop resume`                                                            |
+| Pause stage                           | Cause                                                                                                                  | Clear it with                                                                 |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `escalation`                          | a CRITICAL escalation, or a story still escalated at run end                                                           | [`bmad-loop resolve`](#resolving-an-escalation)                               |
+| `environment`                         | an environment probe failed before a session launched                                                                  | fix the environment, then `bmad-loop resume` ([details](#environment-faults)) |
+| `story-gate`                          | a ledger `gate:`, or a ledger that cannot be read                                                                      | see the [sweep guide](sweep-guide.md#hard-gates)                              |
+| `spec-approval`, `epic-boundary`      | a configured gate or a retrospective                                                                                   | `bmad-loop resume`                                                            |
+| `plan-checkpoint`, `story-checkpoint` | a stories- or tickets-mode checkpoint                                                                                  | `bmad-loop resume`                                                            |
+| `ticket-hitl`, `ticket-refine`        | tickets mode: the next ticket is a hitl ticket, or needs refining                                                      | build or refine it, then `bmad-loop resume`                                   |
+| `ticket-tree`                         | tickets mode: the active initiative changed, `tickets.py` failed, or only tickets the run did not start are in the way | fix the tree, then `bmad-loop resume`                                         |
 
 ## Escalations
 

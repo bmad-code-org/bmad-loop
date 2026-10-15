@@ -265,6 +265,44 @@ def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
     assert secret_path not in json.dumps(scrubbed)
 
 
+def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
+    """The tickets pick's records keep the closed tokens (cause, stage, skip,
+    phase, status) and the ticket ref, and drop the halt's free-text detail — it
+    can quote a plan's `blocked_reason` or a tickets.py error naming a path."""
+    secret_path = "/home/canaryuser/AcmeSecret/plan.md"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    halt = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-pick-halt",
+            "ref": "1.2",
+            "cause": "tree-fault",
+            "stage": "ticket-tree",
+            "detail": f"tickets.py crashed: {secret_path}",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    skipped = diagnostics._scrub_entry(
+        {"kind": "ticket-skipped", "ref": "1.1", "skip": "touched", "phase": "deferred"},
+        pseudo,
+        {},
+        None,
+    )
+    foreign = diagnostics._scrub_entry(
+        {"kind": "ticket-foreign-active", "ref": "2.1", "status": "built"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert (halt["ref"], halt["cause"], halt["stage"]) == ("1.2", "tree-fault", "ticket-tree")
+    assert halt["detail_present"] is True
+    assert secret_path not in json.dumps(halt)
+    assert (skipped["skip"], skipped["phase"]) == ("touched", "deferred")
+    assert foreign["status"] == "built"
+
+
 def test_artifact_size_refusal_rejects_malformed_safe_fields():
     scrubbed = diagnostics._scrub_entry(
         {

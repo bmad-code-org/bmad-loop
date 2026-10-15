@@ -12,12 +12,16 @@ from bmad_loop.model import (
     ENV_FAULT_SITE_DISPATCH_PREFIX,
     ENV_FAULT_SITES,
     PAUSE_ENVIRONMENT,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     Phase,
     RunState,
     SessionRecord,
     StoryTask,
+    TicketBinding,
     TokenUsage,
     VerifyOutcome,
     env_fault_site_reverifiable,
@@ -175,6 +179,81 @@ def test_old_state_json_defaults_initiative_empty():
     del d["initiative_folder"]
     back = RunState.from_dict(d)
     assert back.initiative == "" and back.initiative_folder == ""
+
+
+def _binding(**kw) -> TicketBinding:
+    base = dict(
+        ref="2.1",
+        id="1",
+        epic_slug="epic-checkout",
+        epic_id="2",
+        title="Checkout form",
+        plan="/p/_bmad-output/i/epic-checkout/story-checkout-form-plan.md",
+        risk="high",
+        refined=True,
+        plan_checkpoint=True,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    base.update(kw)
+    return TicketBinding(**base)
+
+
+def test_run_state_ticket_fields_default_and_round_trip():
+    default = _state()
+    assert (default.ticket_epic_filter, default.ticket_story_approvals) == ("", [])
+    assert default.ticket_epic_closures == {}
+    state = _state(
+        ticket_epic_filter="epic-cart",
+        ticket_story_approvals=["2.1"],
+        ticket_epic_closures={"epic-cart": "rejected"},
+    )
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.ticket_epic_filter == "epic-cart"
+    assert back.ticket_story_approvals == ["2.1"]
+    assert back.ticket_epic_closures == {"epic-cart": "rejected"}
+
+
+def test_old_state_json_defaults_ticket_fields_empty():
+    d = _state().to_dict()
+    for key in ("ticket_epic_filter", "ticket_story_approvals", "ticket_epic_closures"):
+        del d[key]
+    back = RunState.from_dict(d)
+    assert (back.ticket_epic_filter, back.ticket_story_approvals) == ("", [])
+    assert back.ticket_epic_closures == {}
+
+
+def test_story_task_ticket_binding_round_trips():
+    task = StoryTask(story_key="2.1", epic=0)
+    task.ticket = _binding()
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert back.ticket == _binding()
+    assert back.ticket is not None and back.ticket.to_dict() == _binding().to_dict()
+
+
+def test_story_task_ticket_defaults_none_and_reads_legacy_state():
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert task.ticket is None
+    d = task.to_dict()
+    assert d["ticket"] is None
+    del d["ticket"]
+    assert StoryTask.from_dict(d).ticket is None
+
+
+def test_story_task_refuses_a_corrupt_ticket_binding():
+    """A binding that is not an object is a corrupt state file: loading refuses it
+    rather than dropping the ticket a resume needs. Ablation (performed): read a
+    non-mapping as None and this FAILS."""
+    d = StoryTask(story_key="2.1", epic=0).to_dict()
+    d["ticket"] = "2.1"
+    with pytest.raises(ValueError, match="ticket binding"):
+        StoryTask.from_dict(d)
+
+
+def test_ticket_pause_stages_are_distinct():
+    stages = (PAUSE_TICKET_HITL, PAUSE_TICKET_REFINE, PAUSE_TICKET_TREE)
+    assert stages == ("ticket-hitl", "ticket-refine", "ticket-tree")
 
 
 def test_sweeps_refused_round_trips():

@@ -1387,6 +1387,36 @@ def _compose_run_for_source(project, *, source, spec_folder):
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "pinned"),
+    [("tickets", True), ("sprint-status", False), ("stories", False)],
+)
+def test_build_run_state_pins_initiative_for_tickets_only(tmp_path, source, pinned):
+    """A tickets run records the active initiative and its folder, which its tree
+    reads compare against the live config; every other source records them
+    empty, so a v6 state is unchanged. Ablation (performed): stamp the pins for
+    every source and the sprint and stories rows FAIL; drop the stamp and the
+    tickets row FAILS."""
+    state = runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=tmp_path,
+        repo_root=tmp_path,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder="",
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+        initiative="shop",
+        initiative_folder=str(tmp_path / "_bmad-output" / "shop"),
+    )
+
+    expected = ("shop", str(tmp_path / "_bmad-output" / "shop")) if pinned else ("", "")
+    assert (state.initiative, state.initiative_folder) == expected
+
+
 def _build_run_state_for_source(project, *, source, spec_folder):
     """The one `build_run_state` call the per-source pin makes (see above)."""
     return runsetup.build_run_state(

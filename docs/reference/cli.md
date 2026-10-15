@@ -151,17 +151,18 @@ Runs the story loop (dev → review → verify → commit) over actionable stori
 bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] [--max-stories MAX_STORIES] [--dry-run]
 ```
 
-| Option                      | Description                                                                                 |
-| --------------------------- | ------------------------------------------------------------------------------------------- |
-| `--spec FOLDER`             | Stories mode: dispatch from `FOLDER/stories.yaml`. Overrides `[stories] source`.            |
-| `--epic EPIC`               | Only stories of this epic (integer). Sprint mode only; ignored with a note in stories mode. |
-| `--story STORY`             | Sprint mode: `E-S` / `E.S`, a slug fragment, or a full key. Stories mode: a story id.       |
-| `--max-stories MAX_STORIES` | Stop after N stories.                                                                       |
-| `--dry-run`                 | Print the per-story plan and spawn nothing.                                                 |
+| Option                      | Description                                                                                                                |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `--spec FOLDER`             | Stories mode: dispatch from `FOLDER/stories.yaml`. Overrides `[stories] source`.                                           |
+| `--epic EPIC`               | Only stories of this epic (integer). Sprint mode only; ignored with a note in stories and tickets modes.                   |
+| `--story STORY`             | Sprint mode: `E-S` / `E.S`, a slug fragment, or a full key. Stories mode: a story id. Ignored with a note in tickets mode. |
+| `--max-stories MAX_STORIES` | Stop after N stories.                                                                                                      |
+| `--dry-run`                 | Print the per-story plan and spawn nothing.                                                                                |
 
 - Sprint mode selects stories at `backlog` or `ready-for-dev`. A `--story` that matches nothing, matches several stories, or is not actionable exits 1.
 - Refused with exit 1 before anything is created on: git below the supported floor, a dirty worktree, a worktree-isolation conflict, missing base skills, or a failing plugin-trust verdict.
-- `[stories] source = "tickets"` is refused with exit 1, `--dry-run` included: tickets runs are not available yet. `validate` checks a tickets project.
+- `[stories] source = "tickets"` is refused with exit 1: tickets runs are not available yet. `validate` checks a tickets project.
+- `--dry-run` in tickets mode reads the active initiative through its `tickets.py` and marks nothing. It prints the startable tickets in build order (initiative epic table, then entry order), each with its badges, its `ticket <ref>` dispatch (`Halt after planning.` on an unrefined plan-checkpoint ticket) and its env, then the first pause a run would reach (`predicted:`), the `next` group counts and the tree's problems. A `tickets.py` failure exits 1.
 - Prints `run <id> starting (attach: bmad-loop attach)`, then the run summary; exits 0 once the engine has run.
 
 ### `sweep`
