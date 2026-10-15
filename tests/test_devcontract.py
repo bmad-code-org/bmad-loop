@@ -1002,6 +1002,36 @@ def test_every_dev_primitive_has_a_fallback_result_prefix():
     assert not missing, f"dev primitives whose completion marker cannot be read back: {missing}"
 
 
+def test_find_result_artifact_ignores_ledger_in_initiative_folder(tmp_path):
+    """On v7 the scan root is the initiative folder, which also holds the
+    deferred-work ledger, the initiative file and the ticket breakdown. Each of
+    those is rewritten during a session, so each is fresher than the launch
+    floor, yet none carries a result marker: qualification stays marker-based
+    and the plan the bundle wrote is the only hit. With the plan gone nothing
+    qualifies, and the scan never falls back to the newest ``*.md``."""
+    import os
+
+    folder = tmp_path / "_bmad-output" / "initiative-checkout"
+    folder.mkdir(parents=True)
+    plan = _spec(folder / "plan-dw-bundle-1-retry-guard.md", status="built", auto_run="done")
+    os.utime(plan, ns=(2_000_000_000, 2_000_000_000))
+    for name, text in (
+        (
+            "deferred-work.md",
+            "# Deferred Work\n\n## DW-1: retry guard\n\n- status: done 2026-10-15\n"
+            "- source_spec: epic-auth/story-login-plan.md\n- summary: guard the retry\n",
+        ),
+        ("initiative-checkout.md", "---\nstatus: active\n---\n\n# Checkout\n"),
+    ):
+        (folder / name).write_text(text, encoding="utf-8")
+        os.utime(folder / name, ns=(3_000_000_000, 3_000_000_000))
+    (folder / "tickets.toml").write_text("[[epics]]\n", encoding="utf-8")
+
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) == plan
+    plan.unlink()
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) is None
+
+
 def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
     """A spec whose only `## Auto Run Result` is a fenced example must not
     qualify as a terminal artifact, even with a fresh mtime — otherwise the

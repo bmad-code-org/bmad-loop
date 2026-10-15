@@ -9083,6 +9083,7 @@ def verify_dev_bundle(
     review_enabled: bool = True,
     *,
     engine_written: tuple[str, ...] = (),
+    accept_statuses: frozenset[str] | None = None,
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
@@ -9092,6 +9093,11 @@ def verify_dev_bundle(
     generic path and passes.
 
     ``engine_written`` has the same contract as :func:`verify_dev`.
+
+    ``accept_statuses`` is the set of spec statuses that finish the dev leg
+    (``SweepEngine._bundle_success_statuses``). ``None`` keeps the v6 rule:
+    ``in-review`` when ``review_enabled``, else ``done``. A v7 sweep passes
+    ``{"built", "done"}``, because build-auto finishes a plan at ``built``.
 
     The artifact-only RECEIPT (DW-273) is this leg's alone. A bundle whose only
     permitted deliverable lives under a gitignored ``implementation_artifacts``
@@ -9134,12 +9140,31 @@ def verify_dev_bundle(
     # With review disabled, the dev session finalizes the bundle straight to done.
     # allow_ancestor_baseline: a bundle that adopts a pre-existing story spec
     # (follow-up review) carries that spec's older-but-ancestral baseline (#161).
+    expected_status = "in-review" if review_enabled else "done"
+    fm: dict[str, Any] | None = None
+    if accept_statuses is not None and len(accept_statuses) == 1:
+        (expected_status,) = accept_statuses
+    elif accept_statuses is not None:
+        # The shared gate checks one status: read the spec once here to pick
+        # which accepted status it must equal, and hand that read over.
+        read = _gate_frontmatter(spec_path)
+        if isinstance(read, VerifyOutcome):
+            return read
+        fm = read
+        status = status_of(fm)
+        if status not in accept_statuses:
+            return VerifyOutcome.retry(
+                f"spec status is {status!r}, expected one of {sorted(accept_statuses)}: "
+                f"{spec_path}"
+            )
+        expected_status = status
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
-        expected_status="in-review" if review_enabled else "done",
+        expected_status=expected_status,
+        fm=fm,
         extra_exclude=engine_written,
         allow_ancestor_baseline=True,
         artifact_only_dir=paths.implementation_artifacts if artifact_only else None,
@@ -10507,6 +10532,7 @@ def verify_review_bundle(
     *,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    accept_statuses: frozenset[str] | None = None,
 ) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
@@ -10514,6 +10540,10 @@ def verify_review_bundle(
     orchestrator flips them after dev and, if review rewrites the ledger diff,
     again immediately before this review gate. Either way this gate is why we
     can trust it happened.
+
+    ``accept_statuses`` is the set of spec statuses that finish the review leg;
+    ``None`` means ``{"done"}``. A v7 sweep passes ``{"built", "done"}``: a
+    follow-up review of a ``built`` plan leaves it ``built``.
 
     ``on_results`` is handed straight to ``_verify_review_commands`` and is the
     engine's hook for journalling this gate's verifier results; see there. It is
@@ -10525,8 +10555,10 @@ def verify_review_bundle(
     if isinstance(fm, VerifyOutcome):
         return fm
     status = status_of(fm)
-    if status != "done":
-        return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
+    accepted = accept_statuses or frozenset({"done"})
+    if status not in accepted:
+        want = f"one of {sorted(accepted)}" if len(accepted) > 1 else repr(next(iter(accepted)))
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected {want}")
 
     ledger = paths.deferred_work
     # Same TOCTOU class as the spec read above: the ledger is rewritten by the

@@ -1807,6 +1807,7 @@ class WorktreeFlow:
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
         unit_branch_epic: Callable[[StoryTask], str | None] = lambda task: None,
+        sprint_board: Callable[[], bool] | None = None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -1831,6 +1832,11 @@ class WorktreeFlow:
         # The unit branch's epic segment (`workspace.unit_branch_name`); None —
         # every mode but tickets — keeps the two-segment name.
         self._unit_branch_epic = unit_branch_epic
+        # Whether this run keeps a v6 sprint board (`Engine._has_sprint_board`).
+        # None reads the persisted source's `SourceTraits.sprint_board`.
+        self._sprint_board = sprint_board or (
+            lambda: worksource.resumed_traits_for(self.state.source).sprint_board
+        )
         verify.reconcile_integration_state_roots(
             run_dir, (task.integration_attempt for task in state.tasks.values())
         )
@@ -2133,13 +2139,14 @@ class WorktreeFlow:
         board escapes, via the rollback's ``reset --hard``. Seeding neither
         introduces the trap nor widens it.
 
-        Nothing for a source without a sprint board (``SourceTraits.sprint_board``):
-        tickets mode never reads or writes one, so a stray board file at the
-        configured path is not seeded either.
+        Nothing for a run without a sprint board (``SourceTraits.sprint_board``,
+        or a sweep on a v7 project): tickets mode and a v7 sweep never read or
+        write one, so a stray board file at the configured path is not seeded
+        either.
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        if not worksource.resumed_traits_for(self.state.source).sprint_board:
+        if not self._sprint_board():
             return ()
         return _artifact_seed(
             self.paths.sprint_status,
@@ -2155,7 +2162,7 @@ class WorktreeFlow:
         board names no board drop, since it seeds none."""
         roots, store = self._mount_roots(worktree), self.paths.shared_store
         drops = [*_artifact_seed_dropped(self.paths.deferred_work, *roots, shared_store=store)]
-        if worksource.resumed_traits_for(self.state.source).sprint_board:
+        if self._sprint_board():
             drops.extend(
                 _artifact_seed_dropped(self.paths.sprint_status, *roots, shared_store=store)
             )

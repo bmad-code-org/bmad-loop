@@ -345,6 +345,14 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     return 1
 
 
+def _sweep_store_source(paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy) -> str:
+    """The source whose store a sweep works, for the store-topology refusal. On
+    v7 the ledger lives in the initiative folder of the ticket store, whatever
+    ``[stories] source`` says, so a v7 sweep is judged as a tickets run. A sweep
+    persists no source of its own."""
+    return worksource.SOURCE_TICKETS if paths.era == "v7" else pol.stories.source
+
+
 def _reject_store_topology(
     project: Path, pol, source: str, *, recorded: dict[str, str | None] | None = None
 ) -> int | None:
@@ -4316,7 +4324,9 @@ def _sweep_factory(
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
-        store = ticketstore.store_conflict(project, pol.stories.source, pol.scm.isolation)
+        store = ticketstore.store_conflict(
+            project, _sweep_store_source(paths, pol), pol.scm.isolation
+        )
         if store is not None:
             raise RuntimeError(store)
         # Same refusal as the three rc-returning sites, same raise-not-return reason
@@ -4408,8 +4418,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
-    # a sweep works the configured source's store (its ledger lives there on v7)
-    if (rc := _reject_store_topology(project, pol, pol.stories.source)) is not None:
+    # a sweep works its ledger's store: the ticket store on v7
+    if (rc := _reject_store_topology(project, pol, _sweep_store_source(paths, pol))) is not None:
         return rc
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):

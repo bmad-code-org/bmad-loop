@@ -2,7 +2,7 @@
 
 A sweep works through the deferred-work ledger (`deferred-work.md`), the list of follow-ups that dev and review sessions defer. A fresh triage session checks every selected open entry against the code and sorts it: already resolved, buildable bundles, blocked, skip, or a decision that needs a human. You answer the decisions. Each bundle then runs through the normal story pipeline (dev → verify → review → commit), and its review gate also requires every bundled entry to be `status: done` in the ledger.
 
-On a BMAD v7 project the ledger is `deferred-work.md` in the active initiative folder, or in `output_folder` when no initiative is active. Entries harvested from a ticket plan name it in `source_spec:` by its path inside the initiative folder, because plan file names repeat across epics.
+On a BMAD v7 project the ledger is `deferred-work.md` in the active initiative folder, or in `output_folder` when no initiative is active. Entries harvested from a ticket plan name it in `source_spec:` by its path inside the initiative folder, because plan file names repeat across epics. See [Sweeps on BMAD v7](#sweeps-on-bmad-v7) for what else changes.
 
 ```text
 bmad-loop sweep [--only DW-1,DW-3 | --min-severity LEVEL] [--no-prompt] [--decisions-only]
@@ -77,6 +77,16 @@ A ledger with entries that are not in `DW-<n>` format is migrated automatically 
 | asked to delete `migrate-*` records by hand (native Windows)                | delete every `migrate-*` file in the run dir, resume                                                                                                           |
 
 A migration fails validation if it drops an existing `gate:` token, changes an existing status, or breaks the numbering.
+
+## Sweeps on BMAD v7
+
+A sweep runs on a v7 project the same way, with these differences:
+
+- **No sprint board.** A v7 sweep never reads `sprint-status.yaml`, never seeds one into a unit worktree, and its review prompts say nothing about one. A stray board at the old path is ignored.
+- **Bundle plans.** Each bundle hands `bmad-build-auto` its free-form intent. The skill writes `plan-<slug>.md` in the initiative folder (or `output_folder`) and is asked to lead the slug with the bundle key, such as `dw-fix-things`. The orchestrator still finds the plan by scanning that folder; the ledger there never counts as a result.
+- **`built` closes a bundle.** build-auto finishes a plan at `built`. The dev gate, the ledger close, the review gate and the review reclose all accept `built` or `done`. A bundle is not a ticket, so nothing marks its plan `done`: it stays `built`.
+- **No retro ingest.** v7 retrospective action items are prose in the epic retrospective, not records. A fresh sweep files none and journals `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
+- **Store layout.** The store-topology check judges a v7 sweep as a tickets run, because its ledger lives in the ticket store.
 
 ## Story-declared closure (`closes_deferred`)
 

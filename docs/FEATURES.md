@@ -246,6 +246,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Ingest runs only at a fresh sweep's start: never on `--dry-run`, on a resumed sweep, or while the ledger is in doubt.
   - Each item is filed once: its `retro action item <id>` origin dedupes against entries of any status, archived stubs included.
   - An unreadable board or a non-list `action_items` is journaled `sweep-retro-ingest-unavailable` and the sweep proceeds.
+  - A BMAD v7 project has no board: the ingest reads nothing and journals `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
   - An auto-sweep that did not run is reported: `bmad-loop status` prints `auto-sweep not run`; `status --json` and `diagnose` list `sweeps_refused`.
 - **Config:** `action_items:` list in sprint-status.yaml (written by bmad-retrospective); `[sweep] auto`
 - **Tested by:** `tests/test_sweep.py`, `tests/test_sprintstatus.py`, `tests/test_cli.py`

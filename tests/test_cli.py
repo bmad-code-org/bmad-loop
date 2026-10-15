@@ -1,6 +1,7 @@
 """CLI command tests — init policy-derived profiles and per-stage dry-run."""
 
 import argparse
+import dataclasses
 import hashlib
 import io
 import json
@@ -22929,3 +22930,19 @@ def test_resolve_restore_patch_latches_the_evacuated_copy(project_v7):
         assert cli._resolve_restore_patch(
             project_v7.project, run.run_dir, "s1", args, pol, run.state, run.task
         ) == (str(copy.resolve()), None)
+
+
+def test_sweep_store_source_judges_a_v7_sweep_as_a_tickets_run(project_v7):
+    """A sweep persists no source of its own, and on v7 its ledger lives in the
+    ticket store, so the store-topology refusal must classify that store even
+    when `[stories] source` is the sprint default. A v6 sweep keeps the
+    configured source.
+
+    ABLATION: return `pol.stories.source` unconditionally and the v7 row reads
+    `sprint-status`, which `store_conflict` answers None for any store."""
+    pol = policy_mod.Policy()
+    assert pol.stories.source == "sprint-status"
+    v7 = bmadconfig.load_paths(project_v7.project)
+    assert cli._sweep_store_source(v7, pol) == "tickets"
+    v6 = dataclasses.replace(v7, era="v6", active_initiative="", initiative_folder=None)
+    assert cli._sweep_store_source(v6, pol) == "sprint-status"

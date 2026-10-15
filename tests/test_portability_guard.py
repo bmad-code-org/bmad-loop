@@ -755,10 +755,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # it collapses to `mcp`; any name outside the set ships as `other`.
         "in_tool",
         # `sweep-retro-ingest-unavailable`'s discriminator (DW-388): WHICH input the
-        # retro action-item ingest could not use, as a closed three-value enum
+        # retro action-item ingest could not use, as a closed four-value enum
         # (`sprint-status-unreadable` | `action-items-malformed` |
-        # `ledger-unavailable`) chosen by the except arm, never read from either
-        # file. A closed slug deliberately — `error`, the natural spelling, is in
+        # `ledger-unavailable` | `no-board`, a v7 project's sweep) chosen by the
+        # code arm, never read from either file. A closed slug deliberately — `error`, the natural spelling, is in
         # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence marker, which
         # could not tell the operator whether to repair the board or the ledger.
         # Item ids and action text are operator free text and are never journaled.
@@ -2025,9 +2025,10 @@ JOURNAL_KINDS = frozenset(
         # entries and is routed by name (`diagnostics._JOURNAL_KEYLIST_FIELDS`).
         "sweep-retro-items-ingested",
         # ...and its degrade: the board could not be read, its `action_items` is
-        # not a list, or the ledger append faulted before writing. The sweep
-        # carries on without ingesting. `ingest_cause` is the closed slug that
-        # tells the three apart; `error` is already a drop field.
+        # not a list, the ledger append faulted before writing, or the project is
+        # v7 and has no board. The sweep carries on without ingesting.
+        # `ingest_cause` is the closed slug that tells the four apart; `error` is
+        # already a drop field.
         "sweep-retro-ingest-unavailable",
         "sweep-return-no-client",
         "sweep-returned-after-decisions",
@@ -2799,7 +2800,7 @@ def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
 
     Empty and occupied-but-unreadable are different answers and must not share one
     return value. ``sweep.py``'s own ``_close_bundle_ledger_when_spec_status(task,
-    str(spec_file), success_status)`` omits ``kind`` and relies on the default, so
+    str(spec_file), success_statuses)`` omits ``kind`` and relies on the default, so
     folding the empty slot into the sentinel reddens the clean tree.
 
     A non-literal in an occupied slot is FLAGGED, not skipped. Deferring it to the
@@ -9809,7 +9810,7 @@ def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
     a KEYWORD-ONLY `kind` (no positional slot exists, so a string in that argument
     position is some other parameter's), an EMPTY slot (the parameter default, which the
     definition arm reports instead — `sweep.py`'s own
-    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)` call
+    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_statuses)` call
     relies on it, so flagging an omitted `kind` would redden the clean tree), the same
     call in a file declaring no such position, and a declared FORWARDER whose positional
     kind the journal-write emit already reports — double-reporting one site would make a

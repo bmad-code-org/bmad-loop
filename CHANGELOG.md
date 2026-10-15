@@ -91,6 +91,10 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   by id (`1`) or folder (`epic-cart`), or a backlog file name. `validate` and the run
   refuse the gated ticket. A v6 story-key token fails `deferred.hard-gate` and pauses the
   run at `story-gate` until it is rewritten.
+- Run deferred-work sweeps on BMAD v7 initiatives. A v7 sweep never reads a sprint board,
+  its bundles write a `plan-<slug>.md` in the initiative folder and close their entries
+  at `built` (or `done`), and retro action-item ingest journals
+  `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
 - Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
   `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,

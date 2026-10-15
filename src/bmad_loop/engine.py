@@ -121,7 +121,7 @@ from .sprintstatus import advanced_bytes as sprint_advanced_bytes
 from .sprintstatus import status_in_bytes as sprint_status_in_bytes
 from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
-from .worksource import Halt, SourceUnreadable, WorkRef, WorkSource
+from .worksource import Halt, SourceUnreadable, WorkRef, WorkSource, resumed_traits_for
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
 
@@ -1036,6 +1036,7 @@ class Engine:
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
             unit_branch_epic=lambda task: self._unit_branch_epic(task),
+            sprint_board=lambda: self._has_sprint_board(),
         )
         # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
         # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
@@ -1846,6 +1847,12 @@ class Engine:
         converges on them (verify, then commit) unless the pass recommends a
         follow-up. Base: the v6 ``done``."""
         return frozenset({devcontract.DONE})
+
+    def _has_sprint_board(self) -> bool:
+        """Whether this run keeps the v6 sprint board: the worktree seed carries
+        it into a unit. Base: the persisted source's ``SourceTraits.sprint_board``.
+        A sweep on a v7 project has none."""
+        return resumed_traits_for(self.state.source).sprint_board
 
     def _phases(self) -> dict[str, Phase]:
         """Every unit this run already touched, by key, with its phase."""

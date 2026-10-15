@@ -53,7 +53,7 @@ from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
@@ -102,7 +102,7 @@ from bmad_loop.sweep import (
     validate_triage,
 )
 from bmad_loop.tui import launch
-from bmad_loop.verify import worktree_clean
+from bmad_loop.verify import rev_parse_head, worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -37842,3 +37842,287 @@ def test_escalated_restart_over_dirt_resets_then_restores_the_snapshot(project):
     assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
     assert git(project.project, "for-each-ref", "refs/attempt-preserve-dirty/") != ""
     assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+
+
+# ------------------------------------------------------------- sweep on BMAD v7
+
+
+def _v7_paths(layout) -> ProjectPaths:
+    """A pure v7 install resolves as v7 with no `want_tickets`, as `cmd_sweep`
+    loads it."""
+    paths = load_paths(layout.project)
+    assert paths.era == "v7" and paths.implementation_artifacts == layout.initiative_folder
+    return paths
+
+
+def _v7_plan(paths: ProjectPaths, name: str) -> Path:
+    """Where build-auto writes a free-form bundle's plan: `plan-<slug>.md` in the
+    initiative folder, its slug led by the bundle key."""
+    return paths.implementation_artifacts / f"plan-dw-{name}.md"
+
+
+def _v7_bundle_dev_effect(paths: ProjectPaths, name: str, dw_ids, *, followup_review: bool):
+    """A v7 build-auto bundle session: it edits code and finishes its plan at
+    `built`, never `done` (the orchestrator owns `done`, and a bundle never gets
+    it). It leaves the ledger alone."""
+
+    def effect(spec):
+        baseline = rev_parse_head(paths.project)
+        source = paths.project / "src.txt"
+        source.write_text(source.read_text(encoding="utf-8") + f"change for dw-{name}\n", "utf-8")
+        plan = _v7_plan(paths, name)
+        write_spec(plan, "built", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(plan),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "followup_review_recommended": followup_review,
+            },
+        )
+
+    return effect
+
+
+def _v7_bundle_review_effect(paths: ProjectPaths, name: str):
+    """A follow-up review of a `built` plan: it converges and leaves the plan at
+    `built`."""
+
+    def effect(spec):
+        plan = _v7_plan(paths, name)
+        baseline = _spec_baseline(plan)
+        write_spec(plan, "built", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(plan),
+                "baseline_commit": baseline,
+                "status": "built",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
+def _plant_stray_board(paths: ProjectPaths) -> None:
+    """A sprint board at the path a v6 sweep would read, carrying an open retro
+    action item, committed: a v7 sweep must ignore it."""
+    paths.sprint_status.write_text(
+        "development_status:\n  epic-1: done\naction_items:\n"
+        "  - id: epic-1-retro-item-1-x\n    action: Add X\n    status: open\n",
+        encoding="utf-8",
+    )
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "stray board")
+
+
+def _forbid_sprint_board(monkeypatch) -> list[str]:
+    """Make every public `sprintstatus` function raise, in that module and
+    wherever a `bmad_loop` module imported it by name, and fail every sprint
+    source read. Returns the names that were called. An `AssertionError` is no
+    exception any board reader catches, so a call also crashes the run."""
+    from bmad_loop import sprintstatus
+    from bmad_loop.sprint_source import SprintWorkSource
+
+    called: list[str] = []
+
+    def raiser(name):
+        def boom(*args, **kwargs):
+            called.append(name)
+            raise AssertionError(f"a v7 sweep read the sprint board: {name}")
+
+        return boom
+
+    targets = {
+        obj: name
+        for name, obj in vars(sprintstatus).items()
+        if callable(obj)
+        and getattr(obj, "__module__", None) == sprintstatus.__name__
+        and not isinstance(obj, type)
+        and not name.startswith("_")
+    }
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or not mod_name.startswith("bmad_loop"):
+            continue
+        for attr, value in list(vars(mod).items()):
+            if not isinstance(value, type) and callable(value) and value in targets:
+                monkeypatch.setattr(mod, attr, raiser(targets[value]))
+    for method in ("pick", "remaining_estimate", "epic_progress", "retro_done", "retro_docs"):
+        monkeypatch.setattr(SprintWorkSource, method, raiser(f"SprintWorkSource.{method}"))
+    return called
+
+
+def _v7_review_policy(enabled: bool) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=enabled),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def test_v7_sweep_never_reads_sprint_status(project_v7, monkeypatch, tmp_path):
+    """A sweep persists no source, so it inherits the sprint source (which has
+    epics) and every sprint-board seam keyed on it. On v7 there is no board: a
+    full sweep (triage, one bundle, its review) reads none, even with a stray
+    board on disk, and no seam would carry one into a worktree.
+
+    ABLATION (each reddens this test): drop the `_make_work_source` override
+    (the source is a sprint source with epics); drop the v7 arm of
+    `_ingest_retro_action_items` (the board read crashes the run); drop the
+    `_sprint_board_instruction` override (the review prompt names
+    sprint-status.yaml); drop the `_has_sprint_board` override (the worktree
+    seed carries the stray board); drop the `_review_converged_statuses`
+    override (a review ending at `built` never converges, and the run asks for
+    a second review)."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    _plant_stray_board(paths)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, adapter = make_sweep(
+        paths,
+        [
+            triage_effect(plan),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=True),
+            _v7_bundle_review_effect(paths, "fix-things"),
+        ],
+        policy=_v7_review_policy(enabled=True),
+    )
+    called = _forbid_sprint_board(monkeypatch)
+
+    assert isinstance(engine.source, sweep_mod.NoBoardWorkSource)
+    assert not engine.source.has_epics
+    assert engine.source.pick({}, None).ref is None
+
+    summary = engine.run()
+
+    assert called == []
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    assert len(adapter.sessions) == 3
+    review_prompt = adapter.sessions[2].prompt
+    assert "sprint-status" not in review_prompt
+    assert "dw-fix-things" in adapter.sessions[1].prompt
+    worktree = tmp_path / "unit"
+    worktree.mkdir()
+    assert engine._worktree_flow._board_seed(worktree) == ()
+    assert engine._worktree_flow._artifact_seed_drops(worktree) == []
+
+
+def test_v7_bundle_closes_on_built(project_v7):
+    """build-auto finishes a v7 bundle's plan at `built`. The dev gate accepts
+    it, the orchestrator closes the bundle's entries, and the plan stays
+    `built`: a bundle is not a ticket, so nothing marks it `done`.
+
+    ABLATION: drop the v7 arm of `_bundle_success_statuses` and the dev gate
+    expects `done`, so the attempt retries and the entries stay open."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    engine, adapter = make_sweep(
+        paths,
+        [
+            triage_effect(plan),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1", "DW-2"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    entries = ledger_entries(paths)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert "resolved by sweep bundle dw-fix-things" in entries["DW-1"].body
+    assert verify.status_of(verify.read_frontmatter(_v7_plan(paths, "fix-things"))) == "built"
+    assert len(_records(engine, "sweep-bundle-closed")) == 1
+    # the free-form intent names the initiative folder and the slug hint
+    dev_prompt = adapter.sessions[1].prompt
+    assert "Lead the plan slug with `dw-fix-things`." in dev_prompt
+    folder = paths.initiative_folder.relative_to(paths.project).as_posix()
+    assert f"the initiative folder `{folder}`" in dev_prompt
+    assert "implementation_artifacts" not in dev_prompt
+
+
+def test_v7_bundle_review_accepts_built(project_v7):
+    """A follow-up review of a `built` plan leaves it `built`. The review gate
+    accepts that, and its reclose finds the plan at a success status: a review
+    that rewrote the ledger gets its entries closed again.
+
+    ABLATION: drop the v7 arm of `_bundle_success_statuses` and the review gate
+    retries on a `built` plan ("expected 'done'"); the reclose skips it too."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    plan = _v7_plan(paths, "fix-things")
+    write_spec(plan, "built", rev_parse_head(paths.project))
+    engine, _ = make_sweep(paths, [], policy=_v7_review_policy(enabled=True))
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"], spec_file=str(plan))
+
+    outcome = engine._verify_review(task)
+
+    assert outcome.ok, outcome.reason
+    assert ledger_entries(paths)["DW-1"].status.startswith("done")
+    assert len(_records(engine, "sweep-bundle-reclosed")) == 1
+    # still `built`: the review gate never asks for `done` on v7
+    assert verify.status_of(verify.read_frontmatter(plan)) == "built"
+
+
+def test_v7_bundle_verify_gates_keep_the_v6_rule_without_accept_statuses(project):
+    """`accept_statuses=None` keeps both bundle gates on today's v6 statuses and
+    wording, so a v6 sweep is unchanged."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    spec = bundle_spec_path(project, "fix-things")
+    write_spec(spec, "built", rev_parse_head(project.project))
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+
+    review = verify.verify_review_bundle(task, project, Policy())
+    assert not review.ok and review.reason == "spec status is 'built', expected 'done'"
+    accepted = verify.verify_review_bundle(
+        task, project, Policy(), accept_statuses=frozenset({"built", "done"})
+    )
+    assert accepted.ok, accepted.reason
+
+
+def test_v7_retro_ingest_skipped_journaled(project_v7, monkeypatch):
+    """A v7 project has no sprint board, and its retro action items are prose in
+    the epic retrospective. A fresh v7 sweep files nothing, reads no board (a
+    stray one on disk included), and says so: one
+    `sweep-retro-ingest-unavailable` row with `ingest_cause="no-board"`.
+
+    ABLATION: drop the v7 arm and the stray board's open item is read (the
+    forbidden read crashes the run) instead of journaled as unavailable."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    _plant_stray_board(paths)
+    before = paths.deferred_work.read_bytes()
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, adapter = make_sweep(paths, [triage_effect(plan)])
+    called = _forbid_sprint_board(monkeypatch)
+
+    summary = engine.run()
+
+    assert called == []
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert paths.deferred_work.read_bytes() == before
+    (row,) = _records(engine, "sweep-retro-ingest-unavailable")
+    assert row["ingest_cause"] == "no-board"
+    assert "error" not in row
+    assert _records(engine, "sweep-retro-items-ingested") == []
