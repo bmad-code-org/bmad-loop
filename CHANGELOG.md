@@ -18,6 +18,8 @@ breaking changes may land in a minor release.
   reader, uv, active initiative, repo store; tracker stores are refused) and the dev
   primitive's ticket route (`skills.tickets-dispatch*`). `validate --probes` also probes
   the project's `tickets.py`.
+- Support BMAD-METHOD v7 as of upstream main `8f0d50e1` (`6.13.0-next`; v7 is not yet
+  tagged). The tickets contract tests run against `tickets.py` vendored at that commit.
 - Add the tickets work source: dispatch `bmad-build-auto ticket <ref>` from the v7 ticket
   tree (tracked in-repo store). The run picks in initiative build order, pauses on hitl
   and unrefined tickets, verifies each plan at `built`, and marks it `done` inside the
