@@ -1181,6 +1181,7 @@ def test_ticket_mark_ref_is_pseudonymized():
         "ticket-hitl-pause",
         "ticket-refine-pause",
         "ticket-pick-halt",
+        "ticket-story-approved",
     ],
 )
 def test_ticket_engine_kinds_pseudonymize_their_ref(kind):
