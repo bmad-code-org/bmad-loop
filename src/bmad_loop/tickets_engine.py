@@ -52,7 +52,7 @@ from . import gates, verify
 from .adapters.base import SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
-from .frontmatter import parse_frontmatter, status_of
+from .frontmatter import frontmatter_fault, parse_frontmatter, status_of
 from .model import (
     PAUSE_TICKET_TREE,
     Phase,
@@ -367,7 +367,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         into the unit worktree only. A missing plan is not produced. A plan that is
         there but cannot be read stops the dispatch (:meth:`_plan_unreadable`):
         answering False would send another ``Halt after planning.`` leg onto
-        planning work whose status nobody could read."""
+        planning work whose status nobody could read. An unrefined
+        ``plan_checkpoint`` plan whose frontmatter does not parse stops it the
+        same way; any other unit dispatches no halt leg either way, so its build
+        meets the malformed plan instead."""
         plan = self._bound_plan(task)
         if plan is None:
             return False
@@ -377,9 +380,14 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return False
         except (OSError, UnicodeDecodeError) as e:
             self._plan_unreadable(task, plan, e)
+        ticket = task.ticket
+        if ticket is not None and ticket.plan_checkpoint and not ticket.refined:
+            fault = frontmatter_fault(text)
+            if fault is not None:
+                self._plan_unreadable(task, plan, fault)
         return plan_planned(status_of(parse_frontmatter(text)))
 
-    def _plan_unreadable(self, task: StoryTask, plan: Path, error: Exception) -> NoReturn:
+    def _plan_unreadable(self, task: StoryTask, plan: Path, error: Exception | str) -> NoReturn:
         """The bound plan is on disk but cannot be read, before any session for
         this dispatch launched. A PENDING task has run nothing: pause at
         ``ticket-tree`` with the fault, as a ``find`` fault does, and the resume

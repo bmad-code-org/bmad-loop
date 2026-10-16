@@ -623,6 +623,41 @@ def test_unreadable_checkpoint_plan_stops_the_dispatch(project_v7):
     assert running.phase == Phase.ESCALATED
 
 
+@pytest.mark.parametrize(
+    ("body", "fault"),
+    [
+        (b"# plan with no frontmatter\n", "no frontmatter block"),
+        (b"---\nticket: 1\nstatus: [ready-for-dev\n---\n", "unparseable frontmatter YAML"),
+        (b"---\n- ready-for-dev\n---\n", "frontmatter is not a mapping"),
+    ],
+)
+def test_malformed_checkpoint_plan_stops_the_dispatch(project_v7, body, fault):
+    """`parse_frontmatter` folds a plan with no block, unparseable YAML or a
+    non-mapping document into `{}`, which raises nothing. An unrefined
+    plan-checkpoint plan in that shape still pauses at `ticket-tree` naming the
+    fault, instead of reading as unplanned and sending another `Halt after
+    planning.` leg onto it. A unit that sends no halt leg dispatches as before.
+    Ablation (performed): drop the `frontmatter_fault` check in `_plan_produced`
+    and the halt leg dispatches — this FAILS."""
+    row = ticket_row("1.1", plan_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    plan = Path(tree.finds["1.1"].plan)
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_bytes(body)
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._plan_halt_now(task)
+    assert paused.value.stage == PAUSE_TICKET_TREE
+    assert fault in str(paused.value)
+    assert task.phase == Phase.PENDING
+
+    assert task.ticket is not None
+    task.ticket = dataclasses.replace(task.ticket, plan_checkpoint=False)
+    assert not engine._plan_halt_now(task)
+
+
 def test_bound_plan_moves_with_a_renamed_project(project_v7, tmp_path):
     """`find` names the plan absolute under the launch-time project, which
     `state.project` keeps. A resume after the project moved reads, re-arms and
