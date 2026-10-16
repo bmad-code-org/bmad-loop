@@ -8380,6 +8380,33 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_sweep_resume_judges_the_store_of_the_configured_source(
+    project, monkeypatch, capsys, source
+):
+    """A sweep persists no source (its `RunState.source` is the launch default),
+    so resume judges the store under `[stories] source`, as `cmd_sweep` does: a
+    tickets-source sweep is refused by its store, a sprint-status one is not judged
+    as tickets. Ablation (performed): pass `state.source` to the gate and the
+    tickets row FAILS (the stub engine runs)."""
+    from bmad_loop import ticketstore
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    _write_policy(project.project, RESUME_POLICY + f'\n[stories]\nsource = "{source}"\n')
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    rc = cli._resume_paused_run(project.project, run_dir)
+    assert rc == (1 if source == "tickets" else 0)
+    err = capsys.readouterr().err
+    assert ("error: the ticket store is not supported" in err) == (source == "tickets")
+    assert (_resume_entries(run_dir) == []) == (source == "tickets")
+
+
 @pytest.mark.parametrize("how", ["deleted", "partial"])
 def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
     project, monkeypatch, capsys, how

@@ -4659,9 +4659,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    # A sweep persists no source; its store is judged under the configured source,
+    # as at launch, against the topology it recorded.
+    store_source = pol.stories.source if state.run_type == "sweep" else state.source
     if (
         rc := _reject_store_topology(
-            project, pol, state.source, recorded=runs.live_store_topology(state, project) or None
+            project, pol, store_source, recorded=runs.live_store_topology(state, project) or None
         )
     ) is not None:
         return rc
