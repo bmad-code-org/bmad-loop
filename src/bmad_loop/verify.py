@@ -7004,6 +7004,19 @@ def worktree_list(repo: Path) -> list[Path]:
     return paths
 
 
+def _is_directory(path: Path) -> bool:
+    """Whether ``path`` is a directory; False only when it is absent or names a
+    non-directory. Any other stat fault (a permission change, a filesystem race)
+    raises :class:`GitError` — ``Path.is_dir`` would raise an untyped ``OSError``
+    or, from Python 3.14, read it as False."""
+    try:
+        return stat.S_ISDIR(path.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        raise GitError(f"cannot stat {path}: {e}") from e
+
+
 def git_toplevel(path: Path) -> Path | None:
     """The working-tree root of the repository holding ``path`` (canonical), or None
     when ``path`` lies in no repository — or does not exist, which git answers the
@@ -7016,10 +7029,11 @@ def git_toplevel(path: Path) -> Path | None:
     :class:`GitError`, as a spawn or timeout fault raises typed
     (:class:`GitSpawnError` / :class:`GitTimeoutError`): folded into "not a
     repository", a store repository git refuses would classify as unversioned.
-    So does a toplevel git reported but this cannot canonicalize."""
+    So does a toplevel git reported but this cannot canonicalize, and a ``path``
+    this cannot stat for a reason other than its absence."""
     proc = _run_git(["git", "-C", str(path), "rev-parse", "--show-toplevel"], path)
     if proc.returncode != 0:
-        if not path.is_dir() or any(
+        if not _is_directory(path) or any(
             line.startswith(_NOT_A_REPOSITORY_PREFIX) for line in proc.stderr.splitlines()
         ):
             return None

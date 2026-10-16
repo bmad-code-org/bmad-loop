@@ -114,6 +114,25 @@ def test_git_toplevel_reads_only_no_repository_as_none(tmp_path):
         verify.git_toplevel(tmp_path)
 
 
+def test_git_toplevel_raises_when_the_path_cannot_be_statted(tmp_path, monkeypatch):
+    """A failed discovery over a ``path`` that cannot be statted (a permission
+    change, a filesystem race) raises rather than reading as an absent path, so
+    the probe refuses rather than reading T6. Ablation (performed): restore
+    ``Path.is_dir`` in `git_toplevel` and this FAILS (an untyped OSError before
+    Python 3.14, None from it)."""
+    locked = tmp_path / "locked"
+    real = Path.stat
+
+    def stat(self, *, follow_symlinks=True):
+        if self == locked:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    with pytest.raises(verify.GitError, match="cannot stat"):
+        verify.git_toplevel(locked)
+
+
 def test_git_toplevel_raises_when_the_reported_toplevel_cannot_resolve(project_v7, monkeypatch):
     """A toplevel git reported but `resolve` cannot canonicalize (a permission or
     filesystem race) raises, so the probe refuses rather than reading T6."""

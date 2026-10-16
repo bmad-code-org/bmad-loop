@@ -13373,7 +13373,7 @@ def test_dirty_ledger_only_does_not_pause(project_v7):
 # from tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
 
 
-def _store_engine(layout, tree, expect, **kw):
+def _store_engine(layout, tree, expect, *, merge_strategy="merge", **kw):
     """`make_engine` under worktree isolation, the run's topology recorded from the
     real probe as `runsetup` stamps it (asserted to be layout ``expect``)."""
     from test_tickets_engine import _policy, make_engine
@@ -13384,7 +13384,8 @@ def _store_engine(layout, tree, expect, **kw):
     paths = load_paths(layout.project, want_tickets=True)
     topology = ticketstore.assess_store(paths, "worktree")
     assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == expect
-    pol = replace(_policy(), scm=ScmPolicy(isolation="worktree", delete_branch=False))
+    scm = ScmPolicy(isolation="worktree", delete_branch=False, merge_strategy=merge_strategy)
+    pol = replace(_policy(), scm=scm)
     return make_engine(layout, tree, policy=pol, store_topology=topology.to_dict(), **kw)
 
 
@@ -13402,7 +13403,7 @@ def _store_tree(layout, *refs):
     return tree
 
 
-def _store_run(layout, expect, monkeypatch):
+def _store_run(layout, expect, monkeypatch, **kw):
     """One ticket built and merged back over a shared store of layout ``expect``."""
     from test_tickets_engine import _builds_shared, _marking_tree
 
@@ -13410,7 +13411,7 @@ def _store_run(layout, expect, monkeypatch):
     plan = Path(tree.finds["1.1"].plan)
     _marking_tree(tree, plan, monkeypatch)
     engine, _ = _store_engine(
-        layout, tree, expect, script=[_builds_shared(layout, tree, plan)], max_stories=1
+        layout, tree, expect, script=[_builds_shared(layout, tree, plan)], max_stories=1, **kw
     )
     engine.run()
     return engine, tree, plan
@@ -13449,6 +13450,24 @@ def test_t3_mark_done_commits_in_store_repo(project_v7_store_repo, monkeypatch):
 
     _assert_plan_committed(engine, layout.output_folder, plan)
     assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
+
+
+def test_squash_merge_back_trailers_name_the_landed_commit(project_v7_store_repo, monkeypatch):
+    """A `squash` merge-back lands a different commit than the unit's, and the
+    unit branch's teardown leaves the unit's unreachable: the store trailers name
+    the target's head, which holds the unit's code. Ablation (performed): pass
+    `task.commit_sha` in `_commit_marked_plan` again and this FAILS."""
+    layout = project_v7_store_repo
+    engine, _, _ = _store_run(layout, "T3", monkeypatch, merge_strategy="squash")
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    repo = engine.paths.repo_root
+    landed = verify.rev_parse_head(repo)
+    assert landed != task.commit_sha and not verify.is_ancestor(repo, task.commit_sha, landed)
+    body = git(layout.output_folder, "log", "-1", "--format=%B")
+    assert f"Bmad-Code-Commit: {landed}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{landed}" in body
 
 
 def test_t4_external_store_commit(project_v7_external_store, monkeypatch):
