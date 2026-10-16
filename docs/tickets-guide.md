@@ -117,7 +117,7 @@ Checkpoints follow upstream's entries in the epic file:
 
 Before each pick and at run end, the run checks the epic table. An open epic is finished when every ticket is `built`, `done` or `dropped`. If this run committed one of its tickets, the epic gets its retrospective:
 
-- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>/<epic-slug>-retrospective.md`, and commits only that document (in the store repository for T3 and T4). A valid document already on disk counts.
+- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>/<epic-slug>-retrospective.md`, and commits only that document (in the store repository for T3 and T4). A valid document already on disk counts. A dirty tree or a git fault pauses at `epic-boundary` before the session and a stop request stops the run; neither records a closure, so the resume runs the retrospective.
 - `"notify"` and `"never"` run no session.
 
 The run records the document's `verdict` (or `unknown` when there is none) and pauses at `epic-boundary`. bmad-loop never writes the epic's file: close the epic with bmad-ticket, then resume. A `rejected` verdict pauses every later pick while the epic stays open, though fix-up tickets added to the rejected epic still run. Any other verdict pauses once; resuming past an epic still open journals `epic-closure-not-recorded`. Details: [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode).
