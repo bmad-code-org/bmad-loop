@@ -41,9 +41,11 @@ breaking changes may land in a minor release.
 - Drive every repo-store layout: a store tracked in the code checkout is marked inside
   the unit's commit; an ignored folder or a store in its own repository is marked after
   the code lands (latched and replayed on resume), and a store repository gets plan-only
-  commits with `Bmad-Code-*` trailers. A failed store commit is retried before the run
-  finishes and pauses at `ticket-tree` if still owed; a failed retrospective commit
-  pauses at the epic boundary before its closure, and the resume commits it. A store
+  commits with `Bmad-Code-*` trailers, the `built` plan too under `mark_done = "never"`.
+  A store commit never overwrites a person's staged version of a path, even one deleted
+  from disk. A failed store commit is retried before the run finishes and pauses at
+  `ticket-tree` if still owed; a failed retrospective commit pauses at the epic boundary
+  before its closure, and the resume commits it. A store
   inside a renamed project moves with it. `confirm` commits a store plan in the store's
   own repository.
 - Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to tickets unit commits, and name worktree
