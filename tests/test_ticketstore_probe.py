@@ -145,6 +145,26 @@ def test_probe_unstattable_epic_is_a_refusal_not_absent(project_v7, monkeypatch)
     assert "cannot stat" in (ticketstore.store_topology_conflict(result) or "")
 
 
+def test_probe_unstattable_initiative_is_a_refusal_not_missing(project_v7, monkeypatch):
+    """A stat fault on the initiative folder itself is `probe-failed`: neither an
+    untyped `OSError` out of validate/preflight nor (Python 3.14 `is_dir`) a
+    missing initiative that records no topology."""
+    paths = _paths(project_v7)
+    initiative = paths.initiative_folder
+    faulty = {initiative, initiative.resolve()}
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self in faulty:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    result = ticketstore.assess_store(paths, "none")
+    assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
+    assert "cannot stat" in (ticketstore.store_topology_conflict(result) or "")
+
+
 def test_probe_refused_store_repository_is_a_refusal_not_unversioned(project_v7_store_repo):
     """A store repository git refuses to open (here a broken gitfile; a
     `safe.directory` ownership refusal answers the same way) is `probe-failed`,

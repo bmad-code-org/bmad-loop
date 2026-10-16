@@ -463,7 +463,9 @@ def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> Store
     store_root, initiative = paths.output_folder.resolve(), initiative.resolve()
     repo_toplevel = verify.git_toplevel(repo_root)
     project_toplevel = verify.git_toplevel(project)
-    store_toplevel = verify.git_toplevel(initiative if initiative.is_dir() else store_root)
+    store_toplevel = verify.git_toplevel(
+        initiative if _has_mode(initiative, stat.S_IFDIR) else store_root
+    )
     tracked: list[tuple[str, bool]] = []
     if repo_toplevel is not None and store_toplevel == repo_toplevel:
         # Against the toplevel, not repo_root: a nested repo_root need not hold the
@@ -500,11 +502,14 @@ def assess_store(
     """Probe and classify the store of ``paths`` (loaded for tickets mode). None
     when there is no active initiative folder to classify — the tickets preflight
     reports that on its own (``tickets.initiative-unset`` / ``-missing``). A git
-    fault is a ``probe-failed`` refusal, never a guess."""
+    fault — or an initiative folder that cannot be statted — is a ``probe-failed``
+    refusal, never a guess."""
     initiative = paths.initiative_folder
-    if paths.era != "v7" or initiative is None or not initiative.is_dir():
+    if paths.era != "v7" or initiative is None:
         return None
     try:
+        if not _has_mode(initiative, stat.S_IFDIR):
+            return None
         facts = probe_store_facts(paths, initiative)
     except verify.GitError as e:
         return StoreRefusal("probe-failed", initiative, str(e))
