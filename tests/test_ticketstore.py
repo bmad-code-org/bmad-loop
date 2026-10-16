@@ -138,7 +138,8 @@ def test_nested_store_not_ignored_refused():
     result = classify_store(_facts(store_toplevel=STORE, tracked=(), ignored=False), "none")
     assert isinstance(result, StoreRefusal)
     assert result.code == "store-not-ignored"
-    assert "nested repository" in (store_topology_conflict(result) or "")
+    assert result.path == STORE  # the repository root, which is what must be ignored
+    assert f"store repository {STORE} is nested" in (store_topology_conflict(result) or "")
 
 
 def test_untracked_unignored_folder_refused():

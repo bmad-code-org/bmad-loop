@@ -71,6 +71,28 @@ def test_probe_nested_store_repo_not_ignored_is_refused(project_v7_store_repo):
     assert isinstance(result, StoreRefusal) and result.code == "store-not-ignored"
 
 
+def test_probe_nested_store_repo_with_only_the_initiative_ignored_is_refused(
+    project_v7_store_repo,
+):
+    """A rule over the initiative alone hides nothing of a nested store repository:
+    git lists the unignored repository root as `dir/` without descending, so the
+    clean-tree gate would refuse the run that validate passed. The root is what
+    must be ignored — refused as `store-not-ignored`, naming it. Ablation
+    (performed): probe `ignored` on the initiative again and this FAILS (T3)."""
+    layout = project_v7_store_repo
+    root = layout.project
+    initiative = layout.initiative_folder.relative_to(root).as_posix()
+    (root / ".gitignore").write_text(
+        f".bmad-loop/runs/\n_bmad/custom/*.user.toml\n/{initiative}/\n", encoding="utf-8"
+    )
+    assert verify.path_ignored(root, layout.initiative_folder)
+    assert "_bmad-output/" in verify.dirty_paths(root)
+    result = ticketstore.assess_store(_paths(layout), "none")
+    assert isinstance(result, StoreRefusal) and result.code == "store-not-ignored"
+    assert result.path == layout.output_folder.resolve()
+    assert "store repository" in (ticketstore.store_topology_conflict(result) or "")
+
+
 def test_probe_non_repo_workspace(project_v7):
     """The project is not a repository (a BMAD workspace): T5, refused."""
     remove_tree(project_v7.project / ".git")

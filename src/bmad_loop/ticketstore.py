@@ -107,7 +107,10 @@ class StoreFacts:
     as a posix path relative to the code repo's toplevel with whether the code
     repo tracks it;
     empty when the store is not in the code repo. ``ignored`` is whether the code
-    repo ignores the initiative folder. The two ``user_config_*`` facts are about
+    repo ignores the initiative folder — or, for a store repository nested in the
+    code repo, that repository's root: git does not descend into an unignored
+    nested repository, so it shows as untracked dirt whatever ignores the
+    initiative inside it. The two ``user_config_*`` facts are about
     :data:`USER_CONFIG_REL` in the code repo, which the redirect rewrites."""
 
     project: Path
@@ -241,7 +244,7 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
     result: StoreTopology | StoreRefusal
     if facts.store_toplevel is not None and facts.store_toplevel != facts.repo_toplevel:
         if in_checkout and not facts.ignored:
-            return StoreRefusal("store-not-ignored", initiative, "a nested repository")
+            return StoreRefusal("store-not-ignored", facts.store_toplevel, "a nested repository")
         result = StoreTopology(
             "T3" if in_checkout else "T4",
             shared,
@@ -332,6 +335,12 @@ def _refusal_text(refusal: StoreRefusal) -> str:
             f"the initiative folder {path} is only partly tracked by the code "
             f"repository (untracked: {refusal.detail}) — commit the whole initiative "
             "folder, or gitignore all of it"
+        )
+    if code == "store-not-ignored" and refusal.detail == "a nested repository":
+        return (
+            f"the store repository {path} is nested inside the code checkout, which "
+            "does not ignore it — it shows as untracked dirt and bmad-build-auto "
+            "halts on an unclean tree; gitignore the store repository's root folder"
         )
     if code == "store-not-ignored":
         return (
@@ -479,6 +488,11 @@ def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> Store
     except ValueError:
         user_rel = None
     in_repo = repo_toplevel is not None  # nothing below can ask a non-repository
+    # A nested store repository is ignored only if its ROOT is: git lists an
+    # unignored one as `dir/` without descending, so a rule over the initiative
+    # inside it hides nothing (see StoreFacts.ignored).
+    nested = store_toplevel is not None and store_toplevel != repo_toplevel
+    ignore_probe = store_toplevel if nested and store_toplevel is not None else initiative
     return StoreFacts(
         project=project,
         repo_root=repo_root,
@@ -488,7 +502,7 @@ def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> Store
         repo_toplevel=repo_toplevel,
         store_toplevel=store_toplevel,
         tracked=tuple(tracked),
-        ignored=in_repo and verify.path_ignored(repo_root, initiative),
+        ignored=in_repo and verify.path_ignored(repo_root, ignore_probe),
         user_config_tracked=(
             in_repo and user_rel is not None and verify.path_tracked(repo_root, user_rel)
         ),
