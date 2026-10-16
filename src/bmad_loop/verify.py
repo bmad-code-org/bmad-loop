@@ -7010,12 +7010,20 @@ def git_toplevel(path: Path) -> Path | None:
     same way. A ticket store's own repository (``ticketstore``) and the code repo
     are told apart by comparing these.
 
-    Git refusing reads as None; a spawn or timeout fault is raised typed
-    (:class:`GitSpawnError` / :class:`GitTimeoutError`), never folded into "not a
-    repository"."""
+    Only git's discovery answer (:data:`_NOT_A_REPOSITORY_PREFIX`) or an absent
+    ``path`` reads as None. Any other refusal — a ``safe.directory`` ownership
+    refusal, a broken gitfile — is a real repository's fault and raises
+    :class:`GitError`, as a spawn or timeout fault raises typed
+    (:class:`GitSpawnError` / :class:`GitTimeoutError`): folded into "not a
+    repository", a store repository git refuses would classify as unversioned."""
     proc = _run_git(["git", "-C", str(path), "rev-parse", "--show-toplevel"], path)
     if proc.returncode != 0:
-        return None
+        if not path.is_dir() or any(
+            line.startswith(_NOT_A_REPOSITORY_PREFIX) for line in proc.stderr.splitlines()
+        ):
+            return None
+        detail = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git rev-parse --show-toplevel failed in {path}: {detail}")
     # Git terminates this scalar with one newline; the path may itself hold others.
     top = proc.stdout.removesuffix("\n")
     try:

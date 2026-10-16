@@ -88,6 +88,31 @@ def test_probe_git_fault_is_a_refusal_not_a_guess(project_v7, monkeypatch):
     assert "failed to spawn" in (ticketstore.store_topology_conflict(result) or "")
 
 
+def test_probe_refused_store_repository_is_a_refusal_not_unversioned(project_v7_store_repo):
+    """A store repository git refuses to open (here a broken gitfile; a
+    `safe.directory` ownership refusal answers the same way) is `probe-failed`,
+    never the unversioned T6 a store in no repository classifies as."""
+    store = project_v7_store_repo.output_folder
+    (store / ".git").rename(store / ".git-moved")
+    (store / ".git").write_text("gitdir: /nonexistent/store.git\n", encoding="utf-8")
+    try:
+        result = ticketstore.assess_store(_paths(project_v7_store_repo), "worktree")
+    finally:  # the fixture's teardown removes the repository it made
+        (store / ".git").unlink()
+        (store / ".git-moved").rename(store / ".git")
+    assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
+
+
+def test_git_toplevel_reads_only_no_repository_as_none(tmp_path):
+    """`git_toplevel` answers None for a directory in no repository and for an
+    absent path; a repository git refuses raises."""
+    assert verify.git_toplevel(tmp_path) is None
+    assert verify.git_toplevel(tmp_path / "absent") is None
+    (tmp_path / ".git").write_text("gitdir: /nonexistent/repo.git\n", encoding="utf-8")
+    with pytest.raises(verify.GitError, match="show-toplevel"):
+        verify.git_toplevel(tmp_path)
+
+
 def test_store_conflict_is_silent_outside_tickets_mode(project_v7_store_repo):
     """Only a tickets run classifies the store: a recorded topology the live T3
     store contradicts refuses a tickets run and nothing else, and the T3 store

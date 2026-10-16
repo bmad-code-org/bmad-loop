@@ -2239,6 +2239,9 @@ def _warn_preflight_would_abort(
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
     preview must not promise an abort over it. ``require_tickets`` (the tickets
     dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set.
+    Both mirror the store-topology refusal (`_reject_store_topology`) the real
+    command applies: a tickets run's store, and the store of the source a sweep
+    works.
 
     The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
     fatal verdicts only: an inert never-granted plugin does not abort the launch.
@@ -2258,10 +2261,14 @@ def _warn_preflight_would_abort(
         )
         if p.severity == "problem"
     ]
-    if require_tickets and (
-        store := ticketstore.store_conflict(
-            paths.project, worksource.SOURCE_TICKETS, pol.scm.isolation
-        )
+    # the store the launch judges: a tickets run's, or the one a sweep works
+    store_source = (
+        worksource.SOURCE_TICKETS
+        if require_tickets
+        else pol.stories.source if require_sweep else None
+    )
+    if store_source is not None and (
+        store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)
     ):
         problems.insert(0, store)
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)

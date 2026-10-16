@@ -241,6 +241,28 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert "NOT runnable" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_sweep_dry_run_banner_mirrors_the_store_refusal(project, capsys, monkeypatch, source):
+    """`cmd_sweep` refuses the ticket store of the source it works before the
+    dry-run's early return could, so the banner mirrors it: a tickets-source sweep
+    names the store's refusal, a sprint-status one is not judged as tickets.
+    Ablation (performed): gate the store check on `require_tickets` alone and the
+    tickets row FAILS."""
+    from bmad_loop import ticketstore
+
+    _write_policy(project.project, f'[stories]\nsource = "{source}"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+
+    assert cli._sweep_dry_run(project, pol) == 0
+    err = capsys.readouterr().err
+    assert ("FAIL: the ticket store is not supported" in err) == (source == "tickets")
+
+
 def _break_sweep_skill(root: Path, tree: str, how: str) -> None:
     """Leave ``root/tree``'s `bmad-loop-sweep` deleted outright or partial (its
     automation mode file gone) — the two DW-367 damage shapes."""
