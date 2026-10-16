@@ -347,12 +347,16 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     below). The most recent triage's wording of each id wins. Sorted by DW
     number.
 
-    On BMAD v7 with an initiative active, the store is that initiative's
-    (:func:`store_scope`) and only that initiative's sweeps are read: DW ids are
-    numbered per initiative ledger, so another initiative's triage names
-    different entries under the same ids."""
+    On BMAD v7 the store is the active initiative's (:func:`store_scope`) and
+    only that initiative's sweeps are read: DW ids are numbered per initiative
+    ledger, so another initiative's triage names different entries under the
+    same ids. With no initiative active only runs that recorded none are read,
+    since the ``output_folder`` ledger numbers its ids independently too."""
     paths = bmadconfig.load_paths(project)
     scope = store_scope(paths)
+    # The initiative a run must have recorded for its triage to be read: v7
+    # filters every run, including the no-initiative case (""); v6 reads all.
+    run_scope = (scope or "") if paths.era == "v7" else None
     ledger = paths.deferred_work
     # OBSERVATION arm of the ledger-read contract (DW-146). This helper writes
     # nothing: every caller is a read-only surface (`cmd_decisions`, `cmd_status`,
@@ -401,7 +405,7 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # A listing fault (DW-468) is surfaced by the callers, as the ledger fault
     # above is: `cmd_decisions` notes it on stderr, the TUI reports it as its fault.
     for run_dir in runs.list_run_dirs(project)[0]:
-        if scope is not None and _run_initiative(run_dir) != scope:
+        if run_scope is not None and _run_initiative(run_dir) != run_scope:
             continue
         for tp in run_dir.glob("triage*.json"):
             m = _TRIAGE_RE.match(tp.name)

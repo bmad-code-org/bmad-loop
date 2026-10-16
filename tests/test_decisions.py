@@ -2351,6 +2351,39 @@ def test_pre_answer_store_scoped_per_initiative(project_v7):
     assert [(d.id, d.question) for d in pending] == [("DW-1", "beta q")]
 
 
+def test_pending_with_no_initiative_skips_initiative_runs(project_v7):
+    """On BMAD v7 with no initiative active the ledger is the `output_folder`
+    one, whose DW ids are numbered independently of every initiative's. An old
+    initiative's triage naming the same `DW-1` must not be offered (and so
+    answered) against it; a run that recorded no initiative still is.
+
+    ABLATION (performed): filter only when `scope` is set and the `alpha`
+    run's question comes back instead of the unscoped run's."""
+    layout = project_v7
+    project = layout.project
+    alpha = _activate(layout, "alpha")
+    _open_ledger(alpha.deferred_work, "DW-1")
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="unscoped q")]),
+    )
+    _make_run(
+        layout,
+        "20260602-000000-bbbb",
+        _triage(["DW-1"], [_decision("DW-1", question="alpha q")]),
+        initiative="alpha",
+    )
+
+    (project / V7_USER_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+    paths = bmadconfig.load_paths(project)
+    assert paths.era == "v7" and not paths.active_initiative
+    _open_ledger(paths.deferred_work, "DW-1")
+
+    pending = decisions.pending_missed_decisions(project)
+    assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
+
+
 def test_v6_store_path_unchanged(project):
     """v6 (and v7 with no initiative active) keeps the single
     `.bmad-loop/decisions.json` store, written by an out-of-band answer exactly
