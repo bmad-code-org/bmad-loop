@@ -2274,7 +2274,7 @@ def _warn_preflight_would_abort(
     store_source = (
         worksource.SOURCE_TICKETS
         if require_tickets
-        else pol.stories.source if require_sweep else None
+        else _sweep_store_source(paths, pol) if require_sweep else None
     )
     if store_source is not None and (
         store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)

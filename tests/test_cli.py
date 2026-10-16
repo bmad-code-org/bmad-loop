@@ -264,6 +264,26 @@ def test_sweep_dry_run_banner_mirrors_the_store_refusal(project, capsys, monkeyp
     assert ("FAIL: the ticket store is not supported" in err) == (source == "tickets")
 
 
+def test_sweep_dry_run_judges_a_v7_ledger_store_as_tickets(project_v7, capsys, monkeypatch):
+    """On v7 the ledger lives in the ticket store whatever `[stories] source` says,
+    so the banner judges the store as tickets, as `cmd_sweep` does
+    (`_sweep_store_source`). Ablation (performed): judge `pol.stories.source`
+    instead and this FAILS."""
+    from bmad_loop import ticketstore
+
+    _write_policy(project_v7.project, '[stories]\nsource = "sprint-status"\n')
+    pol = policy_mod.load(project_v7.project / ".bmad-loop" / "policy.toml")
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+
+    paths = bmadconfig.load_paths(project_v7.project)
+    assert cli._sweep_dry_run(paths, pol) == 0
+    assert "FAIL: the ticket store is not supported" in capsys.readouterr().err
+
+
 def _break_sweep_skill(root: Path, tree: str, how: str) -> None:
     """Leave ``root/tree``'s `bmad-loop-sweep` deleted outright or partial (its
     automation mode file gone) — the two DW-367 damage shapes."""
