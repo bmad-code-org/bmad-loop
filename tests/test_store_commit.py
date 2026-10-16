@@ -123,10 +123,12 @@ def test_store_commit_failure_keeps_latch_and_journals(project_v7_store_repo, mo
     """The plan is marked `done` after the code lands, but its store commit fails
     (a git fault, or a human's staged version of the plan): the run goes on — the
     commit is bookkeeping — with `store-commit-failed` / `store-commit-foreign-dirt`
-    journaled and the latch kept, and the resume (the fault gone) marks again,
-    a no-op, then commits the plan and clears the latch. Ablation (performed):
-    clear the latch whatever the commit did and the resume has nothing to replay
-    — this FAILS."""
+    journaled and the latch kept. At run end the commit is retried, fails again,
+    and the run pauses at `ticket-tree` (`store-commit-owed`) instead of finishing,
+    so the resume (the fault gone) marks again, a no-op, then commits the plan and
+    clears the latch. Ablation (performed): clear the latch whatever the commit did
+    and the resume has nothing to replay — this FAILS; drop the run-end settle and
+    the run finishes, which `resume` refuses — this FAILS."""
     layout = project_v7_store_repo
     store = layout.output_folder
     tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
@@ -155,13 +157,17 @@ def test_store_commit_failure_keeps_latch_and_journals(project_v7_store_repo, mo
 
     result = engine.run()
 
-    assert not result.paused
-    task = load_state(engine.run_dir).tasks["1.1"]
+    assert result.paused
+    state = load_state(engine.run_dir)
+    assert not state.finished
+    assert (state.paused_stage, state.paused_story_key) == ("ticket-tree", "1.1")
+    task = state.tasks["1.1"]
     assert task.phase == Phase.DONE and task.ticket_done_pending
     assert _plan_status(plan) == "done"
     assert verify.rev_parse_head(store) == store_head
     kind = "store-commit-failed" if fault == "git" else "store-commit-foreign-dirt"
-    assert [e["story_key"] for e in _kinds(engine, kind)] == ["1.1"]
+    assert [e["story_key"] for e in _kinds(engine, kind)] == ["1.1", "1.1"]
+    assert [e["story_key"] for e in _kinds(engine, "store-commit-owed")] == ["1.1"]
     assert not _kinds(engine, "store-committed")
 
     monkeypatch.setattr(verify, "commit_paths", real)
@@ -171,9 +177,51 @@ def test_store_commit_failure_keeps_latch_and_journals(project_v7_store_repo, mo
     resumed._replay_post_landing_writes()
 
     assert not load_state(engine.run_dir).tasks["1.1"].ticket_done_pending
-    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written"), ("done", "noop")]
+    assert [(m.target, m.outcome) for m in tree.marks] == [
+        ("done", "written"),
+        ("done", "noop"),
+        ("done", "noop"),
+    ]
     assert _subjects(store)[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
     assert [e["story_key"] for e in _kinds(resumed, "store-committed")] == ["1.1"]
+
+
+def test_store_commit_failed_mid_run_is_retried_before_finishing(
+    project_v7_store_repo, monkeypatch
+):
+    """A store commit that fails once (a transient git fault) keeps its latch, and
+    the run retries it before recording `finished` — a finished run refuses
+    `resume`, so no later retry could reach it: the plan is committed, the latch
+    cleared, and the run finishes. Ablation (performed): drop the
+    `_settle_owed_store_commits` call in `_run_end_retrospective` and the run
+    finishes with the latch set and the plan uncommitted — this FAILS."""
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    real = verify.commit_paths
+    faults = [verify.GitError("index.lock exists")]
+
+    def commit_paths(repo, message, paths):
+        if faults and Path(repo).resolve() == store.resolve():
+            raise faults.pop()
+        return real(repo, message, paths)
+
+    monkeypatch.setattr(verify, "commit_paths", commit_paths)
+    engine, _ = _shared_engine(
+        layout, tree, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+
+    result = engine.run()
+
+    assert not result.paused
+    state = load_state(engine.run_dir)
+    assert state.finished and not state.tasks["1.1"].ticket_done_pending
+    assert [e["story_key"] for e in _kinds(engine, "store-commit-failed")] == ["1.1"]
+    assert [e["story_key"] for e in _kinds(engine, "run-end-ticket-mark")] == ["1.1"]
+    assert [e["story_key"] for e in _kinds(engine, "store-committed")] == ["1.1"]
+    assert _subjects(store)[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
 
 
 def test_retro_doc_committed_in_store_repo(project_v7_store_repo, monkeypatch):

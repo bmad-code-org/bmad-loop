@@ -375,7 +375,8 @@ STORE_TOPOLOGY_CALLERS = {
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
     ("cli.py", "cmd_sweep"): 1,
-    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm, as the #414 pair
+    # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
+    ("cli.py", "cmd_resolve"): 3,
     ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "_prepare_resume_locked"): 1,  # re-validates the recorded topology
     ("cli.py", "_warn_preflight_would_abort"): 1,
@@ -574,6 +575,7 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # (`done` / `blocked`), latched and replayed.
     "ticket-mark-latched": frozenset({"target"}),
     "resume-ticket-mark": frozenset({"target"}),
+    "run-end-ticket-mark": frozenset({"target"}),
     # tickets_engine.py: the unversioned store's closed layout token (`T2`/`T6`).
     "store-unversioned": frozenset({"layout"}),
 }
@@ -2062,10 +2064,13 @@ JOURNAL_KINDS = frozenset(
         # the epic boundary: the closure it recorded, and a resume past an epic
         # still open (its `retro-auto-*` rows reuse the base kinds with `epic_ref`).
         # And a shared store's mark latched for after the code lands, and its
-        # replay on resume; its store-repository commit (made, failed, or skipped
-        # over a foreign staged version) and an unversioned store, once a run.
+        # replay on resume or retry at run end; its store-repository commit (made,
+        # failed, skipped over a foreign staged version, or still owed at run end)
+        # and an unversioned store, once a run.
         "epic-closure-not-recorded",
         "resume-ticket-mark",
+        "run-end-ticket-mark",
+        "store-commit-owed",
         "store-commit-failed",
         "store-commit-foreign-dirt",
         "store-committed",

@@ -56,8 +56,9 @@ breaking changes may land in a minor release.
 - Support a ticket store in its own git repository, nested in the code checkout or
   outside it: each marked plan (and the ledger the unit wrote) gets a plan-only commit
   there with `Bmad-Code-*` trailers, and so does an epic's retrospective document. A
-  failed store commit is journaled and retried on resume, never pauses the run, and
-  shows in `status`. Tickets runs now drive every classified store layout.
+  failed store commit is journaled and shows in `status`; the run goes on, retries it
+  before finishing and pauses at `ticket-tree` if it is still owed. A store inside a
+  renamed project moves with it. Tickets runs now drive every classified store layout.
 - Re-arm a ticket plan after a code rollback: a plan past `ready-for-dev` returns to
   `ready-for-dev` through `tickets.py mark`, and a frontmatter-only plan is deleted.
   A plan restore is confined to the ticket store root.

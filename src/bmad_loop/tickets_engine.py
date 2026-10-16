@@ -117,7 +117,7 @@ from .model import (
     result_mapping,
 )
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
-from .runs import graceful_stop_requested, rebase_recorded_project_path
+from .runs import graceful_stop_requested, live_store_topology, rebase_recorded_project_path
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
 from .ticketmodel import StatusView
 from .tickets_source import (
@@ -303,10 +303,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._unversioned_noted: bool | None = None
         # A store no checkout carries is shared: every artifact dir under it stays
         # at the main checkout (`ProjectPaths.rebased`), and worktree mounts are
-        # redirected to it. Read from the topology the run recorded at its start.
+        # redirected to it. Read from the topology the run recorded at its start,
+        # moved with a renamed project.
         state, paths = kwargs.get("state"), kwargs.get("paths")
         if state is not None and paths is not None and state.store_topology:
-            kwargs["paths"] = ticketstore.with_shared_store(paths, state.store_topology)
+            kwargs["paths"] = ticketstore.with_shared_store(
+                paths, live_store_topology(state, paths.project)
+            )
         super().__init__(*args, **kwargs)
         # pin the mode so resume/resolve rebuild a TicketsEngine without policy.
         self.state.source = SOURCE_TICKETS
@@ -315,9 +318,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     @property
     def store_topology(self) -> ticketstore.StoreTopology | None:
-        """The ticket store the run recorded at its start; None when it recorded
+        """The ticket store the run recorded at its start, located on the live
+        project (:func:`~bmad_loop.runs.live_store_topology`); None when it recorded
         none (no initiative to classify, or a run older than the record)."""
-        recorded = self.state.store_topology
+        recorded = live_store_topology(self.state, self.paths.project)
         return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
 
     @property
@@ -575,7 +579,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         that cannot be read journals ``retro-run-end-skipped``
         (``board-unreadable``) and pauses at ``ticket-tree``, as the pick's own
         read fault does: the epics this run committed are known to this run only,
-        so finishing would lose the boundary for good."""
+        so finishing would lose the boundary for good. Store commits a landed
+        mark still owes are settled first (:meth:`_settle_owed_store_commits`)."""
+        self._settle_owed_store_commits()
         try:
             status_view = self.ticket_tree.status()
         except TicketsError as e:
@@ -1705,13 +1711,46 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         marks it there). A unit still in flight marks after its own landing.
         Journals ``resume-ticket-mark`` per replayed mark."""
         for task in list(self.state.tasks.values()):
-            target = self._post_landing_target(task)
-            if not target or task.phase not in (Phase.DONE, Phase.AWAITING_OPERATOR):
-                continue
-            if task.worktree_path and not task.isolated_ledger_carried:
-                continue
-            self.journal.append("resume-ticket-mark", story_key=task.story_key, target=target)
-            self._land_post_landing_writes(task)
+            if target := self._landed_mark_owed(task):
+                self.journal.append("resume-ticket-mark", story_key=task.story_key, target=target)
+                self._land_post_landing_writes(task)
+
+    def _landed_mark_owed(self, task: StoryTask) -> str:
+        """The latched mark ``task`` still owes although its code has landed — a
+        DONE or AWAITING_OPERATOR unit, in place or merged back — or ""."""
+        target = self._post_landing_target(task)
+        if not target or task.phase not in (Phase.DONE, Phase.AWAITING_OPERATOR):
+            return ""
+        if task.worktree_path and not task.isolated_ledger_carried:
+            return ""
+        return target
+
+    def _settle_owed_store_commits(self) -> None:
+        """Retry, before the run can finish, every mark and store commit a landed
+        unit still owes. A store commit that fails mid-run keeps its latch and the
+        run goes on, but a run recorded ``finished`` refuses ``resume``, so nothing
+        would retry it after. Journals ``run-end-ticket-mark`` per retried mark; one
+        still owed pauses at ``ticket-tree`` (``store-commit-owed``), so the run stays
+        resumable and the resume retries it (:meth:`_replay_post_landing_writes`);
+        ``store-commit-owed`` is journaled per unit still owing."""
+        for task in list(self.state.tasks.values()):
+            if target := self._landed_mark_owed(task):
+                self.journal.append("run-end-ticket-mark", story_key=task.story_key, target=target)
+                self._land_post_landing_writes(task)
+        owed = [t.story_key for t in self.state.tasks.values() if self._landed_mark_owed(t)]
+        if not owed:
+            return
+        topology = self.store_topology
+        repo = topology.store_repo if topology is not None else None
+        for key in owed:
+            self.journal.append("store-commit-owed", story_key=key)
+        reason = (
+            f"the store commit of {', '.join(owed)} is still owed in {repo} (see the "
+            "journal's store-commit-failed / store-commit-foreign-dirt rows) — commit or "
+            f"unstage the store's own changes to those paths, then {self._resume_hint()}"
+        )
+        gates.notify(self.policy, self.run_dir, "store commit owed", reason)
+        raise RunPaused(reason, PAUSE_TICKET_TREE, owed[0])
 
     def _pause_post_landing_mark(self, task: StoryTask, target: str, detail: str) -> NoReturn:
         what = "parking" if target == "blocked" else "marking"

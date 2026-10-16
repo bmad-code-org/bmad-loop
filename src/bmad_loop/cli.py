@@ -4655,7 +4655,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (
         rc := _reject_store_topology(
-            project, pol, state.source, recorded=state.store_topology or None
+            project, pol, state.source, recorded=runs.live_store_topology(state, project) or None
         )
     ) is not None:
         return rc
@@ -5432,6 +5432,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         ):
             return rc
 
+    # The resume's ticket-store refusal, judged ahead of the reverify/adopt
+    # dispatches for the same reason: each persists its transition before the
+    # resume that would refuse a changed store. The re-arm path judges it below.
+    early = reverify or getattr(args, "adopt_branch", False)
+    if (
+        early
+        and state.source == worksource.SOURCE_TICKETS
+        and (
+            rc := _reject_store_topology(
+                project,
+                policy_mod.load(_policy_path(project)),
+                state.source,
+                recorded=runs.live_store_topology(state, project) or None,
+            )
+        )
+        is not None
+    ):
+        return rc
+
     # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
     # as --adopt-branch, and likewise ahead of the interactive session it never runs.
     if reverify:
@@ -5512,7 +5531,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 return rc
             if (
                 rc := _reject_store_topology(
-                    project, pol, state.source, recorded=state.store_topology or None
+                    project,
+                    pol,
+                    state.source,
+                    recorded=runs.live_store_topology(state, project) or None,
                 )
             ) is not None:
                 return rc
@@ -5704,7 +5726,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             return rc
         if (
             rc := _reject_store_topology(
-                project, pol, state.source, recorded=state.store_topology or None
+                project,
+                pol,
+                state.source,
+                recorded=runs.live_store_topology(state, project) or None,
             )
         ) is not None:
             return rc
@@ -6220,7 +6245,7 @@ def _resolve_reverify_finished(
         return rc
     if (
         rc := _reject_store_topology(
-            project, pol, state.source, recorded=state.store_topology or None
+            project, pol, state.source, recorded=runs.live_store_topology(state, project) or None
         )
     ) is not None:
         return rc

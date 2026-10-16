@@ -4958,6 +4958,43 @@ def test_resolve_adopt_branch_refusals_leave_state_untouched(
     assert _state_bytes(run_dir) == before
 
 
+@pytest.mark.parametrize("flag", ["--adopt-branch", "--reverify"])
+def test_resolve_early_dispatch_refuses_a_changed_ticket_store_first(
+    tmp_path, monkeypatch, capsys, flag
+):
+    """A tickets run's `--adopt-branch` / `--reverify` each persist a transition
+    before the resume that refuses a changed ticket store, so the store is judged
+    ahead of both: rc 1 with the store's refusal, the state untouched. Ablation
+    (performed): drop the early `_reject_store_topology` gate in `cmd_resolve` and
+    both rows FAIL (adopt persists COMMITTING; reverify refuses for another reason)."""
+    from bmad_loop import ticketstore
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.store_topology = {"layout": "T3", "store_root": str(tmp_path / "store")}
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    seen: list[object] = []
+
+    def conflict(_project, source, _isolation, *, recorded=None):
+        seen.append(recorded)
+        return "the ticket store changed since this run started" if source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", flag, "--resume"])
+
+    assert rc == 1
+    assert "the ticket store changed since this run started" in capsys.readouterr().err
+    assert seen and seen[0] == state.store_topology
+    assert _state_bytes(run_dir) == before
+
+
 def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
     from bmad_loop.journal import load_state, save_state
 
@@ -12977,6 +13014,52 @@ def test_resume_tickets_refuses_a_changed_store_topology(project, capsys, monkey
     assert cli._resume_paused_run(project.project, run_dir) == 1
     assert "the ticket store changed since this run started" in capsys.readouterr().err
     assert built == []
+
+
+def test_resume_tickets_accepts_a_store_moved_with_the_project(project, capsys, monkeypatch):
+    """A project renamed while its tickets run was paused moves its in-project
+    store too: the topology recorded under the launch-time project is rebased onto
+    the live one (`runs.live_store_topology`) before it is compared, so the resume
+    is not refused as a changed store. Ablation (performed): compare the raw
+    `state.store_topology` in `_prepare_resume_locked` and this FAILS (rc 1)."""
+    from bmad_loop import bmadconfig, runs
+    from bmad_loop.journal import load_state, save_state
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    store = bmadconfig.load_paths(project.project, want_tickets=True).output_folder
+    launched = project.project.parent / "launched-here"
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5708",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology={
+            "layout": "T1",
+            "placement": "checkout",
+            "versioning": "code-repo",
+            "store_root": str(launched / store.relative_to(project.project)),
+            "store_repo": None,
+        },
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    state = load_state(run_dir)
+    state.project = str(launched)
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+    assert len(built) == 1
 
 
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):

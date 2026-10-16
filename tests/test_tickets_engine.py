@@ -2949,6 +2949,41 @@ def test_post_landing_mark_moves_with_a_renamed_project(
     assert task.ticket_done_pending is False
 
 
+def test_shared_store_record_moves_with_a_renamed_project(project_v7_store_repo, tmp_path):
+    """A nested store (T3) recorded under the launch-time project is located on
+    the live one: the engine's shared store and the store repository it commits
+    in are the moved paths, not the recorded ones. Ablation (performed): read the
+    raw `state.store_topology` in `TicketsEngine.__init__` / `store_topology` and
+    both name the old path — this FAILS."""
+    from bmad_loop import ticketstore
+
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    paths = load_paths(layout.project, want_tickets=True)
+    live = ticketstore.assess_store(paths, "none")
+    assert isinstance(live, ticketstore.StoreTopology) and live.store_repo is not None
+    launched = tmp_path / "launched-here"
+    moved = dataclasses.replace(
+        live,
+        store_root=launched / live.store_root.relative_to(layout.project),
+        store_repo=launched / live.store_repo.relative_to(layout.project),
+    )
+    engine, _ = make_engine(layout, tree, policy=_policy(), store_topology=moved.to_dict())
+    engine.state.project = str(launched)
+    resumed = TicketsEngine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=engine.state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+
+    assert resumed.paths.shared_store == live.store_root
+    assert resumed.store_topology == live
+
+
 def test_crash_before_merge_back_replays_merge_then_marks(project_v7_store_repo, monkeypatch):
     """Under worktree isolation a host lost after the unit committed in its mount
     but before the merge-back leaves a DONE unit whose code is NOT on the target:

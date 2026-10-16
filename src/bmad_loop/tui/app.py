@@ -1367,7 +1367,7 @@ class BmadLoopApp(App[None]):
                         self.project,
                         recorded.source,
                         isolation,
-                        recorded=recorded.store_topology or None,
+                        recorded=runs.live_store_topology(recorded, self.project) or None,
                     )
             if conflict is not None:
                 self.notify(conflict, severity="error")

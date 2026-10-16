@@ -4499,6 +4499,22 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     return project_root / relative
 
 
+def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:
+    """`state.store_topology` located on the live project: its `store_root` and
+    `store_repo` moved with a renamed project (`rebase_recorded_project_path`), so a
+    store inside the project (T1–T3) still equals the one `load_paths` classifies
+    under the new path, and the engine marks and commits there. A store outside the
+    recorded project (T4) is unchanged; empty when the run recorded none."""
+    live = dict(state.store_topology)
+    for key in ("store_root", "store_repo"):
+        value = live.get(key)
+        if isinstance(value, str) and value:
+            rebased = rebase_recorded_project_path(Path(value), state, project_root)
+            if rebased != Path(value):
+                live[key] = str(rebased)
+    return live
+
+
 def rebase_recorded_code_root(state: RunState, project_root: Path) -> Path:
     """`state.code_root` located on the live project, for a run never re-stamped.
 
@@ -7390,7 +7406,7 @@ def standalone_replay_refusal(
             f"`bmad-loop resolve {run_id} --reverify --story {story_key}`"
         )
     if state.run_type == "sweep":
-        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; " f"{by_hand}"
+        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; {by_hand}"
     # An allowlist, not a denylist: only a source whose queue a replay can read is
     # admitted. A source the registry does not carry is refused here rather than
     # falling through to the sprint-board read below as if it were a sprint run.
