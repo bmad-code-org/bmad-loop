@@ -5339,6 +5339,48 @@ def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypat
         assert phase != Phase.ESCALATED
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+@pytest.mark.parametrize("mode", ["interactive", "--no-interactive"])
+def test_resolve_judges_a_sweeps_store_under_the_configured_source(
+    project, monkeypatch, capsys, mode, source
+):
+    """A sweep persists no source (its `RunState.source` is the launch default), so
+    the re-arm's store refusals — before the interactive session and after the
+    confirm — judge `[stories] source`, as the resume they precede does: a
+    tickets-source sweep with a refused store is refused before anything is spent,
+    a sprint-status one is not judged as tickets. Ablation (performed): pass
+    `state.source` at either site and its tickets row FAILS (the action runs)."""
+    from bmad_loop import resolve, ticketstore
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1", run_type="sweep")
+    _write_policy(project.project, f'[stories]\nsource = "{source}"\n')
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if mode == "--no-interactive":
+        argv.append(mode)
+    if source == "tickets":
+        assert cli.main(argv) == 1
+        assert "error: the ticket store is not supported" in capsys.readouterr().err
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+    elif mode == "interactive":
+        with pytest.raises(pytest.fail.Exception, match="built adapters"):
+            cli.main(argv)  # past both store gates, into the session
+    else:
+        assert cli.main(argv) == 0
+        assert load_state(run_dir).tasks["s1"].phase != Phase.ESCALATED
+
+
 @pytest.mark.parametrize("mode", ["interactive", "--adopt-branch", "--reverify"])
 def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
     project, monkeypatch, capsys, mode

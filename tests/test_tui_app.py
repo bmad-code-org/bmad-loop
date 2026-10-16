@@ -8075,6 +8075,55 @@ def test_escalation_rearm_retains_outer_lock_through_rearm_call(project_tree, mo
     assert rearms == [run_dir]
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_escalation_rearm_judges_a_sweeps_store_under_the_configured_source(
+    project_tree, monkeypatch, source
+):
+    """`cli.cmd_resolve`'s re-arm parity: a sweep persists no source (its
+    `RunState.source` is the launch default), so the re-arm's store refusal judges
+    `[stories] source`, as the resume it folds in does — a tickets-source sweep with
+    a refused store is toasted before the escalation is spent, a sprint-status one
+    is not judged as tickets. Ablation (performed): pass `recorded.source` and the
+    tickets row FAILS (the gesture re-arms)."""
+    from bmad_loop import runs, ticketstore
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project_tree)
+    bmad = project_tree.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    (bmad / "policy.toml").write_text(f'[stories]\nsource = "{source}"\n', encoding="utf-8")
+    run_dir, _spec = _stories_paused_run(
+        project_tree.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision.",
+    )
+    state = load_state(run_dir)
+    state.run_type = "sweep"
+    save_state(run_dir, state)
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    rearms: list[str] = []
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk)
+    )
+    notes: list[str] = []
+    app = BmadLoopApp(project_tree.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    refused = "the ticket store is not supported" in notes
+    assert refused == (source == "tickets")
+    assert rearms == ([] if source == "tickets" else ["1"])
+
+
 @pytest.mark.parametrize(
     "failure",
     [OSError("lock file could not be created"), runs_mod.StateRootError("no usable state root")],

@@ -4661,7 +4661,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     # A sweep persists no source; its store is judged under the configured source,
     # as at launch, against the topology it recorded.
-    store_source = pol.stories.source if state.run_type == "sweep" else state.source
+    store_source = runs.judged_store_source(state, pol.stories.source)
     if (
         rc := _reject_store_topology(
             project, pol, store_source, recorded=runs.live_store_topology(state, project) or None
@@ -5542,7 +5542,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 rc := _reject_store_topology(
                     project,
                     pol,
-                    state.source,
+                    runs.judged_store_source(state, pol.stories.source),
                     recorded=runs.live_store_topology(state, project) or None,
                 )
             ) is not None:
@@ -5737,7 +5737,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             rc := _reject_store_topology(
                 project,
                 pol,
-                state.source,
+                runs.judged_store_source(state, pol.stories.source),
                 recorded=runs.live_store_topology(state, project) or None,
             )
         ) is not None:

@@ -1304,7 +1304,8 @@ class BmadLoopApp(App[None]):
         if refusal is not None:
             self.notify(refusal, severity="error")
             return
-        # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
+        # The LIVE isolation mode (and the stories source a sweep's store is judged
+        # under), read once and used below. `runs.rearm_escalation`
         # requires it: how the re-drive WILL run is a policy question, and the recorded
         # `task.worktree_path` answers only how the escalated attempt ran — the two part
         # company on exactly the mid-run policy edit the conflict check below is also
@@ -1320,7 +1321,7 @@ class BmadLoopApp(App[None]):
         # silently, and unrecoverably, since a re-arm consumes the escalation.
         # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
         try:
-            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+            live_policy = policy.load(self.project / POLICY_FILE)
         except (policy.PolicyError, OSError) as e:
             self.notify(
                 f"cannot read policy.toml to determine the re-drive's isolation mode "
@@ -1328,6 +1329,7 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return
+        isolation = live_policy.scm.isolation
         # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
         # `runs.rearm_escalation` reads the persisted code root back out of the run
         # state, and only a process that has just read config.yaml can tell whether a
@@ -1365,7 +1367,7 @@ class BmadLoopApp(App[None]):
                 if recorded is not None:
                     conflict = ticketstore.store_conflict(
                         self.project,
-                        recorded.source,
+                        runs.judged_store_source(recorded, live_policy.stories.source),
                         isolation,
                         recorded=runs.live_store_topology(recorded, self.project) or None,
                     )

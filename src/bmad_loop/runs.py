@@ -4499,6 +4499,14 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     return project_root / relative
 
 
+def judged_store_source(state: RunState, sweep_source: str) -> str:
+    """The source whose ticket store a paused run is judged under on resume and
+    re-arm: a story run's own `state.source`; a sweep persists no source (its
+    `RunState.source` is the launch default), so the caller's `sweep_source` — the
+    one a sweep launch is judged under."""
+    return sweep_source if state.run_type == "sweep" else state.source
+
+
 def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:
     """`state.store_topology` located on the live project: its `store_root` and
     `store_repo` moved with a renamed project (`rebase_recorded_project_path`), so a
