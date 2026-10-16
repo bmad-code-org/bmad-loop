@@ -10,6 +10,7 @@ tests/test_engine_worktree.py). Real-spawn budget: none.
 from __future__ import annotations
 
 import dataclasses
+import sys
 from pathlib import Path
 
 import pytest
@@ -431,3 +432,55 @@ def test_retro_store_commit_failure_pauses_and_resume_commits(
     assert [e["story_key"] for e in _kinds(resumed, "store-committed")][-1] == (
         "epic-cart-retrospective"
     )
+
+
+def test_retro_resume_reads_an_unresolvable_doc_as_uncommitted(project_v7_store_repo, monkeypatch):
+    """A resume after a failed retrospective store commit whose repository probe
+    cannot resolve its paths reads the document as uncommitted, not as outside
+    every repository, so `already-done` retries the store commit before recording the
+    closure. Ablation (performed): fold the resolve fault into "outside" in
+    `TicketsEngine._retro_doc_uncommitted` and the resume records the closure
+    with the document uncommitted — this FAILS."""
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    tree = _epic_tree(layout)
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    doc = _retro_doc(layout)
+    real_commit = verify.commit_paths
+    faults = [verify.GitError("index.lock exists")]
+
+    def commit_paths(repo, message, paths):
+        if faults and message.startswith("chore(retro)"):
+            raise faults.pop()
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(verify, "commit_paths", commit_paths)
+    engine, _ = _shared_engine(
+        layout,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(layout, tree, plan), _retro_writes(layout)],
+    )
+    assert engine.run().paused
+    assert load_state(engine.run_dir).ticket_epic_closures == {}
+
+    real_resolve = Path.resolve
+    faulted: list[Path] = []
+
+    def resolve(self, strict=False):
+        if sys._getframe(1).f_code.co_name == "_retro_doc_uncommitted":
+            faulted.append(self)
+            raise OSError(13, "Permission denied")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    resumed = _resume(engine, tree)
+
+    assert resumed.run().paused
+
+    assert faulted
+    state = load_state(engine.run_dir)
+    assert state.ticket_epic_closures == {"epic-cart": "accepted"}
+    assert _subjects(store)[0] == "chore(retro): epic-cart retrospective [bmad-loop test-run]"
+    assert doc.relative_to(store).as_posix() not in verify.dirty_paths(store)

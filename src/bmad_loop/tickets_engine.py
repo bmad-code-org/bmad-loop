@@ -688,8 +688,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _retro_doc_uncommitted(self, slug: str) -> bool:
         """Whether epic ``slug``'s retrospective document is dirty in the code repo,
-        or in a store with its own repository (T3/T4). A git fault reads as dirty:
-        :meth:`_settle_retro_tree` re-reads the tree and pauses on it."""
+        or in a store with its own repository (T3/T4). A git fault, or a path that
+        does not resolve, reads as dirty: :meth:`_settle_retro_tree` re-reads the
+        tree and pauses on it. Only a document outside a repository skips it."""
         doc = self._retro_doc(slug)
         roots = [self.paths.repo_root]
         topology = self.store_topology
@@ -697,8 +698,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             roots.append(topology.store_repo)
         for root in roots:
             try:
-                rel = doc.resolve().relative_to(root.resolve()).as_posix()
-            except (OSError, RuntimeError, ValueError):
+                resolved, top = doc.resolve(), root.resolve()
+            except (OSError, RuntimeError):
+                return True
+            try:
+                rel = resolved.relative_to(top).as_posix()
+            except ValueError:
                 continue  # outside this repository
             try:
                 if rel in verify.dirty_paths(root):
