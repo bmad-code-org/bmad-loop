@@ -88,7 +88,7 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   name the plan by its initiative-relative path. The ledger parser accepts the v7
   attended `bmad-build`'s flat `- source_plan:` blocks.
 - Add ticket-ref gates in tickets mode: a ledger `gate:` names a ticket (`1.2`), an epic
-  by id (`1`) or folder (`epic-cart`), or a backlog file name. `validate` and the run
+  by id (`1`) or folder (`epic-cart`). `validate` and the run
   refuse the gated ticket. A v6 story-key token fails `deferred.hard-gate` and pauses the
   run at `story-gate` until it is rewritten.
 - Run deferred-work sweeps on BMAD v7 initiatives. A v7 sweep never reads a sprint board,

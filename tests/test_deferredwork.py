@@ -2771,7 +2771,6 @@ def test_ticket_gate_shapes_agree_with_the_vendored_tickets_py(monkeypatch):
     assert deferredwork._TICKET_REF_RE.pattern == upstream.CROSS_RE.pattern
     assert deferredwork._TICKET_ID_RE.pattern == upstream.ID_RE.pattern
     assert deferredwork._EPIC_FOLDER_RE.pattern == upstream.EPIC_RE.pattern
-    assert deferredwork._BACKLOG_REF_RE.pattern == upstream.NAME_RE.pattern
 
 
 @pytest.mark.parametrize(
@@ -2782,13 +2781,10 @@ def test_ticket_gate_shapes_agree_with_the_vendored_tickets_py(monkeypatch):
         "1",  # a bare epic id
         "epic-cart",  # an epic folder
         "epic-cart.v2",  # EPIC_RE admits any folder character a line can carry
-        "story-login.md",  # a backlog leaf file name
-        "bug-crash-on-save.md",
-        "spike-cache.md",
     ],
 )
 def test_ticket_grammar_accepts_refs(token):
-    """Every shape a ticket tree names work by is a token under the ticket grammar."""
+    """Every shape a dispatched ticket answers to is a token under the ticket grammar."""
     g = _ticket_gated(f"gate: {token}")
     assert (g.tokens, g.malformed) == ((token,), ())
 
@@ -2814,7 +2810,18 @@ def test_ticket_grammar_rejects_story_keys(token):
     assert (g.tokens, g.malformed) == ((), (token,))
 
 
-@pytest.mark.parametrize("token", ["1.2", "2.6a", "story-login.md"])
+@pytest.mark.parametrize("token", ["story-login.md", "bug-crash-on-save.md", "spike-cache.md"])
+def test_ticket_grammar_rejects_backlog_file_names(token):
+    """A backlog leaf file name gates nothing: a tickets run never dispatches a
+    backlog row, and one moved into an epic is dispatched by its `E.M` ref. So it
+    is `malformed` (validate warns `deferred.hard-gate-unstructured`) rather than
+    a token that reads as a gate in force. Ablation (performed): accept the
+    leaf-name shape (`tickets.py` `NAME_RE`) under `"ticket"` and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+@pytest.mark.parametrize("token", ["1.2", "2.6a"])
 def test_story_grammar_still_rejects_dotted_ref(token):
     """The grammar is a parameter, not a union: a ticket ref on a sprint or stories
     project is a token no story key can match, so it stays `malformed` there.
@@ -2849,9 +2856,6 @@ def test_legacy_story_tokens_are_story_keys_the_ticket_grammar_cannot_read():
         ("2", "1.3", False),
         ("epic-cart", "1.3", True),  # the epic by its folder
         ("epic-carts", "1.3", False),
-        ("story-login.md", "story-login.md", True),  # a backlog row: exact
-        ("story-login.md", "story-login-v2.md", False),
-        ("1", "story-login.md", False),  # a backlog row has no epic id
     ],
 )
 def test_gates_ticket_epic_id_and_slug_arms(token, ref, gated):

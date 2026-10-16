@@ -1331,8 +1331,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"{named} in {ledger_name} declare v6 story-key gate tokens, which no ticket "
             f"ref can match, so {story_key} cannot be shown free of them — the v7 "
             f"migration keeps each story's old key as `v6_key` in its ticket file; "
-            f"rewrite the tokens as ticket refs (`E.M`, an epic id, `epic-<slug>` or a "
-            f"backlog file name) or close the entry"
+            f"rewrite the tokens as ticket refs (`E.M`, an epic id or `epic-<slug>`) or "
+            f"close the entry"
         )
 
     def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:

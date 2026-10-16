@@ -549,7 +549,7 @@ _GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
 # token no story key can ever match — the field's own silent no-op — so each queue
 # admits only the shapes its own keys can take.
 GateGrammar = Literal["story", "ticket"]
-# The four token shapes a BMAD v7 ticket tree names work by (`tickets.py`, whose
+# The three token shapes a dispatched BMAD v7 ticket answers to (`tickets.py`, whose
 # `<ref>` and `after` grammar these mirror). Copied rather than imported for the
 # same reason as `_STORIES_ID_RE`: the project's `tickets.py` is a script, not a
 # module, and the copies are pinned to the vendored upstream by a drift test.
@@ -560,8 +560,6 @@ _TICKET_REF_RE = re.compile(r"^([0-9A-Za-z]+)\.([0-9A-Za-z]+)$")
 _TICKET_ID_RE = re.compile(r"^[0-9A-Za-z]+$")
 # An epic folder (`EPIC_RE`), `epic-<slug>`: that whole epic.
 _EPIC_FOLDER_RE = re.compile(r"^epic-[^/]+$")
-# A leaf file name (`NAME_RE`), the ref of a backlog row.
-_BACKLOG_REF_RE = re.compile(r"^(story|spike|bug)-(.+)\.md$")
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -952,11 +950,13 @@ def _matchable_token(token: str, grammar: GateGrammar = "story") -> bool:
     alone admits ``3.2``, which nothing can match, and the key shapes alone admit
     ``3-2 3-3`` via the sprint slug, which is one token pretending to be two.
 
-    Under ``"ticket"`` the key shapes are the four a ticket tree names work by:
-    an ``E.M`` ref, a bare epic id, an ``epic-<slug>`` folder, and a backlog leaf
-    file name. Each is a shape :func:`gates_ticket` can match, and nothing else
-    is, so a v6 story key (``3-2``, ``3-2-invite-link``) is ``malformed`` there —
-    no ticket carries one.
+    Under ``"ticket"`` the key shapes are the three a dispatched ticket answers
+    to: an ``E.M`` ref, a bare epic id, and an ``epic-<slug>`` folder. Each is a
+    shape :func:`gates_ticket` can match, and nothing else is, so a v6 story key
+    (``3-2``, ``3-2-invite-link``) is ``malformed`` there — no ticket carries one.
+    So is a backlog leaf file name (``story-login.md``): a tickets run never
+    dispatches a backlog row, and one moved into an epic is dispatched by its new
+    ``E.M`` ref, so the file name would gate nothing in silence.
     """
     if not GATE_TOKEN_RE.match(token):
         return False
@@ -965,7 +965,6 @@ def _matchable_token(token: str, grammar: GateGrammar = "story") -> bool:
             _TICKET_REF_RE.match(token)
             or _TICKET_ID_RE.match(token)
             or _EPIC_FOLDER_RE.match(token)
-            or _BACKLOG_REF_RE.match(token)
         )
     return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
 
@@ -1033,7 +1032,7 @@ def gates_ticket(token: str, ref: str, *, epic_id: str, epic_slug: str) -> bool:
     Three arms, one per thing a ticket gate can name:
 
     - **the ticket**: ``token`` is ``ref`` — an ``E.M`` ref compared id by id the
-      way ``tickets.py`` does (``1.06`` is ``1.6``), a backlog file name exactly;
+      way ``tickets.py`` does (``1.06`` is ``1.6``);
     - **its epic by id**: a bare id that is ``epic_id`` gates every ``E.M`` of it;
     - **its epic by folder**: ``epic-<slug>`` that is ``epic_slug``.
 
@@ -1050,7 +1049,7 @@ def gates_ticket(token: str, ref: str, *, epic_id: str, epic_slug: str) -> bool:
             for a, b in zip(pair.groups(), ref_pair.groups())
         )
     if _TICKET_ID_RE.match(token):
-        # Only an `E.M` ref belongs to a listed epic; a backlog row has no epic id.
+        # Only an `E.M` ref belongs to a listed epic.
         return (
             bool(epic_id)
             and ref_pair is not None

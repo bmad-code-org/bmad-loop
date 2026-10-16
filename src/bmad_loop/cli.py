@@ -3257,7 +3257,7 @@ def _validate_hard_gates(
                 f"tickets run pauses before every ticket while it stands, starting with "
                 f"{targets[0].key}. The v7 migration keeps each story's old key as "
                 f"`v6_key` in its ticket file: rewrite the tokens as ticket refs (`E.M`, "
-                f"an epic id, `epic-<slug>` or a backlog file name), or close the entry in "
+                f"an epic id or `epic-<slug>`), or close the entry in "
                 f"{paths.deferred_work.name} (`status: done <date>`)",
                 {
                     "dw_id": entry.id,

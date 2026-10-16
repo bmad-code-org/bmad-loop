@@ -233,18 +233,19 @@ the `gate:` line to make it enforceable.
 ### `gate:` in tickets mode
 
 On a BMAD v7 project run in tickets mode (`[stories] source = "tickets"`), a
-`gate:` token names tickets, not story keys. Four forms are read:
+`gate:` token names tickets, not story keys. Three forms are read:
 
 - `1.2` — the ticket with that ref (epic id, then entry id), the form
   `tickets.py` prints. Ids compare as `tickets.py` compares them, so `1.06` is
   `1.6`;
 - `1` — every ticket of the epic with that id in the initiative's table;
-- `epic-cart` — every ticket of that epic folder;
-- `story-login.md` — a backlog row, by its file name, exactly.
+- `epic-cart` — every ticket of that epic folder.
 
 There is no prefix or split arm: ticket ids are opaque, so `2.6` does not gate
 `2.6a` and `1.2` does not gate `1.20`. A token in none of these forms (`1.2.3`)
-is `deferred.hard-gate-unstructured`, as above.
+is `deferred.hard-gate-unstructured`, as above. So is a backlog file name
+(`story-login.md`): a run never dispatches a backlog row, and a ticket moved
+into an epic runs under its `E.M` ref, so gate it by that ref instead.
 
 A v6 story-key token (`3-2`, `3-2-invite-link`) names no ticket. A migrated
 ledger keeps its `gate:` lines verbatim, and the v7 migration records each
