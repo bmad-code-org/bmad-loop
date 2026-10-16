@@ -41,6 +41,7 @@ pathspec, never the planning edits a human has in flight beside it."""
 from __future__ import annotations
 
 import re
+import stat
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -57,6 +58,7 @@ RefusalCode = Literal[
     "partial-tracking",
     "store-not-ignored",
     "tracked-outside-project",
+    "tracked-outside-checkout",
     "user-config-tracked",
     "user-config-not-ignored",
     "workspace-unsupported",
@@ -81,6 +83,7 @@ _REFUSAL_CHECKS: dict[RefusalCode, str] = {
     "partial-tracking": "tickets.tree-untracked",
     "store-not-ignored": "tickets.tree-untracked",
     "tracked-outside-project": "tickets.store-topology",
+    "tracked-outside-checkout": "tickets.store-topology",
     "user-config-tracked": "tickets.own-repo-isolation",
     "user-config-not-ignored": "tickets.own-repo-isolation",
     "workspace-unsupported": "tickets.workspace-unsupported",
@@ -101,7 +104,8 @@ class StoreCommitError(Exception):
 class StoreFacts:
     """What the probe saw. ``tracked`` pairs each tree marker that exists (the
     initiative ``tickets.toml``, each epic's ``tickets.toml`` and ``epic-*.md``)
-    as a ``repo_root``-relative posix path with whether the code repo tracks it;
+    as a posix path relative to the code repo's toplevel with whether the code
+    repo tracks it;
     empty when the store is not in the code repo. ``ignored`` is whether the code
     repo ignores the initiative folder. The two ``user_config_*`` facts are about
     :data:`USER_CONFIG_REL` in the code repo, which the redirect rewrites."""
@@ -219,8 +223,9 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
       must ignore it — an unignored nested repository is untracked dirt, ``dir/``
       in ``git status``, and build-auto halts on it), T4 outside it.
     - The store is in no repository: T6.
-    - The store is in the code repository: every tree marker tracked is T1 (under
-      worktree isolation only inside the project, where the mount carries it); none
+    - The store is in the code repository: every tree marker tracked is T1 (only
+      inside ``repo_root``, the checkout bmad-loop commits in, and under worktree
+      isolation only inside the project, where the mount carries it); none
       tracked and the initiative ignored is T2; anything else — some markers
       tracked, or none tracked and not ignored — is refused.
 
@@ -249,6 +254,8 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
     else:
         states = [tracked for _, tracked in facts.tracked]
         if states and all(states):
+            if not in_checkout:
+                return StoreRefusal("tracked-outside-checkout", initiative, str(facts.repo_root))
             if isolation == "worktree" and not _within(initiative, facts.project):
                 return StoreRefusal("tracked-outside-project", initiative)
             return StoreTopology("T1", "checkout", "code-repo", facts.store_root)
@@ -341,6 +348,13 @@ def _refusal_text(refusal: StoreRefusal) -> str:
             "its own; move the store under the project, or set "
             '`isolation = "none"` under [scm] in .bmad-loop/policy.toml'
         )
+    if code == "tracked-outside-checkout":
+        return (
+            f"the initiative folder {path} is tracked by the code repository but lies "
+            f"outside repo_root ({refusal.detail}), the checkout bmad-loop commits in — "
+            "the commits it makes by path skip a plan marked there; point repo_root at "
+            "the repository root, or move the store under repo_root"
+        )
     if code in ("user-config-tracked", "user-config-not-ignored"):
         state = "tracked by" if code == "user-config-tracked" else "not gitignored in"
         return (
@@ -413,23 +427,38 @@ def redirected_user_config_text(text: str, main_store: Path) -> str:
 # --- probe part -------------------------------------------------------------
 
 
+def _has_mode(path: Path, kind: int) -> bool:
+    """Whether ``path`` exists with file type ``kind`` (``stat.S_IFDIR``,
+    ``stat.S_IFREG``); False only when it is absent or of another type. Any other
+    stat fault raises ``verify.GitError`` — ``Path.is_dir``/``is_file`` read it as
+    False from Python 3.14, which would drop a marker from the tracking check."""
+    try:
+        return stat.S_IFMT(path.stat().st_mode) == kind
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        raise verify.GitError(f"cannot stat {path}: {e}") from e
+
+
 def _markers(initiative: Path) -> list[Path]:
     """The tree files whose tracking decides T1: the initiative ``tickets.toml``
-    and each epic folder's ``tickets.toml`` and ``epic-*.md``, those that exist."""
+    and each epic folder's ``tickets.toml`` and ``epic-*.md``, those that exist.
+    Raises ``verify.GitError`` when the initiative cannot be listed or a candidate
+    cannot be statted: an incomplete list could read a partly tracked tree as T1."""
     found = [initiative / "tickets.toml"]
     try:
         children = sorted(initiative.iterdir())
-    except OSError:
-        children = []
+    except OSError as e:
+        raise verify.GitError(f"cannot list the initiative folder {initiative}: {e}") from e
     for child in children:
-        if child.is_dir() and child.name.startswith("epic-"):
+        if child.name.startswith("epic-") and _has_mode(child, stat.S_IFDIR):
             found += [child / "tickets.toml", child / f"{child.name}.md"]
-    return [path for path in found if path.is_file()]
+    return [path for path in found if _has_mode(path, stat.S_IFREG)]
 
 
 def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> StoreFacts:
     """Read the facts :func:`classify_store` decides on. Raises ``verify.GitError``
-    when git cannot answer."""
+    when git cannot answer or the initiative cannot be read."""
     project, repo_root = paths.project.resolve(), paths.repo_root.resolve()
     store_root, initiative = paths.output_folder.resolve(), initiative.resolve()
     repo_toplevel = verify.git_toplevel(repo_root)
@@ -437,9 +466,11 @@ def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> Store
     store_toplevel = verify.git_toplevel(initiative if initiative.is_dir() else store_root)
     tracked: list[tuple[str, bool]] = []
     if repo_toplevel is not None and store_toplevel == repo_toplevel:
+        # Against the toplevel, not repo_root: a nested repo_root need not hold the
+        # store (classify_store refuses that once it knows the store is tracked).
         for marker in _markers(initiative):
-            rel = marker.relative_to(repo_root).as_posix()
-            tracked.append((rel, verify.path_tracked(repo_root, rel)))
+            rel = marker.relative_to(repo_toplevel).as_posix()
+            tracked.append((rel, verify.path_tracked(repo_toplevel, rel)))
     user_config = project / USER_CONFIG_REL
     try:
         user_rel = user_config.relative_to(repo_root).as_posix()

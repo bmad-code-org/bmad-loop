@@ -42,9 +42,9 @@ breaking changes may land in a minor release.
 - Classify the ticket-store topology in tickets mode: a store tracked in the code
   checkout (T1), an ignored folder (T2), its own nested or external repository (T3/T4)
   or an outside folder. `validate` reports it (`tickets.store-topology`, the additive
-  `ticket_store` field) and refuses partial tracking, an untracked unignored store and a
-  workspace project (`tickets.tree-untracked`, `tickets.workspace-unsupported`). Runs
-  record it; resume, resolve and the TUI refuse a store that changed. Under worktree
+  `ticket_store` field) and refuses partial tracking, a tracked store outside `repo_root`,
+  an untracked unignored store and a workspace project (`tickets.tree-untracked`,
+  `tickets.workspace-unsupported`). Runs record it; resume, resolve and the TUI refuse a store that changed. Under worktree
   isolation a shared store is read in place: the mount's
   `config.user.toml` is redirected to it (`tickets.own-repo-isolation` when it cannot
   be), and no seed, carry or publication touches it.

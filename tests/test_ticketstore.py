@@ -159,6 +159,18 @@ def test_tracked_store_outside_the_project_refused_under_worktree():
     assert classify_store(facts, "none") == StoreTopology("T1", "checkout", "code-repo", STORE)
 
 
+@pytest.mark.parametrize("isolation", ["none", "worktree"])
+def test_tracked_store_outside_repo_root_refused(isolation):
+    """A tracked store in the code repository but outside a nested `repo_root`:
+    bmad-loop's by-path commits cover only `repo_root`, so it is refused under
+    either isolation."""
+    facts = _facts(repo_root=ROOT / "app", project=ROOT / "app")
+    refused = classify_store(facts, isolation)
+    assert isinstance(refused, StoreRefusal) and refused.code == "tracked-outside-checkout"
+    text = store_topology_conflict(refused) or ""
+    assert str(INITIATIVE) in text and str(ROOT / "app") in text
+
+
 @pytest.mark.parametrize(
     ("over", "code"),
     [

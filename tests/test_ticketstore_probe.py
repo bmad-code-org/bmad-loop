@@ -5,6 +5,7 @@ tickets.py (git only)."""
 
 from __future__ import annotations
 
+import dataclasses
 import tomllib
 from pathlib import Path
 
@@ -87,6 +88,61 @@ def test_probe_git_fault_is_a_refusal_not_a_guess(project_v7, monkeypatch):
     result = ticketstore.assess_store(_paths(project_v7), "none")
     assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
     assert "failed to spawn" in (ticketstore.store_topology_conflict(result) or "")
+
+
+def test_probe_tracked_store_outside_a_nested_repo_root_is_refused(project_v7):
+    """A `repo_root` nested in the code repository with the tracked store beside it
+    (same toplevel, outside `repo_root`): the markers are probed against the
+    toplevel, and the tracked store is refused — not a crash deriving a
+    `repo_root`-relative path, and not T1, whose by-path commits skip it."""
+    root = project_v7.project
+    (root / "code").mkdir()
+    paths = dataclasses.replace(_paths(project_v7), repo_root=root / "code")
+    facts = ticketstore.probe_store_facts(paths, paths.initiative_folder)
+    assert facts.tracked and all(tracked for _, tracked in facts.tracked)
+    assert "_bmad-output/initiative-demo/tickets.toml" in [rel for rel, _ in facts.tracked]
+    for isolation in ("none", "worktree"):
+        result = ticketstore.assess_store(paths, isolation)
+        assert isinstance(result, StoreRefusal) and result.code == "tracked-outside-checkout"
+        assert "outside repo_root" in (ticketstore.store_topology_conflict(result) or "")
+
+
+def test_probe_unlistable_initiative_is_a_refusal_not_an_empty_tree(project_v7, monkeypatch):
+    """An initiative folder git can enter but Python cannot list (an execute-only
+    directory, a filesystem race) is `probe-failed`: an empty epic list would let
+    the root `tickets.toml` alone read the tree as fully tracked."""
+    paths = _paths(project_v7)
+    initiative = paths.initiative_folder.resolve()
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == initiative:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    result = ticketstore.assess_store(paths, "none")
+    assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
+    assert "cannot list the initiative folder" in (
+        ticketstore.store_topology_conflict(result) or ""
+    )
+
+
+def test_probe_unstattable_epic_is_a_refusal_not_absent(project_v7, monkeypatch):
+    """A stat fault on an epic folder is `probe-failed`, never a missing epic."""
+    paths = _paths(project_v7)
+    epic = paths.initiative_folder.resolve() / "epic-cart"
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == epic:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    result = ticketstore.assess_store(paths, "none")
+    assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
+    assert "cannot stat" in (ticketstore.store_topology_conflict(result) or "")
 
 
 def test_probe_refused_store_repository_is_a_refusal_not_unversioned(project_v7_store_repo):
