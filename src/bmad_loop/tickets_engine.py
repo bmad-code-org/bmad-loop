@@ -424,6 +424,26 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return plan
         return self.workspace.paths.project / rel
 
+    def _finish_inflight(self) -> None:
+        """Move each in-place unit's recorded plan paths with a renamed project
+        before recovery reads them, as :meth:`_recorded_plan` moves the binding.
+        An in-place ``spec_file`` / ``dispatched_spec_file`` is persisted absolute
+        under the launch-time project, so a resume at ``REVIEW_VERIFY`` after a
+        move would gate the review on a plan that is gone and retry forever. An
+        isolated unit's paths are persisted relative to its mount and re-anchored
+        by the base; a path outside the recorded project is left as recorded."""
+        for task in self.state.tasks.values():
+            if task.terminal or task.worktree_path:
+                continue
+            for name in ("spec_file", "dispatched_spec_file"):
+                recorded = getattr(task, name)
+                if recorded:
+                    live = rebase_recorded_project_path(
+                        Path(recorded), self.state, self.paths.project
+                    )
+                    setattr(task, name, str(live))
+        super()._finish_inflight()
+
     def _plan_halt_now(self, task: StoryTask) -> bool:
         """Leg 1 of an unrefined ``plan_checkpoint``, read from the binding and the
         plan on disk before the session writes it — the one predicate the prompt's

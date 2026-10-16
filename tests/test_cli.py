@@ -14752,23 +14752,29 @@ def _confirm_argv(paths, *extra):
 
 
 @pytest.mark.parametrize(
-    ("policy_text", "joins_board"),
+    "policy_text",
     [
-        pytest.param(None, True, id="no-policy"),
-        pytest.param('[stories]\nsource = "sprint-status"\n', True, id="sprint"),
-        pytest.param('[stories]\nsource = "stories"\n', True, id="stories"),
-        pytest.param('[stories]\nsource = "tickets"\n', False, id="tickets"),
-        pytest.param("[stories\n", True, id="unreadable"),
+        pytest.param(None, id="no-policy"),
+        pytest.param('[stories]\nsource = "sprint-status"\n', id="sprint"),
+        pytest.param('[stories]\nsource = "tickets"\n', id="tickets"),
     ],
 )
-def test_confirm_joins_the_board_per_source_trait(tmp_path, policy_text, joins_board):
-    """`confirm` joins park records to the sprint board only for a source with one
-    (`SourceTraits.sprint_board`); a policy it cannot read keeps the join. Ablation
-    (performed): return True unconditionally and the tickets row FAILS."""
+def test_confirm_joins_a_board_park_whatever_the_current_source(project, capsys, policy_text):
+    """A park record belongs to the source of the run that wrote it, not to the
+    project's current `[stories] source`: a story parked on the sprint board stays
+    confirmable there after the project switches to tickets. Ablation
+    (performed): skip the board read under a tickets policy and the tickets row
+    reads "not on the sprint board" — this FAILS."""
+    install_bmad_config(project)
     if policy_text is not None:
-        (tmp_path / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / cli.POLICY_FILE).write_text(policy_text, encoding="utf-8")
-    assert cli._confirm_sprint_board(tmp_path) is joins_board
+        (project.project / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        (project.project / cli.POLICY_FILE).write_text(policy_text, encoding="utf-8")
+    _park_story(project)
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    (entry,) = doc["parked"]
+    assert entry["board_status"] == "awaiting-operator"
+    assert entry["confirmable"] is True and entry["drift"] is None
 
 
 def test_confirm_flips_spec_board_record_and_commits(project, capsys, monkeypatch):

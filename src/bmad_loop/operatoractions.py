@@ -412,11 +412,13 @@ class ParkedStory:
         )
 
 
-def resolve(project: Path, paths: ProjectPaths, *, sprint_board: bool = True) -> list[ParkedStory]:
+def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
     """Every park entry joined to its spec and board status, sorted by key.
 
-    ``sprint_board`` is the work source's ``SourceTraits.sprint_board``: False
-    (tickets mode) reads no board, so every ``board_status`` is None.
+    The board is read for every entry whatever the project's current work
+    source: a park record belongs to the source of the run that wrote it, so a
+    story parked on the sprint board stays confirmable there after the project
+    switches ``[stories] source``.
 
     Reading degrades rather than raises throughout: this backs `confirm --list`
     and a `validate` warning, and neither may be the thing that crashes on a spec
@@ -446,7 +448,7 @@ def resolve(project: Path, paths: ProjectPaths, *, sprint_board: bool = True) ->
                 actions=spec_actions or actions_of(entry),
                 spec_path=spec_path,
                 spec_status=status_of(spec_fm) if spec_fm is not None else None,
-                board_status=_board_status(paths, key) if sprint_board else None,
+                board_status=_board_status(paths, key),
                 confirmation_recorded=(
                     spec_path is not None and devcontract.has_operator_confirmation(spec_path)
                 ),

@@ -478,19 +478,6 @@ def test_resolve_joins_the_record_to_spec_and_board(project):
     assert story.confirmable and story.drift() is None
 
 
-def test_resolve_without_a_sprint_board_reads_no_board(project):
-    """A source with no sprint board (tickets mode, `SourceTraits.sprint_board`)
-    joins records to their spec only: a board row at the park stage is never read,
-    so the board side is None and the entry is not confirmable through it.
-    Ablation (performed): drop the `sprint_board` gate in `resolve` and
-    `board_status` reads the row — this FAILS."""
-    _park(project)
-    (story,) = operatoractions.resolve(project.project, project, sprint_board=False)
-    assert story.spec_status == "awaiting-operator"
-    assert story.board_status is None
-    assert not story.confirmable
-
-
 def test_resolve_prefers_the_specs_actions_over_the_recorded_copy(project):
     """The spec is the committed truth. A spec edited after the park must show the
     human what they owe NOW, not what the run recorded then."""

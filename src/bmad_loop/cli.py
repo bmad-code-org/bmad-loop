@@ -6266,17 +6266,6 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     return None
 
 
-def _confirm_sprint_board(project: Path) -> bool:
-    """Whether ``confirm`` joins park records to the sprint board: the policy
-    source's ``sprint_board`` trait. A policy that cannot be read keeps the board
-    join, as before the source mattered here."""
-    try:
-        source = policy_mod.load(_policy_path(project)).stories.source
-    except (policy_mod.PolicyError, OSError):
-        return True
-    return worksource.resumed_traits_for(source).sprint_board
-
-
 def cmd_confirm(args: argparse.Namespace) -> int:
     """Complete a story parked at `awaiting-operator` once the human has carried
     out the external actions it owes (#335).
@@ -6295,7 +6284,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    parked = operatoractions.resolve(project, paths, sprint_board=_confirm_sprint_board(project))
+    parked = operatoractions.resolve(project, paths)
     if args.json:
         # Before any early return and before any prompt: --json IS the listing,
         # and nothing parked is a valid empty document, not a text line.

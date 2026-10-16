@@ -651,6 +651,38 @@ def test_bound_plan_moves_with_a_renamed_project(project_v7, tmp_path):
     assert engine._bound_plan(task) == outside
 
 
+def test_resume_moves_in_place_spec_paths_with_a_renamed_project(project_v7, tmp_path, monkeypatch):
+    """An in-place unit persists its plan paths absolute under the launch-time
+    project. A resume at `REVIEW_VERIFY` after the project moved re-anchors them
+    under the live project before recovery reads them, so the review gate
+    accepts the live plan instead of retrying on a path that is gone. A path
+    outside the recorded project is left as recorded. Ablation (performed): drop
+    `TicketsEngine._finish_inflight` and recovery sees the launch-time paths and
+    the gate retries — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    live = Path(tree.finds["1.1"].plan)
+    _write_plan(live, "built")
+    launched = tmp_path / "launched-here"
+    engine.state.project = str(launched)
+    task.phase = Phase.REVIEW_VERIFY
+    task.spec_file = str(launched / live.relative_to(project_v7.project))
+    outside = tmp_path / "elsewhere" / "plan-1.1.md"
+    task.dispatched_spec_file = str(outside)
+    seen: list[tuple[str | None, str | None]] = []
+
+    def recover(self: Engine) -> None:
+        seen.append((task.spec_file, task.dispatched_spec_file))
+
+    monkeypatch.setattr(Engine, "_finish_inflight", recover)
+
+    engine._finish_inflight()
+
+    assert seen == [(str(live), str(outside))]
+    assert engine._verify_review(task).ok
+
+
 def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     """The follow-up review re-dispatches the ticket with the ledger sentence and
     the tickets clauses: never the banned word, never the sprint board, no
