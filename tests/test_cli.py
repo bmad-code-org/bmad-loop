@@ -22980,6 +22980,36 @@ def test_resolve_restore_patch_latches_the_evacuated_copy(project_v7):
         ) == (str(copy.resolve()), None)
 
 
+@pytest.mark.parametrize("mode", ["interactive", "--no-interactive"])
+def test_resolve_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, monkeypatch, capsys, mode):
+    """The v7 leg of the re-arm's sweep-store gates: on v7 a sweep's ledger lives in
+    the ticket store whatever `[stories] source` says (`_sweep_store_source`), so
+    a refused store is refused before the session and before the re-arm under the
+    sprint default too. Ablation (performed): judge `pol.stories.source` at either
+    site and its row FAILS (the action runs)."""
+    from bmad_loop import resolve, ticketstore
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _escalated_run(project_v7.project, "r1", run_type="sweep")
+    assert policy_mod.load(cli._policy_path(project_v7.project)).stories.source == "sprint-status"
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+
+    argv = ["resolve", "--project", str(project_v7.project), "r1", "--resume"]
+    if mode == "--no-interactive":
+        argv.append(mode)
+    assert cli.main(argv) == 1
+    assert "error: the ticket store is not supported" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
 def test_sweep_store_source_judges_a_v7_sweep_as_a_tickets_run(project_v7):
     """A sweep persists no source of its own, and on v7 its ledger lives in the
     ticket store, so the store-topology refusal must classify that store even

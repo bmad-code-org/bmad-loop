@@ -1367,7 +1367,10 @@ class BmadLoopApp(App[None]):
                 if recorded is not None:
                     conflict = ticketstore.store_conflict(
                         self.project,
-                        runs.judged_store_source(recorded, live_policy.stories.source),
+                        runs.judged_store_source(
+                            recorded,
+                            ticketstore.sweep_store_source(paths, live_policy.stories.source),
+                        ),
                         isolation,
                         recorded=runs.live_store_topology(recorded, self.project) or None,
                     )

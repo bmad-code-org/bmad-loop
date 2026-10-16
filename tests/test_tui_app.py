@@ -8124,6 +8124,34 @@ def test_escalation_rearm_judges_a_sweeps_store_under_the_configured_source(
     assert rearms == ([] if source == "tickets" else ["1"])
 
 
+def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, monkeypatch):
+    """The v7 leg of the sibling above: on v7 a sweep's ledger lives in the ticket
+    store whatever `[stories] source` says (`ticketstore.sweep_store_source`), so a
+    refused store is toasted before the re-arm under the sprint default too.
+    Ablation (performed): judge `live_policy.stories.source` and this FAILS (the
+    gesture re-arms)."""
+    from conftest import escalated_run
+
+    from bmad_loop import runs, ticketstore
+
+    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    notes: list[str] = []
+    app = BmadLoopApp(project_v7.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert "the ticket store is not supported" in notes
+
+
 @pytest.mark.parametrize(
     "failure",
     [OSError("lock file could not be created"), runs_mod.StateRootError("no usable state root")],

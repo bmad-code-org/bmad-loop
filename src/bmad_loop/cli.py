@@ -346,11 +346,9 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
 
 
 def _sweep_store_source(paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy) -> str:
-    """The source whose store a sweep works, for the store-topology refusal. On
-    v7 the ledger lives in the initiative folder of the ticket store, whatever
-    ``[stories] source`` says, so a v7 sweep is judged as a tickets run. A sweep
-    persists no source of its own."""
-    return worksource.SOURCE_TICKETS if paths.era == "v7" else pol.stories.source
+    """:func:`ticketstore.sweep_store_source` under the policy's ``[stories]
+    source``."""
+    return ticketstore.sweep_store_source(paths, pol.stories.source)
 
 
 def _reject_store_topology(
@@ -5686,7 +5684,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 rc := _reject_store_topology(
                     project,
                     pol,
-                    runs.judged_store_source(state, pol.stories.source),
+                    runs.judged_store_source(state, _sweep_store_source(pre_session_paths, pol)),
                     recorded=runs.live_store_topology(state, project) or None,
                 )
             ) is not None:
@@ -5881,7 +5879,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             rc := _reject_store_topology(
                 project,
                 pol,
-                runs.judged_store_source(state, pol.stories.source),
+                runs.judged_store_source(state, _sweep_store_source(paths, pol)),
                 recorded=runs.live_store_topology(state, project) or None,
             )
         ) is not None:

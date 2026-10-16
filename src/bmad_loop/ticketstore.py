@@ -555,6 +555,14 @@ def redirect_mount_store(mount_project: Path, main_store: Path) -> None:
         )
 
 
+def sweep_store_source(paths: bmadconfig.ProjectPaths, stories_source: str) -> str:
+    """The source whose store a sweep works, for the store-topology refusal. On v7
+    the ledger lives in the initiative folder of the ticket store, whatever
+    ``[stories] source`` (``stories_source``) says, so a v7 sweep is judged as a
+    tickets run. A sweep persists no source of its own."""
+    return "tickets" if paths.era == "v7" else stories_source
+
+
 def store_conflict(
     project: Path, source: str, isolation: str, *, recorded: Mapping[str, object] | None = None
 ) -> str | None:
