@@ -5557,6 +5557,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
 
+    # v7: a sweep resolves only on the initiative it started on — the resume's
+    # refusal (`_prepare_resume_locked`), judged ahead of every dispatch below:
+    # reverify, adopt and the re-arm each persist a transition before the resume
+    # that would refuse it, and the interactive session would be spent first.
+    # Re-judged after the confirm against the config the re-arm reads. An
+    # unreadable config skips this early exit only, as the trust gate below
+    # does; the resume's own config read refuses it.
+    if state.run_type == "sweep":
+        try:
+            pin_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pin_paths = None
+        if (
+            pin_paths is not None
+            and (conflict := runsetup.sweep_initiative_conflict(state, pin_paths)) is not None
+        ):
+            print(f"cannot resolve {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
+
     # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
     # so judge it here — ahead of the reverify/adopt dispatches (each persists its
     # transition before resuming) and of the interactive session (a refusal after it
@@ -5884,6 +5903,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             )
         ) is not None:
             return rc
+        # The sweep's initiative pin, re-judged: the active initiative can change
+        # during the resolve session, and the re-arm below precedes the resume.
+        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+            print(f"cannot resolve {args.run_id}: {conflict}", file=sys.stderr)
+            return 1
         # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
         # for the same reason — a refusal after it has already spent the escalation.
         # A re-arm-only resolve (`--no-resume`) launches nothing, so it is not judged.

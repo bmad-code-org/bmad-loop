@@ -9836,6 +9836,92 @@ def test_resolve_sweep_run_proceeds_on_a_readable_ledger(project, monkeypatch, c
     assert "`bmad-loop sweep`" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--no-interactive", "--resume"],
+        ["--no-interactive", "--no-resume"],
+        ["--adopt-branch"],
+        ["--reverify"],
+    ],
+    ids=["interactive", "resume", "no-resume", "adopt", "reverify"],
+)
+def test_resolve_refuses_a_sweep_on_a_switched_initiative_before_any_write(
+    project, monkeypatch, capsys, flags
+):
+    """A v7 sweep resolved under another active initiative is refused with the
+    pin's fix text ahead of every dispatch: the interactive session, the re-arm
+    (`--no-resume` included) and the reverify/adopt transitions all precede the
+    resume's own refusal. The judgment itself is pinned in
+    tests/test_runsetup.py; here it is stubbed to a refusal.
+
+    ABLATION (performed): delete the entry gate in `cmd_resolve` and the
+    interactive, adopt and reverify rows reach their side-effect recorders (the
+    non-interactive re-arm rows fall to the post-confirm check instead)."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop import runsetup
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    before = load_state(run_dir)
+    monkeypatch.setattr(
+        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+    )
+    effects: list = []
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: effects.append("adapters") or {"dev": object()}
+    )
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: effects.append("session"))
+    monkeypatch.setattr(cli, "_resolve_adopt", lambda *a, **k: effects.append("adopt") or 0)
+    monkeypatch.setattr(cli, "_resolve_reverify", lambda *a, **k: effects.append("reverify") or 0)
+
+    rc = cli.main(["resolve", "--project", str(project.project), "r1", *flags])
+
+    assert rc == 1
+    assert "cannot resolve r1: initiative switched" in capsys.readouterr().err
+    assert effects == []
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
+def test_resolve_rejudges_a_sweeps_initiative_after_the_session(project, monkeypatch, capsys):
+    """The active initiative can change while the interactive resolve session is
+    open, and the re-arm precedes the resume that would refuse it: the pin is
+    judged again after the confirm, with the config the re-arm reads.
+
+    ABLATION (performed): delete the post-confirm `sweep_initiative_conflict`
+    check in `cmd_resolve` and the escalation is re-armed."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop import runsetup
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    before = load_state(run_dir)
+    sessions: list = []
+
+    def judge(state, paths):
+        return "initiative switched" if sessions else None
+
+    monkeypatch.setattr(runsetup, "sweep_initiative_conflict", judge)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: sessions.append(1) or True)
+
+    rc = cli.main(["resolve", "--project", str(project.project), "r1", "--resume"])
+
+    assert rc == 1
+    assert sessions == [1]
+    assert "cannot resolve r1: initiative switched" in capsys.readouterr().err
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
 def test_resolve_live_refusal_wins_over_the_ledger_gate(project, monkeypatch, capsys):
     # The gate sits at the END of resolve's pre-side-effect block: the refusals above
     # it answer "this gesture does not apply to this run at all", and repairing the
@@ -22988,10 +23074,13 @@ def test_resolve_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, monkeypat
     sprint default too. Ablation (performed): judge `pol.stories.source` at either
     site and its row FAILS (the action runs)."""
     from bmad_loop import resolve, ticketstore
-    from bmad_loop.journal import load_state
+    from bmad_loop.journal import load_state, save_state
     from bmad_loop.model import Phase
 
     run_dir = _escalated_run(project_v7.project, "r1", run_type="sweep")
+    state = load_state(run_dir)
+    state.initiative = project_v7.initiative  # pinned at launch, as `compose_sweep` does
+    save_state(run_dir, state)
     assert policy_mod.load(cli._policy_path(project_v7.project)).stories.source == "sprint-status"
 
     def conflict(_project, store_source, _isolation, *, recorded=None):
