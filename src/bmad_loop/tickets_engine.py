@@ -203,10 +203,24 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _run_story(self, task: StoryTask) -> None:
         # Attach the binding resolved at pick time the moment `_loop` registers
         # the task; a resumed task already carries its own.
-        if task.ticket is None and task.story_key in self._picked:
-            task.ticket = self._picked.pop(task.story_key)
+        if task.ticket is None:
+            task.ticket = self._picked.pop(task.story_key, None) or self._rebind(task)
             self._save()
         super()._run_story(task)
+
+    def _rebind(self, task: StoryTask) -> TicketBinding:
+        """Re-resolve an unbound task's binding from the tree. A host that died
+        between `_loop` saving the new task and the attach above leaves it
+        registered with no binding and no session; this re-reads what a fresh pick
+        would. A ``find`` fault pauses at ``ticket-tree``, and the resume retries."""
+        try:
+            found = self.ticket_tree.find(task.story_key)
+        except TicketsError as e:
+            self._pause_ticket_pick(
+                Halt("tree-fault", task.story_key, None, f"tickets.py {e.kind}: {e}")
+            )
+        self.journal.append("ticket-rebound", story_key=task.story_key)
+        return ticket_binding(found)
 
     def _journal_pick_notes(self, notes: Iterable[PickNote]) -> None:
         for note in notes:

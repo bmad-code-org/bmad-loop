@@ -2000,10 +2000,12 @@ JOURNAL_KINDS = frozenset(
         # tickets_engine.py — the tickets-mode pick: rows the pick passed over
         # (once per process each), and its pick-time pauses. A blocked plan pauses
         # through the checkpoint mixin's `stories-wedged`. Plus an engine status
-        # write the plan chokepoint has no reason for, refused unwritten.
+        # write the plan chokepoint has no reason for, refused unwritten, and a
+        # registered task whose binding a resume re-resolved from the tree.
         "ticket-foreign-active",
         "ticket-hitl-pause",
         "ticket-pick-halt",
+        "ticket-rebound",
         "ticket-refine-pause",
         "ticket-skipped",
         "ticket-status-write-refused",

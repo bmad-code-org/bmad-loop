@@ -313,6 +313,49 @@ def test_dispatch_binds_the_ticket_on_registration(project_v7, monkeypatch):
     assert binding.done_checkpoint is True
 
 
+def test_unbound_registered_task_rebinds_from_the_tree(project_v7, monkeypatch):
+    """A host that died between `_loop` saving the new task and the attach leaves
+    a registered task with no binding and an empty `_picked`: `_run_story`
+    re-resolves it from the tree before any session."""
+    row = ticket_row("2.1", epic="epic-checkout", done_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, adapter = make_engine(project_v7, tree)
+    monkeypatch.setattr(Engine, "_run_story", lambda self, task: None)
+    task = StoryTask("2.1", 0)
+    engine.state.tasks["2.1"] = task
+
+    engine._run_story(task)
+
+    binding = load_state(engine.run_dir).tasks["2.1"].ticket
+    assert binding is not None
+    assert (binding.ref, binding.epic_slug, binding.plan) == (
+        "2.1",
+        "epic-checkout",
+        tree.finds["2.1"].plan,
+    )
+    assert binding.done_checkpoint is True
+    assert [e["story_key"] for e in _kinds(engine, "ticket-rebound")] == ["2.1"]
+    assert adapter.sessions == []
+
+
+def test_find_fault_on_rebind_pauses_at_ticket_tree(project_v7, monkeypatch):
+    """A `find` fault re-resolving an unbound task pauses at `ticket-tree`
+    instead of driving it unbound; the task stays unbound for the resume."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    tree.faults["find"] = TicketsCrashed("tickets.py died")
+    engine, adapter = make_engine(project_v7, tree)
+    driven: list[str] = []
+    monkeypatch.setattr(Engine, "_run_story", lambda self, task: driven.append(task.story_key))
+    task = StoryTask("1.1", 0)
+    engine.state.tasks["1.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._run_story(task)
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert task.ticket is None and driven == [] and adapter.sessions == []
+
+
 def test_passed_over_rows_journal_once(project_v7):
     """A row the pick passes over is journaled once per process, however many
     picks pass it again: a foreign built ticket and one this run deferred."""
