@@ -421,16 +421,26 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """The ticket's plan as ``find`` named it at pick time (moved with the
         project, :meth:`_recorded_plan`), re-anchored in the active workspace
         (the same path in place; the unit worktree's copy under isolation).
-        None for a task with no binding."""
+        A plan outside a nested project but inside the checkout (an
+        ``output_folder`` of ``../tickets``) is re-anchored on the workspace
+        root: the session's ``tickets.py`` resolves it inside the worktree, and
+        the preflight accepts any initiative folder tracked in the checkout. A
+        plan outside the checkout is left as recorded. None for a task with no
+        binding."""
         ticket = task.ticket
         if ticket is None:
             return None
         plan = self._recorded_plan(ticket)
-        try:
-            rel = plan.relative_to(self.paths.project)
-        except ValueError:
-            return plan
-        return self.workspace.paths.project / rel
+        anchors = (
+            (self.paths.project, self.workspace.paths.project),
+            (self.paths.repo_root, self.workspace.root),
+        )
+        for base, mounted in anchors:
+            try:
+                return mounted / plan.relative_to(base)
+            except ValueError:
+                continue
+        return plan
 
     def _finish_inflight(self) -> None:
         """Move each in-place unit's recorded plan paths with a renamed project
