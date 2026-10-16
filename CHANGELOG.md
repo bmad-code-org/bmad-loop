@@ -51,7 +51,9 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   epic, `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>` and
   commits only its document. The run then records the verdict and pauses at
   `epic-boundary` until a person closes the epic with bmad-ticket. A `rejected` verdict
-  pauses every later pick while the epic stays open; any other pauses once.
+  pauses every later pick while the epic stays open; any other pauses once. A
+  retrospective refused for a dirty tree, a git fault or a stop request records no
+  closure, so the resume runs it.
 - Add `run --dry-run` for tickets mode: the startable tickets in initiative build order,
   each `ticket <ref>` dispatch (with `Halt after planning.` on a plan-checkpoint leg),
   the first pause a run would reach, group counts and tree problems. Marks nothing.

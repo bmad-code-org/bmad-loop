@@ -98,6 +98,7 @@ from .engine import (
 )
 from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatter, status_of
 from .model import (
+    PAUSE_EPIC_BOUNDARY,
     PAUSE_SPEC_APPROVAL,
     PAUSE_TICKET_TREE,
     Phase,
@@ -112,6 +113,7 @@ from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
 from .ticketmodel import StatusView
 from .tickets_source import (
     BOUNDARY_ACK,
+    BOUNDARY_REJECTED,
     BOUNDARY_RETRO,
     CLOSURE_REJECTED,
     HALT_BLOCKED_PLAN,
@@ -303,11 +305,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _make_work_source(self) -> WorkSource:
         """The ticket-tree source. Every getter is live: the tree is built on the
-        first pick, and approvals and closures are read from run state each time."""
+        first pick, and approvals, closures and closure acknowledgements are read
+        from run state each time."""
         return TicketsWorkSource(
             lambda: self.ticket_tree,
             lambda: self.state.ticket_story_approvals,
             lambda: self.state.ticket_epic_closures,
+            acked_get=lambda: self.state.ticket_epic_closure_acked,
         )
 
     @property
@@ -488,7 +492,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           pause again — closing the epic is the human override;
         * any other recorded verdict the operator resumed past: acknowledge it
           (``ticket_epic_closure_acked``), journal ``epic-closure-not-recorded``
-          (the epic is still open) and go on.
+          (the epic is still open) and go on; the pick's end-of-tree
+          ``awaiting-closure`` halt skips an acknowledged epic too.
 
         bmad-loop never writes the epic's file: its status is read, never set."""
         steps = epic_boundary(
@@ -507,15 +512,16 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 self._save()
                 self.journal.append("ticket-epic-closure", epic_ref=step.slug, verdict=verdict)
                 self._pause_epic_closure(step.slug, verdict)
-            self._pause_ticket_pick(
-                Halt(
-                    HALT_EPIC_REJECTED,
-                    step.slug,
-                    None,
-                    f"{step.slug}'s retrospective verdict is rejected; close {step.slug} "
-                    f"with bmad-ticket before the run goes on",
+            if step.action == BOUNDARY_REJECTED:
+                self._pause_ticket_pick(
+                    Halt(
+                        HALT_EPIC_REJECTED,
+                        step.slug,
+                        None,
+                        f"{step.slug}'s retrospective verdict is rejected; close {step.slug} "
+                        f"with bmad-ticket before the run goes on",
+                    )
                 )
-            )
 
     def _ack_epic_closure(self, step: EpicBoundary) -> None:
         """The operator resumed past an epic's one closure pause without closing
@@ -535,14 +541,16 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         the same check as the pick's, on a fresh ``status`` read, so the run's
         last finished epic gets its retrospective and closure pause too. A tree
         that cannot be read journals ``retro-run-end-skipped``
-        (``board-unreadable``)."""
+        (``board-unreadable``) and pauses at ``ticket-tree``, as the pick's own
+        read fault does: the epics this run committed are known to this run only,
+        so finishing would lose the boundary for good."""
         try:
             status_view = self.ticket_tree.status()
         except TicketsError as e:
             self.journal.append(
                 "retro-run-end-skipped", epic=0, reason="board-unreadable", error=str(e)
             )
-            return
+            self._pause_ticket_pick(Halt("tree-fault", "", None, f"tickets.py {e.kind}: {e}"))
         self._ticket_epic_boundary_check(status_view)
 
     def _retro_doc(self, slug: str) -> Path:
@@ -602,16 +610,42 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             errors.append(f"{self._retro_doc(slug).name} predates the session")
         return errors, ("" if errors else verdict)
 
+    def _retro_doc_uncommitted(self, slug: str) -> bool:
+        """Whether epic ``slug``'s retrospective document is dirty in the repo. A
+        git fault reads as dirty: :meth:`_settle_retro_tree` re-reads the tree and
+        pauses on it."""
+        rel = self._repo_relpath(self._retro_doc(slug))
+        if rel is None:
+            return False
+        try:
+            return rel in verify.dirty_paths(self.paths.repo_root)
+        except verify.GitError:
+            return True
+
+    def _pause_retro_refused(self, slug: str, why: str) -> NoReturn:
+        """Pause at ``epic-boundary`` before ``slug``'s auto retrospective, with no
+        closure recorded, so the resume runs it."""
+        raise RunPaused(
+            f"{slug} boundary — its auto retrospective did not run: {why}; fix that, "
+            f"then {self._resume_hint()}",
+            PAUSE_EPIC_BOUNDARY,
+            slug,
+        )
+
     def _ticket_epic_retro(self, slug: str) -> str:
         """The retrospective gate for finished epic ``slug``; returns the closure
         to record: the document's verdict, or ``unknown`` when none was read.
 
         A valid document already on disk is the retro already done (journaled
         ``retro-auto-skipped`` ``already-done`` under ``auto``), whatever the mode.
+        Under ``auto`` a valid document left uncommitted (an earlier leg that
+        failed verification) is committed alone first, as a success would be.
         ``notify`` sends the nudge and ``never`` does nothing; both still pause
         for closure. ``auto`` runs ``/bmad-retrospective -H <slug>`` on the retro
-        adapter, after the base pre-dispatch refusals (``stop-requested``,
-        ``dirty``/``git-error``, ``skill-missing``), verifies it
+        adapter, after the base pre-dispatch refusals. The passing ones record no
+        closure, so the next pass re-enters here: ``stop-requested`` honors the
+        stop, and ``dirty``/``git-error`` pause at ``epic-boundary``. Only
+        ``skill-missing`` lasts and records ``unknown``. The session is verified
         (:meth:`_verify_retro_ticket`), and settles the tree: the document alone
         (``TicketsWorkSource.retro_commit_paths``) is committed, and anything else
         left dirty pauses before a closure is recorded, so a resume re-enters
@@ -622,6 +656,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if not doc_errors:
             if mode == "auto":
                 self._skip_auto_retro(0, "already-done", epic_ref=slug)
+                if self._retro_doc_uncommitted(slug):
+                    self._settle_retro_tree(0, True, [self._retro_doc(slug)], epic_ref=slug)
             return existing
         if mode == "notify":
             gates.notify(
@@ -634,15 +670,16 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return RETRO_VERDICT_UNKNOWN
         if graceful_stop_requested(self.run_dir):
             self._skip_auto_retro(0, "stop-requested", epic_ref=slug)
-            return RETRO_VERDICT_UNKNOWN
+            self._check_stop_request()
+            self._pause_retro_refused(slug, "a stop was requested")  # a racing take
         try:
             clean = verify.worktree_clean(self.workspace.root, project=self.workspace.paths.project)
         except verify.GitError as e:
             self._skip_auto_retro(0, "git-error", str(e), epic_ref=slug)
-            return RETRO_VERDICT_UNKNOWN
+            self._pause_retro_refused(slug, f"git could not read the worktree ({e})")
         if not clean:
             self._skip_auto_retro(0, "dirty", epic_ref=slug)
-            return RETRO_VERDICT_UNKNOWN
+            self._pause_retro_refused(slug, "the tree has uncommitted changes")
         adapter = self.adapters["retro"]
         tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
         if tree and not (self.workspace.paths.project / tree / RETRO_SKILL / "SKILL.md").is_file():

@@ -396,6 +396,25 @@ def test_decide_pick_table(views, phases, closures, approvals, expected):
         assert (decision.cause, decision.key, decision.stage) == expected[1:]
 
 
+def test_decide_pick_skips_an_acked_epic_only_at_the_end_of_the_tree():
+    """An epic whose closure pause the operator resumed past (``acked``) no longer
+    halts the empty tree: the run finishes. A ticket gated by that epic still
+    halts ``awaiting-closure``, since tickets.py holds it until the close.
+    Ablation (performed): drop the ``acked`` filter and the empty tree halts
+    again — this FAILS."""
+    empty = _views(others=(_done("1.1"), _done("1.2")), epics=(_epic(CART, "1"),))
+    decision = ts.decide_pick(*empty, {}, {}, (), acked=frozenset({CART}))
+    assert isinstance(decision, ts.Skip) and decision.reason == ts.SKIP_EMPTY, decision
+
+    gated = _views(
+        blocked=(_waits("2.1", CART, epic=CHECKOUT, gated_by=(CART,)),),
+        others=(_done("1.1"), _done("1.2")),
+    )
+    decision = ts.decide_pick(*gated, {}, {}, (), acked=frozenset({CART}))
+    assert isinstance(decision, ts.Halt), decision
+    assert (decision.cause, decision.key) == (ts.HALT_AWAITING_CLOSURE, CART)
+
+
 def test_decide_pick_notes_what_it_passed_over():
     """A dispatch carries the rows it passed over — a ticket this run touched and a
     foreign built one — for the engine to journal; neither is dispatched."""

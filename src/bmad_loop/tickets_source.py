@@ -47,7 +47,8 @@ noted ``foreign-active``.
    explains → halt ``stalled`` on it;
 6. an epic still open with every ticket done (an empty ``next`` included) →
    halt ``awaiting-closure``, and an open epic with no tickets at all → halt
-   ``stalled``, so the run cannot finish past an unclosed epic;
+   ``stalled``, so the run cannot finish past an unclosed epic — except one whose
+   closure pause the operator already resumed past (``acked``);
 7. otherwise :class:`Skip` ``empty``: the run finishes.
 
 **Epic boundaries** (:func:`epic_boundary`) are read before the pick, from the
@@ -459,8 +460,11 @@ def decide_pick(
     task_phases: Mapping[str, Phase],
     epic_closures: Mapping[str, str],
     approvals: Sequence[str] | frozenset[str],
+    *,
+    acked: Sequence[str] | frozenset[str] = (),
 ) -> PickDecision:
-    """The next pick, per the module docstring."""
+    """The next pick, per the module docstring. ``acked`` holds the epics whose
+    one closure pause the operator resumed past (``ticket_epic_closure_acked``)."""
     touched = {key: phase for key, phase in task_phases.items() if phase != Phase.ESCALATED}
     rank = build_order(status_view)
     notes: list[PickNote] = []
@@ -578,6 +582,9 @@ def decide_pick(
             f"{len(waiting)} ticket(s) wait on nothing this run can start: {', '.join(waiting)}",
             held_notes,
         )
+    # An acknowledged closure paused once already; only a ticket that waits on
+    # the epic (above) holds the run behind it again.
+    awaiting = [slug for slug in awaiting if slug not in acked]
     if awaiting:
         return Halt(
             HALT_AWAITING_CLOSURE,
@@ -604,7 +611,8 @@ def decide_pick(
 class TicketsWorkSource:
     """The ``tickets`` source: units are the active initiative's tickets, keyed
     by ref. Every getter is live, so construction does no I/O and a pick always
-    reads the run's current approvals and closures."""
+    reads the run's current approvals, closures and closure
+    acknowledgements."""
 
     name = SOURCE_TICKETS
     has_epics = False
@@ -614,10 +622,13 @@ class TicketsWorkSource:
         tree_get: Callable[[], TicketTreeLike],
         approvals_get: Callable[[], Sequence[str]],
         closures_get: Callable[[], Mapping[str, str]],
+        *,
+        acked_get: Callable[[], Sequence[str]] = lambda: (),
     ):
         self._tree_get = tree_get
         self._approvals_get = approvals_get
         self._closures_get = closures_get
+        self._acked_get = acked_get
 
     @property
     def tree(self) -> TicketTreeLike:
@@ -651,6 +662,7 @@ class TicketsWorkSource:
             phases,
             self._closures_get(),
             frozenset(self._approvals_get()),
+            acked=frozenset(self._acked_get()),
         )
 
     def pick(self, phases: Mapping[str, Phase], current_epic: int | None) -> Pick:
