@@ -296,10 +296,17 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _pause_ticket_pick(self, halt: Halt) -> NoReturn:
         """Every other pick halt: a refined plan checkpoint (named story file), an
         epic boundary, or the tree itself. ``key`` "" (a tree fault) pauses with
-        no story key."""
+        no story key. A ``find`` fault naming the plan checkpoint's story file
+        pauses at ``ticket-tree`` with the fault instead."""
         if halt.cause == HALT_PLAN_CHECKPOINT:
+            try:
+                found = self.ticket_tree.find(halt.key)
+            except TicketsError as e:
+                self._pause_ticket_pick(
+                    Halt("tree-fault", halt.key, halt.row, f"tickets.py {e.kind}: {e}")
+                )
             reason = (
-                f"approve story file {self._story_file(halt.key)} — {halt.key} has a "
+                f"approve story file {found.story_file or halt.key} — {halt.key} has a "
                 f"plan checkpoint; then {self._resume_hint()}"
             )
         else:
@@ -313,14 +320,6 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         )
         gates.notify(self.policy, self.run_dir, f"tickets run paused: {halt.cause}", reason)
         raise RunPaused(reason, halt.stage, halt.key or None)
-
-    def _story_file(self, ref: str) -> str:
-        """The ticket's pulled story file as ``find`` names it, else its ref."""
-        try:
-            found = self.ticket_tree.find(ref)
-        except TicketsError:
-            return ref
-        return found.story_file or ref
 
     def _pause_blocked_plan(self, halt: Halt) -> NoReturn:
         """A blocked plan this run did not park: record the ESCALATED wedge task

@@ -179,6 +179,27 @@ def test_refined_plan_checkpoint_pauses_before_dispatch(project_v7):
     assert isinstance(picked, TicketRef) and picked.key == "1.1"
 
 
+def test_find_fault_on_refined_plan_checkpoint_pauses_at_ticket_tree(project_v7):
+    """A `find` fault naming a refined plan checkpoint's story file pauses at
+    `ticket-tree` naming the fault, not at `plan-checkpoint` with the ref standing
+    in for a story file the operator cannot approve. Ablation (performed): fall
+    back to the ref on the fault and this FAILS."""
+    row = ticket_row("1.1", refined=True, plan_checkpoint=True, file="story-cart-model.md")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    tree.faults["find"] = TicketsCrashed("tickets.py died")
+    engine, adapter = make_engine(project_v7, tree)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._pick_next()
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert "tickets.py died" in paused.value.reason
+    assert "approve story file" not in paused.value.reason
+    [halt] = _kinds(engine, "ticket-pick-halt")
+    assert (halt["cause"], halt["stage"]) == ("tree-fault", PAUSE_TICKET_TREE)
+    assert engine.state.tasks == {} and adapter.sessions == []
+
+
 def test_blocked_plan_wedges_escalation(project_v7):
     """A blocked plan this run did not park records an ESCALATED task at attempt 0
     — carrying the plan as its spec and the ticket binding — and pauses at

@@ -12726,6 +12726,40 @@ def test_dry_run_tickets_prints_dispatch_and_predicted_pause(project, capsys, mo
     assert tree.marks == [] and [c[0] for c in tree.calls] == ["next", "status"]
 
 
+@pytest.mark.parametrize(
+    ("argv", "predicted"),
+    [
+        ([], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
+        (["--max-stories", "1"], "no pause predicted before 1.1 finishes"),
+        (["--max-stories", "2"], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
+    ],
+)
+def test_dry_run_tickets_done_checkpoint_honors_max_stories(
+    project, capsys, monkeypatch, argv, predicted
+):
+    """A first ticket with `done_checkpoint` predicts its story-checkpoint pause,
+    except under `--max-stories 1`: the run's skip-if-last drops that pause once
+    the cap is spent, so the preview must not advertise it. Ablation
+    (performed): ignore the cap in `_predicted_pause` and the `1` row FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    first = ticket_row("1.1", done_checkpoint=True, title="Cart model")
+    second = ticket_row("1.2", title="Cart rules")
+    folder = project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE / "epic-cart"
+    tree = FakeTicketTree(
+        project.project,
+        next_view=fake_next_view(ready_to_start=(first, second)),
+        status_view=fake_status_view((first, second)),
+        finds={r.ref: fake_find(r, folder) for r in (first, second)},
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run", *argv])
+
+    out, _ = capsys.readouterr()
+    assert rc == 0
+    assert f"predicted: {predicted}\n" in out
+
+
 def test_dry_run_tickets_unrefined_plan_checkpoint_adds_halt_marker(project, capsys, monkeypatch):
     """On the default tree (real `tickets.py`, 2 spawns) the only startable ticket,
     1.1, is an unrefined `plan_checkpoint`: its dispatch is leg 1 —

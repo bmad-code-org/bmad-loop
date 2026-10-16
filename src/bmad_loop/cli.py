@@ -3824,8 +3824,10 @@ def _ticket_badge(row: ticketmodel.TicketRow) -> str:
     return f" [{', '.join(marks)}]" if marks else ""
 
 
-def _predicted_pause(decision: tickets_source.PickDecision) -> str:
-    """The first pause a fresh tickets run would reach, as one line."""
+def _predicted_pause(decision: tickets_source.PickDecision, max_stories: int | None) -> str:
+    """The first pause a fresh tickets run would reach, as one line. A
+    ``--max-stories 1`` run skips the first ticket's done checkpoint, as the
+    engine's skip-if-last does once the cap is spent."""
     if isinstance(decision, tickets_source.Halt):
         where = f" before {decision.key}" if decision.key else ""
         return f"run would pause{where} ({decision.stage}): {decision.detail}"
@@ -3839,7 +3841,7 @@ def _predicted_pause(decision: tickets_source.PickDecision) -> str:
             f"run would pause after planning {decision.ref} (plan-checkpoint): "
             "approve the plan, then resume"
         )
-    if row.done_checkpoint:
+    if row.done_checkpoint and max_stories != 1:
         return f"run would pause after {decision.ref} (story-checkpoint): done checkpoint"
     return f"no pause predicted before {decision.ref} finishes"
 
@@ -3896,7 +3898,7 @@ def _dry_run_tickets(
         if plan_halt:
             env += " BMAD_LOOP_PLAN_HALT=1"
         print(f"    env:    {env}")
-    print(f"\npredicted: {_predicted_pause(decision)}")
+    print(f"\npredicted: {_predicted_pause(decision, args.max_stories)}")
     if next_view.backlog is not None:
         backlog = str(sum(len(next_view.backlog.group(g)) for g in ticketmodel.NEXT_GROUPS))
     else:
