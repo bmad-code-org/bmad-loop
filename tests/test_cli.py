@@ -3118,6 +3118,7 @@ def test_status_json_tickets_run_is_additive(project, capsys):
         "plan": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}/epic-cart/story-1.1-plan.md",
         "done_pending": True,
         "park_pending": None,
+        "commit_pending": False,
     }
     assert second["ticket"]["done_pending"] is False
     assert second["ticket"]["park_pending"] == "awaiting operator: needs a decision"

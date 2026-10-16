@@ -274,6 +274,8 @@ def _ticket_projection(task: StoryTask) -> dict[str, object] | None:
         "done_pending": task.ticket_done_pending,
         # the owed park's `blocked_reason`, or null when no park is owed
         "park_pending": task.ticket_park_pending or None,
+        # `mark_done = "never"` in a store repository: only the plan's commit is owed
+        "commit_pending": task.ticket_commit_pending,
     }
 
 

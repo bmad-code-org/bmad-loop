@@ -544,7 +544,7 @@ Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`i
 
 `tickets` (run level): `initiative` and `initiative_folder` (the pinned initiative), `epic_filter` (the `--epic` slug, or null), `store_topology` (`{layout, placement, versioning, store_root, store_repo}`, or null when none was recorded), `epic_closures` (epic slug → recorded closure verdict) and `epic_closures_acked` (epic slugs whose closure pause was resumed past).
 
-`ticket` (per task): `ref`, `id`, `epic_slug`, `epic_id`, `title`, `plan` (the absolute plan path recorded at the pick), `done_pending` (bool: a shared-store `done` mark is still owed) and `park_pending` (the owed park's reason, or null). It is null for a task with no ticket. A plan's live status is not part of the document, because it is not in `state.json`; the text board reads it.
+`ticket` (per task): `ref`, `id`, `epic_slug`, `epic_id`, `title`, `plan` (the absolute plan path recorded at the pick), `done_pending` (bool: a shared-store `done` mark is still owed), `park_pending` (the owed park's reason, or null) and `commit_pending` (bool: under `mark_done = "never"`, the store-repository commit of the `built` plan is still owed). It is null for a task with no ticket. A plan's live status is not part of the document, because it is not in `state.json`; the text board reads it.
 
 Both objects are additive, so the schema version stays 1. Tickets pause stages (`ticket-hitl`, `ticket-refine`, `ticket-tree`) are new values of `paused_stage`, an open string.
 
