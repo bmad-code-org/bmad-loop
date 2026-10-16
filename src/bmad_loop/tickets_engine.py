@@ -1299,8 +1299,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _gate_binding(self, story_key: str) -> TicketBinding | None:
         """The binding a gate check reads the ticket's epic from: resolved at pick
         time (the gate runs before ``_loop`` registers the task), or the task's own
-        on the restart arm."""
+        on the restart arm — re-resolved there first when a crash left it unbound
+        (:meth:`_rebind`), so its epic's tokens still gate it."""
         task = self.state.tasks.get(story_key)
+        if task is not None and task.ticket is None and story_key not in self._picked:
+            task.ticket = self._rebind(task)
+            self._save()
         return self._picked.get(story_key) or (task.ticket if task is not None else None)
 
     def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:

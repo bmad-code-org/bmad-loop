@@ -438,6 +438,25 @@ def test_tickets_gate_refuses_ref(project_v7, token):
     assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
 
 
+@pytest.mark.parametrize("token", ["2", "epic-checkout"])
+def test_tickets_gate_rebinds_an_unbound_task_on_the_restart_arm(project_v7, token):
+    """The restart arm gates a registered task before `_run_story`; one a crash
+    left unbound is re-resolved first, so an epic token still gates it."""
+    row = ticket_row("2.1", epic="epic-checkout")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, f"gate: {token}")
+    task = StoryTask("2.1", 0)
+    engine.state.tasks["2.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("2.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "2.1")
+    assert task.ticket is not None and task.ticket.epic_slug == "epic-checkout"
+    assert [e["story_key"] for e in _kinds(engine, "ticket-rebound")] == ["2.1"]
+
+
 @pytest.mark.parametrize("token", ["2.2", "1", "epic-cart", "2.1a", "story-2-1.md"])
 def test_tickets_gate_passes_a_ticket_no_token_names(project_v7, token):
     """A ticket-grammar token for another ticket or epic gates nothing here — no
