@@ -6,6 +6,7 @@ tickets.py (git only)."""
 from __future__ import annotations
 
 import tomllib
+from pathlib import Path
 
 import pytest
 from conftest import git, remove_tree
@@ -111,6 +112,21 @@ def test_git_toplevel_reads_only_no_repository_as_none(tmp_path):
     (tmp_path / ".git").write_text("gitdir: /nonexistent/repo.git\n", encoding="utf-8")
     with pytest.raises(verify.GitError, match="show-toplevel"):
         verify.git_toplevel(tmp_path)
+
+
+def test_git_toplevel_raises_when_the_reported_toplevel_cannot_resolve(project_v7, monkeypatch):
+    """A toplevel git reported but `resolve` cannot canonicalize (a permission or
+    filesystem race) raises, so the probe refuses rather than reading T6."""
+    real = Path.resolve
+
+    def resolve(self, strict=False):
+        if strict:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(verify.GitError, match="cannot resolve the toplevel"):
+        verify.git_toplevel(project_v7.project)
 
 
 def test_store_conflict_is_silent_outside_tickets_mode(project_v7_store_repo):

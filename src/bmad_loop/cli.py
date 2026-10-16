@@ -6685,13 +6685,15 @@ def _land_confirmation(
     re-run after the operator repairs the board resumes here.
 
     A ticket park has no board: its plan is marked instead
-    (:func:`_mark_ticket_confirmed`), and the commit carries the plan and the
-    record's deletion."""
+    (:func:`_mark_ticket_confirmed`), and the commit carries the record's
+    deletion and — when the code checkout tracks the store — the plan
+    (:func:`_confirmed_plan_operands`)."""
     if story.ticket:
         target = _mark_ticket_confirmed(project, story, spec)
         if target is None:
             return 1
-        return _commit_confirmation(project, paths, story, [spec], f"plan is {target}")
+        files = _confirmed_plan_operands(project, story, spec)
+        return _commit_confirmation(project, paths, story, files, f"plan is {target}")
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
     # confirming needs no exception to never-regress. Idempotent at `done`, which
@@ -6772,6 +6774,64 @@ def _mark_ticket_confirmed(
         )
         return None
     return target
+
+
+def _confirmed_plan_operands(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> list[Path]:
+    """The confirm commit's operands for a ticket's marked plan, by store layout:
+    ``[spec]`` when the code checkout tracks the store (T1, or no initiative to
+    classify), else nothing. A store with its own repository (T3/T4) gets the plan
+    committed there first, through :class:`~bmad_loop.ticketstore.StoreCommitter`;
+    an unversioned store (T2/T6) has nothing to commit. Handed to the code
+    repository, a store plan is skipped as outside it (T4) or fails ``git add`` as
+    ignored (T2/T3) — sinking the record's deletion with it.
+
+    A store that cannot be classified or committed is warned about on stderr and
+    left out: the mark already landed, so ``confirm`` still finishes."""
+    try:
+        tpaths = bmadconfig.load_paths(project, want_tickets=True)
+    except bmadconfig.BmadConfigError as e:
+        return _plan_left_uncommitted(
+            spec, f"cannot read the BMAD config to classify the ticket store: {e}"
+        )
+    # `none`: only the layout matters here; worktree isolation's extra refusals are
+    # about arming a run, and `confirm` arms none.
+    result = ticketstore.assess_store(tpaths, "none")
+    if result is None:
+        return [spec]
+    if isinstance(result, ticketstore.StoreRefusal):
+        # The code, not the refusal text: that text is a run-arming refusal
+        # (`STORE_TOPOLOGY_CALLERS`), and `confirm` only needs to say why it stopped.
+        return _plan_left_uncommitted(
+            spec, f"the ticket store layout is refused: {result.code} at {result.path}"
+        )
+    if result.per_worktree():
+        return [spec]
+    if result.store_repo is None:
+        return []
+    committer = ticketstore.StoreCommitter(result.store_repo, tpaths.repo_root)
+    try:
+        commit = committer.commit(
+            story.story_key, [spec], f"chore(operator): confirm {story.story_key}"
+        )
+    except ticketstore.StoreCommitError as e:
+        return _plan_left_uncommitted(spec, str(e))
+    if commit.foreign:
+        return _plan_left_uncommitted(
+            spec, f"the store's index holds a staged version of {', '.join(commit.foreign)}"
+        )
+    return []
+
+
+def _plan_left_uncommitted(spec: Path, why: str) -> list[Path]:
+    """Warn that a confirmed plan's mark landed uncommitted; no operands."""
+    print(
+        f"warning: {spec} was marked but not committed ({' '.join(why.split())}) — "
+        "commit it in its ticket store by hand.",
+        file=sys.stderr,
+    )
+    return []
 
 
 def _commit_confirmation(

@@ -22584,7 +22584,11 @@ def _park_ticket(layout, *, policy_text: str):
         layout.project,
         "1.1",
         actions=list(TICKET_PARK_ACTIONS),
-        spec_file=plan.relative_to(layout.project).as_posix(),
+        spec_file=(
+            plan.relative_to(layout.project).as_posix()
+            if plan.is_relative_to(layout.project)
+            else str(plan)  # a T4 store, outside the project
+        ),
         run_id="run-1",
         parked_at="2026-10-15",
         source="tickets",
@@ -22623,6 +22627,51 @@ def test_confirm_tickets_marks_done_and_clears_blocked(project_v7, capsys, monke
     assert plan.relative_to(project_v7.project).as_posix() in changed
     assert verify.worktree_clean(project_v7.project)
     assert "✓ 1.1 confirmed — plan is done" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("layout", ["project_v7_store_repo", "project_v7_external_store"])
+def test_confirm_tickets_commits_the_plan_in_its_store_repository(
+    layout, request, capsys, monkeypatch
+):
+    """With the store in its own repository — nested and ignored (T3) or outside
+    the checkout (T4) — the confirmed plan is committed THERE and the code
+    repository's confirm commit carries only the record's deletion: both trees end
+    clean. Ablation (performed): hand `[spec]` to the code commit again and T3's
+    `git add` refuses the ignored plan, the swallowed fault leaving the record's
+    deletion uncommitted, while T4 drops the plan as outside the repository —
+    leaving the store repository dirty; this FAILS for both."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop import frontmatter, verify
+
+    v7 = request.getfixturevalue(layout)
+    plan = _park_ticket(v7, policy_text='[stories]\nsource = "tickets"\n')
+    store = v7.output_folder
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "park 1.1 plan")
+    reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
+    row = ticket_row("1.1", status="blocked", blocked_reason=reason)
+    tree = FakeTicketTree(v7.project, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(cli, "_confirm_ticket_tree", lambda _project: tree)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(v7.project), "1.1"]) == 0
+
+    assert [m.target for m in tree.marks] == ["done"]
+    out, err = capsys.readouterr()
+    assert "✓ 1.1 confirmed — plan is done" in out and "warning" not in err
+    code = git(v7.project, "show", "--name-only", "--format=%s", "HEAD").split()
+    assert code[:3] == ["chore(operator):", "confirm", "1.1"]
+    assert code[3:] == [".bmad-loop/operator/1.1.json"]
+    stored = git(store, "show", "--name-only", "--format=%s%n%b", "HEAD")
+    assert "chore(operator): confirm 1.1" in stored
+    assert plan.relative_to(store).as_posix() in stored
+    assert "## Operator Confirmation" in git(store, "show", "HEAD")
+    assert frontmatter.status_of(frontmatter.read_frontmatter(plan)) == "blocked"  # fake mark
+    assert verify.worktree_clean(v7.project) and verify.worktree_clean(store)
 
 
 def test_confirm_tickets_never_policy_marks_built(project_v7, capsys, monkeypatch):

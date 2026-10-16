@@ -7015,7 +7015,8 @@ def git_toplevel(path: Path) -> Path | None:
     refusal, a broken gitfile — is a real repository's fault and raises
     :class:`GitError`, as a spawn or timeout fault raises typed
     (:class:`GitSpawnError` / :class:`GitTimeoutError`): folded into "not a
-    repository", a store repository git refuses would classify as unversioned."""
+    repository", a store repository git refuses would classify as unversioned.
+    So does a toplevel git reported but this cannot canonicalize."""
     proc = _run_git(["git", "-C", str(path), "rev-parse", "--show-toplevel"], path)
     if proc.returncode != 0:
         if not path.is_dir() or any(
@@ -7028,8 +7029,8 @@ def git_toplevel(path: Path) -> Path | None:
     top = proc.stdout.removesuffix("\n")
     try:
         return Path(top).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return None
+    except (OSError, RuntimeError) as e:
+        raise GitError(f"cannot resolve the toplevel {top!r} git reported for {path}: {e}") from e
 
 
 def worktree_is_registered(repo: Path, path: Path) -> bool:
