@@ -537,9 +537,10 @@ def _tickets_context(
     the plan reads now — ``plan_status``, ``blocked_reason`` and an excerpt of its
     ``## Auto Run Result`` (``auto_run_result``). Read natively, never through
     ``tickets.py``. A plan that is absent reads as nulls; one that cannot be read
-    reads as nulls too, and the fault is journaled as
-    ``resolve-ticket-context-unreadable`` so the null is never mistaken for an
-    empty plan."""
+    reads as nulls too, and so do the frontmatter fields of a plan whose
+    frontmatter is missing, unparseable or not a mapping. Either fault is
+    journaled as ``resolve-ticket-context-unreadable`` so the null is never
+    mistaken for an empty plan."""
     ticket = task.ticket if task is not None else None
     plan = plan_path if plan_path is not None else Path(ticket.plan) if ticket else None
     ctx: dict[str, Any] = {
@@ -564,12 +565,18 @@ def _tickets_context(
             error=f"{e.__class__.__name__}: {e}",
         )
         return ctx
+    result = devcontract.parse_auto_run_result(text)
+    ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
+    fault = frontmatter.frontmatter_fault(text)
+    if fault is not None:
+        Journal(run_dir).append(
+            "resolve-ticket-context-unreadable", story_key=story_key, plan=str(plan), error=fault
+        )
+        return ctx
     fm = frontmatter.parse_frontmatter(text)
     reason = fm.get("blocked_reason")
-    result = devcontract.parse_auto_run_result(text)
-    ctx["plan_status"] = frontmatter.status_of(fm)
+    ctx["plan_status"] = frontmatter.status_of(fm) or None
     ctx["blocked_reason"] = str(reason) if reason not in (None, "") else None
-    ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
     return ctx
 
 

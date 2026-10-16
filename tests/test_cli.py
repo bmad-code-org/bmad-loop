@@ -12888,6 +12888,44 @@ def test_resume_records_a_refined_story_file_approval(project, capsys, monkeypat
     assert [e["ref"] for e in approved] == want
 
 
+def test_resume_records_an_answered_epic_closure_pause(project, capsys, monkeypatch):
+    """Resuming a tickets run paused at `epic-boundary` on a recorded closure
+    answers that pause: the slug joins `ticket_epic_closure_resumed`, persisted
+    before the engine starts, so the engine acknowledges the closure instead of
+    pausing for it again. Ablation (performed): drop the `resume_epic_closure`
+    call from `_prepare_resume_locked` and this FAILS."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-f00e",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        paused_reason="close epic-cart with bmad-ticket",
+        paused_stage="epic-boundary",
+        paused_story_key="epic-cart",
+        ticket_epic_closures={"epic-cart": "accepted"},
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    seen: list[list[str]] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            seen.append(list(kw["state"].ticket_epic_closure_resumed))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+
+    assert seen == [["epic-cart"]]
+    assert load_state(run_dir).ticket_epic_closure_resumed == ["epic-cart"]
+
+
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
     """`run`'s tickets preflight refuses a store layout tickets runs do not drive
     yet — here an initiative folder that was never committed — with a FAIL line

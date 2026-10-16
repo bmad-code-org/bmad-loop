@@ -590,30 +590,36 @@ def test_source_remaining_estimate(tmp_path: Path):
     assert _source(tree).remaining_estimate({"1.1": Phase.DEFERRED}) == 1
 
 
-def _boundary(views, closures=None, acked=(), committed=(CART,)):
+def _boundary(views, closures=None, acked=(), committed=(CART,), resumed=()):
     _, status_view = views
     return [
         (b.action, b.slug, b.verdict)
         for b in ts.epic_boundary(
-            status_view, closures or {}, frozenset(acked), frozenset(committed)
+            status_view,
+            closures or {},
+            frozenset(acked),
+            frozenset(committed),
+            resumed=frozenset(resumed),
         )
     ]
 
 
 @pytest.mark.parametrize(
-    ("views", "closures", "acked", "committed", "expected"),
+    ("views", "closures", "acked", "committed", "resumed", "expected"),
     [
         pytest.param(
             _views(others=(_done("1.1"), ticket_row("1.2", status="built"))),
             None,
             (),
             (CART,),
+            (),
             [("retro", CART, "")],
             id="finished-and-committed-owes-a-retro",
         ),
         pytest.param(
             _views(others=(_done("1.1"),)),
             None,
+            (),
             (),
             (),
             [],
@@ -624,6 +630,7 @@ def _boundary(views, closures=None, acked=(), committed=(CART,)):
             None,
             (),
             (CART,),
+            (),
             [],
             id="unfinished-owes-nothing",
         ),
@@ -632,6 +639,7 @@ def _boundary(views, closures=None, acked=(), committed=(CART,)):
             {CART: "rejected"},
             (),
             (CART,),
+            (),
             [],
             id="closed-epic-owes-nothing",
         ),
@@ -640,6 +648,7 @@ def _boundary(views, closures=None, acked=(), committed=(CART,)):
             {CART: "rejected"},
             (),
             (CART,),
+            (),
             [("rejected", CART, "rejected")],
             id="rejected-open-and-finished-pauses-again",
         ),
@@ -648,6 +657,7 @@ def _boundary(views, closures=None, acked=(), committed=(CART,)):
             {CART: "rejected"},
             (),
             (CART,),
+            (),
             [],
             id="rejected-with-a-fix-up-ticket-builds-it-first",
         ),
@@ -656,24 +666,65 @@ def _boundary(views, closures=None, acked=(), committed=(CART,)):
             {CART: "accepted"},
             (),
             (CART, CHECKOUT),
+            (CART,),
             [("ack", CART, "accepted"), ("retro", CHECKOUT, "")],
-            id="unacked-closure-then-the-next-epic-in-build-order",
+            id="resumed-closure-then-the-next-epic-in-build-order",
+        ),
+        pytest.param(
+            _views(others=(_done("1.1"), _done("2.1", epic=CHECKOUT))),
+            {CART: "accepted"},
+            (),
+            (CART, CHECKOUT),
+            (),
+            [("pause", CART, "accepted"), ("retro", CHECKOUT, "")],
+            id="closure-no-resume-answered-pauses-for-it",
         ),
         pytest.param(
             _views(others=(_done("1.1"),)),
             {CART: "unknown"},
             (CART,),
             (CART,),
+            (),
             [],
             id="acked-closure-owes-nothing",
         ),
     ],
 )
-def test_epic_boundary(views, closures, acked, committed, expected):
+def test_epic_boundary(views, closures, acked, committed, resumed, expected):
     """The epic-boundary actions, in build order, over the open epics: a retro
     for a finished epic this run committed to, a re-pause for a rejected one
-    still finished, an acknowledgement for any other unacknowledged closure."""
-    assert _boundary(views, closures, acked, committed) == expected
+    still finished, an acknowledgement for any other unacknowledged closure a
+    resume answered, and a pause for one no resume answered (the run stopped
+    between recording it and pausing). Ablation (performed): emit the
+    acknowledgement whatever `resumed` holds and the no-resume row FAILS."""
+    assert _boundary(views, closures, acked, committed, resumed) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "stage", "key", "closures", "recorded"),
+    [
+        ("tickets", PAUSE_EPIC_BOUNDARY, CART, {CART: "accepted"}, CART),
+        ("tickets", PAUSE_EPIC_BOUNDARY, CART, {CART: "rejected"}, None),
+        ("tickets", PAUSE_EPIC_BOUNDARY, CART, {}, None),
+        ("tickets", PAUSE_TICKET_HITL, CART, {CART: "accepted"}, None),
+        ("tickets", PAUSE_EPIC_BOUNDARY, None, {CART: "accepted"}, None),
+        ("stories", PAUSE_EPIC_BOUNDARY, CART, {CART: "accepted"}, None),
+    ],
+    ids=["closure-pause", "rejected", "refusal-pause", "other-stage", "no-key", "stories-run"],
+)
+def test_resume_epic_closure(source, stage, key, closures, recorded):
+    """Only a tickets run's `epic-boundary` pause on an epic with a recorded
+    non-rejected closure is answered by a resume; a refused retro's pause (no
+    closure yet) and a rejected verdict (it pauses again anyway) record
+    nothing, and recording twice records the slug once. Ablation (performed):
+    drop the closure test and the refusal-pause row records — this FAILS."""
+    state = RunState(run_id="r", project="/p", started_at="now", source=source)
+    state.paused_stage, state.paused_story_key = stage, key
+    state.ticket_epic_closures = dict(closures)
+
+    assert ts.resume_epic_closure(state) == recorded
+    assert ts.resume_epic_closure(state) is None
+    assert state.ticket_epic_closure_resumed == ([recorded] if recorded else [])
 
 
 def test_source_decide_gates_on_the_pick_status_view(tmp_path: Path):

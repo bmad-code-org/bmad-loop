@@ -113,6 +113,7 @@ from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
 from .ticketmodel import StatusView
 from .tickets_source import (
     BOUNDARY_ACK,
+    BOUNDARY_PAUSE,
     BOUNDARY_REJECTED,
     BOUNDARY_RETRO,
     CLOSURE_REJECTED,
@@ -493,7 +494,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         * any other recorded verdict the operator resumed past: acknowledge it
           (``ticket_epic_closure_acked``), journal ``epic-closure-not-recorded``
           (the epic is still open) and go on; the pick's end-of-tree
-          ``awaiting-closure`` halt skips an acknowledged epic too.
+          ``awaiting-closure`` halt skips an acknowledged epic too;
+        * a recorded verdict no resume answered (``ticket_epic_closure_resumed``,
+          set by the resume prologue): the run stopped between recording the
+          closure and pausing for it, so pause for it now.
 
         bmad-loop never writes the epic's file: its status is read, never set."""
         steps = epic_boundary(
@@ -501,6 +505,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self.state.ticket_epic_closures,
             frozenset(self.state.ticket_epic_closure_acked),
             self._committed_epics(),
+            resumed=frozenset(self.state.ticket_epic_closure_resumed),
         )
         for step in steps:
             if step.action == BOUNDARY_ACK:
@@ -512,6 +517,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 self._save()
                 self.journal.append("ticket-epic-closure", epic_ref=step.slug, verdict=verdict)
                 self._pause_epic_closure(step.slug, verdict)
+            if step.action == BOUNDARY_PAUSE:
+                self._pause_epic_closure(step.slug, step.verdict)
             if step.action == BOUNDARY_REJECTED:
                 self._pause_ticket_pick(
                     Halt(

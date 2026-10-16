@@ -151,8 +151,9 @@ as they read now:
 ```
 
 `plan_status`, `blocked_reason` and `auto_run_result` are `null` when the plan has
-no such value, is absent, or could not be read (the orchestrator journals an
-unreadable plan). The plan's `blocked_reason` is the condition build-auto halted on;
+no such value, is absent, or could not be read; `plan_status` and `blocked_reason`
+are `null` too when the plan's frontmatter is missing or malformed (the orchestrator
+journals an unreadable plan and a malformed frontmatter). The plan's `blocked_reason` is the condition build-auto halted on;
 the orchestrator clears it when it re-arms the ticket.
 
 Your **output marker** is the file at `resolution_path`. Writing it is the LAST

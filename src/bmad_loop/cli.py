@@ -4884,6 +4884,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     approved = tickets_source.approve_paused_story_file(state)
     if approved is not None:
         journal.append("ticket-story-approved", ref=approved)
+    # Likewise a tickets run paused for an epic's closure: this resume answers that
+    # pause, so the engine acknowledges the closure instead of pausing for it again.
+    tickets_source.resume_epic_closure(state)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever

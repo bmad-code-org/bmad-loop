@@ -21,7 +21,7 @@ from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import load_paths
 from bmad_loop.engine import Engine, RunPaused, SpecStatusWriteRefused
 from bmad_loop.frontmatter import parse_frontmatter, status_of
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -1520,9 +1520,10 @@ def test_tickets_unit_never_touches_sprint_status(project_v7):
 
 def _resumed(engine: TicketsEngine, tree: FakeTicketTree, script: list):
     """The engine `bmad-loop resume` builds from the persisted state: the resume
-    path's story-file approval, then the pause cleared."""
+    path's story-file approval and epic-closure answer, then the pause cleared."""
     state = load_state(engine.run_dir)
     tickets_source.approve_paused_story_file(state)
+    tickets_source.resume_epic_closure(state)
     state.clear_pause()
     adapter = MockAdapter(list(script))
     resumed = TicketsEngine(
@@ -2281,6 +2282,43 @@ def test_ticket_retro_accepted_one_shot_closure_pause(project_v7, done):
     [note] = _kinds(resumed, "epic-closure-not-recorded")
     assert (note["epic_ref"], note["verdict"]) == ("epic-cart", "accepted-with-open-items")
     assert len(_kinds(resumed, "ticket-pick-halt")) == 1 and adapter.sessions == []
+
+
+def test_ticket_closure_recorded_without_its_pause_pauses_again(project_v7):
+    """A closure recorded while the pause never landed (the run was killed
+    between the two: state carries the verdict, no pause) is not acknowledged on
+    restart: the run pauses for it, without a second retrospective, and only a
+    resume of that pause lets it go on. Ablation (performed): acknowledge every
+    recorded closure regardless of `ticket_epic_closure_resumed` and the restart
+    finishes past the epic — this FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[
+            _builds_finishing(project_v7, tree, plan, done=False),
+            _retro_writes(project_v7, "accepted-with-open-items"),
+        ],
+    )
+    assert engine.run().paused
+    killed = load_state(engine.run_dir)
+    killed.clear_pause()
+    save_state(engine.run_dir, killed)
+
+    restarted, adapter = _resumed(engine, tree, [])
+    assert restarted.run().paused
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == ("epic-boundary", "epic-cart")
+    assert state.ticket_epic_closure_acked == [] and adapter.sessions == []
+    assert [h["cause"] for h in _kinds(restarted, "ticket-pick-halt")] == ["epic-closure"] * 2
+    assert len(_kinds(restarted, "ticket-epic-closure")) == 1
+
+    resumed, adapter = _resumed(engine, tree, [])
+    assert not resumed.run().paused
+    assert load_state(engine.run_dir).ticket_epic_closure_acked == ["epic-cart"]
+    assert adapter.sessions == []
 
 
 def test_ticket_retro_existing_doc_already_done(project_v7):

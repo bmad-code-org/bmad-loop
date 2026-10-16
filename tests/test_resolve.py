@@ -5734,6 +5734,54 @@ def test_tickets_context_block(tmp_path):
     assert "tickets" not in ctx
 
 
+@pytest.mark.parametrize(
+    "head, fault",
+    [
+        ("", "no frontmatter block"),
+        ("---\nstatus: [blocked\n---\n", "unparseable frontmatter YAML"),
+        ("---\n- blocked\n---\n", "frontmatter is not a mapping"),
+    ],
+)
+def test_tickets_context_malformed_plan_frontmatter_is_journaled(tmp_path, head, fault):
+    """A plan whose frontmatter is missing, unparseable or not a mapping reads as
+    null status fields, never a healthy-looking `""`, and the fault is journaled;
+    the body's `## Auto Run Result` still reaches the resolver. Ablation
+    (performed): drop the `frontmatter_fault` check and `plan_status` reads `""`
+    with no journal row — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(head + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert (tk["plan_status"], tk["blocked_reason"]) == (None, None)
+    assert tk["auto_run_result"].startswith("Status: blocked")
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "resolve-ticket-context-unreadable"]
+    assert rec["story_key"] == "6-4-cli-list-command" and rec["plan"] == str(plan)
+    assert rec["error"].startswith(fault)
+
+
+def test_tickets_context_plan_without_a_status_reads_null(tmp_path):
+    """A well-formed plan with no `status` key reads `plan_status` null, as the
+    skill documents, and journals nothing."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert ctx["tickets"]["plan_status"] is None
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or "resolve-ticket-context-unreadable" not in journal.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_tickets_context_plan_moves_with_a_renamed_project(tmp_path):
     """A tickets task with no recorded spec reads its plan from the binding, which
     names it absolute under the launch-time project `state.project` keeps. After a

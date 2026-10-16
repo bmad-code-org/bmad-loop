@@ -142,6 +142,7 @@ _TICKET_FINISHED: Final = frozenset({"done", "dropped"})
 BOUNDARY_RETRO: Final = "retro"
 BOUNDARY_REJECTED: Final = "rejected"
 BOUNDARY_ACK: Final = "ack"
+BOUNDARY_PAUSE: Final = "pause"
 
 
 @dataclass(frozen=True)
@@ -245,7 +246,10 @@ class EpicBoundary:
     * :data:`BOUNDARY_REJECTED` — the recorded closure (``verdict``) is
       ``rejected`` and the epic is still open and finished: pause again;
     * :data:`BOUNDARY_ACK` — a non-rejected closure (``verdict``) whose one
-      pause the operator resumed past: acknowledge it and go on."""
+      pause the operator resumed past: acknowledge it and go on;
+    * :data:`BOUNDARY_PAUSE` — a non-rejected closure (``verdict``) no resume
+      answered: the record landed but the run stopped before its pause did, so
+      pause for it now."""
 
     action: str
     slug: str
@@ -266,12 +270,16 @@ def epic_boundary(
     closures: Mapping[str, str],
     acked: Sequence[str] | frozenset[str],
     committed: frozenset[str],
+    *,
+    resumed: Sequence[str] | frozenset[str],
 ) -> list[EpicBoundary]:
     """The epic-boundary actions owed before the next pick, in build order, over
     the open epics only (a closed epic owes nothing: its closure is recorded in
     the tree). ``committed`` holds the epic slugs this run committed a ticket
-    of. The caller stops at the first :data:`BOUNDARY_RETRO` or
-    :data:`BOUNDARY_REJECTED`; acknowledgements before it are carried out."""
+    of; ``resumed`` the epics whose closure pause a resume answered
+    (:func:`resume_epic_closure`). The caller stops at the first
+    :data:`BOUNDARY_RETRO`, :data:`BOUNDARY_REJECTED` or :data:`BOUNDARY_PAUSE`;
+    acknowledgements before it are carried out."""
     out: list[EpicBoundary] = []
     for epic in status_view.epics:
         if epic.status in EPIC_CLOSED:
@@ -286,8 +294,12 @@ def epic_boundary(
             # (`decide_pick` holds only the later epics), then it pauses again.
             if epic_finished(status_view, slug):
                 out.append(EpicBoundary(BOUNDARY_REJECTED, slug, verdict))
-        elif slug not in acked:
+        elif slug in acked:
+            continue
+        elif slug in resumed:
             out.append(EpicBoundary(BOUNDARY_ACK, slug, verdict))
+        else:
+            out.append(EpicBoundary(BOUNDARY_PAUSE, slug, verdict))
     return out
 
 
@@ -341,6 +353,27 @@ def approve_paused_story_file(state: RunState) -> str | None:
         return None
     state.ticket_story_approvals.append(ref)
     return ref
+
+
+def resume_epic_closure(state: RunState) -> str | None:
+    """Record that this resume answers a tickets run's epic closure pause: a run
+    paused at ``epic-boundary`` on an epic with a recorded non-rejected closure.
+    The slug joins ``state.ticket_epic_closure_resumed``, so the next boundary
+    check acknowledges it instead of pausing for it again. Called on the resume
+    path before the pause is cleared. A closure the run recorded but never paused
+    for (the run was killed between the two) has no such pause to resume, so it
+    pauses on the next pass. Returns the slug newly recorded, else None."""
+    slug = state.paused_story_key
+    if (
+        state.source != SOURCE_TICKETS
+        or state.paused_stage != PAUSE_EPIC_BOUNDARY
+        or not slug
+        or state.ticket_epic_closures.get(slug, CLOSURE_REJECTED) == CLOSURE_REJECTED
+        or slug in state.ticket_epic_closure_resumed
+    ):
+        return None
+    state.ticket_epic_closure_resumed.append(slug)
+    return slug
 
 
 THOROUGH_ALWAYS: Final = "always"
