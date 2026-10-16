@@ -38130,6 +38130,53 @@ def test_v7_bundle_plan_committed_in_store_repo(request, fixture, layout):
     assert verify.status_of(verify.read_frontmatter(plan)) == "built"
 
 
+def test_v7_bundle_plan_trailers_name_the_landed_squash_commit(project_v7_store_repo):
+    """Under worktree isolation a `squash` merge-back lands a different commit
+    than the bundle's, and the unit branch's teardown leaves the bundle's
+    unreachable: the store trailers name the target's head, which holds the
+    code. Driven at the seam: a T3 bundle that landed in place, then re-published
+    as a merged-back unit whose own commit the target does not hold.
+
+    ABLATION (performed): pass `task.commit_sha` in `_publish_bundle_plan` again
+    and the trailers name the unreachable unit commit — this FAILS."""
+    v7 = project_v7_store_repo
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+    assert not engine.run().crashed
+    repo = paths.repo_root
+    landed = rev_parse_head(repo)
+    unit = git(repo, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "squashed away").strip()
+    assert not verify.is_ancestor(repo, unit, landed)
+    plan = _v7_plan(paths, "fix-things")
+    plan.write_text(plan.read_text(encoding="utf-8") + "\nreviewed\n", encoding="utf-8")
+    task = replace(
+        engine.state.tasks["dw-fix-things"], worktree_path=str(repo / "unit"), commit_sha=unit
+    )
+
+    engine._publish_bundle_plan(task)
+
+    body = git(store, "log", "-1", "--format=%B")
+    assert f"Bmad-Code-Commit: {landed}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{landed}" in body
+
+
 def test_v7_bundle_plan_in_a_checkout_store_rides_the_code_commit(project_v7):
     """T1 (the store is tracked inside the code checkout): the code commit
     already carries the plan, so the sweep makes no store-repository commit and

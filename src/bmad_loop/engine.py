@@ -4824,6 +4824,24 @@ class Engine:
         write that fails raises ``RunPaused`` with the latch kept. Base: none."""
         del task
 
+    def _landed_code_commit(self, task: StoryTask) -> str | None:
+        """The code commit a store commit's trailers name for ``task`` (a tickets
+        run's marked plan, a v7 sweep's bundle plan): the unit's own commit while
+        the target holds it (in place, or merged back by ``merge`` / ``ff``), else
+        the target's head — a ``squash`` merge-back lands a different commit and
+        the unit branch's teardown leaves the unit's unreachable. None when git
+        cannot read the head: the trailer is provenance, and the commit still
+        lands."""
+        sha = task.commit_sha
+        if not task.worktree_path or not sha:
+            return sha
+        repo = self.paths.repo_root
+        try:
+            head = verify.rev_parse_head(repo)
+        except verify.GitError:
+            return None
+        return sha if verify.is_ancestor(repo, sha, head) else head
+
     def _replay_post_landing_writes(self) -> None:
         """Make, on resume, every latched post-landing write whose code had
         already landed when the host stopped. Called from ``run()`` after

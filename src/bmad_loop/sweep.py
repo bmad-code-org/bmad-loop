@@ -8806,7 +8806,7 @@ class SweepEngine(Engine):
                 task.story_key,
                 [plan],
                 f"chore(sweep): {task.story_key} plan [bmad-loop {self.state.run_id}]",
-                code_commit=task.commit_sha,
+                code_commit=self._landed_code_commit(task),
                 code_baseline=task.baseline_commit,
             )
         except ticketstore.StoreCommitError as e:
