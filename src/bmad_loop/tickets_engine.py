@@ -302,22 +302,25 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _pause_blocked_plan(self, halt: Halt) -> NoReturn:
         """A blocked plan this run did not park: record the ESCALATED wedge task
-        resolve acts on (carrying the plan and the ticket binding), then pause."""
-        binding: TicketBinding | None = None
+        resolve acts on (carrying the plan and the ticket binding), then pause. A
+        ``find`` fault pauses at ``ticket-tree`` with no task recorded, as
+        :meth:`_dispatch_ref` does: an unbound wedge task would re-drive unbound."""
         try:
             binding = ticket_binding(self.ticket_tree.find(halt.key))
-        except TicketsError:
-            binding = None
+        except TicketsError as e:
+            self._pause_ticket_pick(
+                Halt("tree-fault", halt.key, halt.row, f"tickets.py {e.kind}: {e}")
+            )
         try:
             self._pause_wedged(
                 halt.key,
                 state_kind="blocked-plan",
                 detail=halt.detail,
-                spec_file=binding.plan if binding is not None else None,
+                spec_file=binding.plan,
             )
         except RunPaused:
             task = self.state.tasks.get(halt.key)
-            if task is not None and binding is not None:
+            if task is not None:
                 task.ticket = binding
                 self._save()
             raise

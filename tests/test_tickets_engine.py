@@ -207,6 +207,27 @@ def test_blocked_plan_wedges_escalation(project_v7):
     assert isinstance(picked, TicketRef) and picked.key == "1.1"
 
 
+def test_find_fault_on_blocked_plan_pauses_unregistered(project_v7):
+    """A `find` fault while binding a blocked plan pauses at `ticket-tree` naming
+    the fault, with no wedge task recorded: an unbound ESCALATED task would
+    re-drive with no binding after resolve. Ablation (performed): degrade the
+    fault to an unbound `_pause_wedged` and this FAILS."""
+    row = ticket_row("1.1", status="blocked", blocked_reason="tests red", blocked_at="2026-10-14")
+    tree = _tree(project_v7, blocked=(row,))
+    tree.faults["find"] = TicketsCrashed("tickets.py died")
+    engine, adapter = make_engine(project_v7, tree)
+
+    summary = engine.run()
+
+    assert summary.paused
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert "tickets.py died" in (persisted.paused_reason or "")
+    assert persisted.tasks == {}
+    assert _kinds(engine, "stories-wedged") == []
+    assert adapter.sessions == []
+
+
 def test_inrun_escalation_repauses_before_the_pick(project_v7):
     """An escalation a session raised (attempt > 0) re-pauses before the tree is
     read, never re-derived from it. Ablation (performed): drop the
