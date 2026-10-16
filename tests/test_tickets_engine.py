@@ -2659,8 +2659,9 @@ def _builds_shared(layout: V7Layout, tree: FakeTicketTree, plan: Path, *, park: 
 
 def _has_unit_code(checkout: Path) -> bool:
     """Whether the unit's change (`_builds_shared`) is in ``checkout``'s tree; the
-    template commits its own `src.txt`."""
-    return (checkout / "src.txt").read_bytes() == b"cart model\n"
+    template commits its own `src.txt`. Text, not bytes: the merge-back checks the
+    file out under autocrlf on Windows."""
+    return (checkout / "src.txt").read_text(encoding="utf-8") == "cart model\n"
 
 
 def _landed_marks(tree: FakeTicketTree, main: Path, monkeypatch) -> list[tuple[str, bool]]:
