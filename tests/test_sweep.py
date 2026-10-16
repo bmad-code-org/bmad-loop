@@ -38165,6 +38165,38 @@ def test_v7_bundle_plan_in_a_checkout_store_rides_the_code_commit(project_v7):
         assert _records(engine, kind) == []
 
 
+def test_v7_sweep_store_record_moves_with_a_renamed_project(project_v7_store_repo, tmp_path):
+    """A nested store (T3) a v7 sweep recorded under the launch-time project is
+    located on the live one: the sweep's shared store and the store repository it
+    publishes bundle plans in are the moved paths, not the recorded ones.
+    ABLATION (performed): read the raw `state.store_topology` in
+    `SweepEngine.__init__` / `store_topology` and both name the old path."""
+    import dataclasses
+
+    paths = _v7_paths(project_v7_store_repo)
+    live = ticketstore.assess_store(paths, "none")
+    assert isinstance(live, ticketstore.StoreTopology) and live.store_repo is not None
+    launched = tmp_path / "launched-here"
+    moved = dataclasses.replace(
+        live,
+        store_root=launched / live.store_root.relative_to(paths.project),
+        store_repo=launched / live.store_repo.relative_to(paths.project),
+    )
+    engine, adapter = make_sweep(paths, [], store_topology=moved.to_dict())
+    engine.state.project = str(launched)
+    resumed = SweepEngine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=engine.state,
+    )
+
+    assert resumed.paths.shared_store == live.store_root
+    assert resumed.store_topology == live
+
+
 def test_v7_bundle_review_accepts_built(project_v7):
     """A follow-up review of a `built` plan leaves it `built`. The review gate
     accepts that, and its reclose finds the plan at a success status: a review

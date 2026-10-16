@@ -50,7 +50,7 @@ from .platform_util import (
     open_dir_confined,
     safe_segment,
 )
-from .runs import StateRootError, _project_of_run_dir, events_dir_for
+from .runs import StateRootError, _project_of_run_dir, events_dir_for, live_store_topology
 from .signals import attribute_events, session_events
 from .statemachine import advance
 from .worksource import EpicProgress, Pick, WorkSource
@@ -1486,10 +1486,13 @@ class SweepEngine(Engine):
         # v7: a ticket store no checkout carries is shared, as in a tickets run
         # (`TicketsEngine.__init__`) — the ledger and bundle plans under it stay at
         # the main checkout and worktree mounts are redirected to it. Read from the
-        # topology the sweep recorded at its start (`runsetup.compose_sweep`).
+        # topology the sweep recorded at its start (`runsetup.compose_sweep`), moved
+        # with a renamed project.
         state, paths = kwargs.get("state"), kwargs.get("paths")
         if state is not None and paths is not None and state.store_topology:
-            kwargs["paths"] = ticketstore.with_shared_store(paths, state.store_topology)
+            kwargs["paths"] = ticketstore.with_shared_store(
+                paths, live_store_topology(state, paths.project)
+            )
         # Whether `store-unversioned` is already journaled for this run (None until
         # the journal is first read for it, `_note_store_unversioned`).
         self._unversioned_noted: bool | None = None
@@ -8757,9 +8760,10 @@ class SweepEngine(Engine):
 
     @property
     def store_topology(self) -> ticketstore.StoreTopology | None:
-        """The ticket store a v7 sweep recorded at its start; None on v6, and when
+        """The ticket store a v7 sweep recorded at its start, located on the live
+        project (:func:`~bmad_loop.runs.live_store_topology`); None on v6, and when
         it recorded none (no store to classify, or a sweep older than the record)."""
-        recorded = self.state.store_topology
+        recorded = live_store_topology(self.state, self.paths.project)
         return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:
