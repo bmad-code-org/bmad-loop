@@ -457,7 +457,13 @@ def build_context(
     # tickets mode: the ticket the escalation is about, and its plan as it reads now —
     # the status and blocked reason build-auto's HALT left, and its result excerpt.
     if traits.name == worksource.SOURCE_TICKETS:
-        context["tickets"] = _tickets_context(run_dir, story_key, task, plan_path=context_spec_path)
+        ticket_plan = context_spec_path
+        if ticket_plan is None and task is not None and task.ticket is not None:
+            # the binding records the plan absolute under the launch-time project
+            ticket_plan = rebase_recorded_project_path(
+                Path(task.ticket.plan), state, current_project_root
+            )
+        context["tickets"] = _tickets_context(run_dir, story_key, task, plan_path=ticket_plan)
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")

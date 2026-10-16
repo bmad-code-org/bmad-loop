@@ -5734,6 +5734,35 @@ def test_tickets_context_block(tmp_path):
     assert "tickets" not in ctx
 
 
+def test_tickets_context_plan_moves_with_a_renamed_project(tmp_path):
+    """A tickets task with no recorded spec reads its plan from the binding, which
+    names it absolute under the launch-time project `state.project` keeps. After a
+    project move the context names, and reads, the plan under the live project.
+    Ablation (performed): pass `context_spec_path` alone and the context names the
+    old path with null fields — this FAILS."""
+    live = tmp_path / "live"
+    plan = live / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "---\nticket: 1\nstatus: blocked\nblocked_reason: intent gap\n---\n" + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    launched = tmp_path / "launched-here"
+    run_dir, state, task = _escalated_run(live, source="tickets")
+    task.spec_file = ""
+    task.ticket = _ticket_binding(launched / plan.relative_to(live))
+    state.project = str(launched)
+    save_state(run_dir, state)
+
+    path, _, _ = resolve.build_context(
+        state, run_dir, "6-4-cli-list-command", isolation="", project_root=live
+    )
+
+    tk = json.loads(path.read_text(encoding="utf-8"))["tickets"]
+    assert tk["plan"] == plan.as_posix()
+    assert (tk["plan_status"], tk["blocked_reason"]) == ("blocked", "intent gap")
+
+
 def test_rearm_tickets_uses_mark_and_clears_blocked_fields(project_v7):
     """A tickets-mode re-arm moves the plan's status through the real chokepoint —
     `tickets.py mark`, reason `rearm`, the plan as the cross-check — which also

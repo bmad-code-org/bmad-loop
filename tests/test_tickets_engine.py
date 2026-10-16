@@ -1755,6 +1755,24 @@ def test_unit_commit_has_ticket_trailers(project_v7, template):
     assert subject == ("feat: 1.1" if template else "story 1.1: implemented via bmad-loop")
 
 
+def test_ticket_trailer_plan_moves_with_a_renamed_project(project_v7, tmp_path):
+    """`Bmad-Plan` names the plan under the live project after a project move,
+    not dropped because the binding's launch-time path left the checkout.
+    Ablation (performed): relativize `Path(ticket.plan)` and the trailer is
+    omitted — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    live = Path(tree.finds["1.1"].plan)
+    rel = live.relative_to(project_v7.project)
+    launched = tmp_path / "launched-here"
+    engine.state.project = str(launched)
+    assert task.ticket is not None
+    task.ticket = dataclasses.replace(task.ticket, plan=str(launched / rel))
+
+    assert f"Bmad-Plan: {rel.as_posix()}" in engine._commit_message(task)
+
+
 def test_dirty_initiative_status_unreadable_pauses(project_v7, monkeypatch):
     """The dirty-initiative gate fails closed: a checkout whose status cannot be
     read pauses at `ticket-tree` before the ticket is registered. Ablation

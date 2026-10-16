@@ -1362,7 +1362,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return message
         trailers = [f"Bmad-Ticket: {ticket.ref}"]
         try:
-            plan = Path(ticket.plan).resolve().relative_to(self.paths.repo_root.resolve())
+            plan = self._recorded_plan(ticket).resolve().relative_to(self.paths.repo_root.resolve())
         except (OSError, RuntimeError, ValueError):
             plan = None
         if plan is not None:
