@@ -649,16 +649,25 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         return errors, ("" if errors else verdict)
 
     def _retro_doc_uncommitted(self, slug: str) -> bool:
-        """Whether epic ``slug``'s retrospective document is dirty in the repo. A
-        git fault reads as dirty: :meth:`_settle_retro_tree` re-reads the tree and
-        pauses on it."""
-        rel = self._repo_relpath(self._retro_doc(slug))
-        if rel is None:
-            return False
-        try:
-            return rel in verify.dirty_paths(self.paths.repo_root)
-        except verify.GitError:
-            return True
+        """Whether epic ``slug``'s retrospective document is dirty in the code repo,
+        or in a store with its own repository (T3/T4). A git fault reads as dirty:
+        :meth:`_settle_retro_tree` re-reads the tree and pauses on it."""
+        doc = self._retro_doc(slug)
+        roots = [self.paths.repo_root]
+        topology = self.store_topology
+        if topology is not None and topology.store_repo is not None:
+            roots.append(topology.store_repo)
+        for root in roots:
+            try:
+                rel = doc.resolve().relative_to(root.resolve()).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue  # outside this repository
+            try:
+                if rel in verify.dirty_paths(root):
+                    return True
+            except verify.GitError:
+                return True
+        return False
 
     def _pause_retro_refused(self, slug: str, why: str) -> NoReturn:
         """Pause at ``epic-boundary`` before ``slug``'s auto retrospective, with no
@@ -1681,11 +1690,16 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self, epic: int, ok: bool, docs: list[Path], *, epic_ref: str | None = None
     ) -> None:
         """A store with its own repository (T3/T4) commits the retro document
-        there first (``chore(retro): <slug> retrospective``, best effort like a
-        plan's store commit). The code checkout is then settled as the base does;
-        the store repository's own dirt never pauses the run — humans edit
-        planning beside it. Journaled under the retro session's key,
-        ``<slug>-retrospective``."""
+        there first (``chore(retro): <slug> retrospective``). The code checkout is
+        then settled as the base does; the store repository's own dirt never pauses
+        the run — humans edit planning beside it. Journaled under the retro
+        session's key, ``<slug>-retrospective``.
+
+        A store commit that fails (``store-commit-failed`` /
+        ``store-commit-foreign-dirt``) pauses at ``epic-boundary`` before a closure
+        is recorded: nothing else would retry it, so the resume re-enters the
+        boundary and ``already-done`` commits the document again
+        (:meth:`_retro_doc_uncommitted` reads the store repository too)."""
         topology = self.store_topology
         if ok and docs and topology is not None and topology.store_repo is not None:
             label = epic_ref or f"epic {epic}"
@@ -1693,13 +1707,21 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 head: str | None = verify.rev_parse_head(self.paths.repo_root)
             except verify.GitError:
                 head = None  # the trailer is provenance; the commit still lands
-            self._store_commit(
+            if not self._store_commit(
                 topology.store_repo,
                 f"{label}-retrospective",
                 list(docs),
                 f"chore(retro): {label} retrospective [bmad-loop {self.state.run_id}]",
                 code_commit=head,
-            )
+            ):
+                reason = (
+                    f"{label} boundary — its retrospective is not committed in "
+                    f"{topology.store_repo} (see the journal's store-commit-failed / "
+                    "store-commit-foreign-dirt rows); commit or unstage the store's own "
+                    f"changes to it, then {self._resume_hint()}"
+                )
+                gates.notify(self.policy, self.run_dir, "retro store commit owed", reason)
+                raise RunPaused(reason, PAUSE_EPIC_BOUNDARY, label)
         super()._settle_retro_tree(epic, ok, docs, epic_ref=epic_ref)
 
     def _replay_post_landing_writes(self) -> None:

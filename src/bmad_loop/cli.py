@@ -348,8 +348,7 @@ def _reject_store_topology(
     project: Path, pol, source: str, *, recorded: dict[str, str | None] | None = None
 ) -> int | None:
     """Refuse a tickets run whose ticket store tickets runs cannot drive
-    (:func:`ticketstore.store_conflict`: a refused layout, a store other than T1
-    until marking outside the commit window lands, or — given the run's
+    (:func:`ticketstore.store_conflict`: a refused layout or — given the run's
     ``recorded`` ``RunState.store_topology`` — a store that changed since the run
     started). Returns 1 to abort, None to proceed — the
     :func:`_reject_isolation_conflict` sibling, called beside it from every

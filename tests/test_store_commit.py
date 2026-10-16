@@ -262,3 +262,76 @@ def test_retro_doc_committed_in_store_repo(project_v7_store_repo, monkeypatch):
     ]
     assert not _kinds(engine, "retro-auto-dirty")
     assert git(layout.project, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("fault", ["git", "foreign"])
+def test_retro_store_commit_failure_pauses_and_resume_commits(
+    project_v7_store_repo, monkeypatch, fault
+):
+    """A retrospective whose store commit fails (a git fault, or a human's staged
+    draft of the document) pauses at `epic-boundary` with no closure recorded, so
+    the resume re-enters the boundary: `already-done` finds the document still
+    uncommitted in the store repository, commits it, and only then records the
+    closure and pauses for it. Ablation (performed): drop the pause on a failed
+    store commit in `TicketsEngine._settle_retro_tree` and the run records the
+    closure with the document uncommitted — this FAILS; drop the store-repository
+    read in `_retro_doc_uncommitted` and the resume records the closure without
+    committing it — this FAILS too."""
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    tree = _epic_tree(layout)
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    doc = _retro_doc(layout)
+    retro = _retro_writes(layout)
+    if fault == "git":
+        real = verify.commit_paths
+        faults = [verify.GitError("index.lock exists")]
+
+        def commit_paths(repo, message, paths):
+            if faults and message.startswith("chore(retro)"):
+                raise faults.pop()
+            return real(repo, message, paths)
+
+        monkeypatch.setattr(verify, "commit_paths", commit_paths)
+    else:
+        written = retro
+
+        def retro(spec):
+            doc.parent.mkdir(parents=True, exist_ok=True)
+            doc.write_text("a human's draft\n", encoding="utf-8")
+            git(store, "add", doc.relative_to(store).as_posix())
+            return written(spec)
+
+    engine, _ = _shared_engine(
+        layout,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(layout, tree, plan), retro],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert "retrospective is not committed in" in (state.paused_reason or "")
+    assert state.ticket_epic_closures == {}
+    assert _subjects(store)[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
+    kind = "store-commit-failed" if fault == "git" else "store-commit-foreign-dirt"
+    assert [e["story_key"] for e in _kinds(engine, kind)] == ["epic-cart-retrospective"]
+
+    if fault == "foreign":
+        git(store, "reset", "-q")
+    resumed = _resume(engine, tree)
+
+    assert resumed.run().paused
+
+    state = load_state(engine.run_dir)
+    assert state.paused_stage == PAUSE_EPIC_BOUNDARY
+    assert "close epic-cart with bmad-ticket" in (state.paused_reason or "")
+    assert state.ticket_epic_closures == {"epic-cart": "accepted"}
+    assert _subjects(store)[0] == "chore(retro): epic-cart retrospective [bmad-loop test-run]"
+    assert _head_files(store) == [doc.relative_to(store).as_posix()]
+    assert [e["story_key"] for e in _kinds(resumed, "store-committed")][-1] == (
+        "epic-cart-retrospective"
+    )
