@@ -134,6 +134,43 @@ def test_store_commit_refuses_foreign_staged_version_of_an_absent_path(store):
     assert "plan.md" not in git(store, "ls-files").split()
 
 
+def test_store_commit_into_an_unborn_store_repository(tmp_path):
+    """A store repository with no commit yet (unborn HEAD) is an empty baseline,
+    not a git fault: the plan commits as the store's first commit, while a human's
+    staged version distinct from the file is still foreign. Ablation (performed):
+    let the HEAD read fail on an unborn repository and every store commit raises
+    `StoreCommitError` — this FAILS."""
+    root = tmp_path / "store"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.email", "store@example.invalid")
+    git(root, "config", "user.name", "store")
+    (root / "plan.md").write_bytes(b"---\nstatus: draft\n---\n")
+    git(root, "add", "plan.md")
+    (root / "plan.md").write_bytes(PLAN)
+    committer = StoreCommitter(root, root)
+
+    assert committer.commit("1.1", [root / "plan.md"], "chore") == StoreCommit(None, ("plan.md",))
+    assert verify.head_unborn(root)
+
+    git(root, "reset", "-q")
+    result = committer.commit("1.1", [root / "plan.md"], "chore")
+
+    assert result.sha is not None and result.foreign == ()
+    assert git(root, "show", "HEAD:plan.md") == PLAN.decode("utf-8").rstrip("\n")
+    assert not verify.head_unborn(root)
+
+
+def test_store_commit_broken_head_is_not_read_as_unborn(store):
+    """HEAD's branch exists but names a missing object: that is a broken repository,
+    not an empty one, so the HEAD read fault still raises (typed)."""
+    (store / ".git" / "refs" / "heads" / "main").write_text("1" * 40 + "\n")
+
+    assert not verify.head_unborn(store)
+    with pytest.raises(StoreCommitError, match="1.1"):
+        StoreCommitter(store, store).commit("1.1", [store / "plan.md"], "chore")
+
+
 def test_store_commit_git_fault_raises_typed(store, monkeypatch):
     """A git fault is a `StoreCommitError` naming the unit, never a bare
     `GitError` a best-effort caller has no handler for."""

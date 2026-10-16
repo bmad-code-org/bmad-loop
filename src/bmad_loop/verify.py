@@ -5943,6 +5943,19 @@ def _blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
         return _blob_oid_for_file(repo, rel, shadow)
 
 
+def head_unborn(repo: Path) -> bool:
+    """True when ``repo``'s HEAD names a branch that does not exist yet — a freshly
+    initialized repository before its first commit. A detached HEAD, or a branch
+    that exists (even one whose object is unreadable), is not unborn, so a caller
+    that consults this only after a HEAD read failed re-raises that fault rather
+    than reading a broken repository as empty. Raises :class:`GitError` when the
+    ref listing itself fails."""
+    rc, symbolic, _detail = _git_out(repo, "symbolic-ref", "-q", "HEAD")
+    if rc != 0 or not symbolic:
+        return False
+    return not ref_exists_checked(repo, symbolic)
+
+
 def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes | None) -> bool:
     """Whether the INDEX entry for ``rel`` is safe to overwrite with ``data``.
 
@@ -5989,8 +6002,16 @@ def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes | None) -> 
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
         raise GitError(f"git ls-files -s -- {rel} failed in {repo}: {detail}")
     # Read once, up here: BOTH branches below need HEAD, because whether an index
-    # state is safe to overwrite is never answerable from the index alone.
-    head = _entry_at_revision(repo, "HEAD", rel)
+    # state is safe to overwrite is never answerable from the index alone. An UNBORN
+    # HEAD (a freshly initialized repository, e.g. a ticket store before its first
+    # commit) is the empty baseline: `ls-tree HEAD` fails there, but nothing is
+    # committed, so the index alone holds anything a write could lose.
+    try:
+        head = _entry_at_revision(repo, "HEAD", rel)
+    except GitError:
+        if not head_unborn(repo):
+            raise
+        head = None
     head_oid = head[2] if head is not None and head[1] == "blob" else None
     records = [r for r in proc.stdout.split(b"\0") if r]
     if not records:
