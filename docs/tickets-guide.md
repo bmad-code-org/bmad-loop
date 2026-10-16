@@ -53,6 +53,7 @@ Under worktree isolation a shared store is read in place: the unit worktree's `c
 
 - **Workspace (T5):** a project root that is not a git repository, with code in several repositories. Every ticket would need a code-repository binding and a done-mark rule across repositories, which bmad-loop does not have yet (`tickets.workspace-unsupported`).
 - **Partly tracked or untracked:** an initiative folder only partly tracked, or untracked but not ignored (`tickets.tree-untracked`).
+- **Tracked outside the checkout:** a store the code repository tracks but that lies outside `repo_root`, the checkout bmad-loop commits in; the commits bmad-loop makes by path would skip its plans. Under worktree isolation a tracked store must also lie inside the project (`tickets.store-topology`).
 - **Tracker store:** `store` is not `"repo"` (`tickets.store-not-repo`). The vendored `tickets.py` refuses a tracker store as well; the preflight refusal is the earlier, clearer one.
 
 ## How a run picks
