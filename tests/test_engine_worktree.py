@@ -13405,6 +13405,50 @@ def test_ignored_plan_in_a_tracked_store_pauses_before_unit_open(project_v7):
     assert len(adapter.sessions) == 1
 
 
+def _ignore_plan(layout, plan):
+    exclude = layout.project / ".git" / "info" / "exclude"
+    kept = exclude.read_bytes() if exclude.is_file() else b""
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    rel = plan.relative_to(layout.project).as_posix()
+    exclude.write_bytes(kept + f"/{rel}\n".encode())
+    assert verify.path_ignored(layout.project, plan), "premise: the plan is ignored"
+
+
+@pytest.mark.parametrize("gate", ["ignored-plan", "dirty-initiative"])
+def test_rebinding_an_unbound_task_applies_the_pick_gates(project_v7, gate):
+    """A host that died between `_loop` saving the new task and the binding
+    attach leaves a registered, unbound task; the resume re-resolves it through
+    `_rebind`, which must refuse what a fresh pick would: an ignored T1 plan or
+    an unowned edit under the initiative folder pauses at `ticket-tree` before
+    the unit opens — the task stays unbound, no session, no worktree.
+    Ablation (performed): drop the gate's call from `_rebind` and the unit
+    opens and builds — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    if gate == "ignored-plan":
+        _ignore_plan(project_v7, plan)
+    else:
+        (project_v7.initiative_folder / "operator-notes.md").write_bytes(b"draft\n")
+    task = StoryTask("1.1", 0)
+    engine.state.tasks["1.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._run_story(task)
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert task.ticket is None and adapter.sessions == []
+    assert git(project_v7.project, "worktree", "list", "--porcelain").count("worktree ") == 1
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"]) for e in halts] == [("1.1", gate)]
+
+
 # ----------------------------------------- tickets: commits in a store repository
 #
 # A ticket store with its own repository (T3 nested, T4 external) gets a plan-only

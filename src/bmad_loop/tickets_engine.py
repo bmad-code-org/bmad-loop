@@ -120,7 +120,7 @@ from .model import (
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
 from .runs import graceful_stop_requested, live_store_topology, rebase_recorded_project_path
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
-from .ticketmodel import StatusView
+from .ticketmodel import StatusView, TicketRow
 from .tickets_source import (
     BOUNDARY_ACK,
     BOUNDARY_PAUSE,
@@ -372,18 +372,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """Resolve the picked ticket's binding before anything registers it, so a
         ``find`` fault pauses with no task recorded and a resume re-picks. The
         dirty-initiative gate runs first, for the same reason."""
-        self._gate_dirty_initiative(decision)
+        self._gate_dirty_initiative(decision.ref, decision.row)
         try:
             found = self.ticket_tree.find(decision.ref)
         except TicketsError as e:
             self._pause_ticket_pick(
                 Halt("tree-fault", decision.ref, decision.row, f"tickets.py {e.kind}: {e}")
             )
-        self._gate_ignored_plan(decision, Path(found.plan))
+        self._gate_ignored_plan(decision.ref, decision.row, Path(found.plan))
         self._picked[decision.ref] = ticket_binding(found)
         return TicketRef(key=decision.ref, row=decision.row)
 
-    def _gate_ignored_plan(self, decision: Dispatch, plan: Path) -> None:
+    def _gate_ignored_plan(self, ref: str, row: TicketRow | None, plan: Path) -> None:
         """Pause at ``ticket-tree``, before the picked ticket is opened, when a
         worktree unit's mark could not ride its commit: the store is tracked in
         the code checkout (T1, so the plan is marked in the mount inside the
@@ -407,14 +407,14 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             if not ignored:
                 return
             detail = (
-                f"the plan {plan} of {decision.ref} is gitignored by the code repository, "
+                f"the plan {plan} of {ref} is gitignored by the code repository, "
                 "so under worktree isolation its mark could not ride the unit's commit "
                 "and the ticket would stay unmarked; commit the plans with the "
                 "initiative folder, or gitignore the whole store"
             )
-        self._pause_ticket_pick(Halt(HALT_IGNORED_PLAN, decision.ref, decision.row, detail))
+        self._pause_ticket_pick(Halt(HALT_IGNORED_PLAN, ref, row, detail))
 
-    def _gate_dirty_initiative(self, decision: Dispatch) -> None:
+    def _gate_dirty_initiative(self, ref: str, row: TicketRow | None) -> None:
         """Pause at ``ticket-tree``, before the picked ticket is opened, when the
         checkout holds uncommitted edits under the initiative folder that this
         run does not own. The unit's commit stages the whole tree
@@ -441,9 +441,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self._pause_ticket_pick(
                 Halt(
                     HALT_DIRTY_INITIATIVE,
-                    decision.ref,
-                    decision.row,
-                    f"cannot read the checkout's status before opening {decision.ref}: {e}",
+                    ref,
+                    row,
+                    f"cannot read the checkout's status before opening {ref}: {e}",
                 )
             )
         owned = self._run_owned_paths()
@@ -460,10 +460,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._pause_ticket_pick(
             Halt(
                 HALT_DIRTY_INITIATIVE,
-                decision.ref,
-                decision.row,
+                ref,
+                row,
                 f"the initiative folder {prefix} has uncommitted changes this run does not "
-                f"own ({shown}); commit or stash them before {decision.ref} is built, "
+                f"own ({shown}); commit or stash them before {ref} is built, "
                 f"because the ticket's commit stages the whole tree",
             )
         )
@@ -492,13 +492,17 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """Re-resolve an unbound task's binding from the tree. A host that died
         between `_loop` saving the new task and the attach above leaves it
         registered with no binding and no session; this re-reads what a fresh pick
-        would. A ``find`` fault pauses at ``ticket-tree``, and the resume retries."""
+        would, through the same gates as :meth:`_dispatch_ref`, so a unit the pick
+        would have refused is not opened on the resume. A ``find`` fault or a
+        gate pauses at ``ticket-tree``, and the resume retries."""
+        self._gate_dirty_initiative(task.story_key, None)
         try:
             found = self.ticket_tree.find(task.story_key)
         except TicketsError as e:
             self._pause_ticket_pick(
                 Halt("tree-fault", task.story_key, None, f"tickets.py {e.kind}: {e}")
             )
+        self._gate_ignored_plan(task.story_key, None, Path(found.plan))
         self.journal.append("ticket-rebound", story_key=task.story_key)
         return ticket_binding(found)
 
