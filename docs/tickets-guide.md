@@ -45,7 +45,7 @@ The ticket store is the initiative folder and its plans. Where it lives decides 
 
 For T2, T3, T4 and T6 the code commit cannot carry the plan, so the mark is latched on the task when the commit starts and made after `finalize_commit`, or after the merge-back under worktree isolation. A resume replays a latched mark. A failed mark pauses the run at `ticket-tree` and keeps the latch. An unversioned store journals `store-unversioned` once per run.
 
-In T3 and T4 each marked plan (plus the ledger, when the unit wrote to it) gets its own commit, `chore(tickets): <ref> <target> [bmad-loop <run>]`, with `Bmad-Code-*` trailers naming the code commit. A failed store commit is journaled (`store-commit-failed` or `store-commit-foreign-dirt`), retried on resume and listed by `status`; it never pauses the run.
+In T3 and T4 each marked plan (plus the ledger, when the unit wrote to it) gets its own commit, `chore(tickets): <ref> <target> [bmad-loop <run>]`, with `Bmad-Code-*` trailers naming the code commit. A failed store commit is journaled (`store-commit-failed` or `store-commit-foreign-dirt`) and listed by `status`, and the run goes on; it is retried before the run can finish, and one still owed pauses at `ticket-tree` (`store-commit-owed`) so the resume retries it.
 
 Under worktree isolation a shared store is read in place: the unit worktree's `config.user.toml` is redirected to it. `tickets.own-repo-isolation` fails when that file is tracked or not ignored.
 
@@ -81,12 +81,14 @@ A pick pause fires before the ticket is registered, so a resume re-reads the tre
 | `ticket-refine`    | the next ticket needs refining, or a blocked ticket has an open unknown                        | refine it with bmad-ticket, then resume                                                                              |
 | `ticket-tree`      | `active_initiative` no longer matches the run's pinned initiative                              | set it back, then resume                                                                                             |
 | `ticket-tree`      | `tickets.py` failed, or a mark (done, park or rollback re-arm) failed                          | fix the tree, then resume; the mark is retried                                                                       |
+| `ticket-tree`      | a store-repository commit is still owed at run end (`store-commit-owed`)                       | commit or unstage the store's own changes to those paths, then resume; the commit is retried                         |
 | `ticket-tree`      | only tickets this run did not start stand in the way, or the tree is stalled                   | finish or unblock those tickets, then resume                                                                         |
 | `ticket-tree`      | the initiative folder holds uncommitted changes the run does not own                           | commit or stash them, then resume                                                                                    |
 | `plan-checkpoint`  | a refined `plan_checkpoint` ticket waits for story-file approval                               | review the story file; `resume` records the approval and dispatches                                                  |
 | `plan-checkpoint`  | an unrefined `plan_checkpoint` ticket finished its planning leg                                | review the plan, then resume; TUI **Request replan** sends it back to `draft`                                        |
 | `story-checkpoint` | a `done_checkpoint` ticket committed                                                           | resume                                                                                                               |
 | `epic-boundary`    | an epic awaits closure, its verdict is `rejected`, or a later ticket waits on an unclosed epic | close the epic with bmad-ticket, then resume (see [Epic retrospective and closure](#epic-retrospective-and-closure)) |
+| `epic-boundary`    | an epic's retrospective document could not be committed in the store repository                | commit or unstage the store's own changes to it, then resume; the commit is retried                                  |
 | `escalation`       | a plan is `blocked` and this run did not park it, or a session escalated                       | `bmad-loop resolve <run-id>` (see [Parking and resolve](#parking-and-resolve))                                       |
 | `story-gate`       | a deferred-work `gate:` names the ticket, or a gate is a v6 story key                          | close the entry or rewrite the token, then resume (see [Ledger and sweeps](#ledger-and-sweeps))                      |
 
@@ -117,7 +119,7 @@ Checkpoints follow upstream's entries in the epic file:
 
 Before each pick and at run end, the run checks the epic table. An open epic is finished when every ticket is `built`, `done` or `dropped`. If this run committed one of its tickets, the epic gets its retrospective:
 
-- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>/<epic-slug>-retrospective.md`, and commits only that document (in the store repository for T3 and T4). A valid document already on disk counts. A dirty tree or a git fault pauses at `epic-boundary` before the session and a stop request stops the run; neither records a closure, so the resume runs the retrospective.
+- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>/<epic-slug>-retrospective.md`, and commits only that document (in the store repository for T3 and T4; a failed store commit pauses at `epic-boundary` before the closure is recorded, and the resume commits it). A valid document already on disk counts. A dirty tree or a git fault pauses at `epic-boundary` before the session and a stop request stops the run; neither records a closure, so the resume runs the retrospective.
 - `"notify"` and `"never"` run no session.
 
 The run records the document's `verdict` (or `unknown` when there is none) and pauses at `epic-boundary`. bmad-loop never writes the epic's file: close the epic with bmad-ticket, then resume. A `rejected` verdict pauses every later pick while the epic stays open, though fix-up tickets added to the rejected epic still run. Any other verdict pauses once; resuming past an epic still open journals `epic-closure-not-recorded`. Details: [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode).
