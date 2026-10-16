@@ -1599,13 +1599,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         commit of the ``built`` plan the session wrote there
         (``ticket_commit_pending``), which a T1 unit's own commit carries. All
         three fields are assigned every time, so a re-armed unit never carries a
-        stale latch into its next commit. Journals ``ticket-mark-latched``."""
+        stale latch into its next commit. Journals ``ticket-mark-latched``, and
+        ``store-unversioned`` (once per run) for a store without a repository
+        (T2/T6) — here, not only when a mark lands, since under ``"never"`` it
+        latches nothing and the session's ``built`` plan lives on disk alone."""
         if self.paths.shared_store is None or task.ticket is None:
             return
         parked = bool(task.operator_actions)
         accept = not parked and self.policy.tickets.mark_done == "auto"
         topology = self.store_topology
         versioned = topology is not None and topology.store_repo is not None
+        if topology is not None and not versioned:
+            self._note_store_unversioned(topology)
         task.ticket_park_pending = operator_park_reason(task.operator_actions) if parked else ""
         task.ticket_done_pending = accept
         task.ticket_commit_pending = not parked and not accept and versioned

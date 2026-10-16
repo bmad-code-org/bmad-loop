@@ -68,6 +68,7 @@ from bmad_loop.policy import (
     OperatorPolicy,
     Policy,
     ScmPolicy,
+    TicketsPolicy,
     VerifyPolicy,
 )
 from bmad_loop.verify import (
@@ -13457,7 +13458,7 @@ def test_rebinding_an_unbound_task_applies_the_pick_gates(project_v7, gate):
 # from tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
 
 
-def _store_engine(layout, tree, expect, *, merge_strategy="merge", **kw):
+def _store_engine(layout, tree, expect, *, merge_strategy="merge", mark_done="auto", **kw):
     """`make_engine` under worktree isolation, the run's topology recorded from the
     real probe as `runsetup` stamps it (asserted to be layout ``expect``)."""
     from test_tickets_engine import _policy, make_engine
@@ -13469,7 +13470,7 @@ def _store_engine(layout, tree, expect, *, merge_strategy="merge", **kw):
     topology = ticketstore.assess_store(paths, "worktree")
     assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == expect
     scm = ScmPolicy(isolation="worktree", delete_branch=False, merge_strategy=merge_strategy)
-    pol = replace(_policy(), scm=scm)
+    pol = replace(_policy(), scm=scm, tickets=TicketsPolicy(mark_done=mark_done))
     return make_engine(layout, tree, policy=pol, store_topology=topology.to_dict(), **kw)
 
 
@@ -13594,3 +13595,27 @@ def test_t2_unversioned_journals_once(project_v7, monkeypatch):
 
     assert len(_kinds(engine, "store-unversioned")) == 1
     assert [m.outcome for m in tree.marks] == ["written", "noop", "noop"]
+
+
+def test_t2_unversioned_journals_under_mark_done_never(project_v7, monkeypatch):
+    """T2 under `mark_done = "never"`: no mark and no store repository to commit
+    in, so nothing latches — but the session's `built` plan lives on disk alone,
+    and `store-unversioned` is still journaled once. Ablation (performed): drop
+    the `_note_store_unversioned` call in `_latch_post_landing_writes` and nothing
+    is journaled — this FAILS."""
+    from test_tickets_engine import _kinds, _plan_status
+
+    rel = project_v7.output_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "the store is ignored")
+    engine, tree, plan = _store_run(project_v7, "T2", monkeypatch, mark_done="never")
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE
+    assert not (task.ticket_done_pending or task.ticket_park_pending or task.ticket_commit_pending)
+    assert _plan_status(plan) == "built" and not tree.marks
+    assert not _kinds(engine, "ticket-mark-latched")
+    assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]
