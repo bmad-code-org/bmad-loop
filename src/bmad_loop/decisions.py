@@ -449,16 +449,19 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     return sorted(pending, key=lambda d: int(d.id.split("-")[1]))
 
 
-def _run_initiative(run_dir: Path) -> str:
-    """The v7 initiative a run recorded at launch (``RunState.initiative``), or
-    ``""`` when its state names none or cannot be read. Read tolerantly, like the
-    triage caches beside it: an unreadable run's decisions are left out, the same
-    way an unreadable triage cache is."""
+def _run_initiative(run_dir: Path) -> str | None:
+    """The v7 initiative a run recorded at launch (``RunState.initiative``),
+    ``""`` when its state names none, or None when the state cannot be read or
+    is not an object. Read tolerantly, like the triage caches beside it: an
+    unreadable run's decisions are left out, the same way an unreadable triage
+    cache is — None matches no scope, the no-initiative ``""`` included."""
     try:
         data = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        return ""
-    value = data.get("initiative") if isinstance(data, dict) else None
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("initiative")
     return value if isinstance(value, str) else ""
 
 

@@ -2384,6 +2384,37 @@ def test_pending_with_no_initiative_skips_initiative_runs(project_v7):
     assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
 
 
+@pytest.mark.parametrize("state", [b"{not json", b"[]"], ids=["unreadable", "non-object"])
+def test_pending_with_no_initiative_skips_unreadable_runs(project_v7, state):
+    """With no v7 initiative active the run scope is `""`, the value a run that
+    recorded no initiative has. A run whose state cannot be read (or is not an
+    object) says nothing about its initiative, so its triage is left out rather
+    than read as unscoped — even when it is the newest run.
+
+    ABLATION (performed): return `""` from `_run_initiative` for an unreadable
+    state and the newer run's question replaces the unscoped run's."""
+    layout = project_v7
+    project = layout.project
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="unscoped q")]),
+    )
+    unread = _make_run(
+        layout,
+        "20260602-000000-bbbb",
+        _triage(["DW-1"], [_decision("DW-1", question="unreadable q")]),
+    )
+    (unread / "state.json").write_bytes(state)
+    (project / V7_USER_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+    paths = bmadconfig.load_paths(project)
+    assert paths.era == "v7" and not paths.active_initiative
+    _open_ledger(paths.deferred_work, "DW-1")
+
+    pending = decisions.pending_missed_decisions(project)
+    assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
+
+
 def test_v6_store_path_unchanged(project):
     """v6 (and v7 with no initiative active) keeps the single
     `.bmad-loop/decisions.json` store, written by an out-of-band answer exactly
