@@ -1577,7 +1577,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         ticket = task.ticket
         if ticket is None:
             self._pause_post_landing_mark(task, target, "the unit has no ticket binding")
-        plan = Path(ticket.plan)
+        plan = self._recorded_plan(ticket)
         try:
             if task.ticket_park_pending:
                 self.ticket_tree.mark(
@@ -1619,7 +1619,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if topology.store_repo is None:
             self._note_store_unversioned(topology)
             return True
-        paths = [Path(ticket.plan)]
+        paths = [self._recorded_plan(ticket)]
         if task.harvested_deferrals or task.story_closes_intended:
             paths.append(self.paths.deferred_work)
         return self._store_commit(

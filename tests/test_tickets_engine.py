@@ -2912,6 +2912,43 @@ def test_failed_post_landing_mark_pauses_ticket_tree(project_v7_store_repo, monk
     assert task.ticket_done_pending is False and _plan_status(plan) == "done"
 
 
+def test_post_landing_mark_moves_with_a_renamed_project(
+    project_v7_store_repo, monkeypatch, tmp_path
+):
+    """A nested store (T3) moves with the project: a latched mark replayed after
+    the project moved marks, and commits, the plan under the live project, not
+    the binding's launch-time path. Ablation (performed): mark and commit
+    `Path(ticket.plan)` and the mark names the old path — this FAILS."""
+    layout = project_v7_store_repo
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1", status="built"),))
+    live = Path(tree.finds["1.1"].plan)
+    engine, _ = _shared_engine(layout, tree)
+    task = _bound(engine, tree)
+    launched = tmp_path / "launched-here"
+    engine.state.project = str(launched)
+    assert task.ticket is not None
+    task.ticket = dataclasses.replace(
+        task.ticket, plan=str(launched / live.relative_to(layout.project))
+    )
+    task.ticket_done_pending = True
+    marked: list[Path] = []
+    committed: list[list[Path]] = []
+    monkeypatch.setattr(
+        engine.ticket_tree, "mark", lambda *_a, expected_plan, **_k: marked.append(expected_plan)
+    )
+    monkeypatch.setattr(
+        engine,
+        "_store_commit",
+        lambda _repo, _key, paths, *_a, **_k: committed.append(paths) or True,
+    )
+
+    engine._land_post_landing_writes(task)
+
+    assert marked == [live]
+    assert committed and committed[0][0] == live
+    assert task.ticket_done_pending is False
+
+
 def test_crash_before_merge_back_replays_merge_then_marks(project_v7_store_repo, monkeypatch):
     """Under worktree isolation a host lost after the unit committed in its mount
     but before the merge-back leaves a DONE unit whose code is NOT on the target:
