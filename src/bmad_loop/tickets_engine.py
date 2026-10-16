@@ -53,9 +53,16 @@ from .adapters.base import SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
 from .frontmatter import parse_frontmatter, status_of
-from .model import PAUSE_TICKET_TREE, StoryTask, TicketBinding, VerifyOutcome, result_mapping
+from .model import (
+    PAUSE_TICKET_TREE,
+    Phase,
+    StoryTask,
+    TicketBinding,
+    VerifyOutcome,
+    result_mapping,
+)
 from .runs import rebase_recorded_project_path
-from .statemachine import PlanWriteReason
+from .statemachine import PlanWriteReason, advance
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
     HALT_HITL,
@@ -357,15 +364,35 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _plan_produced(self, task: StoryTask) -> bool:
         """Whether the bound plan is on disk at ``ready-for-dev`` or later, read in
         the active workspace (:meth:`_bound_plan`): under isolation leg 1 wrote it
-        into the unit worktree only. A missing or unreadable plan is not produced."""
+        into the unit worktree only. A missing plan is not produced. A plan that is
+        there but cannot be read stops the dispatch (:meth:`_plan_unreadable`):
+        answering False would send another ``Halt after planning.`` leg onto
+        planning work whose status nobody could read."""
         plan = self._bound_plan(task)
         if plan is None:
             return False
         try:
             text = plan.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError):
+        except FileNotFoundError:
             return False
+        except (OSError, UnicodeDecodeError) as e:
+            self._plan_unreadable(task, plan, e)
         return plan_planned(status_of(parse_frontmatter(text)))
+
+    def _plan_unreadable(self, task: StoryTask, plan: Path, error: Exception) -> NoReturn:
+        """The bound plan is on disk but cannot be read, before any session for
+        this dispatch launched. A PENDING task has run nothing: pause at
+        ``ticket-tree`` with the fault, as a ``find`` fault does, and the resume
+        re-reads the plan. A DEV_RUNNING task escalates the way a failed restore
+        patch does, stepping to DEV_VERIFY first: ``_escalate`` cannot leave
+        DEV_RUNNING directly."""
+        detail = f"ticket plan {plan} cannot be read: {error}"
+        if task.phase == Phase.PENDING:
+            self._pause_ticket_pick(Halt("tree-fault", task.story_key, None, detail))
+        if task.phase == Phase.DEV_RUNNING:
+            advance(task, Phase.DEV_VERIFY)
+        self._escalate(task, detail)
+        raise AssertionError("_escalate always raises")  # pragma: no cover
 
     def _schedule_complete(self) -> bool:
         """Whether the next pick would end the run. A tree that cannot be read

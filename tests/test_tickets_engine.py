@@ -586,6 +586,43 @@ def test_plan_produced_reads_the_active_workspace(project_v7, tmp_path):
     assert "Halt after planning." not in engine._dev_prompt(task, None)
 
 
+def test_unreadable_checkpoint_plan_stops_the_dispatch(project_v7):
+    """A plan-checkpoint plan that is on disk but cannot be read is not an absent
+    plan: the run launches no session and pauses naming the fault, instead of
+    sending another `Halt after planning.` leg onto it. Before dispatch (PENDING)
+    it pauses at `ticket-tree`; mid-dispatch (DEV_RUNNING) it escalates.
+    Ablation (performed): fold the read fault back into `return False` in
+    `_plan_produced` and the session launches — this FAILS."""
+    row = ticket_row("1.1", plan_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    plan = Path(tree.finds["1.1"].plan)
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_bytes(b"---\nticket: 1\nstatus: ready-for-dev\xff\n---\n")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "plan")
+    engine, adapter = make_engine(project_v7, tree)
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert adapter.sessions == []
+    (paused,) = _kinds(engine, "run-paused")
+    assert "cannot be read" in paused["reason"]
+
+    pending = _bound(engine, tree)
+    with pytest.raises(RunPaused) as before:
+        engine._plan_halt_now(pending)
+    assert before.value.stage == PAUSE_TICKET_TREE
+    assert pending.phase == Phase.PENDING
+
+    running = _bound(engine, tree)
+    running.phase = Phase.DEV_RUNNING
+    with pytest.raises(RunPaused) as during:
+        engine._plan_halt_now(running)
+    assert during.value.stage == PAUSE_ESCALATION
+    assert running.phase == Phase.ESCALATED
+
+
 def test_bound_plan_moves_with_a_renamed_project(project_v7, tmp_path):
     """`find` names the plan absolute under the launch-time project, which
     `state.project` keeps. A resume after the project moved reads, re-arms and
