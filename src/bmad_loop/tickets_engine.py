@@ -54,6 +54,7 @@ from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import Engine, RunPaused, SpecStatusWriteRefused, SpecWriteReason
 from .frontmatter import parse_frontmatter, status_of
 from .model import PAUSE_TICKET_TREE, StoryTask, TicketBinding, VerifyOutcome, result_mapping
+from .runs import rebase_recorded_project_path
 from .statemachine import PlanWriteReason
 from .tickets_source import (
     HALT_BLOCKED_PLAN,
@@ -356,14 +357,23 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     # -------------------------------------------------------------- dispatch
 
+    def _recorded_plan(self, ticket: TicketBinding) -> Path:
+        """The binding's plan path, moved with a renamed project: ``find`` named
+        it absolute under the launch-time project ``state.project`` keeps, so a
+        resume after a project move reads it under the live project
+        (:func:`~bmad_loop.runs.rebase_recorded_project_path`). A plan outside
+        the recorded project is left as recorded."""
+        return rebase_recorded_project_path(Path(ticket.plan), self.state, self.paths.project)
+
     def _bound_plan(self, task: StoryTask) -> Path | None:
-        """The ticket's plan as ``find`` named it at pick time, re-anchored in the
-        active workspace (the same path in place; the unit worktree's copy under
-        isolation). None for a task with no binding."""
+        """The ticket's plan as ``find`` named it at pick time (moved with the
+        project, :meth:`_recorded_plan`), re-anchored in the active workspace
+        (the same path in place; the unit worktree's copy under isolation).
+        None for a task with no binding."""
         ticket = task.ticket
         if ticket is None:
             return None
-        plan = Path(ticket.plan)
+        plan = self._recorded_plan(ticket)
         try:
             rel = plan.relative_to(self.paths.project)
         except ValueError:

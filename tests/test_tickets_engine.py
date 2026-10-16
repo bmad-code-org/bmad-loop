@@ -522,6 +522,34 @@ def test_plan_produced_reads_the_active_workspace(project_v7, tmp_path):
     assert "Halt after planning." not in engine._dev_prompt(task, None)
 
 
+def test_bound_plan_moves_with_a_renamed_project(project_v7, tmp_path):
+    """`find` names the plan absolute under the launch-time project, which
+    `state.project` keeps. A resume after the project moved reads, re-arms and
+    marks the plan under the live project, not under a directory that is gone.
+    A plan outside the recorded project is left as recorded. Ablation
+    (performed): bind `Path(ticket.plan)` in `_bound_plan` and the moved plan
+    reads as the old path — this FAILS."""
+    row = ticket_row("1.1", plan_checkpoint=True)
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    live = Path(tree.finds["1.1"].plan)
+    launched = tmp_path / "launched-here"
+    engine.state.project = str(launched)
+    assert task.ticket is not None
+    task.ticket = dataclasses.replace(
+        task.ticket, plan=str(launched / live.relative_to(project_v7.project))
+    )
+    _write_plan(live, "ready-for-dev")
+
+    assert engine._bound_plan(task) == live
+    assert not engine._plan_halt_now(task)
+
+    outside = tmp_path / "elsewhere" / "plan-1.1.md"
+    task.ticket = dataclasses.replace(task.ticket, plan=str(outside))
+    assert engine._bound_plan(task) == outside
+
+
 def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     """The follow-up review re-dispatches the ticket with the ledger sentence and
     the tickets clauses: never the banned word, never the sprint board, no
