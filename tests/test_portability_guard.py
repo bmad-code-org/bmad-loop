@@ -2001,10 +2001,12 @@ JOURNAL_KINDS = frozenset(
         # (once per process each), and its pick-time pauses. A blocked plan pauses
         # through the checkpoint mixin's `stories-wedged`. Plus an engine status
         # write the plan chokepoint has no reason for, refused unwritten, and a
-        # registered task whose binding a resume re-resolved from the tree.
+        # registered task whose binding a resume re-resolved from the tree, and a
+        # review leg whose plan risk could not be read (reviewed as high risk).
         "ticket-foreign-active",
         "ticket-hitl-pause",
         "ticket-pick-halt",
+        "ticket-plan-risk-unread",
         "ticket-rebound",
         "ticket-refine-pause",
         "ticket-skipped",

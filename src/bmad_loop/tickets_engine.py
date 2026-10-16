@@ -69,6 +69,7 @@ from .tickets_source import (
     HALT_PLAN_CHECKPOINT,
     HALT_REFINE,
     NOTE_FOREIGN_ACTIVE,
+    RISK_HIGH,
     SKIP_PARKED,
     Dispatch,
     Halt,
@@ -466,19 +467,32 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _review_thorough(self, task: StoryTask) -> bool:
         """``[tickets] thorough_review`` for a review leg: the plan's own ``risk``,
-        which the build settles at or above the ticket's. A plan that cannot be
-        read, or sets no risk, falls back to the find row's."""
+        which the build settles at or above the ticket's. A plan that sets no
+        risk falls back to the find row's. A plan that cannot be read, or whose
+        frontmatter does not parse, may have raised it unseen: the review reads
+        it as ``high`` and journals ``ticket-plan-risk-unread``."""
         ticket = task.ticket
         risk = ticket.risk if ticket is not None else ""
         plan = self._bound_plan(task)
         if plan is not None:
             try:
-                fm = parse_frontmatter(plan.read_text(encoding="utf-8-sig"))
-            except (OSError, UnicodeDecodeError):
-                fm = {}
-            planned = fm.get("risk")
-            if isinstance(planned, str) and planned.strip():
-                risk = planned
+                text = plan.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as e:
+                fault: str | None = f"{type(e).__name__}: {e}"
+            else:
+                fault = frontmatter_fault(text)
+            if fault is not None:
+                self.journal.append(
+                    "ticket-plan-risk-unread",
+                    story_key=task.story_key,
+                    plan=str(plan),
+                    detail=fault,
+                )
+                risk = RISK_HIGH
+            else:
+                planned = parse_frontmatter(text).get("risk")
+                if isinstance(planned, str) and planned.strip():
+                    risk = planned
         return wants_thorough(self.policy.tickets.thorough_review, risk)
 
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:

@@ -511,6 +511,44 @@ def test_dev_prompt_thorough_on_high_risk(project_v7, policy, risk, thorough):
     assert review_head.endswith("ticket 1.1 thorough")
 
 
+@pytest.mark.parametrize("fault", ["unreadable", "malformed"])
+def test_review_thorough_when_plan_risk_cannot_be_read(project_v7, fault):
+    """A plan whose risk cannot be read may have been raised above the find row's
+    `low`: the review leg reads it as high and journals the fault, instead of
+    falling back to the row's risk unseen. `never` still wins. Ablation
+    (performed): restore the silent `{}` fallback and both rows FAIL."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1", risk="low"),))
+
+    def engine_for(thorough_review: str):
+        pol = Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            tickets=TicketsPolicy(thorough_review=thorough_review),
+        )
+        engine, _ = make_engine(project_v7, tree, policy=pol)
+        return engine, _bound(engine, tree)
+
+    engine, task = engine_for("high-risk")
+    plan = Path(tree.finds["1.1"].plan)
+    if fault == "unreadable":
+        plan.mkdir(parents=True)  # read_text raises an OSError on every platform
+    else:
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_bytes(b"---\nstatus: built\nrisk: [high\n---\n\n# plan\n")
+    task.spec_file = str(plan)
+
+    assert engine._review_prompt(task).split(" — ")[0].endswith("ticket 1.1 thorough")
+    [entry] = _kinds(engine, "ticket-plan-risk-unread")
+    assert entry["story_key"] == "1.1"
+    assert entry["plan"] == str(plan)
+    assert entry["detail"]
+
+    never, never_task = engine_for("never")
+    never_task.spec_file = str(plan)
+    assert "thorough" not in never._review_prompt(never_task)
+
+
 def test_dev_prompt_never_thorough_when_policy_never(project_v7):
     """`thorough_review = "never"` keeps both legs at build-auto's own review
     selection, whatever the ticket's or the plan's risk."""
