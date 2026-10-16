@@ -1560,8 +1560,8 @@ on_status_contradiction = "escalate"
 # by bmad-sprint-planning. "stories" opts into folder+id dispatch: the loop reads
 # a typed stories.yaml (Story Breakdown output, sibling of SPEC.md) and dispatches
 # each entry by spec-folder + story id. "tickets" drives the BMAD v7 ticket tree
-# of [core] active_initiative through _bmad/method/scripts/tickets.py (validate
-# checks it today; runs land in a later release). `bmad-loop run --spec <folder>`
+# of [core] active_initiative through _bmad/method/scripts/tickets.py
+# (experimental). `bmad-loop run --spec <folder>`
 # forces stories mode for a single run regardless of this setting.
 source = "sprint-status"     # sprint-status | stories | tickets
 # Required (and must parse) when source = "stories": the project-relative path to
