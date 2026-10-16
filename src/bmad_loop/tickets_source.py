@@ -110,6 +110,11 @@ HALT_DIRTY_INITIATIVE: Final = "dirty-initiative"
 """Raised by the engine, not :func:`decide_pick`: the checkout holds uncommitted
 edits under the initiative folder that this run does not own, so the picked
 ticket is not opened (``TicketsEngine._gate_dirty_initiative``)."""
+HALT_IGNORED_PLAN: Final = "ignored-plan"
+"""Raised by the engine, not :func:`decide_pick`: under worktree isolation the
+picked ticket's plan lies in a tracked initiative folder (T1) but the code repo
+ignores it, so its mark could not ride the unit's commit
+(``TicketsEngine._gate_ignored_plan``)."""
 
 HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_REFINE: PAUSE_TICKET_REFINE,
@@ -124,6 +129,7 @@ HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_TREE_FAULT: PAUSE_TICKET_TREE,
     HALT_PIN_MISMATCH: PAUSE_TICKET_TREE,
     HALT_DIRTY_INITIATIVE: PAUSE_TICKET_TREE,
+    HALT_IGNORED_PLAN: PAUSE_TICKET_TREE,
 }
 """The pause stage each :class:`Halt` cause raises."""
 

@@ -131,6 +131,7 @@ from .tickets_source import (
     HALT_EPIC_CLOSURE,
     HALT_EPIC_REJECTED,
     HALT_HITL,
+    HALT_IGNORED_PLAN,
     HALT_PLAN_CHECKPOINT,
     HALT_REFINE,
     NOTE_FOREIGN_ACTIVE,
@@ -377,8 +378,40 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self._pause_ticket_pick(
                 Halt("tree-fault", decision.ref, decision.row, f"tickets.py {e.kind}: {e}")
             )
+        self._gate_ignored_plan(decision, Path(found.plan))
         self._picked[decision.ref] = ticket_binding(found)
         return TicketRef(key=decision.ref, row=decision.row)
+
+    def _gate_ignored_plan(self, decision: Dispatch, plan: Path) -> None:
+        """Pause at ``ticket-tree``, before the picked ticket is opened, when a
+        worktree unit's mark could not ride its commit: the store is tracked in
+        the code checkout (T1, so the plan is marked in the mount inside the
+        commit window) but the code repo ignores the plan ``find`` named.
+        ``finalize_commit``'s ``add -A`` would leave the marked plan behind, the
+        teardown would delete it with the mount, and the main checkout's ticket
+        would stay unmarked — dispatched again, its dependents still blocked.
+
+        Asked of the path ``find`` names, which a build may not have written yet:
+        ``check-ignore`` answers for a path that does not exist. Not asked in
+        place (the mark lands on the plan ``tickets.py`` reads) nor for a shared
+        store (marked after the code lands, in the store). A probe fault pauses
+        the same way: the gate fails closed."""
+        if not self._isolated or self.paths.shared_store is not None:
+            return
+        try:
+            ignored = verify.path_ignored(self.paths.repo_root, plan)
+        except verify.GitError as e:
+            detail = f"cannot read whether the code repository ignores {plan}: {e}"
+        else:
+            if not ignored:
+                return
+            detail = (
+                f"the plan {plan} of {decision.ref} is gitignored by the code repository, "
+                "so under worktree isolation its mark could not ride the unit's commit "
+                "and the ticket would stay unmarked; commit the plans with the "
+                "initiative folder, or gitignore the whole store"
+            )
+        self._pause_ticket_pick(Halt(HALT_IGNORED_PLAN, decision.ref, decision.row, detail))
 
     def _gate_dirty_initiative(self, decision: Dispatch) -> None:
         """Pause at ``ticket-tree``, before the picked ticket is opened, when the

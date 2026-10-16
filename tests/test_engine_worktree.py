@@ -13365,6 +13365,46 @@ def test_dirty_ledger_only_does_not_pause(project_v7):
     assert not [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
 
 
+def test_ignored_plan_in_a_tracked_store_pauses_before_unit_open(project_v7):
+    """Under worktree isolation a tracked store (T1) is marked in the mount inside
+    the commit window, so a plan the code repo ignores would be left out of the
+    unit's commit and deleted with the mount. The pick pauses at `ticket-tree`
+    before the unit opens — no task, no session — naming the plan; once it is no
+    longer ignored, the resume builds it. Ablation (performed): drop the
+    `_gate_ignored_plan` call from `_dispatch_ref` and the unit opens and builds
+    — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _builds, _resumed, _tree
+
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    rel = plan.relative_to(project_v7.project).as_posix()
+    exclude = project_v7.project / ".git" / "info" / "exclude"
+    kept = exclude.read_bytes() if exclude.is_file() else b""
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_bytes(kept + f"/{rel}\n".encode())
+    assert verify.path_ignored(project_v7.project, plan), "premise: the plan is ignored"
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert str(plan) in (state.paused_reason or "")
+    assert state.tasks == {} and adapter.sessions == []
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"]) for e in halts] == [("1.1", "ignored-plan")]
+
+    exclude.write_bytes(kept)
+    resumed, adapter = _resumed(engine, tree, [_builds(project_v7, tree, plan)])
+    _mount_aware(resumed, tree, project_v7.project).run()
+
+    assert load_state(engine.run_dir).tasks["1.1"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1
+
+
 # ----------------------------------------- tickets: commits in a store repository
 #
 # A ticket store with its own repository (T3 nested, T4 external) gets a plan-only
